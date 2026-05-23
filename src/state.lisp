@@ -21,6 +21,7 @@
            #:protocol-version
            #:client-info
            #:tool-instances
+           #:session-slynk-attach
            #:make-session
            #:*current-session-id*
            #:get-tool-instance))
@@ -57,7 +58,14 @@ initialize params, stored for diagnostics and logging.")
     :initform (make-hash-table :test 'equal)
     :documentation "Per-session tool-instance cache. Maps tool-name
 string to the mcp-tool instance for this session. Populated lazily by
-get-tool-instance the first time a tool is called."))
+get-tool-instance the first time a tool is called.")
+   (slynk-attach
+    :initarg :slynk-attach
+    :accessor session-slynk-attach
+    :initform nil
+    :documentation "Resolved host:port Slynk-attach config string for
+this session, or NIL. Set by run from the resolved config; read by
+%handle-initialize to eager-connect (D-13)."))
   (:documentation "Holds all per-connection state for one MCP session.
 One session is constructed per transport connection:
   - stdio: one session for the whole process lifetime
@@ -66,15 +74,18 @@ One session is constructed per transport connection:
 The session is threaded through every protocol handler; it is NOT a
 dynamic variable (only *current-session-id* is)."))
 
-(defun make-session (&key (id "stdio"))
+(defun make-session (&key (id "stdio") slynk-attach)
   "Create and return a fresh, uninitialised session with the given ID.
 ID defaults to \"stdio\" (the Phase 1 transport's logical name).
+SLYNK-ATTACH is the resolved host:port config string (or NIL) passed
+through from run's resolved-slynk-attach (D-13, ATTACH-07).
 The returned session has:
   - initialized-p: NIL
   - protocol-version: NIL
   - client-info: NIL
-  - tool-instances: empty equal-keyed hash-table"
-  (make-instance 'session :id id))
+  - tool-instances: empty equal-keyed hash-table
+  - slynk-attach: SLYNK-ATTACH (NIL when not configured)"
+  (make-instance 'session :id id :slynk-attach slynk-attach))
 
 ;;; Session-ID dynamic variable --------------------------------------------
 

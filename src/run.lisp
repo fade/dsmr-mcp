@@ -301,8 +301,8 @@ resolves to this function."
                          :parse #'identity)))
 
     ;; Suppress unused-variable notes for Phase-1 settings not yet wired.
-    (declare (ignore resolved-mode resolved-bind resolved-port
-                     resolved-slynk-attach))
+    ;; resolved-slynk-attach is now wired into the session (ATTACH-07 consumed).
+    (declare (ignore resolved-mode resolved-bind resolved-port))
 
     ;; Apply resolved log level.
     (setf *log-level* resolved-log-level)
@@ -313,7 +313,8 @@ resolves to this function."
            (:stdio
             (log-event :info "run.start" "transport" :stdio)
             (serve-streams *standard-input* *standard-output*
-                           :session (make-session :id "stdio")))
+                           :session (make-session :id "stdio"
+                                                  :slynk-attach resolved-slynk-attach)))
            ((:tcp :http)
             (error 'transport-not-implemented-error :transport resolved-transport)))
       ;; Cleanup: always log run.stop, even on unwind from typed errors.

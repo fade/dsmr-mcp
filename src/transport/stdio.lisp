@@ -145,7 +145,9 @@ Behaviour:
 
 Divergences from cl-mcp src/run.lisp:
   - No worker-pool calls (Phase 4).
-  - No ATTACH-DISCONNECT-ALL (Phase 2)."
+  - detach-session closes the attached Slynk connection on teardown (D-18,
+    Phase 2); called before the stdio.stop log via runtime symbol resolution
+    so this file compiles before dsmr-mcp/src/attach/dispatch is loaded."
   (let ((*current-session-id* (session-id session)))
     (log-event :info "stdio.start" "session" (session-id session))
     (unwind-protect
@@ -205,5 +207,13 @@ Divergences from cl-mcp src/run.lisp:
                         (log-event :warn "stdio.write.error"
                                    "error" (princ-to-string e))
                         (return t)))))))))
-      ;; Cleanup: always log stdio.stop, even on abnormal exit.
+      ;; Cleanup: D-18 — close the attached Slynk connection before logging stop
+      ;; so the host Slynk listener gets a clean FIN on EOF or abnormal exit.
+      ;; Runtime symbol resolution avoids a compile-time dep on
+      ;; dsmr-mcp/src/attach/dispatch (same technique as the version lookup
+      ;; in protocol.lisp %handle-initialize). ignore-errors guards against
+      ;; the attach system being absent in a stripped build.
+      (ignore-errors
+       (uiop:symbol-call :dsmr-mcp/src/attach/dispatch :detach-session session))
+      ;; Always log stdio.stop, even on abnormal exit.
       (log-event :info "stdio.stop" "session" (session-id session)))))

@@ -109,6 +109,14 @@ the server's highest supported version. NEVER emits -32602 on mismatch
 
 Capability: both tools AND prompts with listChanged t (D-03).
 
+After the initialized-p flag flips, calls try-eager-connect via runtime
+symbol resolution (D-13 eager connect). The surrounding ignore-errors guards
+against the attach subsystem being absent in a stripped build; try-eager-connect
+itself swallows slime-network-error and logs attach.eager-connect.failed so a
+misconfigured or unreachable target fails fast and visibly without derailing
+this response. The post-death reopen shares the same get-or-open-connection
+path (D-13: first open is eager; only the post-death reopen is on-demand).
+
 Note: serverInfo.version is resolved at call time via uiop:symbol-call
 rather than a compile-time package reference, so this file can be compiled
 before dsmr-mcp/src/main is loaded (required by the run → transport/stdio
@@ -123,6 +131,13 @@ before dsmr-mcp/src/main is loaded (required by the run → transport/stdio
           (initialized-p session) t)
     (when (and params (gethash "clientInfo" params))
       (setf (client-info session) (gethash "clientInfo" params)))
+    ;; D-13: eager connect AFTER initialized-p flips.
+    ;; Runtime symbol resolution (uiop:symbol-call) avoids a compile-time dep
+    ;; on dsmr-mcp/src/attach/dispatch, matching the existing version lookup
+    ;; pattern below. ignore-errors guards against the attach system being
+    ;; absent in a stripped build; try-eager-connect handles network errors.
+    (ignore-errors
+     (uiop:symbol-call :dsmr-mcp/src/attach/dispatch :try-eager-connect session))
     (result id (make-ht "protocolVersion" negotiated
                         "capabilities"    caps
                         "serverInfo"      (make-ht "name"    "dsmr-mcp"
