@@ -107,7 +107,12 @@ if the client requests a supported version, echo it back; otherwise return
 the server's highest supported version. NEVER emits -32602 on mismatch
 (diverges from cl-mcp which does; see D-02).
 
-Capability: both tools AND prompts with listChanged t (D-03)."
+Capability: both tools AND prompts with listChanged t (D-03).
+
+Note: serverInfo.version is resolved at call time via uiop:symbol-call
+rather than a compile-time package reference, so this file can be compiled
+before dsmr-mcp/src/main is loaded (required by the run → transport/stdio
+→ protocol load order)."
   (let* ((client-version (and params (gethash "protocolVersion" params)))
          (negotiated (or (find client-version +supported-protocol-versions+
                                :test #'string=)
@@ -121,7 +126,9 @@ Capability: both tools AND prompts with listChanged t (D-03)."
     (result id (make-ht "protocolVersion" negotiated
                         "capabilities"    caps
                         "serverInfo"      (make-ht "name"    "dsmr-mcp"
-                                                   "version" (dsmr-mcp/src/main:version))))))
+                                                   "version" (uiop:symbol-call
+                                                               :dsmr-mcp/src/main
+                                                               :version))))))
 
 ;;; Tool listing ---------------------------------------------------------------
 
