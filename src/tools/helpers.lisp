@@ -183,27 +183,38 @@ jzon type mapping (from addendum §1):
   "Validate ARGS (a hash-table or NIL) against SCHEMA (a schema literal).
 SCHEMA must be an :object schema (validated here; other kinds error).
 
-Required-field check: for each field in :required, verifies the key is
-present in ARGS using the second return value of gethash so a value of
-'null (jzon JSON null) still counts as present (addendum §6).
+Required-field check: for each field in :required, normalizes the key
+identically to how schema->json emits property names (downcase + kebab->snake)
+and verifies the wire-exact key is present in ARGS using the second return
+value of gethash so a value of 'null (jzon JSON null) still counts as
+present (addendum §6).
 
 Type checks: when a property has a :type, verifies the value type when
 the key is present. Unknown extra keys are silently allowed (permissive
 per JSON Schema default).
+
+Both passes use the same (%kebab->snake (string-downcase (string name)))
+normalization so a :required entry and its matching property descriptor
+always refer to the same wire key regardless of the case the schema
+author used.
 
 Returns T on success. Signals arg-validation-error on failure."
   (unless (and (consp schema) (eq (car schema) :object))
     (error "validate-args: schema must be an :object schema, got ~S" schema))
   (destructuring-bind (&key properties required) (rest schema)
     ;; Required-field presence pass.
+    ;; Normalize each required name identically to the type-check pass:
+    ;; downcase + kebab->snake so "Code" and CODE both become "code",
+    ;; matching the wire key that schema->json emits to the client.
     (dolist (req required)
-      (multiple-value-bind (val presentp)
-          (gethash req (or args (make-hash-table :test 'equal)))
-        (declare (ignore val))
-        (unless presentp
-          (error 'arg-validation-error
-                 :field req
-                 :message (format nil "Missing required field: ~A" req)))))
+      (let ((key (%kebab->snake (string-downcase (string req)))))
+        (multiple-value-bind (val presentp)
+            (gethash key (or args (make-hash-table :test 'equal)))
+          (declare (ignore val))
+          (unless presentp
+            (error 'arg-validation-error
+                   :field req
+                   :message (format nil "Missing required field: ~A" key))))))
     ;; Type-check pass on present fields.
     (dolist (prop properties)
       (destructuring-bind (name &key type &allow-other-keys) prop

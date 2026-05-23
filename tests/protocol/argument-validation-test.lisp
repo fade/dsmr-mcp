@@ -110,3 +110,26 @@ is intentionally skipped (addendum §6: null is present-but-null)."
     ;;  but our stub just returns ok regardless of value.)
     (false (gethash "error" obj))
     (true (hash-table-p (gethash "result" obj)))))
+
+(define-test mixed-case-required-entry-normalizes-consistently
+  "WR-04: a :required entry with mixed case (e.g. \"Code\") must normalize to
+the same wire key (\"code\") that the type-check pass uses, so presence and
+type checks agree on one key.  Tests validate-args directly."
+  ;; Schema with mixed-case :required entry "Code" against property (code :type :string).
+  (let ((schema '(:object
+                  :properties ((code :type :string :description "test"))
+                  :required ("Code"))))
+    ;; An args hash with wire key "code" (lowercase — what jzon delivers) must
+    ;; pass the required-presence check even though :required says "Code".
+    (let ((args-present (dsmr-mcp/src/tools/helpers:make-ht "code" "hello")))
+      (true (dsmr-mcp/src/tools/helpers:validate-args schema args-present)))
+    ;; An args hash missing "code" must fail with arg-validation-error.
+    (let ((args-missing (make-hash-table :test 'equal)))
+      (fail (dsmr-mcp/src/tools/helpers:validate-args schema args-missing)
+            dsmr-mcp/src/tools/helpers:arg-validation-error))
+    ;; A symbol :required entry CODE must also normalize to "code" correctly.
+    (let ((schema-sym '(:object
+                        :properties ((code :type :string))
+                        :required (code)))
+          (args-present (dsmr-mcp/src/tools/helpers:make-ht "code" "hello")))
+      (true (dsmr-mcp/src/tools/helpers:validate-args schema-sym args-present)))))
