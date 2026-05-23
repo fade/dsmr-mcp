@@ -90,6 +90,14 @@ process's live ASDF knowledge (see %extra-registry-push-evals)."
                  (list "--eval" (format nil "(push ~S asdf:*central-registry*)" dir))
                  ;; Push one extra dir per --eval (each --eval must be single form).
                  (loop for e in extra append (list "--eval" e))
+                 ;; Route diagnostic streams to stderr for the child's whole
+                 ;; life so nothing but JSON-RPC reaches stdout. *debug-io* in
+                 ;; particular is how SLYNK's ASDF loader prints its
+                 ;; "SLYNK's ASDF loader finished." banner (slynk.asd) — a
+                 ;; let-binding of *standard-output* alone does not catch it,
+                 ;; and the banner would otherwise corrupt the JSON pipe.
+                 (list "--eval"
+                       "(setf *debug-io* *error-output* *trace-output* *error-output*)")
                  (list "--eval"
                        ;; Suppress any remaining ASDF load output (advisory notes
                        ;; from asdf:load-system itself) from reaching the JSON pipe.
