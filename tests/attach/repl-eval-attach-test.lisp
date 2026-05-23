@@ -10,6 +10,17 @@
 ;;;;   4. Stream output in attached image lands in stdout/stderr fields (ATTACH-04, D-07/D-08)
 ;;;; Also covers ATTACH-02 (connection reuse) and ATTACH-03 (serial lock).
 
+;;; Package evolution: the original defpackage included a :shadowing-import-from
+;;; for dsmr-mcp/src/tools/helpers:result (used with the now-removed
+;;; with-attach-dispatch import).  Removing that shadow causes a package-variance
+;;; error in warm images where the old definition is resident.  Delete any
+;;; prior definition before redefining so the new defpackage is always fresh.
+;;; Symbols in this package are all test-local; no other system imports from it.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (let ((pkg (find-package '#:dsmr-mcp/tests/attach/repl-eval-attach-test)))
+    (when pkg
+      (sb-ext:without-package-locks (delete-package pkg)))))
+
 (defpackage #:dsmr-mcp/tests/attach/repl-eval-attach-test
   (:use #:cl #:parachute)
   (:import-from #:dsmr-mcp/tests/support/slynk-fixture
@@ -19,7 +30,6 @@
                 #:repl-eval-tool-slynk-conn
                 #:repl-eval-tool-call-lock
                 #:%dispatch-attach
-                #:with-attach-dispatch
                 #:try-eager-connect
                 #:detach-session)
   (:import-from #:dsmr-mcp/src/attach/connection
@@ -33,10 +43,7 @@
                 #:make-ht)
   (:import-from #:slynk-client
                 #:slime-eval
-                #:slime-close)
-  ;; Shadow parachute:result with helpers:result (used in with-attach-dispatch).
-  (:shadowing-import-from #:dsmr-mcp/src/tools/helpers
-                          #:result))
+                #:slime-close))
 
 (in-package #:dsmr-mcp/tests/attach/repl-eval-attach-test)
 
@@ -115,7 +122,17 @@ All returned values are presented (not just the last)."
         #+sbcl
         (let ((frames (gethash "frames" ec)))
           (true (vectorp frames))
-          (true (plusp (length frames))))))))
+          (true (plusp (length frames))))
+        ;; CR-01 / D-12: error_context strings must not contain raw ESC (0x1B).
+        ;; Any ANSI sequences in condition messages or frame data are stripped
+        ;; by sanitize-control-chars before reaching the JSON-RPC wire.
+        (false (find #\Escape (gethash "condition_type" ec)))
+        (false (find #\Escape (gethash "message" ec)))
+        (when (and (vectorp (gethash "restarts" ec))
+                   (plusp (length (gethash "restarts" ec))))
+          (let ((r0 (aref (gethash "restarts" ec) 0)))
+            (false (find #\Escape (gethash "name" r0 "")))
+            (false (find #\Escape (gethash "description" r0 "")))))))))
 
 ;;; Criterion 3 — Fail-closed + reconnect on demand (ATTACH-06, D-16)
 ;;;
@@ -133,31 +150,36 @@ All returned values are presented (not just the last)."
                                 :slynk-attach (format nil "127.0.0.1:~A" port-a)))
          (*current-session-id* "crit-3-fail")
          (tool   (get-tool-instance session "repl-eval")))
-    ;; 1. First call — listener A is live; dispatch should connect + succeed.
-    (sleep 0.1)
-    (let ((r1 (%dispatch-attach tool (make-ht "code" "(+ 2 2)"))))
-      (false (gethash "isError" r1))
-      ;; 2. Kill listener A; nil out connection to simulate network drop.
-      (let ((conn-a (repl-eval-tool-slynk-conn tool)))
-        (ignore-errors (slime-close conn-a))
-        (ignore-errors (slynk:stop-server port-a))
-        (setf (repl-eval-tool-slynk-conn tool) nil)
-        (sleep 0.1)
-        ;; 3. Second call to dead server -> isError; conn stays nil after drop.
-        (let ((r2 (%dispatch-attach tool (make-ht "code" "(+ 1 1)"))))
-          (true (gethash "isError" r2))
-          (true (null (repl-eval-tool-slynk-conn tool)))
-          ;; 4. Start a fresh listener B on a new port; update slynk-attach.
-          (let ((port-b (slynk:create-server :port 0 :dont-close t)))
-            (setf (session-slynk-attach session)
-                  (format nil "127.0.0.1:~A" port-b))
-            (sleep 0.1)
-            ;; 5. Third call -> reconnects to listener B and succeeds.
-            (let ((r3 (%dispatch-attach tool (make-ht "code" "(+ 3 3)"))))
-              (ignore-errors (slynk:stop-server port-b))
-              (false (gethash "isError" r3))
-              ;; D-17: reconnect note appears in stdout of r3.
-              (true (search "reconnected" (gethash "stdout" r3))))))))))
+    (unwind-protect
+         (progn
+           ;; 1. First call — listener A is live; dispatch should connect + succeed.
+           (sleep 0.1)
+           (let ((r1 (%dispatch-attach tool (make-ht "code" "(+ 2 2)"))))
+             (false (gethash "isError" r1))
+             ;; 2. Kill listener A; nil out connection to simulate network drop.
+             (let ((conn-a (repl-eval-tool-slynk-conn tool)))
+               (ignore-errors (slime-close conn-a))
+               (ignore-errors (slynk:stop-server port-a))
+               (setf (repl-eval-tool-slynk-conn tool) nil)
+               (sleep 0.1)
+               ;; 3. Second call to dead server -> isError; conn stays nil after drop.
+               (let ((r2 (%dispatch-attach tool (make-ht "code" "(+ 1 1)"))))
+                 (true (gethash "isError" r2))
+                 (true (null (repl-eval-tool-slynk-conn tool)))
+                 ;; 4. Start a fresh listener B on a new port; update slynk-attach.
+                 (let ((port-b (slynk:create-server :port 0 :dont-close t)))
+                   (unwind-protect
+                        (progn
+                          (setf (session-slynk-attach session)
+                                (format nil "127.0.0.1:~A" port-b))
+                          (sleep 0.1)
+                          ;; 5. Third call -> reconnects to listener B and succeeds.
+                          (let ((r3 (%dispatch-attach tool (make-ht "code" "(+ 3 3)"))))
+                            (false (gethash "isError" r3))
+                            ;; D-17: reconnect note appears in stdout of r3.
+                            (true (search "reconnected" (gethash "stdout" r3)))))
+                     (ignore-errors (slynk:stop-server port-b))))))))
+      (ignore-errors (slynk:stop-server port-a)))))
 
 ;;; Criterion 4 — Stream isolation (ATTACH-04, D-07/D-08)
 ;;;
