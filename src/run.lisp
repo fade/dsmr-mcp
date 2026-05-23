@@ -132,7 +132,11 @@ KEYWORD-VALUE  -- value the caller passed explicitly (only consulted when SUPPLI
 ENV-NAME       -- DSMR_* environment variable name (e.g. \"DSMR_TRANSPORT\").
 CONF-PLIST     -- plist from %READ-CONF-INTO-DEFAULTS, or NIL when conf absent.
 DEFAULT        -- built-in fallback value.
-PARSE          -- function applied to string/keyword values before return."
+PARSE          -- function applied to string/keyword values before return.
+
+The conf check uses a sentinel so any Lisp-false value stored in the conf
+(e.g. :slynk-attach nil, :port 0) is correctly honoured over DEFAULT rather
+than being discarded as though the key were absent (D-15/D-16)."
   (cond
     ;; Explicit keyword argument wins unconditionally (D-15).
     (supplied-p
@@ -144,16 +148,17 @@ PARSE          -- function applied to string/keyword values before return."
          ((and env-val (not (string= env-val "")))
           (funcall parse env-val))
          ;; Conf value beats built-in default.
+         ;; Use a unique sentinel so a legitimately-falsy conf value
+         ;; (nil, 0, "") is honoured over DEFAULT rather than treated
+         ;; as absent.  This is the D-15/D-16 fix for WR-01.
          (t
-          ;; Derive the conf plist key from env-name:
-          ;;   "DSMR_TRANSPORT" -> :transport
-          ;;   "DSMR_LOG_LEVEL" -> :log-level
           (let* ((bare  (subseq env-name 5))
                  (pkey  (intern (string-upcase (substitute #\- #\_ bare)) :keyword))
-                 (conf-val (and conf-plist (getf conf-plist pkey))))
-            (if conf-val
-                (funcall parse conf-val)
-                default))))))))
+                 (missing '#:missing)
+                 (conf-val (if conf-plist (getf conf-plist pkey missing) missing)))
+            (if (eq conf-val missing)
+                default
+                (funcall parse conf-val)))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; resolve-transport -- non-blocking seam (D-15, D-17)

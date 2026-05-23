@@ -57,3 +57,33 @@ when no keyword is passed.  Uses resolve-transport (non-blocking seam)."
       (if old-val
           (setf (uiop:getenv "DSMR_TRANSPORT") old-val)
           (setf (uiop:getenv "DSMR_TRANSPORT") "")))))
+
+(define-test falsy-conf-value-beats-built-in-default
+  "WR-01: a legitimately-falsy value stored in the conf plist (nil, 0) must
+be honoured over the built-in default.  Tests the sentinel-based fix to
+%or-from-env that distinguishes 'key present with falsy value' from 'key absent'.
+Exercises the :slynk-attach nil and :port 0 cases that were previously
+silently replaced by the built-in default."
+  ;; :slynk-attach nil in conf => result should be nil, NOT the default "host:7777"
+  (let ((result (dsmr-mcp/src/run::%or-from-env
+                 nil            ; not supplied by caller
+                 nil            ; keyword-value irrelevant
+                 "DSMR_SLYNK_ATTACH"
+                 '(:slynk-attach nil)  ; conf explicitly stores nil
+                 "host:7777"           ; built-in default
+                 :parse #'identity)))
+    (is eq nil result))
+  ;; :port 0 in conf => result should be 0, NOT the default 8080
+  (let ((result (dsmr-mcp/src/run::%or-from-env
+                 nil nil "DSMR_PORT"
+                 '(:port 0)   ; conf explicitly stores 0
+                 8080
+                 :parse #'identity)))
+    (is = 0 result))
+  ;; Absent key => result should be the default (not nil)
+  (let ((result (dsmr-mcp/src/run::%or-from-env
+                 nil nil "DSMR_SLYNK_ATTACH"
+                 '(:transport :stdio)  ; slynk-attach key absent
+                 "host:7777"
+                 :parse #'identity)))
+    (is equal "host:7777" result)))
