@@ -43,6 +43,7 @@
   (:import-from #:dsmr-mcp/src/attach/wrap-form
                 #:build-wrapping-form
                 #:truncate-output
+                #:sanitize-control-chars
                 #:*default-max-output-length*)
   (:import-from #:slynk-client
                 #:slime-eval
@@ -123,25 +124,38 @@ are fully isolated from each other (D-14, T-02-DISP-03)."))
 ;;;   condition_type, message, restarts (array of {name,description}),
 ;;;   frames (array of {index,function,source_file,source_line,locals}).
 
-(defun %build-error-context-ht (error-context)
+(defun %build-error-context-ht (error-context effective-limit)
   "Convert the wrap-form error-context plist to a JSON-encodable hash-table.
-Returns an equal-keyed hash-table suitable for jzon encoding."
+Returns an equal-keyed hash-table suitable for jzon encoding.
+
+All string fields originating in the remote image are routed through
+sanitize-control-chars (D-12).  The :message field is additionally bounded
+by EFFECTIVE-LIMIT via truncate-output so it is consistent with the cap
+applied to printed/stdout/stderr (IN-03, D-11).  Per-value local truncation
+(~200 chars) applied in the wrap-form remains in effect — this sanitisation
+is in addition to, not instead of, those existing bounds."
   (let* ((ht (make-hash-table :test 'equal))
          (ctype   (getf error-context :condition-type))
          (message (getf error-context :message))
          (restarts (getf error-context :restarts))
          (frames   (getf error-context :frames)))
-    (setf (gethash "condition_type" ht) (or ctype ""))
-    (setf (gethash "message"        ht) (or message ""))
+    ;; condition_type: low risk but still sanitise for consistency (CR-01).
+    (setf (gethash "condition_type" ht)
+          (sanitize-control-chars (or ctype "")))
+    ;; message: sanitise + bound by effective-limit (CR-01, IN-03).
+    (setf (gethash "message" ht)
+          (truncate-output (sanitize-control-chars (or message "")) effective-limit))
     ;; Restarts: list of (:name S :description S) plists -> array of hash-tables.
+    ;; Each string sanitised (CR-01).
     (setf (gethash "restarts" ht)
           (coerce
            (mapcar (lambda (r)
-                     (make-ht "name"        (or (getf r :name) "")
-                              "description" (or (getf r :description) "")))
+                     (make-ht "name"        (sanitize-control-chars (or (getf r :name) ""))
+                              "description" (sanitize-control-chars (or (getf r :description) ""))))
                    (or restarts '()))
            'simple-vector))
     ;; Frames: list of (:index N :function S :locals L) plists -> array of hash-tables.
+    ;; function name and each local value sanitised (CR-01).
     (setf (gethash "frames" ht)
           (coerce
            (mapcar (lambda (f)
@@ -149,12 +163,12 @@ Returns an equal-keyed hash-table suitable for jzon encoding."
                             (locals-vec
                               (coerce
                                (mapcar (lambda (lv)
-                                         (make-ht "name"  (or (getf lv :name) "")
-                                                  "value" (or (getf lv :value) "")))
+                                         (make-ht "name"  (sanitize-control-chars (or (getf lv :name) ""))
+                                                  "value" (sanitize-control-chars (or (getf lv :value) ""))))
                                        (or locals '()))
                                'simple-vector)))
                        (make-ht "index"       (or (getf f :index) 0)
-                                "function"    (or (getf f :function) "")
+                                "function"    (sanitize-control-chars (or (getf f :function) ""))
                                 "source_file" (or (getf f :source-file) "")
                                 "source_line" (or (getf f :source-line) 0)
                                 "locals"      locals-vec)))
@@ -167,9 +181,12 @@ Returns an equal-keyed hash-table suitable for jzon encoding."
 ;;; Adapted from cl-mcp/src/tools/response-builders.lisp §77-169 (MIT) under
 ;;; AGPL. Phase 2 omits result_object_id / result_preview (ATTACH-09, Phase 5).
 
-(defun build-eval-response (printed stdout stderr error-context)
+(defun build-eval-response (printed stdout stderr error-context effective-limit)
   "Build the repl-eval response hash-table from the dispatcher-side processed
-fields (truncation and sanitisation already applied).
+fields (truncation and sanitisation already applied to printed/stdout/stderr).
+
+EFFECTIVE-LIMIT is threaded through to %build-error-context-ht so the
+error_context message field is bounded consistently (IN-03, D-11).
 
 Returns a hash-table with:
   \"content\"       : text-content array with enriched text (value + context)
@@ -185,7 +202,7 @@ deferred to Phase 5)."
     (setf (gethash "stderr" ht) (or stderr ""))
     (when error-context
       (setf (gethash "error_context" ht)
-            (%build-error-context-ht error-context)))
+            (%build-error-context-ht error-context effective-limit)))
     ;; Build enriched text for content[].text (cl-mcp §117-161 pattern;
     ;; Phase 2 simplified — no object-id section).
     (let ((enriched
@@ -247,74 +264,77 @@ reconnect note to the stdout field."
                  (text-content
                   "attach: 'code' parameter is required and must be a non-empty string."))))
     ;; Resolve host/port from the session slynk-attach config string.
-    (let* ((attach-config (session-slynk-attach (tool-session tool))))
-      (multiple-value-bind (host port)
-          (parse-slynk-attach attach-config)
-        ;; Fail-fast guard: config was present at dispatch gate but could not be parsed.
-        (unless (and host port)
-          (return-from %dispatch-attach
-            (make-ht "isError" t
-                     "content"
-                     (text-content
-                      "attach: :slynk-attach config is missing or malformed.")))))
-      (multiple-value-bind (host port)
-          (parse-slynk-attach attach-config)
-        (handler-case
-            (let* (;; Track whether we are opening a new connection (reconnect path).
-                   ;; Check BEFORE calling get-or-open-connection so the flag captures
-                   ;; whether the slot was nil at entry, not after the open.
-                   (was-nil (null (repl-eval-tool-slynk-conn tool)))
-                   (conn    (progn
-                              (when was-nil (setf reconnectedp t))
-                              (get-or-open-connection tool host port)))
-                   (lock    (repl-eval-tool-call-lock tool))
-                   (form    (build-wrapping-form code package-name))
-                   ;; ATTACH-03 / D-15: serialise the slime-eval call.
-                   (raw-result (with-lock-held (lock)
-                                 (slime-eval form conn))))
-              ;; Destructure the 5-element result tuple from the remote image.
-              ;; Shape: (printed raw stdout stderr error-context)
-              ;; Pad with nils when the remote returns a shorter list (defensive).
-              (let* ((result-list
-                       (if (listp raw-result)
-                           (let ((r raw-result))
-                             (append r (loop repeat (max 0 (- 5 (length r)))
-                                            collect nil)))
-                           (list (princ-to-string raw-result)
-                                 raw-result "" "" nil)))
-                     (printed       (first  result-list))
-                     ;; raw (second) ignored: raw == printed per D-05/b2c9812f.
-                     (stdout        (or (third  result-list) ""))
-                     (stderr        (or (fourth result-list) ""))
-                     (error-context (fifth  result-list))
-                     (effective-limit (or (and (integerp max-output-length)
-                                               (plusp max-output-length)
-                                               max-output-length)
-                                          *default-max-output-length*)))
-                ;; D-17: reconnect note prepended to stdout when connection was reopened.
+    ;; Parse once; reuse host/port for both the guard check and the live path (WR-02).
+    (multiple-value-bind (host port)
+        (parse-slynk-attach (session-slynk-attach (tool-session tool)))
+      ;; Fail-fast guard: config was present at dispatch gate but could not be parsed.
+      (unless (and host port)
+        (return-from %dispatch-attach
+          (make-ht "isError" t
+                   "content"
+                   (text-content
+                    "attach: :slynk-attach config is missing or malformed."))))
+      (handler-case
+          (let* (;; WR-01: acquire lock BEFORE get-or-open-connection so concurrent
+                 ;; first-callers cannot both see conn=nil and both open a connection,
+                 ;; leaking one socket on the Slynk listener side.
+                 (lock (repl-eval-tool-call-lock tool))
+                 (raw-result
+                   (with-lock-held (lock)
+                     ;; Track whether we are opening a new connection (reconnect path).
+                     ;; Check BEFORE get-or-open-connection; the flag captures whether
+                     ;; the slot was nil at entry, not after the open.
+                     (when (null (repl-eval-tool-slynk-conn tool))
+                       (setf reconnectedp t))
+                     (let* ((conn (get-or-open-connection tool host port))
+                            (form (build-wrapping-form code package-name)))
+                       ;; ATTACH-03 / D-15: slime-eval call is inside the lock.
+                       (slime-eval form conn)))))
+            ;; Destructure the 5-element result tuple from the remote image.
+            ;; Shape: (printed raw stdout stderr error-context)
+            ;; Pad with nils when the remote returns a shorter list (defensive).
+            (let* ((result-list
+                     (if (listp raw-result)
+                         (let ((r raw-result))
+                           (append r (loop repeat (max 0 (- 5 (length r)))
+                                          collect nil)))
+                         (list (princ-to-string raw-result)
+                               raw-result "" "" nil)))
+                   (printed       (first  result-list))
+                   ;; raw (second) ignored: raw == printed per D-05/b2c9812f.
+                   (stdout        (or (third  result-list) ""))
+                   (stderr        (or (fourth result-list) ""))
+                   (error-context (fifth  result-list))
+                   (effective-limit (or (and (integerp max-output-length)
+                                             (plusp max-output-length)
+                                             max-output-length)
+                                        *default-max-output-length*)))
+              ;; Apply truncation+sanitise (D-11/D-12) to the main output fields.
+              ;; D-17: reconnect note prepended to stdout AFTER truncation so the note
+              ;; is never silently dropped when effective-limit is very small (WR-03).
+              (let ((trunc-stdout (truncate-output stdout effective-limit)))
                 (when reconnectedp
-                  (setf stdout
+                  (setf trunc-stdout
                         (concatenate 'string
                                      "[reconnected to Slynk listener -- in-image state may have reset]"
                                      (string #\Newline)
-                                     stdout)))
-                ;; Apply truncation+sanitise (D-11/D-12) in the dispatcher,
-                ;; not in the remote image (RESEARCH.md §3 "truncation and sanitisation").
+                                     trunc-stdout)))
                 (build-eval-response
                  (truncate-output (or printed "") effective-limit)
-                 (truncate-output stdout          effective-limit)
+                 trunc-stdout
                  (truncate-output stderr          effective-limit)
-                 error-context)))
-          (slime-network-error (e)
-            ;; D-16 fail-closed: nil the cached connection so next call reopens.
-            (drop-connection tool :reason "network-error")
-            (log-event :warn "attach.network-error"
-                       "error" (handler-case (princ-to-string e)
-                                 (error () "")))
-            (make-ht "isError" t
-                     "content"
-                     (text-content
-                      (format nil "attach: Slynk connection error: ~A" e)))))))))
+                 error-context
+                 effective-limit))))
+        (slime-network-error (e)
+          ;; D-16 fail-closed: nil the cached connection so next call reopens.
+          (drop-connection tool :reason "network-error")
+          (log-event :warn "attach.network-error"
+                     "error" (handler-case (princ-to-string e)
+                               (error () "")))
+          (make-ht "isError" t
+                   "content"
+                   (text-content
+                    (format nil "attach: Slynk connection error: ~A" e))))))))
 
 ;;; Attach-dispatch gate macro ------------------------------------------------
 ;;;
