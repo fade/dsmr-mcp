@@ -34,7 +34,9 @@ file-based ICP as a fallback for crash isolation and parallel workers."
   :description "Test suite for dsmr-mcp."
   :depends-on ("parachute"
                "dsmr-mcp"
-               "dsmr-mcp/tests/smoke-test")
+               "dsmr-mcp/tests/smoke-test"
+               "dsmr-mcp/tests/support/json-asserts"
+               "dsmr-mcp/tests/state/session-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
