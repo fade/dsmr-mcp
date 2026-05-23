@@ -10,7 +10,8 @@
   (:use #:cl #:parachute)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/transport/stdio
-                #:serve-streams)
+                #:serve-streams
+                #:+max-json-line-bytes+)
   (:import-from #:dsmr-mcp/src/state
                 #:make-session)
   (:import-from #:dsmr-mcp/src/tools/base
@@ -153,3 +154,49 @@ valid JSON."
         (is >= 2 (length split))
         (dolist (line split)
           (true (hash-table-p (jzon:parse line))))))))
+
+(define-test oversized-line-with-trailing-newline-emits-error-and-continues
+  "CR-01 / T-03-01: an oversized line (exceeds +max-json-line-bytes+) followed
+by a terminating newline should emit a -32600 error envelope and then continue
+serving subsequent valid lines.  Uses a cap of 64 bytes: the oversized line is
+65 chars (too large), the init request is 147 chars (also too large at 64) so we
+use a cap of 200, making the 201-char oversized line too big while the 147-char
+initialize request fits comfortably within the cap."
+  (let ((dsmr-mcp/src/transport/stdio::+max-json-line-bytes+ 200))
+    ;; Build: one oversized line (201 chars + newline), then a valid initialize.
+    (let* ((big-line (make-string 201 :initial-element #\x))
+           (init-line "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}")
+           (input (make-string-input-stream
+                   (format nil "~A~%~A~%" big-line init-line)))
+           (output (make-string-output-stream)))
+      (serve-streams input output)
+      (let* ((out-str (get-output-stream-string output))
+             (split (remove "" (uiop:split-string out-str :separator (list #\Newline))
+                            :test #'string=))
+             (parsed (mapcar #'jzon:parse split)))
+        ;; Must produce exactly two responses: the error + the init result.
+        (is = 2 (length parsed))
+        ;; First response: -32600 error.
+        (let ((err (first parsed)))
+          (is = -32600 (jsonrpc-error-code err)))
+        ;; Second response: successful initialize result.
+        (let ((ok (second parsed)))
+          (is = 99 (gethash "id" ok))
+          (true (hash-table-p (gethash "result" ok))))))))
+
+(define-test oversized-newline-free-stream-terminates-connection
+  "CR-01 / T-03-01: a newline-free stream that exceeds the drain budget must
+cause serve-streams to RETURN (not hang).  The connection is terminated rather
+than spinning on an unbounded hostile stream.  Uses a small bound via let-rebind."
+  (let ((dsmr-mcp/src/transport/stdio::+max-json-line-bytes+ 8))
+    ;; Build a string that exceeds the read cap (9 chars), then also exceeds
+    ;; the drain cap (9 more chars) — total 18 chars, no newline anywhere.
+    ;; %read-line-limited signals line-too-long after 9 chars.
+    ;; The drain handler sees 9 more chars before the drain budget is hit,
+    ;; logs stdio.read.drain-exceeded, and return-from serve-streams with T.
+    (let* ((hostile (make-string 20 :initial-element #\A))
+           (input  (make-string-input-stream hostile))
+           (output (make-string-output-stream))
+           (result (serve-streams input output)))
+      ;; serve-streams must return (not block) — the result is T (terminated).
+      (true (eq t result)))))

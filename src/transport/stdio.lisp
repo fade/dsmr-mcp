@@ -135,6 +135,9 @@ Behaviour:
   - An oversized input line (> +MAX-JSON-LINE-BYTES+ chars) causes a literal
     -32600 \"Request too large\" envelope to be written; the loop then
     continues reading subsequent lines rather than aborting (T-03-01).
+    The drain that follows a too-long read is itself bounded to
+    +MAX-JSON-LINE-BYTES+: a newline-free hostile stream terminates the
+    connection rather than pinning the loop (T-03-01 complete mitigation).
   - A STREAM-ERROR on the write path (broken pipe, closed client) ends the
     loop cleanly without signaling further up.
   - STDIO.START fires on loop entry; STDIO.STOP fires in the unwind-protect
@@ -153,10 +156,18 @@ Divergences from cl-mcp src/run.lisp:
                          (line-too-long (e)
                            (log-event :warn "stdio.read.line-too-long"
                                       "error" (princ-to-string e))
-                           ;; Drain remaining bytes up to the newline so the
-                           ;; next iteration starts at a fresh line boundary.
-                           (loop for ch = (read-char in nil nil)
-                                 while (and ch (not (char= ch #\Newline))))
+                           ;; Drain remaining bytes up to the newline, but cap
+                           ;; the drain at +max-json-line-bytes+ too.  A hostile
+                           ;; peer that never sends a newline must not pin us
+                           ;; here indefinitely — terminate the connection if the
+                           ;; drain budget is exceeded (T-03-01 full mitigation).
+                           (loop with drained = 0
+                                 for ch = (read-char in nil nil)
+                                 while ch
+                                 until (char= ch #\Newline)
+                                 do (when (> (incf drained) +max-json-line-bytes+)
+                                      (log-event :warn "stdio.read.drain-exceeded")
+                                      (return-from serve-streams t)))
                            :too-long))))
              (cond
                ;; EOF — client closed the pipe; return t to the caller.
