@@ -10,7 +10,8 @@
   (:import-from #:dsmr-mcp/src/run
                 #:run
                 #:resolve-transport
-                #:transport-not-implemented-error))
+                #:transport-not-implemented-error
+                #:invalid-config-value))
 
 (in-package #:dsmr-mcp/tests/run-test)
 
@@ -87,3 +88,25 @@ silently replaced by the built-in default."
                  "host:7777"
                  :parse #'identity)))
     (is equal "host:7777" result)))
+
+(define-test bad-dsmr-transport-env-signals-typed-error
+  "WR-02: DSMR_TRANSPORT=banana must signal INVALID-CONFIG-VALUE (a typed
+error subclass) rather than a raw case-failure.  Exercises the typed error
+path without calling run (which would block on stdio)."
+  (fail (dsmr-mcp/src/run::%parse-transport "banana") invalid-config-value))
+
+(define-test bad-dsmr-port-env-signals-typed-error
+  "WR-02: a non-integer DSMR_PORT value must signal INVALID-CONFIG-VALUE
+rather than crashing with an unhandled parse-integer error.  Uses run with
+an explicit :transport :tcp to avoid entering the stdio loop; the port
+parse fires eagerly inside the let* before the transport dispatch."
+  (let ((old-val (uiop:getenv "DSMR_PORT")))
+    (unwind-protect
+         (progn
+           (setf (uiop:getenv "DSMR_PORT") "abc")
+           ;; run with :tcp avoids the stdio loop; port is resolved eagerly
+           ;; in the let* so the invalid-config-value fires first.
+           (fail (run :transport :tcp) invalid-config-value))
+      (if old-val
+          (setf (uiop:getenv "DSMR_PORT") old-val)
+          (setf (uiop:getenv "DSMR_PORT") "")))))

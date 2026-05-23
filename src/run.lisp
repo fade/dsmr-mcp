@@ -42,6 +42,9 @@
   (:export #:run
            #:resolve-transport
            #:transport-not-implemented-error
+           #:invalid-config-value
+           #:invalid-config-value-name
+           #:invalid-config-value-raw
            #:process-json-line))
 
 (in-package #:dsmr-mcp/src/run)
@@ -61,41 +64,66 @@ so tests can assert the correct condition class rather than a generic error.
 When Phase 9 delivers the TCP/HTTP transports, the arms that signal this
 condition are replaced with the real implementations."))
 
+(define-condition invalid-config-value (error)
+  ((name :initarg :name :reader invalid-config-value-name
+         :documentation "Name of the config key or env var (e.g. \"DSMR_TRANSPORT\").")
+   (raw  :initarg :raw  :reader invalid-config-value-raw
+         :documentation "The raw value that was rejected."))
+  (:report (lambda (c s)
+             (format s "Invalid value ~S for ~A"
+                     (invalid-config-value-raw c)
+                     (invalid-config-value-name c))))
+  (:documentation "Signaled when a DSMR_* environment variable or conf entry carries
+a value that cannot be coerced to the expected type.  Typed so callers can catch
+config errors distinctly from other run failures."))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Parse helpers
 ;;; ---------------------------------------------------------------------------
 
 (defun %parse-transport (value)
   "Coerce VALUE (string or keyword) to one of :STDIO, :TCP, or :HTTP.
-Signals an error for any other value."
+Signals INVALID-CONFIG-VALUE for any other value so env-var mistakes
+produce a human-readable typed error rather than a raw case-failure."
   (let ((kw (etypecase value
                (keyword value)
                (string  (intern (string-upcase value) :keyword)))))
-    (ecase kw
+    (case kw
       (:stdio :stdio)
       (:tcp   :tcp)
-      (:http  :http))))
+      (:http  :http)
+      (t (error 'invalid-config-value
+                :name "DSMR_TRANSPORT"
+                :raw  value)))))
 
 (defun %parse-mode (value)
-  "Coerce VALUE (string or keyword) to one of :ATTACHED, :HERMETIC, or :AUTO."
+  "Coerce VALUE (string or keyword) to one of :ATTACHED, :HERMETIC, or :AUTO.
+Signals INVALID-CONFIG-VALUE for any other value."
   (let ((kw (etypecase value
                (keyword value)
                (string  (intern (string-upcase value) :keyword)))))
-    (ecase kw
+    (case kw
       (:attached :attached)
       (:hermetic :hermetic)
-      (:auto     :auto))))
+      (:auto     :auto)
+      (t (error 'invalid-config-value
+                :name "DSMR_MODE"
+                :raw  value)))))
 
 (defun %parse-log-level (value)
-  "Coerce VALUE (string or keyword) to one of :DEBUG, :INFO, :WARN, or :ERROR."
+  "Coerce VALUE (string or keyword) to one of :DEBUG, :INFO, :WARN, or :ERROR.
+Signals INVALID-CONFIG-VALUE for any other value."
   (let ((kw (etypecase value
                (keyword value)
                (string  (intern (string-upcase value) :keyword)))))
-    (ecase kw
+    (case kw
       (:debug :debug)
       (:info  :info)
       (:warn  :warn)
-      (:error :error))))
+      (:error :error)
+      (t (error 'invalid-config-value
+                :name "DSMR_LOG_LEVEL"
+                :raw  value)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Conf reader (D-16)
@@ -164,6 +192,19 @@ than being discarded as though the key were absent (D-15/D-16)."
 ;;; resolve-transport -- non-blocking seam (D-15, D-17)
 ;;; ---------------------------------------------------------------------------
 
+(defun %resolve-project-root (supplied-p value)
+  "Resolve the effective project root pathname from the supplied-p flag and VALUE.
+
+Precedence: explicit VALUE (when SUPPLIED-P) > DSMR_PROJECT_ROOT env var > getcwd.
+When SUPPLIED-P is true and VALUE is nil, falls back to getcwd so callers can
+pass :project-root nil to mean \"use the cwd explicitly\"."
+  (if supplied-p
+      (if value (pathname value) (uiop:getcwd))
+      (let ((env (uiop:getenv "DSMR_PROJECT_ROOT")))
+        (if (and env (not (string= env "")))
+            (pathname env)
+            (uiop:getcwd)))))
+
 (defun resolve-transport (&key (transport nil transport-supplied-p)
                                  (project-root nil project-root-supplied-p))
   "Resolve the effective transport keyword WITHOUT entering the blocking loop.
@@ -171,14 +212,11 @@ than being discarded as though the key were absent (D-15/D-16)."
 Applies precedence: keyword > DSMR_TRANSPORT env > .dsmr-mcp.conf > :stdio.
 
 This is the non-blocking seam tests assert the precedence rules against.
-RUN itself calls RESOLVE-TRANSPORT so the public and tested surfaces stay
-identical.  Tests can call this directly without triggering the stdio loop."
-  (let* ((root (if project-root-supplied-p
-                   (if project-root (pathname project-root) (uiop:getcwd))
-                   (let ((env (uiop:getenv "DSMR_PROJECT_ROOT")))
-                     (if (and env (not (string= env "")))
-                         (pathname env)
-                         (uiop:getcwd)))))
+RUN calls %RESOLVE-PROJECT-ROOT and %OR-FROM-ENV through the same helpers
+this function uses, so the tested seam and the live path share identical
+logic.  Tests can call RESOLVE-TRANSPORT directly without triggering the
+stdio loop."
+  (let* ((root (%resolve-project-root project-root-supplied-p project-root))
          (conf (%read-conf-into-defaults root)))
     (%or-from-env transport-supplied-p transport "DSMR_TRANSPORT" conf :stdio
                   :parse #'%parse-transport)))
@@ -213,18 +251,15 @@ Blocking behaviour (D-17):
   :tcp    -- PHASE 9 (currently signals TRANSPORT-NOT-IMPLEMENTED-ERROR).
   :http   -- PHASE 9 (currently signals TRANSPORT-NOT-IMPLEMENTED-ERROR).
 
+Malformed DSMR_* env values signal INVALID-CONFIG-VALUE (a typed subclass
+of ERROR) so operator mistakes produce a clean diagnostic.  This includes
+DSMR_TRANSPORT, DSMR_MODE, DSMR_LOG_LEVEL, and DSMR_PORT.
+
 The dsmr-mcp:run nickname (re-exported by src/main.lisp, owned by Plan 01-01)
 resolves to this function."
   ;; Resolve project root first (needed by conf reader).
   (let* ((resolved-root
-           (cond
-             (project-root-supplied-p
-              (if project-root (pathname project-root) (uiop:getcwd)))
-             (t
-              (let ((env (uiop:getenv "DSMR_PROJECT_ROOT")))
-                (if (and env (not (string= env "")))
-                    (pathname env)
-                    (uiop:getcwd))))))
+           (%resolve-project-root project-root-supplied-p project-root))
          (conf (%read-conf-into-defaults resolved-root))
 
          ;; Resolve each setting with keyword > env > conf > default precedence.
@@ -249,7 +284,16 @@ resolves to this function."
                          :parse (lambda (v)
                                   (etypecase v
                                     (integer v)
-                                    (string  (parse-integer v))))))
+                                    ;; Guard against DSMR_PORT=abc at startup.
+                                    ;; A malformed value signals INVALID-CONFIG-VALUE
+                                    ;; rather than an unhandled parse-integer error.
+                                    (string
+                                     (handler-case
+                                         (parse-integer v :junk-allowed nil)
+                                       (error ()
+                                         (error 'invalid-config-value
+                                                :name "DSMR_PORT"
+                                                :raw  v))))))))
 
          (resolved-slynk-attach
            (%or-from-env slynk-attach-supplied-p slynk-attach
