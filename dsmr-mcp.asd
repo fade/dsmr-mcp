@@ -26,7 +26,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "eclector"
                "hunchentoot"
                "slynk-client"
-               "dsmr-mcp/src/main")
+               "dsmr-mcp/src/main"
+               "dsmr-mcp/src/protocol")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"
@@ -36,7 +37,14 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp"
                "dsmr-mcp/tests/smoke-test"
                "dsmr-mcp/tests/support/json-asserts"
-               "dsmr-mcp/tests/state/session-test")
+               "dsmr-mcp/tests/state/session-test"
+               "dsmr-mcp/tests/protocol/handshake-test"
+               "dsmr-mcp/tests/protocol/version-negotiation-test"
+               "dsmr-mcp/tests/protocol/strict-initialize-test"
+               "dsmr-mcp/tests/protocol/tools-list-test"
+               "dsmr-mcp/tests/protocol/tools-call-test"
+               "dsmr-mcp/tests/protocol/prompts-test"
+               "dsmr-mcp/tests/protocol/argument-validation-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
