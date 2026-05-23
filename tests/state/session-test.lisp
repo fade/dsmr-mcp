@@ -156,6 +156,26 @@ signal arg-validation-error — the key is present."
     ;; intentionally skipped per addendum §6).
     (finish (validate-args schema args))))
 
+(define-test validate-args-hyphenated-property-normalizes-both-passes
+  "Both the required-presence pass and the type-check pass normalize a
+hyphenated schema property name with %kebab->snake (matching the wire
+key schema->json emits). A type mismatch on the snake_case wire key must
+be caught — before both passes shared this normalization the type pass
+looked up the hyphenated name, missed, and silently skipped the check."
+  (let ((schema '(:object :properties ((my-field :type :string))
+                  :required ("my-field"))))
+    ;; Correct type at the snake_case wire key passes.
+    (let ((ok (make-hash-table :test 'equal)))
+      (setf (gethash "my_field" ok) "hello")
+      (finish (validate-args schema ok)))
+    ;; Wrong type at the snake_case wire key is caught by the type pass.
+    (let ((bad (make-hash-table :test 'equal)))
+      (setf (gethash "my_field" bad) 42)
+      (fail (validate-args schema bad) 'arg-validation-error))
+    ;; Absent required field is caught by the presence pass.
+    (let ((empty (make-hash-table :test 'equal)))
+      (fail (validate-args schema empty) 'arg-validation-error))))
+
 (define-test envelope-shapes
   "result builds a jsonrpc/id/result envelope; rpc-error builds an error
 envelope with the correct integer code accessible via jsonrpc-error-code."

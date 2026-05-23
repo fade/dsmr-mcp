@@ -219,7 +219,7 @@ Returns T on success. Signals arg-validation-error on failure."
     (dolist (prop properties)
       (destructuring-bind (name &key type &allow-other-keys) prop
         (when type
-          (let ((key (string-downcase (string name))))
+          (let ((key (%kebab->snake (string-downcase (string name)))))
             (multiple-value-bind (val presentp)
                 (gethash key (or args (make-hash-table :test 'equal)))
               (when presentp
