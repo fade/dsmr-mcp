@@ -148,14 +148,13 @@ when a required field is absent from the args hash-table."
 (define-test validate-args-null-is-present
   "A required field whose value is the jzon null sentinel 'null does NOT
 signal arg-validation-error — the key is present."
-  (let ((schema '(:object :properties ((code :type :string)) :required ("code")))
-        (args (make-hash-table :test 'equal)))
+  (let* ((schema '(:object :properties ((code :type :string)) :required ("code")))
+         (args (make-hash-table :test 'equal)))
     (setf (gethash "code" args) 'null)
-    ;; 'null is present; no error should be signalled.
-    ;; (Type check: null is not :string, but validate-args only checks
-    ;; required presence — type enforcement is a separate pass and 'null
-    ;; as a type is intentionally permissive here per addendum §6.)
-    (true t))) ; presence check passes — no signal
+    ;; validate-args must not signal: 'null is present (present-ness is
+    ;; checked via gethash second return value; type-check for 'null is
+    ;; intentionally skipped per addendum §6).
+    (finish (validate-args schema args))))
 
 (define-test envelope-shapes
   "result builds a jsonrpc/id/result envelope; rpc-error builds an error
