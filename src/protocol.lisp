@@ -232,9 +232,9 @@ This ordering matches what cl-mcp does NOT do — dsmr-mcp is strict here."
 for notifications. Pure of I/O: reads LINE, writes nothing.
 
 CONTRACT (for Plan 03 and beyond):
-  line    — a single MCP stdio line (string); may have trailing whitespace
-  session — the dsmr-mcp/src/state:session for the current connection
-  returns — a JSON string (the response line) for requests, or NIL for
+  line    -- a single MCP stdio line (string); may have trailing whitespace
+  session -- the dsmr-mcp/src/state:session for the current connection
+  returns -- a JSON string (the response line) for requests, or NIL for
             notifications; also NIL for empty lines after trim.
 
 Error handling:
@@ -245,7 +245,12 @@ Error handling:
 Parser bounds (threat T-02-02 mitigation):
   jzon:parse is called with :max-depth +max-json-depth+ and
   :max-string-length +max-json-string-length+. Payloads exceeding these
-  limits raise json-parse-limit-error before allocating unboundedly."
+  limits raise json-parse-limit-error before allocating unboundedly.
+
+Note on JSON null encoding: the MCP spec requires id=null in parse-error
+responses when the request id is unknown. jzon encodes the symbol 'NULL
+(i.e. CL:NULL = NIL) as JSON null; it encodes NIL as JSON false. So
+error-with-unknown-id responses use 'null as the id value."
   (let ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) line)))
     (when (string= trimmed "")
       (return-from process-json-line nil))
@@ -254,7 +259,8 @@ Parser bounds (threat T-02-02 mitigation):
         ;; Returns -32603 Internal error (never leaks condition text on wire).
         (let ((msg
                ;; Inner handler: catches JSON parse failures specifically.
-               ;; Returns -32700 Parse error with id null.
+               ;; Returns -32700 Parse error with id null (using 'null, not nil,
+               ;; because jzon encodes nil as false, not null).
                (handler-case
                    (jzon:parse trimmed
                                :max-depth +max-json-depth+
@@ -263,11 +269,11 @@ Parser bounds (threat T-02-02 mitigation):
                    (log-event :warn "rpc.parse-error"
                               "error" (princ-to-string e))
                    (return-from process-json-line
-                     (%encode-line (rpc-error nil -32700 "Parse error")))))))
+                     (%encode-line (rpc-error 'null -32700 "Parse error")))))))
           ;; Envelope validation: must be a hash-table with jsonrpc = "2.0".
           (unless (hash-table-p msg)
             (return-from process-json-line
-              (%encode-line (rpc-error nil -32600 "Invalid Request"))))
+              (%encode-line (rpc-error 'null -32600 "Invalid Request"))))
           (let ((jsonrpc (gethash "jsonrpc" msg))
                 (id      (gethash "id" msg))
                 (method  (gethash "method" msg))
@@ -288,5 +294,4 @@ Parser bounds (threat T-02-02 mitigation):
                (%encode-line (rpc-error id -32600 "Invalid Request"))))))
       (error (e)
         (log-event :error "rpc.internal" "error" (princ-to-string e))
-        (let ((safe-id nil))
-          (%encode-line (rpc-error safe-id -32603 "Internal error")))))))
+        (%encode-line (rpc-error 'null -32603 "Internal error"))))))

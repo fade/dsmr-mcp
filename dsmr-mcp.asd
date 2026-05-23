@@ -44,7 +44,10 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/protocol/tools-list-test"
                "dsmr-mcp/tests/protocol/tools-call-test"
                "dsmr-mcp/tests/protocol/prompts-test"
-               "dsmr-mcp/tests/protocol/argument-validation-test")
+               "dsmr-mcp/tests/protocol/argument-validation-test"
+               "dsmr-mcp/tests/transport/stdio-test"
+               "dsmr-mcp/tests/transport/stdio-integration-test"
+               "dsmr-mcp/tests/run-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
