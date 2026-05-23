@@ -1,0 +1,32 @@
+# Lisp build artefacts
+*.fasl
+*.fas
+*.lx32fsl
+*.lx64fsl
+*.dx32fsl
+*.dx64fsl
+*.so
+*.dylib
+*.dll
+*.o
+*.a
+.fasls/
+.cache/
+
+# Editor / IDE
+*~
+\#*\#
+.\#*
+.dir-locals.el
+.lspcache/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local-only graph artefacts (we ship summaries, not binaries)
+graphify-out/cache/
+graphify-out/graph.html
+graphify-out/graph.json
