@@ -50,6 +50,9 @@
   (:import-from #:sb-ext)
   (:import-from #:sb-posix)
   (:export #:*worker-pool-warmup* #:*max-pool-size*
+           #:*health-check-interval-seconds*
+           #:*crash-breaker-window* #:*crash-breaker-threshold*
+           #:*circuit-breaker-cooldown* #:*circuit-breaker-map*
            #:initialize-pool #:shutdown-pool
            #:get-or-assign-worker #:release-session
            #:kill-session-worker #:pool-status-info
