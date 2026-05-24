@@ -1,7 +1,7 @@
 ;;;; src/tools/pool-status.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; MCP tool: pool-status (HERM-06, OPS-03).
+;;;; MCP tool: pool-status.
 ;;;; Returns structured pool diagnostic JSON when *mode* is :hermetic;
 ;;;; returns an informative isError when the pool is not running.
 ;;;;
@@ -49,7 +49,7 @@ standby_count, bound_count, max_pool_size, warmup_target, and a workers array.")
   (:metaclass mcp-tool-class)
   (:documentation "MCP tool: return worker pool diagnostic information.
 pool-status returns an informative isError when *mode* is not :hermetic
-(the pool is not running). HERM-06 / OPS-03."))
+(the pool is not running)."))
 
 (defmethod tool-handle ((tool pool-status-tool) id args)
   (declare (ignore args))

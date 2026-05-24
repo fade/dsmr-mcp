@@ -6,10 +6,9 @@
 ;;;; should introduce global state (PROJECT.md decision: "no global state
 ;;;; outside dsmr-mcp/src/state").
 ;;;;
-;;;; D-07: per-session tool instances — each session carries its own
-;;;;       hash-table of tool instances keyed by tool-name string, so
-;;;;       tools can hold per-session state (e.g. a cached Slynk
-;;;;       connection) in ordinary slots.
+;;;; Per-session tool instances — each session carries its own hash-table of
+;;;; tool instances keyed by tool-name string, so tools can hold per-session
+;;;; state (e.g. a cached Slynk connection) in ordinary slots.
 
 (defpackage #:dsmr-mcp/src/state
   (:use #:cl)
@@ -37,13 +36,12 @@
     :reader session-id
     :documentation "Unique identifier for this session. Stdio sessions
 use \"stdio\"; TCP/HTTP sessions use a per-connection UUID assigned at
-accept time (Phase 9).")
+accept time.")
    (initialized-p
     :accessor initialized-p
     :initform nil
     :documentation "T after a successful MCP initialize handshake.
-D-04 strict-initialize: requests arriving before this is T are refused
-with -32002.")
+Strict-initialize: requests arriving before this is T are refused with -32002.")
    (protocol-version
     :accessor protocol-version
     :initform nil
@@ -66,20 +64,20 @@ get-tool-instance the first time a tool is called.")
     :initform nil
     :documentation "Resolved host:port Slynk-attach config string for
 this session, or NIL. Set by run from the resolved config; read by
-%handle-initialize to eager-connect (D-13)."))
+%handle-initialize to eager-connect."))
   (:documentation "Holds all per-connection state for one MCP session.
 One session is constructed per transport connection:
   - stdio: one session for the whole process lifetime
-  - TCP/HTTP (Phase 9): one session per connection
+  - TCP/HTTP (future): one session per connection
   - tests: one fresh session per test case
 The session is threaded through every protocol handler; it is NOT a
 dynamic variable (only *current-session-id* is)."))
 
 (defun make-session (&key (id "stdio") slynk-attach)
   "Create and return a fresh, uninitialised session with the given ID.
-ID defaults to \"stdio\" (the Phase 1 transport's logical name).
+ID defaults to \"stdio\" (the stdio transport's logical name).
 SLYNK-ATTACH is the resolved host:port config string (or NIL) passed
-through from run's resolved-slynk-attach (D-13, ATTACH-07).
+through from run's resolved-slynk-attach.
 The returned session has:
   - initialized-p: NIL
   - protocol-version: NIL
@@ -95,15 +93,15 @@ The returned session has:
 for the duration of one request. Callers must treat this as read-only.
 
 Binding scope by transport:
-  - stdio (Phase 1): bound once around the entire serve-streams loop
+  - stdio: bound once around the entire serve-streams loop
     (session lifecycle == process lifecycle)
-  - TCP (Phase 9): bound per-connection in the accept loop
-  - HTTP (Phase 9): bound per-request from the Mcp-Session-Id header
+  - TCP (future): bound per-connection in the accept loop
+  - HTTP (future): bound per-request from the Mcp-Session-Id header
   - tests: bound explicitly or left NIL when testing process-json-line
     in isolation
 
-Phase 3's structured logger reads this to include the session id in
-every log line without requiring it to be passed as an argument.
+The structured logger reads this to include the session id in every log
+line without requiring it to be passed as an argument.
 
 Declared as defvar (not defparameter) so transports can let-bind it
 for the duration of one request without triggering
@@ -115,14 +113,10 @@ parameter-rebinding warnings on system reload.")
   "Current server dispatch mode. One of :ATTACHED, :HERMETIC, or :AUTO.
 Set once at startup by run.lisp from the resolved-mode value.
 
-Scope: process-level for the current one-image/one-session topology
-(PROJECT.md; see \"Single-image-per-session invariant\").
-Per-session *MODE* is deferred to MULTI-01 when multi-image dispatch lands.
+Scope: process-level for the current one-image/one-session topology.
 
-:AUTO is an alias for :ATTACHED until Phase 4 introduces real hermetic
-execution and the inference logic (HERM-07) has something to enforce.
-:HERMETIC before Phase 4 causes handle-tools-call to return a structured
-isError explaining that hermetic ICP is not yet available.
+:AUTO probes the Slynk listener and resolves to :attached or :hermetic at
+startup. :HERMETIC causes the hermetic worker-pool dispatch path.
 
 Declared as defvar (not defparameter) so tests can let-bind it without
 triggering parameter-rebinding warnings on system reload.")

@@ -81,7 +81,7 @@ returns NIL."
          #+sbcl (listp (getf ec :frames)))))
 
 ;;; Test 6: (read) on the empty *standard-input* → error-context :message
-;;; contains the D-09 stdin hint
+;;; contains the stdin hint
 (check "Test 6: (read) on empty stdin has stdin hint in :message"
   (let* ((result (run-wrap-form "(read)"))
          (ec (fifth result))

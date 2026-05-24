@@ -18,7 +18,7 @@
 ;;;;     ... port)").  Both :style defaults to *communication-style* (typically
 ;;;;     :spawn — threads) and :dont-close defaults to *dont-close* (NIL).
 ;;;;     Pass :dont-close t so the listen socket accepts more than one
-;;;;     connection (required by criterion-3 reconnect test).
+;;;;     connection (required by the fail-closed reconnect test).
 ;;;;
 ;;;;   slynk:stop-server port -> ()
 ;;;;     Sends (:stop-server :port port) to the Slynk sentinel thread which
@@ -26,7 +26,7 @@
 ;;;;     Both create-server and stop-server are EXPORTED from package SLYNK
 ;;;;     (package declaration lines 16-19).
 ;;;;
-;;;; D-13 (RESEARCH §6): fixture shape locked in Phase 1.
+;;;; Fixture shape verified against Slynk source (slynk.lisp lines 935-998).
 
 (defpackage #:dsmr-mcp/tests/support/slynk-fixture
   (:use #:cl)
@@ -43,8 +43,8 @@ bind CONN-VAR to the slynk-client connection, run BODY, then tear down
 cleanly via unwind-protect.
 
 The listener is started with :dont-close t so the listen socket accepts
-multiple connections — required for criterion-3 (reconnect) test which
-opens, closes, then reopens a connection to the same fixture.
+multiple connections — required for the reconnect test which opens, closes,
+then reopens a connection to the same fixture.
 
 Connection race: slime-connect is retried up to 20 times with a 50ms
 sleep between attempts because the Slynk :spawn listener starts an OS
@@ -56,7 +56,7 @@ Teardown (always runs, even on non-local-exit from BODY):
   (ignore-errors (slynk:stop-server PORT)) — shut down the listen socket
 Both are wrapped in ignore-errors so a half-open connection or a
 partially-torn-down sentinel never masks a test assertion failure
-(T-02-TEST-01: no listener resource leaks)."
+(no listener resource leaks)."
   (let ((port-var  (gensym "PORT-"))
         (conn-tmp  (gensym "CONN-"))
         (attempt   (gensym "ATTEMPT-"))
@@ -77,6 +77,6 @@ after ~D attempts on port ~A" ,max-tries ,port-var))
        (let ((,conn-var ,conn-tmp))
          (unwind-protect
               (progn ,@body)
-           ;; Teardown — both in ignore-errors (T-02-TEST-01, T-02-TEST-02).
+           ;; Teardown — both in ignore-errors so partial teardown never masks a failure.
            (ignore-errors (slime-close ,conn-var))
            (ignore-errors (slynk:stop-server ,port-var)))))))

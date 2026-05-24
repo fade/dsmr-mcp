@@ -143,7 +143,7 @@ Allows callers to distinguish size-limit violations from other I/O errors."))
 (defconstant +max-json-line-bytes+ (* 16 1024 1024)
   "Maximum bytes for a single JSON-RPC line (16 MB).
 Guards against memory exhaustion from malformed or malicious input.
-Framing is newline-delimited JSON — NOT length-prefixed (D-05).")
+Framing is newline-delimited JSON — NOT length-prefixed.")
 
 (defun %read-line-limited (stream eof-value limit)
   "Read a newline-delimited line from STREAM, enforcing LIMIT byte cap.

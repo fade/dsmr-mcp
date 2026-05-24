@@ -20,9 +20,9 @@ Attached mode is the default; hermetic mode is the fallback.
 
 ## Status
 
-**Pre-alpha.** Planning artefacts only — see `.planning/PROJECT.md`,
-`.planning/ARCHITECTURE.md`, `.planning/FEATURES.md`, and
-`.planning/ROADMAP.md`. No verbs are wired yet.
+**Pre-alpha**, under active development. The attached and hermetic
+evaluation paths and the core MCP protocol surface are in place; the
+broader verb surface is still being built.
 
 ## Project Lineage
 

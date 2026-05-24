@@ -1,15 +1,13 @@
 ;;;; tests/hermetic/worker-spawn-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Wave-0 scaffold for HERM-01 (worker spawn + handshake) and HERM-02
-;;;; (newline-delimited JSON framing, 16 MB line cap).
+;;;; Tests for worker spawn + handshake and newline-delimited JSON framing
+;;;; (16 MB line cap).
 ;;;;
 ;;;; Unit tests for the framing cap and happy-path line parsing run cold
 ;;;; without spawning any process. The integration test that calls
-;;;; spawn-worker directly is gated: it is a structural test that verifies
-;;;; worker-client plumbing only; full round-trip (worker answering repl-eval)
-;;;; becomes green once 04-01 (worker accept loop) lands and makes
-;;;; dsmr-mcp/src/hermetic/worker/main:start available.
+;;;; spawn-worker directly is gated: it verifies worker-client plumbing only;
+;;;; the full round-trip requires the worker accept loop to be present.
 
 (defpackage #:dsmr-mcp/tests/hermetic/worker-spawn-test
   (:use #:cl #:parachute)
@@ -28,25 +26,22 @@
 (in-package #:dsmr-mcp/tests/hermetic/worker-spawn-test)
 
 ;;; ---------------------------------------------------------------------------
-;;; HERM-02: framing — unit tests (no process spawn, run cold)
+;;; Framing — unit tests (no process spawn, run cold)
 ;;; ---------------------------------------------------------------------------
 
 (define-test framing-cap-enforced
-  "HERM-02: %read-line-limited signals line-too-long when a line exceeds
-the explicit limit. Uses a small synthetic limit to avoid allocating 16 MB.
-Uses parachute (fail ...) which asserts the form signals a condition of the
-given type."
+  "%read-line-limited signals line-too-long when a line exceeds the explicit
+limit. Uses a small synthetic limit to avoid allocating 16 MB."
   ;; Feed 10 characters (no newline); limit is 5 — must signal line-too-long.
   (let ((stream (make-string-input-stream "0123456789")))
     (fail (%read-line-limited stream :eof 5) 'line-too-long)))
 
 (define-test framing-cap-constant
-  "HERM-02: +max-json-line-bytes+ is exactly 16 MB (16 * 1024 * 1024)."
+  "+max-json-line-bytes+ is exactly 16 MB (16 * 1024 * 1024)."
   (is = (* 16 1024 1024) +max-json-line-bytes+))
 
 (define-test framing-newline-happy-path
-  "HERM-02: %read-line-limited reads two newline-delimited JSON lines
-correctly from a string-input-stream."
+  "%read-line-limited reads two newline-delimited JSON lines correctly."
   (let* ((line1 "{\"a\":1}")
          (line2 "{\"b\":2}")
          (input (concatenate 'string line1 (string #\Newline)
@@ -68,12 +63,12 @@ correctly from a string-input-stream."
         (is = 2 (gethash "b" parsed2))))))
 
 (define-test framing-eof-returns-eof-value
-  "HERM-02: %read-line-limited returns the supplied eof-value on empty stream."
+  "%read-line-limited returns the supplied eof-value on empty stream."
   (let ((stream (make-string-input-stream "")))
     (is eq :eof (%read-line-limited stream :eof +max-json-line-bytes+))))
 
 (define-test framing-crlf-stripped
-  "HERM-02: %read-line-limited strips CR before LF (CRLF tolerance)."
+  "%read-line-limited strips CR before LF (CRLF tolerance)."
   (let* ((line (concatenate 'string "hello" (string #\Return) (string #\Newline)))
          (stream (make-string-input-stream line))
          (got (%read-line-limited stream :eof +max-json-line-bytes+)))
@@ -81,13 +76,11 @@ correctly from a string-input-stream."
     (is string= "hello" got)))
 
 ;;; ---------------------------------------------------------------------------
-;;; HERM-01: spawn + handshake integration test
-;;;
-;;; NOTE: worker/main is present as of plan 04-01. Integration test enabled.
+;;; Spawn + handshake integration test
 ;;; ---------------------------------------------------------------------------
 
 (define-test worker-spawns-and-handshakes
-  "HERM-01: spawn-worker launches a fresh SBCL image, reads the handshake,
+  "spawn-worker launches a fresh SBCL image, reads the handshake,
 connects to the TCP port, and returns a worker with a valid pid."
   (let* ((capture (make-string-output-stream))
          (*error-output* capture))

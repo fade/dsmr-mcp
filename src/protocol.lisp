@@ -6,27 +6,27 @@
 ;;;; and error envelopes. The only public entry point is process-json-line.
 ;;;;
 ;;;; Divergences from cl-mcp (read-only MIT reference):
-;;;;   D-02: handle-initialize does NOT emit -32602 on version mismatch.
-;;;;         Instead, it replies with the server's highest supported version.
-;;;;   D-03: InitializeResult.capabilities advertises BOTH tools AND prompts.
-;;;;         cl-mcp advertises only tools.
-;;;;   D-04: Strict-initialize gate: -32002 arm is placed BEFORE tools/prompts
-;;;;         arms. cl-mcp does not gate pre-init requests at all.
+;;;;   handle-initialize does NOT emit -32602 on version mismatch.
+;;;;   Instead, it replies with the server's highest supported version.
+;;;;   InitializeResult.capabilities advertises BOTH tools AND prompts;
+;;;;   cl-mcp advertises only tools.
+;;;;   Strict-initialize gate: -32002 arm is placed BEFORE tools/prompts
+;;;;   arms; cl-mcp does not gate pre-init requests at all.
 ;;;;
-;;;; JSON-RPC error code map (locked by D-04 comments):
+;;;; JSON-RPC error code map:
 ;;;;   -32700  Parse error          malformed JSON or parse-limit exceeded
 ;;;;   -32600  Invalid Request      bad jsonrpc version, missing method, etc.
 ;;;;   -32601  Method not found     unknown method or unknown tool name
 ;;;;   -32602  Invalid params       missing required tool argument
 ;;;;   -32603  Internal error       unexpected error in protocol/dispatch layer
-;;;;   -32002  Server not initialized  pre-handshake request (D-04 strict gate)
+;;;;   -32002  Server not initialized  pre-handshake request (strict gate)
 ;;;;     NOTE: -32002 is the MCP/TypeScript-SDK convention. The MCP 2025-06-18
 ;;;;     spec does not number a "server not initialized" code explicitly — it
 ;;;;     only documents -32602 for the version-mismatch case that dsmr-mcp
-;;;;     deliberately does not use (D-02). -32002 matches cl-mcp behaviour
-;;;;     and what Claude Code/Codex clients expect; locked here by D-04.
+;;;;     deliberately does not use. -32002 matches cl-mcp behaviour and what
+;;;;     Claude Code/Codex clients expect.
 ;;;;
-;;;; Parser-resource-exhaustion mitigation (threat T-02-02):
+;;;; Parser-resource-exhaustion mitigation:
 ;;;;   jzon:parse is called with explicit :max-depth and :max-string-length
 ;;;;   bounds. jzon raises json-parse-limit-error (a subtype of
 ;;;;   json-parse-error) when either bound is exceeded; the inner
@@ -71,23 +71,22 @@
 
 (defparameter +supported-protocol-versions+ '("2025-06-18" "2025-03-26")
   "Supported MCP protocol versions, newest first.
-The car (\"2025-06-18\") is returned on version mismatch (D-02).
-2024-11-05 is intentionally dropped per D-01: it predates Streamable
-HTTP and adds a maintenance burden for clients we do not have.")
+The car (\"2025-06-18\") is returned on version mismatch.
+2024-11-05 is intentionally dropped: it predates Streamable HTTP
+and adds a maintenance burden for clients we do not have.")
 
-;;; Parser resource-exhaustion bounds (threat T-02-02) -----------------------
+;;; Parser resource-exhaustion bounds ------------------------------------------
 
 (defconstant +max-json-depth+ 64
   "Maximum nesting depth accepted by jzon:parse on untrusted input.
 Exceeding this causes jzon to signal json-parse-limit-error (a subtype of
 json-parse-error), which process-json-line catches and maps to -32700.
-Defends against parser resource exhaustion (threat T-02-02).")
+Defends against unbounded parser resource use.")
 
 (defconstant +max-json-string-length+ #x100000
   "Maximum individual string length (1 MB) accepted by jzon:parse on
 untrusted input. Exceeding this causes jzon to signal
-json-parse-limit-error. Defends against parser resource exhaustion
-(threat T-02-02).")
+json-parse-limit-error. Defends against unbounded parser resource use.")
 
 ;;; Encoding helper ------------------------------------------------------------
 
@@ -104,25 +103,22 @@ transport always has a valid string to write. Never passes :pretty t
 ;;; Handshake ------------------------------------------------------------------
 
 (defun %handle-initialize (session id params)
-  "Handle an initialize request. Negotiates protocolVersion per D-01/D-02:
+  "Handle an initialize request. Negotiates protocolVersion:
 if the client requests a supported version, echo it back; otherwise return
-the server's highest supported version. NEVER emits -32602 on mismatch
-(diverges from cl-mcp which does; see D-02).
+the server's highest supported version. Never emits -32602 on mismatch.
 
-Capability: both tools AND prompts with listChanged t (D-03).
+Capability: both tools AND prompts with listChanged t.
 
 After the initialized-p flag flips, calls try-eager-connect via runtime
-symbol resolution (D-13 eager connect). The surrounding ignore-errors guards
-against the attach subsystem being absent in a stripped build; try-eager-connect
-itself swallows slime-network-error and logs attach.eager-connect.failed so a
-misconfigured or unreachable target fails fast and visibly without derailing
-this response. The post-death reopen shares the same get-or-open-connection
-path (D-13: first open is eager; only the post-death reopen is on-demand).
+symbol resolution. The surrounding ignore-errors guards against the attach
+subsystem being absent in a stripped build; try-eager-connect itself swallows
+slime-network-error and logs attach.eager-connect.failed so a misconfigured or
+unreachable target fails fast and visibly without derailing this response. The
+post-death reopen shares the same get-or-open-connection path.
 
 Note: serverInfo.version is resolved at call time via uiop:symbol-call
 rather than a compile-time package reference, so this file can be compiled
-before dsmr-mcp/src/main is loaded (required by the run → transport/stdio
-→ protocol load order)."
+before dsmr-mcp/src/main is loaded."
   (let* ((client-version (and params (gethash "protocolVersion" params)))
          (negotiated (or (find client-version +supported-protocol-versions+
                                :test #'string=)
@@ -133,7 +129,7 @@ before dsmr-mcp/src/main is loaded (required by the run → transport/stdio
           (initialized-p session) t)
     (when (and params (gethash "clientInfo" params))
       (setf (client-info session) (gethash "clientInfo" params)))
-    ;; D-13: eager connect AFTER initialized-p flips.
+    ;; Eager connect AFTER initialized-p flips.
     ;; Runtime symbol resolution (uiop:symbol-call) avoids a compile-time dep
     ;; on dsmr-mcp/src/attach/dispatch, matching the existing version lookup
     ;; pattern below. ignore-errors guards against the attach system being
@@ -165,16 +161,15 @@ so jzon encodes it as a JSON array, never null."
              *tool-classes*)
     (result id (make-ht "tools" (coerce descriptors 'simple-vector)))))
 
-;;; Prompts (D-03 stubs) -------------------------------------------------------
+;;; Prompts stubs --------------------------------------------------------------
 
 (defun %handle-prompts-list (id)
-  "Return the prompts/list result. Phase 1 stub: always an empty array.
-prompts/repl-driven-development.md et al. land in a later phase.
-Result.prompts is a simple-vector so jzon encodes it as [] (D-03)."
+  "Return the prompts/list result. Stub: always an empty array.
+Result.prompts is a simple-vector so jzon encodes it as []."
   (result id (make-ht "prompts" #())))
 
 (defun %handle-prompts-get (id params)
-  "Return -32602 for any prompts/get request. Phase 1 stub per D-03.
+  "Return -32602 for any prompts/get request.
 The error message names the requested prompt name for diagnostics."
   (rpc-error id -32602
              (format nil "Unknown prompt: ~A"
@@ -185,8 +180,8 @@ The error message names the requested prompt name for diagnostics."
 (defun %handle-notification (session method params)
   "Handle a JSON-RPC notification (no response expected, returns nil).
 notifications/initialized: no-op (the gate already flipped during
-handle-initialize per D-04). Unknown notifications are silently ignored
-per JSON-RPC 2.0 spec."
+handle-initialize). Unknown notifications are silently ignored per
+JSON-RPC 2.0 spec."
   (declare (ignore session params))
   (cond
     ((string= method "notifications/initialized")
@@ -207,12 +202,12 @@ per JSON-RPC 2.0 spec."
 Order matters:
   1. initialize  — always allowed, sets up the session
   2. ping        — allowed before init (MCP spec explicitly permits)
-  3. strict-init gate — any other method before init -> -32002 (D-04)
+  3. strict-init gate — any other method before init -> -32002
   4. tools/list, tools/call, prompts/list, prompts/get
   5. t           — -32601 Method not found
 
-The -32002 arm is deliberately placed BEFORE tools/prompts arms (D-04).
-This ordering matches what cl-mcp does NOT do — dsmr-mcp is strict here."
+The -32002 arm is deliberately placed BEFORE tools/prompts arms.
+dsmr-mcp is strict here; cl-mcp does not gate pre-init requests."
   (cond
     ((string= method "initialize")
      (%handle-initialize session id params))
@@ -222,7 +217,7 @@ This ordering matches what cl-mcp does NOT do — dsmr-mcp is strict here."
      (result id (make-ht)))
 
     ((not (initialized-p session))
-     ;; D-04 strict gate: all non-init, non-ping requests before handshake
+     ;; Strict gate: all non-init, non-ping requests before handshake
      ;; return -32002.  This arm is BEFORE the tools/* and prompts/*
      ;; arms — that ordering is load-bearing.
      (rpc-error id -32002 "Server not initialized"))
@@ -260,7 +255,7 @@ correlation id in the log context for the duration of its handling.")
   "Parse one JSON-RPC 2.0 line and return a JSON line string to send, or NIL
 for notifications. Pure of I/O: reads LINE, writes nothing.
 
-CONTRACT (for Plan 03 and beyond):
+CONTRACT:
   line    -- a single MCP stdio line (string); may have trailing whitespace
   session -- the dsmr-mcp/src/state:session for the current connection
   returns -- a JSON string (the response line) for requests, or NIL for
@@ -271,7 +266,7 @@ Error handling:
   any other error in dispatch -> -32603 Internal error
   both cases log to stderr via log-event, never leak details onto the wire.
 
-Parser bounds (threat T-02-02 mitigation):
+Parser bounds:
   jzon:parse is called with :max-depth +max-json-depth+ and
   :max-string-length +max-json-string-length+. Payloads exceeding these
   limits raise json-parse-limit-error before allocating unboundedly.
@@ -311,7 +306,7 @@ error-with-unknown-id responses use 'null as the id value."
               (return-from process-json-line
                 (%encode-line (rpc-error id -32600 "Invalid Request"))))
             ;; Bind correlation IDs for the duration of this request/notification
-            ;; so log-event includes them in every JSON log line (OPS-02, D-10).
+            ;; so log-event includes them in every JSON log line.
             (let ((*log-session-id* *current-session-id*)
                   (*log-request-id* (or id (%generate-notif-id))))
               (cond

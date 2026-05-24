@@ -6,13 +6,13 @@
 ;;;; Re-implemented from cl-mcp/src/attach.lisp §391-477 (MIT) under AGPL.
 ;;;;
 ;;;; Key divergences from cl-mcp:
-;;;;   D-14/D-15: per-instance connection/lock slots, no global hash-tables.
-;;;;   D-16: fail-closed network errors; drop-connection on slime-network-error.
-;;;;   D-17: reconnect note prepended to stdout when connection was reopened.
-;;;;   D-18: detach-session closes the connection gracefully at session end.
-;;;;   D-13: try-eager-connect opens the connection at session initialize time
-;;;;         (NOT lazy-on-first-call); the post-death reopen shares the same
-;;;;         get-or-open-connection path.
+;;;;   Per-instance connection/lock slots, no global hash-tables.
+;;;;   Fail-closed on network errors; drop-connection on slime-network-error.
+;;;;   Reconnect note prepended to stdout when connection was reopened.
+;;;;   detach-session closes the connection gracefully at session end.
+;;;;   try-eager-connect opens the connection at session initialize time
+;;;;   (NOT lazy-on-first-call); the post-death reopen shares the same
+;;;;   get-or-open-connection path.
 
 (defpackage #:dsmr-mcp/src/attach/dispatch
   (:use #:cl)
@@ -66,7 +66,7 @@
 ;;; :default-initargs) because c2mop:class-prototype does not apply
 ;;; :default-initargs; the metaclass registration :after method reads those
 ;;; slots via class-prototype and would see NIL if :default-initargs were used.
-;;; (See src/tools/base.lisp lines 150-154 and 02-PATTERNS.md cross-cutting note 2.)
+;;; (See src/tools/base.lisp lines 150-154 for the metaclass registration detail.)
 
 (defclass repl-eval-tool (mcp-tool)
   ((dsmr-mcp/src/tools/base::name
@@ -93,21 +93,21 @@ Requires :slynk-attach / DSMR_SLYNK_ATTACH to be configured.")
                   :description "Maximum characters for captured stdout/stderr output (default: 50000)."))
                 :required ("code")))
    ;; Per-instance (per-session) connection state — NOT :allocation :class.
-   ;; (D-14): one connection cache per session, living on the tool instance.
+   ;; One connection cache per session, living on the tool instance.
    (slynk-conn
     :initform nil
     :accessor repl-eval-tool-slynk-conn
     :documentation "Cached slynk-connection for this session, or NIL.
-Set by get-or-open-connection; nilled by drop-connection on network error (D-16).")
-   ;; (D-15): per-session call-serialisation lock (ATTACH-03).
+Set by get-or-open-connection; nilled by drop-connection on network error.")
+   ;; Per-session call-serialisation lock.
    (call-lock
     :initform (bordeaux-threads:make-lock "dsmr-repl-eval-lock")
     :reader repl-eval-tool-call-lock
-    :documentation "Serialises concurrent slime-eval calls on this session's connection (ATTACH-03, D-15)."))
+    :documentation "Serialises concurrent slime-eval calls on this session's connection."))
   (:metaclass mcp-tool-class)
   (:documentation "MCP tool: evaluate Lisp forms in the attached Slynk image.
 Per-session slots carry the connection and call-serialisation lock so sessions
-are fully isolated from each other (D-14, T-02-DISP-03)."))
+are fully isolated from each other."))
 
 ;; CRITICAL: ensure-finalized must appear after defclass so the metaclass
 ;; :after finalize-inheritance method fires at load time and registers
@@ -120,7 +120,7 @@ are fully isolated from each other (D-14, T-02-DISP-03)."))
 ;;; Plist shape: (:condition-type S :message S
 ;;;               :restarts ((:name S :description S) ...)
 ;;;               :frames   ((:index N :function S :locals L) ...))
-;;; JSON shape (RESEARCH.md §3 / 02-03-PLAN.md Task 1 action):
+;;; JSON shape:
 ;;;   condition_type, message, restarts (array of {name,description}),
 ;;;   frames (array of {index,function,source_file,source_line,locals}).
 
@@ -129,24 +129,24 @@ are fully isolated from each other (D-14, T-02-DISP-03)."))
 Returns an equal-keyed hash-table suitable for jzon encoding.
 
 All string fields originating in the remote image are routed through
-sanitize-control-chars (D-12).  The :message field is additionally bounded
+sanitize-control-chars.  The :message field is additionally bounded
 by EFFECTIVE-LIMIT via truncate-output so it is consistent with the cap
-applied to printed/stdout/stderr (IN-03, D-11).  Per-value local truncation
-(~200 chars) applied in the wrap-form remains in effect — this sanitisation
-is in addition to, not instead of, those existing bounds."
+applied to printed/stdout/stderr.  Per-value local truncation (~200 chars)
+applied in the wrap-form remains in effect — this sanitisation is in
+addition to, not instead of, those existing bounds."
   (let* ((ht (make-hash-table :test 'equal))
          (ctype   (getf error-context :condition-type))
          (message (getf error-context :message))
          (restarts (getf error-context :restarts))
          (frames   (getf error-context :frames)))
-    ;; condition_type: low risk but still sanitise for consistency (CR-01).
+    ;; condition_type: sanitise for consistency.
     (setf (gethash "condition_type" ht)
           (sanitize-control-chars (or ctype "")))
-    ;; message: sanitise + bound by effective-limit (CR-01, IN-03).
+    ;; message: sanitise + bound by effective-limit.
     (setf (gethash "message" ht)
           (truncate-output (sanitize-control-chars (or message "")) effective-limit))
     ;; Restarts: list of (:name S :description S) plists -> array of hash-tables.
-    ;; Each string sanitised (CR-01).
+    ;; Each string sanitised.
     (setf (gethash "restarts" ht)
           (coerce
            (mapcar (lambda (r)
@@ -155,7 +155,7 @@ is in addition to, not instead of, those existing bounds."
                    (or restarts '()))
            'simple-vector))
     ;; Frames: list of (:index N :function S :locals L) plists -> array of hash-tables.
-    ;; function name and each local value sanitised (CR-01).
+    ;; function name and each local value sanitised.
     (setf (gethash "frames" ht)
           (coerce
            (mapcar (lambda (f)
@@ -178,33 +178,28 @@ is in addition to, not instead of, those existing bounds."
 
 ;;; Response builder ----------------------------------------------------------
 ;;;
-;;; Adapted from cl-mcp/src/tools/response-builders.lisp §77-169 (MIT) under
-;;; AGPL. Phase 2 omits result_object_id / result_preview (ATTACH-09, Phase 5).
+;;; Adapted from cl-mcp/src/tools/response-builders.lisp §77-169 (MIT) under AGPL.
 
 (defun build-eval-response (printed stdout stderr error-context effective-limit)
   "Build the repl-eval response hash-table from the dispatcher-side processed
 fields (truncation and sanitisation already applied to printed/stdout/stderr).
 
 EFFECTIVE-LIMIT is threaded through to %build-error-context-ht so the
-error_context message field is bounded consistently (IN-03, D-11).
+error_context message field is bounded consistently with the other output fields.
 
 Returns a hash-table with:
   \"content\"       : text-content array with enriched text (value + context)
   \"stdout\"        : captured stdout string
   \"stderr\"        : captured stderr string
   \"error_context\" : (only when error-context non-nil) structured hash-table
-                     with condition_type, message, restarts, frames
-
-Phase 2 does NOT include result_object_id / result_preview (those are ATTACH-09,
-deferred to Phase 5)."
+                     with condition_type, message, restarts, frames"
   (let ((ht (make-hash-table :test 'equal)))
     (setf (gethash "stdout" ht) (or stdout ""))
     (setf (gethash "stderr" ht) (or stderr ""))
     (when error-context
       (setf (gethash "error_context" ht)
             (%build-error-context-ht error-context effective-limit)))
-    ;; Build enriched text for content[].text (cl-mcp §117-161 pattern;
-    ;; Phase 2 simplified — no object-id section).
+    ;; Build enriched text for content[].text (no object-id section).
     (let ((enriched
             (with-output-to-string (s)
               (write-string (or printed "") s)
@@ -238,7 +233,7 @@ deferred to Phase 5)."
 ;;; Main dispatcher -----------------------------------------------------------
 ;;;
 ;;; Adapted from cl-mcp/src/attach.lisp §391-461 (MIT) under AGPL.
-;;; Translates global-table slot access to per-instance slot access (D-14/D-15).
+;;; Translates global-table slot access to per-instance slot access.
 
 (defun %dispatch-attach (tool params)
   "Dispatch a repl-eval call to the attached Slynk server.
@@ -247,11 +242,10 @@ TOOL is the per-session repl-eval-tool instance carrying the cached
 connection and call-lock slots. PARAMS is the equal-keyed argument
 hash-table from the tools/call request.
 
-Serialises slime-eval under the per-session call-lock (ATTACH-03, D-15).
-On slime-network-error: drops the dead connection and returns a structured
-isError envelope; the next call reopens on demand (D-16, criterion 3).
-When the connection was nil and reopened successfully, prepends the D-17
-reconnect note to the stdout field."
+Serialises slime-eval under the per-session call-lock. On slime-network-error:
+drops the dead connection and returns a structured isError envelope; the next
+call reopens on demand. When the connection was nil and reopened successfully,
+prepends a reconnect note to the stdout field."
   (let* ((code              (gethash "code" params))
          (package-name      (gethash "package" params))
          (max-output-length (gethash "max_output_length" params))
@@ -264,7 +258,7 @@ reconnect note to the stdout field."
                  (text-content
                   "attach: 'code' parameter is required and must be a non-empty string."))))
     ;; Resolve host/port from the session slynk-attach config string.
-    ;; Parse once; reuse host/port for both the guard check and the live path (WR-02).
+    ;; Parse once; reuse host/port for both the guard check and the live path.
     (multiple-value-bind (host port)
         (parse-slynk-attach (session-slynk-attach (tool-session tool)))
       ;; Fail-fast guard: config was present at dispatch gate but could not be parsed.
@@ -275,7 +269,7 @@ reconnect note to the stdout field."
                    (text-content
                     "attach: :slynk-attach config is missing or malformed."))))
       (handler-case
-          (let* (;; WR-01: acquire lock BEFORE get-or-open-connection so concurrent
+          (let* (;; Acquire lock BEFORE get-or-open-connection so concurrent
                  ;; first-callers cannot both see conn=nil and both open a connection,
                  ;; leaking one socket on the Slynk listener side.
                  (lock (repl-eval-tool-call-lock tool))
@@ -288,7 +282,7 @@ reconnect note to the stdout field."
                        (setf reconnectedp t))
                      (let* ((conn (get-or-open-connection tool host port))
                             (form (build-wrapping-form code package-name)))
-                       ;; ATTACH-03 / D-15: slime-eval call is inside the lock.
+                       ;; slime-eval call is inside the lock.
                        (slime-eval form conn)))))
             ;; Destructure the 5-element result tuple from the remote image.
             ;; Shape: (printed raw stdout stderr error-context)
@@ -301,7 +295,7 @@ reconnect note to the stdout field."
                          (list (princ-to-string raw-result)
                                raw-result "" "" nil)))
                    (printed       (first  result-list))
-                   ;; raw (second) ignored: raw == printed per D-05/b2c9812f.
+                   ;; raw (second) ignored: raw == printed.
                    (stdout        (or (third  result-list) ""))
                    (stderr        (or (fourth result-list) ""))
                    (error-context (fifth  result-list))
@@ -309,9 +303,9 @@ reconnect note to the stdout field."
                                              (plusp max-output-length)
                                              max-output-length)
                                         *default-max-output-length*)))
-              ;; Apply truncation+sanitise (D-11/D-12) to the main output fields.
-              ;; D-17: reconnect note prepended to stdout AFTER truncation so the note
-              ;; is never silently dropped when effective-limit is very small (WR-03).
+              ;; Apply truncation+sanitise to the main output fields.
+              ;; Reconnect note prepended to stdout AFTER truncation so the note
+              ;; is never silently dropped when effective-limit is very small.
               (let ((trunc-stdout (truncate-output stdout effective-limit)))
                 (when reconnectedp
                   (setf trunc-stdout
@@ -326,7 +320,7 @@ reconnect note to the stdout field."
                  error-context
                  effective-limit))))
         (slime-network-error (e)
-          ;; D-16 fail-closed: nil the cached connection so next call reopens.
+          ;; Fail-closed: nil the cached connection so next call reopens.
           (drop-connection tool :reason "network-error")
           (log-event :warn "attach.network-error"
                      "error" (handler-case (princ-to-string e)
@@ -358,9 +352,9 @@ PARAMS is the equal-keyed argument hash-table from the tools/call request."
 
 (defmethod tool-handle ((tool repl-eval-tool) id args)
   "Dispatch the repl-eval tool call. Routes to the attached Slynk server
-when :slynk-attach is configured (with-attach-dispatch). In Phase 2, the
-fallback (no Slynk listener configured) returns a -32603 error; Phase 3
-replaces this body with the hermetic mode dispatch."
+when :slynk-attach is configured (with-attach-dispatch). The fallback (no
+Slynk listener configured) returns a -32603 error; hermetic mode dispatch
+replaces this body when the session is in hermetic mode."
   (with-attach-dispatch (id tool args)
     (rpc-error id -32603
                "repl-eval requires an attached Slynk listener.")))
@@ -368,12 +362,11 @@ replaces this body with the hermetic mode dispatch."
 ;;; Session lifecycle hooks ---------------------------------------------------
 
 (defun try-eager-connect (session)
-  "Open the Slynk connection eagerly at session-initialize time (D-13).
+  "Open the Slynk connection eagerly at session-initialize time.
 When :slynk-attach is configured, finds the repl-eval-tool instance and
 calls get-or-open-connection. On slime-network-error logs a :warn event and
-returns NIL so the initialize response is never derailed (D-13 rationale:
-fail fast and visibly, but not fatally — the next call will reconnect via
-the same get-or-open-connection path).
+returns NIL so the initialize response is never derailed — the next call will
+reconnect via the same get-or-open-connection path.
 Returns NIL in all cases."
   (let ((attach-config (session-slynk-attach session)))
     (when (slynk-attach-configured-p attach-config)
@@ -394,7 +387,7 @@ Returns NIL in all cases."
   nil)
 
 (defun detach-session (session)
-  "Gracefully close the Slynk connection for SESSION (D-18, ATTACH-08).
+  "Gracefully close the Slynk connection for SESSION.
 Iterates the session's tool-instances and calls close-connection on any
 repl-eval-tool instance that carries an open connection. This ensures the
 host Slynk listener receives a clean FIN rather than a reset-by-peer.

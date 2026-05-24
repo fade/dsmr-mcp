@@ -1,7 +1,7 @@
 ;;;; tests/protocol/tools-list-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; MCP-03: tools/list returns result.tools as a JSON array.
+;;;; tools/list returns result.tools as a JSON array.
 ;;;; With no tools registered it is length 0 and (vectorp tools) is true.
 ;;;; Optionally defines a single in-test stub tool to verify auto-registration
 ;;;; and descriptor shape.
@@ -31,10 +31,10 @@
 
 ;;; In-test stub tool ---------------------------------------------------------
 ;;; Defines a minimal tool for testing tools-list descriptor shape.
-;;; Class-allocated slots use :initform (not :default-initargs) per the
-;;; Plan 01-01 deviation rule: c2mop:class-prototype does not apply
-;;; :default-initargs, so :initform is required for finalize-inheritance
-;;; :after to see the name and register the class.
+;;; Class-allocated slots use :initform (not :default-initargs) because
+;;; c2mop:class-prototype does not apply :default-initargs; :initform is
+;;; required for finalize-inheritance :after to see the name and register
+;;; the class.
 
 (defclass tools-list-echo-tool (mcp-tool)
   ((dsmr-mcp/src/tools/base::name
@@ -67,7 +67,7 @@
 ;;; Tests ---------------------------------------------------------------------
 
 (define-test tools-list-result-tools-is-vector
-  "MCP-03: result.tools is a simple-vector (jzon encodes vectors as JSON
+  "result.tools is a simple-vector (jzon encodes vectors as JSON
 arrays). We assert with (vectorp tools) to match jzon's type mapping."
   (let* ((session (make-session :id "tl-vec"))
          (*current-session-id* "tl-vec"))
@@ -80,7 +80,7 @@ arrays). We assert with (vectorp tools) to match jzon's type mapping."
       (true (vectorp tools)))))
 
 (define-test tools-list-stub-tool-registered
-  "MCP-03: the tools-list-echo stub tool is registered and appears in
+  "The tools-list-echo stub tool is registered and appears in
 tools/list with the expected name, description, and inputSchema."
   ;; Confirm registration before testing.
   (true (gethash "tools-list-echo" *tool-classes*))
@@ -102,7 +102,7 @@ tools/list with the expected name, description, and inputSchema."
       (true (hash-table-p (gethash "inputSchema" echo-desc))))))
 
 (define-test tools-list-input-schema-has-required
-  "MCP-03: the inputSchema for the stub tool has a \"required\" key that
+  "The inputSchema for the stub tool has a \"required\" key that
 is a vector (not a list or nil)."
   (let* ((session (make-session :id "tl-schema"))
          (*current-session-id* "tl-schema"))

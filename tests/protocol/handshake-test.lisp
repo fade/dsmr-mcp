@@ -1,10 +1,9 @@
 ;;;; tests/protocol/handshake-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; MCP-01: initialize round-trip test. Verifies that process-json-line
-;;;; on a well-formed initialize request returns the correct JSON-RPC 2.0
-;;;; shape with protocolVersion, capabilities (tools + prompts), and
-;;;; serverInfo (D-03).
+;;;; Initialize round-trip test. Verifies that process-json-line on a
+;;;; well-formed initialize request returns the correct JSON-RPC 2.0 shape
+;;;; with protocolVersion, capabilities (tools + prompts), and serverInfo.
 
 (defpackage #:dsmr-mcp/tests/protocol/handshake-test
   (:use #:cl #:parachute)
@@ -41,8 +40,8 @@
 ;;; Tests ---------------------------------------------------------------------
 
 (define-test initialize-round-trip
-  "MCP-01: a well-formed initialize request returns a JSON-RPC 2.0 success
-response with the correct envelope shape."
+  "A well-formed initialize request returns a JSON-RPC 2.0 success response
+with the correct envelope shape."
   (let* ((session (make-session :id "handshake-test"))
          (*current-session-id* "handshake-test")
          (obj (%parse-response (%init-line 1) session)))
@@ -54,7 +53,7 @@ response with the correct envelope shape."
     (false (gethash "error" obj))))
 
 (define-test initialize-result-has-protocol-version
-  "MCP-01: result.protocolVersion echoes the requested supported version."
+  "result.protocolVersion echoes the requested supported version."
   (let* ((session (make-session :id "handshake-proto"))
          (*current-session-id* "handshake-proto")
          (obj (%parse-response (%init-line 2 "2025-06-18") session))
@@ -62,8 +61,8 @@ response with the correct envelope shape."
     (is equal "2025-06-18" (gethash "protocolVersion" result))))
 
 (define-test initialize-result-has-capabilities-tools-and-prompts
-  "MCP-01/D-03: result.capabilities contains both tools and prompts keys
-with listChanged values. Diverges from cl-mcp which only has tools."
+  "result.capabilities contains both tools and prompts keys with listChanged
+values. Diverges from cl-mcp which only advertises tools."
   (let* ((session (make-session :id "handshake-caps"))
          (*current-session-id* "handshake-caps")
          (obj (%parse-response (%init-line 3) session))
@@ -73,7 +72,7 @@ with listChanged values. Diverges from cl-mcp which only has tools."
     (true (hash-table-p (gethash "prompts" caps)))))
 
 (define-test initialize-result-has-server-info
-  "MCP-01: result.serverInfo has name and version keys."
+  "result.serverInfo has name and version keys."
   (let* ((session (make-session :id "handshake-info"))
          (*current-session-id* "handshake-info")
          (obj (%parse-response (%init-line 4) session))
@@ -83,8 +82,8 @@ with listChanged values. Diverges from cl-mcp which only has tools."
     (true (stringp (gethash "version" sinfo)))))
 
 (define-test initialize-marks-session-initialized
-  "MCP-01: after a successful initialize, the session's initialized-p is T
-and protocol-version is set."
+  "After a successful initialize, the session's initialized-p is T and
+protocol-version is set."
   (let* ((session (make-session :id "handshake-state"))
          (*current-session-id* "handshake-state"))
     (process-json-line (%init-line 5) session)
@@ -92,14 +91,14 @@ and protocol-version is set."
     (is equal "2025-06-18" (protocol-version session))))
 
 (define-test notification-returns-nil
-  "MCP-01: a JSON-RPC notification (no id) returns NIL, not a string."
+  "A JSON-RPC notification (no id) returns NIL, not a string."
   (let* ((session (make-session :id "handshake-notify"))
          (*current-session-id* "handshake-notify")
          (notif "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"))
     (is eq nil (process-json-line notif session))))
 
 (define-test empty-line-returns-nil
-  "MCP-01: an empty (or whitespace-only) line returns NIL without error."
+  "An empty (or whitespace-only) line returns NIL without error."
   (let* ((session (make-session :id "handshake-empty"))
          (*current-session-id* "handshake-empty"))
     (is eq nil (process-json-line "" session))

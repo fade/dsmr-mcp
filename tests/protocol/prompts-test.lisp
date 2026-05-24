@@ -1,11 +1,11 @@
 ;;;; tests/protocol/prompts-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; MCP-03 / D-03: prompts surface tests.
-;;;; - prompts/list returns result.prompts as a length-0 vector (Phase 1 stub).
+;;;; Prompts surface tests.
+;;;; - prompts/list returns result.prompts as a length-0 vector (stub).
 ;;;; - prompts/get for any name returns -32602 "Unknown prompt: ..." (stub).
 ;;;;
-;;;; Phase 1 ships no actual prompt files. The surface is in scope and the
+;;;; No actual prompt files are shipped. The surface is in scope and the
 ;;;; stubs prove the capability is advertised and the wire is correct.
 
 (defpackage #:dsmr-mcp/tests/protocol/prompts-test
@@ -38,8 +38,8 @@
 ;;; Tests ---------------------------------------------------------------------
 
 (define-test prompts-list-result-prompts-is-vector
-  "D-03/MCP-03: result.prompts is a simple-vector. jzon encodes vectors
-as JSON arrays, so [] arrives as #() on the wire."
+  "result.prompts is a simple-vector. jzon encodes vectors as JSON arrays,
+so [] arrives as #() on the wire."
   (let* ((session (make-session :id "pt-vec"))
          (*current-session-id* "pt-vec"))
     (let* ((obj (%init+prompts-list session))
@@ -47,7 +47,7 @@ as JSON arrays, so [] arrives as #() on the wire."
       (true (vectorp prompts)))))
 
 (define-test prompts-list-result-is-empty
-  "D-03/MCP-03: Phase 1 stub returns an empty prompts array (length 0)."
+  "The prompts stub returns an empty prompts array (length 0)."
   (let* ((session (make-session :id "pt-empty"))
          (*current-session-id* "pt-empty"))
     (let* ((obj (%init+prompts-list session))
@@ -55,8 +55,8 @@ as JSON arrays, so [] arrives as #() on the wire."
       (is = 0 (length prompts)))))
 
 (define-test prompts-get-returns-32602
-  "D-03/MCP-03: prompts/get for any name returns -32602 with a message
-naming the requested prompt (Phase 1 stub — no prompt files shipped)."
+  "prompts/get for any name returns -32602 with a message naming the
+requested prompt (stub — no prompt files are shipped)."
   (let* ((session (make-session :id "pt-get"))
          (*current-session-id* "pt-get"))
     ;; Initialize first.
@@ -70,7 +70,7 @@ naming the requested prompt (Phase 1 stub — no prompt files shipped)."
       (is = -32602 (jsonrpc-error-code obj)))))
 
 (define-test prompts-get-message-names-prompt
-  "D-03: the -32602 error message from prompts/get includes the prompt name."
+  "The -32602 error message from prompts/get includes the prompt name."
   (let* ((session (make-session :id "pt-msg"))
          (*current-session-id* "pt-msg"))
     (process-json-line

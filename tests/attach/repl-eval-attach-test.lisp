@@ -3,12 +3,12 @@
 ;;;;
 ;;;; Integration tests for attached-mode repl-eval against an in-process
 ;;;; Slynk fixture (with-temporary-slynk-listener, port 0).
-;;;; Verifies all four ROADMAP success criteria:
-;;;;   1. Eval parity with slyme-eval + multi-value return (ATTACH-01, VERB-10, D-06)
-;;;;   2. Conditions return structured error context (ATTACH-05, D-04)
-;;;;   3. Dead-listener produces isError; next call reconnects (ATTACH-06, D-16)
-;;;;   4. Stream output in attached image lands in stdout/stderr fields (ATTACH-04, D-07/D-08)
-;;;; Also covers ATTACH-02 (connection reuse) and ATTACH-03 (serial lock).
+;;;; Verifies four integration criteria:
+;;;;   1. Eval parity with slime-eval + multi-value return
+;;;;   2. Conditions return structured error context
+;;;;   3. Dead-listener produces isError; next call reconnects
+;;;;   4. Stream output in attached image lands in stdout/stderr fields
+;;;; Also covers connection reuse and serial call-lock behaviour.
 
 ;;; Package evolution: the original defpackage included a :shadowing-import-from
 ;;; for dsmr-mcp/src/tools/helpers:result (used with the now-removed
@@ -64,16 +64,15 @@ value directly on the session object."
     (setf (repl-eval-tool-slynk-conn tool) conn)
     (values session tool)))
 
-;;; Criterion 1 — Eval parity + multi-value return (ATTACH-01, VERB-10, D-06)
+;;; Eval parity + multi-value return
 ;;;
 ;;; Asserts:
 ;;;   a) slime-eval of (+ 1 2) returns 3 (direct wire parity)
 ;;;   b) %dispatch-attach "(+ 1 2)" returns no isError, content contains "3"
-;;;   c) "(values 1 2 3)" content contains "1", "2", and "3" (D-06 all-values)
+;;;   c) "(values 1 2 3)" content contains "1", "2", and "3" (all values)
 
 (define-test criterion-1-eval-parity
-  "ATTACH-01 / VERB-10 / D-06: repl-eval results are identical to slime-eval.
-All returned values are presented (not just the last)."
+  "repl-eval results are identical to slime-eval. All returned values are presented."
   (with-temporary-slynk-listener (conn)
     ;; a) Direct slime-eval parity: the in-process listener returns 3 for (+ 1 2).
     (is = 3 (slime-eval '(+ 1 2) conn))
@@ -85,7 +84,7 @@ All returned values are presented (not just the last)."
              (ctext  (gethash "text" (aref (gethash "content" res) 0))))
         (false (gethash "isError" res))
         (true  (search "3" ctext))))
-    ;; c) Multi-value: (values 1 2 3) must put all three in content text (D-06).
+    ;; c) Multi-value: (values 1 2 3) must put all three in content text.
     (multiple-value-bind (session tool)
         (%make-attach-session "crit-1-multival" conn)
       (declare (ignore session))
@@ -96,14 +95,14 @@ All returned values are presented (not just the last)."
         (true  (search "2" ctext))
         (true  (search "3" ctext))))))
 
-;;; Criterion 2 — Structured error context (ATTACH-05, D-04)
+;;; Structured error context
 ;;;
 ;;; A condition raised in the attached image must return a structured
 ;;; error_context hash-table with non-nil condition_type, message, restarts.
-;;; On SBCL, frames must be a non-empty vector (pre-unwind handler-bind, D-04).
+;;; On SBCL, frames must be a non-empty vector (pre-unwind handler-bind).
 
 (define-test criterion-2-structured-error
-  "ATTACH-05 / D-04: conditions return condition_type, message, restarts, frames."
+  "Conditions return condition_type, message, restarts, and SBCL backtrace frames."
   (with-temporary-slynk-listener (conn)
     (multiple-value-bind (session tool)
         (%make-attach-session "crit-2-error" conn)
@@ -118,14 +117,13 @@ All returned values are presented (not just the last)."
         (let ((restarts (gethash "restarts" ec)))
           (true (vectorp restarts))
           (true (plusp (length restarts))))
-        ;; frames: SBCL-only assertion, handler-bind fires pre-unwind (D-04).
+        ;; frames: SBCL-only assertion, handler-bind fires pre-unwind.
         #+sbcl
         (let ((frames (gethash "frames" ec)))
           (true (vectorp frames))
           (true (plusp (length frames))))
-        ;; CR-01 / D-12: error_context strings must not contain raw ESC (0x1B).
-        ;; Any ANSI sequences in condition messages or frame data are stripped
-        ;; by sanitize-control-chars before reaching the JSON-RPC wire.
+        ;; error_context strings must not contain raw ESC (0x1B); any ANSI
+        ;; sequences are stripped by sanitize-control-chars before the wire.
         (false (find #\Escape (gethash "condition_type" ec)))
         (false (find #\Escape (gethash "message" ec)))
         (when (and (vectorp (gethash "restarts" ec))
@@ -134,7 +132,7 @@ All returned values are presented (not just the last)."
             (false (find #\Escape (gethash "name" r0 "")))
             (false (find #\Escape (gethash "description" r0 "")))))))))
 
-;;; Criterion 3 — Fail-closed + reconnect on demand (ATTACH-06, D-16)
+;;; Fail-closed + reconnect on demand
 ;;;
 ;;; Flow:
 ;;;   1. Start listener A on port pA; do one successful %dispatch-attach call.
@@ -144,7 +142,7 @@ All returned values are presented (not just the last)."
 ;;;   5. Call %dispatch-attach -> must reconnect and succeed.
 
 (define-test criterion-3-fail-closed-reconnect
-  "ATTACH-06 / D-16: dead listener -> isError; next call reconnects on demand."
+  "Dead listener -> isError; the next call reconnects on demand."
   (let* ((port-a (slynk:create-server :port 0 :dont-close t))
          (session (make-session :id "crit-3-fail"
                                 :slynk-attach (format nil "127.0.0.1:~A" port-a)))
@@ -176,12 +174,12 @@ All returned values are presented (not just the last)."
                           ;; 5. Third call -> reconnects to listener B and succeeds.
                           (let ((r3 (%dispatch-attach tool (make-ht "code" "(+ 3 3)"))))
                             (false (gethash "isError" r3))
-                            ;; D-17: reconnect note appears in stdout of r3.
+                            ;; Reconnect note appears in stdout of r3.
                             (true (search "reconnected" (gethash "stdout" r3)))))
                      (ignore-errors (slynk:stop-server port-b))))))))
       (ignore-errors (slynk:stop-server port-a)))))
 
-;;; Criterion 4 — Stream isolation (ATTACH-04, D-07/D-08)
+;;; Stream isolation
 ;;;
 ;;; Output written to *terminal-io* / *debug-io* / *trace-output* in the
 ;;; attached image must land in the "stdout" field of the response.
@@ -189,8 +187,7 @@ All returned values are presented (not just the last)."
 ;;; Neither should reach the test process's real *standard-output*.
 
 (define-test criterion-4-stream-isolation
-  "ATTACH-04 / D-07 / D-08: stream output in attached image goes to response
-fields, not the test process terminal."
+  "Stream output in attached image goes to response fields, not the test process terminal."
   (with-temporary-slynk-listener (conn)
     (multiple-value-bind (session tool)
         (%make-attach-session "crit-4-streams" conn)
@@ -207,7 +204,7 @@ fields, not the test process terminal."
         ;; Real *standard-output* of the test process must have stayed empty
         ;; (proves isolation — not just capture).
         (is equal "" host-stdout))
-      ;; b) *debug-io* write lands in stdout (it is a two-way stream to stdout, D-07).
+      ;; b) *debug-io* write lands in stdout (two-way stream backed by stdout).
       (let* ((res (%dispatch-attach tool
                                     (make-ht "code"
                                              "(write-string \"hello-debug\" *debug-io*)"))))
@@ -220,13 +217,13 @@ fields, not the test process terminal."
         ;; Stderr output must NOT bleed into stdout.
         (false (search "hello-error" (gethash "stdout" res "")))))))
 
-;;; ATTACH-03 — Per-session serialisation lock
+;;; Per-session serialisation lock
 ;;;
 ;;; Two sequential %dispatch-attach calls on the same session and connection
 ;;; must both succeed (the lock is acquired and released cleanly; no deadlock).
 
 (define-test attach-03-serial-lock
-  "ATTACH-03: sequential %dispatch-attach calls on the same session all succeed."
+  "Sequential %dispatch-attach calls on the same session all succeed."
   (with-temporary-slynk-listener (conn)
     (multiple-value-bind (session tool)
         (%make-attach-session "attach-03-lock" conn)
@@ -238,13 +235,13 @@ fields, not the test process terminal."
         (false (gethash "isError" r2))
         (false (gethash "isError" r3))))))
 
-;;; ATTACH-02 — Connection reuse
+;;; Connection reuse
 ;;;
 ;;; Two successive %dispatch-attach calls on the same session must use the
 ;;; same (eq) connection object — no redundant reconnects.
 
 (define-test attach-02-connection-reuse
-  "ATTACH-02: the same connection object is reused across calls in a session."
+  "The same connection object is reused across calls in a session."
   (with-temporary-slynk-listener (conn)
     (multiple-value-bind (session tool)
         (%make-attach-session "attach-02-reuse" conn)

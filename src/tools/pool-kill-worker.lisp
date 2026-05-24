@@ -1,7 +1,7 @@
 ;;;; src/tools/pool-kill-worker.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; MCP tool: pool-kill-worker (HERM-06).
+;;;; MCP tool: pool-kill-worker.
 ;;;; Kills the worker bound to the current session when *mode* is :hermetic;
 ;;;; returns an informative isError when the pool is not running.
 ;;;;
@@ -45,7 +45,7 @@ so the next call can spawn without waiting for the 60-second cool-down."))
                 :required ())))
   (:metaclass mcp-tool-class)
   (:documentation "MCP tool: kill the hermetic worker for the current session.
-Only available when *mode* is :hermetic. HERM-06."))
+Only available when *mode* is :hermetic."))
 
 (defmethod tool-handle ((tool pool-kill-worker-tool) id args)
   (unless (eq *mode* :hermetic)

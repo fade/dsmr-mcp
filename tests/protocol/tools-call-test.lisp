@@ -1,11 +1,11 @@
 ;;;; tests/protocol/tools-call-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; MCP-03: tools/call dispatch test.
+;;;; tools/call dispatch test.
 ;;;; - Unknown tool -> -32601
 ;;;; - Known stub tool with valid args -> structured result
 ;;;; The in-test stub must follow the :initform pattern (not :default-initargs)
-;;;; per Plan 01-01 deviation rule.
+;;;; because c2mop:class-prototype does not apply :default-initargs.
 
 (defpackage #:dsmr-mcp/tests/protocol/tools-call-test
   (:use #:cl #:parachute)
@@ -31,9 +31,9 @@
 (in-package #:dsmr-mcp/tests/protocol/tools-call-test)
 
 ;;; In-test stub tool ---------------------------------------------------------
-;;; Class-allocated slots via :initform (not :default-initargs) per the
-;;; Plan 01-01 deviation rule. Package-qualified slot names since this
-;;; package is not dsmr-mcp/src/tools/base.
+;;; Class-allocated slots via :initform (not :default-initargs) because
+;;; c2mop:class-prototype does not apply :default-initargs. Package-qualified
+;;; slot names since this package is not dsmr-mcp/src/tools/base.
 
 (defclass proto-test-echo-tool (mcp-tool)
   ((dsmr-mcp/src/tools/base::name
@@ -70,7 +70,7 @@
 ;;; Tests ---------------------------------------------------------------------
 
 (define-test unknown-tool-returns-32601
-  "MCP-03: tools/call for an unknown tool name returns -32601 Method not found."
+  "tools/call for an unknown tool name returns -32601 Method not found."
   (let* ((session (make-session :id "tc-unknown"))
          (*current-session-id* "tc-unknown"))
     (%initialize-session session)
@@ -81,7 +81,7 @@
       (is = -32601 (jsonrpc-error-code obj)))))
 
 (define-test known-tool-valid-args-returns-result
-  "MCP-03: tools/call for a registered stub tool with valid arguments
+  "tools/call for a registered stub tool with valid arguments
 returns a structured success result (no error key)."
   (true (gethash "proto-test-echo" *tool-classes*))
   (let* ((session (make-session :id "tc-valid"))

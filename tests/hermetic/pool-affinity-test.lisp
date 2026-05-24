@@ -1,15 +1,15 @@
 ;;;; tests/hermetic/pool-affinity-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Integration tests for HERM-04 (warmup pool pre-spawning) and HERM-05
-;;;; (strict per-session affinity). Both tests spawn real workers via the pool
-;;;; so they require the full hermetic worker subsystem (04-01 through 04-03).
+;;;; Integration tests for warmup pool pre-spawning and strict per-session
+;;;; affinity. Both tests spawn real workers via the pool so they require the
+;;;; full hermetic worker subsystem.
 ;;;;
-;;;; HERM-04: initialize-pool launches warmup standby workers asynchronously;
-;;;; a brief sleep allows the replenish thread to complete.
-;;;; HERM-05: two sequential get-or-assign-worker calls for the same session
-;;;; return a worker with the same pid (strict affinity). A different
-;;;; session-id gets a different worker pid (scale-out isolation).
+;;;; Warmup: initialize-pool launches standby workers asynchronously; a brief
+;;;; sleep allows the replenish thread to complete.
+;;;; Affinity: two sequential get-or-assign-worker calls for the same session
+;;;; return a worker with the same pid. A different session-id gets a different
+;;;; worker pid (scale-out isolation).
 
 (defpackage #:dsmr-mcp/tests/hermetic/pool-affinity-test
   (:use #:cl #:parachute)
@@ -27,13 +27,13 @@
 (in-package #:dsmr-mcp/tests/hermetic/pool-affinity-test)
 
 ;;; ---------------------------------------------------------------------------
-;;; HERM-04: initialize-pool spawns warmup workers asynchronously
+;;; Warmup: initialize-pool spawns standby workers asynchronously
 ;;; ---------------------------------------------------------------------------
 
 (define-test warmup-pool-spawns-standbys
-  "HERM-04: initialize-pool with *worker-pool-warmup* = 1 spawns at least
-one standby worker in the background. The test sleeps briefly to let the
-asynchronous replenish thread complete, then verifies via pool-status-info."
+  "initialize-pool with *worker-pool-warmup* = 1 spawns at least one standby
+worker in the background. The test sleeps briefly to let the asynchronous
+replenish thread complete, then verifies via pool-status-info."
   (let ((*mode* :hermetic)
         (*error-output* (make-string-output-stream)))
     (configure-log4cl-for-server :warn)
@@ -58,13 +58,13 @@ asynchronous replenish thread complete, then verifies via pool-status-info."
         (ignore-errors (shutdown-pool))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; HERM-05: strict session affinity and scale-out isolation
+;;; Strict session affinity and scale-out isolation
 ;;; ---------------------------------------------------------------------------
 
 (define-test session-affinity-same-pid
-  "HERM-05: two sequential get-or-assign-worker calls for the same session-id
-return the same worker (same pid). A second session-id gets a different worker
-with a different pid, confirming scale-out assigns new workers per session."
+  "Two sequential get-or-assign-worker calls for the same session-id return
+the same worker (same pid). A second session-id gets a different worker with a
+different pid, confirming scale-out assigns new workers per session."
   (let ((*mode* :hermetic)
         (*error-output* (make-string-output-stream)))
     (configure-log4cl-for-server :warn)

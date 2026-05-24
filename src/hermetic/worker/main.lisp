@@ -5,9 +5,9 @@
 ;;;;
 ;;;; A hermetic worker is a fresh SBCL image that loads dsmr-mcp and serves
 ;;;; over an ephemeral localhost TCP port it opens itself — it does NOT carry
-;;;; the primary's attached-image state (D-03, HERM-01).
+;;;; the primary's attached-image state.
 ;;;;
-;;;; MANDATORY STARTUP ORDER (D-04, RESEARCH.md Pitfall 2):
+;;;; MANDATORY STARTUP ORDER:
 ;;;;   1. sb-ext:disable-debugger   — prevents SBCL debugger writing to stdout
 ;;;;   2. configure-log4cl-for-server — installs stderr-only appender BEFORE any log
 ;;;;   3. log-event                 — first safe log point
@@ -55,18 +55,16 @@ but does not hard-fail for forward compatibility.")
   (sb-posix:getpid))
 
 ;;; ---------------------------------------------------------------------------
-;;; Internal helpers — Swank (stubbed OFF for Phase 4)
+;;; Internal helpers — Swank (stubbed OFF by default)
 ;;; ---------------------------------------------------------------------------
 
 (defun %maybe-start-swank ()
-  "Attempt to start a Swank server in the worker. Always returns NIL in
-Phase 4 — Swank is OFF by default (D-06, assumption A1 from RESEARCH.md).
-Set DSMR_WORKER_SWANK=1 for the Phase-5 opt-in."
+  "Attempt to start a Swank server in the worker. Always returns NIL —
+Swank is OFF by default. Set DSMR_WORKER_SWANK=1 to opt in."
   (let ((env-val (uiop:getenv "DSMR_WORKER_SWANK")))
     (when (and env-val (plusp (length env-val)))
       (log-event :warn "worker.swank.skip"
-                 "reason" "DSMR_WORKER_SWANK reserved for Phase-5 opt-in"))
-    ;; Always nil this phase — Swank wiring lands in Phase 5.
+                 "reason" "DSMR_WORKER_SWANK not yet wired"))
     nil))
 
 ;;; ---------------------------------------------------------------------------
@@ -75,8 +73,8 @@ Set DSMR_WORKER_SWANK=1 for the Phase-5 opt-in."
 
 (defun %setup-project-root ()
   "Read DSMR_PROJECT_ROOT from the environment and set *default-pathname-defaults*.
-Phase 4 simplification: sets the root but skips chdir — repl-eval does
-not require it. Full chdir + fs verb support lands in Phase 6+."
+Sets the root but skips chdir — repl-eval does not require it. Full chdir
+and filesystem verb support requires a later extension."
   (let ((env-root (uiop:getenv "DSMR_PROJECT_ROOT")))
     (when (and env-root (plusp (length env-root)))
       (let ((dir (uiop:ensure-directory-pathname env-root)))
@@ -114,7 +112,7 @@ which cascades into nested errors when stderr is a broken pipe."
                           &optional (stream *standard-output*))
   "Write the one-line JSON handshake to STREAM then flush.
 SWANK-PORT must be 'null (CL:NULL) when absent — NOT nil, which jzon
-encodes as JSON false (the Phase-1 jzon nil-vs-null fix, D-06).
+encodes as JSON false (jzon encodes nil as false, not null).
 This is the ONLY write to stdout; stdout is redirected afterwards."
   (let ((ht (make-hash-table :test 'equal)))
     (setf (gethash "tcp_port"         ht) tcp-port
@@ -133,7 +131,7 @@ This is the ONLY write to stdout; stdout is redirected afterwards."
   "Open /dev/null for output and rebind *standard-output*, *debug-io*,
 *trace-output*, and *terminal-io* to it. After the handshake any further
 write to those streams goes silently to /dev/null rather than reaching
-the parent's pipe read (D-04 channel integrity)."
+the parent's pipe read — preserving the handshake channel."
   (let ((devnull (open #P"/dev/null" :direction :output :if-exists :append)))
     (setf *standard-output* devnull
           *debug-io*        (make-two-way-stream *standard-input* devnull)
@@ -146,16 +144,15 @@ the parent's pipe read (D-04 channel integrity)."
 
 (defun %start-parent-watchdog ()
   "Start a daemon thread that polls getppid() every 2 seconds and
-self-exits via sb-ext:exit when the parent dies (D-10, RESEARCH.md §Pitfall 6).
+self-exits via sb-ext:exit when the parent dies.
 
 The expected parent PID is read from DSMR_PARENT_PID (injected by
-%build-environment in worker-client). Falling back to the live getppid()
+%build-environment in worker-client). Falls back to the live getppid()
 value when the variable is absent (manual invocation or MCP_NO_WORKER_POOL).
 
-Docker ppid=1 special case (verbatim from cl-mcp): when DSMR_PARENT_PID
-is absent and the original ppid is already 1, the check that would
-detect a stale ppid is skipped — the worker is running inside a
-container where PID 1 is the legitimate parent."
+Docker ppid=1 special case: when DSMR_PARENT_PID is absent and the
+original ppid is already 1, the orphan check is skipped — the worker is
+running inside a container where PID 1 is the legitimate parent."
   (let* ((original-ppid (sb-posix:getppid))
          (env-ppid-str  (uiop:getenv "DSMR_PARENT_PID"))
          (expected-ppid
@@ -192,13 +189,13 @@ container where PID 1 is the legitimate parent."
   "Entry point for worker child processes. Called by the sbcl args built by
 %build-sbcl-args in worker-client.lisp.
 
-Follows the mandatory startup order (RESEARCH.md Pitfall 2, D-04):
+Follows the mandatory startup order:
   1. disable-debugger — first, unconditionally
   2. Restore *standard-output* to sb-sys:*stdout* (raw fd-1 pipe).
      %build-sbcl-args redirects *standard-output* to *error-output* before
-     asdf:load-system so ASDF compile notes and SLYNK's *debug-io* banner
-     do not corrupt the handshake channel.  Here we restore the raw fd-1
-     stream so step 6 (%output-handshake) can reach the parent's pipe read.
+     asdf:load-system so ASDF compile notes and the Slynk banner do not
+     corrupt the handshake channel.  Here we restore the raw fd-1 stream
+     so step 6 (%output-handshake) can reach the parent's pipe read.
   3. configure-log4cl-for-server — second; any earlier log would corrupt stdout
   4. log worker.starting
   5. make-worker-server (ephemeral TCP)
@@ -226,7 +223,7 @@ the process exits cleanly."
                "pid" (%get-pid)))
   ;; Install SIGTERM handler for clean pool shutdown.
   (%install-signal-handlers)
-  ;; Set project root when injected (Phase 6+ uses this for fs verbs).
+  ;; Set project root when injected (fs verbs read this for path resolution).
   (%setup-project-root)
   ;; Step 5: open ephemeral TCP port.
   (handler-case

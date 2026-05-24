@@ -1,18 +1,18 @@
 ;;;; tests/hermetic/circuit-breaker-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Integration tests for HERM-03 crash recovery and circuit-breaker behaviour.
+;;;; Integration tests for crash recovery and circuit-breaker behaviour.
 ;;;; These tests SIGKILL real SBCL worker subprocesses via sb-posix:kill,
 ;;;; so they exercise the full OS-level crash path and may take several seconds.
 ;;;;
-;;;; criterion-2 (D-14, ROADMAP): SIGKILL a bound worker; after the health
+;;;; crash-triggers-reset-notification: SIGKILL a bound worker; after the health
 ;;;; monitor detects the crash, the next same-session get-or-assign-worker
 ;;;; succeeds and check-and-clear-reset-notification returns T exactly once
 ;;;; (second call returns NIL — one-notification guarantee).
 ;;;;
-;;;; criterion-3 (D-13, ROADMAP): Induce 3 crashes for one session; the 4th
-;;;; get-or-assign-worker call must signal an error whose message contains
-;;;; "Circuit breaker". The error fires within *circuit-breaker-cooldown*
+;;;; circuit-breaker-trips-after-threshold: induce 3 crashes for one session;
+;;;; the 4th get-or-assign-worker call must signal an error whose message
+;;;; contains "Circuit breaker". The error fires within *circuit-breaker-cooldown*
 ;;;; (60 s) without attempting another spawn.
 
 (defpackage #:dsmr-mcp/tests/hermetic/circuit-breaker-test
@@ -46,15 +46,14 @@ we wait INTERVAL + 3 seconds to be safe."
   (sleep (+ interval 3)))
 
 ;;; ---------------------------------------------------------------------------
-;;; Criterion 2: one reset notification after crash + replacement (D-14)
+;;; One reset notification after crash + replacement
 ;;; ---------------------------------------------------------------------------
 
 (define-test crash-triggers-reset-notification
-  "HERM-03 / D-14 / ROADMAP criterion 2: SIGKILL on the bound worker triggers
-crash recovery; the next same-session get-or-assign-worker returns a replacement
-worker whose check-and-clear-reset-notification is T exactly once. The second
-call to check-and-clear-reset-notification on the same worker is NIL, confirming
-the one-notification guarantee."
+  "SIGKILL on the bound worker triggers crash recovery; the next same-session
+get-or-assign-worker returns a replacement worker whose
+check-and-clear-reset-notification is T exactly once. The second call returns
+NIL, confirming the one-notification guarantee."
   (let ((*mode* :hermetic)
         (*error-output* (make-string-output-stream))
         ;; Short health-check interval so the test doesn't take forever.
@@ -71,24 +70,24 @@ the one-notification guarantee."
              ;; The next call must succeed: recovery spawned a replacement.
              (let* ((next-worker (get-or-assign-worker "crash-recovery-session"))
                     (had-reset   (check-and-clear-reset-notification next-worker)))
-               ;; Criterion 2a: reset notification was set exactly once.
+               ;; Reset notification was set exactly once.
                (true had-reset)
-               ;; Criterion 2b: second call is NIL (one-notification guarantee, D-14).
+               ;; Second call returns NIL — one-notification guarantee.
                (false (check-and-clear-reset-notification next-worker))
-               ;; Criterion 2c: the replacement is a live worker with a different pid.
+               ;; The replacement is a live worker with a different pid.
                (true (integerp (worker-pid next-worker)))
                (true (plusp (worker-pid next-worker)))))
         (ignore-errors (shutdown-pool))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Criterion 3: circuit breaker trips after 3 crashes and fails fast (D-13)
+;;; Circuit breaker trips after threshold crashes
 ;;; ---------------------------------------------------------------------------
 
 (define-test circuit-breaker-trips-after-threshold
-  "HERM-03 / D-13 / ROADMAP criterion 3: induce *crash-breaker-threshold* (3)
-crashes for one session in quick succession. The next get-or-assign-worker call
-must signal an error whose message contains 'Circuit breaker'. No spawn attempt
-is made during the *circuit-breaker-cooldown* (60 s) window."
+  "Inducing *crash-breaker-threshold* (3) crashes for one session in quick
+succession causes the next get-or-assign-worker call to signal an error whose
+message contains 'Circuit breaker'. No spawn attempt is made during the
+*circuit-breaker-cooldown* (60 s) window."
   (let ((*mode* :hermetic)
         (*error-output* (make-string-output-stream))
         ;; Short health-check interval so recovery + crash cycling is faster.

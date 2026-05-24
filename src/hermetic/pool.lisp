@@ -7,15 +7,15 @@
 ;;;; 1. Strict exclusive affinity: 1 session = 1 dedicated worker. No sharing.
 ;;;; 2. Scale-out: When standbys exhausted, spawn new workers on demand up to max.
 ;;;; 3. Warm standbys: Pool pre-spawns workers ready for immediate assignment.
-;;;; 4. Crash recovery: Detect crash, restart worker, arm reset notification (D-14).
+;;;; 4. Crash recovery: Detect crash, restart worker, arm reset notification.
 ;;;; 5. Explicit crash notification: Session gets ONE notification about
 ;;;;    crash/reset — the next call after that succeeds normally.
 ;;;; 6. Circuit breaker + 60s cool-down (dsmr-mcp addition over cl-mcp):
 ;;;;    After 3 crashes in 5 minutes the breaker trips; further calls for that
-;;;;    session fail fast for 60 seconds (D-13, ROADMAP criterion 3).
-;;;; 7. Parent hard-kill backstop (D-12, SAFETY-05): The in-worker sb-ext:with-timeout
-;;;;    soft-kills the eval; the parent additionally SIGKILLs the worker after the
-;;;;    soft timeout plus DSMR_WORKER_KILL_GRACE_SECONDS (default 5s) to cover
+;;;;    session fail fast for 60 seconds.
+;;;; 7. Parent hard-kill backstop: The in-worker sb-ext:with-timeout soft-kills
+;;;;    the eval; the parent additionally SIGKILLs the worker after the soft
+;;;;    timeout plus DSMR_WORKER_KILL_GRACE_SECONDS (default 5s) to cover
 ;;;;    runaway FFI that cannot be interrupted by the soft timeout.
 ;;;;
 ;;;; Thread safety — lock hierarchy (NEVER acquire in reverse order):
@@ -26,8 +26,8 @@
 ;;;;   - log4cl via log-event (not cl-mcp/src/log's log-stream)
 ;;;;   - No proxy/cancel machinery (verify-proxy-bindings, active-requests)
 ;;;;   - No project-root broadcast (send-root-to-session-worker, broadcast-root-to-workers)
-;;;;   - +60s *circuit-breaker-map* cool-down (D-13; cl-mcp only removes the session)
-;;;;   - Parent hard-kill backstop in pool-rpc-with-hard-kill (D-12, SAFETY-05)
+;;;;   - +60s *circuit-breaker-map* cool-down (cl-mcp only removes the session)
+;;;;   - Parent hard-kill backstop in pool-rpc-with-hard-kill
 
 (defpackage #:dsmr-mcp/src/hermetic/pool
   (:use #:cl)
@@ -139,11 +139,11 @@ Default 16; override with DSMR_MAX_POOL_SIZE env var (positive integer).")
 ;;; ---------------------------------------------------------------------------
 
 (defparameter *crash-breaker-window* 300
-  "Time window in seconds for the crash circuit breaker (D-13: 5 min).")
+  "Time window in seconds for the crash circuit breaker (5 min).")
 
 (defparameter *crash-breaker-threshold* 3
   "Maximum crashes allowed within *crash-breaker-window* before halting
-recovery for a session (D-13).")
+recovery for a session.")
 
 (defparameter *max-concurrent-recoveries* 4
   "Maximum concurrent crash recovery threads. Prevents resource exhaustion
@@ -152,18 +152,18 @@ when many workers crash simultaneously.")
 (defvar *circuit-breaker-map* (make-hash-table :test 'equal)
   "Maps session-id -> circuit-breaker trip timestamp (get-universal-time).
 Entries are cleared by release-session so manual reset works.
-This is the dsmr-mcp addition over cl-mcp: cl-mcp only removes the
-session from the affinity map; dsmr-mcp additionally records the trip
-time and fails fast for *circuit-breaker-cooldown* seconds (D-13).")
+dsmr-mcp addition over cl-mcp: cl-mcp only removes the session from the
+affinity map; dsmr-mcp additionally records the trip time and fails fast
+for *circuit-breaker-cooldown* seconds.")
 
 (defparameter *circuit-breaker-cooldown* 60
-  "Seconds to fail-fast after circuit breaker trips for a session (D-13).
+  "Seconds to fail-fast after circuit breaker trips for a session.
 During the cooldown window, get-or-assign-worker signals an error
 immediately rather than attempting to spawn a replacement worker.
 After the window expires, the session may spawn a new worker normally.")
 
 ;;; ---------------------------------------------------------------------------
-;;; Parent hard-kill backstop — dsmr-mcp addition over cl-mcp (D-12, SAFETY-05)
+;;; Parent hard-kill backstop — dsmr-mcp addition over cl-mcp
 ;;; ---------------------------------------------------------------------------
 
 (defparameter *worker-kill-grace-seconds*
@@ -175,7 +175,7 @@ After the window expires, the session may spawn a new worker normally.")
 parent SIGKILLs the worker. If the worker's sb-ext:with-timeout fires and
 the worker does not return a response within this grace margin, the parent
 treats the worker as runaway and kills it, routing the crash through the
-normal recovery path (D-12, SAFETY-05). Override via DSMR_WORKER_KILL_GRACE_SECONDS.")
+normal recovery path. Override via DSMR_WORKER_KILL_GRACE_SECONDS.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Global pool state
@@ -405,12 +405,11 @@ value is honoured inside the new thread."
 
 (defun %handle-worker-crash (crashed-worker)
   "Handle a crashed worker: spawn a replacement bound to the same session,
-arm needs-reset-notification on the replacement (D-14), and set the
-circuit-breaker trip time when the crash threshold is reached (D-13).
+arm needs-reset-notification on the replacement, and set the circuit-breaker
+trip time when the crash threshold is reached.
 
 When the circuit breaker trips, records the trip time in *circuit-breaker-map*
-(the dsmr-mcp addition: get-or-assign-worker checks this before spawning,
-failing fast for *circuit-breaker-cooldown* seconds).
+so get-or-assign-worker fails fast for *circuit-breaker-cooldown* seconds.
 
 Exits immediately when *pool-running* is NIL to prevent orphan recovery
 threads from spawning workers after shutdown."
@@ -484,10 +483,8 @@ threads from spawning workers after shutdown."
                (when (eql (gethash session-id *affinity-map*) crashed-worker)
                  (remhash session-id *affinity-map*))
                (setf *all-workers* (remove crashed-worker *all-workers*))
-               ;; dsmr-mcp addition: record trip time for the 60s fail-fast
-               ;; cool-down. cl-mcp only removes the session; dsmr-mcp also
-               ;; stamps *circuit-breaker-map* so the next get-or-assign-worker
-               ;; call fails immediately instead of trying to spawn.
+               ;; Record trip time in *circuit-breaker-map* so the next
+               ;; get-or-assign-worker call fails immediately during the cooldown.
                (setf (gethash session-id *circuit-breaker-map*)
                      (get-universal-time)))))
          (when breaker-tripped
@@ -504,9 +501,8 @@ threads from spawning workers after shutdown."
                      (return-from %handle-worker-crash))
                    (setf (worker-state new-worker) :bound)
                    (setf (worker-session-id new-worker) session-id)
-                   ;; Arm the reset notification flag on the replacement (D-14).
-                   ;; check-and-clear-reset-notification (called by the dispatcher)
-                   ;; returns T exactly once, then clears it.
+                   ;; Arm the reset notification flag on the replacement so the
+                   ;; dispatcher returns T exactly once, then clears it.
                    (setf (worker-needs-reset-notification new-worker) t)
                    (setf (worker-last-crash-reason new-worker)
                            (worker-last-crash-reason crashed-worker)
@@ -786,9 +782,8 @@ If a standby worker is available, it is assigned immediately; otherwise
 a new worker is spawned. Multiple concurrent threads requesting the same
 new session coordinate via a placeholder so only one spawn occurs.
 
-Circuit breaker (dsmr-mcp addition): before spawning, checks
-*circuit-breaker-map* for a recent trip within *circuit-breaker-cooldown*
-seconds and fails fast with an informative error (D-13, criterion 3).
+Circuit breaker: before spawning, checks *circuit-breaker-map* for a recent
+trip within *circuit-breaker-cooldown* seconds and fails fast with an error.
 
 Signals pool-shutting-down if the pool is not running.
 Signals pool-capacity-exceeded if max workers would be exceeded.
@@ -799,9 +794,8 @@ Signals error with 'Circuit breaker' in message during the cooldown window."
     (bt:with-lock-held (*pool-lock*)
       (unless *pool-running*
         (error 'pool-shutting-down))
-      ;; dsmr-mcp addition: check circuit-breaker cooldown BEFORE anything else.
-      ;; cl-mcp only removes the session; we additionally block calls during the
-      ;; 60s fail-fast window after the breaker trips.
+      ;; Check circuit-breaker cooldown BEFORE anything else.
+      ;; Blocks calls during the fail-fast window after the breaker trips.
       (let ((trip-time (gethash session-id *circuit-breaker-map*)))
         (when (and trip-time
                    (< (get-universal-time) (+ trip-time *circuit-breaker-cooldown*)))
@@ -848,7 +842,7 @@ The worker crashed ~D times in ~Ds. Manual reset via release-session."
         ;; Path 2: placeholder — another thread is spawning
         ((and entry (typep entry 'worker-placeholder))
          nil))
-      ;; Phase 2: assign standby or insert placeholder for spawn
+      ;; Assign standby or insert placeholder for spawn
       (when (and (null entry) (not circuit-breaker-tripped))
         (loop while *standby-workers*
               for w = (pop *standby-workers*)
@@ -919,8 +913,8 @@ spawn thread will clean up the worker after it completes."
            (setf (worker-state worker-to-kill) :released)
            (remhash session-id *affinity-map*)
            (remhash session-id *crash-history*)
-           ;; dsmr-mcp: clear the circuit breaker map so release-session
-           ;; serves as a manual reset (plan criterion 3).
+           ;; Clear the circuit breaker map so release-session serves as
+           ;; a manual reset.
            (remhash session-id *circuit-breaker-map*)
            (setf *all-workers* (remove worker-to-kill *all-workers*)))
           ((and entry (typep entry 'worker-placeholder))
@@ -1008,8 +1002,7 @@ to prevent unrestricted REPL access bypassing MCP security policies."
     result))
 
 (defun pool-status-info ()
-  "Return a hash-table with pool diagnostic information (used by the
-pool-status MCP tool, HERM-06 / OPS-03).
+  "Return a hash-table with pool diagnostic information for the pool-status MCP tool.
 Keys: pool_running, total_workers, standby_count, bound_count,
 max_pool_size, warmup_target, workers (vector of per-worker hashes)."
   (let* ((running *pool-running*)
@@ -1031,7 +1024,7 @@ max_pool_size, warmup_target, workers (vector of per-worker hashes)."
       info)))
 
 ;;; ---------------------------------------------------------------------------
-;;; Public API — pool-rpc-with-hard-kill (D-12, SAFETY-05)
+;;; Public API — pool-rpc-with-hard-kill
 ;;; ---------------------------------------------------------------------------
 
 (defun pool-rpc-with-hard-kill (worker method params
@@ -1039,19 +1032,18 @@ max_pool_size, warmup_target, workers (vector of per-worker hashes)."
                                       (grace *worker-kill-grace-seconds*))
   "Send METHOD with PARAMS to WORKER, returning the result hash-table.
 
-Implements the two-level timeout (D-12, SAFETY-05):
+Implements a two-level timeout:
   - SOFT-TIMEOUT: passed to worker-rpc so the in-worker sb-ext:with-timeout
     fires if the eval exceeds it. The worker returns a TIMEOUT error payload.
     Defaults to *default-eval-timeout* (120 s) — the eval budget, not the
-    startup budget (WR-04: previously defaulted to *worker-startup-timeout*,
-    30 s, which would hard-kill legitimately long but within-budget evals).
+    startup budget.
   - Hard-kill backstop: if the worker does not return within SOFT-TIMEOUT +
     GRACE seconds, the parent kills the worker via its sb-ext:process object
     (avoiding the PID-reuse hazard of killing by raw numeric pid after the
     process may have already exited), then marks it crashed via the normal
     mark-worker-crashed path (which closes the stream and arms the reset
     notification), then signals WORKER-CRASHED so the dispatcher's existing
-    handler returns a structured isError — never a phantom NIL result (CR-02).
+    handler returns a structured isError.
 
 WORKER-CRASHED from worker-rpc is re-signalled unchanged so the dispatcher's
 existing handler fires for both the soft and hard timeout cases."

@@ -6,9 +6,8 @@
 ;;;; class-allocated schema, dispatch tool-handle, map validation failures
 ;;;; to -32602.
 ;;;;
-;;;; Phase 1 always runs tools inline (no attached/hermetic backend routing).
-;;;; Phase 3+ will extend this file to route to attached/hermetic backends
-;;;; when the session's backend policy is set.
+;;;; Inline tool dispatch is the initial posture; backend routing to attached
+;;;; or hermetic workers is added as those subsystems come online.
 ;;;;
 ;;;; Regression boundary (assertion b5/c in the test plan):
 ;;;;   *current-session-id* must be a bound, non-empty string when
@@ -49,7 +48,7 @@
 1. Assert *current-session-id* is a bound, non-empty string (regression
    boundary — the transport must bind this before calling process-json-line).
 2. When *mode* is :hermetic, route directly to dispatch-hermetic-call which
-   handles pool assignment, the one-notification crash path (D-14), and
+   handles pool assignment, the one-notification crash path, and
    all structured pool error conditions.
 3. Extract tool name from params.
 4. Look up the class in *tool-classes* — return -32601 if not found.
@@ -69,8 +68,8 @@
             The transport (or test setup) must bind it before calling ~
             process-json-line."))
   ;; Hermetic mode: route to the pool dispatcher. dispatch-hermetic-call
-  ;; handles get-or-assign-worker, the one-notification reset path (D-14),
-  ;; and all pool/worker conditions — nothing unhandled escapes (T-04-17).
+  ;; handles get-or-assign-worker, the one-notification reset path,
+  ;; and all pool/worker conditions — nothing unhandled escapes.
   (when (eq *mode* :hermetic)
     (let ((name (and params (gethash "name" params)))
           (args (and params (gethash "arguments" params))))

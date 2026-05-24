@@ -1,9 +1,9 @@
 ;;;; tests/protocol/argument-validation-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; MCP-05: argument validation test. A stub tool with a required "code"
-;;;; argument, called via tools/call with an empty arguments hash, returns
-;;;; -32602 whose message contains "code".
+;;;; Argument validation test. A stub tool with a required "code" argument,
+;;;; called via tools/call with an empty arguments hash, returns -32602 whose
+;;;; message contains "code".
 ;;;;
 ;;;; This test exercises the validate-args -> arg-validation-error ->
 ;;;; -32602 path in src/dispatch.lisp.
@@ -34,7 +34,8 @@
 ;;; In-test stub tool ---------------------------------------------------------
 ;;; This tool requires a "code" argument. Calling it without "code" must
 ;;; trigger arg-validation-error -> -32602 with a message naming "code".
-;;; Class-allocated slots via :initform (Plan 01-01 deviation rule).
+;;; Class-allocated slots via :initform (not :default-initargs) because
+;;; c2mop:class-prototype does not apply :default-initargs.
 
 (defclass arg-val-test-tool (mcp-tool)
   ((dsmr-mcp/src/tools/base::name
@@ -77,14 +78,14 @@ Returns the parsed response object."
 ;;; Tests ---------------------------------------------------------------------
 
 (define-test missing-required-arg-returns-32602
-  "MCP-05: calling a tool with an empty arguments object when a required
+  "Calling a tool with an empty arguments object when a required
 field exists returns -32602 Invalid Params."
   (true (gethash "arg-val-test" *tool-classes*))
   (let ((obj (%initialize-and-call "arg-val-test" "{}")))
     (is = -32602 (jsonrpc-error-code obj))))
 
 (define-test missing-required-arg-message-names-field
-  "MCP-05: the -32602 error message names the missing required field.
+  "The -32602 error message names the missing required field.
 The message must contain \"code\" so the caller knows which field is absent."
   (let* ((obj (%initialize-and-call "arg-val-test" "{}"))
          (msg (gethash* obj "error" "message")))
@@ -92,16 +93,17 @@ The message must contain \"code\" so the caller knows which field is absent."
     (true (search "code" msg))))
 
 (define-test valid-args-reach-tool-handle
-  "MCP-05 (negative): when the required argument is present, validate-args
-passes, tool-handle is called, and a success result is returned."
+  "When the required argument is present, validate-args passes,
+tool-handle is called, and a success result is returned."
   (let ((obj (%initialize-and-call "arg-val-test" "{\"code\":\"hello\"}")))
     (false (gethash "error" obj))
     (true (hash-table-p (gethash "result" obj)))))
 
 (define-test null-required-arg-is-present
-  "MCP-05: a required field with jzon null sentinel 'null counts as
-present — validate-args must not signal. The type check for null
-is intentionally skipped (addendum §6: null is present-but-null)."
+  "A required field with jzon null sentinel 'null counts as present —
+validate-args must not signal. The type check for null is intentionally
+skipped (null is present-but-null: its type compliance depends on whether
+the schema allows null, which validate-args does not enforce)."
   ;; Calling with code: null — validate-args should NOT signal (null is present).
   ;; The tool-handle itself will receive null as the code value.
   (let ((obj (%initialize-and-call "arg-val-test" "{\"code\":null}")))
@@ -112,9 +114,9 @@ is intentionally skipped (addendum §6: null is present-but-null)."
     (true (hash-table-p (gethash "result" obj)))))
 
 (define-test mixed-case-required-entry-normalizes-consistently
-  "WR-04: a :required entry with mixed case (e.g. \"Code\") must normalize to
-the same wire key (\"code\") that the type-check pass uses, so presence and
-type checks agree on one key.  Tests validate-args directly."
+  "A :required entry with mixed case (e.g. \"Code\") must normalize to the
+same wire key (\"code\") that the type-check pass uses, so presence and type
+checks agree on one key.  Tests validate-args directly."
   ;; Schema with mixed-case :required entry "Code" against property (code :type :string).
   (let ((schema '(:object
                   :properties ((code :type :string :description "test"))

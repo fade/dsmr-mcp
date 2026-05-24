@@ -5,19 +5,18 @@
 ;;;; writes one response line per request to the output stream with
 ;;;; force-output, and returns T at EOF.
 ;;;;
-;;;; Key design decisions (from 01-CONTEXT.md):
-;;;;   D-10: serve-streams is the thin entry point string-stream injection
-;;;;         drives as the default end-to-end fixture.
+;;;; Key design decisions:
+;;;;   serve-streams is the thin entry point; string-stream injection drives it
+;;;;   as the default end-to-end test fixture.
 ;;;;   %dispatch-with-stdout-guard captures any stray *standard-output* writes
 ;;;;         so tool code can never corrupt the JSON-RPC channel.
 ;;;;   %read-line-limited caps accumulated bytes at +max-json-line-bytes+
 ;;;;         (8 MB) and signals line-too-long; oversized lines return a
-;;;;         literal -32600 "Request too large" envelope (T-03-01 mitigation).
+;;;;         literal -32600 "Request too large" envelope.
 ;;;;
-;;;; Divergences from cl-mcp (read-only MIT reference,
-;;;;   $LISP_WORKSPACE/cl-mcp/src/run.lisp):
-;;;;   - No worker-pool calls (initialize-pool / shutdown-pool) — Phase 4.
-;;;;   - No attach-disconnect-all — Phase 2.
+;;;; Divergences from cl-mcp (read-only MIT reference):
+;;;;   - No worker-pool calls (initialize-pool / shutdown-pool).
+;;;;   - No attach-disconnect-all.
 ;;;;   - Moved out of run.lisp into its own transport package.
 
 (defpackage #:dsmr-mcp/src/transport/stdio
@@ -44,11 +43,11 @@
   "Maximum byte count for a single JSON-RPC input line (8 MB).
 Lines that exceed this cap are rejected with a -32600 error envelope;
 the loop continues so subsequent well-formed lines are still served.
-This is the Phase-1 mitigation for threat T-03-01 (oversized-input DoS).
+Defends against oversized-input resource exhaustion.
 
-NOTE: Phase 1 counts characters, not bytes, as an approximation for
-ASCII-heavy JSON payloads.  A future phase can use babel:string-size-in-octets
-or a manual UTF-8 width accumulator if the approximation proves inadequate.")
+NOTE: counts characters, not bytes, as an approximation for ASCII-heavy
+JSON payloads.  babel:string-size-in-octets or a manual UTF-8 width
+accumulator can be substituted if the approximation proves inadequate.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Conditions
@@ -107,7 +106,7 @@ Returns two values:
              (empty string when nothing was leaked).
 
 The caller logs a STDIO.TRANSPORT.STDOUT-POLLUTION warning when CAPTURED
-is non-empty (T-03-02 mitigation)."
+is non-empty."
   (let* ((capture (make-string-output-stream))
          (response (let ((*standard-output* capture))
                      (process-json-line line session))))
@@ -131,23 +130,23 @@ Behaviour:
     %DISPATCH-WITH-STDOUT-GUARD, which captures any stray *STANDARD-OUTPUT*
     writes so they cannot corrupt the JSON-RPC channel.
   - Each response is followed by FORCE-OUTPUT so a piped reader sees it
-    immediately (D-10, T-03-03 partial mitigation for broken-pipe recovery).
+    immediately.
   - An oversized input line (> +MAX-JSON-LINE-BYTES+ chars) causes a literal
     -32600 \"Request too large\" envelope to be written; the loop then
-    continues reading subsequent lines rather than aborting (T-03-01).
-    The drain that follows a too-long read is itself bounded to
-    +MAX-JSON-LINE-BYTES+: a newline-free hostile stream terminates the
-    connection rather than pinning the loop (T-03-01 complete mitigation).
+    continues reading subsequent lines rather than aborting. The drain that
+    follows a too-long read is itself bounded to +MAX-JSON-LINE-BYTES+: a
+    newline-free hostile stream terminates the connection rather than pinning
+    the loop.
   - A STREAM-ERROR on the write path (broken pipe, closed client) ends the
     loop cleanly without signaling further up.
   - STDIO.START fires on loop entry; STDIO.STOP fires in the unwind-protect
     cleanup so it logs even on abnormal exit.
 
 Divergences from cl-mcp src/run.lisp:
-  - No worker-pool calls (Phase 4).
-  - detach-session closes the attached Slynk connection on teardown (D-18,
-    Phase 2); called before the stdio.stop log via runtime symbol resolution
-    so this file compiles before dsmr-mcp/src/attach/dispatch is loaded."
+  - No worker-pool calls.
+  - detach-session closes the attached Slynk connection on teardown; called
+    before the stdio.stop log via runtime symbol resolution so this file
+    compiles before dsmr-mcp/src/attach/dispatch is loaded."
   (let ((*current-session-id* (session-id session)))
     (log-event :info "stdio.start" "session" (session-id session))
     (unwind-protect
@@ -162,7 +161,7 @@ Divergences from cl-mcp src/run.lisp:
                            ;; the drain at +max-json-line-bytes+ too.  A hostile
                            ;; peer that never sends a newline must not pin us
                            ;; here indefinitely — terminate the connection if the
-                           ;; drain budget is exceeded (T-03-01 full mitigation).
+                           ;; drain budget is exceeded — terminate rather than pinning indefinitely.
                            (loop with drained = 0
                                  for ch = (read-char in nil nil)
                                  while ch
@@ -207,8 +206,8 @@ Divergences from cl-mcp src/run.lisp:
                         (log-event :warn "stdio.write.error"
                                    "error" (princ-to-string e))
                         (return t)))))))))
-      ;; Cleanup: D-18 — close the attached Slynk connection before logging stop
-      ;; so the host Slynk listener gets a clean FIN on EOF or abnormal exit.
+      ;; Cleanup: close the attached Slynk connection before logging stop so
+      ;; the host Slynk listener gets a clean FIN on EOF or abnormal exit.
       ;; Runtime symbol resolution avoids a compile-time dep on
       ;; dsmr-mcp/src/attach/dispatch (same technique as the version lookup
       ;; in protocol.lisp %handle-initialize). ignore-errors guards against

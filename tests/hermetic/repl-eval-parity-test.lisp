@@ -3,19 +3,17 @@
 ;;;;
 ;;;; Integration tests proving hermetic repl-eval parity with the attached path:
 ;;;;
-;;;; D-17: The hermetic worker returns the same error_context envelope shape
-;;;;        (condition_type, message, restarts, frames) as the attached path.
+;;;; Error parity: the hermetic worker returns the same error_context envelope
+;;;; shape (condition_type, message, restarts, frames) as the attached path.
 ;;;;
-;;;; SAFETY-05: A per-call soft timeout returns a structured TIMEOUT result
-;;;;             naming SB-EXT:TIMEOUT; the worker survives and subsequent
-;;;;             evals succeed.
+;;;; Soft timeout: a per-call soft timeout returns a structured TIMEOUT result
+;;;; naming SB-EXT:TIMEOUT; the worker survives and subsequent evals succeed.
 ;;;;
-;;;; ROADMAP criterion 1: a benign (+ 40 2) eval round-trips end-to-end through
-;;;;                       the pool → worker → result path and returns the value.
+;;;; Benign eval: a (+ 40 2) eval round-trips end-to-end through the pool →
+;;;; worker → result path and returns the value.
 ;;;;
-;;;; ROADMAP criterion 4: with mode :auto and no reachable Slynk listener,
-;;;;                       resolve-mode resolves :hermetic and logs the
-;;;;                       run.auto-mode warn (HERM-07, D-15).
+;;;; Auto fallback: with mode :auto and no reachable Slynk listener,
+;;;; resolve-mode resolves :hermetic and logs the run.auto-mode warn.
 ;;;;
 ;;;; All tests use *worker-pool-warmup* 0 / *max-pool-size* 4 to keep the
 ;;;; test fast and avoid spawning unnecessary standby workers.
@@ -51,7 +49,8 @@
 (defun %with-pool-eval (session-id params-ht &key (soft-timeout nil))
   "Spawn a pool with warmup=0, get a worker for SESSION-ID, call worker/eval
 with PARAMS-HT, shutdown the pool, and return the response hash-table.
-Uses pool-rpc-with-hard-kill when SOFT-TIMEOUT is provided (SAFETY-05 path)."
+Uses pool-rpc-with-hard-kill when SOFT-TIMEOUT is provided (the two-level
+timeout path: soft in-worker timeout plus parent SIGKILL backstop)."
   (let ((*worker-pool-warmup* 0)
         (*max-pool-size* 4))
     (initialize-pool)
@@ -66,13 +65,13 @@ Uses pool-rpc-with-hard-kill when SOFT-TIMEOUT is provided (SAFETY-05 path)."
       (ignore-errors (shutdown-pool)))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Criterion 1 — benign eval round-trip (ROADMAP criterion 1)
+;;; Benign eval round-trip
 ;;; ---------------------------------------------------------------------------
 
 (define-test criterion-1-benign-eval-round-trip
-  "ROADMAP criterion 1: a benign eval of (+ 40 2) round-trips end-to-end
-through the pool → worker → result path. The response has no error_context
-and the content field contains the printed value 42."
+  "A benign eval of (+ 40 2) round-trips end-to-end through the pool → worker
+→ result path. The response has no error_context and the content field
+contains the printed value 42."
   (let* ((dsmr-mcp/src/state:*mode* :hermetic)
          (capture (make-string-output-stream))
          (*error-output* capture))
@@ -91,13 +90,13 @@ and the content field contains the printed value 42."
           (true (search "42" text)))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; D-17 — error_context parity with the attached path
+;;; Error context parity with the attached path
 ;;; ---------------------------------------------------------------------------
 
 (define-test d-17-error-context-parity
-  "D-17: hermetic repl-eval of (error \"boom\") returns the same error_context
+  "hermetic repl-eval of (error \"boom\") returns the same error_context
 envelope shape as the attached path: non-empty condition_type, message, restarts
-(simple-vector), and frames (simple-vector). This proves the build-wrapping-form
+(simple-vector), and frames (simple-vector). Proves the build-wrapping-form
 + eval + build-eval-response pipeline gives identical output regardless of
 whether the eval runs locally or in a hermetic worker."
   (let* ((dsmr-mcp/src/state:*mode* :hermetic)
@@ -132,14 +131,13 @@ whether the eval runs locally or in a hermetic worker."
           (true (simple-vector-p (gethash "locals" frame0))))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; SAFETY-05 — soft timeout returns structured TIMEOUT; worker survives
+;;; Soft timeout — structured TIMEOUT result; worker survives
 ;;; ---------------------------------------------------------------------------
 
 (define-test safety-05-timeout-and-worker-survival
-  "SAFETY-05: eval of (sleep 200) with timeout_seconds=1 returns a structured
-TIMEOUT response naming SB-EXT:TIMEOUT in condition_type. A subsequent eval
-on the SAME worker (same session) succeeds with the correct value — the worker
-survived the timeout and is still available."
+  "Eval of (sleep 200) with timeout_seconds=1 returns a structured TIMEOUT
+response naming SB-EXT:TIMEOUT in condition_type. A subsequent eval on the
+SAME worker (same session) succeeds — the worker survived the timeout."
   (let* ((dsmr-mcp/src/state:*mode* :hermetic)
          (capture (make-string-output-stream))
          (*error-output* capture)
@@ -175,24 +173,23 @@ survived the timeout and is still available."
       (ignore-errors (shutdown-pool)))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Criterion 4 — :auto + no Slynk → :hermetic + run.auto-mode warn (HERM-07)
+;;; Auto fallback — :auto + no Slynk → :hermetic + run.auto-mode warn
 ;;; ---------------------------------------------------------------------------
 
 (define-test criterion-4-auto-fallback-logs-warn-and-resolves-hermetic
-  "ROADMAP criterion 4 / HERM-07 / D-15: with mode :auto and no reachable
-Slynk listener (slynk-attach nil), resolve-mode resolves :hermetic and emits
-a run.auto-mode :warn line on stderr. This is the logged fallback that
-distinguishes :auto from a silent alias of :attached.
+  "With mode :auto and no reachable Slynk listener (slynk-attach nil),
+resolve-mode resolves :hermetic and emits a run.auto-mode :warn line on stderr.
+This is the logged fallback that distinguishes :auto from a silent alias of :attached.
 
 Duplicates the mode-router-test assertion in the hermetic suite for locality
-— test failures in either suite surface the criterion-4 failure clearly."
+— test failures in either suite surface the failure clearly."
   (let* ((capture (make-string-output-stream))
          (*error-output* capture))
     (configure-log4cl-for-server :debug)
     (let ((resolved (resolve-mode :mode :auto :slynk-attach nil)))
-      ;; :auto with no Slynk must resolve to :hermetic (D-15).
+      ;; :auto with no Slynk must resolve to :hermetic.
       (is eq :hermetic resolved)
-      ;; The run.auto-mode warn must appear on stderr (HERM-07).
+      ;; The run.auto-mode warn must appear on stderr.
       (let ((stderr (get-output-stream-string capture)))
         (true (search "run.auto-mode" stderr))))))
 

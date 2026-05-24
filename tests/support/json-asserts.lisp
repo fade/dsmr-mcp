@@ -5,7 +5,7 @@
 ;;;; hash-table shapes. Every protocol test imports these rather than
 ;;;; hand-rolling gethash walks inline.
 ;;;;
-;;;; D-12: hash-table key assertion is the canonical assertion shape —
+;;;; hash-table key assertion is the canonical assertion shape —
 ;;;; no JSON string comparison, no snapshot tests.
 
 (defpackage #:dsmr-mcp/tests/support/json-asserts

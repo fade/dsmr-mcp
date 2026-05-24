@@ -9,7 +9,7 @@
 ;;;; Framing: imports %read-line-limited / +max-json-line-bytes+ from
 ;;;; worker-client — the same 16 MB cap used on both sides of the wire.
 ;;;; Auth: every method call (except worker/authenticate itself) is gated
-;;;; behind the DSMR_WORKER_SECRET check (SAFETY-05 channel boundary).
+;;;; behind a DSMR_WORKER_SECRET check to prevent spoofing by co-resident processes.
 
 (defpackage #:dsmr-mcp/src/hermetic/worker/server
   (:use #:cl)
@@ -127,7 +127,7 @@ that returns a hash-table to be used as the JSON-RPC result."
 (defun %dispatch-request (server stream id method params)
   "Dispatch a JSON-RPC request to the registered handler and write
 the response to STREAM. Authentication is gated before any non-auth
-method fires (SAFETY-05 / D-05 spoofing boundary).
+method fires (guards against spoofing by co-resident processes).
 
 Only worker/authenticate and worker/ping are allowed on an
 unauthenticated connection; everything else returns -32600."
@@ -230,7 +230,7 @@ is the authoritative termination path.
 
 line-too-long is caught specifically and answered with a -32600 error
 so the loop survives a single oversized request rather than treating
-the size violation as an unrecoverable EOF/crash (WR-05)."
+the size violation as an unrecoverable EOF/crash."
   (loop while (worker-server-running-p server)
         for line = (handler-case
                        (sb-ext:with-timeout *worker-read-timeout*

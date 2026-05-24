@@ -1,9 +1,9 @@
 ;;;; tests/state/session-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; MCP-04 unit tests: session state, metaclass auto-registration,
+;;;; Unit tests: session state, metaclass auto-registration,
 ;;;; per-session tool-instance identity, *current-session-id* binding.
-;;;; Task 2 helper tests appended at the bottom of this file.
+;;;; Helper tests for schema->json and validate-args are appended at the bottom.
 
 (defpackage #:dsmr-mcp/tests/state/session-test
   (:use #:cl #:parachute)
@@ -74,7 +74,7 @@
 ;; (closer-mop pitfall documented in 01-PATTERNS.md).
 (c2mop:ensure-finalized (find-class 'session-test-ping-tool))
 
-;;; MCP-04 unit tests -------------------------------------------------------
+;;; Session unit tests -------------------------------------------------------
 
 (define-test fresh-session-is-uninitialized
   "make-session returns a session with initialized-p NIL and an empty

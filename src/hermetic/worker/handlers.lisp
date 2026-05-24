@@ -2,18 +2,18 @@
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
 ;;;; Method handlers for hermetic worker JSON-RPC server.
-;;;; Phase 4 verb surface = worker/eval only (D-18).
+;;;; Current verb surface: worker/eval only.
 ;;;;
 ;;;; register-all-handlers wires the single handler into the server.
 ;;;; The handler function takes a params hash-table and returns a
 ;;;; hash-table payload; worker/server.lisp wraps it in the JSON-RPC
 ;;;; result envelope.
 ;;;;
-;;;; %handle-eval implements attached/hermetic repl-eval output parity (D-17)
-;;;; via build-wrapping-form + eval + build-eval-response — the same pipeline
+;;;; %handle-eval implements attached/hermetic repl-eval output parity via
+;;;; build-wrapping-form + eval + build-eval-response — the same pipeline
 ;;;; as the attached path with local eval replacing slime-eval. A per-call
 ;;;; soft timeout (sb-ext:with-timeout) guards against runaway evaluations
-;;;; while keeping the worker alive for subsequent calls (SAFETY-05).
+;;;; while keeping the worker alive for subsequent calls.
 
 (defpackage #:dsmr-mcp/src/hermetic/worker/handlers
   (:use #:cl)
@@ -39,8 +39,8 @@
     (if (and v (not (string= v "")))
         (max 1 (parse-integer v :junk-allowed t))
         120))
-  "Default per-call eval timeout in seconds (D-11). Workers serving
-autonomous agents need a bounded default to prevent runaway evaluations.
+  "Default per-call eval timeout in seconds. Workers serving autonomous agents
+need a bounded default to prevent runaway evaluations.
 Override via DSMR_WORKER_EVAL_TIMEOUT environment variable.")
 
 ;;; ---------------------------------------------------------------------------
@@ -48,17 +48,17 @@ Override via DSMR_WORKER_EVAL_TIMEOUT environment variable.")
 ;;; ---------------------------------------------------------------------------
 
 (defun %handle-eval (params)
-  "Evaluate code in-process and return the response structure (D-17 parity).
+  "Evaluate code in-process and return the response structure.
 
 Reads code / package / timeout_seconds / max_output_length from PARAMS.
 Builds the wrapping form via build-wrapping-form, evaluates it inside
 sb-ext:with-timeout (client timeout_seconds else *default-eval-timeout*),
 then calls build-eval-response with the same pipeline as the attached path
-(build-wrapping-form + eval + build-eval-response), giving attached/hermetic
-repl-eval output parity (D-17).
+(build-wrapping-form + eval + build-eval-response), giving identical output
+regardless of whether the eval runs in attached or hermetic mode.
 
 On sb-ext:timeout the worker returns a structured TIMEOUT result and
-SURVIVES — the condition is caught, not re-signalled (SAFETY-05).
+SURVIVES — the condition is caught, not re-signalled.
 
 Returns a hash-table payload; worker/server.lisp wraps it in the JSON-RPC
 result envelope (jsonrpc/id/result) before sending to the dispatcher."
@@ -100,9 +100,9 @@ result envelope (jsonrpc/id/result) before sending to the dispatcher."
 ;;; ---------------------------------------------------------------------------
 
 (defun register-all-handlers (server)
-  "Register all Phase-4 worker method handlers on SERVER.
-Phase-4 verb surface = worker/eval only (D-18). No fs-*, inspect-*,
-or other handlers are registered this phase."
+  "Register all worker method handlers on SERVER.
+Current verb surface: worker/eval only. No fs-*, inspect-*,
+or other handlers are registered yet."
   (register-method server "worker/eval" #'%handle-eval)
   (log-event :info "worker.handlers.registered" "count" 1)
   server)

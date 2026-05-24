@@ -6,21 +6,21 @@
 ;;;; Re-implemented from cl-mcp/src/attach.lisp §222-358 (MIT) under AGPL.
 ;;;;
 ;;;; Enhancements over the cl-mcp attach path:
-;;;;   D-04: handler-bind (not handler-case) so the stack is live at capture time.
-;;;;   D-06: all multiple values collected, not just last.
-;;;;   D-09: end-of-file conditions annotated with stdin hint.
-;;;;   D-10: symbol prefix changed to %DSMR-MCP-ATTACH-.
-;;;;   D-19: *read-eval* seam left clean for the SAFETY-* pass.
+;;;;   handler-bind (not handler-case) so the stack is live at capture time.
+;;;;   all multiple values collected, not just last.
+;;;;   end-of-file conditions annotated with stdin hint.
+;;;;   symbol prefix changed to %DSMR-MCP-ATTACH-.
+;;;;   *read-eval* seam left clean for a future safety pass.
 ;;;;
-;;;; D-08: full 7-stream rebinding — *standard-output* *error-output*
-;;;;       *trace-output* *debug-io* *query-io* *terminal-io*
-;;;;       *standard-input* — so TUI applications in the attached image
-;;;;       never corrupt the dispatcher's JSON-RPC stdout channel.
-;;;;       (cl-mcp commit 0797438c rationale)
+;;;; Full 7-stream rebinding — *standard-output* *error-output*
+;;;;   *trace-output* *debug-io* *query-io* *terminal-io*
+;;;;   *standard-input* — so TUI applications in the attached image
+;;;;   never corrupt the dispatcher's JSON-RPC stdout channel.
+;;;;   (cl-mcp commit 0797438c rationale)
 ;;;;
-;;;; D-11/D-12: truncate-output / sanitize-control-chars live here and
-;;;;            are called by the dispatcher AFTER the result returns from
-;;;;            the remote image (not inside the wrap-form itself).
+;;;; truncate-output / sanitize-control-chars live here and are called
+;;;; by the dispatcher AFTER the result returns from the remote image
+;;;; (not inside the wrap-form itself).
 
 (defpackage #:dsmr-mcp/src/attach/wrap-form
   (:use #:cl)
@@ -32,14 +32,14 @@
 
 (in-package #:dsmr-mcp/src/attach/wrap-form)
 
-;;; Output length knob (D-11) ------------------------------------------------
+;;; Output length knob -------------------------------------------------------
 
 (defparameter *default-max-output-length* 50000
   "Default maximum characters for captured output strings (stdout, stderr,
 printed values).  Prevents unbounded output from exhausting memory or
 flooding the JSON-RPC wire.  50 KB matches cl-mcp's *default-max-output-length*.")
 
-;;; Control-character sanitisation (D-12) ------------------------------------
+;;; Control-character sanitisation ------------------------------------------
 ;;;
 ;;; Re-implemented from cl-mcp/src/utils/sanitize.lisp §27-125 (MIT) under
 ;;; AGPL.  Strips ANSI/ECMA-48 escape sequence families (CSI, OSC, DCS, SOS,
@@ -115,7 +115,7 @@ path).  Returns NIL when given NIL."
            (vector-push-extend char result)))))
     (coerce result 'string)))
 
-;;; Output truncation (D-11) -------------------------------------------------
+;;; Output truncation --------------------------------------------------------
 ;;;
 ;;; Re-implemented from cl-mcp/src/repl-core.lisp §59-69 (MIT) under AGPL.
 ;;; Truncate BEFORE sanitising — avoids sanitising data that will be
@@ -123,7 +123,7 @@ path).  Returns NIL when given NIL."
 
 (defun truncate-output (string max-output-length)
   "Truncate STRING to MAX-OUTPUT-LENGTH chars then sanitize control characters.
-Appends the literal marker \"...(truncated)\" when truncation occurs (D-11).
+Appends the literal marker \"...(truncated)\" when truncation occurs.
 When MAX-OUTPUT-LENGTH is not a positive integer, sanitize only (no cap).
 Returns NIL when STRING is NIL."
   (if (and max-output-length
@@ -136,15 +136,13 @@ Returns NIL when STRING is NIL."
 
 ;;; Wrap-form builder --------------------------------------------------------
 ;;;
-;;; Re-implemented from cl-mcp/src/attach.lisp §222-358 (MIT) under AGPL
-;;; with D-04/D-06/D-09/D-10/D-19 enhancements.
+;;; Re-implemented from cl-mcp/src/attach.lisp §222-358 (MIT) under AGPL.
 ;;;
-;;; CRITICAL CONSTRAINTS (cl-mcp attach.lisp §247-266 docstring; RESEARCH.md
-;;; Pitfall 1):
+;;; CRITICAL CONSTRAINTS (cl-mcp attach.lisp §247-266 docstring):
 ;;;
 ;;; 1. Every helper symbol used INSIDE the returned form is interned in
 ;;;    CL-USER via (intern name (find-package :common-lisp-user)) with the
-;;;    %DSMR-MCP-ATTACH- prefix (D-10).  slynk-client's slime-net-send
+;;;    %DSMR-MCP-ATTACH- prefix.  slynk-client's slime-net-send
 ;;;    prints the form with *package* bound to an IO-package that imports
 ;;;    only nil/t/quote.  Any symbol not in CL or CL-USER gets
 ;;;    package-qualified with the dispatcher's home package
@@ -162,7 +160,7 @@ Returns NIL when STRING is NIL."
 ;;;
 ;;; Block/return structure note:
 ;;;    The handler-bind error handlers use (return) to exit an enclosing
-;;;    (block nil ...) early (D-04: the stack is still live at that point).
+;;;    (block nil ...) early (the stack is still live at that point).
 ;;;    The 5-element (list ...) result is the SECOND body form of the outer
 ;;;    let*, placed AFTER the block, so it always executes — whether the block
 ;;;    completed normally (s-err-ctx = nil) or via (return) (s-err-ctx set).
@@ -175,10 +173,10 @@ The remote evaluation produces a 5-element list:
 
   printed       : prin1-to-string of all values from all evaluated forms,
                   values within a form separated by \", \", forms by newline.
-  raw           : same as printed (D-05: wire-safe, avoids #<...> reader errors).
+  raw           : same as printed (wire-safe, avoids #<...> reader errors).
   stdout        : captured *standard-output* + *trace-output* + *terminal-io*
-                  + *debug-io* + *query-io* output (D-07/D-08).
-  stderr        : captured *error-output* (D-07).
+                  + *debug-io* + *query-io* output.
+  stderr        : captured *error-output*.
   error-context : NIL on success; on error a plist
                   (:condition-type S :message S
                    :restarts ((:name S :description S) ...)
@@ -187,15 +185,15 @@ The remote evaluation produces a 5-element list:
 CODE-STRING is the source text; one or more top-level forms are read from it.
 PACKAGE-NAME is the evaluation package name (string); defaults to \"CL-USER\".
 
-D-19 SEAM: *read-eval* is T in the reader call below (Phase 2, trusted
-  localhost, SAFETY-06 posture).  The SAFETY-* pass will wrap the
+*read-eval* SEAM: *read-eval* is T in the reader call below (trusted
+  localhost posture).  A future safety pass will wrap the
   with-input-from-string reader call with (*read-eval* nil) without
   needing to reshape the wrapper."
   (flet ((cl-user-sym (name)
            (intern name (find-package :common-lisp-user))))
     ;; Intern every helper symbol in CL-USER before building the backquote
-    ;; (D-10 — keeps all variable symbols out of this package's namespace in
-    ;; the printed form; see Critical Constraint 1 above).
+    ;; — keeps all variable symbols out of this package's namespace in
+    ;; the printed form; see Critical Constraint 1 above.
     (let ((s-stdout    (cl-user-sym "%DSMR-MCP-ATTACH-STDOUT"))
           (s-stderr    (cl-user-sym "%DSMR-MCP-ATTACH-STDERR"))
           (s-io        (cl-user-sym "%DSMR-MCP-ATTACH-IO"))
@@ -220,7 +218,7 @@ D-19 SEAM: *read-eval* is T in the reader call below (Phase 2, trusted
           (s-fcap      (cl-user-sym "%DSMR-MCP-ATTACH-FRAME-CAP"))
           (s-map-fn    (cl-user-sym "%DSMR-MCP-ATTACH-MAP-FN"))
           (s-frame     (cl-user-sym "%DSMR-MCP-ATTACH-FRAME"))
-          ;; Local value print truncation variables (D-02)
+          ;; Local value print truncation variables
           (s-vstr      (cl-user-sym "%DSMR-MCP-ATTACH-VSTR"))
           (s-vlen      (cl-user-sym "%DSMR-MCP-ATTACH-VLEN"))
           ;; All-vals variable and locals accumulator for frame walk
@@ -235,17 +233,17 @@ D-19 SEAM: *read-eval* is T in the reader call below (Phase 2, trusted
       ;;
       `(let* ((,s-stdout  (make-string-output-stream))
               (,s-stderr  (make-string-output-stream))
-              ;; s-io: two-way stream — reads see empty input (D-09),
+              ;; s-io: two-way stream — reads see empty input,
               ;; writes to *debug-io*/*query-io*/*terminal-io* land in
-              ;; the stdout buffer (D-07/D-08, criterion 4).
+              ;; the stdout buffer (TUI-safe stream isolation).
               (,s-io      (make-two-way-stream (make-string-input-stream "") ,s-stdout))
               (,s-err-ctx nil)
               (,s-all-vals nil)
               (,s-printed nil))
          ;;
          ;; BODY FORM 1: the eval/capture block.
-         ;; SEAM (D-19): *read-eval* is T here — the SAFETY-* pass will wrap
-         ;; the with-input-from-string reader call with (*read-eval* nil).
+         ;; *read-eval* is T here — a future safety pass can wrap the
+         ;; with-input-from-string reader call with (*read-eval* nil).
          ;;
          (block nil
            (let* ((,s-pkg-name ,(or package-name "CL-USER"))
@@ -264,9 +262,9 @@ D-19 SEAM: *read-eval* is T in the reader call below (Phase 2, trusted
                              ((eq ,s-read-form ,s-eof) (nreverse ,s-acc))
                           (push ,s-read-form ,s-acc))))))
              ;; handler-bind (not handler-case!) so the stack is live when
-             ;; the handler runs — restarts and frames are non-nil (D-04).
+             ;; the handler runs — restarts and frames are non-nil.
              (handler-bind
-                 ;; end-of-file: annotate with the D-09 stdin hint.
+                 ;; end-of-file: annotate with the stdin-empty hint.
                  ((end-of-file
                     (lambda (,s-cond)
                       (setf ,s-err-ctx
@@ -292,7 +290,7 @@ D-19 SEAM: *read-eval* is T in the reader call below (Phase 2, trusted
                                           ,s-racc))
                                   :frames nil))
                       (return)))
-                  ;; error: full restarts + SBCL backtrace (D-01/D-02/D-03/D-04).
+                  ;; error: full restarts + SBCL backtrace.
                   (error
                     (lambda (,s-cond)
                       (setf ,s-err-ctx
@@ -315,11 +313,9 @@ D-19 SEAM: *read-eval* is T in the reader call below (Phase 2, trusted
                                           ,s-racc))
                                   ;; Frames: SBCL only, resolved at runtime via
                                   ;; fdefinition/find-symbol to avoid a hard
-                                  ;; compile-time SB-DEBUG dep (RESEARCH.md §2;
-                                  ;; frame-inspector.lisp §261-262).
-                                  ;; D-01: 20-frame cap.
-                                  ;; D-02: per-value ~200-char local truncation.
-                                  ;; #-sbcl: nil fallback (frame-inspector §296-305).
+                                  ;; compile-time SB-DEBUG dep.
+                                  ;; Cap: 20 frames; per-value locals truncated at ~200 chars.
+                                  ;; #-sbcl: nil fallback.
                                   :frames
                                   #+sbcl
                                   (let ((,s-map-fn
@@ -343,7 +339,6 @@ D-19 SEAM: *read-eval* is T in the reader call below (Phase 2, trusted
                                                                   (sb-di:frame-debug-fun
                                                                    ,s-frame)))
                                                               (error () "<unknown>"))
-                                                            ;; D-02: bounded locals
                                                             :locals
                                                             (ignore-errors
                                                               (let ((,s-lacc nil))
@@ -384,20 +379,18 @@ D-19 SEAM: *read-eval* is T in the reader call below (Phase 2, trusted
                                         (nreverse ,s-frames))))
                                   #-sbcl nil))
                       (return))))
-               ;; D-08: FULL 7-stream rebinding — all interactive and standard
+               ;; FULL 7-stream rebinding — all interactive and standard
                ;; streams shadowed so TUI applications and Quicklisp banners in
                ;; the attached image never reach the dispatcher's JSON-RPC stdout.
-               ;; This is the load-bearing criterion-4 / TUI-safety decision
-               ;; (cl-mcp commit 0797438c; attach.lisp §306-313 exact shape).
                (let ((*standard-output* ,s-stdout)
                      (*error-output*    ,s-stderr)
-                     (*trace-output*    ,s-stdout) ; trace → stdout (D-07)
+                     (*trace-output*    ,s-stdout) ; trace → stdout buffer
                      (*debug-io*        ,s-io)
                      (*query-io*        ,s-io)
-                     (*terminal-io*     ,s-io)     ; criterion 4: TUI-safe
+                     (*terminal-io*     ,s-io)     ; TUI-safe
                      (*standard-input*  (make-string-input-stream ""))
                      (*package*         ,s-pkg))
-                 ;; Eval loop (D-06): collect ALL values from ALL forms using
+                 ;; Eval loop: collect ALL values from ALL forms using
                  ;; do (not loop — Critical Constraint 2).
                  (do ((,s-rest ,s-forms (cdr ,s-rest)))
                      ((null ,s-rest))
@@ -420,11 +413,10 @@ D-19 SEAM: *read-eval* is T in the reader call below (Phase 2, trusted
          ;; When (return) fires in a handler-bind clause, the block above exits
          ;; (returning nil) with s-err-ctx set and s-printed nil.  This form
          ;; runs regardless, producing the wire tuple.
-         ;; Shape: cl-mcp attach.lisp §354-358 (verified exact).
-         ;; raw == printed (D-05 / commit b2c9812f: avoids #<...> reader errors).
+         ;; raw == printed: avoids #<...> reader errors on round-trip.
          (list ,s-printed
-               ,s-printed                            ; raw = printed (D-05)
-               (get-output-stream-string ,s-stdout)  ; stdout (D-07)
-               (get-output-stream-string ,s-stderr)  ; stderr (D-07)
+               ,s-printed                            ; raw = printed
+               (get-output-stream-string ,s-stdout)  ; stdout
+               (get-output-stream-string ,s-stderr)  ; stderr
                ,s-err-ctx)))))                       ; closes: list, outer-let*,
                                                      ;   (let (s-stdout...) ...), flet, defun

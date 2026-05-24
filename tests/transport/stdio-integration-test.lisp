@@ -1,13 +1,13 @@
 ;;;; tests/transport/stdio-integration-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; TRANS-01 / D-11: spawned-subprocess integration tests.
+;;;; Spawned-subprocess integration tests.
 ;;;; A real SBCL child process is launched with OS pipes; the test drives an
 ;;;; initialize exchange over those pipes and asserts on the response and on
 ;;;; child stderr capturing a stdio.start log event.
 ;;;;
-;;;; Gated: skips cleanly when sbcl is not on PATH, per D-11.
-;;;; Keep to one or two test cases only (D-11: not the default shape).
+;;;; Gated: skips cleanly when sbcl is not on PATH.
+;;;; Kept to one or two test cases — subprocess tests are slow and environment-dependent.
 
 (defpackage #:dsmr-mcp/tests/transport/stdio-integration-test
   (:use #:cl #:parachute)
@@ -127,7 +127,7 @@ process's live ASDF knowledge (see %extra-registry-push-evals)."
 ;;; ---------------------------------------------------------------------------
 
 (define-test initialize-over-real-pipes
-  "D-11: a spawned SBCL child answers an initialize line on its stdout with
+  "A spawned SBCL child answers an initialize line on its stdout with
 a structurally correct JSON-RPC response containing protocolVersion."
   ;; Skip cleanly when sbcl is not on PATH.
   (unless (%sbcl-path)
@@ -166,8 +166,8 @@ a structurally correct JSON-RPC response containing protocolVersion."
         (uiop:wait-process proc)))))
 
 (define-test stdio-start-appears-in-child-stderr
-  "D-11 / observability dimension 7: child stderr contains a stdio.start
-log event, proving the transport logged its start."
+  "Child stderr contains a stdio.start log event, proving the transport
+logged its start."
   ;; Skip cleanly when sbcl is not on PATH.
   (unless (%sbcl-path)
     (skip "sbcl not on PATH — skipping spawned-subprocess test"))

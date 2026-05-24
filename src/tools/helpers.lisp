@@ -4,9 +4,9 @@
 ;;;; Response-building helpers and the schema-literal -> JSON converter.
 ;;;; Pure functions; no I/O, no global state.
 ;;;;
-;;;; D-08: schema->json converts a class-allocated s-expression literal
-;;;;       to a JSON Schema hash-table at tools/list time.
-;;;; MCP-05: validate-args checks required fields against a schema literal.
+;;;; schema->json converts a class-allocated s-expression literal
+;;;;   to a JSON Schema hash-table at tools/list time.
+;;;; validate-args checks required fields against a schema literal.
 ;;;;
 ;;;; NOTE: No json-bool helper. Under jzon, nil encodes as JSON false and
 ;;;; the symbol 'null encodes as JSON null. There is no jzon:false sentinel
@@ -73,7 +73,7 @@ Returns #({\"type\":\"text\",\"text\":TEXT})."
 
 (defun schema->json (schema)
   "Convert a Lisp schema literal to an equal-keyed hash-table representing
-a JSON Schema object (D-08). Called at tools/list time on the class-allocated
+a JSON Schema object. Called at tools/list time on the class-allocated
 :input-schema literal.
 
 Supported schema forms:
@@ -226,7 +226,7 @@ Returns T on success. Signals arg-validation-error on failure."
                 ;; Skip type check for jzon null sentinel; null is
                 ;; "present but null" — its type compliance depends on
                 ;; whether the schema allows null, which validate-args
-                ;; does not currently enforce (Phase 1 scope).
+                ;; does not currently enforce.
                 (unless (eq val 'null)
                   (%check-type-match val type key))))))))
     t))

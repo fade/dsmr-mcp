@@ -4,13 +4,13 @@
 ;;;; CLOS tool-registry protocol: abstract base class, auto-registering
 ;;;; metaclass, generic-function surface, and the *tool-classes* registry.
 ;;;;
-;;;; D-05: tools are CLOS classes, not cl-mcp's define-tool macro.
-;;;; D-06: mcp-tool-class metaclass auto-registers each concrete subclass
-;;;;       in *tool-classes* at class-finalization time — no register-tool
-;;;;       call required. Hot-reload friendly: re-evaluating a defclass
-;;;;       re-runs finalize-inheritance and refreshes the entry.
-;;;; D-09: closer-mop powers the metaclass machinery (validate-superclass,
-;;;;       finalize-inheritance :after, class-prototype).
+;;;; Tools are CLOS classes, not a define-tool macro.
+;;;; The mcp-tool-class metaclass auto-registers each concrete subclass
+;;;;   in *tool-classes* at class-finalization time — no register-tool
+;;;;   call required. Hot-reload friendly: re-evaluating a defclass
+;;;;   re-runs finalize-inheritance and refreshes the entry.
+;;;; closer-mop powers the metaclass machinery (validate-superclass,
+;;;;   finalize-inheritance :after, class-prototype).
 
 (defpackage #:dsmr-mcp/src/tools/base
   (:use #:cl)
@@ -105,7 +105,7 @@ etc.) without needing a dynamic variable."))
     :documentation "Per-instance session — set at construction time by
 get-tool-instance (src/state.lisp). Tool methods use this to access
 per-session state. Lives as a normal per-instance slot so each
-session gets its own tool object (D-07: per-session tool instances).")
+session gets its own tool object.")
    (name
     :initarg :name
     :reader tool-name

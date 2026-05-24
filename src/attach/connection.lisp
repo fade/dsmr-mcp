@@ -4,15 +4,14 @@
 ;;;; Per-session Slynk connection lifecycle: open, reconnect-on-demand,
 ;;;; call-serialisation lock, graceful close.
 ;;;;
-;;;; D-14: connection cache lives on the repl-eval-tool instance slot, not a
-;;;;       global table. get-tool-instance identity guarantees one connection
-;;;;       per session.
-;;;; D-15: per-session call-serialisation lock on the same instance.
-;;;; D-16: fail-closed network errors; next call reopens on demand.
-;;;; D-18: graceful disconnect via slime-close at session end.
-;;;; D-20: slynk-client sourced from $LISP_WORKSPACE (dispatcher-resilience
-;;;;       patch commit 32691172 is load-bearing — do not update from upstream
-;;;;       without re-verifying the patch).
+;;;; Connection cache lives on the repl-eval-tool instance slot, not a global
+;;;; table. get-tool-instance identity guarantees one connection per session.
+;;;; Per-session call-serialisation lock on the same instance.
+;;;; Fail-closed network errors; next call reopens on demand.
+;;;; Graceful disconnect via slime-close at session end.
+;;;; slynk-client sourced from $LISP_WORKSPACE (dispatcher-resilience patch
+;;;; commit 32691172 is load-bearing — do not update from upstream without
+;;;; re-verifying the patch).
 
 (defpackage #:dsmr-mcp/src/attach/connection
   (:use #:cl)
@@ -30,17 +29,16 @@
 
 (in-package #:dsmr-mcp/src/attach/connection)
 
-;;; Wave-1 / Wave-2 decoupling seam -----------------------------------------
+;;; Dependency decoupling seam -----------------------------------------
 ;;;
 ;;; The slot accessors repl-eval-tool-slynk-conn and repl-eval-tool-call-lock
-;;; are defined by 02-03's defclass in dsmr-mcp/src/attach/dispatch.  That
-;;; package depends on this one, so importing from it would be circular.
+;;; are defined by the defclass in dsmr-mcp/src/attach/dispatch.  That package
+;;; depends on this one, so importing from it would be circular.
 ;;;
 ;;; Resolution: access the accessors by name at runtime via uiop:symbol-call
 ;;; and fdefinition.  The two private helpers below isolate this indirection;
-;;; the rest of the file reads cleanly.  When 02-03 loads, the accessor
-;;; functions are interned in :dsmr-mcp/src/attach/dispatch and the calls
-;;; here resolve correctly.
+;;; the rest of the file reads cleanly.  Once dispatch loads, the accessor
+;;; functions are interned in :dsmr-mcp/src/attach/dispatch and resolve here.
 
 (declaim (ftype function repl-eval-tool-slynk-conn repl-eval-tool-call-lock))
 
@@ -99,10 +97,10 @@ Used by 02-03's with-attach-dispatch to gate the attached eval path."
 HOST and PORT come from the resolved :slynk-attach config string parsed
 by parse-slynk-attach.
 
-On cache hit, returns the existing connection immediately (ATTACH-02, D-14).
+On cache hit, returns the existing connection immediately.
 On cache miss, calls slime-connect; on failure (returns NIL) signals
 slime-network-error naming the target.  On success, caches the connection
-on TOOL's slynk-conn slot and logs attach.connection.opened (ATTACH-01)."
+on TOOL's slynk-conn slot and logs attach.connection.opened."
   (or (%conn tool)
       (let ((conn (slime-connect host port)))
         (unless conn
@@ -116,17 +114,17 @@ on TOOL's slynk-conn slot and logs attach.connection.opened (ATTACH-01)."
         conn)))
 
 (defun drop-connection (tool &key (reason "network-error"))
-  "Nil out the cached connection on TOOL without calling slime-close (D-16).
+  "Nil out the cached connection on TOOL without calling slime-close.
 The connection is presumed dead on a network error; attempting slime-close on
 a dead socket could block.  The nil slot causes the next get-or-open-connection
-call to reopen on demand (fail-closed semantics, ATTACH-06).
+call to reopen on demand (fail-closed semantics).
 Returns NIL."
   (setf (%conn tool) nil)
   (log-event :info "attach.connection.dropped" "reason" reason)
   nil)
 
 (defun close-connection (tool &key (reason "session-end"))
-  "Gracefully close the Slynk connection on TOOL (D-18, ATTACH-08).
+  "Gracefully close the Slynk connection on TOOL.
 Nils the slot first so concurrent calls see no connection, then calls
 slime-close wrapped in handler-case so a teardown error never escapes.
 Returns NIL in all cases."

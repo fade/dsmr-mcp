@@ -4,22 +4,13 @@
 ;;;; Top-level entry point for dsmr-mcp: resolves keyword/env/conf precedence
 ;;;; and dispatches to the appropriate transport.  For :stdio this call is
 ;;;; blocking (returns T at EOF); :tcp and :http raise transport-not-implemented-error
-;;;; until Phase 9 delivers those transports.
+;;;; until those transports are implemented.
 ;;;;
-;;;; Design decisions (from 01-CONTEXT.md):
-;;;;   D-14: Full keyword surface (:transport :slynk-attach :mode :port
-;;;;         :bind :log-level :project-root).
-;;;;   D-15: Every keyword has a DSMR_<KEYWORD> env-var fallback; keyword
-;;;;         takes precedence over env.
-;;;;   D-16: .dsmr-mcp.conf backed by ubiquitous:value (NEVER defaulted-value
-;;;;         which writes the file on first read); absence is silent.
-;;;;         Precedence: keyword > env > conf > built-in default.
-;;;;   D-17: run is blocking for :stdio (returns T at EOF).  :tcp and :http
-;;;;         raise transport-not-implemented-error in Phase 1.
+;;;; Config precedence: keyword > DSMR_<KEYWORD> env var > .dsmr-mcp.conf > built-in default.
+;;;; .dsmr-mcp.conf is read via ubiquitous:value (never defaulted-value, which writes the
+;;;; file on first read); absence is silent.
 ;;;;
-;;;; src/main.lisp ownership: Plan 01-01 already wired the run re-export
-;;;; (:import-from dsmr-mcp/src/run #:run) so the dsmr-mcp:run nickname
-;;;; resolves as soon as this file is loaded.  DO NOT edit src/main.lisp.
+;;;; src/main.lisp owns the dsmr-mcp:run re-export nickname.  DO NOT edit src/main.lisp.
 
 (defpackage #:dsmr-mcp/src/run
   (:use #:cl)
@@ -65,13 +56,11 @@
 (define-condition transport-not-implemented-error (error)
   ((transport :initarg :transport :reader transport-not-implemented-transport))
   (:report (lambda (c s)
-             (format s "Transport ~A is not yet implemented (lands in Phase 9)."
+             (format s "Transport ~A is not yet implemented."
                      (transport-not-implemented-transport c))))
   (:documentation "Signaled by RUN when :transport is :tcp or :http.
-These transports are Phase-9 work; in Phase 1 they raise this typed condition
-so tests can assert the correct condition class rather than a generic error.
-When Phase 9 delivers the TCP/HTTP transports, the arms that signal this
-condition are replaced with the real implementations."))
+These transports are not yet implemented; this typed condition lets tests
+assert the correct condition class rather than a generic error."))
 
 (define-condition invalid-config-value (error)
   ((name :initarg :name :reader invalid-config-value-name
@@ -135,7 +124,7 @@ Signals INVALID-CONFIG-VALUE for any other value."
                 :raw  value)))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Conf reader (D-16)
+;;; Conf reader
 ;;; ---------------------------------------------------------------------------
 
 (defun %read-conf-into-defaults (project-root)
@@ -144,8 +133,7 @@ config values.  Returns NIL when the file is absent (absence is silent,
 no file is created).
 
 Uses ubiquitous:value (NEVER defaulted-value, which writes the file on first
-read) inside with-local-storage :transaction nil so no automatic offload
-occurs.  See D-16 and 01-RESEARCH.md pitfalls section on ubiquitous."
+read) inside with-local-storage :transaction nil so no automatic offload occurs."
   (let ((path (merge-pathnames ".dsmr-mcp.conf" project-root)))
     (when (probe-file path)
       (ubiquitous:with-local-storage (path :type :lisp :transaction nil)
@@ -157,7 +145,7 @@ occurs.  See D-16 and 01-RESEARCH.md pitfalls section on ubiquitous."
               :slynk-attach (ubiquitous:value :slynk-attach))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Precedence helper (D-15)
+;;; Precedence helper
 ;;; ---------------------------------------------------------------------------
 
 (defun %or-from-env (supplied-p keyword-value env-name conf-plist default
@@ -173,9 +161,9 @@ PARSE          -- function applied to string/keyword values before return.
 
 The conf check uses a sentinel so any Lisp-false value stored in the conf
 (e.g. :slynk-attach nil, :port 0) is correctly honoured over DEFAULT rather
-than being discarded as though the key were absent (D-15/D-16)."
+than being discarded as though the key were absent."
   (cond
-    ;; Explicit keyword argument wins unconditionally (D-15).
+    ;; Explicit keyword argument wins unconditionally over env and conf.
     (supplied-p
      (funcall parse keyword-value))
     (t
@@ -186,8 +174,7 @@ than being discarded as though the key were absent (D-15/D-16)."
           (funcall parse env-val))
          ;; Conf value beats built-in default.
          ;; Use a unique sentinel so a legitimately-falsy conf value
-         ;; (nil, 0, "") is honoured over DEFAULT rather than treated
-         ;; as absent.  This is the D-15/D-16 fix for WR-01.
+         ;; (nil, 0, "") is honoured over DEFAULT rather than treated as absent.
          (t
           (let* ((bare  (subseq env-name 5))
                  (pkey  (intern (string-upcase (substitute #\- #\_ bare)) :keyword))
@@ -198,7 +185,7 @@ than being discarded as though the key were absent (D-15/D-16)."
                 (funcall parse conf-val)))))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; resolve-transport -- non-blocking seam (D-15, D-17)
+;;; resolve-transport -- non-blocking seam
 ;;; ---------------------------------------------------------------------------
 
 (defun %resolve-project-root (supplied-p value)
@@ -215,7 +202,7 @@ pass :project-root nil to mean \"use the cwd explicitly\"."
             (uiop:getcwd)))))
 
 ;;; ---------------------------------------------------------------------------
-;;; :auto Slynk reachability probe (D-15, HERM-07)
+;;; :auto Slynk reachability probe
 ;;; ---------------------------------------------------------------------------
 
 (defun %slynk-reachable-p (slynk-attach)
@@ -269,20 +256,20 @@ stdio loop."
                           (project-root nil project-root-supplied-p))
   "Resolve the effective dispatch mode keyword WITHOUT entering the blocking loop.
 
-Applies precedence: keyword > DSMR_MODE env > .dsmr-mcp.conf > :attached (D-02).
+Applies precedence: keyword > DSMR_MODE env > .dsmr-mcp.conf > :attached.
 When the resolved mode is :auto, probes the Slynk listener via %slynk-reachable-p:
   - Reachable -> :attached
   - Unreachable -> :hermetic (emits a log4cl :warn; configure-log4cl-for-server must
     have been called before this function runs or the warn goes to the wrong appender)
 
-Per D-16 / HERM-07: explicit :attached never falls back; :auto is an explicit opt-in
-for the logged fallback. The warn emitted on :auto -> :hermetic resolution is a
-startup-time notice only (not per-call).
+Explicit :attached never falls back; :auto is an explicit opt-in for the logged
+fallback. The warn emitted on :auto -> :hermetic resolution is a startup-time
+notice only (not per-call).
 
-This is the non-blocking seam the criterion-1 tests assert against, mirroring
-RESOLVE-TRANSPORT. It shares %RESOLVE-PROJECT-ROOT, %READ-CONF-INTO-DEFAULTS,
-%OR-FROM-ENV, and %PARSE-MODE with RUN's live path, so the tested seam and the
-live binding of *MODE* resolve identically."
+This is the non-blocking seam tests assert against, mirroring RESOLVE-TRANSPORT.
+It shares %RESOLVE-PROJECT-ROOT, %READ-CONF-INTO-DEFAULTS, %OR-FROM-ENV, and
+%PARSE-MODE with RUN's live path, so the tested seam and the live binding of
+*MODE* resolve identically."
   (declare (ignore slynk-attach-supplied-p))
   (let* ((root (%resolve-project-root project-root-supplied-p project-root))
          (conf (%read-conf-into-defaults root))
@@ -298,7 +285,7 @@ live binding of *MODE* resolve identically."
         m)))
 
 ;;; ---------------------------------------------------------------------------
-;;; Entry point (D-14, D-15, D-16, D-17)
+;;; Entry point
 ;;; ---------------------------------------------------------------------------
 
 (defun run (&key (transport nil transport-supplied-p)
@@ -319,20 +306,19 @@ Keyword arguments (all optional):
   :log-level     {:debug | :info | :warn | :error} -- defaults to :info
   :project-root  pathname-designator | nil       -- server working root
 
-Config precedence (D-15, D-16): keyword > DSMR_<KEYWORD> env var >
+Config precedence: keyword > DSMR_<KEYWORD> env var >
 .dsmr-mcp.conf (via ubiquitous:value, file never written) > built-in default.
 
-Blocking behaviour (D-17):
+Blocking behaviour:
   :stdio  -- blocks reading *STANDARD-INPUT* until EOF, then returns T.
-  :tcp    -- PHASE 9 (currently signals TRANSPORT-NOT-IMPLEMENTED-ERROR).
-  :http   -- PHASE 9 (currently signals TRANSPORT-NOT-IMPLEMENTED-ERROR).
+  :tcp    -- not yet implemented (signals TRANSPORT-NOT-IMPLEMENTED-ERROR).
+  :http   -- not yet implemented (signals TRANSPORT-NOT-IMPLEMENTED-ERROR).
 
 Malformed DSMR_* env values signal INVALID-CONFIG-VALUE (a typed subclass
 of ERROR) so operator mistakes produce a clean diagnostic.  This includes
 DSMR_TRANSPORT, DSMR_MODE, DSMR_LOG_LEVEL, and DSMR_PORT.
 
-The dsmr-mcp:run nickname (re-exported by src/main.lisp, owned by Plan 01-01)
-resolves to this function."
+The dsmr-mcp:run nickname (re-exported by src/main.lisp) resolves to this function."
   ;; Resolve project root first (needed by conf reader).
   (let* ((resolved-root
            (%resolve-project-root project-root-supplied-p project-root))
@@ -376,7 +362,7 @@ resolves to this function."
                          "DSMR_SLYNK_ATTACH" conf nil
                          :parse #'identity)))
 
-    ;; Suppress unused-variable notes for Phase-1 settings not yet wired.
+    ;; Suppress unused-variable notes for settings not yet wired.
     (declare (ignore resolved-bind resolved-port))
 
     ;; Apply resolved log level.
@@ -384,16 +370,16 @@ resolves to this function."
 
     ;; Install the log4cl stderr appender BEFORE mode resolution so the :auto
     ;; Slynk probe's :warn log line lands on stderr, never on the JSON-RPC
-    ;; stdout channel (Pitfall 5 / T-03-LOG-01).
+    ;; stdout channel.
     (configure-log4cl-for-server resolved-log-level)
 
     ;; Resolve the effective mode, performing the real :auto Slynk probe now
-    ;; that the log appender is installed (D-15, HERM-07).
+    ;; that the log appender is installed.
     (setf *mode* (resolve-mode :mode resolved-mode
                                 :slynk-attach resolved-slynk-attach))
 
     ;; When hermetic mode is active, initialize the worker pool and register
-    ;; the shutdown hook so workers are reaped when the process exits (D-03).
+    ;; the shutdown hook so workers are reaped when the process exits.
     (when (eq *mode* :hermetic)
       (initialize-pool)
       (pushnew 'shutdown-pool sb-ext:*exit-hooks*))

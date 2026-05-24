@@ -1,14 +1,14 @@
 ;;;; tests/protocol/strict-initialize-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; MCP-04 / D-04: strict-initialize gate test. Any non-initialize,
-;;;; non-ping, non-notifications/initialized request before handshake
-;;;; completes must return -32002 "Server not initialized".
+;;;; Strict-initialize gate test. Any non-initialize, non-ping,
+;;;; non-notifications/initialized request before handshake completes must
+;;;; return -32002 "Server not initialized".
 ;;;;
-;;;; This is a dsmr-mcp-specific test: cl-mcp does not gate pre-init
-;;;; requests (it dispatches them normally). dsmr-mcp's D-04 is deliberate
-;;;; and load-bearing — the -32002 arm in %handle-request is placed BEFORE
-;;;; the tools/* and prompts/* arms.
+;;;; This is a dsmr-mcp-specific behaviour: cl-mcp does not gate pre-init
+;;;; requests (it dispatches them normally). The -32002 arm in %handle-request
+;;;; is placed BEFORE the tools/* and prompts/* arms — the gate is deliberate
+;;;; and load-bearing.
 
 (defpackage #:dsmr-mcp/tests/protocol/strict-initialize-test
   (:use #:cl #:parachute)
@@ -37,7 +37,7 @@
 ;;; Tests ---------------------------------------------------------------------
 
 (define-test tools-list-before-initialize-returns-32002
-  "D-04: tools/list on a fresh (uninitialized) session returns -32002,
+  "tools/list on a fresh (uninitialized) session returns -32002,
 not -32601 or a success response."
   (multiple-value-bind (session sid) (%fresh)
     (let* ((*current-session-id* sid)
@@ -47,7 +47,7 @@ not -32601 or a success response."
       (is = -32002 (jsonrpc-error-code obj)))))
 
 (define-test tools-call-before-initialize-returns-32002
-  "D-04: tools/call before initialize returns -32002."
+  "tools/call before initialize returns -32002."
   (multiple-value-bind (session sid) (%fresh)
     (let* ((*current-session-id* sid)
            (obj (%parse-line
@@ -56,7 +56,7 @@ not -32601 or a success response."
       (is = -32002 (jsonrpc-error-code obj)))))
 
 (define-test prompts-list-before-initialize-returns-32002
-  "D-04: prompts/list before initialize returns -32002."
+  "prompts/list before initialize returns -32002."
   (multiple-value-bind (session sid) (%fresh)
     (let* ((*current-session-id* sid)
            (obj (%parse-line
@@ -65,7 +65,7 @@ not -32601 or a success response."
       (is = -32002 (jsonrpc-error-code obj)))))
 
 (define-test ping-before-initialize-returns-result
-  "D-04: ping is explicitly allowed before initialize (liveness probe).
+  "ping is explicitly allowed before initialize (liveness probe).
 It must return a success result, NOT a -32002 error."
   (multiple-value-bind (session sid) (%fresh)
     (let* ((*current-session-id* sid)
@@ -77,7 +77,7 @@ It must return a success result, NOT a -32002 error."
       (true (hash-table-p (gethash "result" obj))))))
 
 (define-test unknown-method-before-initialize-returns-32002
-  "D-04: an unknown method before initialize returns -32002 (not -32601).
+  "An unknown method before initialize returns -32002 (not -32601).
 The strict-init gate fires before the method-not-found arm."
   (multiple-value-bind (session sid) (%fresh)
     (let* ((*current-session-id* sid)
@@ -87,8 +87,8 @@ The strict-init gate fires before the method-not-found arm."
       (is = -32002 (jsonrpc-error-code obj)))))
 
 (define-test after-initialize-tools-list-allowed
-  "D-04 (negative case): after a successful initialize, tools/list is
-allowed and returns a success result (no -32002)."
+  "After a successful initialize, tools/list is allowed and returns a
+success result (no -32002)."
   (multiple-value-bind (session sid) (%fresh)
     (let ((*current-session-id* sid))
       ;; Initialize first.

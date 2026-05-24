@@ -1,10 +1,10 @@
 ;;;; tests/transport/stdio-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; TRANS-01: serve-streams string-stream round-trip tests.
-;;;; Drives the stdio transport via paired string streams (D-10 fixture shape)
-;;;; rather than real OS pipes. Asserts the round-trip, the malformed-line
-;;;; skip-and-continue, and the stdout-pollution guard.
+;;;; serve-streams string-stream round-trip tests.
+;;;; Drives the stdio transport via paired string streams rather than real OS
+;;;; pipes. Asserts the round-trip, the malformed-line skip-and-continue, and
+;;;; the stdout-pollution guard.
 
 (defpackage #:dsmr-mcp/tests/transport/stdio-test
   (:use #:cl #:parachute)
@@ -69,9 +69,9 @@ Returns (values output-string list-of-parsed-responses)."
 ;;; ---------------------------------------------------------------------------
 
 (define-test initialize-then-tools-list-round-trip
-  "TRANS-01 / ROADMAP criterion 3: a three-line initialize + notification +
-tools/list exchange through serve-streams yields exactly two parseable
-responses with the correct ids and a JSON array for tools (D-10 fixture).
+  "A three-line initialize + notification + tools/list exchange through
+serve-streams yields exactly two parseable responses with the correct ids
+and a JSON array for tools.
 
 NOTE: we assert (vectorp tools) not (= 0 (length tools)) because other test
 files may have registered in-test stub tools in *tool-classes* by the time
@@ -97,7 +97,7 @@ in the cold-process verify command and in the integration test."
       (true (vectorp tools)))))
 
 (define-test malformed-line-skips-and-continues
-  "TRANS-01: an invalid JSON line produces a -32700 response with id null,
+  "An invalid JSON line produces a -32700 response with id null,
 and the loop continues to serve subsequent valid lines."
   (multiple-value-bind (out-str parsed)
       (%run-serve-streams (list "not json at all"
@@ -115,9 +115,8 @@ and the loop continues to serve subsequent valid lines."
       (true (hash-table-p (gethash "result" ok))))))
 
 (define-test stdout-pollution-guard
-  "TRANS-01 / T-03-02: a tool whose tool-handle does (format t ...) must NOT
-leak that text onto the OUT stream; all lines on OUT must still parse as
-valid JSON."
+  "A tool whose tool-handle does (format t ...) must NOT leak that text onto
+the OUT stream; all lines on OUT must still parse as valid JSON."
   ;; Define a tool that leaks to *standard-output*.
   (defclass stdio-leak-tool (mcp-tool)
     ((dsmr-mcp/src/tools/base::name
@@ -156,12 +155,10 @@ valid JSON."
           (true (hash-table-p (jzon:parse line))))))))
 
 (define-test oversized-line-with-trailing-newline-emits-error-and-continues
-  "CR-01 / T-03-01: an oversized line (exceeds +max-json-line-bytes+) followed
-by a terminating newline should emit a -32600 error envelope and then continue
-serving subsequent valid lines.  Uses a cap of 64 bytes: the oversized line is
-65 chars (too large), the init request is 147 chars (also too large at 64) so we
-use a cap of 200, making the 201-char oversized line too big while the 147-char
-initialize request fits comfortably within the cap."
+  "An oversized line (exceeds +max-json-line-bytes+) followed by a terminating
+newline should emit a -32600 error envelope and then continue serving subsequent
+valid lines.  Uses a cap of 200 bytes: the 201-char oversized line exceeds it
+while the 147-char initialize request fits comfortably."
   (let ((dsmr-mcp/src/transport/stdio::+max-json-line-bytes+ 200))
     ;; Build: one oversized line (201 chars + newline), then a valid initialize.
     (let* ((big-line (make-string 201 :initial-element #\x))
@@ -185,9 +182,9 @@ initialize request fits comfortably within the cap."
           (true (hash-table-p (gethash "result" ok))))))))
 
 (define-test oversized-newline-free-stream-terminates-connection
-  "CR-01 / T-03-01: a newline-free stream that exceeds the drain budget must
-cause serve-streams to RETURN (not hang).  The connection is terminated rather
-than spinning on an unbounded hostile stream.  Uses a small bound via let-rebind."
+  "A newline-free stream that exceeds the drain budget must cause serve-streams
+to RETURN (not hang).  The connection is terminated rather than spinning on an
+unbounded hostile stream.  Uses a small bound via let-rebind."
   (let ((dsmr-mcp/src/transport/stdio::+max-json-line-bytes+ 8))
     ;; Build a string that exceeds the read cap (9 chars), then also exceeds
     ;; the drain cap (9 more chars) — total 18 chars, no newline anywhere.

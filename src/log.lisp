@@ -6,12 +6,11 @@
 ;;;; The body delegates to log4cl; a custom json-layout serialises each
 ;;;; event as a single-line JSON object on *error-output* (stderr).
 ;;;;
-;;;; THREAT MODEL T-03-LOG-01: log4cl's default console-appender writes to
-;;;; *debug-io*, which can reach stdout in a Slynk REPL child process.
-;;;; configure-log4cl-for-server MUST be called before serve-streams; it
-;;;; removes all default appenders and installs ONE fixed-stream-appender
-;;;; targeting (make-synonym-stream '*error-output*) — never *debug-io* or
-;;;; *standard-output*.
+;;;; log4cl's default console-appender writes to *debug-io*, which can reach
+;;;; stdout in a Slynk REPL child process. configure-log4cl-for-server MUST be
+;;;; called before serve-streams; it removes all default appenders and installs
+;;;; ONE fixed-stream-appender targeting (make-synonym-stream '*error-output*)
+;;;; — never *debug-io* or *standard-output*.
 
 (defpackage #:dsmr-mcp/src/log
   (:use #:cl)
@@ -56,9 +55,9 @@ Default :info means debug messages are suppressed in normal operation.")
 (defvar *log-stream* (make-synonym-stream '*error-output*)
   "Retained for API compatibility. The log4cl fixed-stream-appender uses
 its own synonym stream targeting *error-output*; this var is no longer
-used for output but may be read by tests written against the Phase-1 API.
+used for output but may be read by tests written against the original API.
 INVARIANT: this stream must NEVER be *standard-output* — stdout is
-reserved for the JSON-RPC channel (MCP spec / THREAT T-01-03).")
+reserved for the JSON-RPC channel.")
 
 (defvar *log-session-id* nil
   "Dynamically bound to the session-id string for the duration of one
@@ -165,7 +164,7 @@ that writes the message text when called."
 fixed-stream-appender writing JSON to *error-output* (stderr).
 
 MUST be called before serve-streams so no log output reaches *debug-io*
-or *standard-output* (THREAT T-03-LOG-01, D-08).
+or *standard-output*.
 
 LOG-LEVEL is one of :debug :info :warn :error; both the *log-level* shim
 gate and log4cl's root-logger level are set to the same value so they
@@ -192,7 +191,7 @@ stay in sync."
 (defun log-event (level event &rest kvs)
   "Emit one structured JSON log line to *error-output* via log4cl.
 
-Signature frozen (D-07): (log-event level event &rest kvs).
+Signature: (log-event level event &rest kvs).
 LEVEL  — one of :debug :info :warn :error
 EVENT  — a short event-name string (e.g. \"stdio.start\")
 KVS    — alternating string/value pairs appended as \"key=value\" tokens
@@ -204,7 +203,7 @@ The should-log-p gate runs first; log4cl's own level gate provides a
 second check. Both are kept in sync by configure-log4cl-for-server.
 
 INVARIANT: writes only to *error-output* (via the fixed-stream-appender).
-NEVER writes to *standard-output* (THREAT T-03-LOG-01)."
+NEVER writes to *standard-output*."
   (when (should-log-p level)
     (let ((msg (format nil "~A~{ ~A=~S~}" event kvs)))
       (ecase level
