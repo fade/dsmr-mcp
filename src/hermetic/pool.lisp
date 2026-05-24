@@ -44,8 +44,11 @@
                 #:worker-process-info #:worker-crash-history-pushed-p
                 #:worker-last-crash-reason #:worker-last-exit-status
                 #:worker-last-exit-code
+                #:mark-worker-crashed
                 #:*reaper-threads* #:*reaper-threads-lock*
                 #:*worker-startup-timeout*)
+  (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
+                #:*default-eval-timeout*)
   (:import-from #:dsmr-mcp/src/log #:log-event)
   (:import-from #:sb-ext)
   (:import-from #:sb-posix)
@@ -1009,37 +1012,51 @@ max_pool_size, warmup_target, workers (vector of per-worker hashes)."
 ;;; ---------------------------------------------------------------------------
 
 (defun pool-rpc-with-hard-kill (worker method params
-                                 &key (soft-timeout *worker-startup-timeout*)
+                                 &key (soft-timeout *default-eval-timeout*)
                                       (grace *worker-kill-grace-seconds*))
   "Send METHOD with PARAMS to WORKER, returning the result hash-table.
 
 Implements the two-level timeout (D-12, SAFETY-05):
   - SOFT-TIMEOUT: passed to worker-rpc so the in-worker sb-ext:with-timeout
     fires if the eval exceeds it. The worker returns a TIMEOUT error payload.
+    Defaults to *default-eval-timeout* (120 s) — the eval budget, not the
+    startup budget (WR-04: previously defaulted to *worker-startup-timeout*,
+    30 s, which would hard-kill legitimately long but within-budget evals).
   - Hard-kill backstop: if the worker does not return within SOFT-TIMEOUT +
-    GRACE seconds (default: DSMR_WORKER_KILL_GRACE_SECONDS, 5s), the parent
-    SIGKILLs the worker and routes it through crash recovery. This covers
-    runaway FFI that the in-worker soft timeout cannot interrupt.
+    GRACE seconds, the parent kills the worker via its sb-ext:process object
+    (avoiding the PID-reuse hazard of killing by raw numeric pid after the
+    process may have already exited), then marks it crashed via the normal
+    mark-worker-crashed path (which closes the stream and arms the reset
+    notification), then signals WORKER-CRASHED so the dispatcher's existing
+    handler returns a structured isError — never a phantom NIL result (CR-02).
 
-The grace margin (DSMR_WORKER_KILL_GRACE_SECONDS, default 5s) is the
-window between 'soft timeout fired in worker' and 'parent hard-kills'.
-Increase it if workers return timeout responses slowly (e.g., large
-output flushing after the timeout fires)."
+WORKER-CRASHED from worker-rpc is re-signalled unchanged so the dispatcher's
+existing handler fires for both the soft and hard timeout cases."
   (let ((hard-timeout (when (and soft-timeout grace)
                         (+ soft-timeout grace))))
     (handler-case
         (worker-rpc worker method params :timeout hard-timeout)
       (sb-ext:timeout ()
-        ;; Hard timeout expired: the soft timeout should have fired inside
-        ;; the worker, but the response was not returned within the grace
-        ;; margin. SIGKILL the worker so crash recovery arms reset-notification
-        ;; and the next call from the same session gets a fresh worker.
-        (let ((pid (worker-pid worker)))
-          (when pid
-            (log-event :warn "pool.hard-kill.backstop"
-                       "pid" pid
-                       "soft_timeout" soft-timeout
-                       "grace" grace)
-            (ignore-errors (sb-posix:kill pid 9)))))
+        ;; Hard timeout expired: the in-worker soft timeout should have fired
+        ;; and returned a TIMEOUT payload, but the response did not arrive
+        ;; within the grace margin. Kill via the process object to avoid
+        ;; sending SIGKILL to a recycled PID.
+        (log-event :warn "pool.hard-kill.backstop"
+                   "id" (worker-id worker)
+                   "soft_timeout" soft-timeout
+                   "grace" grace)
+        (let ((proc (worker-process-info worker)))
+          (when (and proc (ignore-errors (sb-ext:process-alive-p proc)))
+            (ignore-errors (sb-ext:process-kill proc 9))))
+        ;; Route through the standard crash-recovery path: marks state
+        ;; :crashed, closes stream, arms reset-notification, spawns reaper.
+        ;; This must happen outside of any stream-lock context (the outer
+        ;; with-timeout interrupted worker-rpc before it released the lock,
+        ;; so stream-lock is NOT held here).
+        (ignore-errors
+          (mark-worker-crashed worker "hard-kill-timeout"))
+        ;; Surface as a structured crash so the dispatcher returns isError.
+        (error 'dsmr-mcp/src/hermetic/worker-client:worker-crashed
+               :worker worker :reason "hard-kill-timeout"))
       (dsmr-mcp/src/hermetic/worker-client:worker-crashed (e)
         (error e)))))
