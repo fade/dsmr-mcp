@@ -49,7 +49,12 @@ responses so the MCP serve loop never sees an unhandled condition (T-04-17):
 
 SESSION is the session object (unused; *current-session-id* is the key).
 ID is the JSON-RPC request id. NAME is the tool name string. ARGS is the
-tool arguments hash-table, or NIL when the client sent no arguments."
+tool arguments hash-table, or NIL when the client sent no arguments.
+
+The worker's worker/eval handler expects the MCP arguments hash-table
+directly as the JSON-RPC params (keys: code, package, timeout_seconds,
+max_output_length). ARGS is passed as-is so the worker reads \"code\"
+directly from params without an extra nesting level."
   (declare (ignore session))
   (handler-case
       (let* ((worker (get-or-assign-worker *current-session-id*))
@@ -65,9 +70,11 @@ tool arguments hash-table, or NIL when the client sent no arguments."
                              (text-content
                               "Worker was reset after a crash. \
 In-image state has been lost. Retry your call.")))))
-        (let* ((params (make-ht "name" name
-                                "arguments" (or args (make-hash-table :test 'equal))))
-               (resp (worker-rpc worker "worker/eval" params)))
+        ;; Pass args directly as worker/eval params — the handler reads
+        ;; "code"/"package"/"timeout_seconds"/"max_output_length" from the
+        ;; top-level params hash-table (not nested under "arguments").
+        (let* ((params (or args (make-hash-table :test 'equal)))
+               (resp   (worker-rpc worker "worker/eval" params)))
           (result id resp)))
     (worker-crashed (e)
       (log-event :error "dispatch.worker-crashed"

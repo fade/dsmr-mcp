@@ -65,7 +65,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/dispatch/mode-router-test"
                "dsmr-mcp/tests/hermetic/worker-spawn-test"
                "dsmr-mcp/tests/hermetic/pool-affinity-test"
-               "dsmr-mcp/tests/hermetic/circuit-breaker-test")
+               "dsmr-mcp/tests/hermetic/circuit-breaker-test"
+               "dsmr-mcp/tests/hermetic/repl-eval-parity-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
