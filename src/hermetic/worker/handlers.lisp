@@ -26,7 +26,7 @@
   (:import-from #:dsmr-mcp/src/log #:log-event)
   (:import-from #:sb-ext)
   (:import-from #:uiop)
-  (:export #:register-all-handlers))
+  (:export #:register-all-handlers #:*default-eval-timeout*))
 
 (in-package #:dsmr-mcp/src/hermetic/worker/handlers)
 

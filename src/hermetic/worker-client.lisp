@@ -26,6 +26,7 @@
            #:worker-rpc-error #:worker-tcp-port #:worker-swank-port
            #:worker-pid #:worker-state #:worker-session-id #:worker-id
            #:worker-needs-reset-notification #:worker-stream-lock
+           #:mark-worker-crashed
            #:clear-reset-notification #:check-and-clear-reset-notification
            #:worker-process-info #:kill-worker #:worker-crashed
            #:worker-crashed-reason #:worker-spawn-failed
@@ -512,14 +513,23 @@ Returns nothing."
       (usocket:socket-close (worker-socket worker))
       (setf (worker-socket worker) nil
             (worker-stream worker) nil)))
-  ;; Wait for the stderr drain thread to finish forwarding remaining
-  ;; log output. The worker process is dead so the pipe's write end is
-  ;; closed, causing read-line to return NIL and the thread to exit.
-  ;; 1-second timeout prevents blocking if something goes wrong.
+  ;; Shut down the stderr drain thread. Close the worker's stderr pipe first
+  ;; so read-line in the drain loop returns NIL and the thread exits cleanly
+  ;; via its own unwind-protect. Then poll briefly (up to 1 s) for the
+  ;; natural exit before resorting to destroy-thread. This avoids destroying
+  ;; the thread while it holds *stderr-drain-lock*, which would leave the
+  ;; lock permanently held and block other workers' drain threads.
   (let ((th (worker-stderr-thread worker)))
     (when (and th (bt:thread-alive-p th))
-      ;; bt:join-thread in this bt version has no :timeout; we check alive-p
-      ;; before and after to avoid blocking indefinitely.
+      ;; Close the pipe to wake the read-line loop (write-end closed by
+      ;; the killed process; closing the read-end unblocks any pending read).
+      (let ((proc (worker-process-info worker)))
+        (when proc
+          (ignore-errors (close (sb-ext:process-error proc)))))
+      ;; Poll up to 1 s for natural thread exit before force-destroying.
+      (loop repeat 10
+            while (bt:thread-alive-p th)
+            do (sleep 0.1))
       (when (bt:thread-alive-p th)
         (ignore-errors (bt:destroy-thread th)))
       (setf (worker-stderr-thread worker) nil)))
@@ -634,8 +644,10 @@ Returns T if signal was sent, NIL if process was already dead."
 Closes the TCP socket under stream-lock for mutual exclusion with
 concurrent worker-rpc calls. Sends SIGTERM first, waits up to 2
 seconds, then SIGKILL if still alive. Sets state to :dead.
-Also destroys the stderr drain thread to prevent leaked file
-descriptors from blocking subsequent subprocess launches.
+Closes the worker's stderr pipe before waiting on the drain thread so
+the thread exits cleanly (read-line returns NIL) without holding
+*stderr-drain-lock*; falls back to destroy-thread only if the thread
+has not exited after 1 s.
 Robust against already-dead processes."
   (let ((process (worker-process-info worker)))
     (log-event :info "worker.killing"
@@ -671,11 +683,18 @@ Robust against already-dead processes."
           (log-event :warn "worker.kill.error"
                      "id" (worker-id worker)
                      "error" (princ-to-string e))))
-      ;; Wait for stderr drain thread to finish.
-      ;; bt:join-thread in this bt version has no :timeout; destroy if still alive.
+      ;; Close the stderr pipe to wake the drain thread's read-line loop,
+      ;; then poll up to 1 s for natural exit before resorting to
+      ;; destroy-thread. Closing the pipe avoids the risk of destroy-thread
+      ;; killing the thread while it holds *stderr-drain-lock*.
       (let ((th (worker-stderr-thread worker)))
         (when (and th (bt:thread-alive-p th))
-          (ignore-errors (bt:destroy-thread th))
+          (ignore-errors (close (sb-ext:process-error process)))
+          (loop repeat 10
+                while (bt:thread-alive-p th)
+                do (sleep 0.1))
+          (when (bt:thread-alive-p th)
+            (ignore-errors (bt:destroy-thread th)))
           (setf (worker-stderr-thread worker) nil)))
       (ignore-errors (sb-ext:process-close process)))
     (log-event :info "worker.killed"
@@ -686,6 +705,13 @@ Robust against already-dead processes."
 ;;; ---------------------------------------------------------------------------
 ;;; Public API — utility
 ;;; ---------------------------------------------------------------------------
+
+(defun mark-worker-crashed (worker reason)
+  "Public entry point to mark WORKER as crashed with REASON.
+Delegates to %mark-worker-crashed so pool.lisp can crash-mark a worker
+without accessing private struct accessors. See %mark-worker-crashed for
+full semantics (state, stream close, reset-notification, reaper thread)."
+  (%mark-worker-crashed worker reason))
 
 (defun clear-reset-notification (worker)
   "Clear the needs-reset-notification flag on WORKER."
