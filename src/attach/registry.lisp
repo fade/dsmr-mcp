@@ -118,7 +118,7 @@ value of VALUE-FORM in the DSMR-MCP-ATTACH-REGISTRY table and returns the
 raw integer ID, or NIL when the value is a primitive (not inspectable).
 
 VALUE-FORM is the sexp that evaluates to the value to register.
-SESSION-ID is a string embedded literally as the ownership tag (D-07).
+SESSION-ID is a string embedded literally as the ownership tag.
 
 The inspectable-p check is inlined (numberp/stringp/symbolp/characterp) so
 the remote image does not call back to the dispatcher's inspectable-p.
@@ -157,14 +157,14 @@ when bordeaux-threads is absent in the attached image)."
   "Return the sexp that, when evaluated in the attached image, looks up RAW-ID
 in the DSMR-MCP-ATTACH-REGISTRY table and returns:
   - :FOUND when the entry exists and the stored :session equals SESSION-ID
-  - :OBJECT-NOT-FOUND on id miss or session-id mismatch (D-07)
+  - :OBJECT-NOT-FOUND on id miss or session-id mismatch
 
 RAW-ID is an integer; SESSION-ID is a string — both embedded literally.
 Returns the keyword :FOUND (not the live object) so the result is readable
 across the slime-eval wire.  Used by the session-isolation test and by
-05-03's lookup validation step.  The 05-03 inspect path uses a different
-form that holds the object locally in the image and calls slynk::inspect-object
-on it, returning the readable istate plist."
+the dispatcher's lookup validation step.  The inspect-object path uses a
+different form that holds the object locally in the image and calls
+slynk::inspect-object on it, returning the readable istate plist."
   (flet ((cl-user-sym (name)
            (intern name (find-package :common-lisp-user))))
     (let ((s-tbl   (cl-user-sym "%DSMR-MCP-ATTACH-REG-LU-TBL"))

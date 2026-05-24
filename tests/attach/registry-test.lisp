@@ -2,9 +2,9 @@
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
 ;;;; Integration tests for the image-resident attached object registry.
-;;;; Covers ATTACH-09: result_object_id minting, survival across calls,
-;;;; session isolation (D-07), register_result gating (D-06), and epoch
-;;;; invalidation on connection drop (D-08).
+;;;; Covers result_object_id minting, survival across calls, session
+;;;; isolation, register_result gating, and epoch invalidation on
+;;;; connection drop.
 ;;;;
 ;;;; Uses the in-process Slynk fixture (with-temporary-slynk-listener)
 ;;;; so tests exercise the real slime-eval path without an external image.
@@ -55,16 +55,21 @@ so %dispatch-attach reuses the already-open fixture connection."
     (setf (repl-eval-tool-slynk-conn tool) conn)
     (values session tool)))
 
-;;; ATTACH-09: result_object_id present for inspectable results ---------------
+;;; result_object_id present for inspectable results -------------------------
 
-(define-test attach09-result-object-id-present
+(define-test result-object-id-present
   "A repl-eval returning a CLOS instance puts a non-nil result_object_id
 string in the response envelope. Primitives (numbers) must NOT produce one."
   (with-temporary-slynk-listener (conn)
     ;; Ensure a throwaway CLOS class is available in the attached image.
+    ;; The class must be defined in CL-USER so that code strings read in the
+    ;; default CL-USER package can reference it without a package qualifier.
+    ;; Using cl-user:: here ensures the symbol is interned in CL-USER at
+    ;; test-file read time, matching where the wrap-form reader will look.
     (slime-eval '(progn
-                  (unless (find-class 'test-registry-widget nil)
-                    (defclass test-registry-widget () ((val :initarg :val :initform 0))))
+                  (unless (find-class 'cl-user::test-registry-widget nil)
+                    (defclass cl-user::test-registry-widget
+                        () ((val :initarg :val :initform 0))))
                   nil)
                 conn)
     (multiple-value-bind (session tool)
@@ -86,15 +91,16 @@ string in the response envelope. Primitives (numbers) must NOT produce one."
         (false (gethash "isError" res2))
         (true  (null oid2))))))
 
-;;; ATTACH-09: IDs survive across sequential calls ----------------------------
+;;; IDs survive across sequential calls ---------------------------------------
 
-(define-test attach09-ids-survive-across-calls
+(define-test ids-survive-across-calls
   "Two sequential repl-eval calls in the same session each return a distinct
 result_object_id. Both underlying raw IDs remain look-up-able in the image table."
   (with-temporary-slynk-listener (conn)
     (slime-eval '(progn
-                  (unless (find-class 'test-registry-widget nil)
-                    (defclass test-registry-widget () ((val :initarg :val :initform 0))))
+                  (unless (find-class 'cl-user::test-registry-widget nil)
+                    (defclass cl-user::test-registry-widget
+                        () ((val :initarg :val :initform 0))))
                   nil)
                 conn)
     (multiple-value-bind (session tool)
@@ -139,15 +145,16 @@ result_object_id. Both underlying raw IDs remain look-up-able in the image table
             (isnt eq :object-not-found found1)
             (isnt eq :object-not-found found2)))))))
 
-;;; ATTACH-09: session isolation (D-07) ----------------------------------------
+;;; Session isolation between sessions ----------------------------------------
 
-(define-test attach09-session-isolation
+(define-test session-isolation
   "An ID minted by session A, when looked up with session B's session-id,
-resolves to :object-not-found — never another session's object (D-07)."
+resolves to :object-not-found — never another session's object."
   (with-temporary-slynk-listener (conn)
     (slime-eval '(progn
-                  (unless (find-class 'test-registry-widget nil)
-                    (defclass test-registry-widget () ((val :initarg :val :initform 0))))
+                  (unless (find-class 'cl-user::test-registry-widget nil)
+                    (defclass cl-user::test-registry-widget
+                        () ((val :initarg :val :initform 0))))
                   nil)
                 conn)
     ;; Session A mints an ID.
@@ -166,22 +173,23 @@ resolves to :object-not-found — never another session's object (D-07)."
                (wrong-session-id "reg-test-session-b")
                (isolation-form (build-lookup-form raw-id-a wrong-session-id))
                ;; Use eval (not slime-eval) for in-process lookup — same
-               ;; reason as attach09-ids-survive-across-calls: slime-eval
+               ;; reason as ids-survive-across-calls: slime-eval
                ;; after %dispatch-attach on the same conn can deadlock under
                ;; the BT condition-wait path.
                (lookup-result  (eval isolation-form)))
           ;; Must get :object-not-found — not the actual object.
           (is eq :object-not-found lookup-result))))))
 
-;;; ATTACH-09: register_result false suppresses id (D-06) ----------------------
+;;; register_result false suppresses the id -----------------------------------
 
-(define-test attach09-register-result-false
+(define-test register-result-false-suppresses-id
   "When register_result is false in the params, result_object_id must be absent
-from the response, even for an inspectable (CLOS) result (D-06)."
+from the response, even for an inspectable (CLOS) result."
   (with-temporary-slynk-listener (conn)
     (slime-eval '(progn
-                  (unless (find-class 'test-registry-widget nil)
-                    (defclass test-registry-widget () ((val :initarg :val :initform 0))))
+                  (unless (find-class 'cl-user::test-registry-widget nil)
+                    (defclass cl-user::test-registry-widget
+                        () ((val :initarg :val :initform 0))))
                   nil)
                 conn)
     (multiple-value-bind (session tool)
@@ -197,11 +205,11 @@ from the response, even for an inspectable (CLOS) result (D-06)."
         ;; No result_object_id key when register_result is false.
         (true  (null oid))))))
 
-;;; ATTACH-09: epoch invalidation on drop-connection (D-08) -------------------
+;;; Epoch invalidation on connection drop -------------------------------------
 
-(define-test attach09-epoch-invalidation
+(define-test epoch-invalidation-on-drop
   "Calling drop-connection on the tool increments repl-eval-tool-connection-epoch
-by exactly 1, making IDs minted before the drop carry a stale epoch (D-08)."
+by exactly 1, making IDs minted before the drop carry a stale epoch."
   (with-temporary-slynk-listener (conn)
     (multiple-value-bind (session tool)
         (%make-attach-session "reg-test-epoch" conn)
