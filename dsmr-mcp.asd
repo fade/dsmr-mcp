@@ -39,6 +39,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/hermetic/worker/main"
                "dsmr-mcp/src/hermetic/pool"
                "dsmr-mcp/src/hermetic/dispatch"
+               "dsmr-mcp/src/tools/inspect-object"
                "dsmr-mcp/src/tools/pool-status"
                "dsmr-mcp/src/tools/pool-kill-worker")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
@@ -71,7 +72,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/hermetic/pool-affinity-test"
                "dsmr-mcp/tests/hermetic/circuit-breaker-test"
                "dsmr-mcp/tests/hermetic/repl-eval-parity-test"
-               "dsmr-mcp/tests/hermetic/inspect-test")
+               "dsmr-mcp/tests/hermetic/inspect-test"
+               "dsmr-mcp/tests/attach/inspect-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
