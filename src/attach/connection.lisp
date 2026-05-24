@@ -118,8 +118,29 @@ on TOOL's slynk-conn slot and logs attach.connection.opened."
 The connection is presumed dead on a network error; attempting slime-close on
 a dead socket could block.  The nil slot causes the next get-or-open-connection
 call to reopen on demand (fail-closed semantics).
+
+Also increments the connection-incarnation epoch counter on TOOL via the
+forward-reference accessor pattern (the accessor is defined in dispatch.lisp
+which depends on this file).  The increment uses ignore-errors so teardown
+before dispatch is loaded never escapes.  The epoch bump invalidates all
+result_object_ids minted before the drop.
+
 Returns NIL."
   (setf (%conn tool) nil)
+  ;; Bump epoch via the forward-referenced accessor.  Uses the same
+  ;; (fdefinition (list 'setf (find-symbol ...))) pattern as (setf %conn)
+  ;; above — dispatch.lisp depends on connection.lisp, so a direct import
+  ;; would be circular.
+  (ignore-errors
+    (let* ((epoch-reader (fdefinition
+                          (find-symbol "REPL-EVAL-TOOL-CONNECTION-EPOCH"
+                                       :dsmr-mcp/src/attach/dispatch)))
+           (epoch-writer (fdefinition
+                          (list 'setf
+                                (find-symbol "REPL-EVAL-TOOL-CONNECTION-EPOCH"
+                                             :dsmr-mcp/src/attach/dispatch)))))
+      (when (and epoch-reader epoch-writer)
+        (funcall epoch-writer (1+ (funcall epoch-reader tool)) tool))))
   (log-event :info "attach.connection.dropped" "reason" reason)
   nil)
 

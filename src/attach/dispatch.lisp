@@ -45,6 +45,9 @@
                 #:truncate-output
                 #:sanitize-control-chars
                 #:*default-max-output-length*)
+  (:import-from #:dsmr-mcp/src/attach/registry
+                #:encode-object-id
+                #:decode-object-id)
   (:import-from #:slynk-client
                 #:slime-eval
                 #:slime-network-error)
@@ -54,6 +57,7 @@
   (:export #:repl-eval-tool
            #:repl-eval-tool-slynk-conn
            #:repl-eval-tool-call-lock
+           #:repl-eval-tool-connection-epoch
            #:%dispatch-attach
            #:try-eager-connect
            #:detach-session))
@@ -90,7 +94,12 @@ Requires :slynk-attach / DSMR_SLYNK_ATTACH to be configured.")
                   :description "Package name in which to evaluate; defaults to CL-USER.")
                  (max-output-length
                   :type :integer
-                  :description "Maximum characters for captured stdout/stderr output (default: 50000)."))
+                  :description "Maximum characters for captured stdout/stderr output (default: 50000).")
+                 (register-result
+                  :type :boolean
+                  :description "When true (the default), registers the last form's first \
+return value in the image-resident handle table and returns result_object_id. \
+Set to false to suppress registration for hot loops or uninteresting results."))
                 :required ("code")))
    ;; Per-instance (per-session) connection state — NOT :allocation :class.
    ;; One connection cache per session, living on the tool instance.
@@ -103,11 +112,19 @@ Set by get-or-open-connection; nilled by drop-connection on network error.")
    (call-lock
     :initform (bordeaux-threads:make-lock "dsmr-repl-eval-lock")
     :reader repl-eval-tool-call-lock
-    :documentation "Serialises concurrent slime-eval calls on this session's connection."))
+    :documentation "Serialises concurrent slime-eval calls on this session's connection.")
+   ;; Per-session connection-incarnation epoch counter.
+   (connection-epoch
+    :initform 0
+    :accessor repl-eval-tool-connection-epoch
+    :documentation "Monotonic integer incremented on each drop-connection call.
+Embedded in result_object_id so that IDs minted before a connection drop carry
+a stale epoch and can be short-circuited to a registry-reset error at lookup
+time without a round-trip to the image."))
   (:metaclass mcp-tool-class)
   (:documentation "MCP tool: evaluate Lisp forms in the attached Slynk image.
-Per-session slots carry the connection and call-serialisation lock so sessions
-are fully isolated from each other."))
+Per-session slots carry the connection, call-serialisation lock, and
+connection-incarnation epoch so sessions are fully isolated from each other."))
 
 ;; CRITICAL: ensure-finalized must appear after defclass so the metaclass
 ;; :after finalize-inheritance method fires at load time and registers
@@ -180,29 +197,39 @@ addition to, not instead of, those existing bounds."
 ;;;
 ;;; Adapted from cl-mcp/src/tools/response-builders.lisp §77-169 (MIT) under AGPL.
 
-(defun build-eval-response (printed stdout stderr error-context effective-limit)
+(defun build-eval-response (printed stdout stderr error-context effective-limit
+                            &key result-object-id)
   "Build the repl-eval response hash-table from the dispatcher-side processed
 fields (truncation and sanitisation already applied to printed/stdout/stderr).
 
 EFFECTIVE-LIMIT is threaded through to %build-error-context-ht so the
 error_context message field is bounded consistently with the other output fields.
 
+RESULT-OBJECT-ID when non-nil is the already-encoded wire string (epoch:sess:id)
+added as the \"result_object_id\" key and appended to the enriched content text.
+
 Returns a hash-table with:
-  \"content\"       : text-content array with enriched text (value + context)
-  \"stdout\"        : captured stdout string
-  \"stderr\"        : captured stderr string
-  \"error_context\" : (only when error-context non-nil) structured hash-table
-                     with condition_type, message, restarts, frames"
+  \"content\"         : text-content array with enriched text (value + context)
+  \"stdout\"          : captured stdout string
+  \"stderr\"          : captured stderr string
+  \"error_context\"   : (only when error-context non-nil) structured hash-table
+                       with condition_type, message, restarts, frames
+  \"result_object_id\": (only when result-object-id non-nil) the object handle
+                       string for use with inspect-object"
   (let ((ht (make-hash-table :test 'equal)))
     (setf (gethash "stdout" ht) (or stdout ""))
     (setf (gethash "stderr" ht) (or stderr ""))
     (when error-context
       (setf (gethash "error_context" ht)
             (%build-error-context-ht error-context effective-limit)))
-    ;; Build enriched text for content[].text (no object-id section).
+    (when result-object-id
+      (setf (gethash "result_object_id" ht) result-object-id))
+    ;; Build enriched text for content[].text.
     (let ((enriched
             (with-output-to-string (s)
               (write-string (or printed "") s)
+              (when result-object-id
+                (format s "~&[object-id: ~A]" result-object-id))
               (when (and stdout (plusp (length stdout)))
                 (format s "~&~%;; stdout~%~A" stdout))
               (when (and stderr (plusp (length stderr)))
@@ -239,16 +266,24 @@ Returns a hash-table with:
   "Dispatch a repl-eval call to the attached Slynk server.
 
 TOOL is the per-session repl-eval-tool instance carrying the cached
-connection and call-lock slots. PARAMS is the equal-keyed argument
-hash-table from the tools/call request.
+connection, call-lock, and connection-epoch slots. PARAMS is the equal-keyed
+argument hash-table from the tools/call request.
 
 Serialises slime-eval under the per-session call-lock. On slime-network-error:
 drops the dead connection and returns a structured isError envelope; the next
 call reopens on demand. When the connection was nil and reopened successfully,
-prepends a reconnect note to the stdout field."
+prepends a reconnect note to the stdout field.
+
+When register_result is true (the default) and the last form's result is
+inspectable, the response includes a result_object_id encoded as
+epoch:session-id:raw-id. The epoch is the current connection-incarnation epoch
+so IDs minted before a drop-connection can be detected as stale."
   (let* ((code              (gethash "code" params))
          (package-name      (gethash "package" params))
          (max-output-length (gethash "max_output_length" params))
+         ;; register_result: absent or true => t; explicit jzon false/nil => nil.
+         (register-result   (let ((v (gethash "register_result" params :missing)))
+                              (if (eq v :missing) t (not (null v)))))
          (reconnectedp      nil))
     ;; Validate code parameter.
     (unless (and (stringp code) (plusp (length code)))
@@ -280,29 +315,41 @@ prepends a reconnect note to the stdout field."
                      ;; the slot was nil at entry, not after the open.
                      (when (null (repl-eval-tool-slynk-conn tool))
                        (setf reconnectedp t))
-                     (let* ((conn (get-or-open-connection tool host port))
-                            (form (build-wrapping-form code package-name)))
+                     (let* ((conn     (get-or-open-connection tool host port))
+                            (sess-id  (session-id (tool-session tool)))
+                            (form     (build-wrapping-form code package-name
+                                                           :register-result register-result
+                                                           :session-id sess-id)))
                        ;; slime-eval call is inside the lock.
                        (slime-eval form conn)))))
-            ;; Destructure the 5-element result tuple from the remote image.
-            ;; Shape: (printed raw stdout stderr error-context)
+            ;; Destructure the 6-element result tuple from the remote image.
+            ;; Shape: (printed raw stdout stderr error-context raw-id-or-nil)
             ;; Pad with nils when the remote returns a shorter list (defensive).
             (let* ((result-list
                      (if (listp raw-result)
                          (let ((r raw-result))
-                           (append r (loop repeat (max 0 (- 5 (length r)))
+                           (append r (loop repeat (max 0 (- 6 (length r)))
                                           collect nil)))
                          (list (princ-to-string raw-result)
-                               raw-result "" "" nil)))
+                               raw-result "" "" nil nil)))
                    (printed       (first  result-list))
                    ;; raw (second) ignored: raw == printed.
                    (stdout        (or (third  result-list) ""))
                    (stderr        (or (fourth result-list) ""))
                    (error-context (fifth  result-list))
+                   (raw-id-or-nil (sixth  result-list))
                    (effective-limit (or (and (integerp max-output-length)
                                              (plusp max-output-length)
                                              max-output-length)
-                                        *default-max-output-length*)))
+                                        *default-max-output-length*))
+                   ;; Compute result_object_id. Suppress on the reconnect path:
+                   ;; the just-reinstalled table holds nothing prior; do not hand
+                   ;; back an id whose epoch the caller cannot have seen.
+                   (result-object-id
+                     (when (and raw-id-or-nil (not reconnectedp))
+                       (encode-object-id (repl-eval-tool-connection-epoch tool)
+                                         (session-id (tool-session tool))
+                                         raw-id-or-nil))))
               ;; Apply truncation+sanitise to the main output fields.
               ;; Reconnect note prepended to stdout AFTER truncation so the note
               ;; is never silently dropped when effective-limit is very small.
@@ -318,7 +365,8 @@ prepends a reconnect note to the stdout field."
                  trunc-stdout
                  (truncate-output stderr          effective-limit)
                  error-context
-                 effective-limit))))
+                 effective-limit
+                 :result-object-id result-object-id))))
         (slime-network-error (e)
           ;; Fail-closed: nil the cached connection so next call reopens.
           (drop-connection tool :reason "network-error")
