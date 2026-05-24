@@ -11,7 +11,7 @@
 ;;;;   - inline safe-prin1 as a local helper (no cl-mcp utils dependency)
 ;;;;   - import make-ht and text-content from dsmr-mcp/src/tools/helpers
 ;;;;   - export build-inspect-response (defined here, not in a separate file)
-;;;;   - omit define-tool and with-proxy-dispatch (handled in 05-03)
+;;;;   - omit define-tool and with-proxy-dispatch (handled dispatcher-side)
 ;;;;
 ;;;; Thread safety: all registry mutations acquire the registry's lock via
 ;;;; register-object / lookup-object in registry.lisp.

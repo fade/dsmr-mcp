@@ -58,20 +58,19 @@ Override via DSMR_WORKER_EVAL_TIMEOUT environment variable.")
   "Evaluate code in-process and return the response structure.
 
 Reads code / package / timeout_seconds / max_output_length / register_result
-from PARAMS. Builds the wrapping form via build-wrapping-form, evaluates it
-inside sb-ext:with-timeout, then calls build-eval-response — the same
-pipeline as the attached path, giving identical output regardless of whether
-the eval runs in attached or hermetic mode.
+from PARAMS. Builds the wrapping form via build-wrapping-form with
+:surface-raw-value t, evaluates it once inside sb-ext:with-timeout, then
+calls build-eval-response — the same pipeline as the attached path, giving
+identical output regardless of whether the eval runs in attached or hermetic
+mode.
 
 When register_result is true (the default) and the eval succeeds with an
 inspectable result, registers the live value in REGISTRY and adds
-result_object_id to the response. The live value is captured by evaluating
-the user's forms directly (without output redirection) before the full
-wrapping-form eval, so the registration sees the actual Lisp object, not
-its printed representation. This pre-eval captures the raw value only — it
-does not capture stdout/stderr, which the wrapping-form eval handles. The
-pre-eval result is used solely for registration; no side effects are doubled
-because registration reads only the identity of the object.
+result_object_id to the response. The live value is the 7th element of the
+wrapping-form result list — the actual Lisp object returned by the last
+evaluated form, captured during the single evaluation. No re-read or
+re-eval of the user code occurs; side effects run exactly once and the
+registered object is the same instance the eval returned.
 
 On sb-ext:with-timeout expiry the worker returns a structured TIMEOUT result
 and SURVIVES — the condition is caught, not re-signalled.
@@ -89,7 +88,10 @@ result envelope before sending to the dispatcher."
              (if presentp val t))))
     (unless code
       (error "code is required"))
-    (let* ((form (build-wrapping-form code package-name))
+    ;; :surface-raw-value t adds a 7th element to the result list: the live
+    ;; Lisp object from the last evaluated form.  This lets us register the
+    ;; actual result in REGISTRY from a single evaluation of the user code.
+    (let* ((form (build-wrapping-form code package-name :surface-raw-value t))
            (result-list
              (handler-case
                  (sb-ext:with-timeout (or timeout-seconds *default-eval-timeout*)
@@ -101,11 +103,14 @@ result envelope before sending to the dispatcher."
                        (list :condition-type "SB-EXT:TIMEOUT"
                              :message (format nil "Evaluation timed out after ~A seconds"
                                               (or timeout-seconds *default-eval-timeout*))
-                             :restarts nil :frames nil)))))
+                             :restarts nil :frames nil)
+                       nil nil))))
            (printed       (first  result-list))
            (stdout        (or (third  result-list) ""))
            (stderr        (or (fourth result-list) ""))
            (error-context (fifth  result-list))
+           ;; 7th element: live Lisp object from the last form, NIL on error.
+           (raw-value     (seventh result-list))
            (effective-limit (or (and (integerp max-output-length)
                                      (plusp max-output-length)
                                      max-output-length)
@@ -116,33 +121,14 @@ result envelope before sending to the dispatcher."
               (truncate-output stdout effective-limit)
               (truncate-output stderr effective-limit)
               error-context effective-limit)))
-      ;; Surface result_object_id when: no error, register_result true.
-      ;; The worker eval runs in-process, so the raw Lisp value is accessible.
-      ;; We capture it by re-reading and re-evaluating the code forms in a
-      ;; lightweight handler-case — this is a second eval of the same code,
-      ;; gated strictly on register_result and eval success (error-context nil).
-      ;; The trade-off is acceptable: result registration is opt-outable, the
-      ;; second eval is only for identity capture, and most worker evals are
-      ;; pure expressions rather than long-running side-effectful scripts.
-      (when (and register-result (null error-context))
-        (handler-case
-            (let* ((pkg (or (and package-name (find-package (string-upcase package-name)))
-                            *package*))
-                   (forms (let ((*package* pkg))
-                            (with-input-from-string (s code)
-                              (loop for form = (read s nil s)
-                                    until (eq form s)
-                                    collect form))))
-                   (raw-value
-                     ;; Eval all forms in sequence; keep only the last first value.
-                     (let (last-val)
-                       (dolist (f forms last-val)
-                         (setf last-val (car (multiple-value-list (eval f))))))))
-              (when (and raw-value (inspectable-p raw-value))
-                (let ((id (register-object raw-value registry)))
-                  (when id
-                    (setf (gethash "result_object_id" response) id)))))
-          (error () nil)))
+      ;; Register the result object when: no error, register_result true,
+      ;; and the live value is inspectable.  The value came from the single
+      ;; wrapping-form eval above — no second eval of the user code occurs.
+      (when (and register-result (null error-context) raw-value
+                 (inspectable-p raw-value))
+        (let ((id (register-object raw-value registry)))
+          (when id
+            (setf (gethash "result_object_id" response) id))))
       response)))
 
 ;;; ---------------------------------------------------------------------------
@@ -152,8 +138,8 @@ result envelope before sending to the dispatcher."
 (defun %handle-inspect-object (params registry)
   "Inspect a registered object by ID. Returns the cl-mcp envelope shape.
 REGISTRY is the per-worker object-registry instance passed at handler
-registration. The id parameter is the raw integer ID (the dispatcher in
-05-03 strips the epoch/session prefix before forwarding)."
+registration. The id parameter is the raw integer ID (the dispatcher
+strips the epoch/session prefix before forwarding)."
   (let* ((object-id    (gethash "id"           params))
          (max-depth    (or (gethash "max_depth"    params) 1))
          (max-elements (or (gethash "max_elements" params) 50)))

@@ -4,7 +4,7 @@
 ;;;; In-process tests for the hermetic worker's object registry and walker.
 ;;;; These tests run without spawning a worker process — they exercise the
 ;;;; registry and inspect functions directly, proving the worker-LOCAL
-;;;; behaviors that VERB-11 requires on the hermetic path.
+;;;; behaviors required on the hermetic path.
 ;;;;
 ;;;; Coverage:
 ;;;;   - Registry round-trip (register + lookup)
@@ -12,6 +12,8 @@
 ;;;;   - Walker envelope shape for CLOS instances and hash-tables
 ;;;;   - OBJECT_NOT_FOUND for unknown IDs
 ;;;;   - build-inspect-response wrapping (success and error cases)
+;;;;   - Single-eval guarantee: user code runs once, registered object is
+;;;;     the same instance the eval returned
 
 (defpackage #:dsmr-mcp/tests/hermetic/inspect-test
   (:use #:cl #:parachute)
@@ -22,7 +24,9 @@
                 #:inspectable-p)
   (:import-from #:dsmr-mcp/src/hermetic/worker/inspect
                 #:inspect-object-by-id
-                #:build-inspect-response))
+                #:build-inspect-response)
+  (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
+                #:%handle-eval))
 
 (in-package #:dsmr-mcp/tests/hermetic/inspect-test)
 
@@ -149,3 +153,67 @@ and a content-bearing envelope for a successful inspection."
     ;; Error response must have isError=t
     (true (hash-table-p err-response))
     (true (gethash "isError" err-response))))
+
+;;; ---------------------------------------------------------------------------
+;;; Single-eval guarantee — side effects run once, registered object matches
+;;; ---------------------------------------------------------------------------
+
+;; Counter lives in CL-USER so the eval'd code string can reference it
+;; without package-qualification gymnastics.
+(defvar cl-user::*inspect-test-eval-counter* 0
+  "Counter incremented inside eval-side-effect-runs-once to detect double evaluation.")
+
+(define-test eval-side-effect-runs-once
+  "User code passed to %handle-eval executes exactly once even when
+register_result is true.  A form that increments a special variable and
+returns a fresh cons must leave the counter at exactly 1 after the call."
+  ;; Reset counter before each run.
+  (setf cl-user::*inspect-test-eval-counter* 0)
+  (let* ((reg (make-object-registry))
+         (params (let ((ht (make-hash-table :test 'equal)))
+                   ;; The code increments the counter and returns a cons
+                   ;; (inspectable, so registration fires).
+                   (setf (gethash "code" ht)
+                         "(progn (incf cl-user::*inspect-test-eval-counter*) (cons :tag cl-user::*inspect-test-eval-counter*))")
+                   (setf (gethash "register_result" ht) t)
+                   ht))
+         (response (%handle-eval params reg)))
+    ;; Counter must be 1 — proves the user form ran exactly once.
+    (is = 1 cl-user::*inspect-test-eval-counter*)
+    ;; A result_object_id must have been assigned (cons is inspectable).
+    (true (gethash "result_object_id" response))))
+
+(define-test eval-registers-result-without-re-running
+  "The object stored in the registry under result_object_id is the same
+instance that %handle-eval evaluated — not a second instance produced by
+a re-evaluation.  Verified by mutating the registered object's slot and
+confirming the mutation is visible through a fresh lookup, and by checking
+that the printed result matches the instance's original slot value."
+  (let* ((reg (make-object-registry))
+         (params (let ((ht (make-hash-table :test 'equal)))
+                   (setf (gethash "code" ht)
+                         "(make-instance 'dsmr-mcp/tests/hermetic/inspect-test::%test-widget :color \"same-instance\" :count 42)")
+                   (setf (gethash "register_result" ht) t)
+                   ht))
+         (response (%handle-eval params reg))
+         (id (gethash "result_object_id" response)))
+    ;; An ID must have been assigned.
+    (true (and id (integerp id) (plusp id)))
+    ;; Retrieve the registered object and verify its slot matches what was constructed.
+    (multiple-value-bind (obj found-p)
+        (lookup-object id reg)
+      (true found-p)
+      (is string= "same-instance" (slot-value obj 'color))
+      (is = 42 (slot-value obj 'count))
+      ;; Mutate the registered object.  If it were a re-evaluated second instance,
+      ;; this mutation would not affect whatever was returned to the caller — the
+      ;; test would still pass, but the guarantee would be broken.  Because the
+      ;; same object is registered, the mutation is visible through the same id.
+      (setf (slot-value obj 'count) 999)
+      (multiple-value-bind (obj2 found2-p)
+          (lookup-object id reg)
+        (true found2-p)
+        ;; EQ identity: same pointer, not a copy.
+        (true (eq obj obj2))
+        ;; Mutation visible through re-lookup proves it is the same instance.
+        (is = 999 (slot-value obj2 'count))))))

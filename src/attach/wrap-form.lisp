@@ -170,11 +170,12 @@ Returns NIL when STRING is NIL."
 ;;;    via (return) (s-err-ctx set).
 
 (defun build-wrapping-form (code-string &optional package-name
-                                        &key (register-result t) session-id)
+                                        &key (register-result t) session-id
+                                             surface-raw-value)
   "Return the s-expression to pass to slynk-client:slime-eval.
 
-The remote evaluation produces a 6-element list:
-  (printed raw stdout stderr error-context raw-id)
+The remote evaluation produces a list of 6 or 7 elements:
+  (printed raw stdout stderr error-context raw-id [live-value])
 
   printed       : prin1-to-string of all values from all evaluated forms,
                   values within a form separated by \", \", forms by newline.
@@ -189,6 +190,12 @@ The remote evaluation produces a 6-element list:
   raw-id        : integer handle-table ID when REGISTER-RESULT is true and the
                   last form's first value is inspectable (not a number, string,
                   symbol, or character); NIL otherwise.
+  live-value    : (7th element, present only when SURFACE-RAW-VALUE is true)
+                  the actual Lisp object that is the last form's first return
+                  value, NIL on error or when no forms were evaluated.  On the
+                  attached path this travels through slime-eval serialization
+                  and is not useful; on the hermetic in-process path it is the
+                  real live object, enabling single-eval result registration.
 
 CODE-STRING is the source text; one or more top-level forms are read from it.
 PACKAGE-NAME is the evaluation package name (string); defaults to \"CL-USER\".
@@ -198,6 +205,10 @@ REGISTER-RESULT when true (the default) registers the last form's first return
   registration for hot loops or uninteresting results.
 SESSION-ID is the dsmr session identifier embedded in the table entry for
   isolation between concurrent sessions sharing one image.
+SURFACE-RAW-VALUE when true adds a 7th element to the result list: the live
+  Lisp object that is the last form's first return value.  Intended for the
+  hermetic in-process eval path where the caller needs the real object for
+  registration without a second eval.  Defaults to NIL (6-element list).
 
 *read-eval* SEAM: *read-eval* is T in the reader call below (trusted
   localhost posture).  A future safety pass will wrap the
@@ -436,7 +447,10 @@ SESSION-ID is the dsmr session identifier embedded in the table entry for
          ;; (returning nil) with s-err-ctx set and s-printed nil.  This form
          ;; runs regardless, producing the wire tuple.
          ;; raw == printed: avoids #<...> reader errors on round-trip.
-         ;; The 6th element is the raw integer handle-table ID, or nil.
+         ;; The 6th element is the raw integer handle-table ID for the attached path, or nil.
+         ;; The optional 7th element (when surface-raw-value is true) is the live Lisp
+         ;; object that is the last form's first return value — useful on the hermetic
+         ;; in-process path where the caller has direct access to the live value.
          (list ,s-printed
                ,s-printed                            ; raw = printed
                (get-output-stream-string ,s-stdout)  ; stdout
@@ -451,4 +465,13 @@ SESSION-ID is the dsmr session identifier embedded in the table entry for
                   (build-register-result-form
                    `(when (and (null ,s-err-ctx) ,s-all-vals)
                       (car (car ,s-all-vals)))
-                   (or session-id ""))))))))   ; closes: list, outer-let*, flet, defun
+                   (or session-id "")))
+               ;; 7th element (surface-raw-value only): the live Lisp object.
+               ;; s-all-vals is collected in reverse order and then nreverse'd in
+               ;; the success path; on error it stays nil (the block returned early).
+               ;; (last s-all-vals) gives the list of values from the last evaluated
+               ;; form; (car (first ...)) gives the first of those values.
+               ;; This element is NIL when s-err-ctx is non-nil or no forms ran.
+               ,@(when surface-raw-value
+                   `((when (and (null ,s-err-ctx) ,s-all-vals)
+                       (car (first (last ,s-all-vals)))))))))))   ; closes: list, outer-let*, flet, defun
