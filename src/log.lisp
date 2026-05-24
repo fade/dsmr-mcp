@@ -16,6 +16,24 @@
 (defpackage #:dsmr-mcp/src/log
   (:use #:cl)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
+  ;; The body uses these log4cl:-prefixed symbols; declaring them via
+  ;; :import-from is how the :package-inferred-system scanner discovers
+  ;; that this file depends on the log4cl system (which also creates the
+  ;; LOG package the log: macros need). Without this, a cold build loads
+  ;; this sub-system before log4cl exists and fails to compile.
+  (:import-from #:log4cl
+                #:layout
+                #:layout-to-stream
+                #:log-level-to-string
+                #:+log-level-debug+
+                #:+log-level-info+
+                #:+log-level-warn+
+                #:+log-level-error+
+                #:fixed-stream-appender
+                #:add-appender
+                #:remove-all-appenders
+                #:*root-logger*
+                #:set-log-level)
   (:export #:log-event
            #:*log-level*
            #:*log-stream*
