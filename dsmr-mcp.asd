@@ -33,7 +33,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/hermetic/worker-client"
                "dsmr-mcp/src/hermetic/worker/server"
                "dsmr-mcp/src/hermetic/worker/handlers"
-               "dsmr-mcp/src/hermetic/worker/main")
+               "dsmr-mcp/src/hermetic/worker/main"
+               "dsmr-mcp/src/hermetic/pool")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"
