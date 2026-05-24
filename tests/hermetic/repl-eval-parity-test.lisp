@@ -27,6 +27,7 @@
                 #:initialize-pool #:shutdown-pool
                 #:get-or-assign-worker
                 #:pool-rpc-with-hard-kill
+                #:pool-status-info
                 #:*worker-pool-warmup*
                 #:*max-pool-size*)
   (:import-from #:dsmr-mcp/src/hermetic/worker-client
@@ -194,3 +195,67 @@ Duplicates the mode-router-test assertion in the hermetic suite for locality
       ;; The run.auto-mode warn must appear on stderr (HERM-07).
       (let ((stderr (get-output-stream-string capture)))
         (true (search "run.auto-mode" stderr))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Warmup-concurrent spawn — regression for cold-startup worker failure
+;;;
+;;; This test catches regressions where two workers spawning concurrently
+;;; (one standby, one session) cannot successfully handshake.  The most
+;;; likely causes are:
+;;;
+;;;   a) *standard-output* not restored to sb-sys:*stdout* in start()
+;;;      before %output-handshake — the handshake goes to stderr, the
+;;;      parent times out waiting on the stdout pipe.
+;;;
+;;;   b) --no-userinit removed from %build-sbcl-args — .sbclrc runs in
+;;;      each child and both children try to compile slynk to the same
+;;;      tmp fasl path simultaneously (reliably fatal only on cold builds
+;;;      outside the test suite, but the stdout-restore regression is
+;;;      detectable here).
+;;;
+;;; NOTE: This test does NOT catch the cold-compile fasl race that was the
+;;; primary production failure mode, because by the time the test suite runs
+;;; all fasls are warm.  The cold-fasl race is verified by the live smoke
+;;; test (smoke-hermetic-* in the Makefile / CI script).  This test
+;;; catches the protocol regressions (a) and (b) that are detectable with
+;;; warm fasls.
+;;; ---------------------------------------------------------------------------
+
+(define-test concurrent-warmup-and-session-spawn-both-succeed
+  "Regression: warmup=1 causes the pool to spawn a standby worker at
+initialize-pool time. When a session also requests a worker immediately
+after, two workers exist concurrently. Both must handshake and serve
+repl-eval successfully.
+
+Catches: stdout-pipe restore regression in start() where the handshake
+goes to stderr instead of the parent's pipe (causing a timeout), and
+placeholder-coordination regressions in the pool where a concurrent spawn
+is left in :spawning state indefinitely."
+  (let* ((dsmr-mcp/src/state:*mode* :hermetic)
+         (capture (make-string-output-stream))
+         (*error-output* capture)
+         (*worker-pool-warmup* 1)
+         (*max-pool-size* 4))
+    (configure-log4cl-for-server :warn)
+    (initialize-pool)
+    (unwind-protect
+         (progn
+           ;; Wait for the standby worker to appear (replenish is async).
+           (loop repeat 60
+                 until (let ((info (pool-status-info)))
+                         (plusp (gethash "standby_count" info)))
+                 do (sleep 0.5))
+           ;; Get a session worker — the pool now has both a standby (id=1)
+           ;; and a newly-bound session worker (id=2) at the same time.
+           (let* ((worker (get-or-assign-worker "concurrent-spawn-session"))
+                  (params (make-ht "code" "(+ 40 2)"))
+                  (resp (worker-rpc worker "worker/eval" params)))
+             ;; Session worker must return the correct value.
+             (true (hash-table-p resp))
+             (false (gethash "error_context" resp))
+             (let ((content (gethash "content" resp)))
+               (true content)
+               (true (plusp (length content)))
+               (let ((text (gethash "text" (aref content 0))))
+                 (true (search "42" text))))))
+      (ignore-errors (shutdown-pool)))))
