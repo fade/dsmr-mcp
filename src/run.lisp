@@ -34,6 +34,12 @@
                 #:set-log-level-from-env
                 #:*log-level*
                 #:configure-log4cl-for-server)
+  (:import-from #:dsmr-mcp/src/attach/connection
+                #:parse-slynk-attach)
+  (:import-from #:dsmr-mcp/src/hermetic/pool
+                #:initialize-pool #:shutdown-pool #:release-session)
+  (:import-from #:usocket)
+  (:import-from #:sb-ext)
   ;; process-json-line is re-exported from here so src/main.lisp's
   ;; existing :import-from dsmr-mcp/src/run #:process-json-line
   ;; (wired by Plan 01-01) continues to resolve. The canonical
@@ -208,6 +214,40 @@ pass :project-root nil to mean \"use the cwd explicitly\"."
             (pathname env)
             (uiop:getcwd)))))
 
+;;; ---------------------------------------------------------------------------
+;;; :auto Slynk reachability probe (D-15, HERM-07)
+;;; ---------------------------------------------------------------------------
+
+(defun %slynk-reachable-p (slynk-attach)
+  "Probe whether the Slynk listener at SLYNK-ATTACH is reachable.
+Returns T when a TCP connection to host:port succeeds within 3 seconds,
+NIL when SLYNK-ATTACH is nil/empty or when the connect times out or
+is refused (connection-refused-error, end-of-file, general error).
+
+The probe uses sb-ext:with-timeout — NOT usocket:socket-connect :timeout
+which sets SO_RCVTIMEO and causes IO-TIMEOUT on subsequent reads
+(documented in usocket as a known pitfall)."
+  (when (or (null slynk-attach) (string= slynk-attach ""))
+    (return-from %slynk-reachable-p nil))
+  (multiple-value-bind (host port)
+      (handler-case (parse-slynk-attach slynk-attach)
+        (error () (return-from %slynk-reachable-p nil)))
+    (unless (and host port)
+      (return-from %slynk-reachable-p nil))
+    (handler-case
+        (sb-ext:with-timeout 3
+          (let ((sock (usocket:socket-connect host port :element-type 'character)))
+            (ignore-errors (usocket:socket-close sock))
+            t))
+      (sb-ext:timeout ()
+        nil)
+      (usocket:connection-refused-error ()
+        nil)
+      (usocket:socket-error ()
+        nil)
+      (error ()
+        nil))))
+
 (defun resolve-transport (&key (transport nil transport-supplied-p)
                                  (project-root nil project-root-supplied-p))
   "Resolve the effective transport keyword WITHOUT entering the blocking loop.
@@ -229,27 +269,33 @@ stdio loop."
                           (project-root nil project-root-supplied-p))
   "Resolve the effective dispatch mode keyword WITHOUT entering the blocking loop.
 
-Applies precedence: keyword > DSMR_MODE env > .dsmr-mcp.conf > :attached (D-02),
-then aliases :auto -> :attached (D-01 — real inference is deferred to Phase 4).
-Returns :ATTACHED or :HERMETIC.
+Applies precedence: keyword > DSMR_MODE env > .dsmr-mcp.conf > :attached (D-02).
+When the resolved mode is :auto, probes the Slynk listener via %slynk-reachable-p:
+  - Reachable -> :attached
+  - Unreachable -> :hermetic (emits a log4cl :warn; configure-log4cl-for-server must
+    have been called before this function runs or the warn goes to the wrong appender)
+
+Per D-16 / HERM-07: explicit :attached never falls back; :auto is an explicit opt-in
+for the logged fallback. The warn emitted on :auto -> :hermetic resolution is a
+startup-time notice only (not per-call).
 
 This is the non-blocking seam the criterion-1 tests assert against, mirroring
-RESOLVE-TRANSPORT.  It shares %RESOLVE-PROJECT-ROOT, %READ-CONF-INTO-DEFAULTS,
+RESOLVE-TRANSPORT. It shares %RESOLVE-PROJECT-ROOT, %READ-CONF-INTO-DEFAULTS,
 %OR-FROM-ENV, and %PARSE-MODE with RUN's live path, so the tested seam and the
-live binding of *MODE* resolve identically.
-
-The :slynk-attach argument is accepted to mirror RUN's keyword surface (the
-criterion-1 'with a slynk-attach target' case), but the mode itself does not
-depend on it: a configured target yields :ATTACHED only because :attached is
-the built-in default.  The mode keyword / DSMR_MODE / conf are the real inputs."
-  (declare (ignore slynk-attach slynk-attach-supplied-p))
+live binding of *MODE* resolve identically."
+  (declare (ignore slynk-attach-supplied-p))
   (let* ((root (%resolve-project-root project-root-supplied-p project-root))
          (conf (%read-conf-into-defaults root))
          (m    (%or-from-env mode-supplied-p mode "DSMR_MODE" conf :attached
                              :parse #'%parse-mode)))
-    ;; D-01: :auto is an alias for :attached.  This alias is also applied
-    ;; inline in RUN when setting *MODE*; keep the two in lockstep.
-    (if (eq m :auto) :attached m)))
+    (if (eq m :auto)
+        (if (%slynk-reachable-p slynk-attach)
+            :attached
+            (progn
+              (log-event :warn "run.auto-mode"
+                         "msg" "auto: no attached Slynk listener, using hermetic")
+              :hermetic))
+        m)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Entry point (D-14, D-15, D-16, D-17)
@@ -331,32 +377,39 @@ resolves to this function."
                          :parse #'identity)))
 
     ;; Suppress unused-variable notes for Phase-1 settings not yet wired.
-    ;; resolved-slynk-attach is now wired into the session (ATTACH-07 consumed);
-    ;; resolved-mode is now applied to *MODE* below (D-03).
     (declare (ignore resolved-bind resolved-port))
 
     ;; Apply resolved log level.
     (setf *log-level* resolved-log-level)
 
-    ;; Apply the resolved dispatch mode before transport dispatch so every
-    ;; tool call sees the configured *MODE* (D-03).  :auto aliases :attached
-    ;; (D-01); the same alias lives in RESOLVE-MODE — keep the two in lockstep.
-    (setf *mode* (if (eq resolved-mode :auto) :attached resolved-mode))
-
-    ;; Install the log4cl stderr appender before the transport loop so every
-    ;; log line (including the mode router's dispatch.mode-not-ready) is routed
-    ;; to *error-output*, never the JSON-RPC stdout channel (T-03-LOG-01).
+    ;; Install the log4cl stderr appender BEFORE mode resolution so the :auto
+    ;; Slynk probe's :warn log line lands on stderr, never on the JSON-RPC
+    ;; stdout channel (Pitfall 5 / T-03-LOG-01).
     (configure-log4cl-for-server resolved-log-level)
+
+    ;; Resolve the effective mode, performing the real :auto Slynk probe now
+    ;; that the log appender is installed (D-15, HERM-07).
+    (setf *mode* (resolve-mode :mode resolved-mode
+                                :slynk-attach resolved-slynk-attach))
+
+    ;; When hermetic mode is active, initialize the worker pool and register
+    ;; the shutdown hook so workers are reaped when the process exits (D-03).
+    (when (eq *mode* :hermetic)
+      (initialize-pool)
+      (pushnew 'shutdown-pool sb-ext:*exit-hooks*))
 
     ;; Dispatch to the selected transport.
     (unwind-protect
          (ecase resolved-transport
            (:stdio
-            (log-event :info "run.start" "transport" :stdio)
+            (log-event :info "run.start" "transport" :stdio "mode" *mode*)
             (serve-streams *standard-input* *standard-output*
                            :session (make-session :id "stdio"
                                                   :slynk-attach resolved-slynk-attach)))
            ((:tcp :http)
             (error 'transport-not-implemented-error :transport resolved-transport)))
       ;; Cleanup: always log run.stop, even on unwind from typed errors.
+      ;; When hermetic, release the stdio session worker so it is reaped.
+      (when (eq *mode* :hermetic)
+        (ignore-errors (release-session "stdio")))
       (log-event :info "run.stop" "transport" resolved-transport))))

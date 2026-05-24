@@ -113,12 +113,13 @@ parse fires eagerly inside the let* before the transport dispatch."
           (setf (uiop:getenv "DSMR_PORT") "")))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Mode resolution — criterion 1 (D-01, D-02)
+;;; Mode resolution — criterion 1 (D-01, D-02, D-15, HERM-07)
 ;;;
 ;;; resolve-mode is the non-blocking seam mirroring resolve-transport: it runs
 ;;; the keyword > env > conf > default resolution for the dispatch mode and
-;;; applies the :auto -> :attached alias.  These tests assert mode resolution
-;;; WITHOUT entering the blocking :stdio loop, exactly as the transport tests do.
+;;; performs the real :auto Slynk probe (Phase 4: resolves to :attached when
+;;; reachable, emits a :warn and returns :hermetic when not).  These tests
+;;; assert mode resolution WITHOUT entering the blocking :stdio loop.
 ;;; ---------------------------------------------------------------------------
 
 (define-test criterion-1-keyword-slynk-attach-sets-attached
@@ -147,9 +148,18 @@ unwind-protect so the test leaves the environment unchanged."
           (setf (uiop:getenv "DSMR_MODE") "")))))
 
 (define-test criterion-1-auto-aliases-attached
-  "D-01: :auto is an alias for :attached when applied via resolve-mode.
-Real inference is deferred to Phase 4."
-  (is eq :attached (resolve-mode :mode :auto)))
+  "D-15 / HERM-07: with :mode :auto and no reachable Slynk listener,
+resolve-mode returns :hermetic and emits a log4cl :warn. With a reachable
+listener it returns :attached. This test covers the no-listener path, which
+is the common case in a CI environment."
+  ;; No slynk-attach and mode=:auto -> probe fails -> :hermetic
+  (let* ((capture (make-string-output-stream))
+         (*error-output* capture))
+    (dsmr-mcp/src/log:configure-log4cl-for-server :warn)
+    (is eq :hermetic (resolve-mode :mode :auto))
+    ;; The warn line lands on stderr (not stdout).
+    (let ((stderr (get-output-stream-string capture)))
+      (true (search "run.auto-mode" stderr)))))
 
 (define-test default-mode-is-attached
   "D-02: with nothing configured (no keyword, DSMR_MODE unset), resolve-mode
