@@ -24,10 +24,12 @@
                 #:make-ht #:text-content #:result #:rpc-error)
   (:import-from #:dsmr-mcp/src/hermetic/pool
                 #:get-or-assign-worker #:pool-shutting-down
-                #:pool-capacity-exceeded)
+                #:pool-capacity-exceeded #:pool-rpc-with-hard-kill)
   (:import-from #:dsmr-mcp/src/hermetic/worker-client
-                #:worker-rpc #:worker-crashed
+                #:worker-crashed
                 #:check-and-clear-reset-notification)
+  (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
+                #:*default-eval-timeout*)
   (:export #:dispatch-hermetic-call))
 
 (in-package #:dsmr-mcp/src/hermetic/dispatch)
@@ -54,7 +56,13 @@ tool arguments hash-table, or NIL when the client sent no arguments.
 The worker's worker/eval handler expects the MCP arguments hash-table
 directly as the JSON-RPC params (keys: code, package, timeout_seconds,
 max_output_length). ARGS is passed as-is so the worker reads \"code\"
-directly from params without an extra nesting level."
+directly from params without an extra nesting level.
+
+The call is routed through pool-rpc-with-hard-kill (D-12, SAFETY-05),
+which enforces a two-level timeout: the in-worker sb-ext:with-timeout
+(soft, using the per-call timeout_seconds or *default-eval-timeout*)
+plus a parent SIGKILL backstop after the grace margin. This covers
+runaway FFI that the in-worker soft timeout cannot interrupt."
   (declare (ignore session))
   (handler-case
       (let* ((worker (get-or-assign-worker *current-session-id*))
@@ -73,8 +81,17 @@ In-image state has been lost. Retry your call.")))))
         ;; Pass args directly as worker/eval params — the handler reads
         ;; "code"/"package"/"timeout_seconds"/"max_output_length" from the
         ;; top-level params hash-table (not nested under "arguments").
+        ;; Route through pool-rpc-with-hard-kill (D-12, SAFETY-05) so the
+        ;; parent hard-kill backstop covers runaway FFI that the in-worker
+        ;; soft timeout cannot interrupt. The eval timeout comes from
+        ;; timeout_seconds in the params when provided, else *default-eval-timeout*.
         (let* ((params (or args (make-hash-table :test 'equal)))
-               (resp   (worker-rpc worker "worker/eval" params)))
+               (soft   (let ((v (gethash "timeout_seconds" params)))
+                         (if (and v (integerp v) (plusp v))
+                             v
+                             *default-eval-timeout*)))
+               (resp   (pool-rpc-with-hard-kill worker "worker/eval" params
+                                                :soft-timeout soft)))
           (result id resp)))
     (worker-crashed (e)
       (log-event :error "dispatch.worker-crashed"
