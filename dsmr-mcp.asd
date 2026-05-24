@@ -29,7 +29,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "slynk-client"
                "dsmr-mcp/src/main"
                "dsmr-mcp/src/protocol"
-               "dsmr-mcp/src/attach/dispatch")
+               "dsmr-mcp/src/attach/dispatch"
+               "dsmr-mcp/src/hermetic/worker-client")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"
