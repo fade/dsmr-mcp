@@ -21,6 +21,8 @@
                 #:*mode*)
   (:import-from #:dsmr-mcp/src/dispatch
                 #:handle-tools-call)
+  (:import-from #:dsmr-mcp/src/run
+                #:resolve-mode)
   (:import-from #:dsmr-mcp/src/hermetic/pool
                 #:initialize-pool #:shutdown-pool)
   (:import-from #:dsmr-mcp/src/log
@@ -99,3 +101,27 @@ stays up. Exercises both pool-not-running and the :attached fallthrough."
     (finish (handle-tools-call
              session "req-4"
              (make-ht "name" "no-such-tool" "arguments" (make-ht))))))
+
+;;; ---------------------------------------------------------------------------
+;;; :auto mode fallback — criterion 4 / HERM-07
+;;; ---------------------------------------------------------------------------
+
+(define-test criterion-4-auto-no-slynk-resolves-hermetic
+  "HERM-07 / D-15 / criterion-4: with mode :auto and no reachable Slynk
+listener (slynk-attach nil), resolve-mode emits a run.auto-mode :warn line
+on stderr and resolves to :hermetic.
+
+This is the non-crashing, logged fallback that distinguishes :auto from a
+silent alias of :attached. The warn line is startup-time only (not per-call)."
+  (let* ((capture (make-string-output-stream))
+         (*error-output* capture)
+         (*log-level* :debug))
+    (configure-log4cl-for-server :debug)
+    ;; :auto with nil slynk-attach: %slynk-reachable-p returns nil, so
+    ;; resolve-mode logs the warn and returns :hermetic.
+    (let ((resolved (resolve-mode :mode :auto :slynk-attach nil)))
+      ;; Resolved to hermetic (D-15).
+      (is eq :hermetic resolved)
+      ;; The warn JSON line was emitted to stderr (HERM-07).
+      (let ((stderr (get-output-stream-string capture)))
+        (true (search "run.auto-mode" stderr))))))
