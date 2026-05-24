@@ -44,14 +44,14 @@
 
 (defun %conn (tool)
   "Read the slynk-conn slot on TOOL via the forward-referenced accessor.
-The accessor is defined by 02-03 (dsmr-mcp/src/attach/dispatch)."
+The accessor is defined in dsmr-mcp/src/attach/dispatch."
   (uiop:symbol-call :dsmr-mcp/src/attach/dispatch
                     :repl-eval-tool-slynk-conn
                     tool))
 
 (defun (setf %conn) (value tool)
   "Write the slynk-conn slot on TOOL via the forward-referenced (setf accessor).
-The accessor is defined by 02-03 (dsmr-mcp/src/attach/dispatch)."
+The accessor is defined in dsmr-mcp/src/attach/dispatch."
   (funcall (fdefinition (list 'setf
                                (find-symbol "REPL-EVAL-TOOL-SLYNK-CONN"
                                             :dsmr-mcp/src/attach/dispatch)))
@@ -59,7 +59,7 @@ The accessor is defined by 02-03 (dsmr-mcp/src/attach/dispatch)."
 
 (defun %call-lock (tool)
   "Read the call-lock slot on TOOL via the forward-referenced accessor.
-The accessor is defined by 02-03 (dsmr-mcp/src/attach/dispatch)."
+The accessor is defined in dsmr-mcp/src/attach/dispatch."
   (uiop:symbol-call :dsmr-mcp/src/attach/dispatch
                     :repl-eval-tool-call-lock
                     tool))
@@ -87,7 +87,7 @@ Signals a plain error for a non-empty string that contains no colon."
 
 (defun slynk-attach-configured-p (attach-string)
   "Return non-NIL when ATTACH-STRING is a non-empty string.
-Used by 02-03's with-attach-dispatch to gate the attached eval path."
+Used by with-attach-dispatch to gate the attached eval path."
   (and (stringp attach-string) (plusp (length attach-string))))
 
 ;;; Connection lifecycle ----------------------------------------------------

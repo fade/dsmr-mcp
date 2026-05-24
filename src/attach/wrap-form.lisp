@@ -197,7 +197,7 @@ REGISTER-RESULT when true (the default) registers the last form's first return
   raw integer ID as the 6th element.  Pass :register-result nil to suppress
   registration for hot loops or uninteresting results.
 SESSION-ID is the dsmr session identifier embedded in the table entry for
-  isolation between concurrent sessions sharing one image (D-07).
+  isolation between concurrent sessions sharing one image.
 
 *read-eval* SEAM: *read-eval* is T in the reader call below (trusted
   localhost posture).  A future safety pass will wrap the
