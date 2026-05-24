@@ -83,27 +83,22 @@ correctly from a string-input-stream."
 ;;; ---------------------------------------------------------------------------
 ;;; HERM-01: spawn + handshake integration test
 ;;;
-;;; NOTE: spawn-worker calls (asdf:load-system :dsmr-mcp/src/hermetic/worker/main)
-;;; inside the spawned SBCL child. That system does not exist yet in this
-;;; Wave-0 foundation build — the worker accept loop lands in plan 04-01.
-;;; Therefore this test is commented out. When 04-01 lands, uncomment and
-;;; verify the integration path end-to-end.
+;;; NOTE: worker/main is present as of plan 04-01. Integration test enabled.
 ;;; ---------------------------------------------------------------------------
 
-;; (define-test worker-spawns-and-handshakes
-;;   "HERM-01: spawn-worker launches a fresh SBCL image, reads the handshake,
-;; connects to the TCP port, and returns a worker with a valid pid.
-;; Requires plan 04-01 (worker/main) to be present."
-;;   (let* ((capture (make-string-output-stream))
-;;          (*error-output* capture))
-;;     (configure-log4cl-for-server :debug)
-;;     (let ((w nil))
-;;       (unwind-protect
-;;            (progn
-;;              (setf w (spawn-worker))
-;;              (true (integerp (worker-pid w)))
-;;              (true (plusp (worker-pid w)))
-;;              (true (integerp (worker-tcp-port w)))
-;;              (true (plusp (worker-tcp-port w))))
-;;         (when w
-;;           (ignore-errors (kill-worker w)))))))
+(define-test worker-spawns-and-handshakes
+  "HERM-01: spawn-worker launches a fresh SBCL image, reads the handshake,
+connects to the TCP port, and returns a worker with a valid pid."
+  (let* ((capture (make-string-output-stream))
+         (*error-output* capture))
+    (configure-log4cl-for-server :debug)
+    (let ((w nil))
+      (unwind-protect
+           (progn
+             (setf w (spawn-worker))
+             (true (integerp (worker-pid w)))
+             (true (plusp (worker-pid w)))
+             (true (integerp (worker-tcp-port w)))
+             (true (plusp (worker-tcp-port w))))
+        (when w
+          (ignore-errors (kill-worker w)))))))
