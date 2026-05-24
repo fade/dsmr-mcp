@@ -194,22 +194,32 @@ container where PID 1 is the legitimate parent."
 
 Follows the mandatory startup order (RESEARCH.md Pitfall 2, D-04):
   1. disable-debugger — first, unconditionally
-  2. configure-log4cl-for-server — second; any earlier log would corrupt stdout
-  3. log worker.starting
-  4. make-worker-server (ephemeral TCP)
-  5. register-all-handlers
-  6. %output-handshake (ONE line to stdout, then done)
-  7. %redirect-stdout-to-devnull
-  8. %start-parent-watchdog thread
-  9. start-accept-loop (blocks)
+  2. Restore *standard-output* to sb-sys:*stdout* (raw fd-1 pipe).
+     %build-sbcl-args redirects *standard-output* to *error-output* before
+     asdf:load-system so ASDF compile notes and SLYNK's *debug-io* banner
+     do not corrupt the handshake channel.  Here we restore the raw fd-1
+     stream so step 6 (%output-handshake) can reach the parent's pipe read.
+  3. configure-log4cl-for-server — second; any earlier log would corrupt stdout
+  4. log worker.starting
+  5. make-worker-server (ephemeral TCP)
+  6. register-all-handlers
+  7. %output-handshake (ONE line to stdout, then done)
+  8. %redirect-stdout-to-devnull
+  9. %start-parent-watchdog thread
+  10. start-accept-loop (blocks)
 
 When the accept loop exits (parent disconnected or server stopped),
 the process exits cleanly."
   ;; Step 1: disable debugger FIRST — prevents SBCL writing to stdout on errors.
   (sb-ext:disable-debugger)
-  ;; Step 2: install stderr-only log appender BEFORE any log-event call.
+  ;; Step 2: restore *standard-output* to the raw fd-1 pipe so the handshake
+  ;; can reach the parent.  %build-sbcl-args redirected it to *error-output*
+  ;; before asdf:load-system to keep ASDF compile notes and SLYNK's banner
+  ;; off the handshake channel.
+  (setf *standard-output* sb-sys:*stdout*)
+  ;; Step 3: install stderr-only log appender BEFORE any log-event call.
   (configure-log4cl-for-server :info)
-  ;; Step 3: first safe log point.
+  ;; Step 4: first safe log point.
   (let ((worker-id (or (uiop:getenv "DSMR_WORKER_ID") "?")))
     (log-event :info "worker.starting"
                "worker_id" worker-id
@@ -218,26 +228,27 @@ the process exits cleanly."
   (%install-signal-handlers)
   ;; Set project root when injected (Phase 6+ uses this for fs verbs).
   (%setup-project-root)
-  ;; Step 4: open ephemeral TCP port.
+  ;; Step 5: open ephemeral TCP port.
   (handler-case
       (let* ((server   (make-worker-server))
              (tcp-port (server-port server)))
-        ;; Step 5: register method handlers.
+        ;; Step 6: register method handlers.
         (register-all-handlers server)
-        ;; Step 6: start optional Swank (always nil this phase).
+        ;; Step 6 cont: start optional Swank (always nil this phase).
         (let ((swank-port (%maybe-start-swank)))
           (log-event :info "worker.ready"
                      "tcp_port" tcp-port
                      "swank_port" (or swank-port "none")
                      "pid" (%get-pid))
-          ;; Step 6 cont: emit the ONE handshake line to stdout.
+          ;; Step 7: emit the ONE handshake line to stdout.
+          ;; *standard-output* was restored to sb-sys:*stdout* above.
           ;; 'null (CL:NULL) for absent swank_port — NOT nil (jzon nil = false).
           (%output-handshake tcp-port swank-port)
-          ;; Step 7: stdout → /dev/null; no further writes reach the parent pipe.
+          ;; Step 8: stdout → /dev/null; no further writes reach the parent pipe.
           (%redirect-stdout-to-devnull)
-          ;; Step 8: orphan watchdog thread.
+          ;; Step 9: orphan watchdog thread.
           (%start-parent-watchdog)
-          ;; Step 9: block in the accept loop.
+          ;; Step 10: block in the accept loop.
           (start-accept-loop server)))
     (serious-condition (e)
       (ignore-errors

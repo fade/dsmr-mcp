@@ -249,15 +249,33 @@ loaded in the current image, or NIL otherwise."
 
 (defun %build-sbcl-args ()
   "Build command-line arguments for spawning a worker via bare SBCL.
-Configures ASDF source registry to find dsmr-mcp, loads the worker
-system, and calls the worker entry point."
+
+--no-userinit prevents the user's ~/.sbclrc from running in the child.
+Without this flag, .sbclrc (which quickloads bordeaux-threads and slynk)
+runs in every worker, and when two workers spawn concurrently both try to
+compile slynk to the same tmp-named fasl simultaneously, causing ASDF to
+crash with a PROTO-SYSTEM error before the worker can emit its handshake.
+
+The redirect-to-stderr eval runs before asdf:load-system so that ASDF
+compile notes and SLYNK's *debug-io* banner ('SLYNK's ASDF loader
+finished.') are routed to stderr rather than the handshake channel (fd 1).
+sb-sys:*stdout* is the raw fd-1 FD-STREAM and is not affected by the
+rebinding; start() restores *standard-output* to it before emitting the
+handshake JSON line."
   (let ((source-dir (namestring (asdf:system-source-directory :dsmr-mcp)))
         (ql-setup (%quicklisp-setup-path)))
     (append
-     (list "--noinform" "--non-interactive")
+     (list "--noinform" "--non-interactive" "--no-userinit")
      (when ql-setup
        (list "--load" ql-setup))
      (list
+      ;; Route stdout to stderr during load-system so compile notes and
+      ;; SLYNK's *debug-io* banner cannot corrupt the handshake channel.
+      ;; sb-sys:*stdout* retains the raw fd-1 pipe; start() restores it.
+      "--eval"
+      "(setf *standard-output* *error-output*
+             *trace-output*    *error-output*
+             *debug-io*        (make-two-way-stream *standard-input* *error-output*))"
       "--eval" (format nil
                        "(asdf:initialize-source-registry '(:source-registry :inherit-configuration (:tree ~S)))"
                        source-dir)
