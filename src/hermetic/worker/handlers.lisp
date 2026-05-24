@@ -9,10 +9,11 @@
 ;;;; hash-table payload; worker/server.lisp wraps it in the JSON-RPC
 ;;;; result envelope.
 ;;;;
-;;;; FULL EVAL BODY: completed in 04-04 (D-17 parity via
-;;;; build-wrapping-form + eval + build-eval-response).
-;;;; The placeholder body below satisfies the ASDF load graph and
-;;;; cold-build requirements for this plan.
+;;;; %handle-eval implements attached/hermetic repl-eval output parity (D-17)
+;;;; via build-wrapping-form + eval + build-eval-response — the same pipeline
+;;;; as the attached path with local eval replacing slime-eval. A per-call
+;;;; soft timeout (sb-ext:with-timeout) guards against runaway evaluations
+;;;; while keeping the worker alive for subsequent calls (SAFETY-05).
 
 (defpackage #:dsmr-mcp/src/hermetic/worker/handlers
   (:use #:cl)
@@ -47,22 +48,26 @@ Override via DSMR_WORKER_EVAL_TIMEOUT environment variable.")
 ;;; ---------------------------------------------------------------------------
 
 (defun %handle-eval (params)
-  "Evaluate code and return the response structure expected by the
-dispatcher side. Returns a hash-table payload (the JSON-RPC result
-field); worker/server.lisp wraps it in the response envelope.
+  "Evaluate code in-process and return the response structure (D-17 parity).
 
-FULL EVAL BODY: completed in 04-04 (D-17 parity via
-build-wrapping-form + eval + build-eval-response).
-This placeholder satisfies the ASDF load graph for the current plan."
+Reads code / package / timeout_seconds / max_output_length from PARAMS.
+Builds the wrapping form via build-wrapping-form, evaluates it inside
+sb-ext:with-timeout (client timeout_seconds else *default-eval-timeout*),
+then calls build-eval-response with the same pipeline as the attached path
+(build-wrapping-form + eval + build-eval-response), giving attached/hermetic
+repl-eval output parity (D-17).
+
+On sb-ext:timeout the worker returns a structured TIMEOUT result and
+SURVIVES — the condition is caught, not re-signalled (SAFETY-05).
+
+Returns a hash-table payload; worker/server.lisp wraps it in the JSON-RPC
+result envelope (jsonrpc/id/result) before sending to the dispatcher."
   (let* ((code (gethash "code" params))
          (package-name (gethash "package" params))
          (timeout-seconds (gethash "timeout_seconds" params))
          (max-output-length (gethash "max_output_length" params)))
     (unless code
       (error "code is required"))
-    ;; FULL EVAL BODY: completed in 04-04 (D-17 parity via
-    ;; build-wrapping-form + eval + build-eval-response).
-    ;; Placeholder: returns a stub response so the load graph resolves.
     (let* ((form (build-wrapping-form code package-name))
            (result-list
              (handler-case
