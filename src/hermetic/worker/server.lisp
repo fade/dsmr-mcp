@@ -15,7 +15,7 @@
   (:use #:cl)
   (:import-from #:dsmr-mcp/src/log #:log-event)
   (:import-from #:dsmr-mcp/src/hermetic/worker-client
-                #:%read-line-limited #:+max-json-line-bytes+)
+                #:%read-line-limited #:+max-json-line-bytes+ #:line-too-long)
   (:import-from #:usocket)
   (:import-from #:com.inuoe.jzon)
   (:import-from #:sb-ext)
@@ -226,7 +226,11 @@ Writes the response to STREAM. Handles parse errors and invalid requests."
   "Read JSON-RPC lines from STREAM and write responses until EOF.
 The idle timeout (*worker-read-timeout*) keeps the loop alive without
 closing — parent lifecycle management (kill-worker, shutdown-pool)
-is the authoritative termination path."
+is the authoritative termination path.
+
+line-too-long is caught specifically and answered with a -32600 error
+so the loop survives a single oversized request rather than treating
+the size violation as an unrecoverable EOF/crash (WR-05)."
   (loop while (worker-server-running-p server)
         for line = (handler-case
                        (sb-ext:with-timeout *worker-read-timeout*
@@ -234,6 +238,18 @@ is the authoritative termination path."
                      (sb-ext:timeout ()
                        (log-event :debug "worker.read.idle"
                                   "seconds" *worker-read-timeout*)
+                       :idle)
+                     (line-too-long ()
+                       ;; Oversize request: reject with a JSON-RPC error and
+                       ;; keep the loop running. Do NOT treat as EOF — that
+                       ;; would mark the worker crashed and burn a circuit-breaker
+                       ;; count for what is a recoverable protocol-size violation.
+                       (log-event :warn "worker.read.line-too-long"
+                                  "limit" +max-json-line-bytes+)
+                       (ignore-errors
+                         (%write-response stream
+                                          (%make-error nil -32600
+                                                       "Request too large")))
                        :idle)
                      (error (e)
                        (log-event :warn "worker.read.error"
