@@ -34,9 +34,6 @@ attached-image-first workflow and the AGPL toolchain in
 `$LISP_WORKSPACE` (`eve-gate`, `eve-quant`, `charmed`,
 `charmed-mcclim`, `ubiquitous`, `slynk-client`).
 
-`.planning/FEATURES.md` catalogues which cl-mcp capabilities dsmr-mcp
-preserves, re-architects, drops, or adds — and why.
-
 ## License
 
 AGPL-3.0-or-later. See `LICENSE`.

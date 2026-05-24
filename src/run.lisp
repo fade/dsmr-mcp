@@ -33,8 +33,8 @@
   (:import-from #:sb-ext)
   ;; process-json-line is re-exported from here so src/main.lisp's
   ;; existing :import-from dsmr-mcp/src/run #:process-json-line
-  ;; (wired by Plan 01-01) continues to resolve. The canonical
-  ;; definition lives in dsmr-mcp/src/protocol; this export shadows
+  ;; continues to resolve. The canonical definition lives in
+  ;; dsmr-mcp/src/protocol; this export shadows
   ;; the stub that was previously defined locally in this package.
   (:shadowing-import-from #:dsmr-mcp/src/protocol
                           #:process-json-line)

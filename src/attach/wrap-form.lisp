@@ -399,7 +399,7 @@ PACKAGE-NAME is the evaluation package name (string); defaults to \"CL-USER\".
                ;; Success path: format the printed value string.
                (setf ,s-all-vals (nreverse ,s-all-vals))
                ;; Format: values within a form separated by ", ",
-               ;; forms by newline (A1 format, Claude's Discretion).
+               ;; forms by newline.
                (let ((*print-readably* nil) (*print-circle* t))
                  (setf ,s-printed
                        (format nil "~{~{~A~^, ~}~^~%~}"
