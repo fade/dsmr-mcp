@@ -27,11 +27,13 @@
   (:import-from #:dsmr-mcp/src/transport/stdio
                 #:serve-streams)
   (:import-from #:dsmr-mcp/src/state
-                #:make-session)
+                #:make-session
+                #:*mode*)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event
                 #:set-log-level-from-env
-                #:*log-level*)
+                #:*log-level*
+                #:configure-log4cl-for-server)
   ;; process-json-line is re-exported from here so src/main.lisp's
   ;; existing :import-from dsmr-mcp/src/run #:process-json-line
   ;; (wired by Plan 01-01) continues to resolve. The canonical
@@ -41,6 +43,7 @@
                           #:process-json-line)
   (:export #:run
            #:resolve-transport
+           #:resolve-mode
            #:transport-not-implemented-error
            #:invalid-config-value
            #:invalid-config-value-name
@@ -221,6 +224,33 @@ stdio loop."
     (%or-from-env transport-supplied-p transport "DSMR_TRANSPORT" conf :stdio
                   :parse #'%parse-transport)))
 
+(defun resolve-mode (&key (mode nil mode-supplied-p)
+                          (slynk-attach nil slynk-attach-supplied-p)
+                          (project-root nil project-root-supplied-p))
+  "Resolve the effective dispatch mode keyword WITHOUT entering the blocking loop.
+
+Applies precedence: keyword > DSMR_MODE env > .dsmr-mcp.conf > :attached (D-02),
+then aliases :auto -> :attached (D-01 — real inference is deferred to Phase 4).
+Returns :ATTACHED or :HERMETIC.
+
+This is the non-blocking seam the criterion-1 tests assert against, mirroring
+RESOLVE-TRANSPORT.  It shares %RESOLVE-PROJECT-ROOT, %READ-CONF-INTO-DEFAULTS,
+%OR-FROM-ENV, and %PARSE-MODE with RUN's live path, so the tested seam and the
+live binding of *MODE* resolve identically.
+
+The :slynk-attach argument is accepted to mirror RUN's keyword surface (the
+criterion-1 'with a slynk-attach target' case), but the mode itself does not
+depend on it: a configured target yields :ATTACHED only because :attached is
+the built-in default.  The mode keyword / DSMR_MODE / conf are the real inputs."
+  (declare (ignore slynk-attach slynk-attach-supplied-p))
+  (let* ((root (%resolve-project-root project-root-supplied-p project-root))
+         (conf (%read-conf-into-defaults root))
+         (m    (%or-from-env mode-supplied-p mode "DSMR_MODE" conf :attached
+                             :parse #'%parse-mode)))
+    ;; D-01: :auto is an alias for :attached.  This alias is also applied
+    ;; inline in RUN when setting *MODE*; keep the two in lockstep.
+    (if (eq m :auto) :attached m)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Entry point (D-14, D-15, D-16, D-17)
 ;;; ---------------------------------------------------------------------------
@@ -301,11 +331,22 @@ resolves to this function."
                          :parse #'identity)))
 
     ;; Suppress unused-variable notes for Phase-1 settings not yet wired.
-    ;; resolved-slynk-attach is now wired into the session (ATTACH-07 consumed).
-    (declare (ignore resolved-mode resolved-bind resolved-port))
+    ;; resolved-slynk-attach is now wired into the session (ATTACH-07 consumed);
+    ;; resolved-mode is now applied to *MODE* below (D-03).
+    (declare (ignore resolved-bind resolved-port))
 
     ;; Apply resolved log level.
     (setf *log-level* resolved-log-level)
+
+    ;; Apply the resolved dispatch mode before transport dispatch so every
+    ;; tool call sees the configured *MODE* (D-03).  :auto aliases :attached
+    ;; (D-01); the same alias lives in RESOLVE-MODE — keep the two in lockstep.
+    (setf *mode* (if (eq resolved-mode :auto) :attached resolved-mode))
+
+    ;; Install the log4cl stderr appender before the transport loop so every
+    ;; log line (including the mode router's dispatch.mode-not-ready) is routed
+    ;; to *error-output*, never the JSON-RPC stdout channel (T-03-LOG-01).
+    (configure-log4cl-for-server resolved-log-level)
 
     ;; Dispatch to the selected transport.
     (unwind-protect

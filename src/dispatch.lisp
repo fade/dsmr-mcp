@@ -21,7 +21,10 @@
   (:use #:cl)
   (:import-from #:dsmr-mcp/src/state
                 #:get-tool-instance
-                #:*current-session-id*)
+                #:*current-session-id*
+                #:*mode*)
+  (:import-from #:dsmr-mcp/src/log
+                #:log-event)
   (:import-from #:dsmr-mcp/src/tools/base
                 #:*tool-classes*
                 #:tool-handle
@@ -30,7 +33,10 @@
                 #:rpc-error
                 #:validate-args
                 #:arg-validation-error
-                #:arg-validation-message)
+                #:arg-validation-message
+                #:make-ht
+                #:text-content
+                #:result)
   (:export #:handle-tools-call))
 
 (in-package #:dsmr-mcp/src/dispatch)
@@ -60,6 +66,27 @@ based on session backend policy. Phase 1 always runs inline."
     (error "handle-tools-call: *current-session-id* is not a bound non-empty string. ~
             The transport (or test setup) must bind it before calling ~
             process-json-line."))
+  ;; Mode router (D-05): :hermetic has no backend until Phase 4.  Short-circuit
+  ;; before tool lookup so any tools/call under :hermetic — including an unknown
+  ;; tool name — surfaces a structured not-yet-implemented isError (never a crash,
+  ;; never a -32601) and logs the miss.  :attached (and :auto, already aliased to
+  ;; :attached in run) falls through to the unchanged Phase 2 path; the D-04
+  ;; no-target check stays in attach's with-attach-dispatch and is NOT duplicated
+  ;; here.
+  (when (eq *mode* :hermetic)
+    (let ((name (and params (gethash "name" params))))
+      (log-event :warn "dispatch.mode-not-ready"
+                 "mode" :hermetic "tool" name)
+      (return-from handle-tools-call
+        (result id
+                (make-ht "isError" t
+                         "content"
+                         (text-content
+                          (format nil
+                                  "Mode :hermetic is not yet available (Phase 4). ~
+                                   Requested tool: ~A. Set DSMR_MODE=attached or ~
+                                   omit DSMR_MODE to use attached mode."
+                                  name)))))))
   (let* ((name (and params (gethash "name" params)))
          (args (and params (gethash "arguments" params)))
          (class (and name (gethash name *tool-classes*))))
