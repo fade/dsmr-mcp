@@ -10,6 +10,7 @@
   (:import-from #:dsmr-mcp/src/run
                 #:run
                 #:resolve-transport
+                #:resolve-mode
                 #:transport-not-implemented-error
                 #:invalid-config-value))
 
@@ -110,3 +111,54 @@ parse fires eagerly inside the let* before the transport dispatch."
       (if old-val
           (setf (uiop:getenv "DSMR_PORT") old-val)
           (setf (uiop:getenv "DSMR_PORT") "")))))
+
+;;; ---------------------------------------------------------------------------
+;;; Mode resolution — criterion 1 (D-01, D-02)
+;;;
+;;; resolve-mode is the non-blocking seam mirroring resolve-transport: it runs
+;;; the keyword > env > conf > default resolution for the dispatch mode and
+;;; applies the :auto -> :attached alias.  These tests assert mode resolution
+;;; WITHOUT entering the blocking :stdio loop, exactly as the transport tests do.
+;;; ---------------------------------------------------------------------------
+
+(define-test criterion-1-keyword-slynk-attach-sets-attached
+  "Criterion 1: with a :slynk-attach target configured, the mode resolves to
+:ATTACHED (the default).  resolve-mode mirrors resolve-transport's seam and
+never enters the stdio loop."
+  (is eq :attached (resolve-mode :slynk-attach "127.0.0.1:9999")))
+
+(define-test criterion-1-env-slynk-attach-sets-attached
+  "Criterion 1: with DSMR_SLYNK_ATTACH bound (and DSMR_MODE unset), mode
+resolves to :ATTACHED via the env path.  Bind/restore both env vars with
+unwind-protect so the test leaves the environment unchanged."
+  (let ((old-sa (uiop:getenv "DSMR_SLYNK_ATTACH"))
+        (old-mode (uiop:getenv "DSMR_MODE")))
+    (unwind-protect
+         (progn
+           (setf (uiop:getenv "DSMR_SLYNK_ATTACH") "127.0.0.1:9999")
+           ;; DSMR_MODE empty so the default (:attached) governs.
+           (setf (uiop:getenv "DSMR_MODE") "")
+           (is eq :attached (resolve-mode)))
+      (if old-sa
+          (setf (uiop:getenv "DSMR_SLYNK_ATTACH") old-sa)
+          (setf (uiop:getenv "DSMR_SLYNK_ATTACH") ""))
+      (if old-mode
+          (setf (uiop:getenv "DSMR_MODE") old-mode)
+          (setf (uiop:getenv "DSMR_MODE") "")))))
+
+(define-test criterion-1-auto-aliases-attached
+  "D-01: :auto is an alias for :attached when applied via resolve-mode.
+Real inference is deferred to Phase 4."
+  (is eq :attached (resolve-mode :mode :auto)))
+
+(define-test default-mode-is-attached
+  "D-02: with nothing configured (no keyword, DSMR_MODE unset), resolve-mode
+returns the built-in default :ATTACHED."
+  (let ((old-mode (uiop:getenv "DSMR_MODE")))
+    (unwind-protect
+         (progn
+           (setf (uiop:getenv "DSMR_MODE") "")
+           (is eq :attached (resolve-mode)))
+      (if old-mode
+          (setf (uiop:getenv "DSMR_MODE") old-mode)
+          (setf (uiop:getenv "DSMR_MODE") "")))))
