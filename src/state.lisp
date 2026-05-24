@@ -24,6 +24,7 @@
            #:session-slynk-attach
            #:make-session
            #:*current-session-id*
+           #:*mode*
            #:get-tool-instance))
 
 (in-package #:dsmr-mcp/src/state)
@@ -107,6 +108,24 @@ every log line without requiring it to be passed as an argument.
 Declared as defvar (not defparameter) so transports can let-bind it
 for the duration of one request without triggering
 parameter-rebinding warnings on system reload.")
+
+;;; Process-level mode special -----------------------------------------------
+
+(defvar *mode* :attached
+  "Current server dispatch mode. One of :ATTACHED, :HERMETIC, or :AUTO.
+Set once at startup by run.lisp from the resolved-mode value.
+
+Scope: process-level for the current one-image/one-session topology
+(PROJECT.md; see \"Single-image-per-session invariant\").
+Per-session *MODE* is deferred to MULTI-01 when multi-image dispatch lands.
+
+:AUTO is an alias for :ATTACHED until Phase 4 introduces real hermetic
+execution and the inference logic (HERM-07) has something to enforce.
+:HERMETIC before Phase 4 causes handle-tools-call to return a structured
+isError explaining that hermetic ICP is not yet available.
+
+Declared as defvar (not defparameter) so tests can let-bind it without
+triggering parameter-rebinding warnings on system reload.")
 
 ;;; Per-session tool-instance retrieval ------------------------------------
 

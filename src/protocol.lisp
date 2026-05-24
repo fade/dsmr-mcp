@@ -57,7 +57,9 @@
                 #:tool-input-schema
                 #:tool-description)
   (:import-from #:dsmr-mcp/src/log
-                #:log-event)
+                #:log-event
+                #:*log-session-id*
+                #:*log-request-id*)
   (:import-from #:dsmr-mcp/src/dispatch
                 #:handle-tools-call)
   (:export #:process-json-line
@@ -240,6 +242,18 @@ This ordering matches what cl-mcp does NOT do — dsmr-mcp is strict here."
     (t
      (rpc-error id -32601 (format nil "Method not found: ~A" method)))))
 
+;;; Correlation-ID helpers ---------------------------------------------------
+
+(defvar *notif-counter* 0
+  "Monotonic counter for notification request-id fallback strings.
+Single-threaded stdio serialises access; no lock needed.
+Each notification that lacks a JSON-RPC id gets a distinct 'notif-N'
+correlation id in the log context for the duration of its handling.")
+
+(defun %generate-notif-id ()
+  "Return a unique 'notif-<n>' string for a notification without a JSON-RPC id."
+  (format nil "notif-~A" (incf *notif-counter*)))
+
 ;;; Public entry point ---------------------------------------------------------
 
 (defun process-json-line (line session)
@@ -296,17 +310,21 @@ error-with-unknown-id responses use 'null as the id value."
             (unless (and (stringp jsonrpc) (string= jsonrpc "2.0"))
               (return-from process-json-line
                 (%encode-line (rpc-error id -32600 "Invalid Request"))))
-            (cond
-              ((and method id)
-               ;; Request: has both method and id -> dispatch and return response.
-               (%encode-line (%handle-request session id method params)))
-              ((and method (not id))
-               ;; Notification: has method, no id -> handle, return nil (no response).
-               (%handle-notification session method params)
-               nil)
-              (t
-               ;; Missing method: malformed request.
-               (%encode-line (rpc-error id -32600 "Invalid Request"))))))
+            ;; Bind correlation IDs for the duration of this request/notification
+            ;; so log-event includes them in every JSON log line (OPS-02, D-10).
+            (let ((*log-session-id* *current-session-id*)
+                  (*log-request-id* (or id (%generate-notif-id))))
+              (cond
+                ((and method id)
+                 ;; Request: has both method and id -> dispatch and return response.
+                 (%encode-line (%handle-request session id method params)))
+                ((and method (not id))
+                 ;; Notification: has method, no id -> handle, return nil (no response).
+                 (%handle-notification session method params)
+                 nil)
+                (t
+                 ;; Missing method: malformed request.
+                 (%encode-line (rpc-error id -32600 "Invalid Request")))))))
       (error (e)
         (log-event :error "rpc.internal" "error" (princ-to-string e))
         (%encode-line (rpc-error 'null -32603 "Internal error"))))))
