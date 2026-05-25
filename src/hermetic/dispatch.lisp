@@ -27,9 +27,12 @@
                 #:pool-capacity-exceeded #:pool-rpc-with-hard-kill)
   (:import-from #:dsmr-mcp/src/hermetic/worker-client
                 #:worker-crashed
-                #:check-and-clear-reset-notification)
+                #:check-and-clear-reset-notification
+                #:worker-id)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
                 #:*default-eval-timeout*)
+  (:import-from #:dsmr-mcp/src/attach/registry
+                #:decode-object-id)
   (:export #:dispatch-hermetic-call))
 
 (in-package #:dsmr-mcp/src/hermetic/dispatch)
@@ -42,6 +45,14 @@ a crash, the agent receives a structured isError reset notification as the
 response to THIS call, and the call is NOT forwarded to the worker. The next
 call from the same session proceeds normally.
 
+Routes by NAME:
+  \"inspect-object\" -> worker method \"worker/inspect-object\" with a
+    worker-incarnation epoch check before the RPC call.  The decoded epoch
+    is compared to (worker-id worker); a mismatch short-circuits to a
+    registry-reset error before any pool-rpc-with-hard-kill call.  Only
+    the raw integer id (epoch+session stripped) is forwarded to the worker.
+  Any other name  -> worker method \"worker/eval\" (unchanged behaviour).
+
 Structured conditions are caught and returned as isError / rpc-error
 responses so the MCP serve loop never sees an unhandled condition:
   worker-crashed      -> isError with crash message
@@ -51,21 +62,10 @@ responses so the MCP serve loop never sees an unhandled condition:
 
 SESSION is the session object (unused; *current-session-id* is the key).
 ID is the JSON-RPC request id. NAME is the tool name string. ARGS is the
-tool arguments hash-table, or NIL when the client sent no arguments.
-
-The worker's worker/eval handler expects the MCP arguments hash-table
-directly as the JSON-RPC params (keys: code, package, timeout_seconds,
-max_output_length). ARGS is passed as-is so the worker reads \"code\"
-directly from params without an extra nesting level.
-
-The call is routed through pool-rpc-with-hard-kill, which enforces a
-two-level timeout: the in-worker sb-ext:with-timeout (soft, using the
-per-call timeout_seconds or *default-eval-timeout*) plus a parent SIGKILL
-backstop after the grace margin. This covers runaway FFI that the in-worker
-soft timeout cannot interrupt."
+tool arguments hash-table, or NIL when the client sent no arguments."
   (declare (ignore session))
   (handler-case
-      (let* ((worker (get-or-assign-worker *current-session-id*))
+      (let* ((worker    (get-or-assign-worker *current-session-id*))
              (had-reset (check-and-clear-reset-notification worker)))
         (when had-reset
           (log-event :warn "dispatch.worker-reset"
@@ -78,21 +78,75 @@ soft timeout cannot interrupt."
                              (text-content
                               "Worker was reset after a crash. \
 In-image state has been lost. Retry your call.")))))
-        ;; Pass args directly as worker/eval params — the handler reads
-        ;; "code"/"package"/"timeout_seconds"/"max_output_length" from the
-        ;; top-level params hash-table (not nested under "arguments").
-        ;; Route through pool-rpc-with-hard-kill so the parent hard-kill
-        ;; backstop covers runaway FFI that the in-worker soft timeout cannot
-        ;; interrupt. The eval timeout comes from timeout_seconds in the params
-        ;; when provided, else *default-eval-timeout*.
-        (let* ((params (or args (make-hash-table :test 'equal)))
-               (soft   (let ((v (gethash "timeout_seconds" params)))
-                         (if (and v (integerp v) (plusp v))
-                             v
-                             *default-eval-timeout*)))
-               (resp   (pool-rpc-with-hard-kill worker "worker/eval" params
-                                                :soft-timeout soft)))
-          (result id resp)))
+        ;; Name-based routing.
+        (if (string= name "inspect-object")
+            ;; ------------------------------------------------------------------
+            ;; inspect-object branch: epoch check + worker/inspect-object RPC.
+            ;; ------------------------------------------------------------------
+            (let* ((params      (or args (make-hash-table :test 'equal)))
+                   (id-string   (gethash "id" params)))
+              ;; Validate the id field is present.
+              (unless (and (stringp id-string) (plusp (length id-string)))
+                (return-from dispatch-hermetic-call
+                  (rpc-error id -32602
+                             "inspect-object: 'id' parameter is required.")))
+              ;; Decode the object id; malformed -> rpc-error -32602.
+              (multiple-value-bind (decoded-epoch decoded-session-id decoded-raw-id)
+                  (handler-case (decode-object-id id-string)
+                    (error (e)
+                      (return-from dispatch-hermetic-call
+                        (rpc-error id -32602
+                                   (format nil "inspect-object: malformed id: ~A" e)))))
+                (declare (ignore decoded-session-id))
+                ;; Worker-incarnation epoch check: compare the decoded epoch
+                ;; to (worker-id worker).  A mismatch means the object was
+                ;; registered against a previous worker incarnation and the
+                ;; registry has been reset.  Short-circuit BEFORE any RPC call.
+                (when (/= decoded-epoch (worker-id worker))
+                  (log-event :info "dispatch.inspect.stale-epoch"
+                             "session" *current-session-id*
+                             "decoded-epoch" decoded-epoch
+                             "worker-epoch" (worker-id worker))
+                  (return-from dispatch-hermetic-call
+                    (result id
+                            (make-ht "isError"    t
+                                     "error_type" "registry-reset"
+                                     "content"
+                                     (text-content
+                                      "Object registry was reset after a worker \
+crash; the object id is no longer valid.")))))
+                ;; Epoch matches: forward only the raw integer id to the worker.
+                ;; Strip the epoch and session-id; the worker owns only raw ids.
+                (let* ((worker-params (make-hash-table :test 'equal)))
+                  (setf (gethash "id" worker-params) decoded-raw-id)
+                  ;; Forward optional max_depth / max_elements if provided.
+                  (let ((max-depth     (gethash "max_depth" params))
+                        (max-elements  (gethash "max_elements" params)))
+                    (when max-depth
+                      (setf (gethash "max_depth" worker-params) max-depth))
+                    (when max-elements
+                      (setf (gethash "max_elements" worker-params) max-elements)))
+                  (let ((resp (pool-rpc-with-hard-kill worker "worker/inspect-object"
+                                                       worker-params
+                                                       :soft-timeout *default-eval-timeout*)))
+                    (result id resp)))))
+            ;; ------------------------------------------------------------------
+            ;; Default branch: worker/eval (repl-eval and any future verbs).
+            ;; Pass args directly as worker/eval params — the handler reads
+            ;; "code"/"package"/"timeout_seconds"/"max_output_length" from the
+            ;; top-level params hash-table (not nested under "arguments").
+            ;; Route through pool-rpc-with-hard-kill so the parent hard-kill
+            ;; backstop covers runaway FFI that the in-worker soft timeout
+            ;; cannot interrupt.
+            ;; ------------------------------------------------------------------
+            (let* ((params (or args (make-hash-table :test 'equal)))
+                   (soft   (let ((v (gethash "timeout_seconds" params)))
+                             (if (and v (integerp v) (plusp v))
+                                 v
+                                 *default-eval-timeout*)))
+                   (resp   (pool-rpc-with-hard-kill worker "worker/eval" params
+                                                    :soft-timeout soft)))
+              (result id resp))))
     (worker-crashed (e)
       (log-event :error "dispatch.worker-crashed"
                  "session" *current-session-id*
