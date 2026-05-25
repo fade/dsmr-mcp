@@ -25,6 +25,9 @@
 (defpackage #:dsmr-mcp/src/attach/wrap-form
   (:use #:cl)
   (:import-from #:cl-ppcre #:regex-replace-all)
+  (:import-from #:dsmr-mcp/src/attach/registry
+                #:build-registry-ensure-form
+                #:build-register-result-form)
   (:export #:build-wrapping-form
            #:truncate-output
            #:sanitize-control-chars
@@ -161,15 +164,18 @@ Returns NIL when STRING is NIL."
 ;;; Block/return structure note:
 ;;;    The handler-bind error handlers use (return) to exit an enclosing
 ;;;    (block nil ...) early (the stack is still live at that point).
-;;;    The 5-element (list ...) result is the SECOND body form of the outer
-;;;    let*, placed AFTER the block, so it always executes — whether the block
-;;;    completed normally (s-err-ctx = nil) or via (return) (s-err-ctx set).
+;;;    The 6-element (list ...) result is the THIRD body form of the outer
+;;;    let*, placed AFTER the ensure prologue and the block, so it always
+;;;    executes — whether the block completed normally (s-err-ctx = nil) or
+;;;    via (return) (s-err-ctx set).
 
-(defun build-wrapping-form (code-string &optional package-name)
+(defun build-wrapping-form (code-string &optional package-name
+                                        &key (register-result t) session-id
+                                             surface-raw-value)
   "Return the s-expression to pass to slynk-client:slime-eval.
 
-The remote evaluation produces a 5-element list:
-  (printed raw stdout stderr error-context)
+The remote evaluation produces a list of 6 or 7 elements:
+  (printed raw stdout stderr error-context raw-id [live-value])
 
   printed       : prin1-to-string of all values from all evaluated forms,
                   values within a form separated by \", \", forms by newline.
@@ -181,9 +187,28 @@ The remote evaluation produces a 5-element list:
                   (:condition-type S :message S
                    :restarts ((:name S :description S) ...)
                    :frames   ((:index N :function S :locals L) ...))
+  raw-id        : integer handle-table ID when REGISTER-RESULT is true and the
+                  last form's first value is inspectable (not a number, string,
+                  symbol, or character); NIL otherwise.
+  live-value    : (7th element, present only when SURFACE-RAW-VALUE is true)
+                  the actual Lisp object that is the last form's first return
+                  value, NIL on error or when no forms were evaluated.  On the
+                  attached path this travels through slime-eval serialization
+                  and is not useful; on the hermetic in-process path it is the
+                  real live object, enabling single-eval result registration.
 
 CODE-STRING is the source text; one or more top-level forms are read from it.
 PACKAGE-NAME is the evaluation package name (string); defaults to \"CL-USER\".
+REGISTER-RESULT when true (the default) registers the last form's first return
+  value in the image-resident DSMR-MCP-ATTACH-REGISTRY table and returns its
+  raw integer ID as the 6th element.  Pass :register-result nil to suppress
+  registration for hot loops or uninteresting results.
+SESSION-ID is the dsmr session identifier embedded in the table entry for
+  isolation between concurrent sessions sharing one image.
+SURFACE-RAW-VALUE when true adds a 7th element to the result list: the live
+  Lisp object that is the last form's first return value.  Intended for the
+  hermetic in-process eval path where the caller needs the real object for
+  registration without a second eval.  Defaults to NIL (6-element list).
 
 *read-eval* SEAM: *read-eval* is T in the reader call below (trusted
   localhost posture).  A future safety pass will wrap the
@@ -225,10 +250,12 @@ PACKAGE-NAME is the evaluation package name (string); defaults to \"CL-USER\".
           (s-vals      (cl-user-sym "%DSMR-MCP-ATTACH-VALS"))
           (s-lacc      (cl-user-sym "%DSMR-MCP-ATTACH-LACC")))
       ;;
-      ;; The returned form has two body forms in the outer let*:
-      ;;   1. (block nil ...) — runs the eval/capture logic; error handlers
+      ;; The returned form has three body forms in the outer let*:
+      ;;   1. (unless ...) — registry-ensure prologue; idempotent ANSI form
+      ;;      that installs DSMR-MCP-ATTACH-REGISTRY in the image if absent.
+      ;;   2. (block nil ...) — runs the eval/capture logic; error handlers
       ;;      call (return) to exit early with s-err-ctx set.
-      ;;   2. (list ...) — always executes after the block, whether the
+      ;;   3. (list ...) — always executes after the block, whether the
       ;;      block exited normally or via (return).
       ;;
       `(let* ((,s-stdout  (make-string-output-stream))
@@ -241,7 +268,13 @@ PACKAGE-NAME is the evaluation package name (string); defaults to \"CL-USER\".
               (,s-all-vals nil)
               (,s-printed nil))
          ;;
-         ;; BODY FORM 1: the eval/capture block.
+         ;; BODY FORM 1: registry-ensure prologue (idempotent, ANSI, pure CL).
+         ;; Installs DSMR-MCP-ATTACH-REGISTRY in the attached image if absent;
+         ;; no-op on subsequent evals (self-healing after reconnect to fresh image).
+         ;;
+         ,(build-registry-ensure-form)
+         ;;
+         ;; BODY FORM 2: the eval/capture block.
          ;; *read-eval* is T here — a future safety pass can wrap the
          ;; with-input-from-string reader call with (*read-eval* nil).
          ;;
@@ -399,7 +432,7 @@ PACKAGE-NAME is the evaluation package name (string); defaults to \"CL-USER\".
                ;; Success path: format the printed value string.
                (setf ,s-all-vals (nreverse ,s-all-vals))
                ;; Format: values within a form separated by ", ",
-               ;; forms by newline (A1 format, Claude's Discretion).
+               ;; forms by newline.
                (let ((*print-readably* nil) (*print-circle* t))
                  (setf ,s-printed
                        (format nil "~{~{~A~^, ~}~^~%~}"
@@ -409,14 +442,36 @@ PACKAGE-NAME is the evaluation package name (string); defaults to \"CL-USER\".
                                                           ;   outer-mapcar, format, setf,
                                                           ;   let (*print-readably*), block
          ;;
-         ;; BODY FORM 2 of outer let* — always executes after the block.
+         ;; BODY FORM 3 of outer let* — always executes after the block.
          ;; When (return) fires in a handler-bind clause, the block above exits
          ;; (returning nil) with s-err-ctx set and s-printed nil.  This form
          ;; runs regardless, producing the wire tuple.
          ;; raw == printed: avoids #<...> reader errors on round-trip.
+         ;; The 6th element is the raw integer handle-table ID for the attached path, or nil.
+         ;; The optional 7th element (when surface-raw-value is true) is the live Lisp
+         ;; object that is the last form's first return value — useful on the hermetic
+         ;; in-process path where the caller has direct access to the live value.
          (list ,s-printed
                ,s-printed                            ; raw = printed
                (get-output-stream-string ,s-stdout)  ; stdout
                (get-output-stream-string ,s-stderr)  ; stderr
-               ,s-err-ctx)))))                       ; closes: list, outer-let*,
-                                                     ;   (let (s-stdout...) ...), flet, defun
+               ,s-err-ctx                            ; error-context or nil
+               ;; 6th element: register the last form's first return value.
+               ;; The build-register-result-form call runs at macro-expansion time
+               ;; (dispatcher side) to produce the injected sexp; the generated
+               ;; sexp runs in the attached image and returns the raw-id integer.
+               ;; When register-result is nil, the 6th element is literally nil.
+               ,(when register-result
+                  (build-register-result-form
+                   `(when (and (null ,s-err-ctx) ,s-all-vals)
+                      (car (car ,s-all-vals)))
+                   (or session-id "")))
+               ;; 7th element (surface-raw-value only): the live Lisp object.
+               ;; s-all-vals is collected in reverse order and then nreverse'd in
+               ;; the success path; on error it stays nil (the block returned early).
+               ;; (last s-all-vals) gives the list of values from the last evaluated
+               ;; form; (car (first ...)) gives the first of those values.
+               ;; This element is NIL when s-err-ctx is non-nil or no forms ran.
+               ,@(when surface-raw-value
+                   `((when (and (null ,s-err-ctx) ,s-all-vals)
+                       (car (first (last ,s-all-vals)))))))))))   ; closes: list, outer-let*, flet, defun

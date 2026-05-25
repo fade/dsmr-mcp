@@ -27,6 +27,8 @@
                 #:make-worker-server #:server-port #:start-accept-loop)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
                 #:register-all-handlers)
+  (:import-from #:dsmr-mcp/src/hermetic/worker/registry
+                #:make-object-registry)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event #:configure-log4cl-for-server)
   (:import-from #:com.inuoe.jzon)
@@ -229,8 +231,10 @@ the process exits cleanly."
   (handler-case
       (let* ((server   (make-worker-server))
              (tcp-port (server-port server)))
-        ;; Step 6: register method handlers.
-        (register-all-handlers server)
+        ;; Step 6: create a per-worker registry and register method handlers.
+        ;; The registry lives for the worker process lifetime; a crash (new process)
+        ;; starts a fresh empty registry, which is the correct invalidation behavior.
+        (register-all-handlers server (make-object-registry))
         ;; Step 6 cont: start optional Swank (always nil this phase).
         (let ((swank-port (%maybe-start-swank)))
           (log-event :info "worker.ready"

@@ -18,14 +18,22 @@
   (:import-from #:slynk-client
                 #:slime-connect
                 #:slime-close
+                #:slime-eval-async
                 #:slime-network-error)
+  (:import-from #:bordeaux-threads
+                #:make-lock
+                #:make-condition-variable
+                #:with-lock-held
+                #:condition-wait
+                #:condition-notify)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
   (:export #:get-or-open-connection
            #:drop-connection
            #:close-connection
            #:parse-slynk-attach
-           #:slynk-attach-configured-p))
+           #:slynk-attach-configured-p
+           #:bounded-slime-eval))
 
 (in-package #:dsmr-mcp/src/attach/connection)
 
@@ -44,14 +52,14 @@
 
 (defun %conn (tool)
   "Read the slynk-conn slot on TOOL via the forward-referenced accessor.
-The accessor is defined by 02-03 (dsmr-mcp/src/attach/dispatch)."
+The accessor is defined in dsmr-mcp/src/attach/dispatch."
   (uiop:symbol-call :dsmr-mcp/src/attach/dispatch
                     :repl-eval-tool-slynk-conn
                     tool))
 
 (defun (setf %conn) (value tool)
   "Write the slynk-conn slot on TOOL via the forward-referenced (setf accessor).
-The accessor is defined by 02-03 (dsmr-mcp/src/attach/dispatch)."
+The accessor is defined in dsmr-mcp/src/attach/dispatch."
   (funcall (fdefinition (list 'setf
                                (find-symbol "REPL-EVAL-TOOL-SLYNK-CONN"
                                             :dsmr-mcp/src/attach/dispatch)))
@@ -59,7 +67,7 @@ The accessor is defined by 02-03 (dsmr-mcp/src/attach/dispatch)."
 
 (defun %call-lock (tool)
   "Read the call-lock slot on TOOL via the forward-referenced accessor.
-The accessor is defined by 02-03 (dsmr-mcp/src/attach/dispatch)."
+The accessor is defined in dsmr-mcp/src/attach/dispatch."
   (uiop:symbol-call :dsmr-mcp/src/attach/dispatch
                     :repl-eval-tool-call-lock
                     tool))
@@ -87,8 +95,48 @@ Signals a plain error for a non-empty string that contains no colon."
 
 (defun slynk-attach-configured-p (attach-string)
   "Return non-NIL when ATTACH-STRING is a non-empty string.
-Used by 02-03's with-attach-dispatch to gate the attached eval path."
+Used by with-attach-dispatch to gate the attached eval path."
   (and (stringp attach-string) (plusp (length attach-string))))
+
+;;; Bounded slime-eval -------------------------------------------------------
+;;;
+;;; slynk-client:slime-eval waits for the reply unconditionally, so a reply the
+;;; remote never delivers blocks the caller forever.  This bounds the wait:
+;;; dispatch with slime-eval-async, then wait on a private condition variable
+;;; with a deadline.  A lost reply becomes a clean slime-network-error after
+;;; TIMEOUT seconds instead of an indefinite hang; the caller's existing
+;;; network-error path then drops and reopens the connection.
+;;;
+;;; The wait is a timed condition-wait, NOT sb-ext:with-timeout: a SIGALRM
+;;; unwind does not compose with the locked condition-wait inside the rex
+;;; round-trip.  Safe only for idempotent forms (the caller decides); a
+;;; non-returning round-trip must not be retried on the same connection while
+;;; it may still be in flight.
+(defun bounded-slime-eval (form conn &key (timeout 30))
+  "Evaluate FORM on CONN, bounding the wait to TIMEOUT seconds.  Returns the
+remote result, or signals slynk-client:slime-network-error if no reply arrives
+within TIMEOUT."
+  (let ((done-lock (make-lock "dsmr-bounded-slime-eval"))
+        (done      (make-condition-variable))
+        (available nil)
+        (result    nil))
+    (slime-eval-async
+     form conn
+     (lambda (x)
+       (with-lock-held (done-lock)
+         (setf result x available t)
+         (condition-notify done))))
+    (with-lock-held (done-lock)
+      (let ((deadline (+ (get-internal-real-time)
+                         (round (* timeout internal-time-units-per-second)))))
+        (loop until available
+              do (let ((remaining (/ (- deadline (get-internal-real-time))
+                                     internal-time-units-per-second)))
+                   (when (<= remaining 0) (return))
+                   (condition-wait done done-lock :timeout remaining)))))
+    (if available
+        result
+        (error 'slime-network-error))))
 
 ;;; Connection lifecycle ----------------------------------------------------
 
@@ -118,8 +166,29 @@ on TOOL's slynk-conn slot and logs attach.connection.opened."
 The connection is presumed dead on a network error; attempting slime-close on
 a dead socket could block.  The nil slot causes the next get-or-open-connection
 call to reopen on demand (fail-closed semantics).
+
+Also increments the connection-incarnation epoch counter on TOOL via the
+forward-reference accessor pattern (the accessor is defined in dispatch.lisp
+which depends on this file).  The increment uses ignore-errors so teardown
+before dispatch is loaded never escapes.  The epoch bump invalidates all
+result_object_ids minted before the drop.
+
 Returns NIL."
   (setf (%conn tool) nil)
+  ;; Bump epoch via the forward-referenced accessor.  Uses the same
+  ;; (fdefinition (list 'setf (find-symbol ...))) pattern as (setf %conn)
+  ;; above — dispatch.lisp depends on connection.lisp, so a direct import
+  ;; would be circular.
+  (ignore-errors
+    (let* ((epoch-reader (fdefinition
+                          (find-symbol "REPL-EVAL-TOOL-CONNECTION-EPOCH"
+                                       :dsmr-mcp/src/attach/dispatch)))
+           (epoch-writer (fdefinition
+                          (list 'setf
+                                (find-symbol "REPL-EVAL-TOOL-CONNECTION-EPOCH"
+                                             :dsmr-mcp/src/attach/dispatch)))))
+      (when (and epoch-reader epoch-writer)
+        (funcall epoch-writer (1+ (funcall epoch-reader tool)) tool))))
   (log-event :info "attach.connection.dropped" "reason" reason)
   nil)
 
