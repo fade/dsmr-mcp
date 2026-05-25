@@ -29,13 +29,17 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "slynk-client"
                "dsmr-mcp/src/main"
                "dsmr-mcp/src/protocol"
+               "dsmr-mcp/src/attach/registry"
                "dsmr-mcp/src/attach/dispatch"
                "dsmr-mcp/src/hermetic/worker-client"
                "dsmr-mcp/src/hermetic/worker/server"
+               "dsmr-mcp/src/hermetic/worker/registry"
+               "dsmr-mcp/src/hermetic/worker/inspect"
                "dsmr-mcp/src/hermetic/worker/handlers"
                "dsmr-mcp/src/hermetic/worker/main"
                "dsmr-mcp/src/hermetic/pool"
                "dsmr-mcp/src/hermetic/dispatch"
+               "dsmr-mcp/src/tools/inspect-object"
                "dsmr-mcp/src/tools/pool-status"
                "dsmr-mcp/src/tools/pool-kill-worker")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
@@ -61,12 +65,15 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/transport/stdio-integration-test"
                "dsmr-mcp/tests/run-test"
                "dsmr-mcp/tests/attach/repl-eval-attach-test"
+               "dsmr-mcp/tests/attach/registry-test"
                "dsmr-mcp/tests/log/log-test"
                "dsmr-mcp/tests/dispatch/mode-router-test"
                "dsmr-mcp/tests/hermetic/worker-spawn-test"
                "dsmr-mcp/tests/hermetic/pool-affinity-test"
                "dsmr-mcp/tests/hermetic/circuit-breaker-test"
-               "dsmr-mcp/tests/hermetic/repl-eval-parity-test")
+               "dsmr-mcp/tests/hermetic/repl-eval-parity-test"
+               "dsmr-mcp/tests/hermetic/inspect-test"
+               "dsmr-mcp/tests/attach/inspect-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names

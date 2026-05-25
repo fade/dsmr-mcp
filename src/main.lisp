@@ -8,8 +8,7 @@
   (:nicknames #:dsmr-mcp #:dsmr)
   ;; NOTE: deliberately NOT claiming the unqualified `mcp' nickname.
   ;; cl-mcp reserves it and the two must be loadable in the same image
-  ;; during the migration window. See .planning/PROJECT.md
-  ;; "cl-mcp coexistence" decision row.
+  ;; during the migration window.
   (:use #:cl)
   (:import-from #:dsmr-mcp/src/run
                 #:run
