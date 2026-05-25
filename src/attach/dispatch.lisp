@@ -39,7 +39,8 @@
                 #:drop-connection
                 #:close-connection
                 #:parse-slynk-attach
-                #:slynk-attach-configured-p)
+                #:slynk-attach-configured-p
+                #:bounded-slime-eval)
   (:import-from #:dsmr-mcp/src/attach/wrap-form
                 #:build-wrapping-form
                 #:truncate-output
@@ -49,7 +50,6 @@
                 #:encode-object-id
                 #:decode-object-id)
   (:import-from #:slynk-client
-                #:slime-eval
                 #:slime-network-error)
   (:import-from #:bordeaux-threads
                 #:with-lock-held
@@ -320,8 +320,10 @@ so IDs minted before a drop-connection can be detected as stale."
                             (form     (build-wrapping-form code package-name
                                                            :register-result register-result
                                                            :session-id sess-id)))
-                       ;; slime-eval call is inside the lock.
-                       (slime-eval form conn)))))
+                       ;; Bounded slime-eval inside the lock: a lost reply
+                       ;; becomes a clean slime-network-error after the timeout
+                       ;; instead of blocking the caller indefinitely.
+                       (bounded-slime-eval form conn :timeout 30)))))
             ;; Destructure the 6-element result tuple from the remote image.
             ;; Shape: (printed raw stdout stderr error-context raw-id-or-nil)
             ;; Pad with nils when the remote returns a shorter list (defensive).
