@@ -62,13 +62,22 @@ and SESSION-ID is a string that must not contain a colon."
 (defun decode-object-id (id-string)
   "Return (values EPOCH SESSION-ID RAW-ID) parsed from ID-STRING.
 Signals a plain error when ID-STRING is not in epoch:session-id:raw-id format
-(exactly 3 colon-delimited parts).  SESSION-ID is returned as a string;
-EPOCH and RAW-ID are returned as integers."
+(exactly 3 colon-delimited parts).  SESSION-ID is returned as a string with
+element type CHARACTER; EPOCH and RAW-ID are returned as integers.
+
+The (map 'string ...) call on the session-id segment is load-bearing:
+encode-object-id uses FORMAT NIL which produces a SIMPLE-BASE-STRING on SBCL,
+and UIOP:SPLIT-STRING propagates that element type to each substring part.
+A SIMPLE-BASE-STRING serialized under WITH-STANDARD-IO-SYNTAX (as used by
+slime-net-send) prints as #A((N) BASE-CHAR . \"...\"), which the Slynk
+server's read-loop cannot parse and responds to by closing the TCP connection.
+(coerce part 'simple-string) is a no-op on SBCL because SIMPLE-BASE-STRING
+already satisfies SIMPLE-STRING; the MAP form forces element type CHARACTER."
   (let ((parts (uiop:split-string id-string :separator ":")))
     (unless (= (length parts) 3)
       (error "Malformed object-id (expected epoch:session:raw-id): ~S" id-string))
     (values (parse-integer (first parts))
-            (second parts)
+            (map 'string #'identity (second parts))
             (parse-integer (third parts)))))
 
 ;;; Injected-form builders ----------------------------------------------------
