@@ -107,10 +107,15 @@ the %DSMR-MCP-ATTACH-REG- prefix (Critical Constraint 1 above)."
            (setf (symbol-value (intern "*REGISTRY-TABLE*" ,s-pkg))
                  (make-hash-table :test 'eql))
            (setf (symbol-value (intern "*NEXT-ID*" ,s-pkg)) 0)
-           (setf (symbol-value (intern "*REGISTRY-LOCK*" ,s-pkg))
-                 #+bordeaux-threads
-                 (bordeaux-threads:make-lock "dsmr-attach-registry")
-                 #-bordeaux-threads nil))))))
+           ;; *REGISTRY-LOCK* is retained for ABI compatibility but is not
+           ;; acquired by the dispatcher's injected forms.  All registry
+           ;; mutations inside slime-eval forms are unsynchronised; the
+           ;; dispatcher's call-lock serialises session access instead.
+           ;; Acquiring bordeaux-threads:with-lock-held inside an in-process
+           ;; Slynk slime-eval deadlocks subsequent calls (SBCL world-quiesce
+           ;; races with Slynk's read/dispatch threads), so no BT primitives
+           ;; are used inside injected forms.
+           (setf (symbol-value (intern "*REGISTRY-LOCK*" ,s-pkg)) nil))))))
 
 (defun build-register-result-form (value-form session-id)
   "Return the sexp that, when evaluated in the attached image, registers the
@@ -122,36 +127,30 @@ SESSION-ID is a string embedded literally as the ownership tag.
 
 The inspectable-p check is inlined (numberp/stringp/symbolp/characterp) so
 the remote image does not call back to the dispatcher's inspectable-p.
-The registration acquires *REGISTRY-LOCK* (or skips locking when NIL, i.e.,
-when bordeaux-threads is absent in the attached image)."
+
+No lock is acquired inside the injected form.  The dispatcher's call-lock
+serializes all session access so no additional lock is needed.  Acquiring
+bordeaux-threads:with-lock-held inside an in-process Slynk slime-eval call
+deadlocks subsequent slime-eval calls (SBCL world-quiesce/Slynk race)."
   (flet ((cl-user-sym (name)
            (intern name (find-package :common-lisp-user))))
     (let ((s-val  (cl-user-sym "%DSMR-MCP-ATTACH-REG-VAL"))
           (s-tbl  (cl-user-sym "%DSMR-MCP-ATTACH-REG-TBL"))
-          (s-lock (cl-user-sym "%DSMR-MCP-ATTACH-REG-LCK"))
           (s-ctr  (cl-user-sym "%DSMR-MCP-ATTACH-REG-CTR"))
           (s-id   (cl-user-sym "%DSMR-MCP-ATTACH-REG-ID")))
       `(let* ((,s-val  ,value-form)
               (,s-tbl  (symbol-value
                         (intern "*REGISTRY-TABLE*" "DSMR-MCP-ATTACH-REGISTRY")))
-              (,s-lock (symbol-value
-                        (intern "*REGISTRY-LOCK*" "DSMR-MCP-ATTACH-REGISTRY")))
               (,s-ctr  (intern "*NEXT-ID*" "DSMR-MCP-ATTACH-REGISTRY")))
          (when (and ,s-val
                     (not (numberp ,s-val))
                     (not (stringp ,s-val))
                     (not (symbolp ,s-val))
                     (not (characterp ,s-val)))
-           (if ,s-lock
-               (bordeaux-threads:with-lock-held (,s-lock)
-                 (let ((,s-id (incf (symbol-value ,s-ctr))))
-                   (setf (gethash ,s-id ,s-tbl)
-                         (list :object ,s-val :session ,session-id))
-                   ,s-id))
-               (let ((,s-id (incf (symbol-value ,s-ctr))))
-                 (setf (gethash ,s-id ,s-tbl)
-                       (list :object ,s-val :session ,session-id))
-                 ,s-id)))))))
+           (let ((,s-id (incf (symbol-value ,s-ctr))))
+             (setf (gethash ,s-id ,s-tbl)
+                   (list :object ,s-val :session ,session-id))
+             ,s-id))))))
 
 (defun build-lookup-form (raw-id session-id)
   "Return the sexp that, when evaluated in the attached image, looks up RAW-ID

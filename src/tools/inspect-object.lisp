@@ -5,21 +5,21 @@
 ;;;; istate->JSON normaliser, and tool-handle routing.
 ;;;;
 ;;;; Attached path: decodes the result_object_id, performs an epoch check,
-;;;; then slime-evals a form that calls slynk::inspect-object on the held
-;;;; object and registers sub-objects in the image-resident table, returning
+;;;; then slime-evals a form that drives Slynk's native inspector on the held
+;;;; object and registers the inspectable sub-objects it surfaces, returning
 ;;;; (list :ok ISTATE-PLIST PART-IDS SESSION-ID).  The dispatcher normalises
-;;;; the istate plist to the D-04 envelope.
+;;;; the istate plist to the canonical inspect envelope shared with the
+;;;; hermetic worker path.
 ;;;;
-;;;; Hermetic path: delegates to dispatch-hermetic-call which routes via the
-;;;; name-based "worker/inspect-object" branch (Task 3 / hermetic dispatch).
+;;;; Hermetic path: delegates to dispatch-hermetic-call, which routes by name
+;;;; to the worker's inspect handler.
 ;;;;
-;;;; Placement rationale: %dispatch-attach-inspect and %istate->inspect-ht
-;;;; live in this tool file rather than in src/attach/dispatch.lisp to keep
-;;;; the inspect logic co-located with its tool class.  The only accessor
-;;;; needed from attach/dispatch is repl-eval-tool-connection-epoch (and the
-;;;; slynk-conn/call-lock); those are imported directly.  No circular
-;;;; dependency arises because this file depends on attach/dispatch, not vice
-;;;; versa.
+;;;; Placement rationale: the attached-inspect helpers live in this tool file
+;;;; rather than in src/attach/dispatch.lisp to keep the inspect logic
+;;;; co-located with its tool class.  The accessors needed from attach/dispatch
+;;;; (the connection, call-lock, and connection-epoch) are imported directly;
+;;;; no circular dependency arises because this file depends on attach/dispatch,
+;;;; not vice versa.
 ;;;;
 ;;;; Re-implemented from cl-mcp/src/inspect.lisp (MIT) under AGPL for the
 ;;;; istate normalisation patterns; the eval form and epoch logic are new.
@@ -45,6 +45,8 @@
                 #:repl-eval-tool-slynk-conn
                 #:repl-eval-tool-call-lock
                 #:repl-eval-tool-connection-epoch)
+  (:import-from #:dsmr-mcp/src/attach/connection
+                #:bounded-slime-eval)
   (:import-from #:dsmr-mcp/src/state
                 #:*mode*
                 #:session-id
@@ -55,7 +57,6 @@
   (:import-from #:dsmr-mcp/src/hermetic/dispatch
                 #:dispatch-hermetic-call)
   (:import-from #:slynk-client
-                #:slime-eval
                 #:slime-network-error)
   (:import-from #:bordeaux-threads
                 #:with-lock-held)
@@ -67,9 +68,10 @@
 ;;; ---------------------------------------------------------------------------
 ;;; inspect-object-tool CLOS class
 ;;;
-;;; Mirrors repl-eval-tool (src/attach/dispatch.lisp) exactly:
-;;;   class-allocated name/description/input-schema with :initform (NOT
-;;;   :default-initargs); c2mop:ensure-finalized immediately after defclass.
+;;; Mirrors repl-eval-tool (src/attach/dispatch.lisp): class-allocated
+;;; name/description/input-schema with :initform (NOT :default-initargs);
+;;; c2mop:ensure-finalized immediately after defclass so the metaclass :after
+;;; method registers the tool at load time.
 ;;; ---------------------------------------------------------------------------
 
 (defclass inspect-object-tool (mcp-tool)
@@ -99,12 +101,12 @@ result_object_id or a previous inspect-object response.")
                 :required ("id"))))
   (:metaclass mcp-tool-class)
   (:documentation "MCP tool: inspect a held object by ID.
-Routes to slynk::inspect-object on the attached path and to
-worker/inspect-object on the hermetic path.  Both paths return the
-same D-04 envelope shape (kind/summary/slots/elements/entries/meta/id)."))
+Routes to Slynk's native inspector on the attached path and to the worker
+inspect handler on the hermetic path.  Both paths return the same envelope
+shape (kind/summary/slots/elements/entries/meta/id)."))
 
-;; CRITICAL: ensure-finalized fires the metaclass :after method immediately,
-;; registering \"inspect-object\" in *tool-classes* at load time.
+;; ensure-finalized fires the metaclass :after method immediately, registering
+;; "inspect-object" in *tool-classes* at load time.
 (c2mop:ensure-finalized (find-class 'inspect-object-tool))
 
 ;;; ---------------------------------------------------------------------------
@@ -113,47 +115,57 @@ same D-04 envelope shape (kind/summary/slots/elements/entries/meta/id)."))
 ;;; Builds the sexp sent to the attached image via slime-eval.  The form:
 ;;;   1. Looks up RAW-ID in the DSMR-MCP-ATTACH-REGISTRY table.
 ;;;   2. Verifies the stored session tag matches SESSION-ID.
-;;;   3. Calls (slynk::inspect-object obj) wrapped in slynk::with-buffer-syntax.
-;;;   4. Registers every (:value OBJ IDX) sub-object in the table.
+;;;   3. Drives Slynk's native inspector on the held object: builds an istate,
+;;;      runs the backend emacs-inspect method, and renders it to the elisp
+;;;      plist (which assigns each inspectable part an index into the istate's
+;;;      parts vector).
+;;;   4. Registers every inspectable part object (the LIVE object, fetched from
+;;;      the istate parts vector by its index) in the dsmr handle table, mapping
+;;;      slynk part-index -> dsmr raw-id.
 ;;;   5. Returns (list :ok ISTATE-PLIST PART-IDS SESSION-ID)
-;;;      or (list :not-found RAW-ID)
-;;;      or (list :session-mismatch RAW-ID).
+;;;      or (list :not-found RAW-ID) or (list :session-mismatch RAW-ID).
 ;;;
 ;;; Sub-object registration MUST happen inside this form because the live
-;;; objects cannot cross the slime-eval wire.  The form returns
-;;; (slynk-idx . dsmr-raw-id) pairs so the dispatcher can build object-ref
-;;; entries carrying persistent dsmr IDs.
+;;; objects cannot cross the slime-eval wire; only their printed representations
+;;; do.  Slynk's value-part renders each inspectable value to a string and
+;;; stashes the live object in the istate parts vector, so the live object is
+;;; reachable only here, in-image, by index.  The form returns
+;;; (slynk-index dsmr-raw-id) pairs so the dispatcher can build object-ref
+;;; entries carrying persistent dsmr IDs for drill-down.
 ;;;
-;;; Symbol interning follows the %DSMR-MCP-ATTACH-REG- CL-USER convention
-;;; from src/attach/wrap-form.lisp Critical Constraint 1 — all symbols
-;;; inside the form are either CL standard or CL-USER-interned with this
-;;; prefix so the remote reader resolves them correctly.
+;;; Symbol hygiene: every dsmr-side symbol in the form is interned in CL-USER
+;;; with the %DSMR-MCP-ATTACH-REG- prefix so the remote reader resolves it
+;;; without the dispatcher's (remotely-absent) package; the Slynk internals are
+;;; package-qualified and exist in the attached image.  No registry lock is
+;;; acquired in-image: the dispatcher's per-session call-lock serialises access,
+;;; and acquiring a lock inside an in-process Slynk eval form can deadlock.
 ;;; ---------------------------------------------------------------------------
 
 (defun %build-attach-inspect-form (raw-id session-id)
   "Return the sexp that, when evaluated in the attached image, looks up RAW-ID,
-verifies the session tag, inspects the object via slynk::inspect-object, and
-registers sub-objects.  Returns (list :ok ISTATE-PLIST PART-IDS SESSION-ID),
-(list :not-found RAW-ID), or (list :session-mismatch RAW-ID)."
+verifies the session tag, drives Slynk's inspector on the held object, registers
+the inspectable sub-objects it surfaces, and returns
+(list :ok ISTATE-PLIST PART-IDS SESSION-ID), (list :not-found RAW-ID), or
+(list :session-mismatch RAW-ID)."
   (flet ((cs (name) (intern name (find-package :common-lisp-user))))
-    (let ((s-tbl      (cs "%DSMR-MCP-ATTACH-REG-INS-TBL"))
-          (s-entry    (cs "%DSMR-MCP-ATTACH-REG-INS-ENTRY"))
-          (s-obj      (cs "%DSMR-MCP-ATTACH-REG-INS-OBJ"))
-          (s-ip       (cs "%DSMR-MCP-ATTACH-REG-INS-ISTATE"))
-          (s-cont     (cs "%DSMR-MCP-ATTACH-REG-INS-CONTENT"))
-          (s-parts    (cs "%DSMR-MCP-ATTACH-REG-INS-PARTS"))
-          (s-pids     (cs "%DSMR-MCP-ATTACH-REG-INS-PIDS"))
-          (s-part     (cs "%DSMR-MCP-ATTACH-REG-INS-PART"))
+    (let ((s-tbl     (cs "%DSMR-MCP-ATTACH-REG-INS-TBL"))
+          (s-ctr     (cs "%DSMR-MCP-ATTACH-REG-INS-CTR"))
+          (s-entry   (cs "%DSMR-MCP-ATTACH-REG-INS-ENTRY"))
+          (s-obj     (cs "%DSMR-MCP-ATTACH-REG-INS-OBJ"))
+          (s-insp    (cs "%DSMR-MCP-ATTACH-REG-INS-INSP"))
+          (s-hist    (cs "%DSMR-MCP-ATTACH-REG-INS-HIST"))
+          (s-istate  (cs "%DSMR-MCP-ATTACH-REG-INS-ISTATE"))
+          (s-ip      (cs "%DSMR-MCP-ATTACH-REG-INS-ELISP"))
+          (s-parts   (cs "%DSMR-MCP-ATTACH-REG-INS-PARTS"))
+          (s-cont    (cs "%DSMR-MCP-ATTACH-REG-INS-CONTENT"))
           (s-part-list (cs "%DSMR-MCP-ATTACH-REG-INS-PL"))
-          (s-lock     (cs "%DSMR-MCP-ATTACH-REG-INS-LOCK"))
-          (s-ctr      (cs "%DSMR-MCP-ATTACH-REG-INS-CTR"))
-          (s-nid      (cs "%DSMR-MCP-ATTACH-REG-INS-NID"))
-          (s-sobj     (cs "%DSMR-MCP-ATTACH-REG-INS-SOBJ"))
-          (s-sidx     (cs "%DSMR-MCP-ATTACH-REG-INS-SIDX")))
+          (s-part    (cs "%DSMR-MCP-ATTACH-REG-INS-PART"))
+          (s-pids    (cs "%DSMR-MCP-ATTACH-REG-INS-PIDS"))
+          (s-nid     (cs "%DSMR-MCP-ATTACH-REG-INS-NID"))
+          (s-sobj    (cs "%DSMR-MCP-ATTACH-REG-INS-SOBJ"))
+          (s-sidx    (cs "%DSMR-MCP-ATTACH-REG-INS-SIDX")))
       `(let* ((,s-tbl   (symbol-value
                          (intern "*REGISTRY-TABLE*" "DSMR-MCP-ATTACH-REGISTRY")))
-              (,s-lock  (symbol-value
-                         (intern "*REGISTRY-LOCK*" "DSMR-MCP-ATTACH-REGISTRY")))
               (,s-ctr   (intern "*NEXT-ID*" "DSMR-MCP-ATTACH-REGISTRY"))
               (,s-entry (gethash ,raw-id ,s-tbl)))
          (cond
@@ -162,58 +174,65 @@ registers sub-objects.  Returns (list :ok ISTATE-PLIST PART-IDS SESSION-ID),
            ((not (string= (getf ,s-entry :session) ,session-id))
             (list :session-mismatch ,raw-id))
            (t
-            (let* ((,s-obj (getf ,s-entry :object))
-                   (,s-ip  (slynk::with-buffer-syntax ()
-                             (slynk::inspect-object ,s-obj)))
-                   ;; istate-plist is (:title S :id N :content PREPARE-RANGE-RESULT)
-                   ;; prepare-range result is (PARTS-LIST NEXT-END START END)
-                   (,s-cont  (getf ,s-ip :content))
-                   (,s-parts (when (listp ,s-cont) (car ,s-cont)))
-                   (,s-pids  nil))
-              ;; Register each inspectable (:value SOBJ SIDX) sub-object
-              ;; into the dsmr table and collect (SIDX . NEW-RAW-ID) pairs.
-              ;; Using do* (not loop) per Critical Constraint 2.
-              (when ,s-parts
-                (do* ((,s-part-list ,s-parts (cdr ,s-part-list))
-                      (,s-part (car ,s-part-list) (car ,s-part-list)))
-                     ((null ,s-part-list))
-                  (when (and (consp ,s-part)
-                             (eq (car ,s-part) :value))
-                    (let ((,s-sobj (cadr ,s-part))
-                          (,s-sidx (caddr ,s-part)))
-                      (when (and ,s-sobj
-                                 (not (numberp ,s-sobj))
-                                 (not (stringp ,s-sobj))
-                                 (not (symbolp ,s-sobj))
-                                 (not (characterp ,s-sobj)))
-                        (if ,s-lock
-                            (bordeaux-threads:with-lock-held (,s-lock)
-                              (let ((,s-nid (incf (symbol-value ,s-ctr))))
-                                (setf (gethash ,s-nid ,s-tbl)
-                                      (list :object ,s-sobj :session ,session-id))
-                                (push (list ,s-sidx ,s-nid) ,s-pids)))
-                            (let ((,s-nid (incf (symbol-value ,s-ctr))))
-                              (setf (gethash ,s-nid ,s-tbl)
-                                    (list :object ,s-sobj :session ,session-id))
-                              (push (list ,s-sidx ,s-nid) ,s-pids))))))))
+            (let* ((,s-obj  (getf ,s-entry :object))
+                   (,s-ip   nil)
+                   (,s-pids nil))
+              ;; Drive Slynk's native inspector on the held object, wrapped in
+              ;; with-buffer-syntax so value printing matches an interactive
+              ;; inspect.  inspect-object renders the elisp plist (assigning
+              ;; each inspectable part an index) and leaves the istate at the
+              ;; top of the inspector history.
+              (slynk::with-buffer-syntax ()
+                (setf ,s-ip (slynk::inspect-object ,s-obj)))
+              ;; Reach the live part objects via the istate just produced (the
+              ;; printed parts crossing the wire carry only indices into this
+              ;; per-image parts vector).
+              (let* ((,s-insp   (slynk::target-inspector))
+                     (,s-hist   (slynk::inspector-%history ,s-insp))
+                     (,s-istate (when (and ,s-hist (plusp (fill-pointer ,s-hist)))
+                                  (aref ,s-hist (1- (fill-pointer ,s-hist)))))
+                     (,s-parts  (when ,s-istate (slynk::istate.parts ,s-istate)))
+                     (,s-cont   (getf ,s-ip :content))
+                     (,s-part-list (when (listp ,s-cont) (car ,s-cont))))
+                ;; For each (:value PRINTED IDX) token, fetch the LIVE object
+                ;; from the parts vector by IDX and register the inspectable
+                ;; ones, mapping IDX -> a fresh dsmr raw-id.
+                (when ,s-parts
+                  (dolist (,s-part ,s-part-list)
+                    (when (and (consp ,s-part) (eq (car ,s-part) :value))
+                      (let* ((,s-sidx (caddr ,s-part))
+                             (,s-sobj (when (and (integerp ,s-sidx)
+                                                 (< ,s-sidx (length ,s-parts)))
+                                        (aref ,s-parts ,s-sidx))))
+                        (when (and ,s-sobj
+                                   (not (numberp ,s-sobj))
+                                   (not (stringp ,s-sobj))
+                                   (not (symbolp ,s-sobj))
+                                   (not (characterp ,s-sobj)))
+                          (let ((,s-nid (incf (symbol-value ,s-ctr))))
+                            (setf (gethash ,s-nid ,s-tbl)
+                                  (list :object ,s-sobj :session ,session-id))
+                            (push (list ,s-sidx ,s-nid) ,s-pids))))))))
               (list :ok ,s-ip (nreverse ,s-pids) ,session-id))))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; istate->JSON normaliser (Approach A, RESEARCH Item 2)
+;;; istate->JSON normaliser
 ;;;
-;;; Consumes the (:ok ISTATE-PLIST PART-IDS SESSION-ID) tuple returned by the
-;;; in-image form and builds the D-04 envelope hash-table.
+;;; Consumes the (:ok ISTATE-PLIST PART-IDS SESSION-ID) tuple and builds the
+;;; canonical inspect envelope hash-table.
 ;;;
-;;; ISTATE-PLIST shape: (:title S :id N :content PREPARE-RANGE-RESULT)
-;;; PREPARE-RANGE-RESULT: (PARTS-LIST NEXT-END START END)
-;;; PARTS-LIST tokens: STRING, (:value OBJ IDX), (:label . STRINGS),
-;;;                    (:action S LAMBDA IDX), (:line LABEL VALUE), newlines.
+;;; ISTATE-PLIST shape: (:title S :id N :content (PARTS-LIST NEXT-END START END))
+;;; PARTS-LIST tokens (after Slynk's prepare-part): plain strings,
+;;;   (:value PRINTED-STRING IDX), (:label STRING), (:action LABEL IDX), and
+;;;   newline strings.  Slynk renders slot/element values as a label string
+;;;   followed by a (:value PRINTED-STRING IDX) token (the live object is kept
+;;;   server-side in the parts vector, never on the wire).
 ;;;
-;;; PART-IDS: list of (SLYNK-IDX DSMR-RAW-ID) pairs from sub-object
-;;; registration.  Used to build object-ref entries for (:value OBJ IDX) tokens.
-;;;
-;;; The object-ref ids are FULL encode-object-id strings so drill-down
-;;; re-enters the dispatcher's id space.
+;;; Slots are built by pairing the most recent label string with the following
+;;; (:value ...) token.  An inspectable value that was registered in-image
+;;; (its IDX appears in PART-IDS) becomes an object-ref carrying a full
+;;; encode-object-id string, so drill-down re-enters the dispatcher's id space;
+;;; everything else becomes a primitive value carrying the printed string.
 ;;; ---------------------------------------------------------------------------
 
 (defun %kind-from-title (title)
@@ -243,114 +262,105 @@ Falls back to \"slynk-object\" when no pattern matches."
   (handler-case (prin1-to-string obj)
     (error () "#<unreadable>")))
 
-(defun %make-primitive-value (obj)
-  "Build a primitive value-repr hash-table for a non-inspectable OBJ."
-  (make-ht "value" (%safe-prin1 obj)
-           "type"  (string-downcase (symbol-name (type-of obj)))))
-
 (defun %istate->inspect-ht (istate-plist part-ids encoded-id epoch session-id)
-  "Normalise a Slynk istate plist to the D-04 inspect-object envelope.
+  "Normalise a Slynk istate plist to the canonical inspect-object envelope.
 
 ISTATE-PLIST: (:title S :id N :content (PARTS-LIST NEXT-END START END))
 PART-IDS: list of (SLYNK-IDX DSMR-RAW-ID) pairs from sub-object registration.
 ENCODED-ID: the full epoch:session:raw-id string for the root object.
 EPOCH, SESSION-ID: current epoch and session for encoding sub-object ids."
-  (let* ((title     (getf istate-plist :title))
-         (content   (getf istate-plist :content))
-         ;; content is (PARTS-LIST NEXT-END START END) from prepare-range
+  (let* ((title      (getf istate-plist :title))
+         (content    (getf istate-plist :content))
          (parts-list (when (listp content) (car content)))
          (next-end   (when (listp content) (second content)))
          (end        (when (listp content) (fourth content)))
-         ;; Build a lookup map from slynk-idx -> dsmr-raw-id.
          (sidx->raw  (let ((ht (make-hash-table :test 'eql)))
                        (dolist (pair part-ids)
                          (when (and (consp pair) (= 2 (length pair)))
                            (setf (gethash (first pair) ht) (second pair))))
                        ht))
-         ;; Accumulate slots from (:line LABEL VALUE) tokens.
-         (slots      nil)
-         ;; Accumulate content text from strings / (:label ...) / newlines.
-         (content-text (make-string-output-stream)))
-    ;; Walk the parts list.
+         (slots         nil)
+         (pending-label nil)
+         (content-text  (make-string-output-stream)))
     (dolist (part (or parts-list '()))
       (cond
-        ;; (:line LABEL VALUE) -> slot entry
-        ((and (consp part) (eq (car part) :line))
-         (let* ((label     (second part))
-                (val-obj   (third part))
-                (label-str (if (stringp label) label (%safe-prin1 label)))
-                (val-repr
-                  (if (inspectable-p val-obj)
-                      ;; Look up if we registered it (it would have been registered
-                      ;; as a (:value ...) token; :line values are also sometimes
-                      ;; registered — use the raw-id from part-ids if available,
-                      ;; otherwise build a plain primitive repr).
-                      ;;
-                      ;; Note: slynk's prepare-part emits :line tokens for slot
-                      ;; entries; the live VALUE in :line may or may not have a
-                      ;; corresponding :value token.  We always encode inspectable
-                      ;; :line values as object-refs when we have a raw-id from
-                      ;; the image-registration step (part-ids carries (:value ...)
-                      ;; registrations).  When no part-id is available for the value,
-                      ;; fall back to a primitive repr with the printed form.
-                      (%make-primitive-value val-obj)
-                      (%make-primitive-value val-obj))))
-           (declare (ignore val-repr))
-           ;; We produce an object-ref when a matching :value registration
-           ;; is available; otherwise a plain value repr.
-           (push (make-ht "name"  label-str
-                          "value" (if (inspectable-p val-obj)
-                                      ;; Check part-ids for a registered raw-id.
-                                      ;; :line values are not directly indexed by
-                                      ;; slynk-idx; we fall back to a plain repr
-                                      ;; with the printed form here.
-                                      (make-ht "value" (%safe-prin1 val-obj)
-                                               "type"  "object"
-                                               "kind"  "printable")
-                                      (%make-primitive-value val-obj)))
-                 slots)))
-        ;; (:value OBJ IDX) -> inline object-ref (using sidx->raw lookup)
+        ;; (:value PRINTED-STRING IDX) -> a slot/element value.
         ((and (consp part) (eq (car part) :value))
-         (let* ((obj (cadr part))
-                (idx (caddr part))
-                (raw-id (gethash idx sidx->raw)))
-           (when raw-id
-             (let ((ref-id (encode-object-id epoch session-id raw-id)))
-               (push (make-ht "name"  (format nil "part-~A" idx)
-                              "value" (make-ht "kind"    "object-ref"
-                                               "id"      ref-id
-                                               "summary" (%safe-prin1 obj)
-                                               "type"    (%safe-prin1 (type-of obj))))
-                     slots)))))
-        ;; Plain string or newline -> append to content text
-        ((stringp part)
-         (write-string part content-text))
-        ;; (:label . STRINGS) -> append to content text
+         (let* ((printed (second part))
+                (idx     (third part))
+                (raw-id  (gethash idx sidx->raw))
+                (printed-str (if (stringp printed) printed (%safe-prin1 printed)))
+                (name    (or pending-label (format nil "part-~A" idx)))
+                (value   (if raw-id
+                             (make-ht "kind"    "object-ref"
+                                      "id"      (encode-object-id epoch session-id raw-id)
+                                      "summary" printed-str)
+                             (make-ht "value" printed-str))))
+           (push (make-ht "name" name "value" value) slots)
+           (setf pending-label nil)))
+        ;; (:action LABEL IDX) -> dropped (UI-only; no Emacs).
+        ((and (consp part) (eq (car part) :action))
+         nil)
+        ;; (:label STRING...) -> folded into content text.
         ((and (consp part) (eq (car part) :label))
          (dolist (s (cdr part))
            (when (stringp s) (write-string s content-text))))
-        ;; (:action ...) -> DROPPED (no Emacs; actions are UI-only)
-        ((and (consp part) (eq (car part) :action))
-         nil)
-        ;; Anything else -> ignore
+        ;; Plain string -> content text + candidate slot label.
+        ((stringp part)
+         (write-string part content-text)
+         (let ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return #\:) part)))
+           (when (plusp (length trimmed))
+             (setf pending-label trimmed))))
         (t nil)))
-    ;; Build the envelope hash-table.
     (let ((ht (make-hash-table :test 'equal)))
       (setf (gethash "kind"    ht) (%kind-from-title title))
       (setf (gethash "summary" ht) (or title ""))
       (setf (gethash "id"      ht) encoded-id)
       (when slots
         (setf (gethash "slots" ht) (coerce (nreverse slots) 'simple-vector)))
-      ;; content text field (folded strings/labels)
       (let ((ctext (get-output-stream-string content-text)))
         (when (plusp (length ctext))
           (setf (gethash "content" ht) (text-content ctext))))
-      ;; meta: truncated flag when the istate was paginated
+      ;; meta: mark truncation when Slynk paginated past the first page.
       (when (and next-end end (> next-end (1+ end)))
         (setf (gethash "meta" ht)
-              (make-ht "truncated" t
-                       "max_elements" (or end 500))))
+              (make-ht "truncated" t "max_elements" (or end 500))))
       ht)))
+
+;;; ---------------------------------------------------------------------------
+;;; Bounded, retrying eval for the attached inspect round-trip
+;;;
+;;; The attached inspect eval is read-only and idempotent: it reads a held
+;;; object and asks Slynk's inspector to describe it, never mutating user state.
+;;; The rex round-trip can intermittently leave the waiting thread blocked
+;;; forever when a reply is not delivered to it, so the wait is bounded by
+;;; bounded-slime-eval (the dispatcher-side helper that turns a lost reply into
+;;; a clean slime-network-error after a deadline).  This wrapper adds an
+;;; idempotent-retry budget on top: a fresh attempt gets an independent chance
+;;; to complete, turning a rare indefinite hang into a reliable result (or, once
+;;; the budget is spent, a clean network-error envelope).
+;;; ---------------------------------------------------------------------------
+
+(defun %slime-eval/retry (form conn &key (timeout 30) (attempts 1))
+  "Evaluate FORM on CONN via bounded-slime-eval, bounding each wait to TIMEOUT
+seconds.  A lost reply yields a bounded wait rather than the indefinite block
+that plain slime-eval would suffer.  Signals slime-network-error once the
+ATTEMPTS budget is spent.
+
+ATTEMPTS defaults to 1 and retrying is NOT a safe recovery: when a reply does
+not arrive, the in-image inspect may still be running, and a second inspect
+request would run concurrently against the connection's shared inspector state
+and corrupt it (wedging the connection).  The bounded wait exists only to turn a
+pathological non-returning round-trip into a clean error instead of an
+indefinite hang.  ATTEMPTS is retained for callers that can guarantee the prior
+request has fully settled.  Safe only for idempotent forms; the attached inspect
+eval qualifies."
+  (dotimes (i attempts (error 'slime-network-error))
+    (handler-case
+        (return (bounded-slime-eval form conn :timeout timeout))
+      (slime-network-error ()
+        (log-event :warn "inspect.attach.eval-retry"
+                   "attempt" (1+ i) "attempts" attempts)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Attached inspector dispatcher
@@ -360,26 +370,24 @@ EPOCH, SESSION-ID: current epoch and session for encoding sub-object ids."
   "Dispatch inspect-object to the attached Slynk server.
 
 TOOL is the per-session repl-eval-tool instance carrying the connection,
-call-lock, and connection-epoch slots.  ID is the JSON-RPC request id (may
-be nil in direct test calls).  PARAMS is the tool argument hash-table.
+call-lock, and connection-epoch slots.  ID is the JSON-RPC request id (may be
+nil in direct test calls).  PARAMS is the tool argument hash-table.
 
-Performs the epoch check (D-08) BEFORE any slime-eval:
-  - If the decoded epoch /= (repl-eval-tool-connection-epoch tool) OR the
-    decoded session-id /= the tool's session-id, returns registry-reset.
+Performs the epoch check BEFORE any slime-eval:
+  - If the decoded epoch /= the tool's connection-epoch OR the decoded
+    session-id /= the tool's session-id, returns a registry-reset error.
   - If the epoch matches but the raw-id is not in the image table, returns
     OBJECT_NOT_FOUND.
-  - On success: normalises the istate plist to the D-04 envelope.
+  - On success: normalises the istate plist to the canonical envelope.
 
-Returns the envelope hash-table directly (without result wrapper) so the
-caller can decide whether to wrap in (result id ...) or return bare."
+Returns the envelope hash-table directly (without the result wrapper) so the
+caller decides whether to wrap it in (result id ...) or return it bare."
   (let* ((id-string (and params (gethash "id" params))))
-    ;; Validate the id parameter.
     (unless (and (stringp id-string) (plusp (length id-string)))
       (return-from %dispatch-attach-inspect
         (make-ht "isError" t
                  "content"
                  (text-content "inspect-object: 'id' parameter is required."))))
-    ;; Decode the object id.
     (multiple-value-bind (decoded-epoch decoded-session-id decoded-raw-id)
         (handler-case (decode-object-id id-string)
           (error (e)
@@ -389,7 +397,7 @@ caller can decide whether to wrap in (result id ...) or return bare."
                        "content"
                        (text-content
                         (format nil "inspect-object: malformed id: ~A" e))))))
-      ;; Epoch check (D-08): short-circuit to registry-reset before slime-eval.
+      ;; Epoch check: short-circuit to registry-reset before any slime-eval.
       (let* ((current-epoch   (repl-eval-tool-connection-epoch tool))
              (tool-session-id (session-id (tool-session tool))))
         (when (or (/= decoded-epoch current-epoch)
@@ -401,19 +409,15 @@ caller can decide whether to wrap in (result id ...) or return bare."
                      (text-content
                       "Object registry was reset (connection reconnected or \
 epoch mismatch); the object id is no longer valid."))))
-        ;; Build and dispatch the in-image inspect form.
+        ;; Acquire the call-lock once, covering the bounded slime-eval.
         (handler-case
-            (let* ((lock     (repl-eval-tool-call-lock tool))
-                   (conn     (with-lock-held (lock)
-                               (repl-eval-tool-slynk-conn tool)))
-                   (form     (%build-attach-inspect-form decoded-raw-id decoded-session-id))
-                   (raw-result
-                     (with-lock-held (lock)
-                       (slime-eval form (repl-eval-tool-slynk-conn tool)))))
-              (declare (ignore conn))
-              ;; Dispatch on the result tag.
+            (let* ((form       (%build-attach-inspect-form decoded-raw-id decoded-session-id))
+                   (lock       (repl-eval-tool-call-lock tool))
+                   (raw-result (with-lock-held (lock)
+                                 (%slime-eval/retry
+                                  form (repl-eval-tool-slynk-conn tool)))))
               (cond
-                ;; Object not found or session mismatch -> OBJECT_NOT_FOUND
+                ;; Object not found or session mismatch -> OBJECT_NOT_FOUND.
                 ((and (listp raw-result)
                       (or (eq (car raw-result) :not-found)
                           (eq (car raw-result) :session-mismatch)))
@@ -429,7 +433,6 @@ in the attached image." id-string))))
                         (part-ids     (third raw-result)))
                    (%istate->inspect-ht istate-plist part-ids id-string
                                         current-epoch decoded-session-id)))
-                ;; Unexpected result shape
                 (t
                  (log-event :warn "inspect.attach.unexpected-result"
                             "shape" (%safe-prin1 (and (listp raw-result) (car raw-result))))
@@ -452,10 +455,10 @@ in the attached image." id-string))))
 
 (defmethod tool-handle ((tool inspect-object-tool) id args)
   "Route inspect-object.
-Attached path: resolve the repl-eval-tool for this session and call
+Attached mode: resolve the repl-eval-tool for this session and call
 %dispatch-attach-inspect on it.
-Hermetic path: dispatch-hermetic-call (name-based routing in hermetic/dispatch
-routes 'inspect-object' to worker/inspect-object)."
+Hermetic mode: dispatch-hermetic-call routes the verb by name to the worker
+inspect handler."
   (ecase *mode*
     (:attached
      (let ((repl-tool (get-tool-instance (tool-session tool) "repl-eval")))
