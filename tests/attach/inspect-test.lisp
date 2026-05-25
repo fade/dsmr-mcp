@@ -242,7 +242,7 @@ summary, id, and slots/entries, meta)."
     (%ensure-test-class conn)
     (multiple-value-bind (session repl-tool inspect-tool)
         (%make-attach-session "inspect-parity" conn)
-      (declare (ignore inspect-tool))
+      (declare (ignore session inspect-tool))
       ;; --- Attached envelope ---
       (let* ((repl-res (%dispatch-attach
                         repl-tool
@@ -255,21 +255,16 @@ summary, id, and slots/entries, meta)."
                              repl-tool nil (make-ht "id" oid))))
           (false (gethash "isError" attached-env))
           ;; --- Hermetic envelope via in-process registry + walker ---
-          (let* ((reg     (make-object-registry))
-                 (obj     (make-instance session 'cl-user::test-inspect-widget))
-                 ;; Make a fresh in-process CLOS instance for the hermetic side.
-                 ;; We construct directly rather than via eval to avoid package
-                 ;; qualification issues in the test body.
-                 (h-obj   (make-instance (find-class 'cl-user::test-inspect-widget)))
-                 (h-id    (register-object h-obj reg))
-                 (h-env   (inspect-object-by-id h-id reg)))
-            (declare (ignore obj))
+          (let* ((reg   (make-object-registry))
+                 (h-obj (make-instance 'cl-user::test-inspect-widget))
+                 (h-id  (register-object h-obj reg))
+                 (h-env (inspect-object-by-id h-id reg)))
             ;; Both envelopes must carry the common required keys.
             (let ((attached-keys (loop for k being the hash-keys of attached-env
                                        collect k))
                   (hermetic-keys (loop for k being the hash-keys of h-env
                                        collect k)))
-              ;; The D-04 parity keys must appear in BOTH envelopes.
+              ;; The shared envelope keys must appear in BOTH backends.
               (dolist (k '("kind" "summary" "id"))
                 (true (member k attached-keys :test #'string=)
                       (format nil "attached envelope missing key ~S" k))
