@@ -81,36 +81,71 @@ Choose a specific project directory."
 ;;; Broad-root deny list ----------------------------------------------------
 
 (defparameter *broad-root-deny-list*
-  (list "/" "/tmp/" "/home/" "/usr/" "/etc/" "/var/")
-  "Paths that are too broad to be used as a project root (D-13).")
+  (list "/" "/tmp/" "/home/" "/usr/" "/etc/" "/var/"
+        "/root/" "/dev/" "/proc/" "/sys/" "/run/" "/boot/")
+  "Paths that are too broad to be used as a project root (D-13).
+Expanded to include system pseudo-filesystems and privileged home dirs.")
 
 (defun broad-root-p (pathname)
   "Return T when PATHNAME is on the broad-root deny list (D-13).
 Checks both the raw namestring and the truename-resolved namestring to
-prevent symlink bypass (e.g. macOS /tmp -> /private/tmp/)."
+prevent symlink bypass (e.g. macOS /tmp -> /private/tmp/).
+Uses %resolve-with-parent-fallback so that a symlinked or nonexistent
+candidate root is still resolved before the deny-list check (CR-03)."
   (let ((ns (namestring (uiop:ensure-directory-pathname pathname))))
     (when (some (lambda (d) (string= ns d)) *broad-root-deny-list*)
       (return-from broad-root-p t))
-    ;; Also check after truename resolution to close symlink bypass
-    (let* ((tn (handler-case (truename pathname) (file-error () nil)))
-           (resolved (when tn
-                       (namestring (uiop:ensure-directory-pathname tn)))))
-      (when (and resolved (some (lambda (d) (string= resolved d)) *broad-root-deny-list*))
+    ;; Also check after symlink/parent resolution to close bypass attempts.
+    ;; %resolve-with-parent-fallback handles the case where the directory
+    ;; does not yet exist, unlike a bare truename call.
+    (let* ((resolved (%resolve-with-parent-fallback
+                      (uiop:ensure-directory-pathname pathname)))
+           (resolved-ns (namestring (uiop:ensure-directory-pathname resolved))))
+      (when (some (lambda (d) (string= resolved-ns d)) *broad-root-deny-list*)
         (return-from broad-root-p t)))
     nil))
 
 ;;; Path canonicalization ---------------------------------------------------
 
+(defun %resolve-with-parent-fallback (pn)
+  "Return the real (truename-resolved) path for PN, falling back to parent-directory
+resolution when PN does not yet exist.
+
+When PN exists, truename resolves it directly (symlinks followed, D-14).
+When PN does not exist, truename on the parent directory is used so that a
+symlinked parent resolves to its real location before we reconstruct the full
+path.  This closes the nonexistent-leaf escape: a symlink /root/evil ->
+/outside/ causes the parent truename to return /outside/, so
+/root/evil/newfile.txt resolves to /outside/newfile.txt — correctly outside
+the root — instead of the unresolved /root/evil/newfile.txt which passes
+uiop:subpathp against the root.
+
+If even the parent does not exist (new multi-level path with no symlinks) we
+fall back to PN as-is; that is safe because without a real symlink the
+lexical path is already inside the root."
+  (or
+   ;; Primary: file exists — truename resolves it including any symlinks.
+   (handler-case (truename pn) (file-error () nil))
+   ;; Secondary: file does not exist — resolve via the deepest existing ancestor.
+   (let ((parent (uiop:pathname-directory-pathname pn)))
+     (handler-case
+         (let ((resolved-parent (truename parent)))
+           (make-pathname :name     (pathname-name pn)
+                          :type     (pathname-type pn)
+                          :version  (pathname-version pn)
+                          :defaults resolved-parent))
+       ;; Parent also absent (brand-new multi-level path) — keep PN unchanged.
+       (file-error () pn)))))
+
 (defun canonical-path (path session-root)
   "Merge a relative PATH against SESSION-ROOT (absolute paths pass through).
-Returns a pathname. Does not signal on nonexistent paths — truename is guarded."
+Returns a pathname. Does not signal on nonexistent paths — truename is guarded.
+Uses %resolve-with-parent-fallback so that a symlinked parent directory is
+resolved before the containment check (see D-14)."
   (let* ((pn (if (uiop:absolute-pathname-p path)
                  (uiop:ensure-pathname path)
-                 (uiop:merge-pathnames* path session-root)))
-         ;; Pitfall 3 guard: truename signals file-error on nonexistent paths.
-         ;; Use the guarded form; fall back to the un-resolved pathname.
-         (resolved (or (handler-case (truename pn) (file-error () nil)) pn)))
-    resolved))
+                 (uiop:merge-pathnames* path session-root))))
+    (%resolve-with-parent-fallback pn)))
 
 ;;; ASDF source directory enumeration (D-15) --------------------------------
 
@@ -136,12 +171,16 @@ a typed error before calling this function. This function does NOT signal
 on a nil SESSION-ROOT — that would make the contract too implicit.
 
 D-14 ordering: canonicalize with truename FIRST, then check containment.
-A symlink inside the root that resolves outside it returns NIL."
+A symlink inside the root that resolves outside it returns NIL.
+%resolve-with-parent-fallback handles the nonexistent-leaf case: when the
+target file does not yet exist, the parent directory is truename-resolved so
+a symlinked parent cannot bypass the containment check."
   (let* ((pn (if (uiop:absolute-pathname-p path)
                  (uiop:ensure-pathname path)
                  (uiop:merge-pathnames* path session-root)))
-         ;; Resolve symlinks before containment check (D-14)
-         (resolved (or (handler-case (truename pn) (file-error () nil)) pn))
+         ;; Resolve symlinks before containment check (D-14).
+         ;; Use parent-fallback to handle the nonexistent-leaf case (CR-02).
+         (resolved (%resolve-with-parent-fallback pn))
          ;; Normalize directory status after resolution
          (normalized (if (uiop:directory-exists-p resolved)
                          (uiop:ensure-directory-pathname resolved)
@@ -167,14 +206,18 @@ Return NIL when PATH is outside the session root or when SESSION-ROOT is NIL.
 
 D-13: writes are allowed only under the current session root. ASDF source
 dirs are read-only and are deliberately excluded from the write allow-list.
-D-14: truename runs before the containment check."
+D-14: truename runs before the containment check.
+%resolve-with-parent-fallback handles the nonexistent-leaf case (CR-01):
+when the target file does not yet exist, the parent directory is
+truename-resolved so a symlinked parent cannot bypass the write jail."
   (unless session-root
     (return-from ensure-write-path nil))
   (let* ((pn (if (uiop:absolute-pathname-p path)
                  (uiop:ensure-pathname path)
                  (uiop:merge-pathnames* path session-root)))
-         ;; Resolve symlinks before containment check (D-14)
-         (resolved (or (handler-case (truename pn) (file-error () nil)) pn))
+         ;; Resolve symlinks before containment check (D-14).
+         ;; Use parent-fallback to handle the nonexistent-leaf case (CR-01).
+         (resolved (%resolve-with-parent-fallback pn))
          (root-dir (uiop:ensure-directory-pathname session-root))
          (resolved-root (or (handler-case (truename root-dir) (file-error () nil))
                             root-dir)))

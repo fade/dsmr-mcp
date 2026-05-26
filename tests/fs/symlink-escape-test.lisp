@@ -13,7 +13,8 @@
 (defpackage #:dsmr-mcp/tests/fs/symlink-escape-test
   (:use #:cl #:parachute)
   (:import-from #:dsmr-mcp/src/project-root
-                #:allowed-read-path)
+                #:allowed-read-path
+                #:ensure-write-path)
   (:import-from #:dsmr-mcp/tests/support/fs-fixture
                 #:with-temp-project-root
                 #:write-fixture-file
@@ -43,3 +44,58 @@ truename must run before the containment check so the resolved path is tested."
                ;; to the outside file BEFORE the containment check (D-14)
                (false (allowed-read-path (namestring link-pn) root)))))
       (uiop:delete-directory-tree outside-dir :validate t :if-does-not-exist :ignore))))
+
+(define-test symlink-parent-of-new-file-write-rejected
+  "A write to a nonexistent file whose parent directory is a symlink pointing
+outside the session root must be rejected, even though the leaf file does not
+exist and truename on the full path would fail.
+Regression for the nonexistent-leaf write-jail escape."
+  (let* ((outside-dir (%make-temp-directory)))
+    (unwind-protect
+         (with-temp-project-root (_session root)
+           ;; /root/evil -> /outside/  (evil is a directory symlink, not a file symlink)
+           (let ((link-name (namestring (make-pathname :name "evil" :defaults root))))
+             (sb-posix:symlink (namestring outside-dir) link-name)
+             ;; Attempt to write a NEW file under the symlinked directory.
+             ;; newfile.txt does not exist, so truename on the full path fails —
+             ;; the fix must resolve via the parent directory instead.
+             (let* ((target (concatenate 'string link-name "/newfile.txt"))
+                    (result (ensure-write-path target root)))
+               ;; Must return NIL: the real write destination is outside the root.
+               (false result
+                      "ensure-write-path must reject a new file under a symlinked-out-of-root parent"))))
+      (uiop:delete-directory-tree outside-dir :validate t :if-does-not-exist :ignore))))
+
+(define-test symlink-parent-of-new-file-read-rejected
+  "A read of a nonexistent file whose parent directory is a symlink pointing
+outside the session root must be rejected.
+Regression for the nonexistent-leaf read-allow-list escape."
+  (let* ((outside-dir (%make-temp-directory)))
+    (unwind-protect
+         (with-temp-project-root (_session root)
+           ;; /root/evil -> /outside/  (evil is a directory symlink)
+           (let ((link-name (namestring (make-pathname :name "evil" :defaults root))))
+             (sb-posix:symlink (namestring outside-dir) link-name)
+             ;; Attempt to read a nonexistent file under the symlinked directory.
+             (let* ((target (concatenate 'string link-name "/secret.txt"))
+                    (result (allowed-read-path target root)))
+               ;; Must return NIL: the real path resolves outside the root.
+               (false result
+                      "allowed-read-path must reject a nonexistent file under a symlinked-out-of-root parent"))))
+      (uiop:delete-directory-tree outside-dir :validate t :if-does-not-exist :ignore))))
+
+(define-test new-file-under-root-without-symlink-allowed
+  "Writing or reading a new (nonexistent) file at a path that is lexically
+inside the session root and involves no symlinks must remain allowed.
+Ensures the symlink-parent fix does not break the common new-file case."
+  (with-temp-project-root (_session root)
+    ;; A nonexistent file directly under the root
+    (let* ((target (namestring (merge-pathnames "brand-new.lisp" root)))
+           (write-result (ensure-write-path target root))
+           (read-result  (allowed-read-path target root)))
+      (true write-result "ensure-write-path must allow a new file directly under the root")
+      (true read-result  "allowed-read-path must allow a new file directly under the root"))
+    ;; A nonexistent file under a new (also nonexistent) subdirectory
+    (let* ((target (namestring (merge-pathnames "newsubdir/brand-new.lisp" root)))
+           (write-result (ensure-write-path target root)))
+      (true write-result "ensure-write-path must allow a new file in a new subdirectory"))))
