@@ -84,6 +84,45 @@ Regression for the nonexistent-leaf read-allow-list escape."
                       "allowed-read-path must reject a nonexistent file under a symlinked-out-of-root parent"))))
       (uiop:delete-directory-tree outside-dir :validate t :if-does-not-exist :ignore))))
 
+(define-test symlink-parent-of-deeply-nested-new-file-write-rejected
+  "A write to a nonexistent file whose path descends through MULTIPLE
+nonexistent components below a symlinked-out-of-root ancestor must be
+rejected. truename fails on the full path AND on the immediate parent, so
+resolving only the immediate parent leaves the path lexically inside the
+root and the writer's ensure-directories-exist would create the missing
+directories THROUGH the symlink, escaping the jail.
+Regression for the multi-level nonexistent-tail write-jail escape."
+  (let* ((outside-dir (%make-temp-directory)))
+    (unwind-protect
+         (with-temp-project-root (_session root)
+           ;; /root/evil -> /outside/  (evil is a directory symlink)
+           (let ((link-name (namestring (make-pathname :name "evil" :defaults root))))
+             (sb-posix:symlink (namestring outside-dir) link-name)
+             ;; newdir AND newfile.txt both do not exist (two missing levels).
+             (let* ((target (concatenate 'string link-name "/newdir/newfile.txt"))
+                    (result (ensure-write-path target root)))
+               (false result
+                      "ensure-write-path must reject a deeply-nested new file under a symlinked-out-of-root ancestor"))))
+      (uiop:delete-directory-tree outside-dir :validate t :if-does-not-exist :ignore))))
+
+(define-test symlink-parent-of-deeply-nested-new-file-read-rejected
+  "A read of a nonexistent file whose path descends through MULTIPLE
+nonexistent components below a symlinked-out-of-root ancestor must be
+rejected.
+Regression for the multi-level nonexistent-tail read-allow-list escape."
+  (let* ((outside-dir (%make-temp-directory)))
+    (unwind-protect
+         (with-temp-project-root (_session root)
+           ;; /root/evil -> /outside/  (evil is a directory symlink)
+           (let ((link-name (namestring (make-pathname :name "evil" :defaults root))))
+             (sb-posix:symlink (namestring outside-dir) link-name)
+             ;; newdir AND secret.txt both do not exist (two missing levels).
+             (let* ((target (concatenate 'string link-name "/newdir/secret.txt"))
+                    (result (allowed-read-path target root)))
+               (false result
+                      "allowed-read-path must reject a deeply-nested new file under a symlinked-out-of-root ancestor"))))
+      (uiop:delete-directory-tree outside-dir :validate t :if-does-not-exist :ignore))))
+
 (define-test new-file-under-root-without-symlink-allowed
   "Writing or reading a new (nonexistent) file at a path that is lexically
 inside the session root and involves no symlinks must remain allowed.
