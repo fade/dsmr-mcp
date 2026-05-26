@@ -21,6 +21,7 @@
            #:client-info
            #:tool-instances
            #:session-slynk-attach
+           #:session-project-root
            #:make-session
            #:*current-session-id*
            #:*mode*
@@ -64,7 +65,14 @@ get-tool-instance the first time a tool is called.")
     :initform nil
     :documentation "Resolved host:port Slynk-attach config string for
 this session, or NIL. Set by run from the resolved config; read by
-%handle-initialize to eager-connect."))
+%handle-initialize to eager-connect.")
+   (project-root
+    :initarg :project-root
+    :accessor session-project-root
+    :initform nil
+    :documentation "Absolute pathname of this session's project root.
+NIL until fs-set-project-root is called. Never modified by the process CWD;
+changed only via fs-set-project-root. Multi-client safe (D-03)."))
   (:documentation "Holds all per-connection state for one MCP session.
 One session is constructed per transport connection:
   - stdio: one session for the whole process lifetime
@@ -73,18 +81,22 @@ One session is constructed per transport connection:
 The session is threaded through every protocol handler; it is NOT a
 dynamic variable (only *current-session-id* is)."))
 
-(defun make-session (&key (id "stdio") slynk-attach)
+(defun make-session (&key (id "stdio") slynk-attach project-root)
   "Create and return a fresh, uninitialised session with the given ID.
 ID defaults to \"stdio\" (the stdio transport's logical name).
 SLYNK-ATTACH is the resolved host:port config string (or NIL) passed
 through from run's resolved-slynk-attach.
+PROJECT-ROOT is the initial project root pathname (or NIL); can be set
+later via fs-set-project-root.
 The returned session has:
   - initialized-p: NIL
   - protocol-version: NIL
   - client-info: NIL
   - tool-instances: empty equal-keyed hash-table
-  - slynk-attach: SLYNK-ATTACH (NIL when not configured)"
-  (make-instance 'session :id id :slynk-attach slynk-attach))
+  - slynk-attach: SLYNK-ATTACH (NIL when not configured)
+  - project-root: PROJECT-ROOT (NIL when not configured)"
+  (make-instance 'session :id id :slynk-attach slynk-attach
+                          :project-root project-root))
 
 ;;; Session-ID dynamic variable --------------------------------------------
 
