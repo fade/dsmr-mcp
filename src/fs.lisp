@@ -98,12 +98,17 @@ Returns four values:
 (defun write-file-string-atomically (pathname content)
   "Write CONTENT to PATHNAME atomically via tmp-then-rename.
 Parent directories are created if absent.
-The original file is preserved on failure (unwind-protect cleanup)."
+The original file is preserved on failure (unwind-protect cleanup).
+
+The rename-done flag ensures the unwind-protect cleanup only deletes the
+temp file when the rename did not complete.  A post-rename failure (e.g.
+in log-event) cannot delete the now-live destination file."
   (ensure-directories-exist pathname)
   (let ((tmp (make-pathname
               :name (format nil ".~A.tmp" (pathname-name pathname))
               :type (pathname-type pathname)
-              :defaults pathname)))
+              :defaults pathname))
+        (rename-done nil))
     (unwind-protect
          (progn
            (with-open-file (out tmp :direction :output :if-exists :supersede
@@ -111,12 +116,16 @@ The original file is preserved on failure (unwind-protect cleanup)."
              (write-string content out)
              (finish-output out))
            (rename-file tmp pathname)
+           (setf rename-done t)
            (log-event :debug "fs.write.atomic"
                       "path" (namestring pathname)
                       "bytes" (length content))
            t)
-      (when (probe-file tmp)
-        (handler-case (delete-file tmp) (file-error () nil))))))
+      ;; Only clean up the temp file when the rename did not complete.
+      ;; After a successful rename, tmp no longer refers to live data.
+      (unless rename-done
+        (when (probe-file tmp)
+          (handler-case (delete-file tmp) (file-error () nil)))))))
 
 ;;; Directory listing -------------------------------------------------------
 
