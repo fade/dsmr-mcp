@@ -80,7 +80,12 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/hermetic/circuit-breaker-test"
                "dsmr-mcp/tests/hermetic/repl-eval-parity-test"
                "dsmr-mcp/tests/hermetic/inspect-test"
-               "dsmr-mcp/tests/attach/inspect-test")
+               "dsmr-mcp/tests/attach/inspect-test"
+               "dsmr-mcp/tests/support/fs-fixture"
+               "dsmr-mcp/tests/fs/sandbox-test"
+               "dsmr-mcp/tests/fs/symlink-escape-test"
+               "dsmr-mcp/tests/fs/project-root-test"
+               "dsmr-mcp/tests/fs/fs-verbs-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
