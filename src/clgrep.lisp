@@ -33,6 +33,9 @@
                 #:all-matches-as-strings)
   (:import-from #:dsmr-mcp/src/project-root
                 #:allowed-read-path)
+  (:import-from #:dsmr-mcp/src/fs
+                #:read-file-string
+                #:*fs-read-max-bytes*)
   (:import-from #:dsmr-mcp/src/cst
                 #:parse-top-level-forms
                 #:cst-node-kind
@@ -722,21 +725,31 @@ Pass the scan root as session-root for an unrestricted scan."))
           (when allowed-pn
             ;; Per-file guard (Pitfall 8): one bad file must not abort the walk
             (handler-case
-                (let* ((content (uiop/stream:read-file-string allowed-pn))
-                       (file-results
-                        (if form-pattern
-                            ;; Structural mode (D-11): parse CST and match pattern
-                            (%search-file-structural allowed-pn content pattern-tree
-                                                     form-types include-form session-root)
-                            ;; Regex fast path (D-09)
-                            (%search-file-regex allowed-pn content scanner
-                                                form-types include-form))))
-              (dolist (r file-results)
-                (when (and limit (>= count limit))
-                  (setf limited t)
-                  (return-from walk))
-                (push r all-results)
-                (incf count)))
+                ;; Honor *fs-read-max-bytes* like every other read path
+                ;; (T-06-04): a single oversized file in the tree is read
+                ;; only up to the cap, never unbounded.  A truncated file is
+                ;; scanned on its prefix; we log so the partial coverage is
+                ;; visible rather than silent.
+                (multiple-value-bind (content truncated)
+                    (read-file-string allowed-pn)
+                  (when truncated
+                    (log-event :warn "clgrep.file-truncated"
+                               "file" (namestring allowed-pn)
+                               "cap" *fs-read-max-bytes*))
+                  (let ((file-results
+                          (if form-pattern
+                              ;; Structural mode (D-11): parse CST, match pattern
+                              (%search-file-structural allowed-pn content pattern-tree
+                                                       form-types include-form session-root)
+                              ;; Regex fast path (D-09)
+                              (%search-file-regex allowed-pn content scanner
+                                                  form-types include-form))))
+                    (dolist (r file-results)
+                      (when (and limit (>= count limit))
+                        (setf limited t)
+                        (return-from walk))
+                      (push r all-results)
+                      (incf count))))
               (error (e)
                 (log-event :warn "clgrep.file-error"
                            "file" (namestring file)
