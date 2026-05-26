@@ -236,3 +236,32 @@ Regression for the SAFETY-02 bypass when the session-root keyword is omitted."
           (true (search "session-root" (princ-to-string e)))))
       (true errored
             "semantic-grep must signal an error when session-root is NIL"))))
+
+(define-test per-file-read-honors-byte-cap
+  "Each per-file read must respect *fs-read-max-bytes* like every other read
+path (T-06-04 parity): a pattern living only beyond the cap is invisible to
+the scan, while a pattern within the cap is still found.  Regression guard for
+the formerly-uncapped read that bypassed the sandbox's per-file size bound."
+  (with-temp-project-root (_session root)
+    (let* ((prefix  (format nil "(defun early-marker () t)~%"))
+           ;; Blank lines are whitespace, so truncating anywhere inside the pad
+           ;; still leaves a cleanly-parseable prefix form.
+           (pad     (make-string 8192 :initial-element #\Newline))
+           (content (concatenate 'string prefix pad
+                                 (format nil "(defun late-marker () t)~%"))))
+      (write-fixture-file root "big.lisp" content)
+      ;; Cap the read to exactly the prefix: only early-marker is read.
+      (let ((dsmr-mcp/src/fs:*fs-read-max-bytes* (length prefix)))
+        (is = 0 (length (semantic-grep root "late-marker"
+                                       :recursive t :session-root root))
+            "late-marker lives beyond the cap and must not be read")
+        (true (>= (length (semantic-grep root "early-marker"
+                                         :recursive t :session-root root))
+                  1)
+              "early-marker lives within the cap and must still be found"))
+      ;; Under the default cap the whole file is read and late-marker reappears,
+      ;; proving it was only the cap that hid it above.
+      (true (>= (length (semantic-grep root "late-marker"
+                                       :recursive t :session-root root))
+                1)
+            "late-marker must be found once the read cap admits the full file"))))
