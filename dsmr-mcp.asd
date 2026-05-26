@@ -39,6 +39,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/hermetic/worker/main"
                "dsmr-mcp/src/hermetic/pool"
                "dsmr-mcp/src/hermetic/dispatch"
+               "dsmr-mcp/src/project-root"
                "dsmr-mcp/src/tools/inspect-object"
                "dsmr-mcp/src/tools/pool-status"
                "dsmr-mcp/src/tools/pool-kill-worker")
