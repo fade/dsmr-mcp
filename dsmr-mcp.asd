@@ -46,7 +46,9 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/lisp-read-file"
                "dsmr-mcp/src/parinfer"
                "dsmr-mcp/src/lisp-edit-form-core"
+               "dsmr-mcp/src/lisp-edit-form"
                "dsmr-mcp/src/tools/lisp-read-file"
+               "dsmr-mcp/src/tools/lisp-edit-form"
                "dsmr-mcp/src/tools/fs-set-project-root"
                "dsmr-mcp/src/tools/fs-get-project-info"
                "dsmr-mcp/src/tools/fs-read-file"
@@ -92,7 +94,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/fs/symlink-escape-test"
                "dsmr-mcp/tests/fs/project-root-test"
                "dsmr-mcp/tests/fs/fs-verbs-test"
-               "dsmr-mcp/tests/fs/lisp-read-file-test")
+               "dsmr-mcp/tests/fs/lisp-read-file-test"
+               "dsmr-mcp/tests/lisp-edit-form-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
