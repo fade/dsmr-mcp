@@ -27,7 +27,8 @@
                 #:symbol-is-not-external)
   (:export #:call-with-lenient-packages
            #:call-with-file-package-context
-           #:*homeless-due-to-teardown*))
+           #:*homeless-due-to-teardown*
+           #:extract-in-package-name-from-text))
 
 (in-package #:dsmr-mcp/src/package-context)
 
@@ -268,6 +269,11 @@ Returns a SYNTHESIZED-CONTEXT, or NIL if pkg-name is NIL or already loaded."
         (when (and name (find-package name))
           (%record-homeless-on-teardown pkg)
           (ignore-errors (delete-package pkg)))))))
+
+(defun extract-in-package-name-from-text (text)
+  "Return the package name named by the first IN-PACKAGE form in TEXT, or NIL.
+Delegates to %extract-in-package-name.  Exported for use by edit-form modules."
+  (%extract-in-package-name text))
 
 (defun call-with-file-package-context (file-text thunk)
   "Extract the IN-PACKAGE name from FILE-TEXT and call THUNK with *PACKAGE*
