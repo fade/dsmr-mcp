@@ -166,3 +166,35 @@ rather than crashing (D-16 no-root guard)."
          (res     (gethash "result" resp)))
     (true (gethash "isError" res))
     (is string= "project-root-not-set" (gethash "error_type" res))))
+
+(define-test patch-validation-accepts-absent-package-symbols
+  "Structural validation of a patched form must not reject forms that contain
+package-qualified symbols from packages absent in the dispatcher image.
+call-with-lenient-packages must be active during the read-from-string call
+so that dsmr-mcp/src/cst::some-fn or similar qualified symbols do not produce
+a false patch-operation-error."
+  (with-temp-project-root (session root)
+    (let* ((source "(defun foo (x)
+  (format t \"hello ~A\" x))
+")
+           (pn (write-fixture-file root "test.lisp" source))
+           (error-signalled nil))
+      ;; Patch the body to contain a fully-qualified symbol from a package
+      ;; that is not in the current image.  If %validate-form-parseable is not
+      ;; wrapped in call-with-lenient-packages, this would incorrectly signal
+      ;; patch-operation-error with "package does not exist".
+      (handler-case
+          (patch-form (namestring root) (namestring pn)
+                      "defun" "foo"
+                      "(format t \"hello ~A\" x)"
+                      "(nonexistent-pkg::do-thing x)"
+                      :dry-run t)
+        (patch-operation-error (e)
+          (setf error-signalled t)
+          ;; Log the reason for debugging if this unexpectedly fails
+          (format *test-debug-output* "unexpected patch error: ~A~%"
+                  (patch-operation-reason e))))
+      ;; The dry-run must succeed: lenient packages means absent-package
+      ;; symbols are read without signalling.
+      (false error-signalled
+             "patch validation must not reject a form with absent-package qualified symbols"))))
