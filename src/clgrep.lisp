@@ -683,10 +683,19 @@ Keyword arguments:
   INCLUDE-FORM     -- include full form text in results (default: nil)
   LIMIT            -- max results to return (nil = unlimited)
   FORM-PATTERN     -- optional form-shape pattern string (D-11 structural mode)
-  SESSION-ROOT     -- session project root for allowed-read-path checks (SAFETY-02)
+  SESSION-ROOT     -- session project root for allowed-read-path checks (SAFETY-02).
+                      Must be non-NIL; passing NIL signals an error so the sandbox
+                      cannot be bypassed by omitting this argument.
 
 Returns (values results limited-p) where RESULTS is a list of alists and
 LIMITED-P is T when the result set was truncated by LIMIT."
+  ;; SAFETY-02: session-root is mandatory — fail closed rather than open.
+  ;; An absent session-root would allow reading any file in ROOT without sandbox
+  ;; validation.  Callers that legitimately need an unrestricted scan should
+  ;; pass the root itself as session-root.
+  (unless session-root
+    (error "semantic-grep requires a non-NIL session-root for sandbox enforcement (SAFETY-02). ~
+Pass the scan root as session-root for an unrestricted scan."))
   ;; Validate / compile the regex pattern up-front (fast-path only)
   (let ((scanner (when (null form-pattern)
                    (handler-case
@@ -707,10 +716,9 @@ LIMITED-P is T when the result set was truncated by LIMIT."
         (when (and limit (>= count limit))
           (setf limited t)
           (return-from walk))
-        ;; Sandbox check: only read files in the allow-list (SAFETY-02)
-        (let ((allowed-pn (if session-root
-                              (allowed-read-path file session-root)
-                              file)))
+        ;; Sandbox check: only read files in the allow-list (SAFETY-02).
+        ;; session-root is guaranteed non-NIL by the guard above.
+        (let ((allowed-pn (allowed-read-path file session-root)))
           (when allowed-pn
             ;; Per-file guard (Pitfall 8): one bad file must not abort the walk
             (handler-case
@@ -723,12 +731,12 @@ LIMITED-P is T when the result set was truncated by LIMIT."
                             ;; Regex fast path (D-09)
                             (%search-file-regex allowed-pn content scanner
                                                 form-types include-form))))
-                  (dolist (r file-results)
-                    (when (and limit (>= count limit))
-                      (setf limited t)
-                      (return-from walk))
-                    (push r all-results)
-                    (incf count)))
+              (dolist (r file-results)
+                (when (and limit (>= count limit))
+                  (setf limited t)
+                  (return-from walk))
+                (push r all-results)
+                (incf count)))
               (error (e)
                 (log-event :warn "clgrep.file-error"
                            "file" (namestring file)
