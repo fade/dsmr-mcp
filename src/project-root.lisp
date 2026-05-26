@@ -108,34 +108,60 @@ candidate root is still resolved before the deny-list check (CR-03)."
 ;;; Path canonicalization ---------------------------------------------------
 
 (defun %resolve-with-parent-fallback (pn)
-  "Return the real (truename-resolved) path for PN, falling back to parent-directory
-resolution when PN does not yet exist.
+  "Return the real (truename-resolved) path for PN, falling back to
+ancestor-directory resolution when PN does not yet exist.
 
 When PN exists, truename resolves it directly (symlinks followed, D-14).
-When PN does not exist, truename on the parent directory is used so that a
-symlinked parent resolves to its real location before we reconstruct the full
-path.  This closes the nonexistent-leaf escape: a symlink /root/evil ->
-/outside/ causes the parent truename to return /outside/, so
-/root/evil/newfile.txt resolves to /outside/newfile.txt — correctly outside
-the root — instead of the unresolved /root/evil/newfile.txt which passes
-uiop:subpathp against the root.
 
-If even the parent does not exist (new multi-level path with no symlinks) we
-fall back to PN as-is; that is safe because without a real symlink the
-lexical path is already inside the root."
+When PN does not exist, we walk UP the directory components to the DEEPEST
+EXISTING ANCESTOR, truename THAT ancestor (following any symlink in the
+existing portion), and reattach ALL the stripped nonexistent tail components
+plus the leaf name/type onto the resolved ancestor. This closes the
+nonexistent-leaf escape regardless of how many path levels are missing.
+
+A symlink /root/evil -> /outside/ causes /root/evil/newdir/newfile to resolve
+to /outside/newdir/newfile — correctly outside the root — even though both
+newdir and newfile are absent and truename on the full path (and on the
+immediate parent) would fail. The writer's ensure-directories-exist would
+otherwise create newdir THROUGH the symlink and escape the jail.
+
+If no ancestor exists at all (e.g. an absolute path on a nonexistent volume),
+we keep PN as-is; that is safe because without a real symlink the lexical
+path carries no resolution to follow. Reconstruction preserves the
+absolute/relative status of PN so a nonexistent path never silently becomes
+relative."
   (or
    ;; Primary: file exists — truename resolves it including any symlinks.
    (handler-case (truename pn) (file-error () nil))
-   ;; Secondary: file does not exist — resolve via the deepest existing ancestor.
-   (let ((parent (uiop:pathname-directory-pathname pn)))
-     (handler-case
-         (let ((resolved-parent (truename parent)))
-           (make-pathname :name     (pathname-name pn)
-                          :type     (pathname-type pn)
-                          :version  (pathname-version pn)
-                          :defaults resolved-parent))
-       ;; Parent also absent (brand-new multi-level path) — keep PN unchanged.
-       (file-error () pn)))))
+   ;; Secondary: file does not exist — resolve via the deepest existing
+   ;; ancestor directory and reattach the missing tail components.
+   (let* ((dir (pathname-directory pn))
+          (absolute (eq (first dir) :absolute))
+          (components (rest dir))
+          ;; Tail directory components stripped while walking up, in path order.
+          (tail '()))
+     (labels ((directory-pathname-for (head)
+                (make-pathname
+                 :directory (cons (if absolute :absolute :relative) head)
+                 :name nil :type nil :version nil
+                 :defaults pn)))
+       (loop with head = (copy-list components)
+             for existing = (handler-case (truename (directory-pathname-for head))
+                              (file-error () nil))
+             when existing
+               ;; Reattach stripped dirs + leaf onto the resolved ancestor.
+               do (return
+                    (make-pathname
+                     :directory (append (pathname-directory existing) tail)
+                     :name (pathname-name pn)
+                     :type (pathname-type pn)
+                     :version (pathname-version pn)
+                     :defaults existing))
+             ;; No ancestor exists at all — keep PN unchanged (no symlink to follow).
+             when (null head)
+               do (return pn)
+             do (push (car (last head)) tail)
+                (setf head (butlast head)))))))
 
 (defun canonical-path (path session-root)
   "Merge a relative PATH against SESSION-ROOT (absolute paths pass through).
