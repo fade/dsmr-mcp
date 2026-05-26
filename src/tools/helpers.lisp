@@ -77,8 +77,12 @@ a JSON Schema object. Called at tools/list time on the class-allocated
 :input-schema literal.
 
 Supported schema forms:
-  :string | :integer | :number | :boolean | :null
+  :string | :integer | :number | :boolean | :null | :array | :object
     -> {\"type\": \"<name>\"}
+    The bare :array / :object keywords emit an unconstrained array/object
+    schema (no \"items\"/\"properties\"). Use the compound forms below when
+    the item or property shapes need to be declared. The bare keywords are
+    accepted here so a property :type matches the set validate-args checks.
 
   (:object :properties ((NAME &key type description enum) ...) :required (...))
     -> {\"type\":\"object\",\"properties\":{...},\"required\":[...]}
@@ -97,7 +101,9 @@ a JSON array. An empty required list becomes #(), not nil/null."
        (:integer (make-ht "type" "integer"))
        (:number  (make-ht "type" "number"))
        (:boolean (make-ht "type" "boolean"))
-       (:null    (make-ht "type" "null"))))
+       (:null    (make-ht "type" "null"))
+       (:array   (make-ht "type" "array"))
+       (:object  (make-ht "type" "object"))))
     (cons
      (case (car schema)
        (:object
