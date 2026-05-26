@@ -218,3 +218,21 @@
     (is equal t (gethash "isError" (gethash "result" result)))
     (is equal "project-root-not-set"
         (gethash "error_type" (gethash "result" result)))))
+
+(define-test nil-session-root-signals-error
+  "semantic-grep must signal an error when session-root is NIL rather than
+silently reading all files in the walk root without sandbox validation.
+Regression for the SAFETY-02 bypass when the session-root keyword is omitted."
+  (with-temp-project-root (_session root)
+    (write-fixture-file root "sample.lisp"
+      "(defun something () t)")
+    ;; Calling without session-root must signal an error — not return results
+    (let ((errored nil))
+      (handler-case
+          (semantic-grep root "something")
+        (error (e)
+          (setf errored t)
+          ;; The error message should mention session-root
+          (true (search "session-root" (princ-to-string e)))))
+      (true errored
+            "semantic-grep must signal an error when session-root is NIL"))))
