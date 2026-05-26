@@ -89,7 +89,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/fs/sandbox-test"
                "dsmr-mcp/tests/fs/symlink-escape-test"
                "dsmr-mcp/tests/fs/project-root-test"
-               "dsmr-mcp/tests/fs/fs-verbs-test")
+               "dsmr-mcp/tests/fs/fs-verbs-test"
+               "dsmr-mcp/tests/fs/lisp-read-file-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
