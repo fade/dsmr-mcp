@@ -80,7 +80,11 @@ Returns four values:
            (buf       (make-string capped))
            (count     (read-sequence buf in :end capped))
            (text      (subseq buf 0 count))
-           (truncated (and raw-len (> (- raw-len (or offset 0)) capped))))
+           ;; Truncated iff the effective requested amount was itself capped by
+           ;; *fs-read-max-bytes* (i.e. the file/remaining exceeds the cap).
+           ;; A user-supplied limit that happens to be less than file-length
+           ;; is NOT truncation — the user asked for that much.
+           (truncated (and raw-len (> effective capped))))
       (log-event :debug "fs.read"
                  "path" (namestring pathname)
                  "offset" offset
