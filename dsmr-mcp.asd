@@ -59,6 +59,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/tools/fs-read-file"
                "dsmr-mcp/src/tools/fs-write-file"
                "dsmr-mcp/src/tools/fs-list-directory"
+               "dsmr-mcp/src/tools/clgrep-search"
                "dsmr-mcp/src/tools/inspect-object"
                "dsmr-mcp/src/tools/pool-status"
                "dsmr-mcp/src/tools/pool-kill-worker")
@@ -102,7 +103,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/fs/lisp-read-file-test"
                "dsmr-mcp/tests/lisp-edit-form-test"
                "dsmr-mcp/tests/lisp-patch-form-test"
-               "dsmr-mcp/tests/validate-test")
+               "dsmr-mcp/tests/validate-test"
+               "dsmr-mcp/tests/clgrep-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
