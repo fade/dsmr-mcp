@@ -50,6 +50,29 @@
   (:use #:cl #:parachute))
 
 ;;; ---------------------------------------------------------------------------
+;;; File-defined failing test in the scratch package
+;;;
+;;; This test is a TOP-LEVEL definition compiled with the file, so Parachute
+;;; can record its source location via sb-introspect. Its deliberate failure
+;;; lets the source-location code path be exercised by the assertion in
+;;; run-tests-reports-source-location-for-failure below.
+;;;
+;;; The test lives in the scratch package so it never pollutes the project's
+;;; own suite counts.
+;;; ---------------------------------------------------------------------------
+
+(in-package #:dsmr-scratch-runner-tests)
+
+(parachute:define-test scratch-file-defined-failing-test-for-source
+  :defun t
+  "A deliberately failing test whose definition is compiled from this file.
+Parachute records the source location so the run-tests extractor can populate
+the source{file,line} fields in the failure detail."
+  (parachute:true nil))
+
+(in-package #:dsmr-mcp/tests/code-intelligence/run-tests-test)
+
+;;; ---------------------------------------------------------------------------
 ;;; detect-framework-prefers-asdf-deps
 ;;;
 ;;; ASDF :depends-on closure walk must take precedence over the
@@ -130,6 +153,68 @@ Exercises the uniform envelope and criterion 3 source-location reporting."
             (true (stringp (gethash "test_name" first-failure))))))
       ;; Clean up scratch tests after the test.
       (when remove-fn (ignore-errors (funcall remove-fn scratch-pkg))))))
+
+(define-test run-tests-reports-source-location-for-failure
+  "The Parachute extractor populates source{file,line} in a failed_tests entry
+when the failing test is defined in a real source file (not eval'd at runtime).
+The file-defined scratch test at the top of this file is compiled with :defun t
+so sb-introspect can locate its source."
+  (let* ((parachute-pkg (find-package :org.shirakumo.parachute))
+         (scratch-pkg (find-package :dsmr-scratch-runner-tests)))
+    (true (and parachute-pkg scratch-pkg))
+    (when (and parachute-pkg scratch-pkg)
+      ;; Ensure the file-defined test is registered.  A prior test's cleanup
+      ;; may have called remove-all-tests-in-package on the scratch package.
+      ;; Re-register using the symbol interned in scratch-pkg (not CL-USER) so
+      ;; %test-source-location can find the defun compiled from this file.
+      (let* ((ensure-fn (find-symbol "ENSURE-TEST" parachute-pkg))
+             (setf-find-fn (fdefinition
+                             `(setf ,(find-symbol "FIND-TEST" parachute-pkg))))
+             (test-sym (intern "SCRATCH-FILE-DEFINED-FAILING-TEST-FOR-SOURCE" scratch-pkg)))
+        (when (and ensure-fn setf-find-fn)
+          (let ((test-obj (funcall (fdefinition ensure-fn)
+                                   'parachute:test
+                                   :name test-sym
+                                   :home scratch-pkg
+                                   :tests (list (lambda () (parachute:true nil))))))
+            (funcall setf-find-fn test-obj test-sym scratch-pkg))))
+      ;; Run the scratch suite (reload=nil: the test is registered in-image).
+      (let ((result (run-tests "dsmr-scratch-runner-tests"
+                               :framework "parachute"
+                               :reload nil)))
+        (true (hash-table-p result))
+        (let ((failed-tests (gethash "failed_tests" result)))
+          (true (or (vectorp failed-tests) (listp failed-tests)))
+          ;; Locate the failed_tests entry whose test_name matches the file-defined test.
+          (let ((file-defined-entry
+                  (loop for i from 0 below (length failed-tests)
+                        for entry = (if (vectorp failed-tests)
+                                        (aref failed-tests i)
+                                        (nth i failed-tests))
+                        when (and (hash-table-p entry)
+                                  (string= (string-upcase
+                                            (gethash "test_name" entry ""))
+                                           "SCRATCH-FILE-DEFINED-FAILING-TEST-FOR-SOURCE"))
+                        return entry)))
+            ;; The entry must exist.
+            (true (hash-table-p file-defined-entry))
+            (when (hash-table-p file-defined-entry)
+              ;; "source" must be a non-nil hash-table.
+              (let ((source (gethash "source" file-defined-entry)))
+                (true (hash-table-p source))
+                (when (hash-table-p source)
+                  ;; "file" must be a non-empty string.
+                  (let ((file-val (gethash "file" source)))
+                    (true (stringp file-val))
+                    (true (plusp (length file-val))))
+                  ;; "line" must be a positive integer.
+                  (let ((line-val (gethash "line" source)))
+                    (true (integerp line-val))
+                    (true (plusp line-val))))))))
+        ;; Clean up scratch tests after the assertion.
+        (let ((remove-fn (find-symbol "REMOVE-ALL-TESTS-IN-PACKAGE" parachute-pkg)))
+          (when remove-fn
+            (ignore-errors (funcall remove-fn scratch-pkg))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; run-tests-ghost-purge-drops-deleted-test
