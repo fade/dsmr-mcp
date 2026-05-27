@@ -1215,7 +1215,11 @@ Returns one of:
                                (,s-pending (gethash "pending"     ,s-result 0))
                                (,s-dur     (gethash "duration_ms" ,s-result 0))
                                (,s-fw      (gethash "framework"   ,s-result "unknown"))
-                               (,s-fails   (gethash "failed_tests" ,s-result #())))
+                               ;; (vector) not #(): this form crosses the Slynk wire, whose
+                               ;; SWANK->SLYNK translating reader cannot read the #( dispatch
+                               ;; and corrupts the message. (vector) is an empty-vector
+                               ;; constructor in plain list syntax that survives the wire.
+                               (,s-fails   (gethash "failed_tests" ,s-result (vector))))
                            (list :ok
                                  (list :passed  ,s-passed
                                        :failed  ,s-failed
