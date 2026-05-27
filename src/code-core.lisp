@@ -706,16 +706,23 @@ Uses CL-USER symbol hygiene; no loop; coerces all strings."
                                  (do ()
                                      ((>= ,s-i ,s-limit))
                                    (let ((,s-ch (char ,s-content ,s-i)))
+                                     ;; Char literals are spelled (code-char N) because
+                                     ;; this form crosses the Slynk wire: the SWANK->SLYNK
+                                     ;; translating reader strips the backslash in #\X
+                                     ;; (turning #\Space into the unreadable token #Space),
+                                     ;; corrupting the message. (code-char N) is plain list
+                                     ;; syntax that survives the wire and is portable on the
+                                     ;; target image. 32=Space 9=Tab 10=Newline 13=Return 59=#\;
                                      (cond
-                                       ((or (char= ,s-ch #\Space) (char= ,s-ch #\Tab)
-                                            (char= ,s-ch #\Newline) (char= ,s-ch #\Return))
+                                       ((or (char= ,s-ch (code-char 32)) (char= ,s-ch (code-char 9))
+                                            (char= ,s-ch (code-char 10)) (char= ,s-ch (code-char 13)))
                                         (incf ,s-i))
-                                       ((char= ,s-ch #\;)
-                                        (let ((,s-nl (position #\Newline ,s-content
+                                       ((char= ,s-ch (code-char 59))
+                                        (let ((,s-nl (position (code-char 10) ,s-content
                                                                :start ,s-i :end ,s-limit)))
                                           (setf ,s-i (if ,s-nl (1+ ,s-nl) ,s-limit))))
                                        (t (return)))))
-                                 (1+ (count #\Newline ,s-content
+                                 (1+ (count (code-char 10) ,s-content
                                             :end (min ,s-i ,s-len)))))))
                          ;; Relativize path when root-namestring is baked in.
                          (,s-path
@@ -854,17 +861,21 @@ or a typed not-found plist. Uses CL-USER symbol hygiene; no loop; coerces string
                                        (do ()
                                            ((>= ,s-i ,s-limit))
                                          (let ((,s-ch (char ,s-content ,s-i)))
+                                           ;; (code-char N) not #\X: this form crosses the
+                                           ;; Slynk wire, whose SWANK->SLYNK translating reader
+                                           ;; strips the backslash in #\X and corrupts the
+                                           ;; message. 32=Space 9=Tab 10=Newline 13=Return 59=#\;
                                            (cond
-                                             ((or (char= ,s-ch #\Space) (char= ,s-ch #\Tab)
-                                                  (char= ,s-ch #\Newline) (char= ,s-ch #\Return))
+                                             ((or (char= ,s-ch (code-char 32)) (char= ,s-ch (code-char 9))
+                                                  (char= ,s-ch (code-char 10)) (char= ,s-ch (code-char 13)))
                                               (incf ,s-i))
-                                             ((char= ,s-ch #\;)
+                                             ((char= ,s-ch (code-char 59))
                                               (let ((,s-nl
-                                                      (position #\Newline ,s-content
+                                                      (position (code-char 10) ,s-content
                                                                 :start ,s-i :end ,s-limit)))
                                                 (setf ,s-i (if ,s-nl (1+ ,s-nl) ,s-limit))))
                                              (t (return)))))
-                                       (1+ (count #\Newline ,s-content
+                                       (1+ (count (code-char 10) ,s-content
                                                   :end (min ,s-i ,s-len)))))))
                                ;; Relativize path when root-namestring is baked in.
                                (,s-path
