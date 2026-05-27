@@ -122,10 +122,12 @@ RAW is either:
      (make-ht "isError" t
               "error_type" "symbol-not-found"
               "content" (text-content "Symbol not found in image.")))
-    ;; Typed not-found marker: plist with :not-found keyword.
-    ((and (listp raw) (getf raw :not-found))
+    ;; Typed not-found marker: outer list starts with :not-found keyword.
+    ;; (car raw) is :not-found, :package, or :symbol — a keyword at the
+    ;; top level of the outer list, not inside an inner plist.
+    ((and (listp raw) (eq (car raw) :not-found))
      (%decode-not-found raw))
-    ;; Success: list of location plists.
+    ;; Success: list of location plists — (car raw) is a cons (:path ...).
     ((and (listp raw) (listp (car raw)))
      (let* ((locs (mapcar (lambda (loc)
                             (make-ht "path" (or (getf loc :path) "")

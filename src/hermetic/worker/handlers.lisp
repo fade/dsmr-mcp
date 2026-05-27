@@ -163,6 +163,21 @@ result envelope before sending to the dispatcher."
              (vector (make-ht "type" "text"
                               "text" (format nil "~@[~A: ~]~A" name hint))))))
 
+(defun %not-found-marker-p (result)
+  "Return T when RESULT is a typed not-found marker plist from code-core.
+Not-found markers start with :not-found as the first plist key (a keyword at
+position 0 of the outer list). Location lists are lists-of-plists where the
+first element is a cons (:path ...), not a keyword. This lets the handlers
+distinguish the two without calling getf on a list-of-plists, which would
+signal a malformed-property-list error."
+  (and (consp result)
+       (eq (car result) :not-found)))
+
+(defun %describe-result-p (result)
+  "Return T when RESULT is a successful code-describe plist (starts with :name)."
+  (and (consp result)
+       (eq (car result) :name)))
+
 (defun %handle-code-find (params registry)
   "Worker handler for code-find: calls code-core in-process inside a timeout.
 Reads \"symbol\" (required) and \"package\" (optional) from PARAMS.
@@ -176,8 +191,8 @@ Returns the locations wire envelope or a typed not-found isError."
         (sb-ext:with-timeout 30
           (let ((result (code-find-definition symbol-name :package package-name)))
             (cond
-              ;; Typed not-found marker.
-              ((and (listp result) (getf result :not-found))
+              ;; Typed not-found marker: outer list starts with :not-found.
+              ((%not-found-marker-p result)
                (%build-not-found-response result))
               ;; Location list (may be empty — treat as symbol-not-found when empty).
               ((null result)
@@ -221,11 +236,11 @@ Returns the describe wire envelope or a typed not-found isError."
         (sb-ext:with-timeout 30
           (let ((result (code-describe-symbol symbol-name :package package-name)))
             (cond
-              ;; Typed not-found marker.
-              ((and (listp result) (getf result :not-found))
+              ;; Typed not-found marker: outer list starts with :not-found.
+              ((%not-found-marker-p result)
                (%build-not-found-response result))
-              ;; Describe plist.
-              ((and (listp result) (getf result :name))
+              ;; Describe plist: starts with :name.
+              ((%describe-result-p result)
                (make-ht "name"    (or (getf result :name)    "")
                         "type"    (or (getf result :type)    "")
                         "arglist" (or (getf result :arglist) "()")
@@ -270,8 +285,8 @@ project_only defaults to true. Returns the references wire envelope or a typed e
                                                                  (plusp (length relation))
                                                                  relation))))
             (cond
-              ;; Typed not-found marker.
-              ((and (listp result) (getf result :not-found))
+              ;; Typed not-found marker: outer list starts with :not-found.
+              ((%not-found-marker-p result)
                (%build-not-found-response result))
               ;; NIL or list of reference plists.
               (t

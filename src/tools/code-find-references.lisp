@@ -108,8 +108,8 @@ RAW is either:
   - a plist with :not-found key (typed error)
   - NIL (empty result — no references found, not an error)"
   (cond
-    ;; Typed not-found marker (package-not-found or symbol-not-found).
-    ((and (listp raw) (getf raw :not-found))
+    ;; Typed not-found marker: outer list starts with :not-found keyword.
+    ((and (listp raw) (eq (car raw) :not-found))
      (let* ((kind  (getf raw :not-found))
             (name  (getf raw :name))
             (hint  (getf raw :hint))

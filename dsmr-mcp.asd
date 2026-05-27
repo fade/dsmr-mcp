@@ -109,7 +109,10 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/lisp-patch-form-test"
                "dsmr-mcp/tests/validate-test"
                "dsmr-mcp/tests/clgrep-test"
-               "dsmr-mcp/tests/code-intelligence/code-core-test")
+               "dsmr-mcp/tests/code-intelligence/code-core-test"
+               "dsmr-mcp/tests/code-intelligence/code-find-test"
+               "dsmr-mcp/tests/code-intelligence/code-describe-test"
+               "dsmr-mcp/tests/code-intelligence/code-find-refs-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
