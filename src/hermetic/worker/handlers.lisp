@@ -30,6 +30,13 @@
   (:import-from #:dsmr-mcp/src/hermetic/worker/registry
                 #:register-object
                 #:inspectable-p)
+  (:import-from #:dsmr-mcp/src/code-core
+                #:code-find-definition
+                #:code-describe-symbol
+                #:code-find-references)
+  (:import-from #:dsmr-mcp/src/tools/helpers
+                #:make-ht
+                #:text-content)
   (:import-from #:dsmr-mcp/src/log #:log-event)
   (:import-from #:sb-ext)
   (:import-from #:uiop)
@@ -132,6 +139,157 @@ result envelope before sending to the dispatcher."
       response)))
 
 ;;; ---------------------------------------------------------------------------
+;;; Code-intelligence handlers (worker/code-find, /code-describe, /code-find-references)
+;;;
+;;; Each handler reads its arguments from the params hash-table, validates the
+;;; required "symbol" arg, wraps the in-process code-core call in
+;;; sb-ext:with-timeout, and builds the same wire envelope the attached path
+;;; produces. The worker survives a timeout — the condition is caught and a
+;;; structured TIMEOUT isError is returned.
+;;; ---------------------------------------------------------------------------
+
+(defun %build-not-found-response (marker)
+  "Convert a typed not-found marker plist from code-core into a wire envelope."
+  (let* ((kind  (getf marker :not-found))
+         (name  (getf marker :name))
+         (hint  (getf marker :hint))
+         (etype (ecase kind
+                  (:package  "package-not-found")
+                  (:symbol   "symbol-not-found")
+                  (:source-location "found-but-no-source-location"))))
+    (make-ht "isError"    t
+             "error_type" etype
+             "content"
+             (vector (make-ht "type" "text"
+                              "text" (format nil "~@[~A: ~]~A" name hint))))))
+
+(defun %handle-code-find (params registry)
+  "Worker handler for code-find: calls code-core in-process inside a timeout.
+Reads \"symbol\" (required) and \"package\" (optional) from PARAMS.
+Returns the locations wire envelope or a typed not-found isError."
+  (declare (ignore registry))
+  (let* ((symbol-name  (gethash "symbol"  params))
+         (package-name (gethash "package" params)))
+    (unless (and (stringp symbol-name) (plusp (length symbol-name)))
+      (error "symbol is required"))
+    (handler-case
+        (sb-ext:with-timeout 30
+          (let ((result (code-find-definition symbol-name :package package-name)))
+            (cond
+              ;; Typed not-found marker.
+              ((and (listp result) (getf result :not-found))
+               (%build-not-found-response result))
+              ;; Location list (may be empty — treat as symbol-not-found when empty).
+              ((null result)
+               (make-ht "isError"    t
+                        "error_type" "symbol-not-found"
+                        "content"
+                        (vector (make-ht "type" "text"
+                                         "text"
+                                         (format nil "Symbol ~S not found in image. \
+Try load-system first, or clgrep-search for text search." symbol-name)))))
+              ((listp result)
+               (let ((locs (mapcar (lambda (loc)
+                                     (make-ht "path" (or (getf loc :path) "")
+                                              "line" (or (getf loc :line) 0)
+                                              "kind" (or (getf loc :kind) "")))
+                                   result)))
+                 (make-ht "locations" (coerce locs 'simple-vector))))
+              (t
+               (make-ht "isError"    t
+                        "error_type" "symbol-not-found"
+                        "content"
+                        (vector (make-ht "type" "text"
+                                         "text" "Unexpected result from code-find.")))))))
+      (sb-ext:timeout ()
+        (make-ht "isError"    t
+                 "error_type" "TIMEOUT"
+                 "content"
+                 (vector (make-ht "type" "text"
+                                  "text" "code-find timed out (30s)")))))))
+
+(defun %handle-code-describe (params registry)
+  "Worker handler for code-describe: calls code-core in-process inside a timeout.
+Reads \"symbol\" (required) and \"package\" (optional) from PARAMS.
+Returns the describe wire envelope or a typed not-found isError."
+  (declare (ignore registry))
+  (let* ((symbol-name  (gethash "symbol"  params))
+         (package-name (gethash "package" params)))
+    (unless (and (stringp symbol-name) (plusp (length symbol-name)))
+      (error "symbol is required"))
+    (handler-case
+        (sb-ext:with-timeout 30
+          (let ((result (code-describe-symbol symbol-name :package package-name)))
+            (cond
+              ;; Typed not-found marker.
+              ((and (listp result) (getf result :not-found))
+               (%build-not-found-response result))
+              ;; Describe plist.
+              ((and (listp result) (getf result :name))
+               (make-ht "name"    (or (getf result :name)    "")
+                        "type"    (or (getf result :type)    "")
+                        "arglist" (or (getf result :arglist) "()")
+                        "doc"     (or (getf result :doc)     "")
+                        "path"    (or (getf result :path)    "")
+                        "line"    (or (getf result :line)    0)))
+              (t
+               (make-ht "isError"    t
+                        "error_type" "symbol-not-found"
+                        "content"
+                        (vector (make-ht "type" "text"
+                                         "text"
+                                         (format nil "Symbol ~S not found. \
+Try load-system first, or clgrep-search for text search." symbol-name))))))))
+      (sb-ext:timeout ()
+        (make-ht "isError"    t
+                 "error_type" "TIMEOUT"
+                 "content"
+                 (vector (make-ht "type" "text"
+                                  "text" "code-describe timed out (30s)")))))))
+
+(defun %handle-code-find-references (params registry)
+  "Worker handler for code-find-references: calls code-core in-process inside a timeout.
+Reads \"symbol\" (required), \"package\", \"project_only\", and \"relation\" from PARAMS.
+project_only defaults to true. Returns the references wire envelope or a typed error."
+  (declare (ignore registry))
+  (let* ((symbol-name  (gethash "symbol"  params))
+         (package-name (gethash "package" params))
+         ;; project_only defaults to true when key is absent.
+         (project-only (multiple-value-bind (val presentp)
+                           (gethash "project_only" params)
+                         (if presentp val t)))
+         (relation     (gethash "relation" params)))
+    (unless (and (stringp symbol-name) (plusp (length symbol-name)))
+      (error "symbol is required"))
+    (handler-case
+        (sb-ext:with-timeout 30
+          (let ((result (code-find-references symbol-name
+                                              :package      package-name
+                                              :project-only project-only
+                                              :relation     (and (stringp relation)
+                                                                 (plusp (length relation))
+                                                                 relation))))
+            (cond
+              ;; Typed not-found marker.
+              ((and (listp result) (getf result :not-found))
+               (%build-not-found-response result))
+              ;; NIL or list of reference plists.
+              (t
+               (let ((refs (mapcar (lambda (ref)
+                                     (make-ht "path"     (or (getf ref :path)     "")
+                                              "line"     (or (getf ref :line)     0)
+                                              "caller"   (or (getf ref :caller)   "")
+                                              "relation" (or (getf ref :relation) "")))
+                                   (or result '()))))
+                 (make-ht "references" (coerce refs 'simple-vector)))))))
+      (sb-ext:timeout ()
+        (make-ht "isError"    t
+                 "error_type" "TIMEOUT"
+                 "content"
+                 (vector (make-ht "type" "text"
+                                  "text" "code-find-references timed out (30s)")))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Public API
 ;;; ---------------------------------------------------------------------------
 
@@ -156,11 +314,20 @@ REGISTRY is the per-worker object-registry instance; it is closed over by
 the handler lambdas so each call shares the same per-process registry.
 
 Registered methods:
-  worker/eval            — evaluate code and return a response
-  worker/inspect-object  — inspect a registered object by ID"
+  worker/eval                  — evaluate code and return a response
+  worker/inspect-object        — inspect a registered object by ID
+  worker/code-find             — locate definition(s) for a symbol
+  worker/code-describe         — describe a symbol's type/arglist/docstring
+  worker/code-find-references  — find xref callers/references for a symbol"
   (register-method server "worker/eval"
                    (lambda (params) (%handle-eval params registry)))
   (register-method server "worker/inspect-object"
                    (lambda (params) (%handle-inspect-object params registry)))
-  (log-event :info "worker.handlers.registered" "count" 2)
+  (register-method server "worker/code-find"
+                   (lambda (params) (%handle-code-find params registry)))
+  (register-method server "worker/code-describe"
+                   (lambda (params) (%handle-code-describe params registry)))
+  (register-method server "worker/code-find-references"
+                   (lambda (params) (%handle-code-find-references params registry)))
+  (log-event :info "worker.handlers.registered" "count" 5)
   server)
