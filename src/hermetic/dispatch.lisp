@@ -51,9 +51,9 @@ Routes by NAME:
     is compared to (worker-id worker); a mismatch short-circuits to a
     registry-reset error before any pool-rpc-with-hard-kill call.  Only
     the raw integer id (epoch+session stripped) is forwarded to the worker.
-  \"code-find\" / \"code-describe\" / \"code-find-references\" / \"load-system\"
-    -> worker method \"worker/<name>\" directly (no epoch check — these verbs
-    carry no object IDs).
+  \"code-find\" / \"code-describe\" / \"code-find-references\" / \"load-system\" /
+    \"run-tests\" -> worker method \"worker/<name>\" directly (no epoch check —
+    these verbs carry no object IDs).
   Any other name  -> worker method \"worker/eval\" (unchanged behaviour).
 
 Structured conditions are caught and returned as isError / rpc-error
@@ -140,7 +140,7 @@ crash; the object id is no longer valid.")))))
           ;; The per-call timeout_seconds param is honoured when present.
           ;; ----------------------------------------------------------------
           ((member name '("code-find" "code-describe" "code-find-references"
-                          "load-system")
+                          "load-system" "run-tests")
                    :test #'string=)
            (let* ((params (or args (make-hash-table :test 'equal)))
                   (soft   (let ((v (gethash "timeout_seconds" params)))

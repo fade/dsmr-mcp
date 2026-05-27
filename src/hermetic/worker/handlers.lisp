@@ -36,6 +36,8 @@
                 #:code-find-references)
   (:import-from #:dsmr-mcp/src/system-loader-core
                 #:load-system)
+  (:import-from #:dsmr-mcp/src/test-runner-core
+                #:run-tests)
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht
                 #:text-content)
@@ -352,6 +354,42 @@ PARAMS. Returns the make-ht wire envelope produced by load-system."
                  :clear-fasls     clear-fasls
                  :timeout-seconds timeout-seconds)))
 
+(defun %handle-run-tests (params registry)
+  "Worker handler for run-tests: calls test-runner-core:run-tests in-process
+and returns the structured result envelope.
+
+The core's own sb-ext:with-timeout applies (300 s default), so a runaway
+test run is interrupted within the worker. The pool's pool-rpc-with-hard-kill
+provides the outer hard-kill backstop.
+
+Reads system (required), framework, test, tests, timeout_seconds (default 300),
+and reload (boolean, default true) from PARAMS."
+  (declare (ignore registry))
+  (let* ((sys-name        (gethash "system"          params))
+         (framework       (gethash "framework"       params))
+         (test            (gethash "test"            params))
+         (tests           (gethash "tests"           params))
+         (timeout-seconds (or (gethash "timeout_seconds" params) 300))
+         ;; reload defaults true when key is absent.
+         (reload          (multiple-value-bind (v presentp)
+                              (gethash "reload" params)
+                            (if presentp v t))))
+    (unless (and (stringp sys-name) (plusp (length sys-name)))
+      (error "system is required"))
+    ;; Normalize tests from JSON array (vector) to list when present.
+    (let ((tests-list (when tests
+                        (if (vectorp tests)
+                            (coerce tests 'list)
+                            tests))))
+      ;; test-runner-core:run-tests wraps the work in sb-ext:with-timeout
+      ;; internally, so a runaway test is interrupted within this handler.
+      (run-tests sys-name
+                 :framework framework
+                 :test test
+                 :tests tests-list
+                 :timeout-seconds timeout-seconds
+                 :reload reload))))
+
 (defun register-all-handlers (server registry)
   "Register all worker method handlers on SERVER.
 REGISTRY is the per-worker object-registry instance; it is closed over by
@@ -363,7 +401,8 @@ Registered methods:
   worker/code-find             — locate definition(s) for a symbol
   worker/code-describe         — describe a symbol's type/arglist/docstring
   worker/code-find-references  — find xref callers/references for a symbol
-  worker/load-system           — load an ASDF system with force/timeout/warning capture"
+  worker/load-system           — load an ASDF system with force/timeout/warning capture
+  worker/run-tests             — run tests with framework detection and ghost-purge"
   (register-method server "worker/eval"
                    (lambda (params) (%handle-eval params registry)))
   (register-method server "worker/inspect-object"
@@ -376,5 +415,7 @@ Registered methods:
                    (lambda (params) (%handle-code-find-references params registry)))
   (register-method server "worker/load-system"
                    (lambda (params) (%handle-load-system params registry)))
-  (log-event :info "worker.handlers.registered" "count" 6)
+  (register-method server "worker/run-tests"
+                   (lambda (params) (%handle-run-tests params registry)))
+  (log-event :info "worker.handlers.registered" "count" 7)
   server)
