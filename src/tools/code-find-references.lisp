@@ -34,7 +34,8 @@
                 #:bounded-slime-eval)
   (:import-from #:dsmr-mcp/src/state
                 #:*mode*
-                #:get-tool-instance)
+                #:get-tool-instance
+                #:session-project-root)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
   (:import-from #:dsmr-mcp/src/hermetic/dispatch
@@ -147,10 +148,14 @@ RAW is either:
 ;;; Attached dispatcher
 ;;; ---------------------------------------------------------------------------
 
-(defun %dispatch-attach-code-find-references (tool id params)
+(defun %dispatch-attach-code-find-references (tool id params root-namestring)
   "Dispatch code-find-references to the attached Slynk image.
 Builds the injected sb-introspect xref form, acquires the call-lock, and
-runs bounded-slime-eval. Returns a wire envelope hash-table."
+runs bounded-slime-eval.
+ROOT-NAMESTRING is the session project root namestring (or NIL); when non-NIL
+the injected form relativizes returned paths against it and uses it as the
+project_only filter root.
+Returns a wire envelope hash-table."
   (declare (ignore id))
   (let* ((symbol-name  (and params (gethash "symbol" params)))
          (package-name (and params (gethash "package" params)))
@@ -166,16 +171,15 @@ runs bounded-slime-eval. Returns a wire envelope hash-table."
                  (text-content "code-find-references: 'symbol' parameter is required."))))
     (let* ((form (handler-case
                      (%build-code-find-refs-form symbol-name package-name
-                                                 (if project-only t nil))
+                                                 (if project-only t nil)
+                                                 root-namestring)
                    (error (e)
                      (return-from %dispatch-attach-code-find-references
                        (make-ht "isError" t
                                 "content"
                                 (text-content
-                                 (format nil "code-find-references: form build error: ~A" e)))))))
-           ;; The relation filter is handled by the form builder via the
-           ;; project-only/finders machinery. If the caller wants a specific
-           ;; relation on the attached path we re-filter client-side below.
+                                 (format nil "code-find-references: form build error: ~A"
+                                         e)))))))
            (lock (repl-eval-tool-call-lock tool))
            (raw  (handler-case
                      (with-lock-held (lock)
@@ -217,8 +221,11 @@ Hermetic: routes to worker/code-find-references via dispatch-hermetic-call.
 Inline: returns a typed mode error."
   (ecase *mode*
     (:attached
-     (let ((repl-tool (get-tool-instance (tool-session tool) "repl-eval")))
-       (result id (%dispatch-attach-code-find-references repl-tool id args))))
+     (let* ((session      (tool-session tool))
+            (root         (session-project-root session))
+            (root-ns      (and root (namestring root)))
+            (repl-tool    (get-tool-instance session "repl-eval")))
+       (result id (%dispatch-attach-code-find-references repl-tool id args root-ns))))
     (:hermetic
      (dispatch-hermetic-call (tool-session tool) id "code-find-references" args))
     (:inline

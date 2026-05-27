@@ -21,7 +21,9 @@
   (:import-from #:dsmr-mcp/src/state
                 #:*mode*)
   (:import-from #:dsmr-mcp/src/tools/helpers
-                #:make-ht))
+                #:make-ht)
+  (:import-from #:asdf
+                #:system-source-directory))
 
 (in-package #:dsmr-mcp/tests/code-intelligence/code-find-test)
 
@@ -60,19 +62,55 @@ returns a hash-table with a non-empty 'locations' vector.  Each location has
         (true (plusp (gethash "line" first-loc)))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Hermetic criterion 1: returned path is absolute (not a relative fragment)
-;;;
-;;; The code-core engine uses namestring on the translated logical pathname,
-;;; which always produces an absolute path in SBCL. Criterion 1 asserts the
-;;; path for a symbol in a loaded system is findable (non-empty, has content).
-;;; Project-relative display is handled by the client; the engine returns the
-;;; absolute path from sb-introspect so the client can compute relativity.
+;;; Criterion 1: path is relative when session root is set and the symbol's
+;;; source is under it; absolute when outside root or no root is given.
 ;;; ---------------------------------------------------------------------------
 
-(define-test code-find-hermetic-returns-project-path
-  "The path returned for a symbol in a loaded system is non-empty and points
-to an existing file (criterion 1: path + line for a symbol in a loaded system)."
-  (let* ((params (make-params "symbol" "dsmr-mcp/src/code-core:code-find-definition"
+(define-test code-find-returns-relative-path-under-session-root
+  "When %handle-code-find is called with a project_root set to the dsmr-mcp
+checkout root and a symbol whose source is in that tree, the returned path is
+project-relative: no leading directory separator, and merging it under the root
+resolves to an existing file."
+  (let* ((root-pn  (asdf:system-source-directory :dsmr-mcp))
+         (root-str (namestring root-pn))
+         (params   (make-params "symbol"       "dsmr-mcp/src/code-core:code-find-definition"
+                                "package"      "dsmr-mcp/src/code-core"
+                                "project_root" root-str))
+         (result   (%handle-code-find params nil)))
+    (true (hash-table-p result))
+    (false (gethash "isError" result))
+    (let* ((locs (gethash "locations" result))
+           (path (and locs (plusp (length locs))
+                      (gethash "path" (aref locs 0)))))
+      (true (stringp path))
+      (true (plusp (length path)))
+      ;; Path must be relative (no leading /).
+      (false (char= (char path 0) #\/))
+      ;; Merging back under root must resolve to an existing file.
+      (true (probe-file (merge-pathnames path root-pn))))))
+
+(define-test code-find-returns-absolute-path-outside-session-root
+  "When %handle-code-find is called with a project_root that does NOT contain
+the symbol's source file, the returned path is absolute (first char is /)."
+  (let* (;; Use /tmp as the session root — no dsmr-mcp source lives there.
+         (params (make-params "symbol"       "dsmr-mcp/src/code-core:code-find-definition"
+                              "package"      "dsmr-mcp/src/code-core"
+                              "project_root" "/tmp/"))
+         (result (%handle-code-find params nil)))
+    (true (hash-table-p result))
+    (false (gethash "isError" result))
+    (let* ((locs (gethash "locations" result))
+           (path (and locs (plusp (length locs))
+                      (gethash "path" (aref locs 0)))))
+      (true (stringp path))
+      (true (plusp (length path)))
+      ;; Path must be absolute since the source is not under /tmp/.
+      (true (char= (char path 0) #\/)))))
+
+(define-test code-find-returns-absolute-path-when-no-root
+  "When %handle-code-find is called without a project_root param, the returned
+path is absolute — preserving the no-root contract."
+  (let* ((params (make-params "symbol"  "dsmr-mcp/src/code-core:code-find-definition"
                               "package" "dsmr-mcp/src/code-core"))
          (result (%handle-code-find params nil)))
     (true (hash-table-p result))
@@ -82,8 +120,8 @@ to an existing file (criterion 1: path + line for a symbol in a loaded system)."
                       (gethash "path" (aref locs 0)))))
       (true (stringp path))
       (true (plusp (length path)))
-      ;; The path must point to an existing file.
-      (true (probe-file path)))))
+      ;; No root -> path must be absolute.
+      (true (char= (char path 0) #\/)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Hermetic: package not found returns typed not-found error with hint
