@@ -24,6 +24,8 @@
 
 (defpackage #:dsmr-mcp/tests/code-intelligence/run-tests-test
   (:use #:cl #:parachute)
+  (:import-from #:dsmr-mcp/tests/support/slynk-fixture
+                #:with-temporary-slynk-listener)
   (:import-from #:dsmr-mcp/src/test-runner-core
                 #:detect-test-framework
                 #:%parachute-purge-ghost-suites
@@ -32,9 +34,17 @@
   (:import-from #:dsmr-mcp/src/tools/base
                 #:tool-handle)
   (:import-from #:dsmr-mcp/src/state
+                #:make-session
+                #:*current-session-id*
+                #:get-tool-instance
                 #:*mode*)
+  (:import-from #:dsmr-mcp/src/attach/dispatch
+                #:repl-eval-tool-slynk-conn)
+  (:import-from #:dsmr-mcp/src/tools/helpers
+                #:make-ht)
   (:import-from #:dsmr-mcp/src/tools/run-tests
-                #:run-tests-tool))
+                #:run-tests-tool
+                #:%dispatch-attach-run-tests))
 
 (in-package #:dsmr-mcp/tests/code-intelligence/run-tests-test)
 
@@ -252,6 +262,57 @@ cannot haunt results after reload."
       ;; After purge, the package's test index must be empty.
       (let ((tests-after (funcall pkg-tests-fn scratch-pkg)))
         (true (zerop (length tests-after)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; run-tests-attached-returns-structured-counts
+;;;
+;;; The attached path injects a ghost-purge + reload + run form via Slynk.
+;;; Running the scratch runner-tests package through the attached path must
+;;; return an envelope with the standard passed/failed/framework fields.
+;;; ---------------------------------------------------------------------------
+
+(defun %make-run-tests-attach-session (id conn)
+  "Create a test session wired to the given Slynk connection."
+  (let* ((session (make-session :id id :slynk-attach "127.0.0.1:1"))
+         (*current-session-id* id)
+         (repl-tool (get-tool-instance session "repl-eval")))
+    (setf (repl-eval-tool-slynk-conn repl-tool) conn)
+    (values session repl-tool)))
+
+(define-test run-tests-attached-returns-structured-counts
+  "Calling %dispatch-attach-run-tests via the in-process Slynk fixture against
+the always-loaded 'dsmr-scratch-runner-tests' package returns an envelope with
+integer 'passed', 'failed', 'pending' fields and a string 'framework' field —
+NOT a NETWORK_ERROR.
+The attached path injects a ghost-purge + run form into the live image; the form
+must survive the Slynk wire protocol round-trip and return a structured result.
+Target the scratch package, NOT this test's own package: pointing run-tests at
+the package the outer harness is currently running would re-enter this very test
+in-image and recurse until the call-lock deadline fires."
+  (with-temporary-slynk-listener (conn)
+    (multiple-value-bind (session repl-tool)
+        (%make-run-tests-attach-session "rt-attach-counts" conn)
+      (declare (ignore session))
+      ;; Use reload=nil: the scratch package is already loaded in the image;
+      ;; skipping ASDF reload keeps this test fast and avoids compile noise in
+      ;; the test runner's own output.
+      (let* ((params (make-ht "system"          "dsmr-scratch-runner-tests"
+                              "framework"       "parachute"
+                              "reload"          nil
+                              "timeout_seconds" 300))
+             (result (%dispatch-attach-run-tests repl-tool nil params)))
+        (true (hash-table-p result))
+        ;; Must NOT be a NETWORK_ERROR — that would mean the injected form failed
+        ;; to survive the Slynk wire protocol (e.g. #() literal in the form is
+        ;; incompatible with Slynk's translating-read protocol parser).
+        ;; A NETWORK_ERROR here indicates the attached path is broken.
+        (false (string= "NETWORK_ERROR" (gethash "error_type" result "")))
+        ;; On success: structured counts envelope.
+        (false (gethash "isError" result))
+        (true (integerp (gethash "passed"    result)))
+        (true (integerp (gethash "failed"    result)))
+        (true (integerp (gethash "pending"   result)))
+        (true (stringp  (gethash "framework" result)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; run-tests-inline-returns-mode-error

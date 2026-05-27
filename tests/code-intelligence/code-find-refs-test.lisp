@@ -12,14 +12,22 @@
 
 (defpackage #:dsmr-mcp/tests/code-intelligence/code-find-refs-test
   (:use #:cl #:parachute)
+  (:import-from #:dsmr-mcp/tests/support/slynk-fixture
+                #:with-temporary-slynk-listener)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
                 #:%handle-code-find-references)
   (:import-from #:dsmr-mcp/src/tools/code-find-references
-                #:code-find-references-tool)
+                #:code-find-references-tool
+                #:%dispatch-attach-code-find-references)
   (:import-from #:dsmr-mcp/src/tools/base
                 #:tool-handle)
   (:import-from #:dsmr-mcp/src/state
+                #:make-session
+                #:*current-session-id*
+                #:get-tool-instance
                 #:*mode*)
+  (:import-from #:dsmr-mcp/src/attach/dispatch
+                #:repl-eval-tool-slynk-conn)
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht))
 
@@ -104,6 +112,49 @@ the response has isError=t and error_type='package-not-found'."
     (true (hash-table-p result))
     (true (gethash "isError" result))
     (is string= "package-not-found" (gethash "error_type" result))))
+
+;;; ---------------------------------------------------------------------------
+;;; Attached: %dispatch-attach-code-find-references returns references via Slynk
+;;; ---------------------------------------------------------------------------
+
+(defun %make-code-find-refs-attach-session (id conn)
+  "Create a test session wired to the given Slynk connection."
+  (let* ((session (make-session :id id :slynk-attach "127.0.0.1:1"))
+         (*current-session-id* id)
+         (repl-tool (get-tool-instance session "repl-eval")))
+    (setf (repl-eval-tool-slynk-conn repl-tool) conn)
+    (values session repl-tool)))
+
+(define-test code-find-references-attached-returns-references-vector
+  "Calling %dispatch-attach-code-find-references via the in-process Slynk fixture
+returns an envelope with a 'references' vector key — NOT a NETWORK_ERROR.
+The attached path injects an sb-introspect xref form into the live image; the form
+must survive the Slynk wire protocol round-trip and return a structured result."
+  (with-temporary-slynk-listener (conn)
+    (multiple-value-bind (session repl-tool)
+        (%make-code-find-refs-attach-session "cfr-attach-refs" conn)
+      (declare (ignore session))
+      (let* ((params (make-ht "symbol"       "dsmr-mcp/src/code-core:code-find-definition"
+                              "project_only" nil))
+             (result (%dispatch-attach-code-find-references repl-tool nil params nil)))
+        (true (hash-table-p result))
+        ;; Must NOT be a NETWORK_ERROR — that would mean the injected form failed
+        ;; to survive the Slynk wire protocol (e.g. character literals in the form
+        ;; are incompatible with the Slynk translating-read protocol parser).
+        ;; A NETWORK_ERROR here indicates the attached path is broken, not just
+        ;; that no references were found.
+        (false (string= "NETWORK_ERROR" (gethash "error_type" result "")))
+        ;; Either success (references vector) or typed not-found — both valid.
+        ;; A NETWORK_ERROR is NOT a valid outcome for a successfully-formed request.
+        (if (gethash "isError" result)
+            ;; Typed not-found errors are acceptable.
+            (let ((etype (gethash "error_type" result)))
+              (true (stringp etype))
+              (true (member etype '("symbol-not-found" "package-not-found"
+                                    "found-but-no-source-location")
+                            :test #'string=)))
+            ;; Success path: references must be a vector.
+            (true (vectorp (gethash "references" result))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Inline: tool-handle returns typed mode error

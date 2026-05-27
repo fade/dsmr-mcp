@@ -10,14 +10,22 @@
 
 (defpackage #:dsmr-mcp/tests/code-intelligence/code-describe-test
   (:use #:cl #:parachute)
+  (:import-from #:dsmr-mcp/tests/support/slynk-fixture
+                #:with-temporary-slynk-listener)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
                 #:%handle-code-describe)
   (:import-from #:dsmr-mcp/src/tools/code-describe
-                #:code-describe-tool)
+                #:code-describe-tool
+                #:%dispatch-attach-code-describe)
   (:import-from #:dsmr-mcp/src/tools/base
                 #:tool-handle)
   (:import-from #:dsmr-mcp/src/state
+                #:make-session
+                #:*current-session-id*
+                #:get-tool-instance
                 #:*mode*)
+  (:import-from #:dsmr-mcp/src/attach/dispatch
+                #:repl-eval-tool-slynk-conn)
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht))
 
@@ -80,6 +88,40 @@ the image, the response has isError=t and error_type='package-not-found'."
     (true (hash-table-p result))
     (true (gethash "isError" result))
     (is string= "package-not-found" (gethash "error_type" result))))
+
+;;; ---------------------------------------------------------------------------
+;;; Attached: %dispatch-attach-code-describe returns name + arglist + doc via Slynk
+;;; ---------------------------------------------------------------------------
+
+(defun %make-code-describe-attach-session (id conn)
+  "Create a test session wired to the given Slynk connection."
+  (let* ((session (make-session :id id :slynk-attach "127.0.0.1:1"))
+         (*current-session-id* id)
+         (repl-tool (get-tool-instance session "repl-eval")))
+    (setf (repl-eval-tool-slynk-conn repl-tool) conn)
+    (values session repl-tool)))
+
+(define-test code-describe-attached-returns-name-and-arglist
+  "Calling %dispatch-attach-code-describe via the in-process Slynk fixture for a
+known function returns an envelope with 'name' and 'arglist' string fields.
+The attached path delegates to Slynk's describe-symbol + operator-arglist so
+the doc field carries describe text and arglist carries the arglist string."
+  (with-temporary-slynk-listener (conn)
+    (multiple-value-bind (session repl-tool)
+        (%make-code-describe-attach-session "cd-attach-name-arglist" conn)
+      (declare (ignore session))
+      (let* ((params (make-ht "symbol" "dsmr-mcp/src/code-core:code-find-definition"))
+             (result (%dispatch-attach-code-describe repl-tool nil params nil)))
+        (true (hash-table-p result))
+        (false (gethash "isError" result))
+        ;; 'name' must be a non-empty string.
+        (true (stringp (gethash "name" result)))
+        (true (plusp (length (gethash "name" result))))
+        ;; 'arglist' must be a non-empty string (at least "()" for zero-arg).
+        (true (stringp (gethash "arglist" result)))
+        (true (plusp (length (gethash "arglist" result))))
+        ;; 'doc' must be present as a string (may be empty).
+        (true (stringp (gethash "doc" result)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Inline: tool-handle returns typed mode error

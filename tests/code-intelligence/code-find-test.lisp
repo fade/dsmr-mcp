@@ -12,14 +12,22 @@
 
 (defpackage #:dsmr-mcp/tests/code-intelligence/code-find-test
   (:use #:cl #:parachute)
+  (:import-from #:dsmr-mcp/tests/support/slynk-fixture
+                #:with-temporary-slynk-listener)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
                 #:%handle-code-find)
   (:import-from #:dsmr-mcp/src/tools/code-find
-                #:code-find-tool)
+                #:code-find-tool
+                #:%dispatch-attach-code-find)
   (:import-from #:dsmr-mcp/src/tools/base
                 #:tool-handle)
   (:import-from #:dsmr-mcp/src/state
+                #:make-session
+                #:*current-session-id*
+                #:get-tool-instance
                 #:*mode*)
+  (:import-from #:dsmr-mcp/src/attach/dispatch
+                #:repl-eval-tool-slynk-conn)
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht)
   (:import-from #:asdf
@@ -146,6 +154,61 @@ content field carrying hint text."
     (let ((content (gethash "content" result)))
       (true (or (and (simple-vector-p content) (plusp (length content)))
                 (and (vectorp content) (plusp (length content))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Attached: %dispatch-attach-code-find returns locations via Slynk
+;;; ---------------------------------------------------------------------------
+
+(defun %make-code-find-attach-session (id conn)
+  "Create a test session wired to the given Slynk connection."
+  (let* ((session (make-session :id id :slynk-attach "127.0.0.1:1"))
+         (*current-session-id* id)
+         (repl-tool (get-tool-instance session "repl-eval")))
+    (setf (repl-eval-tool-slynk-conn repl-tool) conn)
+    (values session repl-tool)))
+
+(define-test code-find-attached-returns-locations-for-known-symbol
+  "Calling %dispatch-attach-code-find via the in-process Slynk fixture for a
+symbol that is loaded in the current image returns a locations vector with at
+least one entry carrying 'path', 'line', and 'kind' fields.  Exercises the
+real slime-eval injection path in attached mode."
+  (with-temporary-slynk-listener (conn)
+    (multiple-value-bind (session repl-tool)
+        (%make-code-find-attach-session "cf-attach-locations" conn)
+      (declare (ignore session))
+      (let* ((params (make-ht "symbol" "dsmr-mcp/src/code-core:code-find-definition"))
+             (result (%dispatch-attach-code-find repl-tool nil params nil)))
+        (true (hash-table-p result))
+        (false (gethash "isError" result))
+        (let ((locs (gethash "locations" result)))
+          (true (and locs (plusp (length locs))))
+          (let ((first-loc (aref locs 0)))
+            (true (hash-table-p first-loc))
+            (true (stringp  (gethash "path" first-loc)))
+            (true (integerp (gethash "line" first-loc)))
+            (true (stringp  (gethash "kind" first-loc)))
+            (true (plusp (length (gethash "path" first-loc))))
+            (true (plusp (gethash "line" first-loc)))))))))
+
+(define-test code-find-attached-hermetic-envelope-parity
+  "The attached code-find envelope and the hermetic %handle-code-find envelope
+share the same top-level result key ('locations') for the same symbol.
+Exercises the dual-mode envelope shape contract."
+  (with-temporary-slynk-listener (conn)
+    (multiple-value-bind (session repl-tool)
+        (%make-code-find-attach-session "cf-attach-parity" conn)
+      (declare (ignore session))
+      (let* ((sym    "dsmr-mcp/src/code-core:code-find-definition")
+             (params (make-ht "symbol" sym))
+             ;; Attached envelope
+             (att-result (%dispatch-attach-code-find repl-tool nil params nil))
+             ;; Hermetic envelope
+             (herm-result (%handle-code-find params nil)))
+        (false (gethash "isError" att-result))
+        (false (gethash "isError" herm-result))
+        ;; Both must carry a "locations" key.
+        (true (gethash "locations" att-result))
+        (true (gethash "locations" herm-result))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Inline: tool-handle returns typed mode error
