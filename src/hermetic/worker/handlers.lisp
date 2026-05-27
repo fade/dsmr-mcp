@@ -34,6 +34,8 @@
                 #:code-find-definition
                 #:code-describe-symbol
                 #:code-find-references)
+  (:import-from #:dsmr-mcp/src/system-loader-core
+                #:load-system)
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht
                 #:text-content)
@@ -323,6 +325,33 @@ strips the epoch/session prefix before forwarding)."
                                         :max-elements max-elements)))
       (build-inspect-response result))))
 
+(defun %handle-load-system (params registry)
+  "Worker handler for load-system: calls system-loader-core:load-system
+in-process (already inside the worker) and returns the structured result.
+The core's own sb-ext:with-timeout applies, so a runaway compile is
+interrupted within the worker. The pool's pool-rpc-with-hard-kill provides
+the outer hard-kill backstop.
+
+Reads system (required), force (boolean, default true), clear_fasls
+(boolean, default false), and timeout_seconds (integer, default 120) from
+PARAMS. Returns the make-ht wire envelope produced by load-system."
+  (declare (ignore registry))
+  (let* ((sys-name        (gethash "system"          params))
+         (force           (multiple-value-bind (v presentp)
+                              (gethash "force" params)
+                            (if presentp v t)))   ; default true when absent
+         (clear-fasls     (gethash "clear_fasls"     params))
+         (timeout-seconds (or (gethash "timeout_seconds" params) 120)))
+    (unless (and (stringp sys-name) (plusp (length sys-name)))
+      (error "system is required"))
+    ;; load-system from system-loader-core wraps the work in
+    ;; sb-ext:with-timeout internally, so a runaway compile is interrupted
+    ;; within this handler call.
+    (load-system sys-name
+                 :force           force
+                 :clear-fasls     clear-fasls
+                 :timeout-seconds timeout-seconds)))
+
 (defun register-all-handlers (server registry)
   "Register all worker method handlers on SERVER.
 REGISTRY is the per-worker object-registry instance; it is closed over by
@@ -333,7 +362,8 @@ Registered methods:
   worker/inspect-object        — inspect a registered object by ID
   worker/code-find             — locate definition(s) for a symbol
   worker/code-describe         — describe a symbol's type/arglist/docstring
-  worker/code-find-references  — find xref callers/references for a symbol"
+  worker/code-find-references  — find xref callers/references for a symbol
+  worker/load-system           — load an ASDF system with force/timeout/warning capture"
   (register-method server "worker/eval"
                    (lambda (params) (%handle-eval params registry)))
   (register-method server "worker/inspect-object"
@@ -344,5 +374,7 @@ Registered methods:
                    (lambda (params) (%handle-code-describe params registry)))
   (register-method server "worker/code-find-references"
                    (lambda (params) (%handle-code-find-references params registry)))
-  (log-event :info "worker.handlers.registered" "count" 5)
+  (register-method server "worker/load-system"
+                   (lambda (params) (%handle-load-system params registry)))
+  (log-event :info "worker.handlers.registered" "count" 6)
   server)
