@@ -114,7 +114,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/code-intelligence/code-core-test"
                "dsmr-mcp/tests/code-intelligence/code-find-test"
                "dsmr-mcp/tests/code-intelligence/code-describe-test"
-               "dsmr-mcp/tests/code-intelligence/code-find-refs-test")
+               "dsmr-mcp/tests/code-intelligence/code-find-refs-test"
+               "dsmr-mcp/tests/code-intelligence/load-system-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
