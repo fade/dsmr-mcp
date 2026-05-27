@@ -407,7 +407,9 @@ the function works whether the parachute package is called org.shirakumo.parachu
 or parachute."
   (log-event :info "test-runner" "framework" "parachute" "system" system-name)
   (let* ((pkg (find-package :org.shirakumo.parachute))
-         (test-fn (and pkg (find-symbol "TEST" pkg))))
+         (test-fn (and pkg (find-symbol "TEST" pkg)))
+         (context-var (and pkg (find-symbol "*CONTEXT*" pkg)))
+         (parent-var  (and pkg (find-symbol "*PARENT*" pkg))))
     (unless test-fn
       (log-event :warn "test-runner" "message" "Parachute not loaded; falling back to ASDF")
       (return-from %run-parachute-tests (%run-asdf-fallback system-name)))
@@ -421,13 +423,18 @@ or parachute."
           (let ((*standard-output* stdout-stream)
                 (*error-output*    stderr-stream)
                 (*test-debug-output* debug-stream))
-            ;; parachute:test accepts a package designator or system name.
-            ;; Try the system-name as a package name first; if the package
-            ;; doesn't exist, let Parachute resolve it.
-            (setf result-obj
-                  (funcall test-fn
-                           (or (find-package (string-upcase system-name))
-                               (intern (string-upcase system-name) :keyword)))))
+            ;; Bind both *CONTEXT* and *PARENT* to NIL so this run's result
+            ;; objects do not register themselves into any outer Parachute context
+            ;; (e.g. when run-tests is called from inside a define-test body
+            ;; during our own test suite). *PARENT* is set by eval-in-context
+            ;; :around on parent-result and causes new result objects to attach
+            ;; to the outer test-result via initialize-instance :after.
+            (let ((isolation-vars (remove nil (list context-var parent-var))))
+              (setf result-obj
+                    (progv isolation-vars (make-list (length isolation-vars))
+                      (funcall test-fn
+                               (or (find-package (string-upcase system-name))
+                                   (intern (string-upcase system-name) :keyword)))))))
         (error (c)
           (setf run-error (princ-to-string c))))
       (let* ((end-time (get-internal-real-time))
