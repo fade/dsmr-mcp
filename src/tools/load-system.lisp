@@ -14,13 +14,13 @@
 ;;;;                worker/load-system handler.
 ;;;;   :inline    — returns a typed "requires attached or hermetic mode" error.
 ;;;;
-;;;; No human-permission gate on the attached path (D-04): load-system
+;;;; No human-permission gate on the attached path: load-system
 ;;;; compiles and executes arbitrary ASDF systems in the developer's own live
 ;;;; image — by design, because the agent is already trusted to repl-eval
 ;;;; arbitrary code, and recompiling to pick up edits is the whole point.
 ;;;;
 ;;;; The attached path wraps the load in sb-ext:with-timeout inside the image
-;;;; (D-06), so a runaway compile is interrupted rather than observed from
+;;;; so a runaway compile is interrupted rather than observed from
 ;;;; the dispatcher side. The hermetic path defers to the worker handler which
 ;;;; calls load-system from system-loader-core (also wrapped in with-timeout).
 

@@ -19,13 +19,13 @@
 ;;;;
 ;;;; Design notes:
 ;;;;   The attached path wraps asdf:load-system in sb-ext:with-timeout INSIDE
-;;;;   the target image (D-06) so a runaway compile is actually interrupted,
+;;;;   the target image so a runaway compile is actually interrupted,
 ;;;;   not merely observed from the dispatcher side. sb-ext:timeout is a
 ;;;;   serious-condition, not error, so the load's own handler-case (error ...)
 ;;;;   cannot swallow it.
 ;;;;
 ;;;;   Warnings are collected non-fatally into a structured list and muffled
-;;;;   off the host stderr (D-05). Errors abort the load and return the
+;;;;   off the host stderr. Errors abort the load and return the
 ;;;;   structured error shape. The calling tool wrapper decides how to present
 ;;;;   the result — load-system returns a hash-table with "status", "duration_ms",
 ;;;;   and either "warnings"/"warning_details" (success) or "message" (error/timeout).
@@ -41,7 +41,7 @@
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht
                 #:text-content)
-  ;; sb-ext for with-timeout (SBCL-specific, intentional per D-06):
+  ;; sb-ext for with-timeout (SBCL-specific, intentional):
   (:import-from #:sb-ext)
   ;; asdf always present:
   (:import-from #:asdf)
@@ -84,7 +84,7 @@ works across CL implementations and against string-message conditions."
 ;;;
 ;;; Builds the sexp sent to the attached image via slime-eval (attached path).
 ;;; The form wraps asdf:load-system in sb-ext:with-timeout inside the image so
-;;; a runaway compile is actually interrupted (D-06). All helpers are interned
+;;; a runaway compile is actually interrupted. All helpers are interned
 ;;; in CL-USER with the %DSMR-LOADER- prefix (Critical Constraint 1 from
 ;;; wrap-form.lisp: the slynk-client IO-package does not import our package,
 ;;; so any symbol not in CL or CL-USER gets package-qualified and the remote
@@ -125,7 +125,7 @@ Returns (list :ok WARN-COUNT WARNS), (list :timeout TIMEOUT), or
                          (sys (asdf:find-system ,sys-name nil)))
                      (when sys
                        (asdf:clear-system ,sys-name)))))
-             ;; D-05: collect warnings non-fatally, muffle off host stderr.
+             ;; collect warnings non-fatally, muffle off host stderr.
              ;; do not muffle errors (they abort and flow to the error arm).
              (let ((,s-warns nil))
                (handler-bind
@@ -205,7 +205,7 @@ returns status=timeout."
                 (asdf:clear-system sys-name)
                 (when asd-src
                   (ignore-errors (asdf:load-asd asd-src)))))
-            ;; D-05: collect warnings non-fatally, muffle off host stderr.
+            ;; collect warnings non-fatally, muffle off host stderr.
             (handler-bind ((warning #'collect-warning))
               (if clear-fasls
                   (asdf:load-system sys-name :force t)

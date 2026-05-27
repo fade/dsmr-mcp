@@ -73,7 +73,7 @@ and a warnings count."
 ;;;
 ;;; Loading a system whose source emits a warn at load time must return
 ;;; status=loaded (not abort) with a non-empty warning_details list.
-;;; This confirms D-05: warnings are non-fatal and muffled off host stderr.
+;;; Warnings must be non-fatal and muffled off host stderr.
 ;;; ---------------------------------------------------------------------------
 
 (defvar *warning-test-system-dir* nil
@@ -108,7 +108,7 @@ name string. Idempotent: writes the files each time to ensure they exist."
 (define-test load-system-captures-warnings-non-fatally
   "Loading a system that emits a warning returns status=loaded (not error)
 with a non-empty warning_details list. The warning did not abort the load
-and did not reach the host stderr (D-05 non-fatal warning bucketing)."
+and did not reach the host stderr (non-fatal warning bucketing)."
   (let* ((sys-name (%ensure-warning-test-system))
          (result   (load-system sys-name :force t :timeout-seconds 30)))
     (true (hash-table-p result))
@@ -127,7 +127,7 @@ and did not reach the host stderr (D-05 non-fatal warning bucketing)."
 ;;; load-system-timeout-returns-structured-timeout
 ;;;
 ;;; A load wrapped with a sub-millisecond timeout returns the structured
-;;; TIMEOUT marker rather than hanging or re-signalling. This confirms D-06:
+;;; TIMEOUT marker rather than hanging or re-signalling. This confirms
 ;;; the timeout fires inside the image and interrupts the compile rather than
 ;;; being observed after the fact.
 ;;; ---------------------------------------------------------------------------
@@ -136,7 +136,7 @@ and did not reach the host stderr (D-05 non-fatal warning bucketing)."
   "load-system with an absurdly small timeout returns status=timeout and a
 descriptive message. The TIMEOUT condition is caught inside sb-ext:with-timeout
 and returned as a structured result rather than propagating as an unhandled
-condition — confirming D-06 in-image timeout interruption."
+condition — confirming in-image timeout interruption."
   ;; 0.001 seconds is well below any real compile; the timeout must fire.
   (let ((result (load-system "alexandria" :timeout-seconds 0.001 :force t)))
     (true (hash-table-p result))
