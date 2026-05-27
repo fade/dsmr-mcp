@@ -22,6 +22,8 @@
 
 (defpackage #:dsmr-mcp/tests/code-intelligence/load-system-test
   (:use #:cl #:parachute)
+  (:import-from #:dsmr-mcp/tests/support/slynk-fixture
+                #:with-temporary-slynk-listener)
   (:import-from #:dsmr-mcp/src/system-loader-core
                 #:load-system
                 #:%redefinition-warning-p
@@ -31,11 +33,17 @@
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht)
   (:import-from #:dsmr-mcp/src/state
+                #:make-session
+                #:*current-session-id*
+                #:get-tool-instance
                 #:*mode*)
+  (:import-from #:dsmr-mcp/src/attach/dispatch
+                #:repl-eval-tool-slynk-conn)
   (:import-from #:dsmr-mcp/src/tools/base
                 #:tool-handle)
   (:import-from #:dsmr-mcp/src/tools/load-system
-                #:load-system-tool))
+                #:load-system-tool
+                #:%dispatch-attach-load-system))
 
 (in-package #:dsmr-mcp/tests/code-intelligence/load-system-test)
 
@@ -143,6 +151,41 @@ condition — confirming in-image timeout interruption."
     (is string= "timeout" (gethash "status" result))
     (true (stringp (gethash "message" result)))
     (true (search "timed out" (gethash "message" result)))))
+
+;;; ---------------------------------------------------------------------------
+;;; load-system-attached-loads-known-system
+;;;
+;;; The attached path injects a with-timeout + handler-bind form via Slynk.
+;;; For a system already in ASDF's source registry (alexandria is always
+;;; available in this image), the result must be status=loaded.
+;;; ---------------------------------------------------------------------------
+
+(defun %make-load-system-attach-session (id conn)
+  "Create a test session wired to the given Slynk connection."
+  (let* ((session (make-session :id id :slynk-attach "127.0.0.1:1"))
+         (*current-session-id* id)
+         (repl-tool (get-tool-instance session "repl-eval")))
+    (setf (repl-eval-tool-slynk-conn repl-tool) conn)
+    (values session repl-tool)))
+
+(define-test load-system-attached-loads-known-system
+  "Calling %dispatch-attach-load-system via the in-process Slynk fixture for
+'alexandria' — always available in this image — returns status=loaded with
+a duration_ms integer.  Exercises the real slime-eval injection path and
+the (:ok N WARNS) result decoder in attached mode."
+  (with-temporary-slynk-listener (conn)
+    (multiple-value-bind (session repl-tool)
+        (%make-load-system-attach-session "ls-attach-known" conn)
+      (declare (ignore session))
+      (let* ((params (make-ht "system"          "alexandria"
+                              "force"           t
+                              "timeout_seconds" 120))
+             (result (%dispatch-attach-load-system repl-tool nil params)))
+        (true (hash-table-p result))
+        (false (gethash "isError" result))
+        (is string= "loaded" (gethash "status" result))
+        (is string= "alexandria" (gethash "system" result))
+        (true (integerp (gethash "duration_ms" result)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; load-system-inline-returns-mode-error
