@@ -257,7 +257,8 @@ Returns the standard make-test-result envelope with framework=asdf."
         (progn
           (let ((*standard-output* output)
                 (*error-output* error-output)
-                (*test-debug-output* debug-stream))
+                (*test-debug-output* debug-stream)
+                (*standard-input* (make-string-input-stream "")))
             (asdf:test-system system-name))
           (setf success t))
       (error (c)
@@ -438,7 +439,8 @@ or parachute."
       (handler-case
           (let ((*standard-output* stdout-stream)
                 (*error-output*    stderr-stream)
-                (*test-debug-output* debug-stream))
+                (*test-debug-output* debug-stream)
+                (*standard-input* (make-string-input-stream "")))
             ;; Bind both *CONTEXT* and *PARENT* to NIL so this run's result
             ;; objects do not register themselves into any outer Parachute context
             ;; (e.g. when run-tests is called from inside a define-test body
@@ -766,7 +768,8 @@ Filters string dependencies that have SYSTEM-NAME/ as a prefix."
                     (list (make-broadcast-stream))
                   (let ((*standard-output* stdout-stream)
                         (*error-output* stderr-stream)
-                        (*test-debug-output* debug-stream))
+                        (*test-debug-output* debug-stream)
+                        (*standard-input* (make-string-input-stream "")))
                     (funcall run-tests-fn test-symbols)))))
       (error (c)
         (setf rove-error (princ-to-string c))
@@ -835,7 +838,8 @@ Filters string dependencies that have SYSTEM-NAME/ as a prefix."
             (list (make-broadcast-stream))
           (let ((*standard-output* stdout-stream)
                 (*error-output* stderr-stream)
-                (*test-debug-output* debug-stream))
+                (*test-debug-output* debug-stream)
+                (*standard-input* (make-string-input-stream "")))
             (funcall run-fn
                      (intern (string-upcase system-name) :keyword))))
       (error (c)
@@ -903,7 +907,8 @@ Filters string dependencies that have SYSTEM-NAME/ as a prefix."
                                   (list (make-broadcast-stream))
                                 (let ((*standard-output* (make-broadcast-stream))
                                       (*error-output* (make-broadcast-stream))
-                                      (*test-debug-output* (make-broadcast-stream)))
+                                      (*test-debug-output* (make-broadcast-stream))
+                                      (*standard-input* (make-string-input-stream "")))
                                   (funcall run-fn
                                            (intern (string-upcase sub-sys) :keyword))))
                               (setf run-ok t))
@@ -957,7 +962,8 @@ when FiveAM's expected API symbols cannot be found."
       (handler-case
           (let ((*standard-output* stdout-stream)
                 (*error-output*    stderr-stream)
-                (*test-debug-output* debug-stream))
+                (*test-debug-output* debug-stream)
+                (*standard-input* (make-string-input-stream "")))
             ;; fiveam:run! runs a named suite and prints a report; we prefer
             ;; fiveam:run which returns result objects without printing.
             (let* ((run-quiet-fn (find-symbol "RUN" fiveam-pkg))
