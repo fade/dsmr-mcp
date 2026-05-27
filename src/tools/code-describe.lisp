@@ -33,7 +33,8 @@
                 #:bounded-slime-eval)
   (:import-from #:dsmr-mcp/src/state
                 #:*mode*
-                #:get-tool-instance)
+                #:get-tool-instance
+                #:session-project-root)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
   (:import-from #:dsmr-mcp/src/hermetic/dispatch
@@ -94,9 +95,12 @@ Both paths return the same envelope: name/type/arglist/doc/path/line."))
 ;;; into the wire envelope.
 ;;; ---------------------------------------------------------------------------
 
-(defun %dispatch-attach-code-describe (tool id params)
+(defun %dispatch-attach-code-describe (tool id params root-namestring)
   "Dispatch code-describe to the attached Slynk image.
 Injects a form that uses Slynk's describe-symbol + operator-arglist.
+ROOT-NAMESTRING is the session project root namestring (or NIL); it is passed
+to %build-code-describe-form for API consistency but the attached describe path
+returns no path field (Slynk output does not include a source location here).
 Returns a wire envelope hash-table (without the result wrapper)."
   (declare (ignore id))
   (let* ((symbol-name  (and params (gethash "symbol" params)))
@@ -107,7 +111,7 @@ Returns a wire envelope hash-table (without the result wrapper)."
                  "content"
                  (text-content "code-describe: 'symbol' parameter is required."))))
     (let* ((form (handler-case
-                     (%build-code-describe-form symbol-name package-name)
+                     (%build-code-describe-form symbol-name package-name root-namestring)
                    (error (e)
                      (return-from %dispatch-attach-code-describe
                        (make-ht "isError" t
@@ -127,9 +131,8 @@ Returns a wire envelope hash-table (without the result wrapper)."
                                 "error_type" "NETWORK_ERROR"
                                 "content"
                                 (text-content
-                                 (format nil "code-describe: Slynk connection error: ~A" e))))))))
-      ;; The form returns (list describe-string arglist-string).
-      ;; describe-string is NIL when Slynk could not describe the symbol.
+                                 (format nil "code-describe: Slynk connection error: ~A"
+                                         e))))))))
       (cond
         ((null raw)
          (make-ht "isError"    t
@@ -139,7 +142,8 @@ Returns a wire envelope hash-table (without the result wrapper)."
                    (format nil "Symbol ~S not found. Try load-system first, \
 or clgrep-search for text search." symbol-name))))
         ((not (listp raw))
-         (log-event :warn "code-describe.attach.unexpected" "type" (princ-to-string (type-of raw)))
+         (log-event :warn "code-describe.attach.unexpected"
+                    "type" (princ-to-string (type-of raw)))
          (make-ht "isError" t
                   "error_type" "symbol-not-found"
                   "content"
@@ -154,8 +158,6 @@ or clgrep-search for text search." symbol-name))))
                         (text-content
                          (format nil "Symbol ~S not found in image. \
 Try load-system first, or clgrep-search for text search." symbol-name)))
-               ;; Build the canonical envelope. Attached path returns describe text
-               ;; and arglist; no type/path/line available from Slynk alone here.
                (make-ht "name"    (map 'string #'identity symbol-name)
                         "type"    ""
                         "arglist" (or (and (stringp args-text)
@@ -169,8 +171,6 @@ Try load-system first, or clgrep-search for text search." symbol-name)))
                         "path"    ""
                         "line"    0))))))))
 
-
-
 ;;; ---------------------------------------------------------------------------
 ;;; tool-handle method
 ;;; ---------------------------------------------------------------------------
@@ -182,8 +182,11 @@ Hermetic: routes to worker/code-describe via dispatch-hermetic-call.
 Inline: returns a typed mode error."
   (ecase *mode*
     (:attached
-     (let ((repl-tool (get-tool-instance (tool-session tool) "repl-eval")))
-       (result id (%dispatch-attach-code-describe repl-tool id args))))
+     (let* ((session      (tool-session tool))
+            (root         (session-project-root session))
+            (root-ns      (and root (namestring root)))
+            (repl-tool    (get-tool-instance session "repl-eval")))
+       (result id (%dispatch-attach-code-describe repl-tool id args root-ns))))
     (:hermetic
      (dispatch-hermetic-call (tool-session tool) id "code-describe" args))
     (:inline

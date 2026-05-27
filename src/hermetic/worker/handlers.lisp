@@ -184,16 +184,21 @@ signal a malformed-property-list error."
 
 (defun %handle-code-find (params registry)
   "Worker handler for code-find: calls code-core in-process inside a timeout.
-Reads \"symbol\" (required) and \"package\" (optional) from PARAMS.
+Reads \"symbol\" (required), \"package\" (optional), and \"project_root\" (optional)
+from PARAMS. When \"project_root\" is present, paths under that root are returned
+relative (no leading separator); paths outside it remain absolute.
 Returns the locations wire envelope or a typed not-found isError."
   (declare (ignore registry))
-  (let* ((symbol-name  (gethash "symbol"  params))
-         (package-name (gethash "package" params)))
+  (let* ((symbol-name  (gethash "symbol"       params))
+         (package-name (gethash "package"      params))
+         (project-root (gethash "project_root" params)))
     (unless (and (stringp symbol-name) (plusp (length symbol-name)))
       (error "symbol is required"))
     (handler-case
         (sb-ext:with-timeout 30
-          (let ((result (code-find-definition symbol-name :package package-name)))
+          (let ((result (code-find-definition symbol-name
+                                              :package package-name
+                                              :root project-root)))
             (cond
               ;; Typed not-found marker: outer list starts with :not-found.
               ((%not-found-marker-p result)
@@ -229,16 +234,21 @@ Try load-system first, or clgrep-search for text search." symbol-name)))))
 
 (defun %handle-code-describe (params registry)
   "Worker handler for code-describe: calls code-core in-process inside a timeout.
-Reads \"symbol\" (required) and \"package\" (optional) from PARAMS.
+Reads \"symbol\" (required), \"package\" (optional), and \"project_root\" (optional)
+from PARAMS. When \"project_root\" is present, the source path in the response is
+returned relative for files under that root; paths outside it remain absolute.
 Returns the describe wire envelope or a typed not-found isError."
   (declare (ignore registry))
-  (let* ((symbol-name  (gethash "symbol"  params))
-         (package-name (gethash "package" params)))
+  (let* ((symbol-name  (gethash "symbol"       params))
+         (package-name (gethash "package"      params))
+         (project-root (gethash "project_root" params)))
     (unless (and (stringp symbol-name) (plusp (length symbol-name)))
       (error "symbol is required"))
     (handler-case
         (sb-ext:with-timeout 30
-          (let ((result (code-describe-symbol symbol-name :package package-name)))
+          (let ((result (code-describe-symbol symbol-name
+                                              :package package-name
+                                              :root    project-root)))
             (cond
               ;; Typed not-found marker: outer list starts with :not-found.
               ((%not-found-marker-p result)
@@ -267,17 +277,21 @@ Try load-system first, or clgrep-search for text search." symbol-name))))))))
                                   "text" "code-describe timed out (30s)")))))))
 
 (defun %handle-code-find-references (params registry)
-  "Worker handler for code-find-references: calls code-core in-process inside a timeout.
-Reads \"symbol\" (required), \"package\", \"project_only\", and \"relation\" from PARAMS.
-project_only defaults to true. Returns the references wire envelope or a typed error."
+  "Worker handler for code-find-references: calls code-core in-process inside a
+timeout. Reads \"symbol\" (required), \"package\", \"project_only\", \"relation\",
+and \"project_root\" (optional) from PARAMS. project_only defaults to true.
+When \"project_root\" is present, paths under that root are returned relative and
+the project_only filter uses it as the boundary.
+Returns the references wire envelope or a typed error."
   (declare (ignore registry))
-  (let* ((symbol-name  (gethash "symbol"  params))
-         (package-name (gethash "package" params))
+  (let* ((symbol-name  (gethash "symbol"       params))
+         (package-name (gethash "package"      params))
          ;; project_only defaults to true when key is absent.
          (project-only (multiple-value-bind (val presentp)
                            (gethash "project_only" params)
                          (if presentp val t)))
-         (relation     (gethash "relation" params)))
+         (relation     (gethash "relation"     params))
+         (project-root (gethash "project_root" params)))
     (unless (and (stringp symbol-name) (plusp (length symbol-name)))
       (error "symbol is required"))
     (handler-case
@@ -285,6 +299,7 @@ project_only defaults to true. Returns the references wire envelope or a typed e
           (let ((result (code-find-references symbol-name
                                               :package      package-name
                                               :project-only project-only
+                                              :root         project-root
                                               :relation     (and (stringp relation)
                                                                  (plusp (length relation))
                                                                  relation))))
