@@ -61,6 +61,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/tools/fs-list-directory"
                "dsmr-mcp/src/tools/clgrep-search"
                "dsmr-mcp/src/tools/inspect-object"
+               "dsmr-mcp/src/code-core"
                "dsmr-mcp/src/tools/pool-status"
                "dsmr-mcp/src/tools/pool-kill-worker")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
