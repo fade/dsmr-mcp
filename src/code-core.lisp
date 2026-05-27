@@ -28,7 +28,10 @@
   (:import-from #:sb-introspect)
   (:import-from #:uiop
                 #:read-file-string
-                #:ensure-pathname)
+                #:ensure-pathname
+                #:enough-pathname
+                #:ensure-directory-pathname
+                #:native-namestring)
   (:export
    ;; Typed not-found markers
    #:package-not-found
@@ -244,23 +247,42 @@ the file cannot be read or the offset is out of range."
 ;;;; normalize-path-for-display — make paths project-relative when possible
 ;;;; ---------------------------------------------------------------------------
 
-(defun %normalize-path (pathname)
-  "Return a display string for PATHNAME: namestring when available, NIL otherwise."
+(defun %normalize-path (pathname &optional root)
+  "Return a display string for PATHNAME.
+When ROOT is non-NIL and PATHNAME resolves to a path under ROOT, returns a
+project-relative namestring (no leading directory separator). When PATHNAME is
+not under ROOT, or when ROOT is NIL, returns the absolute namestring unchanged.
+Wraps relativization in ignore-errors so a malformed root degrades to the
+absolute namestring rather than signalling."
   (when pathname
-    (ignore-errors (namestring (translate-logical-pathname pathname)))))
+    (ignore-errors
+      (let* ((translated (translate-logical-pathname pathname)))
+        (if root
+            (let* ((resolved  (or (handler-case (truename translated)
+                                    (file-error () nil))
+                                  translated))
+                   (root-dir  (uiop:ensure-directory-pathname root))
+                   (rel       (ignore-errors
+                                 (uiop:enough-pathname resolved root-dir))))
+              (if rel
+                  (uiop:native-namestring rel)
+                  (namestring translated)))
+            (namestring translated))))))
 
 ;;;; ---------------------------------------------------------------------------
 ;;;; code-find-definition — multi-location, all definition kinds
 ;;;; ---------------------------------------------------------------------------
 
-(defun code-find-definition (symbol-name &key package)
+(defun code-find-definition (symbol-name &key package root)
   "Return a list of definition location plists for SYMBOL-NAME.
 Each plist: (:path PATH :line LINE :kind KIND-STRING).
 Returns the typed not-found marker plist when the package or symbol is absent.
 Iterates all definition kinds so each method of a generic function appears as a
 separate :method entry (multi-location). Uses the two-pass NIL-pathname
 strategy: prefer entries with non-NIL path (avoid implicitly-created GF entries),
-fall back to any entry when no path-bearing entries exist."
+fall back to any entry when no path-bearing entries exist.
+ROOT, when non-NIL, causes path values to be project-relative (no leading
+separator) for files under ROOT; files outside ROOT keep their absolute path."
   ;; Guard: package resolution failure returns a typed marker.
   (let ((pkg-check
           (when (and package (stringp package) (plusp (length package)))
@@ -292,7 +314,7 @@ fall back to any entry when no path-bearing entries exist."
             (let* ((pathname (and path-fn (funcall path-fn src)))
                    (offset   (and offset-fn (funcall offset-fn src)))
                    (line     (%offset->line pathname offset))
-                   (path     (%normalize-path pathname)))
+                   (path     (%normalize-path pathname root)))
               (when (and path line)
                 (push (list :path path :line line
                             :kind (string-downcase (symbol-name kind)))
@@ -306,7 +328,7 @@ fall back to any entry when no path-bearing entries exist."
                      (offset   (and offset-fn (funcall offset-fn src)))
                      (line     (or (%offset->line pathname offset)
                                    (when pathname 1)))
-                     (path     (%normalize-path pathname)))
+                     (path     (%normalize-path pathname root)))
                 (when (and path line)
                   (push (list :path path :line line
                               :kind (string-downcase (symbol-name kind)))
@@ -415,12 +437,15 @@ Returns T when PROJECT-ROOT is NIL (no filter when root not set)."
          (and ns root-ns
               (uiop:string-prefix-p root-ns ns))))))
 
-(defun code-find-references (symbol-name &key package (project-only t) relation)
+(defun code-find-references (symbol-name &key package (project-only t) relation root)
   "Return a list of reference plists for SYMBOL-NAME.
 Each plist: (:path PATH :line LINE :caller CALLER-STRING :relation RELATION-STRING).
 RELATION optionally restricts to a single relation name (\"calls\", \"references\",
 \"binds\", \"sets\", \"macroexpands\").
-PROJECT-ONLY (default T) restricts results to paths under *project-root* (when set).
+PROJECT-ONLY (default T) restricts results to paths under ROOT when ROOT is non-NIL.
+When ROOT is NIL, PROJECT-ONLY has no effect (all paths returned).
+ROOT, when non-NIL, also causes path values to be project-relative for files under
+ROOT; files outside ROOT keep their absolute path.
 Returns a typed not-found marker plist when the package or symbol is absent."
   ;; Package guard.
   (when (and package (stringp package) (plusp (length package)))
@@ -458,12 +483,7 @@ Returns a typed not-found marker plist when the package or symbol is absent."
                         all-finders))
            (path-fn    (and pkg (find-symbol "DEFINITION-SOURCE-PATHNAME" pkg)))
            (offset-fn  (and pkg (find-symbol "DEFINITION-SOURCE-CHARACTER-OFFSET" pkg)))
-           (seen (make-hash-table :test #'equal))
-           ;; Retrieve the project root binding if available.
-           (project-root (ignore-errors
-                           (symbol-value
-                            (find-symbol "*PROJECT-ROOT*"
-                                         (find-package :dsmr-mcp/src/project-root))))))
+           (seen (make-hash-table :test #'equal)))
       (dolist (finder-name finders)
         (let ((fn (and pkg (find-symbol finder-name pkg))))
           (when fn
@@ -474,12 +494,12 @@ Returns a typed not-found marker plist when the package or symbol is absent."
                   (let* ((pathname   (and path-fn   (funcall path-fn   definition)))
                          (offset     (and offset-fn (funcall offset-fn definition)))
                          (line       (%offset->line pathname offset))
-                         (path       (%normalize-path pathname))
+                         (path       (%normalize-path pathname root))
                          (caller-str (%format-xref-caller caller-name))
                          (rel-str    (%finder->relation finder-name)))
                     (when (and path line
                                (or (not project-only)
-                                   (%path-inside-project-p pathname project-root)))
+                                   (%path-inside-project-p pathname root)))
                       (let ((key (format nil "~A:~A:~A:~A"
                                          path line rel-str
                                          (or caller-str ""))))
@@ -501,10 +521,13 @@ Returns a typed not-found marker plist when the package or symbol is absent."
 ;;;; (see %build-code-describe-form below).
 ;;;; ---------------------------------------------------------------------------
 
-(defun code-describe-symbol (symbol-name &key package)
+(defun code-describe-symbol (symbol-name &key package root)
   "Return a plist of symbol metadata for the hermetic path.
 Plist keys: :name :type :arglist :doc :path :line.
-Returns a typed not-found marker plist when the package or symbol is absent."
+Returns the typed not-found marker plist when the package or symbol is absent.
+ROOT, when non-NIL, causes the path value to be project-relative for files under
+ROOT (threaded through to code-find-definition); files outside ROOT keep their
+absolute path."
   ;; Package guard.
   (when (and package (stringp package) (plusp (length package)))
     (unless (find-package (string-upcase package))
@@ -580,8 +603,8 @@ Returns a typed not-found marker plist when the package or symbol is absent."
                  ((boundp sym)  (documentation sym 'variable))
                  (class         (documentation sym 'type))
                  (t             nil)))
-             ;; Reuse code-find-definition for location.
-             (locs (ignore-errors (code-find-definition symbol-name :package package)))
+             ;; Reuse code-find-definition for location; pass root for relativization.
+             (locs (ignore-errors (code-find-definition symbol-name :package package :root root)))
              (first-loc (and (consp locs) (listp (car locs)) (car locs)))
              (path (and first-loc (getf first-loc :path)))
              (line (and first-loc (getf first-loc :line))))
@@ -606,10 +629,13 @@ Returns a typed not-found marker plist when the package or symbol is absent."
 ;;;;   3. Coerce every string leaving the form: (map 'string #'identity s).
 ;;;; ---------------------------------------------------------------------------
 
-(defun %build-code-find-form (symbol-name package-name)
+(defun %build-code-find-form (symbol-name package-name &optional root-namestring)
   "Build an injected form that locates all definitions for SYMBOL-NAME in the
 attached image using sb-introspect. Returns a list of (:path PATH :line LINE
 :kind KIND) plists, or a typed not-found plist.
+ROOT-NAMESTRING, when non-NIL, is a namestring for the session project root;
+paths under that root are returned relative (no leading separator); paths outside
+it are returned absolute.
 Uses CL-USER symbol hygiene; no loop; coerces all strings."
   (flet ((cs (n) (intern n (find-package :common-lisp-user))))
     (let ((s-pkg       (cs "%DSMR-CODE-PKG"))
@@ -691,11 +717,25 @@ Uses CL-USER symbol hygiene; no loop; coerces all strings."
                                        (t (return)))))
                                  (1+ (count #\Newline ,s-content
                                             :end (min ,s-i ,s-len)))))))
-                         (,s-path (and ,s-pn
-                                       (ignore-errors
-                                         (map 'string #'identity
-                                              (namestring
-                                               (translate-logical-pathname ,s-pn)))))))
+                         ;; Relativize path when root-namestring is baked in.
+                         (,s-path
+                           (and ,s-pn
+                             (ignore-errors
+                               (let* ((%pn-tr  (translate-logical-pathname ,s-pn))
+                                      (%pn-res (or (handler-case (truename %pn-tr)
+                                                     (file-error () nil))
+                                                   %pn-tr)))
+                                 (map 'string #'identity
+                                      (if ,root-namestring
+                                          (let* ((%rdir (uiop:ensure-directory-pathname
+                                                         ,root-namestring))
+                                                 (%rel  (ignore-errors
+                                                          (uiop:enough-pathname
+                                                           %pn-res %rdir))))
+                                            (if %rel
+                                                (uiop:native-namestring %rel)
+                                                (namestring %pn-tr)))
+                                          (namestring %pn-tr))))))))
                     (when (and ,s-path ,s-line)
                       (push (list :path ,s-path :line ,s-line
                                   :kind (map 'string #'identity
@@ -713,11 +753,16 @@ Uses CL-USER symbol hygiene; no loop; coerces all strings."
                      :name (map 'string #'identity ,symbol-name)
                      :hint "Symbol not found. Try load-system or clgrep-search.")))))))))
 
-(defun %build-code-describe-form (symbol-name package-name)
+(defun %build-code-describe-form (symbol-name package-name &optional root-namestring)
   "Build an injected form that describes SYMBOL-NAME in the attached image using
 Slynk's describe-symbol and operator-arglist. Returns a list of two strings:
 the describe output and the arglist string (either may be NIL).
+ROOT-NAMESTRING is accepted for signature consistency with the other form builders
+but is not used here: the attached code-describe path returns path=\"\" (Slynk's
+describe output contains no path field); the hermetic path relativizes via
+code-describe-symbol calling code-find-definition with :root.
 Uses CL-USER symbol hygiene; coerces all strings."
+  (declare (ignore root-namestring))
   (flet ((cs (n) (intern n (find-package :common-lisp-user))))
     (let ((s-desc (cs "%DSMR-CODE-DESC"))
           (s-args (cs "%DSMR-CODE-ARGS")))
@@ -726,10 +771,15 @@ Uses CL-USER symbol hygiene; coerces all strings."
          (list (and ,s-desc (map 'string #'identity ,s-desc))
                (and ,s-args (map 'string #'identity ,s-args)))))))
 
-(defun %build-code-find-refs-form (symbol-name package-name project-only)
+(defun %build-code-find-refs-form (symbol-name package-name project-only
+                                   &optional root-namestring)
   "Build an injected form that returns xref references for SYMBOL-NAME in the
 attached image using sb-introspect who-calls/who-references/etc.
-PROJECT-ONLY (T/NIL) restricts results to paths under the project root.
+PROJECT-ONLY (T/NIL) restricts results to paths under the session project root.
+ROOT-NAMESTRING, when non-NIL, is a namestring for the session project root;
+paths under that root are returned relative (no leading separator) and the
+project_only filter keys off that root. When NIL, project_only has no effect
+and paths remain absolute.
 Returns a list of (:path PATH :line LINE :caller CALLER :relation RELATION) plists,
 or a typed not-found plist. Uses CL-USER symbol hygiene; no loop; coerces strings."
   (flet ((cs (n) (intern n (find-package :common-lisp-user))))
@@ -753,7 +803,6 @@ or a typed not-found plist. Uses CL-USER symbol hygiene; no loop; coerces string
           (s-cstr      (cs "%DSMR-CODE-RCSTR"))
           (s-key       (cs "%DSMR-CODE-RKEY"))
           (s-rel       (cs "%DSMR-CODE-RREL"))
-          (s-root      (cs "%DSMR-CODE-RROOT"))
           (s-content   (cs "%DSMR-CODE-RCONT"))
           (s-len       (cs "%DSMR-CODE-RLEN"))
           (s-start     (cs "%DSMR-CODE-RSTART"))
@@ -774,11 +823,7 @@ or a typed not-found plist. Uses CL-USER symbol hygiene; no loop; coerces string
               (,s-finders '("WHO-CALLS" "WHO-MACROEXPANDS" "WHO-BINDS"
                             "WHO-REFERENCES" "WHO-SETS"))
               (,s-results nil)
-              (,s-seen   (make-hash-table :test 'equal))
-              (,s-root   (ignore-errors
-                           (symbol-value
-                            (find-symbol "*PROJECT-ROOT*"
-                                         (find-package :dsmr-mcp/src/project-root))))))
+              (,s-seen   (make-hash-table :test 'equal)))
          (cond
            ((and ,package-name (not ,s-pkg))
             (list :not-found :package :name (map 'string #'identity ,package-name)
@@ -821,11 +866,25 @@ or a typed not-found plist. Uses CL-USER symbol hygiene; no loop; coerces string
                                              (t (return)))))
                                        (1+ (count #\Newline ,s-content
                                                   :end (min ,s-i ,s-len)))))))
-                               (,s-path (and ,s-pn
-                                             (ignore-errors
-                                               (map 'string #'identity
-                                                    (namestring
-                                                     (translate-logical-pathname ,s-pn))))))
+                               ;; Relativize path when root-namestring is baked in.
+                               (,s-path
+                                 (and ,s-pn
+                                   (ignore-errors
+                                     (let* ((%pn-tr  (translate-logical-pathname ,s-pn))
+                                            (%pn-res (or (handler-case (truename %pn-tr)
+                                                           (file-error () nil))
+                                                         %pn-tr)))
+                                       (map 'string #'identity
+                                            (if ,root-namestring
+                                                (let* ((%rdir (uiop:ensure-directory-pathname
+                                                               ,root-namestring))
+                                                       (%rel  (ignore-errors
+                                                                (uiop:enough-pathname
+                                                                 %pn-res %rdir))))
+                                                  (if %rel
+                                                      (uiop:native-namestring %rel)
+                                                      (namestring %pn-tr)))
+                                                (namestring %pn-tr)))))))
                                (,s-cstr
                                  ;; Simplified caller formatting inline.
                                  (when ,s-cname
@@ -845,14 +904,21 @@ or a typed not-found plist. Uses CL-USER symbol hygiene; no loop; coerces string
                                         ((string= ,s-finder "WHO-REFERENCES")   "references")
                                         ((string= ,s-finder "WHO-SETS")         "sets")
                                         (t "unknown")))))
-                          ;; Project-only filter.
+                          ;; Project-only filter: when root-namestring is present, use it
+                          ;; as the filter root; when absent, no filtering occurs.
                           (when (and ,s-path ,s-line
                                      (or (not ,project-only)
-                                         (not ,s-root)
+                                         (not ,root-namestring)
                                          (uiop:string-prefix-p
                                           (namestring
-                                           (uiop:ensure-directory-pathname ,s-root))
-                                          ,s-path)))
+                                           (uiop:ensure-directory-pathname ,root-namestring))
+                                          ;; Compare against the absolute path for filtering,
+                                          ;; even when the displayed path is relative.
+                                          (let* ((%pn-tr2 (translate-logical-pathname ,s-pn))
+                                                 (%pn-res2 (or (handler-case (truename %pn-tr2)
+                                                                 (file-error () nil))
+                                                               %pn-tr2)))
+                                            (namestring %pn-res2)))))
                             (let ((,s-key (format nil "~A:~A:~A:~A"
                                                   ,s-path ,s-line ,s-rel
                                                   (or ,s-cstr ""))))
