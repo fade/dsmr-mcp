@@ -357,9 +357,14 @@ test sub-systems in a package-inferred layout."
 
 (defun %parachute-extract-failures (result-obj)
   "Walk a Parachute test-result tree and collect failure details for each
-:failed leaf result.  Returns a list of make-failure-detail hash-tables."
+:failed leaf result.  Returns a list of make-failure-detail hash-tables.
+
+Parent result nodes carry the test name symbol as the NAME of their expression
+(a PARACHUTE:TEST object).  That symbol is propagated down to leaf failures so
+source locations are populated for file-defined tests even when the leaf's own
+expression is an assertion form rather than a test object."
   (let ((failures nil))
-    (labels ((walk (r)
+    (labels ((walk (r parent-test-sym)
                (let* ((pkg (find-package :org.shirakumo.parachute))
                       (status-fn  (and pkg (find-symbol "STATUS" pkg)))
                       (results-fn (and pkg (find-symbol "RESULTS" pkg)))
@@ -369,21 +374,34 @@ test sub-systems in a package-inferred layout."
                       (children (ignore-errors
                                   (and results-fn (funcall results-fn r)))))
                  (if (and children (plusp (length children)))
-                     ;; Parent result: recurse.
-                     (dotimes (i (length children))
-                       (walk (aref children i)))
-                     ;; Leaf result.
+                     ;; Parent result: extract this node's test symbol (when its
+                     ;; expression has a non-nil symbol name) and pass it into
+                     ;; children so leaf failures can report the containing test.
+                     (let* ((expr (and expr-fn (ignore-errors (funcall expr-fn r))))
+                            (node-name (and expr name-fn
+                                            (ignore-errors (funcall name-fn expr))))
+                            (node-test-sym (if (and node-name (symbolp node-name))
+                                               node-name
+                                               parent-test-sym)))
+                       (dotimes (i (length children))
+                         (walk (aref children i) node-test-sym)))
+                     ;; Leaf result: record if failed.
                      (when (eq status :failed)
                        (let* ((expr     (and expr-fn (ignore-errors (funcall expr-fn r))))
-                              ;; expr may be the test object or a symbol/form.
+                              (leaf-name (and expr name-fn
+                                              (ignore-errors (funcall name-fn expr))))
+                              ;; Prefer a non-nil symbol from the leaf itself; fall
+                              ;; back to the nearest ancestor test symbol.
+                              (effective-sym (cond
+                                               ((and leaf-name (symbolp leaf-name)) leaf-name)
+                                               (t parent-test-sym)))
                               (test-name (cond
-                                           ((and expr name-fn
-                                                 (ignore-errors (funcall name-fn expr)))
-                                            (ignore-errors (funcall name-fn expr)))
+                                           (effective-sym
+                                            (princ-to-string effective-sym))
                                            (expr (princ-to-string expr))
                                            (t "unknown")))
-                              (source (when (symbolp test-name)
-                                        (%test-source-location test-name)))
+                              (source (when effective-sym
+                                        (%test-source-location effective-sym)))
                               (reason-str (ignore-errors
                                             (let* ((fmt-fn (find-symbol "FORMAT-RESULT"
                                                                         :org.shirakumo.parachute))
@@ -391,13 +409,11 @@ test sub-systems in a package-inferred layout."
                                               (and fmt-fn
                                                    (funcall fmt-fn r ext-kw))))))
                          (push (make-failure-detail
-                                :test-name (if (stringp test-name)
-                                               test-name
-                                               (princ-to-string test-name))
+                                :test-name test-name
                                 :reason (or reason-str "failed")
                                 :source source)
                                failures)))))))
-      (walk result-obj))
+      (walk result-obj nil))
     (nreverse failures)))
 
 (defun %run-parachute-tests (system-name)
