@@ -79,74 +79,93 @@ tool arguments hash-table, or NIL when the client sent no arguments."
                               "Worker was reset after a crash. \
 In-image state has been lost. Retry your call.")))))
         ;; Name-based routing.
-        (if (string= name "inspect-object")
-            ;; ------------------------------------------------------------------
-            ;; inspect-object branch: epoch check + worker/inspect-object RPC.
-            ;; ------------------------------------------------------------------
-            (let* ((params      (or args (make-hash-table :test 'equal)))
-                   (id-string   (gethash "id" params)))
-              ;; Validate the id field is present.
-              (unless (and (stringp id-string) (plusp (length id-string)))
-                (return-from dispatch-hermetic-call
-                  (rpc-error id -32602
-                             "inspect-object: 'id' parameter is required.")))
-              ;; Decode the object id; malformed -> rpc-error -32602.
-              (multiple-value-bind (decoded-epoch decoded-session-id decoded-raw-id)
-                  (handler-case (decode-object-id id-string)
-                    (error (e)
-                      (return-from dispatch-hermetic-call
-                        (rpc-error id -32602
-                                   (format nil "inspect-object: malformed id: ~A" e)))))
-                (declare (ignore decoded-session-id))
-                ;; Worker-incarnation epoch check: compare the decoded epoch
-                ;; to (worker-id worker).  A mismatch means the object was
-                ;; registered against a previous worker incarnation and the
-                ;; registry has been reset.  Short-circuit BEFORE any RPC call.
-                (when (/= decoded-epoch (worker-id worker))
-                  (log-event :info "dispatch.inspect.stale-epoch"
-                             "session" *current-session-id*
-                             "decoded-epoch" decoded-epoch
-                             "worker-epoch" (worker-id worker))
-                  (return-from dispatch-hermetic-call
-                    (result id
-                            (make-ht "isError"    t
-                                     "error_type" "registry-reset"
-                                     "content"
-                                     (text-content
-                                      "Object registry was reset after a worker \
+        (cond
+          ;; ----------------------------------------------------------------
+          ;; inspect-object branch: epoch check + worker/inspect-object RPC.
+          ;; ----------------------------------------------------------------
+          ((string= name "inspect-object")
+           (let* ((params      (or args (make-hash-table :test 'equal)))
+                  (id-string   (gethash "id" params)))
+             ;; Validate the id field is present.
+             (unless (and (stringp id-string) (plusp (length id-string)))
+               (return-from dispatch-hermetic-call
+                 (rpc-error id -32602
+                            "inspect-object: 'id' parameter is required.")))
+             ;; Decode the object id; malformed -> rpc-error -32602.
+             (multiple-value-bind (decoded-epoch decoded-session-id decoded-raw-id)
+                 (handler-case (decode-object-id id-string)
+                   (error (e)
+                     (return-from dispatch-hermetic-call
+                       (rpc-error id -32602
+                                  (format nil "inspect-object: malformed id: ~A" e)))))
+               (declare (ignore decoded-session-id))
+               ;; Worker-incarnation epoch check: compare the decoded epoch
+               ;; to (worker-id worker).  A mismatch means the object was
+               ;; registered against a previous worker incarnation and the
+               ;; registry has been reset.  Short-circuit BEFORE any RPC call.
+               (when (/= decoded-epoch (worker-id worker))
+                 (log-event :info "dispatch.inspect.stale-epoch"
+                            "session" *current-session-id*
+                            "decoded-epoch" decoded-epoch
+                            "worker-epoch" (worker-id worker))
+                 (return-from dispatch-hermetic-call
+                   (result id
+                           (make-ht "isError"    t
+                                    "error_type" "registry-reset"
+                                    "content"
+                                    (text-content
+                                     "Object registry was reset after a worker \
 crash; the object id is no longer valid.")))))
-                ;; Epoch matches: forward only the raw integer id to the worker.
-                ;; Strip the epoch and session-id; the worker owns only raw ids.
-                (let* ((worker-params (make-hash-table :test 'equal)))
-                  (setf (gethash "id" worker-params) decoded-raw-id)
-                  ;; Forward optional max_depth / max_elements if provided.
-                  (let ((max-depth     (gethash "max_depth" params))
-                        (max-elements  (gethash "max_elements" params)))
-                    (when max-depth
-                      (setf (gethash "max_depth" worker-params) max-depth))
-                    (when max-elements
-                      (setf (gethash "max_elements" worker-params) max-elements)))
-                  (let ((resp (pool-rpc-with-hard-kill worker "worker/inspect-object"
-                                                       worker-params
-                                                       :soft-timeout *default-eval-timeout*)))
-                    (result id resp)))))
-            ;; ------------------------------------------------------------------
-            ;; Default branch: worker/eval (repl-eval and any future verbs).
-            ;; Pass args directly as worker/eval params — the handler reads
-            ;; "code"/"package"/"timeout_seconds"/"max_output_length" from the
-            ;; top-level params hash-table (not nested under "arguments").
-            ;; Route through pool-rpc-with-hard-kill so the parent hard-kill
-            ;; backstop covers runaway FFI that the in-worker soft timeout
-            ;; cannot interrupt.
-            ;; ------------------------------------------------------------------
-            (let* ((params (or args (make-hash-table :test 'equal)))
-                   (soft   (let ((v (gethash "timeout_seconds" params)))
-                             (if (and v (integerp v) (plusp v))
-                                 v
-                                 *default-eval-timeout*)))
-                   (resp   (pool-rpc-with-hard-kill worker "worker/eval" params
-                                                    :soft-timeout soft)))
-              (result id resp))))
+               ;; Epoch matches: forward only the raw integer id to the worker.
+               ;; Strip the epoch and session-id; the worker owns only raw ids.
+               (let* ((worker-params (make-hash-table :test 'equal)))
+                 (setf (gethash "id" worker-params) decoded-raw-id)
+                 ;; Forward optional max_depth / max_elements if provided.
+                 (let ((max-depth     (gethash "max_depth" params))
+                       (max-elements  (gethash "max_elements" params)))
+                   (when max-depth
+                     (setf (gethash "max_depth" worker-params) max-depth))
+                   (when max-elements
+                     (setf (gethash "max_elements" worker-params) max-elements)))
+                 (let ((resp (pool-rpc-with-hard-kill worker "worker/inspect-object"
+                                                      worker-params
+                                                      :soft-timeout *default-eval-timeout*)))
+                   (result id resp))))))
+          ;; ----------------------------------------------------------------
+          ;; Code-intelligence branch: route to worker/<name> directly.
+          ;; No object-ID epoch check — these verbs carry no object IDs.
+          ;; The name list is open for extension (07-03/07-04 will add
+          ;; load-system and run-tests to the same arm).
+          ;; ----------------------------------------------------------------
+          ((member name '("code-find" "code-describe" "code-find-references")
+                   :test #'string=)
+           (let* ((params (or args (make-hash-table :test 'equal)))
+                  (soft   (let ((v (gethash "timeout_seconds" params)))
+                            (if (and v (integerp v) (plusp v))
+                                v *default-eval-timeout*)))
+                  (resp   (pool-rpc-with-hard-kill worker
+                                                   (format nil "worker/~A" name)
+                                                   params
+                                                   :soft-timeout soft)))
+             (result id resp)))
+          ;; ----------------------------------------------------------------
+          ;; Default branch: worker/eval (repl-eval and any future verbs).
+          ;; Pass args directly as worker/eval params — the handler reads
+          ;; "code"/"package"/"timeout_seconds"/"max_output_length" from the
+          ;; top-level params hash-table (not nested under "arguments").
+          ;; Route through pool-rpc-with-hard-kill so the parent hard-kill
+          ;; backstop covers runaway FFI that the in-worker soft timeout
+          ;; cannot interrupt.
+          ;; ----------------------------------------------------------------
+          (t
+           (let* ((params (or args (make-hash-table :test 'equal)))
+                  (soft   (let ((v (gethash "timeout_seconds" params)))
+                            (if (and v (integerp v) (plusp v))
+                                v
+                                *default-eval-timeout*)))
+                  (resp   (pool-rpc-with-hard-kill worker "worker/eval" params
+                                                   :soft-timeout soft)))
+             (result id resp)))))
     (worker-crashed (e)
       (log-event :error "dispatch.worker-crashed"
                  "session" *current-session-id*
