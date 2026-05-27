@@ -5,7 +5,7 @@
 ;;;; hermetic worker handler.
 ;;;;
 ;;;; Provides:
-;;;;   detect-test-framework   — D-07 ASDF-deps-first framework detection.
+;;;;   detect-test-framework   — ASDF-deps-first framework detection.
 ;;;;   run-tests               — in-process entry point (hermetic path).
 ;;;;   %build-run-tests-form   — builds the sexp injected into the attached
 ;;;;                             image (attached path).
@@ -136,7 +136,7 @@ Fields: test_name (required), plus optional description, form, values, reason, s
 ;;; ---------------------------------------------------------------------------
 ;;; Framework Detection
 ;;;
-;;; D-07 precedence: explicit arg > ASDF :depends-on closure > loaded-package
+;;; precedence: explicit arg > ASDF :depends-on closure > loaded-package
 ;;; heuristic. The ASDF-deps walk is preferred over the loaded-package heuristic
 ;;; because a long-lived attached image may have several test frameworks loaded
 ;;; simultaneously (e.g., Parachute from dsmr's own suite AND Rove from a

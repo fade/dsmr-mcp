@@ -6,14 +6,14 @@
 ;;;; and the tool directly, proving hermetic path behaviors.
 ;;;;
 ;;;; Coverage:
-;;;;   detect-framework-prefers-asdf-deps      — D-07: ASDF :depends-on walk
+;;;;   detect-framework-prefers-asdf-deps      — ASDF :depends-on walk
 ;;;;                                             precedes loaded-package heuristic;
 ;;;;                                             explicit arg is honored.
-;;;;   run-tests-parachute-returns-structured-counts — D-08: Parachute extractor
+;;;;   run-tests-parachute-returns-structured-counts — Parachute extractor
 ;;;;                                             produces passed/failed/pending
 ;;;;                                             counts and a failed_tests entry
 ;;;;                                             with source location.
-;;;;   run-tests-ghost-purge-drops-deleted-test  — D-09: a purged test is absent
+;;;;   run-tests-ghost-purge-drops-deleted-test  — a purged test is absent
 ;;;;                                             from the index after
 ;;;;                                             %parachute-purge-ghost-suites.
 ;;;;   run-tests-inline-returns-mode-error      — :inline mode returns -32603.
@@ -52,7 +52,7 @@
 ;;; ---------------------------------------------------------------------------
 ;;; detect-framework-prefers-asdf-deps
 ;;;
-;;; D-07: ASDF :depends-on closure walk must take precedence over the
+;;; ASDF :depends-on closure walk must take precedence over the
 ;;; loaded-package heuristic. dsmr-mcp/tests depends on parachute via ASDF,
 ;;; so detect-test-framework must return :parachute for it even in an image
 ;;; that may also have other test frameworks loaded.
@@ -74,7 +74,7 @@ ASDF :depends-on closure, not by loaded-package heuristic. An explicit
 ;;; ---------------------------------------------------------------------------
 ;;; run-tests-parachute-returns-structured-counts
 ;;;
-;;; D-08: Running a tiny Parachute suite through the core's extractor returns
+;;; Running a tiny Parachute suite through the core's extractor returns
 ;;; the uniform envelope with passed/failed counts and at least one failed_tests
 ;;; entry with a source location (criterion 3).
 ;;;
@@ -85,7 +85,7 @@ ASDF :depends-on closure, not by loaded-package heuristic. An explicit
 (define-test run-tests-parachute-returns-structured-counts
   "The Parachute extractor produces passed/failed/pending counts and a
 failed_tests entry with a source location for a deliberately failing test.
-Exercises the D-08 uniform envelope and criterion 3 source-location reporting."
+Exercises the uniform envelope and criterion 3 source-location reporting."
   ;; Define a throwaway two-test suite in the scratch package.
   (let* ((scratch-pkg (find-package :dsmr-scratch-runner-tests))
          (parachute-pkg (find-package :org.shirakumo.parachute))
@@ -134,7 +134,7 @@ Exercises the D-08 uniform envelope and criterion 3 source-location reporting."
 ;;; ---------------------------------------------------------------------------
 ;;; run-tests-ghost-purge-drops-deleted-test
 ;;;
-;;; D-09: After registering a Parachute test in the scratch package, calling
+;;; After registering a Parachute test in the scratch package, calling
 ;;; %parachute-purge-ghost-suites must remove all tests from that package's
 ;;; registry so a subsequent run does not see the purged test.
 ;;; ---------------------------------------------------------------------------
