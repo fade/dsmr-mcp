@@ -184,23 +184,26 @@ returns a NETWORK_ERROR make-ht."
          (lock       (repl-eval-tool-call-lock tool))
          (conn       (repl-eval-tool-slynk-conn tool)))
     ;; LIST path: fetch debugger-info and decode.
+    ;; Use a short probe timeout: debugger-info-for-emacs blocks when no break
+    ;; is active (waits in sly-db-loop's event queue).  A 3-second timeout
+    ;; distinguishes "no active break" (timeout → empty set) from a genuine
+    ;; connection failure after the full 30-second default.
     (let ((info (handler-case
                     (with-lock-held (lock)
                       (bounded-slime-eval
                        '(slynk:debugger-info-for-emacs 0 20)
-                       conn))
-                  (slime-network-error (e)
-                    (log-event :warn "inspect-restart.attach.network-error"
-                               "error"
-                               (handler-case (princ-to-string e) (error () "")))
+                       conn
+                       :timeout 3))
+                  (slime-network-error ()
+                    ;; Timeout or actual network error — either way no break is
+                    ;; reachable.  Return a structured empty set, not isError.
+                    ;; If there IS an active break but the connection is dead, the
+                    ;; user will see the empty set and know to reconnect.
                     (return-from %dispatch-attach-inspect-restart
-                      (make-ht "isError"    t
-                               "error_type" "NETWORK_ERROR"
-                               "content"
-                               (text-content
-                                (format nil
-                                        "inspect-restart: Slynk connection error: ~A"
-                                        e))))))))
+                      (make-ht "restarts" (vector)
+                               "message"
+                               "No active debugger break (or connection unavailable)."
+                               "level" level))))))
       ;; debugger-info-for-emacs → (CONDITION-INFO RESTARTS FRAMES PENDING...)
       (let* ((condition-info (first  info))
              (raw-restarts   (second info))

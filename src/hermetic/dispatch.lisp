@@ -179,10 +179,11 @@ crash; the object id is no longer valid.")))))
                                                      :soft-timeout soft)))
                (result id resp)))
             ;; ----------------------------------------------------------------
-            ;; inspect-thread branch: route to worker/inspect-thread.
+            ;; Inspection-verb branch: route to worker/<name>.
             ;; No epoch check, no project_root injection.
+            ;; inspect-restart returns a structured empty set in hermetic mode.
             ;; ----------------------------------------------------------------
-            ((member name '("inspect-thread")
+            ((member name '("inspect-thread" "inspect-restart")
                      :test #'string=)
              (let* ((params (or args (make-hash-table :test 'equal)))
                     (soft   (let ((v (gethash "timeout_seconds" params)))

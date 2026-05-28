@@ -458,6 +458,16 @@ REGISTRY is accepted but ignored — thread enumeration needs no registry."
                        (all-threads))))
     (make-ht "threads" (coerce threads 'simple-vector))))
 
+(defun %handle-inspect-restart (params registry)
+  "Return a structured empty restart set for the hermetic worker.
+No interactive debugger break exists in a fresh hermetic worker, so this
+handler always returns an empty 'restarts' vector with an explanatory message.
+This is correct behaviour, not an error — the verb is valid, it simply has
+no active restarts to surface."
+  (declare (ignore params registry))
+  (make-ht "restarts" (vector)
+           "message"  "No active debugger break in hermetic mode."))
+
 (defun register-all-handlers (server registry)
   "Register all worker method handlers on SERVER.
 REGISTRY is the per-worker object-registry instance; it is closed over by
@@ -471,7 +481,8 @@ Registered methods:
   worker/code-find-references  — find xref callers/references for a symbol
   worker/load-system           — load an ASDF system with force/timeout/warning capture
   worker/run-tests             — run tests with framework detection and ghost-purge
-  worker/inspect-thread        — enumerate worker threads with optional backtrace"
+  worker/inspect-thread        — enumerate worker threads with optional backtrace
+  worker/inspect-restart        — return structured empty restart set (no break in worker)"
   (register-method server "worker/eval"
                    (lambda (params) (%handle-eval params registry)))
   (register-method server "worker/inspect-object"
@@ -488,5 +499,7 @@ Registered methods:
                    (lambda (params) (%handle-run-tests params registry)))
   (register-method server "worker/inspect-thread"
                    (lambda (params) (%handle-inspect-thread params registry)))
-  (log-event :info "worker.handlers.registered" "count" 8)
+  (register-method server "worker/inspect-restart"
+                   (lambda (params) (%handle-inspect-restart params registry)))
+  (log-event :info "worker.handlers.registered" "count" 9)
   server)
