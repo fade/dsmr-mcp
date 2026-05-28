@@ -218,6 +218,18 @@ returns a NETWORK_ERROR make-ht."
                                "No active debugger break (or connection unavailable)."
                                "level" level))))))
       ;; debugger-info-for-emacs → (CONDITION-INFO RESTARTS FRAMES PENDING...)
+      ;; CONDITION-INFO is documented as (message type extras) on current
+      ;; Slynk but the contract has shifted historically (older SLIME
+      ;; swank:debugger-info-for-emacs returned 2-tuples).  Log a warn
+      ;; breadcrumb when the shape is anything other than a 2+-element cons
+      ;; so a future shape change in Slynk does not silently degrade the
+      ;; "" fallbacks below.
+      (let ((condition-info (first info)))
+        (when (and condition-info
+                   (not (and (consp condition-info) (cdr condition-info))))
+          (log-event :warn "inspect-restart.unexpected-condition-shape"
+                     "shape" (handler-case (princ-to-string condition-info)
+                               (error () "<unprintable>")))))
       (let* ((condition-info (first  info))
              (raw-restarts   (second info))
              (restarts-vec   (if (and (listp raw-restarts) raw-restarts)
