@@ -1191,7 +1191,8 @@ Returns one of:
             (s-dur     (cs "%DSMR-RUNNER-DUR"))
             (s-fails   (cs "%DSMR-RUNNER-FAILS"))
             (s-pkg     (cs "%DSMR-RUNNER-PKG"))
-            (s-testfn  (cs "%DSMR-RUNNER-TESTFN")))
+            (s-testfn  (cs "%DSMR-RUNNER-TESTFN"))
+            (s-e       (cs "%DSMR-RUNNER-E")))
         `(handler-case
              (sb-ext:with-timeout ,effective-timeout
                (let ((,s-sys ,system-name))
@@ -1232,5 +1233,5 @@ Returns one of:
                                          "test-runner-core not loaded in attached image; use hermetic mode"))))))
            (sb-ext:timeout ()
              (list :timeout ,effective-timeout))
-           (error (e)
-             (list :error (map 'string #'identity (princ-to-string e)))))))))
+           (error (,s-e)
+             (list :error (map 'string #'identity (princ-to-string ,s-e)))))))))

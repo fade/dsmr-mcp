@@ -30,6 +30,7 @@
                 #:detect-test-framework
                 #:%parachute-purge-ghost-suites
                 #:run-tests
+                #:%build-run-tests-form
                 #:*test-debug-output*)
   (:import-from #:dsmr-mcp/src/tools/base
                 #:tool-handle)
@@ -334,3 +335,43 @@ No test run is attempted in inline mode."
       (true (hash-table-p err))
       (is = -32603 (gethash "code" err))
       (true (search "mode" (gethash "message" err))))))
+
+;;; ---------------------------------------------------------------------------
+;;; run-tests-injected-form-is-portable
+;;;
+;;; %build-run-tests-form is serialized and READ in the attached image, which
+;;; never has dsmr-mcp loaded. Any symbol interned in a DSMR-MCP-internal
+;;; package makes the remote READ fail ("Package ... does not exist") and aborts
+;;; the run with a reader-error / NETWORK_ERROR. Referencing the in-image
+;;; test-runner-core by KEYWORD package name (find-package :dsmr-mcp/src/...) is
+;;; the portable pattern — a keyword reads anywhere; an actual symbol interned
+;;; in a DSMR-MCP package (e.g. a stray handler-case error variable) is the
+;;; hazard. Pure structural guard; the in-process fixture cannot catch it
+;;; because its target image shares dsmr-mcp's package namespace.
+;;; ---------------------------------------------------------------------------
+
+(defun %collect-symbols (form)
+  "Flat list of every symbol appearing in FORM (a tree of conses and atoms,
+descending into non-string vectors)."
+  (let ((acc '()))
+    (labels ((walk (x)
+               (cond ((and (symbolp x) x) (push x acc))
+                     ((consp x) (walk (car x)) (walk (cdr x)))
+                     ((and (vectorp x) (not (stringp x))) (map nil #'walk x)))))
+      (walk form))
+    acc))
+
+(defun %dsmr-package-leaks (form)
+  "Symbols in FORM whose home package name contains \"DSMR-MCP\" — symbols that
+cannot be READ in an attached image that does not have dsmr-mcp loaded."
+  (remove-duplicates
+   (remove-if-not
+    (lambda (s)
+      (let ((pkg (symbol-package s)))
+        (and pkg (search "DSMR-MCP" (package-name pkg)))))
+    (%collect-symbols form))))
+
+(define-test run-tests-injected-form-is-portable
+  "%build-run-tests-form must emit no symbol from a DSMR-MCP-internal package."
+  (is equal '() (%dsmr-package-leaks
+                 (%build-run-tests-form "alexandria" nil nil nil 300 t))))

@@ -208,3 +208,47 @@ No load is attempted in inline mode."
       (true (hash-table-p err))
       (is = -32603 (gethash "code" err))
       (true (search "mode" (gethash "message" err))))))
+
+;;; ---------------------------------------------------------------------------
+;;; load-system-injected-form-is-portable
+;;;
+;;; The form built by %build-load-system-form is serialized and READ in the
+;;; attached image, which has only the developer's own system + Slynk loaded —
+;;; never dsmr-mcp. Any symbol interned in a DSMR-MCP-internal package prints
+;;; package-qualified on the wire and makes the remote READ fail
+;;; ("Package ... does not exist"), surfacing as a reader-error / NETWORK_ERROR
+;;; that aborts the load before it runs. CL / CL-USER / KEYWORD / SB-EXT / ASDF
+;;; symbols all resolve in a real SBCL dev image; only DSMR-MCP-package symbols
+;;; are the hazard. The in-process Slynk fixture cannot catch this because its
+;;; target image IS the dsmr-mcp image, where the package exists — so this is a
+;;; pure structural guard on the emitted form, covering both the force-only and
+;;; the clear-fasls branches.
+;;; ---------------------------------------------------------------------------
+
+(defun %collect-symbols (form)
+  "Flat list of every symbol appearing in FORM (a tree of conses and atoms,
+descending into non-string vectors)."
+  (let ((acc '()))
+    (labels ((walk (x)
+               (cond ((and (symbolp x) x) (push x acc))
+                     ((consp x) (walk (car x)) (walk (cdr x)))
+                     ((and (vectorp x) (not (stringp x))) (map nil #'walk x)))))
+      (walk form))
+    acc))
+
+(defun %dsmr-package-leaks (form)
+  "Symbols in FORM whose home package name contains \"DSMR-MCP\" — symbols that
+cannot be READ in an attached image that does not have dsmr-mcp loaded."
+  (remove-duplicates
+   (remove-if-not
+    (lambda (s)
+      (let ((pkg (symbol-package s)))
+        (and pkg (search "DSMR-MCP" (package-name pkg)))))
+    (%collect-symbols form))))
+
+(define-test load-system-injected-form-is-portable
+  "%build-load-system-form must emit no symbol from a DSMR-MCP-internal package;
+such a symbol breaks the remote READ in a real attached image. Covers both the
+force-only and the clear-fasls branches."
+  (is equal '() (%dsmr-package-leaks (%build-load-system-form "alexandria" t nil 120)))
+  (is equal '() (%dsmr-package-leaks (%build-load-system-form "alexandria" t t   120))))
