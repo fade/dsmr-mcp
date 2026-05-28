@@ -411,9 +411,18 @@ and reload (boolean, default true) from PARAMS."
 
 (defun %handle-inspect-thread (params registry)
   "Enumerate threads in the worker process.
-Returns a make-ht with a 'threads' simple-vector of per-thread entries,
-each carrying 'name' and 'alive'.  When 'backtrace' is true, also captures
-the current thread's call stack (SBCL only) and includes it in every entry.
+Returns a make-ht with a 'threads' simple-vector of per-thread entries
+(each carrying 'name' and 'alive').  When 'backtrace' is true, the response
+also carries an 'eval_thread_frames' simple-vector at the top level — a
+single snapshot of the CURRENT thread's call stack on SBCL, an empty vector
+on #-sbcl.  The frames key is omitted entirely when backtrace was not
+requested, present (possibly empty) when it was.
+
+The frames are NOT attached to each per-thread entry because the same
+snapshot cannot honestly describe N different threads' stacks.  Earlier
+code repeated the frames vector into every entry, which actively misled
+callers reading result.threads[N].frames.
+
 Interrupting arbitrary worker threads is intentionally avoided.
 
 REGISTRY is accepted but ignored — thread enumeration needs no registry."
@@ -456,19 +465,19 @@ REGISTRY is accepted but ignored — thread enumeration needs no registry."
                                                     ((null   raw-name) "unnamed")
                                                     (t (princ-to-string
                                                         raw-name)))
-                                            (error () "unnamed")))
-                                (ht (make-ht
-                                     "name"  (map 'string #'identity name-str)
-                                     "alive" (if (handler-case
-                                                     (thread-alive-p thr)
-                                                   (error () nil))
-                                                 t nil))))
-                           (when cur-frames
-                             (setf (gethash "frames" ht)
-                                   (coerce cur-frames 'simple-vector)))
-                           ht))
-                       (all-threads))))
-    (make-ht "threads" (coerce threads 'simple-vector))))
+                                            (error () "unnamed"))))
+                           (make-ht
+                            "name"  (map 'string #'identity name-str)
+                            "alive" (if (handler-case
+                                            (thread-alive-p thr)
+                                          (error () nil))
+                                        t nil))))
+                       (all-threads)))
+         (ht          (make-ht "threads" (coerce threads 'simple-vector))))
+    (when backtrace-p
+      (setf (gethash "eval_thread_frames" ht)
+            (coerce (or cur-frames '()) 'simple-vector)))
+    ht))
 
 (defun %handle-inspect-restart (params registry)
   "Return a structured empty restart set for the hermetic worker.
