@@ -269,12 +269,31 @@ returns a NETWORK_ERROR make-ht."
                            ;; connection after a successful restart invoke.
                            ;; Treat this as expected — the break resolved.
                            :post-invoke-network-disconnect))))
-                 (declare (ignore invoke-result))
                  (return-from %dispatch-attach-inspect-restart
-                   (make-ht "invoked"  t
-                            "index"   resolved-idx
-                            "level"   level
-                            "message" "Restart invoked; the break may have resolved.")))))))
+                   (cond
+                     ((eq invoke-result :post-invoke-network-disconnect)
+                      ;; Break thread closed the connection — restart resolved.
+                      (make-ht "invoked" t
+                               "index"   resolved-idx
+                               "level"   level
+                               "message"
+                               "Restart invoked; break thread closed the \
+connection (expected on resolving restarts)."))
+                     (t
+                      ;; The slyfun returned a value rather than disconnecting.
+                      ;; A non-disconnect result can mean (a) the level did not
+                      ;; match *sly-db-level* — slynk silently no-ops, returning
+                      ;; nil; or (b) the restart did not unwind the break.
+                      ;; Surface the raw result so callers can distinguish a
+                      ;; resolving invoke from a no-op.
+                      (make-ht "invoked" t
+                               "index"   resolved-idx
+                               "level"   level
+                               "result"  (handler-case
+                                             (princ-to-string invoke-result)
+                                           (error () "<unprintable>"))
+                               "message"
+                               "Restart invoked; the break may have resolved.")))))))))
         ;; LIST path result: restarts were found, no invoke requested.
         (make-ht "restarts"  restarts-vec
                  "condition" condition-ht

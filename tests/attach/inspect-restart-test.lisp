@@ -207,6 +207,41 @@ Verifies no isError, message present, no unhandled condition."
                       (equal error-type "NETWORK_ERROR"))
                   "invoke result must not be an unexpected error type")))))))
 
+(defun %read-source-as-string (relative-path)
+  "Read a project source file into a single string for structural assertions."
+  (let ((src-path (asdf:system-relative-pathname :dsmr-mcp relative-path)))
+    (with-open-file (stream src-path :direction :input)
+      (let ((buf (make-string (file-length stream))))
+        (read-sequence buf stream)
+        buf))))
+
+(define-test invoke-path-distinguishes-disconnect-from-other-results
+  "%dispatch-attach-inspect-restart's invoke branch must distinguish a
+:post-invoke-network-disconnect (the break thread closed the connection on a
+resolving restart) from any other slyfun return value.  Earlier code ignored
+invoke-result entirely and reported invoked=t for every outcome — including
+slynk's silent no-op on a level mismatch.
+
+Asserts the contract by reading the source file and checking for the
+disconnect-vs-other cond branch plus the 'result' key carrying the raw
+non-disconnect outcome.  A structural assertion is the right granularity here:
+exercising the live invoke branch requires a real attached image with a break
+in the eval thread (manual-only carve-out), but the contract must not regress
+silently."
+  (let ((src (%read-source-as-string "src/tools/inspect-restart.lisp")))
+    (true (search ":post-invoke-network-disconnect" src)
+          "function must reference the post-invoke disconnect sentinel")
+    ;; The cond must distinguish disconnect from other results, surfacing the
+    ;; raw value under a 'result' key for the non-disconnect branch.  These
+    ;; substrings are present in the post-fix source.
+    (true (search "\"result\"" src)
+          "non-disconnect branch must surface raw result under 'result' key")
+    ;; Negative assertion: the ignore declaration that caused the silent-success
+    ;; bug must not return.
+    (false (search "(declare (ignore invoke-result))" src)
+           "invoke-result must not be declared ignored — that masked level \
+mismatches and other no-ops as success")))
+
 (define-test inspect-restart-hermetic-returns-empty-set
   "inspect-restart in hermetic mode returns a structured empty restart set
 (restarts length 0 and a message), not an isError."
