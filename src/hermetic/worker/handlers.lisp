@@ -42,6 +42,10 @@
                 #:make-ht
                 #:text-content)
   (:import-from #:dsmr-mcp/src/log #:log-event)
+  (:import-from #:bordeaux-threads
+                #:all-threads
+                #:thread-name
+                #:thread-alive-p)
   (:import-from #:sb-ext)
   (:import-from #:uiop)
   (:export #:register-all-handlers #:*default-eval-timeout*))
@@ -405,6 +409,55 @@ and reload (boolean, default true) from PARAMS."
                  :timeout-seconds timeout-seconds
                  :reload reload))))
 
+(defun %handle-inspect-thread (params registry)
+  "Enumerate threads in the worker process.
+Returns a make-ht with a 'threads' simple-vector of per-thread entries,
+each carrying 'name' and 'alive'.  When 'backtrace' is true, also captures
+the current thread's call stack (SBCL only) and includes it in every entry.
+Interrupting arbitrary worker threads is intentionally avoided.
+
+REGISTRY is accepted but ignored — thread enumeration needs no registry."
+  (declare (ignore registry))
+  (let* ((backtrace-p (gethash "backtrace" params))
+         (map-fn      #+sbcl
+                      (when backtrace-p
+                        (ignore-errors
+                          (fdefinition (find-symbol "MAP-BACKTRACE" "SB-DEBUG"))))
+                      #-sbcl nil)
+         (cur-frames  (when map-fn
+                        (let ((frames nil)
+                              (fidx   0)
+                              (fcap   20))
+                          (funcall map-fn
+                                   (lambda (frame)
+                                     (when (< fidx fcap)
+                                       (push (make-ht
+                                              "index"    fidx
+                                              "function" (or
+                                                          (ignore-errors
+                                                            (map 'string #'identity
+                                                                 (prin1-to-string
+                                                                  (sb-di:debug-fun-name
+                                                                   (sb-di:frame-debug-fun frame)))))
+                                                          "<unknown>"))
+                                             frames)
+                                       (incf fidx))))
+                          (nreverse frames))))
+         (threads     (mapcar
+                       (lambda (thr)
+                         (let ((ht (make-ht
+                                    "name"  (or (ignore-errors
+                                                  (map 'string #'identity
+                                                       (thread-name thr)))
+                                                "unnamed")
+                                    "alive" (if (thread-alive-p thr) t nil))))
+                           (when cur-frames
+                             (setf (gethash "frames" ht)
+                                   (coerce cur-frames 'simple-vector)))
+                           ht))
+                       (all-threads))))
+    (make-ht "threads" (coerce threads 'simple-vector))))
+
 (defun register-all-handlers (server registry)
   "Register all worker method handlers on SERVER.
 REGISTRY is the per-worker object-registry instance; it is closed over by
@@ -417,7 +470,8 @@ Registered methods:
   worker/code-describe         — describe a symbol's type/arglist/docstring
   worker/code-find-references  — find xref callers/references for a symbol
   worker/load-system           — load an ASDF system with force/timeout/warning capture
-  worker/run-tests             — run tests with framework detection and ghost-purge"
+  worker/run-tests             — run tests with framework detection and ghost-purge
+  worker/inspect-thread        — enumerate worker threads with optional backtrace"
   (register-method server "worker/eval"
                    (lambda (params) (%handle-eval params registry)))
   (register-method server "worker/inspect-object"
@@ -432,5 +486,7 @@ Registered methods:
                    (lambda (params) (%handle-load-system params registry)))
   (register-method server "worker/run-tests"
                    (lambda (params) (%handle-run-tests params registry)))
-  (log-event :info "worker.handlers.registered" "count" 7)
+  (register-method server "worker/inspect-thread"
+                   (lambda (params) (%handle-inspect-thread params registry)))
+  (log-event :info "worker.handlers.registered" "count" 8)
   server)

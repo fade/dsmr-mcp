@@ -59,6 +59,8 @@ Routes by NAME:
   \"load-system\" / \"run-tests\" -> worker method \"worker/<name>\" directly
     (no epoch check, no project_root injection — these verbs do not
     relativize paths).
+  \"inspect-thread\" -> worker method \"worker/inspect-thread\" directly
+    (no epoch check, no project_root injection).
   Any other name  -> worker method \"worker/eval\" (unchanged behaviour).
 
 Structured conditions are caught and returned as isError / rpc-error
@@ -166,6 +168,21 @@ crash; the object id is no longer valid.")))))
             ;; No epoch check, no project_root injection.
             ;; ----------------------------------------------------------------
             ((member name '("load-system" "run-tests")
+                     :test #'string=)
+             (let* ((params (or args (make-hash-table :test 'equal)))
+                    (soft   (let ((v (gethash "timeout_seconds" params)))
+                              (if (and v (integerp v) (plusp v))
+                                  v *default-eval-timeout*)))
+                    (resp   (pool-rpc-with-hard-kill worker
+                                                     (format nil "worker/~A" name)
+                                                     params
+                                                     :soft-timeout soft)))
+               (result id resp)))
+            ;; ----------------------------------------------------------------
+            ;; inspect-thread branch: route to worker/inspect-thread.
+            ;; No epoch check, no project_root injection.
+            ;; ----------------------------------------------------------------
+            ((member name '("inspect-thread")
                      :test #'string=)
              (let* ((params (or args (make-hash-table :test 'equal)))
                     (soft   (let ((v (gethash "timeout_seconds" params)))
