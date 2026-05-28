@@ -445,12 +445,24 @@ REGISTRY is accepted but ignored — thread enumeration needs no registry."
                           (nreverse frames))))
          (threads     (mapcar
                        (lambda (thr)
-                         (let ((ht (make-ht
-                                    "name"  (or (ignore-errors
-                                                  (map 'string #'identity
-                                                       (thread-name thr)))
-                                                "unnamed")
-                                    "alive" (if (thread-alive-p thr) t nil))))
+                         ;; Defensive name coercion: thread-name returns
+                         ;; whatever was passed to make-thread :name (a
+                         ;; symbol or any printable object is allowed).
+                         ;; Coerce to a string before placing on the wire
+                         ;; so (map 'string ...) cannot signal TYPE-ERROR.
+                         (let* ((raw-name (ignore-errors (thread-name thr)))
+                                (name-str (handler-case
+                                              (cond ((stringp raw-name) raw-name)
+                                                    ((null   raw-name) "unnamed")
+                                                    (t (princ-to-string
+                                                        raw-name)))
+                                            (error () "unnamed")))
+                                (ht (make-ht
+                                     "name"  (map 'string #'identity name-str)
+                                     "alive" (if (handler-case
+                                                     (thread-alive-p thr)
+                                                   (error () nil))
+                                                 t nil))))
                            (when cur-frames
                              (setf (gethash "frames" ht)
                                    (coerce cur-frames 'simple-vector)))

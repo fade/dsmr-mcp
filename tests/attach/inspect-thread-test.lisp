@@ -129,6 +129,49 @@ entry with a non-empty name and no isError."
             (let ((name (gethash "name" thr)))
               (true (and (stringp name) (plusp (length name)))))))))))
 
+(defun %make-fake-thread-name-form (fake-name)
+  "Return a sexp shaped like %build-attach-thread-form's per-thread inner
+let* + push, but with the thread-name call replaced by a constant FAKE-NAME.
+Lets the test exercise the form's name-coercion logic without depending on
+a bordeaux-threads implementation that accepts non-string :name arguments."
+  (flet ((cs (n) (intern n (find-package :common-lisp-user))))
+    (let ((s-nm-raw (cs "%DSMR-MCP-ATTACH-THR-NM-RAW"))
+          (s-nm     (cs "%DSMR-MCP-ATTACH-THR-NM")))
+      `(let* ((,s-nm-raw ',fake-name)
+              (,s-nm     (handler-case
+                             (cond ((stringp ,s-nm-raw) ,s-nm-raw)
+                                   ((null   ,s-nm-raw) "unnamed")
+                                   (t (princ-to-string ,s-nm-raw)))
+                           (error () "unnamed"))))
+         (map 'string #'identity ,s-nm)))))
+
+(define-test thread-list-coerces-non-string-name-defensively
+  "inspect-thread's name-coercion logic must produce a string for any
+bordeaux-threads:thread-name return value, including symbols and other
+printable objects.  Earlier code passed the raw value straight to
+(map 'string #'identity ...), which signals TYPE-ERROR on a symbol and
+aborts the whole dolist mid-loop — surfacing as NETWORK_ERROR from a
+real attached image.
+
+Exercises the form's coercion logic in isolation by EVALing a fragment
+shaped like %build-attach-thread-form's per-thread body, with the BT
+thread-name call replaced by a constant.  Asserts a string result for
+every input type the form might encounter."
+  ;; String passes through untouched.
+  (let ((result (eval (%make-fake-thread-name-form "string-name"))))
+    (is equal "string-name" result))
+  ;; NIL → "unnamed".
+  (let ((result (eval (%make-fake-thread-name-form nil))))
+    (is equal "unnamed" result))
+  ;; Symbol → string via princ-to-string (not type-error).
+  (let ((result (eval (%make-fake-thread-name-form 'foo-thread))))
+    (true (stringp result))
+    (true (search "FOO-THREAD" result)))
+  ;; Integer → string.
+  (let ((result (eval (%make-fake-thread-name-form 12345))))
+    (true (stringp result))
+    (is equal "12345" result)))
+
 (define-test attached-backtrace-captures-frames
   "inspect-thread with backtrace requested returns a well-formed result —
 no isError — for at least one thread entry.  The frames field is present
