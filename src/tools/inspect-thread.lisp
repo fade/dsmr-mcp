@@ -83,8 +83,12 @@ the result reflects the worker process's own threads.")
 Currently accepted but not used for thread selection.")
                  (backtrace
                   :type :boolean
-                  :description "When true, include a per-thread backtrace \
-(SBCL only; capped at 20 frames).  Captures the eval thread's call stack."))
+                  :description "When true, the response carries an \
+'eval_thread_frames' vector at the top level: a single snapshot of the \
+EVAL thread's call stack (SBCL only; capped at 20 frames; empty vector on \
+#-sbcl).  Frames are NOT attached per-thread because there is only one \
+snapshot — attaching the same vector to every thread entry would mislead \
+the caller about which thread the frames belong to."))
                 :required ())))
   (:metaclass mcp-tool-class)
   (:documentation "MCP tool: enumerate threads in the attached image or
@@ -116,12 +120,20 @@ enumerates the worker's own threads."))
 
 (defun %build-attach-thread-form (target-thread-id backtrace-p)
   "Return the sexp that, when evaluated in the attached image, enumerates
-bordeaux-threads:all-threads and returns a list of per-thread plists.
-Each plist carries :name, :alive, and (when BACKTRACE-P) :frames.
+bordeaux-threads:all-threads and returns a plist of:
+  (:threads LIST-OF-THREAD-PLISTS
+   :eval-thread-frames LIST-OF-FRAME-PLISTS-OR-NIL)
+
+Each thread plist carries :name and :alive — never :frames.  The backtrace
+belongs at the top level because it is one snapshot of the EVAL thread's
+call stack; attaching the same vector to every thread entry was actively
+misleading (a caller reading result.threads[N].frames would reasonably
+believe those were thread-N's frames).
 
 When BACKTRACE-P is true, the #+sbcl fragment captures the call stack of
-the current (eval) thread via sb-debug:map-backtrace, capped at 20 frames,
-and includes it in every thread entry.  The #-sbcl fallback yields nil.
+the current (eval) thread via sb-debug:map-backtrace, capped at 20 frames.
+The #-sbcl fallback yields nil.  When BACKTRACE-P is false, the
+:eval-thread-frames slot is omitted entirely from the return plist.
 
 TARGET-THREAD-ID is accepted for API parity and ignored; no interrupt-thread
 call is issued (avoids async races and portability concerns).
@@ -130,16 +142,38 @@ No DSMR-MCP-package symbols cross the wire; the structural portability
 guard thread-form-is-portable verifies this for both arities."
   (declare (ignore target-thread-id))
   (flet ((cs (n) (intern n (find-package :common-lisp-user))))
-    (let ((s-acc    (cs "%DSMR-MCP-ATTACH-THR-ACC"))
-          (s-t      (cs "%DSMR-MCP-ATTACH-THR-T"))
-          (s-nm     (cs "%DSMR-MCP-ATTACH-THR-NM"))
-          (s-map-fn (cs "%DSMR-MCP-ATTACH-THR-MAPFN"))
-          (s-frames (cs "%DSMR-MCP-ATTACH-THR-FRAMES"))
-          (s-fidx   (cs "%DSMR-MCP-ATTACH-THR-FIDX"))
-          (s-frame  (cs "%DSMR-MCP-ATTACH-THR-FRAME"))
-          (s-fcap   (cs "%DSMR-MCP-ATTACH-THR-FCAP"))
-          (s-curbt  (cs "%DSMR-MCP-ATTACH-THR-CURBT")))
-      (let ((s-nm-raw (cs "%DSMR-MCP-ATTACH-THR-NM-RAW")))
+    (let ((s-acc     (cs "%DSMR-MCP-ATTACH-THR-ACC"))
+          (s-t       (cs "%DSMR-MCP-ATTACH-THR-T"))
+          (s-nm      (cs "%DSMR-MCP-ATTACH-THR-NM"))
+          (s-nm-raw  (cs "%DSMR-MCP-ATTACH-THR-NM-RAW"))
+          (s-map-fn  (cs "%DSMR-MCP-ATTACH-THR-MAPFN"))
+          (s-frames  (cs "%DSMR-MCP-ATTACH-THR-FRAMES"))
+          (s-fidx    (cs "%DSMR-MCP-ATTACH-THR-FIDX"))
+          (s-frame   (cs "%DSMR-MCP-ATTACH-THR-FRAME"))
+          (s-fcap    (cs "%DSMR-MCP-ATTACH-THR-FCAP"))
+          (s-curbt   (cs "%DSMR-MCP-ATTACH-THR-CURBT")))
+      (let ((dolist-body
+              `(dolist (,s-t (bordeaux-threads:all-threads))
+                 (let* ((,s-nm-raw (ignore-errors
+                                     (bordeaux-threads:thread-name ,s-t)))
+                        ;; bordeaux-threads:thread-name returns whatever the
+                        ;; thread was named with — string, symbol, or anything
+                        ;; printable.  Coerce defensively before (map 'string ...),
+                        ;; which signals TYPE-ERROR on a non-string.  A handler-case
+                        ;; ((error () ...)) around the conversion keeps a hostile
+                        ;; name (e.g. an unprintable object) from corkscrewing the
+                        ;; whole dolist into NETWORK_ERROR.
+                        (,s-nm     (handler-case
+                                       (cond ((stringp ,s-nm-raw) ,s-nm-raw)
+                                             ((null   ,s-nm-raw) "unnamed")
+                                             (t (princ-to-string ,s-nm-raw)))
+                                     (error () "unnamed"))))
+                   (push (list :name  (map 'string #'identity ,s-nm)
+                               :alive (handler-case
+                                          (bordeaux-threads:thread-alive-p
+                                           ,s-t)
+                                        (error () nil)))
+                         ,s-acc)))))
         (if backtrace-p
             `(let* ((,s-acc nil)
                     (,s-curbt
@@ -169,75 +203,46 @@ guard thread-form-is-portable verifies this for both arities."
                                        (incf ,s-fidx))))
                           (nreverse ,s-frames)))
                       #-sbcl nil))
-               (dolist (,s-t (bordeaux-threads:all-threads))
-                 (let* ((,s-nm-raw (ignore-errors
-                                     (bordeaux-threads:thread-name ,s-t)))
-                        ;; bordeaux-threads:thread-name returns whatever the
-                        ;; thread was named with — string, symbol, or anything
-                        ;; printable.  Coerce defensively before (map 'string ...),
-                        ;; which signals TYPE-ERROR on a non-string.  A handler-case
-                        ;; ((error () ...)) around the conversion keeps a hostile
-                        ;; name (e.g. an unprintable object) from corkscrewing the
-                        ;; whole dolist into NETWORK_ERROR.
-                        (,s-nm     (handler-case
-                                       (cond ((stringp ,s-nm-raw) ,s-nm-raw)
-                                             ((null   ,s-nm-raw) "unnamed")
-                                             (t (princ-to-string ,s-nm-raw)))
-                                     (error () "unnamed"))))
-                   (push (list :name   (map 'string #'identity ,s-nm)
-                               :alive  (handler-case
-                                           (bordeaux-threads:thread-alive-p
-                                            ,s-t)
-                                         (error () nil))
-                               :frames ,s-curbt)
-                         ,s-acc)))
-               (nreverse ,s-acc))
+               ,dolist-body
+               (list :threads            (nreverse ,s-acc)
+                     :eval-thread-frames ,s-curbt))
             `(let ((,s-acc nil))
-               (dolist (,s-t (bordeaux-threads:all-threads))
-                 (let* ((,s-nm-raw (ignore-errors
-                                     (bordeaux-threads:thread-name ,s-t)))
-                        (,s-nm     (handler-case
-                                       (cond ((stringp ,s-nm-raw) ,s-nm-raw)
-                                             ((null   ,s-nm-raw) "unnamed")
-                                             (t (princ-to-string ,s-nm-raw)))
-                                     (error () "unnamed"))))
-                   (push (list :name  (map 'string #'identity ,s-nm)
-                               :alive (handler-case
-                                          (bordeaux-threads:thread-alive-p
-                                           ,s-t)
-                                        (error () nil)))
-                         ,s-acc)))
-               (nreverse ,s-acc)))))))
+               ,dolist-body
+               (list :threads (nreverse ,s-acc))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Decode raw plist result into a wire hash-table
 ;;; ---------------------------------------------------------------------------
 
 (defun %plist->thread-ht (plist)
-  "Convert a single per-thread plist (:name S :alive B [:frames F]) to a
-wire hash-table.  Coerces string values to element-type CHARACTER."
+  "Convert a single per-thread plist (:name S :alive B) to a wire hash-table.
+Frames are NO LONGER carried per-thread — they belong at the top of the
+response under the 'eval_thread_frames' key because there is only one
+snapshot.  Coerces string values to element-type CHARACTER."
   (let ((ht (make-hash-table :test 'equal)))
     (setf (gethash "name"  ht) (let ((n (getf plist :name)))
                                   (if (stringp n)
                                       (map 'string #'identity n)
                                       "unnamed")))
     (setf (gethash "alive" ht) (if (getf plist :alive) t nil))
-    (when (getf plist :frames)
-      (let ((raw-frames (getf plist :frames)))
-        (setf (gethash "frames" ht)
-              (if (listp raw-frames)
-                  (coerce
-                   (mapcar (lambda (f)
-                             (let ((fht (make-hash-table :test 'equal)))
-                               (setf (gethash "index"    fht) (or (getf f :index) 0))
-                               (setf (gethash "function" fht)
-                                     (map 'string #'identity
-                                          (or (getf f :function) "<unknown>")))
-                               fht))
-                           raw-frames)
-                   'simple-vector)
-                  (vector)))))
     ht))
+
+(defun %frames->vector (raw-frames)
+  "Convert a list of frame plists ((:index I :function F) ...) to a
+simple-vector of wire hash-tables.  Returns an empty vector when
+RAW-FRAMES is not a list."
+  (if (listp raw-frames)
+      (coerce
+       (mapcar (lambda (f)
+                 (let ((fht (make-hash-table :test 'equal)))
+                   (setf (gethash "index"    fht) (or (getf f :index) 0))
+                   (setf (gethash "function" fht)
+                         (map 'string #'identity
+                              (or (getf f :function) "<unknown>")))
+                   fht))
+               raw-frames)
+       'simple-vector)
+      (vector)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Attached dispatcher
@@ -251,7 +256,19 @@ request id (may be nil in direct test calls).  PARAMS is the tool argument
 hash-table (or a fresh empty hash-table when nil).
 
 Acquires the call-lock, evaluates the injected form via bounded-slime-eval,
-and normalises the returned plist list to a 'threads' vector.
+and normalises the returned plist (:threads ... :eval-thread-frames ...)
+into a wire hash-table with a 'threads' simple-vector and (when backtrace
+was requested) an 'eval_thread_frames' simple-vector at the top level.
+
+The eval_thread_frames key, when present, is the EVAL thread's call stack
+— a single snapshot.  It is exposed at the response top level rather than
+attached to every per-thread entry because the same vector cannot honestly
+describe N different threads' frames; an earlier shape did exactly that
+and misled callers.
+
+When backtrace was requested but the implementation has no backtrace path
+(e.g. #-sbcl), eval_thread_frames is still present as an empty vector so
+callers can distinguish 'did not ask' from 'asked and got nothing'.
 
 On slime-network-error returns a make-ht with isError t and
 error_type NETWORK_ERROR without propagating the condition."
@@ -262,14 +279,25 @@ error_type NETWORK_ERROR without propagating the condition."
          (form       (%build-attach-thread-form thread-id backtrace-p))
          (lock       (repl-eval-tool-call-lock tool)))
     (handler-case
-        (let* ((raw (with-lock-held (lock)
-                      (bounded-slime-eval form (repl-eval-tool-slynk-conn tool))))
-               (threads (if (listp raw)
-                            (coerce
-                             (mapcar #'%plist->thread-ht raw)
-                             'simple-vector)
-                            (vector))))
-          (make-ht "threads" threads))
+        (let* ((raw         (with-lock-held (lock)
+                              (bounded-slime-eval
+                               form (repl-eval-tool-slynk-conn tool))))
+               (raw-threads (when (listp raw) (getf raw :threads)))
+               (raw-frames  (when (listp raw) (getf raw :eval-thread-frames)))
+               (threads     (if (listp raw-threads)
+                                (coerce
+                                 (mapcar #'%plist->thread-ht raw-threads)
+                                 'simple-vector)
+                                (vector)))
+               (ht          (make-ht "threads" threads)))
+          (when backtrace-p
+            ;; Surface presence: key is always present when caller asked for
+            ;; backtrace, even if the resulting vector is empty.  Lets the
+            ;; caller distinguish 'did not request' from 'requested but the
+            ;; implementation returned no frames'.
+            (setf (gethash "eval_thread_frames" ht)
+                  (%frames->vector raw-frames)))
+          ht)
       (slime-network-error (e)
         (log-event :warn "inspect-thread.attach.network-error"
                    "error" (handler-case (princ-to-string e) (error () "")))

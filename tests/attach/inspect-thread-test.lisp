@@ -174,8 +174,10 @@ every input type the form might encounter."
 
 (define-test attached-backtrace-captures-frames
   "inspect-thread with backtrace requested returns a well-formed result —
-no isError — for at least one thread entry.  The frames field is present
-(possibly empty under #-sbcl) without signalling an error."
+no isError — with a top-level 'eval_thread_frames' key (present even when
+empty under #-sbcl) and per-thread entries that no longer carry a per-entry
+'frames' key.  The single backtrace snapshot belongs at the top of the
+response because it is one snapshot of the eval thread's stack."
   (with-temporary-slynk-listener (conn)
     (multiple-value-bind (session repl-tool thr-tool)
         (%make-attach-session "test-thr-bt-01" conn)
@@ -190,4 +192,28 @@ no isError — for at least one thread entry.  The frames field is present
           ;; Must have a "threads" key with at least one entry.
           (let ((threads (gethash "threads" result)))
             (true threads)
-            (true (plusp (length threads)))))))))
+            (true (plusp (length threads)))
+            ;; Per-thread entries must NOT carry a 'frames' key — the
+            ;; snapshot is at the response top level now.
+            (dolist (thr (coerce threads 'list))
+              (false (gethash "frames" thr)
+                     "per-thread entry must not carry 'frames' — \
+that misled callers about which thread the frames belonged to")))
+          ;; eval_thread_frames must be present when backtrace was requested.
+          (true (nth-value 1 (gethash "eval_thread_frames" result))
+                "eval_thread_frames key must be present when backtrace=t"))))))
+
+(define-test attached-no-backtrace-omits-frames-key
+  "inspect-thread without backtrace requested must NOT carry an
+'eval_thread_frames' key at all — that lets the caller distinguish 'did
+not ask for backtrace' from 'asked and got an empty vector'."
+  (with-temporary-slynk-listener (conn)
+    (multiple-value-bind (session repl-tool thr-tool)
+        (%make-attach-session "test-thr-no-bt-01" conn)
+      (declare (ignore session thr-tool))
+      (let* ((params (make-hash-table :test 'equal))
+             (result (%dispatch-attach-inspect-thread repl-tool nil params)))
+        (false (gethash "isError" result))
+        (false (nth-value 1 (gethash "eval_thread_frames" result))
+               "eval_thread_frames must be absent when backtrace was not \
+requested")))))
