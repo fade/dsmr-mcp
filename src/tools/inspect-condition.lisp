@@ -135,9 +135,14 @@ to the worker inspect handler."))
 ;;;   4. (map 'string #'identity s) on ALL wire-bound strings.
 ;;;   5. Every binding interned in CL-USER via (cs "...").
 ;;;   6. handler-case uses (error () ...) with NO named variable.
-;;;   7. SB-MOP accessed via find-symbol.
-;;;   8. ANSI-portable only; condition slot inspection via ANSI slot-boundp/
-;;;      slot-value is portable across CL implementations.
+;;;   7. MOP accessed via find-package + find-symbol against a probe list
+;;;      (closer-mop, c2mop, sb-mop, ccl, mop, clos) — the attached image's
+;;;      CL implementation is not known at form-build time, so the form
+;;;      degrades cleanly to an empty :slots / :hierarchy when no MOP
+;;;      package is available rather than hard-failing.
+;;;   8. ANSI-portable: condition slot inspection via ANSI slot-boundp/
+;;;      slot-value works across CL implementations.  Slot enumeration
+;;;      itself needs MOP — see rule 7 for the discovery strategy.
 ;;;
 ;;; Return value from the injected form:
 ;;;   A plist: (:condition-p BOOL :type STRING-OR-NIL
@@ -230,7 +235,21 @@ tests/attach/inspect-condition-test.lisp verifies this for both arities."
                     #'cs s-cond s-csf s-sdn s-cplf s-cnfn
                     s-slots s-hier s-slot s-nm s-val s-cls s-cpl s-cname))
             (mop-bindings
-              `((,s-mopkg  (find-package "SB-MOP"))
+              ;; Probe known MOP package names in priority order — the
+              ;; attached image's CL implementation is not known at form-
+              ;; build time, so a hard-coded "SB-MOP" silently empties the
+              ;; slots vector on CCL/ECL/CLISP/ACL.  closer-mop and c2mop
+              ;; are the portable shims that wrap whichever native MOP
+              ;; package the implementation exposes; sb-mop/ccl/mop/clos
+              ;; are the direct native packages.  If none resolve the
+              ;; result form will surface :hierarchy nil :slots nil
+              ;; without crashing.
+              `((,s-mopkg  (or (find-package "CLOSER-MOP")
+                               (find-package "C2MOP")
+                               (find-package "SB-MOP")
+                               (find-package "CCL")
+                               (find-package "MOP")
+                               (find-package "CLOS")))
                 (,s-csf    (when ,s-mopkg
                              (find-symbol "CLASS-SLOTS" ,s-mopkg)))
                 (,s-sdn    (when ,s-mopkg
