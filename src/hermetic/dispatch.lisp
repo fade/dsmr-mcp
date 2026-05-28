@@ -59,7 +59,8 @@ Routes by NAME:
   \"load-system\" / \"run-tests\" -> worker method \"worker/<name>\" directly
     (no epoch check, no project_root injection — these verbs do not
     relativize paths).
-  \"inspect-thread\" -> worker method \"worker/inspect-thread\" directly
+  \"inspect-thread\" / \"inspect-restart\" / \"inspect-condition\" ->
+    worker method \"worker/<name>\" directly
     (no epoch check, no project_root injection).
   Any other name  -> worker method \"worker/eval\" (unchanged behaviour).
 
@@ -182,8 +183,9 @@ crash; the object id is no longer valid.")))))
             ;; Inspection-verb branch: route to worker/<name>.
             ;; No epoch check, no project_root injection.
             ;; inspect-restart returns a structured empty set in hermetic mode.
+            ;; inspect-condition requires a held-object id in hermetic mode.
             ;; ----------------------------------------------------------------
-            ((member name '("inspect-thread" "inspect-restart")
+            ((member name '("inspect-thread" "inspect-restart" "inspect-condition")
                      :test #'string=)
              (let* ((params (or args (make-hash-table :test 'equal)))
                     (soft   (let ((v (gethash "timeout_seconds" params)))

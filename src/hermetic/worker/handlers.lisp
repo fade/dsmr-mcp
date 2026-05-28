@@ -468,6 +468,23 @@ no active restarts to surface."
   (make-ht "restarts" (vector)
            "message"  "No active debugger break in hermetic mode."))
 
+(defun %handle-inspect-condition (params registry)
+  "Inspect a held condition object by registry ID.
+Reads the required \"id\" param (a raw integer registry ID as forwarded by the
+hermetic dispatcher) and reuses inspect-object-by-id + build-inspect-response
+from worker/inspect.lisp — the same in-process SB-MOP path as %handle-inspect-object.
+
+REGISTRY is the per-worker object-registry instance holding the condition."
+  (let* ((object-id    (gethash "id" params))
+         (max-depth    (or (gethash "max_depth"    params) 1))
+         (max-elements (or (gethash "max_elements" params) 50)))
+    (unless object-id
+      (error "id is required"))
+    (let ((result (inspect-object-by-id object-id registry
+                                        :max-depth    max-depth
+                                        :max-elements max-elements)))
+      (build-inspect-response result))))
+
 (defun register-all-handlers (server registry)
   "Register all worker method handlers on SERVER.
 REGISTRY is the per-worker object-registry instance; it is closed over by
@@ -482,7 +499,8 @@ Registered methods:
   worker/load-system           — load an ASDF system with force/timeout/warning capture
   worker/run-tests             — run tests with framework detection and ghost-purge
   worker/inspect-thread        — enumerate worker threads with optional backtrace
-  worker/inspect-restart        — return structured empty restart set (no break in worker)"
+  worker/inspect-restart       — return structured empty restart set (no break in worker)
+  worker/inspect-condition     — inspect a held condition object by registry ID"
   (register-method server "worker/eval"
                    (lambda (params) (%handle-eval params registry)))
   (register-method server "worker/inspect-object"
@@ -501,5 +519,7 @@ Registered methods:
                    (lambda (params) (%handle-inspect-thread params registry)))
   (register-method server "worker/inspect-restart"
                    (lambda (params) (%handle-inspect-restart params registry)))
-  (log-event :info "worker.handlers.registered" "count" 9)
+  (register-method server "worker/inspect-condition"
+                   (lambda (params) (%handle-inspect-condition params registry)))
+  (log-event :info "worker.handlers.registered" "count" 10)
   server)
