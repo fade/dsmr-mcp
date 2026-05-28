@@ -88,15 +88,18 @@ the already-open fixture connection."
 ;;; VALIDATION manual-only carve-outs.
 ;;; ---------------------------------------------------------------------------
 
-(define-test rex-routing-reaches-break-thread
-  "Empirical resolution of RESEARCH Open Question #1: verifies the observed
-behaviour of (slynk:debugger-info-for-emacs 0 20) against a fixture with an
-active background break thread.
+(define-test rex-routing-times-out-against-background-break-thread
+  "Empirical finding of an architectural constraint: (slynk:debugger-info-for-emacs
+0 20) called via slynk-client/bounded-slime-eval does NOT route to a
+background break thread's sly-db-loop context.  The probe blocks until the
+3-second timeout fires; the tool's structured empty-set fallback then
+returns.
 
-Outcome: the slyfun does NOT route to the break thread via the slynk-client
-rex mechanism — the probe times out (3 seconds) and the tool returns a
-structured empty restart set.  This test asserts the probe-timeout fallback
-path works correctly: structured empty set, no isError, message present."
+This is the negative result — the slyfun's rex routing does not reach the
+break thread in this configuration.  The test asserts the observed
+behaviour (timeout + empty-set fallback) rather than a hoped-for routing
+success, recording the constraint so a future regression that quietly
+changes the rex-routing behaviour cannot pass silently."
   (with-temporary-slynk-listener (conn)
     (multiple-value-bind (session repl-tool restart-tool)
         (%make-attach-session "test-rst-rex-01" conn)
