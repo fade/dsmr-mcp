@@ -28,6 +28,8 @@
   (:use #:cl #:parachute)
   (:import-from #:dsmr-mcp/tests/support/slynk-fixture
                 #:with-temporary-slynk-listener)
+  (:import-from #:dsmr-mcp/tests/support/portability-guard
+                #:dsmr-package-leaks-in)
   (:import-from #:dsmr-mcp/src/tools/inspect-thread
                 #:inspect-thread-tool
                 #:%build-attach-thread-form
@@ -41,34 +43,6 @@
                 #:get-tool-instance))
 
 (in-package #:dsmr-mcp/tests/attach/inspect-thread-test)
-
-;;; ---------------------------------------------------------------------------
-;;; Portability guard helpers
-;;;
-;;; Copied verbatim from tests/code-intelligence/load-system-test.lisp lines
-;;; 228-247, per the established precedent for structural injected-form guards.
-;;; ---------------------------------------------------------------------------
-
-(defun %collect-symbols (form)
-  "Flat list of every symbol appearing in FORM (a tree of conses and atoms,
-descending into non-string vectors)."
-  (let ((acc '()))
-    (labels ((walk (x)
-               (cond ((and (symbolp x) x) (push x acc))
-                     ((consp x) (walk (car x)) (walk (cdr x)))
-                     ((and (vectorp x) (not (stringp x))) (map nil #'walk x)))))
-      (walk form))
-    acc))
-
-(defun %dsmr-package-leaks (form)
-  "Symbols in FORM whose home package name contains \"DSMR-MCP\" — symbols that
-cannot be READ in an attached image that does not have dsmr-mcp loaded."
-  (remove-duplicates
-   (remove-if-not
-    (lambda (s)
-      (let ((pkg (symbol-package s)))
-        (and pkg (search "DSMR-MCP" (package-name pkg)))))
-    (%collect-symbols form))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Test session helper
@@ -101,8 +75,8 @@ THREAD-TOOL is the inspect-thread-tool instance for the same session."
   "%build-attach-thread-form must emit no symbol from a DSMR-MCP-internal
 package for either the no-backtrace or the backtrace arities.  A DSMR-MCP
 symbol in an injected form breaks the remote READ in a real attached image."
-  (is equal '() (%dsmr-package-leaks (%build-attach-thread-form nil nil)))
-  (is equal '() (%dsmr-package-leaks (%build-attach-thread-form 42 t))))
+  (is equal '() (dsmr-package-leaks-in (%build-attach-thread-form nil nil)))
+  (is equal '() (dsmr-package-leaks-in (%build-attach-thread-form 42 t))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Integration tests (use the in-process Slynk fixture)
