@@ -219,6 +219,8 @@ tests/attach/inspect-condition-test.lisp verifies this for both arities."
           (s-cplf  (cs "%DSMR-MCP-ATTACH-COND-CPLF"))
           (s-cnfn  (cs "%DSMR-MCP-ATTACH-COND-CNFN"))
           ;; cs-interned symbols for registry-lookup branch.
+          (s-rpkg  (cs "%DSMR-MCP-ATTACH-COND-RPKG"))
+          (s-rsym  (cs "%DSMR-MCP-ATTACH-COND-RSYM"))
           (s-tbl   (cs "%DSMR-MCP-ATTACH-COND-TBL"))
           (s-entry (cs "%DSMR-MCP-ATTACH-COND-ENTRY"))
           ;; cs-interned symbols for live-break branch.
@@ -246,11 +248,23 @@ tests/attach/inspect-condition-test.lisp verifies this for both arities."
                      :slots       ,s-slots)))
         (if object-id
             ;; Held-object branch: resolve from DSMR-MCP-ATTACH-REGISTRY.
+            ;; find-package / find-symbol (not intern) — the registry package may
+            ;; not exist in the attached image (common case for an image dsmr-mcp
+            ;; has not been loaded into).  intern would signal package-error;
+            ;; find-package / find-symbol return NIL gracefully, the inner WHENs
+            ;; short-circuit, and the form yields a not-found result.
             `(let* (,@mop-bindings
-                    (,s-cond   (let* ((,s-tbl   (symbol-value
-                                                 (intern "*REGISTRY-TABLE*"
-                                                         "DSMR-MCP-ATTACH-REGISTRY")))
-                                      (,s-entry (gethash ,object-id ,s-tbl)))
+                    (,s-cond   (let* ((,s-rpkg  (find-package
+                                                 "DSMR-MCP-ATTACH-REGISTRY"))
+                                      (,s-rsym  (and ,s-rpkg
+                                                     (find-symbol
+                                                      "*REGISTRY-TABLE*"
+                                                      ,s-rpkg)))
+                                      (,s-tbl   (when (and ,s-rsym
+                                                           (boundp ,s-rsym))
+                                                  (symbol-value ,s-rsym)))
+                                      (,s-entry (when ,s-tbl
+                                                  (gethash ,object-id ,s-tbl))))
                                  (when ,s-entry (getf ,s-entry :object))))
                     (,s-slots  nil)
                     (,s-hier   nil))
