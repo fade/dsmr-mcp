@@ -128,9 +128,9 @@ package for either the live-break (nil object-id) or the held-object branch.
 A leaked handler-case condition variable breaks the remote READ in a real
 attached image — this was the root cause of commit 6ca196d."
   ;; Live-break branch (nil object-id)
-  (is equal '() (%dsmr-package-leaks (%build-attach-condition-form nil nil)))
+  (is equal '() (%dsmr-package-leaks (%build-attach-condition-form nil)))
   ;; Held-object branch (non-nil object-id)
-  (is equal '() (%dsmr-package-leaks (%build-attach-condition-form 42 "test-session-01"))))
+  (is equal '() (%dsmr-package-leaks (%build-attach-condition-form 42))))
 
 (defun %find-strings-in-form (form)
   "Flat list of every string literal appearing in FORM (a tree of conses,
@@ -150,7 +150,7 @@ CLISP, ACL), find-package \"SB-MOP\" returns NIL — if it were the only
 candidate, the slots vector would silently come back empty with no
 diagnostic.  The probe must include closer-mop and c2mop (the portable
 shims) and at least one of the implementation-native packages."
-  (let* ((form     (%build-attach-condition-form nil nil))
+  (let* ((form     (%build-attach-condition-form nil))
          (strings  (%find-strings-in-form form)))
     ;; closer-mop is the canonical portable MOP shim — must be probed first.
     (true (member "CLOSER-MOP" strings :test #'string=)
@@ -231,7 +231,7 @@ Verifies:
   - hierarchy vector contains TEST-CUSTOM-CONDITION and ERROR or CONDITION.
   - slots vector contains the DETAIL slot with the expected value."
   (let* ((the-condition (make-condition 'test-custom-condition :detail "hier-test"))
-         (form          (%build-attach-condition-form nil nil))
+         (form          (%build-attach-condition-form nil))
          (slynk-cond-sym (find-symbol "*SLYNK-DEBUGGER-CONDITION*" "SLYNK"))
          ;; Evaluate the injected form directly with *slynk-debugger-condition*
          ;; bound in this thread — tests the form logic without Slynk dispatch.
