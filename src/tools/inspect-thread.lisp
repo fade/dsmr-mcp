@@ -139,51 +139,75 @@ guard thread-form-is-portable verifies this for both arities."
           (s-frame  (cs "%DSMR-MCP-ATTACH-THR-FRAME"))
           (s-fcap   (cs "%DSMR-MCP-ATTACH-THR-FCAP"))
           (s-curbt  (cs "%DSMR-MCP-ATTACH-THR-CURBT")))
-      (if backtrace-p
-          `(let* ((,s-acc nil)
-                  (,s-curbt
-                    #+sbcl
-                    (let ((,s-map-fn
-                            (ignore-errors
-                              (fdefinition
-                               (find-symbol "MAP-BACKTRACE" "SB-DEBUG"))))
-                          (,s-frames nil)
-                          (,s-fidx   0)
-                          (,s-fcap   20))
-                      (when ,s-map-fn
-                        (funcall ,s-map-fn
-                                 (lambda (,s-frame)
-                                   (when (< ,s-fidx ,s-fcap)
-                                     (push (list
-                                            :index ,s-fidx
-                                            :function
-                                            (handler-case
-                                                (map 'string #'identity
-                                                     (prin1-to-string
-                                                      (sb-di:debug-fun-name
-                                                       (sb-di:frame-debug-fun
-                                                        ,s-frame))))
-                                              (error () "<unknown>")))
-                                           ,s-frames)
-                                     (incf ,s-fidx))))
-                        (nreverse ,s-frames)))
-                    #-sbcl nil))
-             (dolist (,s-t (bordeaux-threads:all-threads))
-               (let ((,s-nm (ignore-errors (bordeaux-threads:thread-name ,s-t))))
-                 (push (list :name   (map 'string #'identity
-                                          (or ,s-nm "unnamed"))
-                             :alive  (bordeaux-threads:thread-alive-p ,s-t)
-                             :frames ,s-curbt)
-                       ,s-acc)))
-             (nreverse ,s-acc))
-          `(let ((,s-acc nil))
-             (dolist (,s-t (bordeaux-threads:all-threads))
-               (let ((,s-nm (ignore-errors (bordeaux-threads:thread-name ,s-t))))
-                 (push (list :name  (map 'string #'identity
-                                         (or ,s-nm "unnamed"))
-                             :alive (bordeaux-threads:thread-alive-p ,s-t))
-                       ,s-acc)))
-             (nreverse ,s-acc))))))
+      (let ((s-nm-raw (cs "%DSMR-MCP-ATTACH-THR-NM-RAW")))
+        (if backtrace-p
+            `(let* ((,s-acc nil)
+                    (,s-curbt
+                      #+sbcl
+                      (let ((,s-map-fn
+                              (ignore-errors
+                                (fdefinition
+                                 (find-symbol "MAP-BACKTRACE" "SB-DEBUG"))))
+                            (,s-frames nil)
+                            (,s-fidx   0)
+                            (,s-fcap   20))
+                        (when ,s-map-fn
+                          (funcall ,s-map-fn
+                                   (lambda (,s-frame)
+                                     (when (< ,s-fidx ,s-fcap)
+                                       (push (list
+                                              :index ,s-fidx
+                                              :function
+                                              (handler-case
+                                                  (map 'string #'identity
+                                                       (prin1-to-string
+                                                        (sb-di:debug-fun-name
+                                                         (sb-di:frame-debug-fun
+                                                          ,s-frame))))
+                                                (error () "<unknown>")))
+                                             ,s-frames)
+                                       (incf ,s-fidx))))
+                          (nreverse ,s-frames)))
+                      #-sbcl nil))
+               (dolist (,s-t (bordeaux-threads:all-threads))
+                 (let* ((,s-nm-raw (ignore-errors
+                                     (bordeaux-threads:thread-name ,s-t)))
+                        ;; bordeaux-threads:thread-name returns whatever the
+                        ;; thread was named with — string, symbol, or anything
+                        ;; printable.  Coerce defensively before (map 'string ...),
+                        ;; which signals TYPE-ERROR on a non-string.  A handler-case
+                        ;; ((error () ...)) around the conversion keeps a hostile
+                        ;; name (e.g. an unprintable object) from corkscrewing the
+                        ;; whole dolist into NETWORK_ERROR.
+                        (,s-nm     (handler-case
+                                       (cond ((stringp ,s-nm-raw) ,s-nm-raw)
+                                             ((null   ,s-nm-raw) "unnamed")
+                                             (t (princ-to-string ,s-nm-raw)))
+                                     (error () "unnamed"))))
+                   (push (list :name   (map 'string #'identity ,s-nm)
+                               :alive  (handler-case
+                                           (bordeaux-threads:thread-alive-p
+                                            ,s-t)
+                                         (error () nil))
+                               :frames ,s-curbt)
+                         ,s-acc)))
+               (nreverse ,s-acc))
+            `(let ((,s-acc nil))
+               (dolist (,s-t (bordeaux-threads:all-threads))
+                 (let* ((,s-nm-raw (ignore-errors
+                                     (bordeaux-threads:thread-name ,s-t)))
+                        (,s-nm     (handler-case
+                                       (cond ((stringp ,s-nm-raw) ,s-nm-raw)
+                                             ((null   ,s-nm-raw) "unnamed")
+                                             (t (princ-to-string ,s-nm-raw)))
+                                     (error () "unnamed"))))
+                   (push (list :name  (map 'string #'identity ,s-nm)
+                               :alive (handler-case
+                                          (bordeaux-threads:thread-alive-p
+                                           ,s-t)
+                                        (error () nil)))
+                         ,s-acc)))
+               (nreverse ,s-acc)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Decode raw plist result into a wire hash-table
