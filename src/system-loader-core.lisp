@@ -108,7 +108,9 @@ Returns (list :ok WARN-COUNT WARNS), (list :timeout TIMEOUT), or
 (list :error ERROR-STRING)."
   (flet ((cs (n) (intern n (find-package :common-lisp-user))))
     (let ((s-warns    (cs "%DSMR-LOADER-WARNS"))
-          (s-w        (cs "%DSMR-LOADER-W")))
+          (s-w        (cs "%DSMR-LOADER-W"))
+          (s-e        (cs "%DSMR-LOADER-E"))
+          (s-sys      (cs "%DSMR-LOADER-SYS")))
       `(handler-case
            (sb-ext:with-timeout ,(or timeout-seconds 120)
              ;; Force-reload: clear loaded state so changed definitions
@@ -121,9 +123,8 @@ Returns (list :ok WARN-COUNT WARNS), (list :timeout TIMEOUT), or
              ;; next load triggers a full source recompile. Runs in-image
              ;; so it clears the image's cache, not the dispatcher's.
              ,@(when clear-fasls
-                 `((let ((op (asdf:make-operation 'asdf:load-op))
-                         (sys (asdf:find-system ,sys-name nil)))
-                     (when sys
+                 `((let ((,s-sys (asdf:find-system ,sys-name nil)))
+                     (when ,s-sys
                        (asdf:clear-system ,sys-name)))))
              ;; collect warnings non-fatally, muffle off host stderr.
              ;; do not muffle errors (they abort and flow to the error arm).
@@ -144,8 +145,8 @@ Returns (list :ok WARN-COUNT WARNS), (list :timeout TIMEOUT), or
          ;; being swallowed — only this outer handler-case arm catches it.
          (sb-ext:timeout ()
            (list :timeout ,(or timeout-seconds 120)))
-         (error (e)
-           (list :error (map 'string #'identity (princ-to-string e))))))))
+         (error (,s-e)
+           (list :error (map 'string #'identity (princ-to-string ,s-e))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; load-system
