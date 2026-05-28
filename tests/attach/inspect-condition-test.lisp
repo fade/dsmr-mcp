@@ -132,6 +132,38 @@ attached image — this was the root cause of commit 6ca196d."
   ;; Held-object branch (non-nil object-id)
   (is equal '() (%dsmr-package-leaks (%build-attach-condition-form 42 "test-session-01"))))
 
+(defun %find-strings-in-form (form)
+  "Flat list of every string literal appearing in FORM (a tree of conses,
+strings, and atoms)."
+  (let ((acc '()))
+    (labels ((walk (x)
+               (cond ((stringp x) (push x acc))
+                     ((consp x) (walk (car x)) (walk (cdr x)))
+                     ((and (vectorp x) (not (stringp x))) (map nil #'walk x)))))
+      (walk form))
+    acc))
+
+(define-test condition-form-discovers-mop-portably
+  "%build-attach-condition-form's MOP discovery must probe portable MOP
+packages, not hard-code SB-MOP.  On a non-SBCL attached image (CCL, ECL,
+CLISP, ACL), find-package \"SB-MOP\" returns NIL — if it were the only
+candidate, the slots vector would silently come back empty with no
+diagnostic.  The probe must include closer-mop and c2mop (the portable
+shims) and at least one of the implementation-native packages."
+  (let* ((form     (%build-attach-condition-form nil nil))
+         (strings  (%find-strings-in-form form)))
+    ;; closer-mop is the canonical portable MOP shim — must be probed first.
+    (true (member "CLOSER-MOP" strings :test #'string=)
+          "form must probe CLOSER-MOP — the portable MOP shim used by \
+the CL ecosystem")
+    ;; c2mop is the other common portable shim.
+    (true (member "C2MOP" strings :test #'string=)
+          "form must probe C2MOP — the other portable MOP shim")
+    ;; sb-mop must remain in the probe list for SBCL images that have not
+    ;; loaded closer-mop yet, but it must not be the only candidate.
+    (true (member "SB-MOP" strings :test #'string=)
+          "form must keep SB-MOP in the probe list for plain SBCL images")))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Integration tests
 ;;; ---------------------------------------------------------------------------
