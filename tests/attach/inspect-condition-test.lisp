@@ -35,6 +35,8 @@
   (:use #:cl #:parachute)
   (:import-from #:dsmr-mcp/tests/support/slynk-fixture
                 #:with-temporary-slynk-listener)
+  (:import-from #:dsmr-mcp/tests/support/portability-guard
+                #:dsmr-package-leaks-in)
   (:import-from #:dsmr-mcp/src/attach/dispatch
                 #:repl-eval-tool
                 #:repl-eval-tool-slynk-conn)
@@ -50,34 +52,6 @@
                 #:get-tool-instance))
 
 (in-package #:dsmr-mcp/tests/attach/inspect-condition-test)
-
-;;; ---------------------------------------------------------------------------
-;;; Portability guard helpers
-;;;
-;;; Copied verbatim from tests/code-intelligence/load-system-test.lisp lines
-;;; 228-247, per the established precedent for structural injected-form guards.
-;;; ---------------------------------------------------------------------------
-
-(defun %collect-symbols (form)
-  "Flat list of every symbol appearing in FORM (a tree of conses and atoms,
-descending into non-string vectors)."
-  (let ((acc '()))
-    (labels ((walk (x)
-               (cond ((and (symbolp x) x) (push x acc))
-                     ((consp x) (walk (car x)) (walk (cdr x)))
-                     ((and (vectorp x) (not (stringp x))) (map nil #'walk x)))))
-      (walk form))
-    acc))
-
-(defun %dsmr-package-leaks (form)
-  "Symbols in FORM whose home package name contains \"DSMR-MCP\" — symbols that
-cannot be READ in an attached image that does not have dsmr-mcp loaded."
-  (remove-duplicates
-   (remove-if-not
-    (lambda (s)
-      (let ((pkg (symbol-package s)))
-        (and pkg (search "DSMR-MCP" (package-name pkg)))))
-    (%collect-symbols form))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Custom condition fixture for the live-condition tests
@@ -128,9 +102,9 @@ package for either the live-break (nil object-id) or the held-object branch.
 A leaked handler-case condition variable breaks the remote READ in a real
 attached image — this was the root cause of commit 6ca196d."
   ;; Live-break branch (nil object-id)
-  (is equal '() (%dsmr-package-leaks (%build-attach-condition-form nil)))
+  (is equal '() (dsmr-package-leaks-in (%build-attach-condition-form nil)))
   ;; Held-object branch (non-nil object-id)
-  (is equal '() (%dsmr-package-leaks (%build-attach-condition-form 42))))
+  (is equal '() (dsmr-package-leaks-in (%build-attach-condition-form 42))))
 
 (defun %find-strings-in-form (form)
   "Flat list of every string literal appearing in FORM (a tree of conses,
