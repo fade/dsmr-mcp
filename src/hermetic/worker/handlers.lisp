@@ -480,12 +480,33 @@ REGISTRY is accepted but ignored — thread enumeration needs no registry."
     ht))
 
 (defun %handle-inspect-restart (params registry)
-  "Return a structured empty restart set for the hermetic worker.
-No interactive debugger break exists in a fresh hermetic worker, so this
-handler always returns an empty 'restarts' vector with an explanatory message.
-This is correct behaviour, not an error — the verb is valid, it simply has
-no active restarts to surface."
-  (declare (ignore params registry))
+  "Return a structured empty restart set for the hermetic worker, or a typed
+no-active-break error when the caller supplied state-changing invoke args.
+
+A plain query (no invoke / invoke_name) returns an empty 'restarts' vector
+with an explanatory message — correct behaviour, not an error, since the
+verb is valid and simply has no active restarts.
+
+A query with invoke or invoke_name is a state-changing request that cannot
+be honoured in hermetic mode.  Silently dropping the args (returning the
+same empty response as a plain query) would let a caller believe their
+restart was invoked when it was not.  Surface a typed isError instead so
+the caller knows their action had no effect, matching the contract of the
+attached path which emits rpc-error -32602 for a missing restart name.
+
+REGISTRY is accepted but ignored."
+  (declare (ignore registry))
+  (let ((invoke    (gethash "invoke"      params))
+        (invoke-nm (gethash "invoke_name" params)))
+    (when (or invoke invoke-nm)
+      (return-from %handle-inspect-restart
+        (make-ht "isError"    t
+                 "error_type" "no-active-break"
+                 "content"
+                 (vector (make-ht "type" "text"
+                                  "text"
+                                  "inspect-restart: no active debugger break \
+in hermetic mode; invoke/invoke_name has no effect."))))))
   (make-ht "restarts" (vector)
            "message"  "No active debugger break in hermetic mode."))
 

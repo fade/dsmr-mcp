@@ -259,3 +259,23 @@ mismatches and other no-ops as success")))
     ;; Must have an explanatory message.
     (true (and (stringp (gethash "message" result))
                (plusp (length (gethash "message" result)))))))
+
+(define-test inspect-restart-hermetic-rejects-state-changing-invoke
+  "inspect-restart in hermetic mode with an invoke or invoke_name arg must
+return a typed isError, not the same empty-set response as a plain query.
+Silently dropping the state-changing arg would let a caller believe their
+restart was invoked when it was not."
+  ;; invoke index → isError
+  (let* ((params (make-hash-table :test 'equal)))
+    (setf (gethash "invoke" params) 0)
+    (let ((result (%handle-inspect-restart params nil)))
+      (true (gethash "isError" result)
+            "supplying invoke must produce isError in hermetic mode")
+      (is equal "no-active-break" (gethash "error_type" result))))
+  ;; invoke_name → isError
+  (let* ((params (make-hash-table :test 'equal)))
+    (setf (gethash "invoke_name" params) "ABORT")
+    (let ((result (%handle-inspect-restart params nil)))
+      (true (gethash "isError" result)
+            "supplying invoke_name must produce isError in hermetic mode")
+      (is equal "no-active-break" (gethash "error_type" result)))))
