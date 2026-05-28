@@ -64,8 +64,6 @@
                 #:bounded-slime-eval)
   (:import-from #:dsmr-mcp/src/state
                 #:*mode*
-                #:session-id
-                #:*current-session-id*
                 #:get-tool-instance)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
@@ -194,20 +192,20 @@ All symbols are pre-interned in CL-USER by the caller."
          (error () nil))
        (setf ,s-slots (nreverse ,s-slots)))))
 
-(defun %build-attach-condition-form (object-id session-id)
+(defun %build-attach-condition-form (object-id)
   "Return the sexp that, when evaluated in the attached image, inspects the
 current debugger condition (or a held condition by OBJECT-ID) and returns a
 plist with :condition-p, :type, :hierarchy, and :slots.
 
 When OBJECT-ID is nil: reads SLYNK::*SLYNK-DEBUGGER-CONDITION*.
 When OBJECT-ID is non-nil: resolves the condition from DSMR-MCP-ATTACH-REGISTRY
-by raw integer id (mirrors %build-attach-inspect-form).
+by raw integer id.  The registry table lookup is keyed on raw-id alone — no
+session qualifier needed because each session has its own per-tool registry.
 
 Returns :condition-p nil (not an error) when no condition is accessible.
 
 No DSMR-MCP-package symbols cross the wire; condition-form-is-portable in
 tests/attach/inspect-condition-test.lisp verifies this for both arities."
-  (declare (ignore session-id))
   (flet ((cs (n) (intern n (find-package :common-lisp-user))))
     (let ((s-cond  (cs "%DSMR-MCP-ATTACH-COND-C"))
           (s-slots (cs "%DSMR-MCP-ATTACH-COND-SLOTS"))
@@ -372,11 +370,7 @@ and no isError.  On slime-network-error returns a NETWORK_ERROR make-ht."
                                (declare (ignore ep sid))
                                rid)
                            (error () nil))))
-         (session-str  (when raw-id
-                         (ignore-errors
-                           (session-id
-                            (tool-session tool)))))
-         (form         (%build-attach-condition-form raw-id session-str))
+         (form         (%build-attach-condition-form raw-id))
          (lock         (repl-eval-tool-call-lock tool)))
     (handler-case
         (let* ((raw (with-lock-held (lock)
