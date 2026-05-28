@@ -178,8 +178,21 @@ On unexpected slime-network-error (LIST path, or non-post-invoke): logs and
 returns a NETWORK_ERROR make-ht."
   (declare (ignore id))
   (let* ((p          (or params (make-hash-table :test 'equal)))
-         (level      (or (gethash "level" p) 1))
-         (invoke-idx (gethash "invoke" p))
+         ;; JSON clients sometimes serialise integers as strings; coerce
+         ;; defensively so slynk:invoke-nth-restart-for-emacs never sees
+         ;; (slynk:invoke-nth-restart-for-emacs "1" 0) — slynk silently
+         ;; no-ops on type mismatch and the dispatcher would report
+         ;; invoked=t for a call that did nothing.
+         (level      (let ((v (gethash "level" p)))
+                       (cond ((integerp v) v)
+                             ((and (stringp v)
+                                   (parse-integer v :junk-allowed t)))
+                             (t 1))))
+         (invoke-idx (let ((v (gethash "invoke" p)))
+                       (cond ((integerp v) v)
+                             ((and (stringp v)
+                                   (parse-integer v :junk-allowed t)))
+                             (t nil))))
          (invoke-nm  (gethash "invoke_name" p))
          (lock       (repl-eval-tool-call-lock tool))
          (conn       (repl-eval-tool-slynk-conn tool)))
