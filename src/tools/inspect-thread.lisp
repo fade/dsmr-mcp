@@ -271,8 +271,13 @@ When backtrace was requested but the implementation has no backtrace path
 callers can distinguish 'did not ask' from 'asked and got nothing'.
 
 On slime-network-error returns a make-ht with isError t and
-error_type NETWORK_ERROR without propagating the condition."
-  (declare (ignore id))
+error_type NETWORK_ERROR without propagating the condition.
+
+ID is the JSON-RPC request id (possibly nil for direct test calls).  The
+parameter is kept available rather than declared ignored so future rpc-error
+emission can echo the caller's id per the JSON-RPC 2.0 spec without
+broadening the function signature."
+  (declare (ignorable id))
   (let* ((p          (or params (make-hash-table :test 'equal)))
          (thread-id  (gethash "thread_id" p))
          (backtrace-p (gethash "backtrace" p))

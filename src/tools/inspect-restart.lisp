@@ -175,8 +175,11 @@ slime-network-error after invoke is treated as expected (the break resolved),
 returning a make-ht with 'invoked' t instead of surfacing the error.
 
 On unexpected slime-network-error (LIST path, or non-post-invoke): logs and
-returns a NETWORK_ERROR make-ht."
-  (declare (ignore id))
+returns a NETWORK_ERROR make-ht.
+
+ID is the JSON-RPC request id (possibly nil for direct test calls) and is
+threaded through to rpc-error sites so JSON-RPC error envelopes echo the
+caller's id, per the JSON-RPC 2.0 spec."
   (let* ((p          (or params (make-hash-table :test 'equal)))
          ;; JSON clients sometimes serialise integers as strings; coerce
          ;; defensively so slynk:invoke-nth-restart-for-emacs never sees
@@ -268,7 +271,7 @@ returns a NETWORK_ERROR make-ht."
               ((null resolved-idx)
                ;; invoke_name supplied but not found.
                (return-from %dispatch-attach-inspect-restart
-                 (rpc-error nil -32602
+                 (rpc-error id -32602
                             (format nil
                                     "inspect-restart: restart name ~S not found in current break."
                                     invoke-nm))))
@@ -276,7 +279,7 @@ returns a NETWORK_ERROR make-ht."
                    (>= resolved-idx (length restarts-vec)))
                ;; Out-of-range index.
                (return-from %dispatch-attach-inspect-restart
-                 (rpc-error nil -32602
+                 (rpc-error id -32602
                             (format nil
                                     "inspect-restart: restart index ~D out of range (0–~D)."
                                     resolved-idx

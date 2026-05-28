@@ -357,8 +357,12 @@ uses the held-object branch.  Otherwise uses the live-break branch.
 
 Returns a make-ht with condition_p, condition_type (when applicable),
 hierarchy vector, and slots vector.  A not-at-break result has condition_p=false
-and no isError.  On slime-network-error returns a NETWORK_ERROR make-ht."
-  (declare (ignore id))
+and no isError.  On slime-network-error returns a NETWORK_ERROR make-ht.
+
+The MCP request ID is kept available (declared ignorable rather than ignored)
+so future rpc-error emission can echo the caller's id per JSON-RPC 2.0
+without broadening the function signature."
+  (declare (ignorable id))
   (let* ((p            (or params (make-hash-table :test 'equal)))
          (id-string    (gethash "id" p))
          (max-elements (gethash "max_elements" p))
