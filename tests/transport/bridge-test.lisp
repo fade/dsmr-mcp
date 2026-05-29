@@ -39,8 +39,11 @@ runner's current working directory."
                    (asdf:system-source-directory :dsmr-mcp)))
 
 (defun %bridge-binary-present-p ()
-  "Return T when bin/dsmr-mcp-bridge exists on disk."
-  (and (probe-file (%bridge-binary-path)) t))
+  "Return T when bin/dsmr-mcp-bridge exists on disk.
+Guards probe-file because a malformed pathname or a symlink loop can
+signal — the guarded tests are supposed to degrade to PASS in that
+case, not crash the suite."
+  (and (ignore-errors (probe-file (%bridge-binary-path))) t))
 
 (defun %socket-available-p ()
   "Return T when a TCP listen socket can be bound on loopback.
