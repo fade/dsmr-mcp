@@ -35,6 +35,7 @@
                 #:make-session
                 #:session-id
                 #:session-notify-channel
+                #:session-notify-channel-lock
                 #:session-slynk-attach
                 #:session-project-root
                 #:*current-session-id*)
@@ -514,13 +515,21 @@ Supports both application/json and text/event-stream Accept modes."
                    ;; with a null-channel on cleanup) when this POST is in
                    ;; SSE mode. When no SSE subscriber exists prior is a
                    ;; null-channel; we then own the swap and must restore it.
-                   (prior-channel (session-notify-channel mcp-sess))
-                   (reuse-prior   (and sse-p (typep prior-channel 'sse-channel)))
-                   (fresh-channel (if reuse-prior
-                                      prior-channel
-                                      (make-instance 'sse-channel :stream nil))))
-              (when (and sse-p (not reuse-prior))
-                (setf (session-notify-channel mcp-sess) fresh-channel))
+                   (prior-channel nil)
+                   (reuse-prior   nil)
+                   (fresh-channel nil))
+              ;; Capture-prior + check + install must be atomic against a
+              ;; concurrent GET subscriber's install, so run the read-modify-
+              ;; write of the notify-channel slot under the per-session lock.
+              (when sse-p
+                (with-lock-held ((session-notify-channel-lock mcp-sess))
+                  (setf prior-channel (session-notify-channel mcp-sess)
+                        reuse-prior   (typep prior-channel 'sse-channel)
+                        fresh-channel (if reuse-prior
+                                          prior-channel
+                                          (make-instance 'sse-channel :stream nil)))
+                  (unless reuse-prior
+                    (setf (session-notify-channel mcp-sess) fresh-channel))))
               (unwind-protect
                    (if sse-p
                        ;; SSE mode: open a response stream and write the
@@ -568,8 +577,13 @@ Supports both application/json and text/event-stream Accept modes."
                 ;; one ourselves — otherwise we'd overwrite the GET
                 ;; subscriber's live sse-channel with a null-channel, and
                 ;; the GET handler's condition-wait would block forever.
+                ;; Under the lock, and guarded by still-own-slot: a GET that
+                ;; ran concurrently may have legitimately swapped its own
+                ;; channel in, in which case we must not stomp it.
                 (when (and sse-p (not reuse-prior))
-                  (setf (session-notify-channel mcp-sess) prior-channel))
+                  (with-lock-held ((session-notify-channel-lock mcp-sess))
+                    (when (eq (session-notify-channel mcp-sess) fresh-channel)
+                      (setf (session-notify-channel mcp-sess) prior-channel))))
                 (bordeaux-threads:with-lock-held
                     ((http-session-active-requests-lock http-sess))
                   (decf (http-session-active-requests http-sess)))))))))
@@ -602,13 +616,20 @@ Supports both application/json and text/event-stream Accept modes."
                  ;; reaches the GET stream, matching MCP Streamable HTTP
                  ;; semantics: GET is the canonical notification channel,
                  ;; POST returns the call result inline).
-                 (prior-channel (session-notify-channel mcp-sess))
-                 (reuse-prior   (and sse-p (typep prior-channel 'sse-channel)))
-                 (fresh-channel (if reuse-prior
-                                    prior-channel
-                                    (make-instance 'sse-channel :stream nil))))
-            (when (and sse-p (not reuse-prior))
-              (setf (session-notify-channel mcp-sess) fresh-channel))
+                 (prior-channel nil)
+                 (reuse-prior   nil)
+                 (fresh-channel nil))
+            ;; Atomic capture-prior + check + install under the per-session
+            ;; lock so a concurrent GET subscriber's install cannot interleave.
+            (when sse-p
+              (with-lock-held ((session-notify-channel-lock mcp-sess))
+                (setf prior-channel (session-notify-channel mcp-sess)
+                      reuse-prior   (typep prior-channel 'sse-channel)
+                      fresh-channel (if reuse-prior
+                                        prior-channel
+                                        (make-instance 'sse-channel :stream nil)))
+                (unless reuse-prior
+                  (setf (session-notify-channel mcp-sess) fresh-channel))))
             (unwind-protect
                  (let ((*current-session-id* session-id-header))
                    (if sse-p
@@ -652,9 +673,13 @@ Supports both application/json and text/event-stream Accept modes."
                                "")))))
               ;; Cleanup runs whether dispatch returned normally or threw.
               ;; Restore the prior channel only when we owned the swap —
-              ;; never overwrite a GET subscriber's live sse-channel.
+              ;; never overwrite a GET subscriber's live sse-channel.  Under
+              ;; the lock and guarded by still-own-slot so a concurrent GET
+              ;; that swapped its own channel in is not stomped.
               (when (and sse-p (not reuse-prior))
-                (setf (session-notify-channel mcp-sess) prior-channel))
+                (with-lock-held ((session-notify-channel-lock mcp-sess))
+                  (when (eq (session-notify-channel mcp-sess) fresh-channel)
+                    (setf (session-notify-channel mcp-sess) prior-channel))))
               (bordeaux-threads:with-lock-held
                   ((http-session-active-requests-lock http-sess))
                 (decf (http-session-active-requests http-sess))))))))))
@@ -688,16 +713,33 @@ own channel)."
                           :status 404)))
 
       (let* ((mcp-sess (http-session-mcp-session http-sess))
-             (prior-channel (session-notify-channel mcp-sess)))
+             (prior-channel nil)
+             (channel nil))
 
-        ;; Only one GET subscriber per session — refuse a second concurrent
-        ;; GET with 409 Conflict.  The MCP Streamable HTTP shape designates
-        ;; GET as the single canonical drainer of the notification queue;
-        ;; allowing two would race on %drain-sse-queue and split events.
-        (when (typep prior-channel 'sse-channel)
-          (return-from handle-mcp-get
-            (%json-response (%http-error-json -32600 "GET stream already open")
-                            :status 409)))
+        ;; Reserve the notification slot atomically: under the per-session
+        ;; install lock, refuse a second concurrent GET (409 Conflict — the
+        ;; MCP Streamable HTTP shape designates GET as the single canonical
+        ;; drainer of the notification queue; allowing two would race on
+        ;; %drain-sse-queue and split events), otherwise install a placeholder
+        ;; :stream nil channel.  Reserving a placeholder rather than the real
+        ;; channel lets us release the lock before send-headers (which can
+        ;; block on a slow client) and attach the live stream afterward.  A
+        ;; concurrent POST that emits during that gap only queues onto the
+        ;; channel — emit never touches the stream — so the events are drained
+        ;; intact once the loop starts.
+        (let ((conflict
+                (with-lock-held ((session-notify-channel-lock mcp-sess))
+                  (setf prior-channel (session-notify-channel mcp-sess))
+                  (if (typep prior-channel 'sse-channel)
+                      t
+                      (progn
+                        (setf channel (make-instance 'sse-channel :stream nil))
+                        (setf (session-notify-channel mcp-sess) channel)
+                        nil)))))
+          (when conflict
+            (return-from handle-mcp-get
+              (%json-response (%http-error-json -32600 "GET stream already open")
+                              :status 409))))
 
         ;; Set SSE response headers BEFORE send-headers.
         (setf (hunchentoot:content-type*) "text/event-stream")
@@ -707,13 +749,12 @@ own channel)."
         ;; send-headers flushes the response headers to the client and returns
         ;; a binary chunked stream.  Wrap it in a flexi-stream for character
         ;; output so %write-sse-event / %drain-sse-queue can use write-string.
-        (let* ((stream (make-flexi-stream (hunchentoot:send-headers)
-                                          :external-format :utf-8))
-               (channel (make-instance 'sse-channel :stream stream))
-               (done-p nil))
+        (let ((stream (make-flexi-stream (hunchentoot:send-headers)
+                                         :external-format :utf-8))
+              (done-p nil))
 
-          ;; Install the SSE channel on the session.
-          (setf (session-notify-channel mcp-sess) channel)
+          ;; Attach the live stream to the reserved channel.
+          (setf (sse-channel-stream channel) stream)
 
           ;; Count the long-lived GET as one in-flight request so the idle
           ;; eviction sweep treats the session as active for as long as the
@@ -744,9 +785,11 @@ own channel)."
             ;; slot.  A POST handler that ran in SSE mode against this same
             ;; session may legitimately have swapped a different channel in
             ;; while we were waiting; stomping it unconditionally here would
-            ;; orphan that POST's subscriber.
-            (when (eq (session-notify-channel mcp-sess) channel)
-              (setf (session-notify-channel mcp-sess) prior-channel))
+            ;; orphan that POST's subscriber.  Under the install lock so the
+            ;; check-then-act against a concurrent POST cleanup is atomic.
+            (with-lock-held ((session-notify-channel-lock mcp-sess))
+              (when (eq (session-notify-channel mcp-sess) channel)
+                (setf (session-notify-channel mcp-sess) prior-channel)))
             (bordeaux-threads:with-lock-held
                 ((http-session-active-requests-lock http-sess))
               (decf (http-session-active-requests http-sess)))

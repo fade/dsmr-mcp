@@ -77,9 +77,11 @@ does not need to guard against a dead client."))
 (defclass sse-channel ()
   ((stream
     :initarg :stream
-    :reader sse-channel-stream
+    :accessor sse-channel-stream
     :documentation "Hunchentoot chunked output stream for this SSE connection.
-Owned exclusively by the SSE server thread; emit must NOT write to it directly.")
+Owned exclusively by the SSE server thread; emit must NOT write to it directly.
+Writable so the GET handler can reserve a :stream nil channel under the install
+lock, then attach the real stream after send-headers without holding the lock.")
    (lock
     :initform (bordeaux-threads:make-lock "sse-channel")
     :reader sse-channel-lock

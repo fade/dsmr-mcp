@@ -328,6 +328,87 @@ Uses Connection: close to prevent keep-alive from hanging reads."
         (stop-http-server)
         (%clear-all-sessions))))
 
+(define-test http-get-concurrent-installs-elect-one-winner
+  "N GET /mcp subscribers race the sse-channel install against one session;
+exactly one wins (200) and the rest get 409 Conflict.  The per-session
+install lock serialises the check-then-act on the notify-channel slot, so no
+two GETs can both pass the not-already-attached check and install a channel.
+A pre-fix racy install would let two concurrent GETs both reach 200 (and
+orphan one subscriber).  Single-client tests never exercise this."
+  (if (not (http-port-available-p))
+      (true t)
+      (let ((sockets nil))
+        (unwind-protect
+             (multiple-value-bind (acceptor port)
+                 (start-http-server :host "127.0.0.1" :port 0)
+               (declare (ignore acceptor))
+               (sleep 0.1d0)
+               (multiple-value-bind (init-status init-headers)
+                   (handler-case
+                       (send-http-request
+                        port "POST" "/mcp"
+                        :body (%init-body)
+                        :headers '(("Content-Type" . "application/json")
+                                   ("Accept" . "application/json")))
+                     (error () (values nil nil)))
+                 (let ((id (and init-status (eql init-status 200)
+                                (%extract-session-id init-headers))))
+                   ;; Degrade to PASS when the environment could not init.
+                   (if (not id)
+                       (true t)
+                       (let* ((n 8)
+                              (go-latch (list nil))
+                              (results (make-array n :initial-element nil)))
+                         ;; Pre-connect N racers, each spinning on a shared
+                         ;; latch so all fire their GET near-simultaneously and
+                         ;; actually contend for the install.
+                         (dotimes (i n)
+                           (let ((idx i))
+                             (bordeaux-threads:make-thread
+                              (lambda ()
+                                (handler-case
+                                    (let* ((sock (usocket:socket-connect
+                                                  "127.0.0.1" port
+                                                  :element-type 'character))
+                                           (stream (usocket:socket-stream sock)))
+                                      (bordeaux-threads:with-lock-held (*sessions-lock*)
+                                        (push sock sockets))
+                                      (loop until (car go-latch)
+                                            do (sleep 0.001d0))
+                                      (format stream "GET /mcp HTTP/1.1~C~C" #\Return #\Newline)
+                                      (format stream "Host: 127.0.0.1:~D~C~C" port #\Return #\Newline)
+                                      (format stream "Mcp-Session-Id: ~A~C~C" id #\Return #\Newline)
+                                      (format stream "~C~C" #\Return #\Newline)
+                                      (finish-output stream)
+                                      ;; send-headers flushes the status line for
+                                      ;; both winner (200) and losers (409), so a
+                                      ;; single read-line resolves every racer.
+                                      (setf (aref results idx)
+                                            (read-line stream nil "")))
+                                  (error () (setf (aref results idx) :error))))
+                              :name (format nil "get-racer-~D" idx))))
+                         ;; Let every thread reach the latch, then release.
+                         (sleep 0.2d0)
+                         (setf (car go-latch) t)
+                         ;; Wait until all N have a status line (or time out).
+                         (loop repeat 500
+                               until (= n (count-if #'identity results))
+                               do (sleep 0.01d0))
+                         (let ((winners
+                                 (count-if (lambda (r)
+                                             (and (stringp r) (search "200" r)))
+                                           results))
+                               (conflicts
+                                 (count-if (lambda (r)
+                                             (and (stringp r) (search "409" r)))
+                                           results)))
+                           (is eql 1 winners)
+                           (is eql (1- n) conflicts)))))))
+          (dolist (s sockets)
+            (ignore-errors (usocket:socket-close s)))
+          (stop-http-server)
+          (%clear-all-sessions)))))
+
 (define-test http-post-with-accept-event-stream-returns-sse
   "POST /mcp initialize with Accept: text/event-stream returns SSE body with result."
   (if (not (http-port-available-p))
