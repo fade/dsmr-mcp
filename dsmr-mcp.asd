@@ -159,8 +159,9 @@ file-based ICP as a fallback for crash isolation and parallel workers."
 ;;; Bridge binary: standalone stdio<->TCP proxy for stdio-only MCP clients.
 ;;;
 ;;; Produces bin/dsmr-mcp-bridge via (asdf:make :dsmr-mcp-bridge).
-;;; Per D-07 this is a Lisp-only executable (no Python runtime on the client
-;;; machine); per D-08 per-platform CI artefacts are Phase 12's concern.
+;;; The bridge is a Lisp-only executable so the client machine needs no
+;;; Python runtime.  Per-platform CI artefacts are a later concern;
+;;; today the operator builds locally with `make bridge`.
 ;;;
 ;;; Build-operation note: the string form "program-op" is the CL Cookbook
 ;;; recommended style for ASDF >= 3.1; if it fails with "operation not found"

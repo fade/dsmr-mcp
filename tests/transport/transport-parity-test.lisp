@@ -1,13 +1,15 @@
 ;;;; tests/transport/transport-parity-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; D-14 transport parity test: verifies that the tools/list response
-;;;; served over HTTP contains the same tool names as the in-process
-;;;; *tool-classes* registry (which is what the stdio and TCP transports
-;;;; expose).
+;;;; Transport parity test: verifies that the tools/list response served
+;;;; over HTTP contains the same tool names as the in-process *tool-classes*
+;;;; registry (which is what the stdio and TCP transports expose).  A
+;;;; future tool added to the registry without a corresponding HTTP-side
+;;;; schema entry is caught here, not at a client.
 ;;;;
 ;;;; send-http-request and http-port-available-p are imported from
-;;;; dsmr-mcp/tests/transport/http-test — single source of truth (W-3).
+;;;; dsmr-mcp/tests/transport/http-test rather than duplicated so the
+;;;; HTTP harness has a single owner.
 
 (defpackage #:dsmr-mcp/tests/transport/transport-parity-test
   (:use #:cl #:parachute)

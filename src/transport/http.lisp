@@ -9,24 +9,25 @@
 ;;;; Per-session slynk-attach and project-root are closure-captured from
 ;;;; serve-http's keyword args and flowed into every create-session call via
 ;;;; the Hunchentoot request-handler closures — no process-wide special holds
-;;;; either value (BLOCKER fix: honours no-global-project-root-session-scoped
-;;;; invariant end-to-end).
+;;;; either value, so fs-set-project-root in one session never reaches another.
 ;;;;
-;;;; Auth posture (D-11): no Bearer-token / CORS-token / client-certificate.
+;;;; Auth posture: no Bearer-token / CORS-token / client-certificate — the
+;;;; loopback origin check is the entire trust boundary.
 ;;;; CORS: loopback-only allow-list (%loopback-origin-p, ported verbatim from
-;;;; cl-mcp/src/http.lisp lines 399-416, D-12).
-;;;; Session eviction: 1h idle, 1-min sweep, active-requests guard (D-06).
+;;;; cl-mcp/src/http.lisp lines 399-416).
+;;;; Session eviction: 1h idle, 1-min sweep, active-requests guard.
 ;;;;
 ;;;; Ported and adapted from cl-mcp/src/http.lisp (MIT) under AGPL:
 ;;;;   - defstruct http-session → defclass (project CLOS convention)
 ;;;;   - make-state → make-session with :slynk-attach :project-root from closure
 ;;;;   - release-session → uiop:symbol-call detach-session
 ;;;;   - yason:encode/parse → jzon:stringify/parse
-;;;;   - Bearer-token auth removed entirely (D-11)
-;;;;   - *session-timeout-seconds* 86400 → 3600 (D-06)
-;;;;   - *cleanup-interval-seconds* 300 → 60 (D-06)
-;;;;   - handle-mcp-get 405 stub → real SSE implementation (D-04)
-;;;;   - POST SSE path added (D-04)
+;;;;   - Bearer-token auth removed entirely
+;;;;   - *session-timeout-seconds* 86400 → 3600 to bound the per-session
+;;;;     Slynk client lifetime
+;;;;   - *cleanup-interval-seconds* 300 → 60 for tighter eviction cadence
+;;;;   - handle-mcp-get 405 stub → real SSE implementation
+;;;;   - POST SSE path added
 
 (defpackage #:dsmr-mcp/src/transport/http
   (:use #:cl)
@@ -149,7 +150,8 @@ Default 60 (1 minute). Operator-tunable via DSMR_HTTP_CLEANUP_INTERVAL.")
 tool-instances, session-slynk-attach, session-project-root, etc.).
 Created by CREATE-SESSION with the closed-over default-slynk-attach and
 default-project-root from serve-http's lexical scope — never from any
-process-wide special (BLOCKER fix).")
+process-wide special, so per-session project-root mutations stay
+within that session.")
    (created-at
     :initform (get-universal-time)
     :reader http-session-created-at
@@ -164,7 +166,7 @@ Updated by GET-SESSION on each access.")
     :accessor http-session-active-requests
     :documentation "Count of in-flight requests currently being served.
 A session with active-requests > 0 is never evicted even when expired,
-so a long tool call is not killed mid-flight (D-06 active-request guard).")
+so a long tool call is not killed mid-flight.")
    (active-requests-lock
     :initform (bordeaux-threads:make-lock "active-requests-lock")
     :reader http-session-active-requests-lock
@@ -182,7 +184,7 @@ handlers access it as a regular session (same API as stdio/TCP)."))
 (defun %generate-session-id ()
   "Generate a random 64-character lowercase hex session ID.
 Uses (random (expt 2 256)) for 256 bits of entropy, making spoofing
-infeasible for the loopback threat model (T-09-03-04)."
+infeasible for the loopback threat model."
   (format nil "~64,'0x" (random (expt 2 256))))
 
 ;;; ---------------------------------------------------------------------------
@@ -291,7 +293,8 @@ handler exits instead of parking indefinitely on a dead session."
   "Periodically sweep *SESSIONS* for idle-expired entries and evict them.
 Runs in a background thread until *CLEANUP-RUNNING* becomes NIL.
 Uses 1-second sub-sleeps for responsive shutdown.
-Sessions with active-requests > 0 are skipped (D-06 active-request guard)."
+Sessions with active-requests > 0 are skipped so a tool call in flight
+is never killed mid-request."
   (loop while *cleanup-running*
         do (loop repeat (max 1 (ceiling *cleanup-interval-seconds*))
                  while *cleanup-running*
@@ -313,7 +316,7 @@ Sessions with active-requests > 0 are skipped (D-06 active-request guard)."
                                         (http-session-active-requests http-sess))))
                                 (if (zerop active)
                                     (push (cons id http-sess) expired-ids)
-                                    ;; In-flight: skip eviction (D-06 guard).
+                                    ;; In-flight: skip eviction so the tool call completes.
                                     nil)))))
                         *sessions*)
                        ;; Remove expired entries under the same lock pass.
@@ -353,7 +356,7 @@ Sessions with active-requests > 0 are skipped (D-06 active-request guard)."
   (setf *cleanup-thread* nil))
 
 ;;; ---------------------------------------------------------------------------
-;;; CORS validation (D-12)
+;;; CORS validation
 ;;; ---------------------------------------------------------------------------
 
 (defun %loopback-origin-p (origin)
@@ -405,7 +408,8 @@ supported set."
 
 (defun %apply-cors-headers (request)
   "Apply CORS response headers when the request Origin is a loopback address.
-Non-loopback origins receive no Access-Control-Allow-Origin (D-12).
+Non-loopback origins receive no Access-Control-Allow-Origin so a
+browser-sourced cross-origin request is blocked at the wire.
 Always sets Access-Control-Expose-Headers so clients can read Mcp-Session-Id."
   (let ((origin (hunchentoot:header-in :origin request)))
     (when (and origin (%loopback-origin-p origin))
@@ -450,7 +454,8 @@ Always sets Access-Control-Expose-Headers so clients can read Mcp-Session-Id."
 (defun handle-mcp-post (default-slynk-attach default-project-root)
   "Handle POST /mcp for this acceptor invocation.
 DEFAULT-SLYNK-ATTACH and DEFAULT-PROJECT-ROOT are the closure-captured
-defaults from serve-http — never from any process-wide special (BLOCKER fix).
+defaults from serve-http — never from any process-wide special, so
+per-session mutations stay within that session.
 Supports both application/json and text/event-stream Accept modes."
   (let* ((request hunchentoot:*request*)
          (session-id-header (hunchentoot:header-in :mcp-session-id request))
@@ -646,7 +651,7 @@ Supports both application/json and text/event-stream Accept modes."
                 (decf (http-session-active-requests http-sess))))))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; GET handler — long-lived SSE notification stream (D-04)
+;;; GET handler — long-lived SSE notification stream
 ;;; ---------------------------------------------------------------------------
 
 (defun handle-mcp-get ()
@@ -755,7 +760,7 @@ Returns 204 No Content on success, 400 for missing header, 404 for unknown."
     :reader mcp-acceptor-post-handler
     :documentation "Closure that handles POST /mcp for this acceptor invocation.
 Captures default-slynk-attach and default-project-root from serve-http's
-lexical scope (BLOCKER fix).")
+lexical scope so per-session mutations never escape to other sessions.")
    (get-handler
     :initarg :get-handler
     :reader mcp-acceptor-get-handler
@@ -815,18 +820,20 @@ Arguments:
   SESSION-TIMEOUT   — idle eviction threshold in seconds (default 3600)
   CLEANUP-INTERVAL  — sweep interval in seconds (default 60)
 
-BLOCKER fix: SLYNK-ATTACH and PROJECT-ROOT are let-bound as DEFAULT-SLYNK-ATTACH
-and DEFAULT-PROJECT-ROOT in this function's lexical scope.  The four per-method
-handler closures capture those local bindings.  Every CREATE-SESSION call
-receives the captured values as keyword arguments.  No process-wide special
-holds either value — so fs-set-project-root on one HTTP session updates only
-that session's SESSION-PROJECT-ROOT slot, never another session's."
+SLYNK-ATTACH and PROJECT-ROOT are let-bound as DEFAULT-SLYNK-ATTACH and
+DEFAULT-PROJECT-ROOT in this function's lexical scope.  The four
+per-method handler closures capture those local bindings.  Every
+CREATE-SESSION call receives the captured values as keyword arguments.
+No process-wide special holds either value — so fs-set-project-root on
+one HTTP session updates only that session's SESSION-PROJECT-ROOT slot,
+never another session's."
   ;; Apply operator-supplied timeouts to the process-wide specials.
   (setf *session-timeout-seconds* session-timeout
         *cleanup-interval-seconds* cleanup-interval)
 
-  ;; BLOCKER fix: let-bind the two per-invocation defaults from keyword args.
-  ;; These names are the ONLY carrier; no defvar/defparameter is created.
+  ;; Let-bind the two per-invocation defaults from keyword args; these
+  ;; names are the ONLY carrier — no defvar/defparameter is created, so
+  ;; one session's fs-set-project-root cannot reach any other session.
   (let* ((default-slynk-attach slynk-attach)
          (default-project-root project-root)
 

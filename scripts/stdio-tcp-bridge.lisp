@@ -19,8 +19,10 @@
 ;;;;   3  — TCP connection timeout (never-connected path)
 ;;;;  64  — invalid CLI arguments (sysexits.h EX_USAGE; e.g. --port abc)
 ;;;;
-;;;; Per D-07: standalone source, depends only on usocket + bordeaux-threads
-;;;; + sb-ext.  No dsmr-mcp/src/... package imports allowed here.
+;;;; Standalone source: depends only on usocket + bordeaux-threads + sb-ext.
+;;;; No dsmr-mcp/src/... package imports allowed here — the bridge ships
+;;;; as its own program-op binary and must not drag the full server image
+;;;; into its dependency closure.
 
 (defpackage #:dsmr-mcp-bridge/scripts/stdio-tcp-bridge
   (:use #:cl)
@@ -50,7 +52,8 @@
 ;;; Log-line heuristic
 ;;; ---------------------------------------------------------------------------
 
-;; D-09 substring check (not prefix) — jzon key order is non-deterministic; see RESEARCH.md Pitfall 5.
+;; Substring check (not prefix) because jzon serialises hash-table keys
+;; in implementation-defined order — the "ts" key is not always first.
 (defun %log-line-p (line)
   "Return T when LINE looks like a log4cl JSON layout output line.
 Uses substring search for \"ts\": or \"level\": rather than a prefix check
@@ -248,7 +251,7 @@ and accepted arguments."
   (force-output *error-output*))
 
 ;;; ---------------------------------------------------------------------------
-;;; Bridge driver (three distinct exit paths — W-4)
+;;; Bridge driver (three distinct exit paths)
 ;;; ---------------------------------------------------------------------------
 
 (defun run-bridge (host port connect-timeout)
@@ -259,7 +262,9 @@ Returns an integer exit code:
   2  — connection refused (NEVER-CONNECTED path)
   3  — connection timeout (NEVER-CONNECTED path)
 
-The three exit paths (0 / 2 / 3) are textually distinct code paths (W-4)."
+The three exit paths (0 / 2 / 3) are textually distinct code paths so a
+supervisor inspecting the exit code can distinguish a clean shutdown
+from a connection failure mode."
   (let ((sock
           (handler-case
               (with-timeout connect-timeout
