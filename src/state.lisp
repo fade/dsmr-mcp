@@ -22,6 +22,7 @@
            #:tool-instances
            #:session-slynk-attach
            #:session-project-root
+           #:session-notify-channel
            #:make-session
            #:*current-session-id*
            #:*mode*
@@ -72,7 +73,21 @@ this session, or NIL. Set by run from the resolved config; read by
     :initform nil
     :documentation "Absolute pathname of this session's project root.
 NIL until fs-set-project-root is called. Never modified by the process CWD;
-changed only via fs-set-project-root. Multi-client safe (D-03)."))
+changed only via fs-set-project-root. Multi-client safe (D-03).")
+   (notify-channel
+    :initarg :notify-channel
+    :accessor session-notify-channel
+    :initform nil
+    :documentation "Notification channel for this session.
+null-channel: stdio sessions and bare test fixtures (emit is a no-op).
+tcp-line-channel: TCP sessions — emit writes one JSON-RPC notification line.
+sse-channel: HTTP sessions — emit queues an event for the SSE server thread.
+Set by the transport at session-create; never NIL after make-session returns.
+
+Load-order note: src/notify.lisp loads AFTER src/state.lisp in the
+package-inferred-system order. make-session installs a null-channel instance
+via runtime class lookup (find-symbol / find-package) so this slot's initform
+stays nil and no compile-time import of dsmr-mcp/src/notify is required."))
   (:documentation "Holds all per-connection state for one MCP session.
 One session is constructed per transport connection:
   - stdio: one session for the whole process lifetime
@@ -94,9 +109,26 @@ The returned session has:
   - client-info: NIL
   - tool-instances: empty equal-keyed hash-table
   - slynk-attach: SLYNK-ATTACH (NIL when not configured)
-  - project-root: PROJECT-ROOT (NIL when not configured)"
-  (make-instance 'session :id id :slynk-attach slynk-attach
-                          :project-root project-root))
+  - project-root: PROJECT-ROOT (NIL when not configured)
+  - notify-channel: a null-channel instance (emit is a no-op until the
+    transport installs a real channel via setf session-notify-channel)"
+  (let ((result (make-instance 'session :id id :slynk-attach slynk-attach
+                                        :project-root project-root)))
+    ;; Install a null-channel as the default notify-channel.  Runtime class
+    ;; lookup via find-symbol / find-package avoids a compile-time import of
+    ;; dsmr-mcp/src/notify, which would create a circular load-order dependency
+    ;; (notify.lisp loads after state.lisp in the package-inferred order).
+    ;; When notify.lisp is not yet loaded the channel stays nil; tools call
+    ;; emit only after full system load, so this is safe.
+    (let ((null-channel-class
+            (let ((pkg (find-package :dsmr-mcp/src/notify)))
+              (when pkg
+                (let ((sym (find-symbol "NULL-CHANNEL" pkg)))
+                  (when sym (find-class sym nil)))))))
+      (when null-channel-class
+        (setf (session-notify-channel result)
+              (make-instance null-channel-class))))
+    result))
 
 ;;; Session-ID dynamic variable --------------------------------------------
 

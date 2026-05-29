@@ -30,8 +30,11 @@
                 #:session
                 #:session-id
                 #:session-slynk-attach
+                #:session-notify-channel
                 #:get-tool-instance
                 #:tool-instances)
+  (:import-from #:dsmr-mcp/src/notify
+                #:emit)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
   (:import-from #:dsmr-mcp/src/attach/connection
@@ -60,9 +63,130 @@
            #:repl-eval-tool-connection-epoch
            #:%dispatch-attach
            #:try-eager-connect
-           #:detach-session))
+           #:detach-session
+           #:*attach-call-lock*
+           #:*attach-waiters*
+           #:*attach-waiters-lock*
+           #:*attach-holder-session-id*
+           #:*attach-concurrency*
+           #:with-serialised-attach-call
+           #:%resolve-attach-concurrency))
 
 (in-package #:dsmr-mcp/src/attach/dispatch)
+
+;;; ---------------------------------------------------------------------------
+;;; Process-wide attach call-lock and concurrency policy
+;;; ---------------------------------------------------------------------------
+
+(defparameter *attach-call-lock*
+  (bordeaux-threads:make-lock "attach-call-lock")
+  "Process-wide lock serialising attached-mode tool-handle calls.
+Held for the duration of every bounded-slime-eval when *attach-concurrency*
+is :serialised (the default).  Sessions operating in :parallel mode never
+acquire this lock.  Hermetic mode is unaffected; hermetic workers run in
+separate processes and are session-affined.")
+
+(defparameter *attach-waiters-lock*
+  (bordeaux-threads:make-lock "attach-waiters-lock")
+  "Lock protecting *attach-waiters* and *attach-holder-session-id*.")
+
+(defparameter *attach-waiters*
+  nil
+  "Ordered list of session-id strings currently waiting for *attach-call-lock*.
+Entries are appended at enqueue and removed after the lock is acquired.
+Protected by *attach-waiters-lock*.")
+
+(defparameter *attach-holder-session-id*
+  nil
+  "Session-id string of the session currently holding *attach-call-lock*, or NIL.
+Set to the entering session's id when the lock is acquired and reset to NIL
+in the unwind-protect cleanup.  Protected by *attach-waiters-lock*.")
+
+(defparameter *attach-concurrency*
+  :serialised
+  "Concurrency policy for attached-mode tool calls.
+:SERIALISED (default) — *attach-call-lock* is held around every
+  bounded-slime-eval so concurrent sessions take turns inside the developer's
+  live image, preventing interleaved eval state.
+:PARALLEL — lock is never acquired; concurrent sessions may race inside the
+  image.  Only set this when you know the agents are read-mostly and will not
+  corrupt shared image state.
+Set once at startup from DSMR_ATTACH_CONCURRENCY; never toggled at runtime.")
+
+;;; Concurrency env-var parser ------------------------------------------------
+
+(defun %resolve-attach-concurrency (value)
+  "Coerce VALUE (string or keyword) to :SERIALISED or :PARALLEL.
+Signals INVALID-CONFIG-VALUE (from dsmr-mcp/src/run) for any other value."
+  (let ((kw (etypecase value
+               (keyword value)
+               (string  (intern (string-upcase value) :keyword)))))
+    (case kw
+      (:serialised :serialised)
+      (:parallel   :parallel)
+      (t (error (find-symbol "INVALID-CONFIG-VALUE"
+                             (find-package :dsmr-mcp/src/run))
+                :name "DSMR_ATTACH_CONCURRENCY"
+                :raw  value)))))
+
+;;; Serialised-attach-call macro ----------------------------------------------
+
+(defmacro with-serialised-attach-call ((session) &body body)
+  "Execute BODY holding the process-wide *attach-call-lock* when
+*attach-concurrency* is :SERIALISED, or execute BODY immediately when :PARALLEL.
+
+Before blocking on the lock, emits a notifications/dsmr-mcp/attach/queued
+notification over SESSION's notify-channel carrying the current waiter
+position and holder_session_id.  The notification fires before the session
+blocks so the client can render a status indicator immediately.
+
+The position number reflects the length of *attach-waiters* at enqueue
+time and is approximate — the mutex does not guarantee strict FIFO, so
+position is advisory.
+
+SESSION is a dsmr-mcp session object; its session-id and notify-channel
+are used for the queued notification and the holder-tracking bookkeeping."
+  (let ((session-var (gensym "SESSION"))
+        (sid-var     (gensym "SID"))
+        (pos-var     (gensym "POSITION"))
+        (holder-var  (gensym "HOLDER")))
+    `(if (eq *attach-concurrency* :parallel)
+         (progn ,@body)
+         (let* ((,session-var ,session)
+                (,sid-var     (session-id ,session-var))
+                ,pos-var
+                ,holder-var)
+           ;; Register this session in the waiter list and snapshot the
+           ;; current holder before blocking.  Protected by *attach-waiters-lock*.
+           (bordeaux-threads:with-lock-held (*attach-waiters-lock*)
+             (setf *attach-waiters*
+                   (append *attach-waiters* (list ,sid-var)))
+             (setf ,pos-var   (length *attach-waiters*))
+             (setf ,holder-var *attach-holder-session-id*))
+           ;; Emit the queued notification BEFORE blocking so the client sees
+           ;; it immediately.  Only fire when there is actually a holder
+           ;; (position > 0 and holder is non-nil means we will have to wait).
+           (when (and (> ,pos-var 0) ,holder-var)
+             (emit (session-notify-channel ,session-var)
+                   "notifications/dsmr-mcp/attach/queued"
+                   (make-ht "position"          ,pos-var
+                            "holder_session_id" ,holder-var)))
+           ;; Acquire the process-wide lock.  bordeaux-threads:with-lock-held
+           ;; blocks here until the current holder releases it.
+           (bordeaux-threads:with-lock-held (*attach-call-lock*)
+             ;; Announce ourselves as the holder under the waiters lock so
+             ;; concurrently-enqueueing sessions read the current holder-id.
+             ;; Must use setf (not dynamic let) so all threads see the update.
+             (bordeaux-threads:with-lock-held (*attach-waiters-lock*)
+               (setf *attach-holder-session-id* ,sid-var))
+             (unwind-protect
+                  (progn ,@body)
+               ;; Cleanup under the waiters lock: remove from the waiter list
+               ;; and clear the global holder-id.
+               (bordeaux-threads:with-lock-held (*attach-waiters-lock*)
+                 (setf *attach-waiters*
+                       (remove ,sid-var *attach-waiters* :test #'string= :count 1))
+                 (setf *attach-holder-session-id* nil))))))))
 
 ;;; repl-eval-tool CLOS class -------------------------------------------------
 ;;;
@@ -388,15 +512,24 @@ so IDs minted before a drop-connection can be detected as stale."
 
 (defmacro with-attach-dispatch ((id tool params) &body body)
   "When the tool session has a configured :slynk-attach target, route the
-call to the attached Slynk server and return (result ID (%dispatch-attach TOOL PARAMS)),
-short-circuiting BODY. Otherwise evaluate BODY.
+call to the attached Slynk server inside with-serialised-attach-call, then
+return (result ID (%dispatch-attach TOOL PARAMS)), short-circuiting BODY.
+Otherwise evaluate BODY.
 
 ID is the JSON-RPC request id. TOOL must be the repl-eval-tool instance.
-PARAMS is the equal-keyed argument hash-table from the tools/call request."
-  `(if (slynk-attach-configured-p
-        (session-slynk-attach (tool-session ,tool)))
-       (result ,id (%dispatch-attach ,tool ,params))
-       (progn ,@body)))
+PARAMS is the equal-keyed argument hash-table from the tools/call request.
+
+The with-serialised-attach-call wrapper ensures all attached tool calls
+observe *attach-concurrency* policy: sessions serialise through
+*attach-call-lock* by default, giving each session exclusive access to
+the developer's live image for the duration of the eval."
+  (let ((session-sym (gensym "SESSION")))
+    `(if (slynk-attach-configured-p
+          (session-slynk-attach (tool-session ,tool)))
+         (let ((,session-sym (tool-session ,tool)))
+           (with-serialised-attach-call (,session-sym)
+             (result ,id (%dispatch-attach ,tool ,params))))
+         (progn ,@body))))
 
 ;;; tool-handle method --------------------------------------------------------
 
