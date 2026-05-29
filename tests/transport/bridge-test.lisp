@@ -29,11 +29,16 @@
 ;;; Helpers
 ;;; ---------------------------------------------------------------------------
 
+(defun %bridge-binary-path ()
+  "Return an absolute pathname for bin/dsmr-mcp-bridge, resolved from the
+dsmr-mcp system source directory so the lookup is independent of the test
+runner's current working directory."
+  (merge-pathnames "bin/dsmr-mcp-bridge"
+                   (asdf:system-source-directory :dsmr-mcp)))
+
 (defun %bridge-binary-present-p ()
   "Return T when bin/dsmr-mcp-bridge exists on disk."
-  (and (probe-file (make-pathname :name "dsmr-mcp-bridge"
-                                  :directory '(:relative "bin")))
-       t))
+  (and (probe-file (%bridge-binary-path)) t))
 
 (defun %socket-available-p ()
   "Return T when a TCP listen socket can be bound on loopback.
@@ -124,7 +129,7 @@ Covers the NEVER-CONNECTED path exclusively."
       (multiple-value-bind (stdout stderr rc)
           (handler-case
               (uiop:run-program
-               (list "bin/dsmr-mcp-bridge"
+               (list (namestring (%bridge-binary-path))
                      "--host" "127.0.0.1"
                      "--port" "1"
                      "--connect-timeout" "2.0")
@@ -161,7 +166,7 @@ Covers the CONNECTED-then-stdin-EOF path exclusively."
                         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}"))
                  ;; Launch bridge with writable stdin and readable stdout.
                  (let ((proc (uiop:launch-program
-                              (list "bin/dsmr-mcp-bridge"
+                              (list (namestring (%bridge-binary-path))
                                     "--host" "127.0.0.1"
                                     "--port" (write-to-string port))
                               :input :stream
@@ -230,7 +235,7 @@ Proves the substring filter, not a prefix check -- W-6."
                  (multiple-value-bind (stdout stderr _rc)
                      (handler-case
                          (uiop:run-program
-                          (list "bin/dsmr-mcp-bridge"
+                          (list (namestring (%bridge-binary-path))
                                 "--host" "127.0.0.1"
                                 "--port" (write-to-string port))
                           :output :string
@@ -258,7 +263,7 @@ to stderr that mentions stdio or TCP."
       (multiple-value-bind (stdout stderr rc)
           (handler-case
               (uiop:run-program
-               (list "bin/dsmr-mcp-bridge" "--help")
+               (list (namestring (%bridge-binary-path)) "--help")
                :output :string
                :error-output :string
                :ignore-error-status t)
