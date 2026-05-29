@@ -938,16 +938,32 @@ otherwise leaves the Slynk peer without a FIN)."
   (when (http-server-running-p)
     (log-event :info "http.stop" "port" *http-server-port*)
     (%stop-session-cleanup)
-    (hunchentoot:stop *http-server*)
-    (bordeaux-threads:with-lock-held (*sessions-lock*)
-      (maphash (lambda (id http-sess)
-                 (declare (ignore id))
-                 (%wake-sse-subscriber (http-session-mcp-session http-sess))
-                 (ignore-errors
-                  (uiop:symbol-call :dsmr-mcp/src/attach/dispatch :detach-session
-                                    (http-session-mcp-session http-sess))))
-               *sessions*)
-      (clrhash *sessions*))
+    ;; Snapshot live sessions under *sessions-lock*, then release before
+    ;; touching any per-session lock.  delete-session and the cleanup sweep
+    ;; release *sessions-lock* before reaching for sse-channel-lock; this
+    ;; site mirrors that ordering so a future caller is never invited to
+    ;; assume *sessions-lock* → sse-channel-lock is safe.
+    (let ((all-sessions nil))
+      (bordeaux-threads:with-lock-held (*sessions-lock*)
+        (maphash (lambda (id http-sess)
+                   (declare (ignore id))
+                   (push http-sess all-sessions))
+                 *sessions*)
+        (clrhash *sessions*))
+      ;; Wake every in-flight GET subscriber FIRST so its handler thread
+      ;; observes done-p and exits cleanly.  hunchentoot:stop blocks until
+      ;; in-flight handler threads return — waking subscribers before the
+      ;; listener teardown avoids parking the shutdown on a condition-wait
+      ;; the listener's exit cannot itself release.
+      (dolist (http-sess all-sessions)
+        (%wake-sse-subscriber (http-session-mcp-session http-sess)))
+      (hunchentoot:stop *http-server*)
+      ;; Detach Slynk peers after the listener is down so each session sees
+      ;; a clean disconnect rather than racing with handler-thread teardown.
+      (dolist (http-sess all-sessions)
+        (ignore-errors
+         (uiop:symbol-call :dsmr-mcp/src/attach/dispatch :detach-session
+                           (http-session-mcp-session http-sess)))))
     (setf *http-server* nil
           *http-server-port* nil))
   t)
