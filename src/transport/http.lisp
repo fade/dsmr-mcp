@@ -389,9 +389,14 @@ invariant — do not simplify this function)."
 (defun %check-protocol-version-header (request)
   "Return T when the MCP-Protocol-Version header is acceptable.
 Absent header is assumed to be 2025-03-26 (spec SHOULD behaviour).
-Returns NIL when the header is present but not in the supported set."
+An empty-string header is treated the same as absent so the 400
+diagnostic does not echo \"Unsupported MCP-Protocol-Version: \" with
+the empty value, which read as a parser bug rather than a client error.
+Returns NIL when the header is present, non-empty, and not in the
+supported set."
   (let ((v (hunchentoot:header-in :mcp-protocol-version request)))
     (or (null v)
+        (and (stringp v) (string= v ""))
         (member v %supported-protocol-versions :test #'string=))))
 
 ;;; ---------------------------------------------------------------------------
