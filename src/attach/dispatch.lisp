@@ -496,13 +496,19 @@ so IDs minted before a drop-connection can be detected as stale."
         (slime-network-error (e)
           ;; Fail-closed: nil the cached connection so next call reopens.
           (drop-connection tool :reason "network-error")
-          (log-event :warn "attach.network-error"
-                     "error" (handler-case (princ-to-string e)
-                               (error () "")))
-          (make-ht "isError" t
-                   "content"
-                   (text-content
-                    (format nil "attach: Slynk connection error: ~A" e))))))))
+          ;; Print the condition once into a guarded string, then reuse
+          ;; that string for both the log line and the user-facing
+          ;; payload.  Earlier the format call re-invoked the condition's
+          ;; print-object method, which on a dead connection could itself
+          ;; raise — escaping the handler and surfacing as a top-level
+          ;; error upstack.
+          (let ((msg (handler-case (princ-to-string e)
+                       (error () "<unprintable>"))))
+            (log-event :warn "attach.network-error" "error" msg)
+            (make-ht "isError" t
+                     "content"
+                     (text-content
+                      (format nil "attach: Slynk connection error: ~A" msg)))))))))
 
 ;;; Attach-dispatch gate macro ------------------------------------------------
 ;;;
