@@ -294,7 +294,13 @@ handler exits instead of parking indefinitely on a dead session."
 Runs in a background thread until *CLEANUP-RUNNING* becomes NIL.
 Uses 1-second sub-sleeps for responsive shutdown.
 Sessions with active-requests > 0 are skipped so a tool call in flight
-is never killed mid-request."
+is never killed mid-request.
+
+*CLEANUP-RUNNING* is read without an explicit memory barrier; the
+1-second sleep between checks is the implicit synchronisation point
+on SBCL (kernel signal delivery flushes the read).  A future port to
+an implementation with weaker thread ordering should tighten this to
+an atomic flag."
   (loop while *cleanup-running*
         do (loop repeat (max 1 (ceiling *cleanup-interval-seconds*))
                  while *cleanup-running*
