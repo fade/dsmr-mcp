@@ -73,7 +73,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/tools/inspect-restart"
                "dsmr-mcp/src/tools/inspect-condition"
                "dsmr-mcp/src/tools/pool-status"
-               "dsmr-mcp/src/tools/pool-kill-worker")
+               "dsmr-mcp/src/tools/pool-kill-worker"
+               "dsmr-mcp/src/notify")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"
@@ -125,7 +126,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/code-intelligence/code-describe-test"
                "dsmr-mcp/tests/code-intelligence/code-find-refs-test"
                "dsmr-mcp/tests/code-intelligence/load-system-test"
-               "dsmr-mcp/tests/code-intelligence/run-tests-test")
+               "dsmr-mcp/tests/code-intelligence/run-tests-test"
+               "dsmr-mcp/tests/notify/notify-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
