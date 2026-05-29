@@ -166,43 +166,94 @@ attack surface is the decimal-fraction path."
           (when (and (realp val) (plusp val))
             (coerce val 'double-float)))))))
 
+(defun %env-or-nil (name)
+  "Return the value of environment variable NAME unless it is unset or empty.
+Mirrors src/run.lisp's %or-from-env convention: an empty-string env var is
+treated as unset (the conventional way operators clear an inherited value
+without unsetting the name)."
+  (let ((v (uiop:getenv name)))
+    (and v (not (string= v "")) v)))
+
+(defun %flag-needs-value (flag value error-p-cell)
+  "Return T when FLAG was passed without a usable VALUE (NIL or another flag).
+Writes a diagnostic to *error-output* and sets the car of ERROR-P-CELL to T."
+  (cond
+    ((null value)
+     (format *error-output* "[bridge] ~A requires a value~%" flag)
+     (force-output *error-output*)
+     (setf (car error-p-cell) t)
+     t)
+    ((and (>= (length value) 1) (char= (char value 0) #\-))
+     (format *error-output*
+             "[bridge] ~A requires a value (got flag-like ~A)~%"
+             flag value)
+     (force-output *error-output*)
+     (setf (car error-p-cell) t)
+     t)
+    (t nil)))
+
 (defun %parse-args (argv)
   "Parse ARGV (a list of strings) and return five values:
   HOST PORT CONNECT-TIMEOUT HELP-REQUESTED-P ERROR-P.
 Recognised flags: --host, --port, --connect-timeout, --help, -h, --version.
-Missing values fall back to env vars DSMR_MCP_HOST / DSMR_MCP_PORT, then
-hard-coded defaults (127.0.0.1 / 3000 / 5.0d0)."
+Missing values fall back to env vars DSMR_MCP_HOST / DSMR_MCP_PORT (treating
+empty-string as unset, matching src/run.lisp's convention), then to the
+hard-coded defaults 127.0.0.1 / 3000 / 5.0d0.
+
+Unknown flags, value-bearing flags with a missing or flag-like value, and
+a --port outside 1..65535 all set ERROR-P so the caller exits 64."
   (let ((host nil)
         (port-str nil)
         (timeout-str nil)
         (help-p nil)
-        (error-p nil))
-    (loop for rest on argv by #'cddr
-          for flag = (car rest)
-          for value = (cadr rest)
-          do (cond
-               ((member flag '("--help" "-h" "--version") :test #'string=)
-                (setf help-p t))
-               ((string= flag "--host")
-                (when value (setf host value)))
-               ((string= flag "--port")
-                (when value (setf port-str value)))
-               ((string= flag "--connect-timeout")
-                (when value (setf timeout-str value)))))
-    ;; Apply env fallbacks.
+        (error-p-cell (list nil))
+        ;; Advance by one slot at a time so the loop can decide whether to
+        ;; consume VALUE based on the flag's shape.  --help has no value;
+        ;; --port does.  Advancing by two unconditionally was the source of
+        ;; both the silent-unknown-flag and silent-missing-value defects.
+        (i 0)
+        (n (length argv))
+        (vec (coerce argv 'vector)))
+    (loop while (< i n)
+          do (let ((flag (aref vec i)))
+               (cond
+                 ((member flag '("--help" "-h" "--version") :test #'string=)
+                  (setf help-p t)
+                  (incf i))
+                 ((string= flag "--host")
+                  (let ((value (when (< (1+ i) n) (aref vec (1+ i)))))
+                    (unless (%flag-needs-value "--host" value error-p-cell)
+                      (setf host value))
+                    (incf i 2)))
+                 ((string= flag "--port")
+                  (let ((value (when (< (1+ i) n) (aref vec (1+ i)))))
+                    (unless (%flag-needs-value "--port" value error-p-cell)
+                      (setf port-str value))
+                    (incf i 2)))
+                 ((string= flag "--connect-timeout")
+                  (let ((value (when (< (1+ i) n) (aref vec (1+ i)))))
+                    (unless (%flag-needs-value "--connect-timeout" value error-p-cell)
+                      (setf timeout-str value))
+                    (incf i 2)))
+                 (t
+                  (format *error-output* "[bridge] unknown flag: ~A~%" flag)
+                  (force-output *error-output*)
+                  (setf (car error-p-cell) t)
+                  (incf i)))))
+    ;; Apply env fallbacks (empty-string env var = absent).
     (unless host
-      (setf host (or (uiop:getenv "DSMR_MCP_HOST") "127.0.0.1")))
+      (setf host (or (%env-or-nil "DSMR_MCP_HOST") "127.0.0.1")))
     (let ((port
-            (handler-case
-                (parse-integer (or port-str
-                                   (uiop:getenv "DSMR_MCP_PORT")
-                                   "3000"))
-              (error (e)
-                (format *error-output*
-                        "[bridge] invalid --port value: ~A~%" e)
-                (force-output *error-output*)
-                (setf error-p t)
-                3000)))
+            (let ((chosen (or port-str
+                              (%env-or-nil "DSMR_MCP_PORT")
+                              "3000")))
+              (handler-case (parse-integer chosen)
+                (error (e)
+                  (format *error-output*
+                          "[bridge] invalid --port value: ~A~%" e)
+                  (force-output *error-output*)
+                  (setf (car error-p-cell) t)
+                  3000))))
           (timeout
             (if timeout-str
                 (or (%parse-positive-real timeout-str)
@@ -211,10 +262,18 @@ hard-coded defaults (127.0.0.1 / 3000 / 5.0d0)."
                               "[bridge] invalid --connect-timeout value: ~A~%"
                               timeout-str)
                       (force-output *error-output*)
-                      (setf error-p t)
+                      (setf (car error-p-cell) t)
                       5.0d0))
                 5.0d0)))
-      (values host port timeout help-p error-p))))
+      ;; Range-check the resolved port.  parse-integer accepts -1, 0, and
+      ;; large positive integers; usocket would then raise a runtime error
+      ;; with the wrong exit-code category.
+      (unless (and (integerp port) (<= 1 port 65535))
+        (format *error-output*
+                "[bridge] --port must be 1..65535 (got ~A)~%" port)
+        (force-output *error-output*)
+        (setf (car error-p-cell) t))
+      (values host port timeout help-p (car error-p-cell)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Usage block
