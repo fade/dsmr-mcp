@@ -64,6 +64,8 @@
                 #:condition-wait
                 #:condition-notify)
   (:import-from #:hunchentoot)
+  (:import-from #:flexi-streams
+                #:make-flexi-stream)
   (:import-from #:com.inuoe.jzon)
   (:export #:serve-http
            #:start-http-server
@@ -459,7 +461,8 @@ Supports both application/json and text/event-stream Accept modes."
 
       ;; initialize: create a new session; no Mcp-Session-Id required.
       (when (and (stringp method) (string= method "initialize"))
-        (let* ((http-sess (create-session :slynk-attach default-slynk-attach
+        (return-from handle-mcp-post
+          (let* ((http-sess (create-session :slynk-attach default-slynk-attach
                                           :project-root default-project-root))
                (mcp-sess (http-session-mcp-session http-sess))
                (id (http-session-id http-sess))
@@ -493,7 +496,9 @@ Supports both application/json and text/event-stream Accept modes."
                          ;; Now open the SSE response and drain queued events + final.
                          (setf (hunchentoot:content-type*) "text/event-stream")
                          (setf (hunchentoot:header-out :cache-control) "no-cache")
-                         (let ((stream (hunchentoot:send-headers)))
+                         (let ((stream (make-flexi-stream
+                                        (hunchentoot:send-headers)
+                                        :external-format :utf-8)))
                            ;; Drain any notifications queued during dispatch.
                            (handler-case
                                (%drain-sse-queue fresh-channel stream)
@@ -520,7 +525,7 @@ Supports both application/json and text/event-stream Accept modes."
                          (%json-response response))))
               (bordeaux-threads:with-lock-held
                   ((http-session-active-requests-lock http-sess))
-                (decf (http-session-active-requests http-sess))))))))
+                (decf (http-session-active-requests http-sess)))))))))
 
       ;; Non-initialize: Mcp-Session-Id is required.
       (unless session-id-header
@@ -560,7 +565,9 @@ Supports both application/json and text/event-stream Accept modes."
                        (declare (ignore _))
                        (setf (hunchentoot:content-type*) "text/event-stream")
                        (setf (hunchentoot:header-out :cache-control) "no-cache")
-                       (let ((stream (hunchentoot:send-headers)))
+                       (let ((stream (make-flexi-stream
+                                      (hunchentoot:send-headers)
+                                      :external-format :utf-8)))
                          (handler-case
                              (%drain-sse-queue fresh-channel stream)
                            (stream-error () nil))
@@ -620,9 +627,10 @@ On disconnect (stream-error), restores the null-channel and returns."
         (setf (hunchentoot:header-out :x-accel-buffering) "no")
 
         ;; send-headers flushes the response headers to the client and returns
-        ;; the underlying chunked stream.  From this point the handler owns
-        ;; the stream and must not use Hunchentoot response helpers.
-        (let* ((stream (hunchentoot:send-headers))
+        ;; a binary chunked stream.  Wrap it in a flexi-stream for character
+        ;; output so %write-sse-event / %drain-sse-queue can use write-string.
+        (let* ((stream (make-flexi-stream (hunchentoot:send-headers)
+                                          :external-format :utf-8))
                (channel (make-instance 'sse-channel :stream stream))
                (done-p nil))
 
