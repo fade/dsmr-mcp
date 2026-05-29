@@ -300,10 +300,29 @@ immediately — used for integration tests that need a single-shot server."
                       (cond
                         (accepted
                          (let ((conn-id (incf *tcp-conn-counter*)))
-                           (bordeaux-threads:make-thread
-                            (lambda ()
-                              (%tcp-handle-client client conn-id slynk-attach project-root))
-                            :name (format nil "dsmr-tcp-client-~A" conn-id))))
+                           ;; make-thread can signal under genuinely abnormal
+                           ;; conditions (pthread-create exhaustion, OOM,
+                           ;; SBCL thread-creation-failed).  When that fires
+                           ;; the handler thread's unwind-protect never runs,
+                           ;; so the live-connections slot AND the client
+                           ;; socket the handler would have reaped both leak.
+                           ;; A leaked slot is a slow-DOS path: a sequence
+                           ;; of failed spawns eventually pins the cap at
+                           ;; full and the accept loop refuses every new
+                           ;; client.  Reap both here when the spawn fails.
+                           (handler-case
+                               (bordeaux-threads:make-thread
+                                (lambda ()
+                                  (%tcp-handle-client client conn-id slynk-attach project-root))
+                                :name (format nil "dsmr-tcp-client-~A" conn-id))
+                             (error (e)
+                               (bordeaux-threads:with-lock-held
+                                   (*tcp-live-connections-lock*)
+                                 (decf *tcp-live-connections*))
+                               (ignore-errors (usocket:socket-close client))
+                               (log-event :warn "tcp.spawn.failed"
+                                          "conn" conn-id
+                                          "error" (princ-to-string e))))))
                         (t
                          (log-event :warn "tcp.accept.capped"
                                     "limit" *tcp-max-connections*)
