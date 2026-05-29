@@ -25,6 +25,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "bordeaux-threads"
                "eclector"
                "hunchentoot"
+               "flexi-streams"
                "log4cl"
                "slynk-client"
                "dsmr-mcp/src/main"
@@ -131,7 +132,9 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/code-intelligence/run-tests-test"
                "dsmr-mcp/tests/notify/notify-test"
                "dsmr-mcp/tests/attach/call-lock-test"
-               "dsmr-mcp/tests/transport/tcp-test")
+               "dsmr-mcp/tests/transport/tcp-test"
+               "dsmr-mcp/tests/transport/http-test"
+               "dsmr-mcp/tests/transport/transport-parity-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
