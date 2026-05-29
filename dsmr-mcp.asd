@@ -74,7 +74,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/tools/inspect-condition"
                "dsmr-mcp/src/tools/pool-status"
                "dsmr-mcp/src/tools/pool-kill-worker"
-               "dsmr-mcp/src/notify")
+               "dsmr-mcp/src/notify"
+               "dsmr-mcp/src/transport/tcp")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"
