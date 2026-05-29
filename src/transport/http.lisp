@@ -230,6 +230,7 @@ in-flight request completes)."
     ;; cached on the session's repl-eval-tool instance would leak until
     ;; process exit.
     (when evict-sess
+      (%wake-sse-subscriber (http-session-mcp-session evict-sess))
       (ignore-errors
        (uiop:symbol-call :dsmr-mcp/src/attach/dispatch :detach-session
                          (http-session-mcp-session evict-sess)))
@@ -255,14 +256,27 @@ Returns the new HTTP-SESSION."
     (log-event :info "http.session.created" "session" id)
     http-sess))
 
+(defun %wake-sse-subscriber (mcp-sess)
+  "If MCP-SESS currently has an sse-channel installed, mark it done and
+notify the condition variable so a GET handler blocked in condition-wait
+unblocks and exits.  Safe to call when the channel is a null-channel."
+  (let ((channel (session-notify-channel mcp-sess)))
+    (when (typep channel 'sse-channel)
+      (bordeaux-threads:with-lock-held ((sse-channel-lock channel))
+        (setf (sse-channel-done-p channel) t)
+        (bordeaux-threads:condition-notify (sse-channel-cv channel))))))
+
 (defun delete-session (session-id)
   "Remove SESSION-ID from *SESSIONS* and close its Slynk connection.
-Returns the evicted HTTP-SESSION, or NIL if the session was not found."
+Returns the evicted HTTP-SESSION, or NIL if the session was not found.
+Wakes any GET subscriber blocked on the session's sse-channel so the
+handler exits instead of parking indefinitely on a dead session."
   (let ((http-sess nil))
     (bordeaux-threads:with-lock-held (*sessions-lock*)
       (setf http-sess (gethash session-id *sessions*))
       (remhash session-id *sessions*))
     (when http-sess
+      (%wake-sse-subscriber (http-session-mcp-session http-sess))
       (ignore-errors
        (uiop:symbol-call :dsmr-mcp/src/attach/dispatch :detach-session
                          (http-session-mcp-session http-sess)))
@@ -309,6 +323,7 @@ Sessions with active-requests > 0 are skipped (D-06 active-request guard)."
                    (dolist (pair expired-ids)
                      (let ((id (car pair))
                            (http-sess (cdr pair)))
+                       (%wake-sse-subscriber (http-session-mcp-session http-sess))
                        (ignore-errors
                         (uiop:symbol-call :dsmr-mcp/src/attach/dispatch :detach-session
                                           (http-session-mcp-session http-sess)))
@@ -871,14 +886,25 @@ starting a second one."
 
 (defun stop-http-server ()
   "Stop the running HTTP server, cleanup threads, and clear sessions.
-Returns T whether or not a server was running."
+Returns T whether or not a server was running.
+
+Each session's Slynk connection is detached before *SESSIONS* is cleared
+so the host listener gets a clean disconnect.  This matters for the
+test harness (stop-http-server is called from unwind-protect on a live
+process) and for operator-driven shutdown (Ctrl-C of a foreground server
+otherwise leaves the Slynk peer without a FIN)."
   (when (http-server-running-p)
     (log-event :info "http.stop" "port" *http-server-port*)
     (%stop-session-cleanup)
     (hunchentoot:stop *http-server*)
-    ;; Clear all sessions (detach-session on each would be expensive
-    ;; at shutdown; processes are exiting anyway).
     (bordeaux-threads:with-lock-held (*sessions-lock*)
+      (maphash (lambda (id http-sess)
+                 (declare (ignore id))
+                 (%wake-sse-subscriber (http-session-mcp-session http-sess))
+                 (ignore-errors
+                  (uiop:symbol-call :dsmr-mcp/src/attach/dispatch :detach-session
+                                    (http-session-mcp-session http-sess))))
+               *sessions*)
       (clrhash *sessions*))
     (setf *http-server* nil
           *http-server-port* nil))
