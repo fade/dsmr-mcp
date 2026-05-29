@@ -11,22 +11,57 @@
                 #:run
                 #:resolve-transport
                 #:resolve-mode
+                #:%check-remote-bind
                 #:transport-not-implemented-error
                 #:invalid-config-value))
 
 (in-package #:dsmr-mcp/tests/run-test)
 
 ;;; ---------------------------------------------------------------------------
-;;; Transport stub tests
+;;; Transport gate tests
+;;;
+;;; :tcp and :http now route to transport packages via runtime symbol resolution
+;;; rather than raising transport-not-implemented-error. Without the bind address
+;;; being set, both paths hit %check-remote-bind first, so the most observable
+;;; error for a bare run :transport :tcp call is now INVALID-CONFIG-VALUE (the
+;;; gate rejects the default 127.0.0.1 bind... actually 127.0.0.1 is loopback so
+;;; it passes the gate and the error becomes package-not-found for the transport
+;;; that doesn't exist yet). Either way the old transport-not-implemented-error
+;;; is no longer raised; these tests verify the new error shape.
 ;;; ---------------------------------------------------------------------------
 
-(define-test tcp-stub-signals-transport-not-implemented
-  "run :transport :tcp signals transport-not-implemented-error (not yet implemented)."
-  (fail (run :transport :tcp) transport-not-implemented-error))
+(define-test tcp-transport-uses-symbol-call
+  "run :transport :tcp no longer raises transport-not-implemented-error;
+it routes to dsmr-mcp/src/transport/tcp:serve-tcp via runtime symbol resolution.
+Without the transport package loaded, uiop:symbol-call raises a package-error."
+  ;; Ensure DSMR_ALLOW_REMOTE is clear so loopback passes; default bind is 127.0.0.1.
+  (let ((old-val (uiop:getenv "DSMR_ALLOW_REMOTE")))
+    (unwind-protect
+         (progn
+           (setf (uiop:getenv "DSMR_ALLOW_REMOTE") "")
+           ;; Must NOT raise transport-not-implemented-error any more.
+           (false (handler-case (run :transport :tcp)
+                    (transport-not-implemented-error () t)
+                    (error () nil))))
+      (if old-val
+          (setf (uiop:getenv "DSMR_ALLOW_REMOTE") old-val)
+          (setf (uiop:getenv "DSMR_ALLOW_REMOTE") "")))))
 
-(define-test http-stub-signals-transport-not-implemented
-  "run :transport :http signals transport-not-implemented-error (not yet implemented)."
-  (fail (run :transport :http) transport-not-implemented-error))
+(define-test http-transport-uses-symbol-call
+  "run :transport :http no longer raises transport-not-implemented-error;
+it routes to dsmr-mcp/src/transport/http:serve-http via runtime symbol resolution.
+Without the transport package loaded, uiop:symbol-call raises a package-error."
+  (let ((old-val (uiop:getenv "DSMR_ALLOW_REMOTE")))
+    (unwind-protect
+         (progn
+           (setf (uiop:getenv "DSMR_ALLOW_REMOTE") "")
+           ;; Must NOT raise transport-not-implemented-error any more.
+           (false (handler-case (run :transport :http)
+                    (transport-not-implemented-error () t)
+                    (error () nil))))
+      (if old-val
+          (setf (uiop:getenv "DSMR_ALLOW_REMOTE") old-val)
+          (setf (uiop:getenv "DSMR_ALLOW_REMOTE") "")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Keyword/env precedence
@@ -167,3 +202,74 @@ returns the built-in default :ATTACHED."
       (if old-mode
           (setf (uiop:getenv "DSMR_MODE") old-mode)
           (setf (uiop:getenv "DSMR_MODE") "")))))
+
+;;; ---------------------------------------------------------------------------
+;;; Remote-bind gate
+;;; ---------------------------------------------------------------------------
+
+(define-test remote-bind-non-loopback-without-override-signals
+  "A non-loopback bind without DSMR_ALLOW_REMOTE set signals INVALID-CONFIG-VALUE
+with name DSMR_BIND before any listener socket is created."
+  (let ((old-val (uiop:getenv "DSMR_ALLOW_REMOTE")))
+    (unwind-protect
+         (progn
+           ;; Clear the env var so the gate fires.
+           (setf (uiop:getenv "DSMR_ALLOW_REMOTE") "")
+           (fail (%check-remote-bind "0.0.0.0") invalid-config-value)
+           (fail (%check-remote-bind "10.0.0.1") invalid-config-value)
+           (fail (%check-remote-bind "0.0.0.0") invalid-config-value))
+      (if old-val
+          (setf (uiop:getenv "DSMR_ALLOW_REMOTE") old-val)
+          (setf (uiop:getenv "DSMR_ALLOW_REMOTE") "")))))
+
+(define-test remote-bind-non-loopback-with-override-passes
+  "With DSMR_ALLOW_REMOTE=1, a non-loopback bind passes the gate without
+signalling. The gate is designed to be bypassed when the operator explicitly
+opts into remote exposure."
+  (let ((old-val (uiop:getenv "DSMR_ALLOW_REMOTE")))
+    (unwind-protect
+         (progn
+           (setf (uiop:getenv "DSMR_ALLOW_REMOTE") "1")
+           ;; Should return NIL without signalling.
+           (is eq nil (%check-remote-bind "0.0.0.0"))
+           ;; Also accepts the other truthy strings.
+           (setf (uiop:getenv "DSMR_ALLOW_REMOTE") "true")
+           (is eq nil (%check-remote-bind "10.0.0.1"))
+           (setf (uiop:getenv "DSMR_ALLOW_REMOTE") "yes")
+           (is eq nil (%check-remote-bind "192.168.1.1")))
+      (if old-val
+          (setf (uiop:getenv "DSMR_ALLOW_REMOTE") old-val)
+          (setf (uiop:getenv "DSMR_ALLOW_REMOTE") "")))))
+
+(define-test remote-bind-loopback-bypasses-gate
+  "Loopback addresses pass the gate regardless of DSMR_ALLOW_REMOTE, so
+operators never need to set the env var for a local-only server."
+  (let ((old-val (uiop:getenv "DSMR_ALLOW_REMOTE")))
+    (unwind-protect
+         (progn
+           ;; Gate absent — loopback must still pass.
+           (setf (uiop:getenv "DSMR_ALLOW_REMOTE") "")
+           (is eq nil (%check-remote-bind "127.0.0.1"))
+           (is eq nil (%check-remote-bind "::1"))
+           (is eq nil (%check-remote-bind "localhost")))
+      (if old-val
+          (setf (uiop:getenv "DSMR_ALLOW_REMOTE") old-val)
+          (setf (uiop:getenv "DSMR_ALLOW_REMOTE") "")))))
+
+(define-test attach-concurrency-env-resolves
+  "DSMR_ATTACH_CONCURRENCY=parallel is accepted by %resolve-attach-concurrency
+and produces the :parallel keyword, matching the startup resolution path."
+  (let ((old-val (uiop:getenv "DSMR_ATTACH_CONCURRENCY")))
+    (unwind-protect
+         (progn
+           (setf (uiop:getenv "DSMR_ATTACH_CONCURRENCY") "parallel")
+           (is eq :parallel
+               (dsmr-mcp/src/attach/dispatch::%resolve-attach-concurrency
+                (uiop:getenv "DSMR_ATTACH_CONCURRENCY")))
+           (setf (uiop:getenv "DSMR_ATTACH_CONCURRENCY") "serialised")
+           (is eq :serialised
+               (dsmr-mcp/src/attach/dispatch::%resolve-attach-concurrency
+                (uiop:getenv "DSMR_ATTACH_CONCURRENCY"))))
+      (if old-val
+          (setf (uiop:getenv "DSMR_ATTACH_CONCURRENCY") old-val)
+          (setf (uiop:getenv "DSMR_ATTACH_CONCURRENCY") "")))))
