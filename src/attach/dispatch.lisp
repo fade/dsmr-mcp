@@ -523,13 +523,21 @@ The with-serialised-attach-call wrapper ensures all attached tool calls
 observe *attach-concurrency* policy: sessions serialise through
 *attach-call-lock* by default, giving each session exclusive access to
 the developer's live image for the duration of the eval."
-  (let ((session-sym (gensym "SESSION")))
-    `(if (slynk-attach-configured-p
-          (session-slynk-attach (tool-session ,tool)))
-         (let ((,session-sym (tool-session ,tool)))
+  (let ((tool-sym    (gensym "TOOL"))
+        (id-sym      (gensym "ID"))
+        (params-sym  (gensym "PARAMS"))
+        (session-sym (gensym "SESSION")))
+    ;; Bind the argument forms once so callers can pass side-effecting
+    ;; expressions (or anything other than a parameter access) without
+    ;; observing them re-evaluated in each macro-expanded position.
+    `(let* ((,tool-sym ,tool)
+            (,id-sym ,id)
+            (,params-sym ,params)
+            (,session-sym (tool-session ,tool-sym)))
+       (if (slynk-attach-configured-p (session-slynk-attach ,session-sym))
            (with-serialised-attach-call (,session-sym)
-             (result ,id (%dispatch-attach ,tool ,params))))
-         (progn ,@body))))
+             (result ,id-sym (%dispatch-attach ,tool-sym ,params-sym)))
+           (progn ,@body)))))
 
 ;;; tool-handle method --------------------------------------------------------
 
