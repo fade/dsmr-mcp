@@ -197,7 +197,8 @@ evicted and NIL is returned — UNLESS active-requests > 0, in which case
 the session remains in the table (its eviction is deferred until after the
 in-flight request completes)."
   (let ((result nil)
-        (evict-id nil))
+        (evict-id nil)
+        (evict-sess nil))
     (bordeaux-threads:with-lock-held (*sessions-lock*)
       (let ((http-sess (gethash session-id *sessions*)))
         (when http-sess
@@ -217,21 +218,21 @@ in-flight request completes)."
                          (http-session-active-requests http-sess))))
                  (when (zerop active)
                    (remhash session-id *sessions*)
-                   (setf evict-id session-id))))
+                   (setf evict-id session-id
+                         evict-sess http-sess))))
               (t
                (setf (http-session-last-access http-sess) now)
                (setf result http-sess)))))))
-    ;; Evict the Slynk connection outside the sessions lock to avoid
-    ;; holding the lock during potentially blocking cleanup.
-    (when evict-id
+    ;; Detach the Slynk connection outside the sessions lock to avoid
+    ;; holding the lock during potentially blocking cleanup. The session
+    ;; has already been removed from *SESSIONS*, so the cleanup sweep
+    ;; can never see it — without this branch the Slynk client connection
+    ;; cached on the session's repl-eval-tool instance would leak until
+    ;; process exit.
+    (when evict-sess
       (ignore-errors
-       (let ((http-sess (progn
-                          ;; We already removed it; the value captured
-                          ;; above is gone. Re-fetch from local variable.
-                          nil)))
-         (declare (ignore http-sess))))
-      ;; Nothing to detach: we already removed before recording the session.
-      ;; The cleanup loop handles detach for sweep-evicted sessions.
+       (uiop:symbol-call :dsmr-mcp/src/attach/dispatch :detach-session
+                         (http-session-mcp-session evict-sess)))
       (log-event :info "http.session.evicted"
                  "session" evict-id
                  "reason" "idle-expired-on-access"))
