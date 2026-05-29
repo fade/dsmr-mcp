@@ -141,13 +141,21 @@ code paths can call emit unconditionally without any I/O side effects."
 (defmethod emit ((channel tcp-line-channel) method params)
   "Write one JSON-RPC notification line to the TCP stream and force-output.
 Acquires the per-channel write lock to prevent line interleaving.
-A stream-error (broken-pipe, closed client) is caught and suppressed."
+A stream-error (broken-pipe, closed client) is logged at debug level and
+suppressed — silent recovery is the correct behaviour, but a breadcrumb
+helps operators investigating dropped notifications."
   (bordeaux-threads:with-lock-held ((tcp-line-channel-lock channel))
     (handler-case
         (let ((json (%build-notification-json method params)))
           (write-line json (tcp-line-channel-stream channel))
           (force-output (tcp-line-channel-stream channel)))
-      (stream-error () nil))))
+      (stream-error (e)
+        (uiop:symbol-call :dsmr-mcp/src/log :log-event
+                          :debug "notify.tcp.stream-error"
+                          "method" method
+                          "error" (handler-case (princ-to-string e)
+                                    (error () "<unprintable>")))
+        nil))))
 
 (defmethod emit ((channel sse-channel) method params)
   "Queue a (method params) pair and wake the SSE server thread.
