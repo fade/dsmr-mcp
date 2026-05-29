@@ -70,29 +70,28 @@ the first thread's body completes."
         (log-lock (bordeaux-threads:make-lock "call-lock-test-log")))
     (let ((s1 (make-session :id "lock-test-s1"))
           (s2 (make-session :id "lock-test-s2")))
-      (let* ((t1 (bordeaux-threads:make-thread
-                  (lambda ()
-                    (with-serialised-attach-call (s1)
-                      (sleep 0.06d0)
-                      (bordeaux-threads:with-lock-held (log-lock)
-                        (push :t1-done log))))
-                  :name "call-lock-test-t1"))
-             ;; Small sleep so t1 enters the lock first.
-             (dummy (progn (sleep 0.01d0) nil))
-             (t2 (bordeaux-threads:make-thread
-                  (lambda ()
-                    (with-serialised-attach-call (s2)
-                      (bordeaux-threads:with-lock-held (log-lock)
-                        (push :t2-start log))))
-                  :name "call-lock-test-t2")))
-        (declare (ignore dummy))
-        (bordeaux-threads:join-thread t1)
-        (bordeaux-threads:join-thread t2)
-        ;; Log is in reverse push order: (:t2-start :t1-done)
-        ;; meaning t1-done happened before t2-start.
-        (is = 2 (length log))
-        (is eq :t1-done (second log))
-        (is eq :t2-start (first log))))))
+      (let ((t1 (bordeaux-threads:make-thread
+                 (lambda ()
+                   (with-serialised-attach-call (s1)
+                     (sleep 0.06d0)
+                     (bordeaux-threads:with-lock-held (log-lock)
+                       (push :t1-done log))))
+                 :name "call-lock-test-t1")))
+        ;; Small sleep so t1 enters the lock first.
+        (sleep 0.01d0)
+        (let ((t2 (bordeaux-threads:make-thread
+                   (lambda ()
+                     (with-serialised-attach-call (s2)
+                       (bordeaux-threads:with-lock-held (log-lock)
+                         (push :t2-start log))))
+                   :name "call-lock-test-t2")))
+          (bordeaux-threads:join-thread t1)
+          (bordeaux-threads:join-thread t2)
+          ;; Log is in reverse push order: (:t2-start :t1-done)
+          ;; meaning t1-done happened before t2-start.
+          (is = 2 (length log))
+          (is eq :t1-done (second log))
+          (is eq :t2-start (first log)))))))
 
 (define-test parallel-concurrency-does-not-block
   "Under :parallel concurrency two threads calling with-serialised-attach-call
@@ -145,26 +144,23 @@ notifications/dsmr-mcp/attach/queued notification with 'position' and
                          (bordeaux-threads:with-lock-held (a-hold-lock)
                            (setf a-holding t))
                          (sleep 0.15d0)))
-                     :name "queued-test-holder"))
-               ;; Wait until A has entered.
-               (dummy (progn
-                        (loop until (bordeaux-threads:with-lock-held (a-hold-lock)
-                                      a-holding)
-                              do (sleep 0.005d0))
-                        nil))
-               (t-b (bordeaux-threads:make-thread
-                     (lambda ()
-                       (with-serialised-attach-call (s-b)
-                         nil))
-                     :name "queued-test-waiter")))
-          (declare (ignore dummy))
-          (bordeaux-threads:join-thread t-a)
-          (bordeaux-threads:join-thread t-b)
-          ;; Session B's channel should have received a queued notification.
-          (let ((captured (get-output-stream-string out-b)))
-            (true (search "notifications/dsmr-mcp/attach/queued" captured))
-            (true (search "position" captured))
-            (true (search "holder-a" captured))))))))
+                     :name "queued-test-holder")))
+          ;; Wait until A has entered the critical section before spawning t-b.
+          (loop until (bordeaux-threads:with-lock-held (a-hold-lock)
+                        a-holding)
+                do (sleep 0.005d0))
+          (let ((t-b (bordeaux-threads:make-thread
+                      (lambda ()
+                        (with-serialised-attach-call (s-b)
+                          nil))
+                      :name "queued-test-waiter")))
+            (bordeaux-threads:join-thread t-a)
+            (bordeaux-threads:join-thread t-b)
+            ;; Session B's channel should have received a queued notification.
+            (let ((captured (get-output-stream-string out-b)))
+              (true (search "notifications/dsmr-mcp/attach/queued" captured))
+              (true (search "position" captured))
+              (true (search "holder-a" captured)))))))))
 
 (define-test concurrency-env-parser-rejects-invalid
   "%%resolve-attach-concurrency signals invalid-config-value for unknown values."
