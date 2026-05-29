@@ -133,6 +133,36 @@ Returns on TCP read EOF (server-side close)."
 ;;; Argument parsing
 ;;; ---------------------------------------------------------------------------
 
+(defun %parse-positive-real (s)
+  "Parse S as a positive real number (integer or decimal).  Returns the parsed
+double, or NIL when S is malformed or non-positive.
+
+Does NOT call read-from-string: a #. reader macro embedded in a CLI argument
+would otherwise execute arbitrary code in the bridge process at parse time.
+Accepts decimal digits with an optional single decimal point; rejects any
+other character (including leading sign, exponent notation, whitespace).
+Tightening past parse-integer for the integer case is not required — the
+attack surface is the decimal-fraction path."
+  (when (and (stringp s) (plusp (length s)))
+    (let ((dot-seen nil)
+          (digit-count 0))
+      (loop for c across s
+            do (cond
+                 ((digit-char-p c)
+                  (incf digit-count))
+                 ((char= c #\.)
+                  (when dot-seen (return-from %parse-positive-real nil))
+                  (setf dot-seen t))
+                 (t (return-from %parse-positive-real nil))))
+      (when (zerop digit-count)
+        (return-from %parse-positive-real nil))
+      ;; Safe to use read-from-string now: input is digits and at most one dot.
+      ;; Bind *read-eval* nil belt-and-braces for any future relaxation.
+      (let ((*read-eval* nil))
+        (let ((val (handler-case (read-from-string s) (error () nil))))
+          (when (and (realp val) (plusp val))
+            (coerce val 'double-float)))))))
+
 (defun %parse-args (argv)
   "Parse ARGV (a list of strings) and return five values:
   HOST PORT CONNECT-TIMEOUT HELP-REQUESTED-P ERROR-P.
@@ -172,8 +202,14 @@ hard-coded defaults (127.0.0.1 / 3000 / 5.0d0)."
                 3000)))
           (timeout
             (if timeout-str
-                (handler-case (read-from-string timeout-str)
-                  (error () 5.0d0))
+                (or (%parse-positive-real timeout-str)
+                    (progn
+                      (format *error-output*
+                              "[bridge] invalid --connect-timeout value: ~A~%"
+                              timeout-str)
+                      (force-output *error-output*)
+                      (setf error-p t)
+                      5.0d0))
                 5.0d0)))
       (values host port timeout help-p error-p))))
 
