@@ -743,8 +743,8 @@ own channel)."
             ;; Cleanup: restore the prior channel only when we still own the
             ;; slot.  A POST handler that ran in SSE mode against this same
             ;; session may legitimately have swapped a different channel in
-            ;; while we were waiting; stomping it here would orphan its
-            ;; subscriber the same way the iter2 POST regression did.
+            ;; while we were waiting; stomping it unconditionally here would
+            ;; orphan that POST's subscriber.
             (when (eq (session-notify-channel mcp-sess) channel)
               (setf (session-notify-channel mcp-sess) prior-channel))
             (bordeaux-threads:with-lock-held
