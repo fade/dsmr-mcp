@@ -257,14 +257,17 @@ immediately — used for integration tests that need a single-shot server."
                   (return)))
 
                ;; Normal multi-client mode: spawn a thread per connection.
+               ;; Increment the counter only after a successful accept so
+               ;; transient accept failures (ECONNABORTED, fd exhaustion)
+               ;; don't leave gaps in conn-id sequencing.
                (t
-                (let ((conn-id (incf *tcp-conn-counter*))
-                      (client  (%tcp-accept-client listener)))
+                (let ((client (%tcp-accept-client listener)))
                   (when client
-                    (bordeaux-threads:make-thread
-                     (lambda ()
-                       (%tcp-handle-client client conn-id slynk-attach project-root))
-                     :name (format nil "dsmr-tcp-client-~A" conn-id)))))))))
+                    (let ((conn-id (incf *tcp-conn-counter*)))
+                      (bordeaux-threads:make-thread
+                       (lambda ()
+                         (%tcp-handle-client client conn-id slynk-attach project-root))
+                       :name (format nil "dsmr-tcp-client-~A" conn-id))))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Public: blocking server entry point
