@@ -474,45 +474,50 @@ Supports both application/json and text/event-stream Accept modes."
             (bordeaux-threads:with-lock-held
                 ((http-session-active-requests-lock http-sess))
               (incf (http-session-active-requests http-sess)))
-            (unwind-protect
-                 (let ((sse-p (and accept (search "text/event-stream" accept))))
+            (let* ((sse-p (and accept (search "text/event-stream" accept)))
+                   ;; Capture the channel installed by any concurrent GET
+                   ;; subscriber so we can reuse it (and never overwrite it
+                   ;; with a null-channel on cleanup) when this POST is in
+                   ;; SSE mode. When no SSE subscriber exists prior is a
+                   ;; null-channel; we then own the swap and must restore it.
+                   (prior-channel (session-notify-channel mcp-sess))
+                   (reuse-prior   (and sse-p (typep prior-channel 'sse-channel)))
+                   (fresh-channel (if reuse-prior
+                                      prior-channel
+                                      (make-instance 'sse-channel :stream nil))))
+              (when (and sse-p (not reuse-prior))
+                (setf (session-notify-channel mcp-sess) fresh-channel))
+              (unwind-protect
                    (if sse-p
                        ;; SSE mode: open a response stream and write the
                        ;; result as a single SSE message event.
-                       (let* ((fresh-channel (make-instance 'sse-channel
-                                                            :stream nil))
-                              ;; Install channel so intermediate notifications
-                              ;; emitted during dispatch are queued (they will
-                              ;; be drained to the stream once send-headers
-                              ;; returns it).
-                              (_ (setf (session-notify-channel mcp-sess) fresh-channel))
-                              (response (multiple-value-bind (resp captured)
-                                            (%dispatch-with-stdout-guard line mcp-sess)
-                                          (when (plusp (length captured))
-                                            (log-event :warn "transport.stdout-pollution"
-                                                       "session" id
-                                                       "bytes" (length captured)))
-                                          resp)))
-                         (declare (ignore _))
+                       (let ((response (multiple-value-bind (resp captured)
+                                           (%dispatch-with-stdout-guard line mcp-sess)
+                                         (when (plusp (length captured))
+                                           (log-event :warn "transport.stdout-pollution"
+                                                      "session" id
+                                                      "bytes" (length captured)))
+                                         resp)))
                          ;; Now open the SSE response and drain queued events + final.
                          (setf (hunchentoot:content-type*) "text/event-stream")
                          (setf (hunchentoot:header-out :cache-control) "no-cache")
                          (let ((stream (make-flexi-stream
                                         (hunchentoot:send-headers)
                                         :external-format :utf-8)))
-                           ;; Drain any notifications queued during dispatch.
-                           (handler-case
-                               (%drain-sse-queue fresh-channel stream)
-                             (stream-error () nil))
+                           ;; Drain any notifications queued during dispatch —
+                           ;; but only when we own a fresh channel. When we
+                           ;; reused the GET subscriber's channel, the GET
+                           ;; thread is the queue drainer.
+                           (unless reuse-prior
+                             (handler-case
+                                 (%drain-sse-queue fresh-channel stream)
+                               (stream-error () nil)))
                            ;; Write the final response as a message event.
                            (when response
                              (handler-case
                                  (%write-sse-event stream "message" response)
                                (stream-error () nil)))
-                           (ignore-errors (finish-output stream))
-                           ;; Restore null-channel.
-                           (setf (session-notify-channel mcp-sess)
-                                 (make-instance 'null-channel)))
+                           (ignore-errors (finish-output stream)))
                          ;; Return empty string — Hunchentoot uses send-headers output.
                          "")
                        ;; JSON mode: return the response as a plain body.
@@ -523,10 +528,17 @@ Supports both application/json and text/event-stream Accept modes."
                                                       "session" id
                                                       "bytes" (length captured)))
                                          resp)))
-                         (%json-response response))))
-              (bordeaux-threads:with-lock-held
-                  ((http-session-active-requests-lock http-sess))
-                (decf (http-session-active-requests http-sess)))))))))
+                         (%json-response response)))
+                ;; Cleanup runs whether dispatch returned normally or threw.
+                ;; Restore the prior channel only when we installed a fresh
+                ;; one ourselves — otherwise we'd overwrite the GET
+                ;; subscriber's live sse-channel with a null-channel, and
+                ;; the GET handler's condition-wait would block forever.
+                (when (and sse-p (not reuse-prior))
+                  (setf (session-notify-channel mcp-sess) prior-channel))
+                (bordeaux-threads:with-lock-held
+                    ((http-session-active-requests-lock http-sess))
+                  (decf (http-session-active-requests http-sess)))))))))
 
       ;; Non-initialize: Mcp-Session-Id is required.
       (unless session-id-header
@@ -549,52 +561,69 @@ Supports both application/json and text/event-stream Accept modes."
           (bordeaux-threads:with-lock-held
               ((http-session-active-requests-lock http-sess))
             (incf (http-session-active-requests http-sess)))
-          (unwind-protect
-               (let ((*current-session-id* session-id-header)
-                     (sse-p (and accept (search "text/event-stream" accept))))
-                 (if sse-p
-                     ;; SSE mode for an existing session.
-                     (let* ((fresh-channel (make-instance 'sse-channel :stream nil))
-                            (_ (setf (session-notify-channel mcp-sess) fresh-channel))
-                            (response (multiple-value-bind (resp captured)
-                                          (%dispatch-with-stdout-guard line mcp-sess)
-                                        (when (plusp (length captured))
-                                          (log-event :warn "transport.stdout-pollution"
-                                                     "session" session-id-header
-                                                     "bytes" (length captured)))
-                                        resp)))
-                       (declare (ignore _))
-                       (setf (hunchentoot:content-type*) "text/event-stream")
-                       (setf (hunchentoot:header-out :cache-control) "no-cache")
-                       (let ((stream (make-flexi-stream
-                                      (hunchentoot:send-headers)
-                                      :external-format :utf-8)))
-                         (handler-case
-                             (%drain-sse-queue fresh-channel stream)
-                           (stream-error () nil))
-                         (when response
-                           (handler-case
-                               (%write-sse-event stream "message" response)
-                             (stream-error () nil)))
-                         (ignore-errors (finish-output stream))
-                         (setf (session-notify-channel mcp-sess)
-                               (make-instance 'null-channel)))
-                       "")
-                     ;; JSON mode.
-                     (multiple-value-bind (response captured)
-                         (%dispatch-with-stdout-guard line mcp-sess)
-                       (when (plusp (length captured))
-                         (log-event :warn "transport.stdout-pollution"
-                                    "session" session-id-header
-                                    "bytes" (length captured)))
-                       (if response
-                           (%json-response response)
-                           (progn
-                             (setf (hunchentoot:return-code*) 202)
-                             "")))))
-            (bordeaux-threads:with-lock-held
-                ((http-session-active-requests-lock http-sess))
-              (decf (http-session-active-requests http-sess))))))))
+          (let* ((sse-p (and accept (search "text/event-stream" accept)))
+                 ;; Reuse the GET subscriber's sse-channel when one is
+                 ;; already installed so the POST does not stomp it on
+                 ;; cleanup (any notification emitted during dispatch
+                 ;; reaches the GET stream, matching MCP Streamable HTTP
+                 ;; semantics: GET is the canonical notification channel,
+                 ;; POST returns the call result inline).
+                 (prior-channel (session-notify-channel mcp-sess))
+                 (reuse-prior   (and sse-p (typep prior-channel 'sse-channel)))
+                 (fresh-channel (if reuse-prior
+                                    prior-channel
+                                    (make-instance 'sse-channel :stream nil))))
+            (when (and sse-p (not reuse-prior))
+              (setf (session-notify-channel mcp-sess) fresh-channel))
+            (unwind-protect
+                 (let ((*current-session-id* session-id-header))
+                   (if sse-p
+                       ;; SSE mode for an existing session.
+                       (let ((response (multiple-value-bind (resp captured)
+                                           (%dispatch-with-stdout-guard line mcp-sess)
+                                         (when (plusp (length captured))
+                                           (log-event :warn "transport.stdout-pollution"
+                                                      "session" session-id-header
+                                                      "bytes" (length captured)))
+                                         resp)))
+                         (setf (hunchentoot:content-type*) "text/event-stream")
+                         (setf (hunchentoot:header-out :cache-control) "no-cache")
+                         (let ((stream (make-flexi-stream
+                                        (hunchentoot:send-headers)
+                                        :external-format :utf-8)))
+                           ;; Drain queued events only when we own the
+                           ;; channel; otherwise the GET handler is the
+                           ;; designated drainer.
+                           (unless reuse-prior
+                             (handler-case
+                                 (%drain-sse-queue fresh-channel stream)
+                               (stream-error () nil)))
+                           (when response
+                             (handler-case
+                                 (%write-sse-event stream "message" response)
+                               (stream-error () nil)))
+                           (ignore-errors (finish-output stream)))
+                         "")
+                       ;; JSON mode.
+                       (multiple-value-bind (response captured)
+                           (%dispatch-with-stdout-guard line mcp-sess)
+                         (when (plusp (length captured))
+                           (log-event :warn "transport.stdout-pollution"
+                                      "session" session-id-header
+                                      "bytes" (length captured)))
+                         (if response
+                             (%json-response response)
+                             (progn
+                               (setf (hunchentoot:return-code*) 202)
+                               "")))))
+              ;; Cleanup runs whether dispatch returned normally or threw.
+              ;; Restore the prior channel only when we owned the swap —
+              ;; never overwrite a GET subscriber's live sse-channel.
+              (when (and sse-p (not reuse-prior))
+                (setf (session-notify-channel mcp-sess) prior-channel))
+              (bordeaux-threads:with-lock-held
+                  ((http-session-active-requests-lock http-sess))
+                (decf (http-session-active-requests http-sess))))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; GET handler — long-lived SSE notification stream (D-04)
