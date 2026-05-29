@@ -425,9 +425,12 @@ Always sets Access-Control-Expose-Headers so clients can read Mcp-Session-Id."
 ;;; ---------------------------------------------------------------------------
 
 (defun %http-error-json (code message)
-  "Build a JSON-RPC error envelope string with id null and the given CODE/MESSAGE."
+  "Build a JSON-RPC error envelope string with id null and the given CODE/MESSAGE.
+The id field uses the fully-qualified CL:NULL symbol so jzon's null detection
+remains correct even under a future encoder tightening that requires the
+home package to match."
   (let ((err (make-ht "code" code "message" message))
-        (outer (make-ht "jsonrpc" "2.0" "id" 'null "error" nil)))
+        (outer (make-ht "jsonrpc" "2.0" "id" 'cl:null "error" nil)))
     (setf (gethash "error" outer) err)
     (com.inuoe.jzon:stringify outer)))
 
