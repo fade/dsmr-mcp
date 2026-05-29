@@ -4,13 +4,15 @@
 ;;;; Parachute end-to-end tests for the stdio<->TCP bridge binary.
 ;;;;
 ;;;; Every test opens with (if (not (%bridge-binary-present-p)) (true t) ...)
-;;;; so a CI lane that has not built the binary degrades to PASS-via-guard
-;;;; rather than CI failure (D-15 pattern).
+;;;; so a CI lane that has not built the binary degrades to pass-via-guard
+;;;; rather than CI failure.
 ;;;;
-;;;; W-4 invariant: three distinct exit paths have three distinct tests:
+;;;; Three distinct exit paths have three distinct tests:
 ;;;;   (1) bridge-exits-cleanly-on-connect-refused -- the never-connected path
 ;;;;   (2) bridge-exits-cleanly-on-stdin-eof-after-connect -- connected-then-EOF
-;;;;   (3) bridge-routes-log-lines-to-stderr -- D-09 log-line filter (W-6)
+;;;;   (3) bridge-routes-log-lines-to-stderr -- log-line filter is substring-
+;;;;       based, not a prefix check, because jzon key order is implementation-
+;;;;       defined
 ;;;;   (4) bridge-help-exits-zero -- --help short-circuit path
 
 (defpackage #:dsmr-mcp/tests/transport/bridge-test
@@ -42,7 +44,8 @@ runner's current working directory."
 
 (defun %socket-available-p ()
   "Return T when a TCP listen socket can be bound on loopback.
-Mirrors the guard pattern from tcp-test.lisp (D-15)."
+Mirrors the guard pattern from tcp-test.lisp so the test passes
+gracefully on a host where port binding is restricted."
   (handler-case
       (let ((sock (usocket:socket-listen "127.0.0.1" 0
                                          :reuse-address t
@@ -207,12 +210,14 @@ Covers the CONNECTED-then-stdin-EOF path exclusively."
 (define-test bridge-routes-log-lines-to-stderr
   "Bridge proxies a plain JSON-RPC line to stdout and routes a log-shaped
 line where ts: appears mid-object (not first key) to stderr.
-Proves the substring filter, not a prefix check -- W-6."
+Proves the substring filter is wired correctly: a log object where the
+ts: key is buried mid-object would slip past a naive prefix check."
   (if (or (not (%bridge-binary-present-p))
           (not (%socket-available-p)))
       (true t)
       ;; line1: plain JSON-RPC result (no ts: or level: key)
-      ;; line2: log-shaped object where ts: is NOT the first key (W-6 mid-object)
+      ;; line2: log-shaped object where ts: is NOT the first key (mid-object,
+      ;; the case a prefix-only check would miss).
       (let* ((jsonrpc-line
                "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}")
              (log-line
@@ -250,7 +255,7 @@ Proves the substring filter, not a prefix check -- W-6."
                    ;; Log line (mid-object ts:) must NOT reach stdout.
                    (false (and (stringp stdout)
                                (search "\"ts\":" stdout)))
-                   ;; Log line must reach stderr (substring check W-6).
+                   ;; Log line must reach stderr (proving the substring check).
                    (true (and (stringp stderr)
                               (search "\"ts\":" stderr))))))
           (ignore-errors (join-thread server-thr))))))

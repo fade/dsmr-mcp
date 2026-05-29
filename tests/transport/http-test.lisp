@@ -41,7 +41,8 @@
 (in-package #:dsmr-mcp/tests/transport/http-test)
 
 ;;; ---------------------------------------------------------------------------
-;;; Test helpers (exported — W-3 single source of truth)
+;;; Test helpers (exported so the transport-parity test reuses them
+;;; instead of duplicating the harness).
 ;;; ---------------------------------------------------------------------------
 
 (defun http-port-available-p ()
@@ -575,15 +576,16 @@ Uses Connection: close to prevent keep-alive from hanging reads."
                            (is string= init-root (namestring (session-project-root mcp-1)))
                            (is string= init-root (namestring (session-project-root mcp-2)))
                            ;; Directly mutate session 1's project-root slot to new-root.
-                           ;; This proves the BLOCKER fix invariant: the two sessions are
-                           ;; independent objects, so mutating one leaves the other unchanged.
-                           ;; (The closure-captured default is proven by the two assertions
-                           ;; above — both sessions started with init-root, not a NIL or
-                           ;; stale process-wide value.)
+                           ;; The two sessions are independent objects, so
+                           ;; mutating one must leave the other unchanged.  (The
+                           ;; closure-captured default is proven by the two
+                           ;; assertions above — both sessions started with
+                           ;; init-root, not NIL or a stale process-wide value.)
                            (setf (session-project-root mcp-1) (pathname new-root))
                            ;; Session 1's root is now new-root.
                            (is string= new-root (namestring (session-project-root mcp-1)))
-                           ;; Session 2's root is STILL init-root — BLOCKER fix proof.
+                           ;; Session 2's root must still be init-root —
+                           ;; no shared process-wide state can be the carrier.
                            (is string= init-root (namestring (session-project-root mcp-2)))))))))
           (stop-http-server)
           (bordeaux-threads:with-lock-held (*sessions-lock*)
