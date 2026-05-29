@@ -696,7 +696,7 @@ On disconnect (stream-error), restores the null-channel and returns."
                ;; Block until the channel is marked done or the client disconnects.
                (loop
                  (bordeaux-threads:with-lock-held ((sse-channel-lock channel))
-                   ;; Wait with spurious-wakeup-safe loop (Pitfall 4).
+                   ;; Wait inside a loop so a spurious wakeup re-checks done-p / queue.
                    (loop until (or (sse-channel-done-p channel)
                                    (sse-channel-queue channel))
                          do (bordeaux-threads:condition-wait
