@@ -73,7 +73,8 @@ this session, or NIL. Set by run from the resolved config; read by
     :initform nil
     :documentation "Absolute pathname of this session's project root.
 NIL until fs-set-project-root is called. Never modified by the process CWD;
-changed only via fs-set-project-root. Multi-client safe (D-03).")
+changed only via fs-set-project-root.  Session-local: one session's
+re-rooting does not reach another.")
    (notify-channel
     :initarg :notify-channel
     :accessor session-notify-channel
