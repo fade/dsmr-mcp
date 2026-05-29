@@ -17,6 +17,7 @@
 ;;;;   0  — clean shutdown (stdin EOF after the bridge was connected)
 ;;;;   2  — TCP connection refused (never-connected path)
 ;;;;   3  — TCP connection timeout (never-connected path)
+;;;;  64  — invalid CLI arguments (sysexits.h EX_USAGE; e.g. --port abc)
 ;;;;
 ;;;; Per D-07: standalone source, depends only on usocket + bordeaux-threads
 ;;;; + sb-ext.  No dsmr-mcp/src/... package imports allowed here.
@@ -283,9 +284,17 @@ The three exit paths (0 / 2 / 3) are textually distinct code paths (W-4)."
   (let ((args (uiop:command-line-arguments)))
     (multiple-value-bind (host port timeout help-p error-p)
         (%parse-args args)
-      (when (or help-p error-p)
+      (when help-p
         (%print-usage)
         (uiop:quit 0))
+      ;; Bad CLI usage exits 64 (sysexits.h EX_USAGE) so wrapper scripts
+      ;; and supervisors can distinguish a malformed invocation from a
+      ;; clean --help shutdown.  Without this distinction a supervisor
+      ;; watching the exit code would either restart on a typo (because
+      ;; 0 looked clean) or treat the bridge as healthy.
+      (when error-p
+        (%print-usage)
+        (uiop:quit 64))
       (let ((rc (run-bridge host port timeout)))
         (format *error-output* "[bridge] exit ~D~%" rc)
         (force-output *error-output*)
