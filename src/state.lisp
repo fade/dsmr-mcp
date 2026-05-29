@@ -14,6 +14,8 @@
   (:use #:cl)
   (:import-from #:dsmr-mcp/src/tools/base
                 #:*tool-classes*)
+  (:import-from #:bordeaux-threads
+                #:make-lock)
   (:export #:session
            #:session-id
            #:initialized-p
@@ -23,6 +25,7 @@
            #:session-slynk-attach
            #:session-project-root
            #:session-notify-channel
+           #:session-notify-channel-lock
            #:make-session
            #:*current-session-id*
            #:*mode*
@@ -88,7 +91,15 @@ Set by the transport at session-create; never NIL after make-session returns.
 Load-order note: src/notify.lisp loads AFTER src/state.lisp in the
 package-inferred-system order. make-session installs a null-channel instance
 via runtime class lookup (find-symbol / find-package) so this slot's initform
-stays nil and no compile-time import of dsmr-mcp/src/notify is required."))
+stays nil and no compile-time import of dsmr-mcp/src/notify is required.")
+   (notify-channel-lock
+    :reader session-notify-channel-lock
+    :initform (make-lock "session-notify-channel-lock")
+    :documentation "Guards the critical section around the notify-channel slot.
+HTTP GET and POST handlers run concurrently against the same session; without
+this lock the install half (read-prior + check + setf) of the channel swap is
+a check-then-act race that can orphan a subscriber or lose notifications.
+Every read-modify-write of notify-channel by a transport must hold this lock."))
   (:documentation "Holds all per-connection state for one MCP session.
 One session is constructed per transport connection:
   - stdio: one session for the whole process lifetime
