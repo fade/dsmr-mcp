@@ -46,7 +46,9 @@
                 #:%dispatch-with-stdout-guard)
   (:import-from #:bordeaux-threads
                 #:make-thread
-                #:thread-alive-p)
+                #:thread-alive-p
+                #:make-lock
+                #:with-lock-held)
   (:import-from #:usocket)
   (:export #:serve-tcp
            #:start-tcp-server-thread
@@ -58,7 +60,8 @@
            #:*tcp-stop-flag*
            #:*tcp-conn-counter*
            #:*tcp-accept-timeout*
-           #:*tcp-read-timeout*))
+           #:*tcp-read-timeout*
+           #:*tcp-max-connections*))
 
 (in-package #:dsmr-mcp/src/transport/tcp)
 
@@ -93,6 +96,21 @@ Default 0.5s means stop requests are observed within half a second.")
 re-checks the stop flag.  NIL = no per-connection read timeout; idle
 connections remain open indefinitely (the accept-loop heartbeat handles
 stop signalling, not per-connection timeouts).")
+
+(defparameter *tcp-max-connections* 64
+  "Maximum number of concurrent connection-handler threads.  When the live
+count reaches this ceiling the accept loop closes new connections
+immediately (after logging a warn) instead of spawning another thread.
+Defaults sized for the loopback workload; bump for a remote-bind
+deployment.  NIL disables the cap.")
+
+(defvar *tcp-live-connections* 0
+  "Count of in-flight connection-handler threads.  Mutated only inside
+*TCP-LIVE-CONNECTIONS-LOCK*.")
+
+(defvar *tcp-live-connections-lock*
+  (bordeaux-threads:make-lock "tcp-live-connections-lock")
+  "Lock protecting *TCP-LIVE-CONNECTIONS*.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Internal: accept helpers
@@ -197,8 +215,9 @@ Returns when the client closes the connection (EOF), a write error occurs
 Creates a fresh session with id \"tcp-<CONN-ID>\", installs a TCP-LINE-CHANNEL
 so the session can push server-initiated notifications to this client,
 then runs the dispatch loop.  Cleanup under UNWIND-PROTECT closes the stream
-and socket and calls DETACH-SESSION via runtime symbol resolution (mirrors
-stdio.lisp line 216)."
+and socket, calls DETACH-SESSION via runtime symbol resolution (mirrors
+stdio.lisp line 216), and decrements *tcp-live-connections* so the accept
+loop can spawn another thread."
   (let ((stream nil)
         (session (make-session :id (format nil "tcp-~A" conn-id)
                                :slynk-attach slynk-attach
@@ -220,6 +239,8 @@ stdio.lisp line 216)."
       ;; Close the attached Slynk connection cleanly, same as stdio.lisp.
       (ignore-errors
        (uiop:symbol-call :dsmr-mcp/src/attach/dispatch :detach-session session))
+      (bordeaux-threads:with-lock-held (*tcp-live-connections-lock*)
+        (decf *tcp-live-connections*))
       (log-event :info "tcp.conn.closed" "conn" conn-id))))
 
 ;;; ---------------------------------------------------------------------------
@@ -259,15 +280,34 @@ immediately — used for integration tests that need a single-shot server."
                ;; Normal multi-client mode: spawn a thread per connection.
                ;; Increment the counter only after a successful accept so
                ;; transient accept failures (ECONNABORTED, fd exhaustion)
-               ;; don't leave gaps in conn-id sequencing.
+               ;; don't leave gaps in conn-id sequencing.  When the live
+               ;; thread count is at *tcp-max-connections*, close the new
+               ;; socket immediately so a buggy or hostile client cannot
+               ;; spawn unbounded threads.
                (t
                 (let ((client (%tcp-accept-client listener)))
                   (when client
-                    (let ((conn-id (incf *tcp-conn-counter*)))
-                      (bordeaux-threads:make-thread
-                       (lambda ()
-                         (%tcp-handle-client client conn-id slynk-attach project-root))
-                       :name (format nil "dsmr-tcp-client-~A" conn-id))))))))))
+                    (let ((accepted
+                            (bordeaux-threads:with-lock-held
+                                (*tcp-live-connections-lock*)
+                              (cond
+                                ((or (null *tcp-max-connections*)
+                                     (< *tcp-live-connections*
+                                        *tcp-max-connections*))
+                                 (incf *tcp-live-connections*)
+                                 t)
+                                (t nil)))))
+                      (cond
+                        (accepted
+                         (let ((conn-id (incf *tcp-conn-counter*)))
+                           (bordeaux-threads:make-thread
+                            (lambda ()
+                              (%tcp-handle-client client conn-id slynk-attach project-root))
+                            :name (format nil "dsmr-tcp-client-~A" conn-id))))
+                        (t
+                         (log-event :warn "tcp.accept.capped"
+                                    "limit" *tcp-max-connections*)
+                         (ignore-errors (usocket:socket-close client))))))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Public: blocking server entry point
