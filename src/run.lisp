@@ -180,6 +180,14 @@ than being discarded as though the key were absent."
          ;; Use a unique sentinel so a legitimately-falsy conf value
          ;; (nil, 0, "") is honoured over DEFAULT rather than treated as absent.
          (t
+          ;; Conf key is derived by stripping the DSMR_ prefix and
+          ;; folding underscores to dashes.  Assert the prefix so a
+          ;; future non-DSMR_ env var name does not silently misderive
+          ;; the conf key.
+          (assert (and (>= (length env-name) 5)
+                       (string= env-name "DSMR_" :end1 5))
+                  () "%or-from-env requires DSMR_-prefixed env var, got ~S"
+                  env-name)
           (let* ((bare  (subseq env-name 5))
                  (pkey  (intern (string-upcase (substitute #\- #\_ bare)) :keyword))
                  (missing '#:missing)
