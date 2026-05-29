@@ -656,10 +656,14 @@ Supports both application/json and text/event-stream Accept modes."
 
 (defun handle-mcp-get ()
   "Handle GET /mcp — open a long-lived SSE stream for unsolicited notifications.
-Validates Mcp-Session-Id (400 missing, 404 unknown), sets SSE headers,
-installs an sse-channel on the mcp-session, then blocks waiting for events
-or client disconnect.
-On disconnect (stream-error), restores the null-channel and returns."
+Validates Mcp-Session-Id (400 missing, 404 unknown, 409 when another GET
+stream is already attached to this session), sets SSE headers, installs an
+sse-channel on the mcp-session, bumps active-requests so the eviction sweep
+does not kill a live subscriber, then blocks waiting for events or client
+disconnect.
+On disconnect (stream-error), restores the prior channel only when this GET
+still owns the slot (a concurrent POST may legitimately have swapped in its
+own channel)."
   (let* ((request hunchentoot:*request*)
          (session-id-header (hunchentoot:header-in :mcp-session-id request)))
 
@@ -674,7 +678,17 @@ On disconnect (stream-error), restores the null-channel and returns."
           (%json-response (%http-error-json -32600 "Session not found")
                           :status 404)))
 
-      (let* ((mcp-sess (http-session-mcp-session http-sess)))
+      (let* ((mcp-sess (http-session-mcp-session http-sess))
+             (prior-channel (session-notify-channel mcp-sess)))
+
+        ;; Only one GET subscriber per session — refuse a second concurrent
+        ;; GET with 409 Conflict.  The MCP Streamable HTTP shape designates
+        ;; GET as the single canonical drainer of the notification queue;
+        ;; allowing two would race on %drain-sse-queue and split events.
+        (when (typep prior-channel 'sse-channel)
+          (return-from handle-mcp-get
+            (%json-response (%http-error-json -32600 "GET stream already open")
+                            :status 409)))
 
         ;; Set SSE response headers BEFORE send-headers.
         (setf (hunchentoot:content-type*) "text/event-stream")
@@ -692,25 +706,41 @@ On disconnect (stream-error), restores the null-channel and returns."
           ;; Install the SSE channel on the session.
           (setf (session-notify-channel mcp-sess) channel)
 
+          ;; Count the long-lived GET as one in-flight request so the idle
+          ;; eviction sweep treats the session as active for as long as the
+          ;; subscriber stays connected.
+          (bordeaux-threads:with-lock-held
+              ((http-session-active-requests-lock http-sess))
+            (incf (http-session-active-requests http-sess)))
+
           (unwind-protect
-               ;; Block until the channel is marked done or the client disconnects.
-               (loop
-                 (bordeaux-threads:with-lock-held ((sse-channel-lock channel))
-                   ;; Wait inside a loop so a spurious wakeup re-checks done-p / queue.
-                   (loop until (or (sse-channel-done-p channel)
-                                   (sse-channel-queue channel))
-                         do (bordeaux-threads:condition-wait
-                             (sse-channel-cv channel)
-                             (sse-channel-lock channel)))
-                   (setf done-p (sse-channel-done-p channel)))
-                 (handler-case
-                     (%drain-sse-queue channel stream)
-                   (stream-error ()
-                     ;; Client disconnected mid-drain — exit the loop.
-                     (setf done-p t)))
-                 (when done-p (return)))
-            ;; Cleanup: restore null-channel so emit calls don't hit a dead stream.
-            (setf (session-notify-channel mcp-sess) (make-instance 'null-channel))
+               (let ((*current-session-id* session-id-header))
+                 ;; Block until the channel is marked done or the client disconnects.
+                 (loop
+                   (bordeaux-threads:with-lock-held ((sse-channel-lock channel))
+                     ;; Wait inside a loop so a spurious wakeup re-checks done-p / queue.
+                     (loop until (or (sse-channel-done-p channel)
+                                     (sse-channel-queue channel))
+                           do (bordeaux-threads:condition-wait
+                               (sse-channel-cv channel)
+                               (sse-channel-lock channel)))
+                     (setf done-p (sse-channel-done-p channel)))
+                   (handler-case
+                       (%drain-sse-queue channel stream)
+                     (stream-error ()
+                       ;; Client disconnected mid-drain — exit the loop.
+                       (setf done-p t)))
+                   (when done-p (return))))
+            ;; Cleanup: restore the prior channel only when we still own the
+            ;; slot.  A POST handler that ran in SSE mode against this same
+            ;; session may legitimately have swapped a different channel in
+            ;; while we were waiting; stomping it here would orphan its
+            ;; subscriber the same way the iter2 POST regression did.
+            (when (eq (session-notify-channel mcp-sess) channel)
+              (setf (session-notify-channel mcp-sess) prior-channel))
+            (bordeaux-threads:with-lock-held
+                ((http-session-active-requests-lock http-sess))
+              (decf (http-session-active-requests http-sess)))
             (ignore-errors (finish-output stream)))
 
           ;; Return empty string so Hunchentoot doesn't try to write a body.
