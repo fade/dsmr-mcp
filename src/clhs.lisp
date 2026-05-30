@@ -27,6 +27,7 @@
                 #:make-ht
                 #:text-content)
   (:export #:clhs-lookup
+           #:reset-clhs-cache
            #:%section-to-filename
            #:%section-number-p))
 
@@ -37,7 +38,9 @@
 ;;; ---------------------------------------------------------------------------
 
 (defvar *clhs-symbol-map* nil
-  "Cached hash table mapping uppercase symbol names to relative HyperSpec paths.")
+  "Cached symbol map. One of: NIL (resolution not yet attempted), the keyword
+:UNRESOLVED (attempted and no HyperSpec found — the negative-cache sentinel), or
+a hash table mapping uppercase symbol names to relative HyperSpec paths.")
 
 (defvar *clhs-root* nil
   "Cached HyperSpec root directory pathname (the dir holding Data/ and Body/).")
@@ -98,32 +101,54 @@ Returns a mapped root pathname, or NIL on any failure (fail-open)."
 
 (defun %load-symbol-map ()
   "Resolve a HyperSpec root, parse Data/Map_Sym.txt into a fresh table, and
-cache both root and table. Returns the table, or NIL when no HyperSpec
-resolves (the caller surfaces the structured not-found, never a crash)."
+cache both root and table. Returns the table, or NIL when no HyperSpec resolves.
+
+On a miss, caches the :UNRESOLVED sentinel so the full 3-tier probe — including
+the gated tier-3 network install — runs at most once per session rather than on
+every lookup. Call RESET-CLHS-CACHE to force re-resolution (e.g. after setting
+DSMR_HYPERSPEC_DIR mid-session)."
   (let ((root (%resolve-hyperspec-root)))
-    (when root
-      (let ((map-file (merge-pathnames "Data/Map_Sym.txt" root))
-            (table (make-hash-table :test 'equalp)))
-        (with-open-file (s map-file :external-format :latin-1)
-          (loop for symbol = (read-line s nil)
-                for path = (read-line s nil)
-                while (and symbol path)
-                do (setf (gethash symbol table) path)))
-        (setf *clhs-root* root
-              *clhs-symbol-map* table)
-        (log-event :info "clhs" "action" "loaded symbol map"
-                   "count" (hash-table-count table))
-        table))))
+    (cond
+      ((null root)
+       (setf *clhs-symbol-map* :unresolved)   ; negative cache: don't retry
+       nil)
+      (t
+       (let ((map-file (merge-pathnames "Data/Map_Sym.txt" root))
+             (table (make-hash-table :test 'equalp)))
+         (with-open-file (s map-file :external-format :latin-1)
+           (loop for symbol = (read-line s nil)
+                 for path = (read-line s nil)
+                 while (and symbol path)
+                 do (setf (gethash symbol table) path)))
+         (setf *clhs-root* root
+               *clhs-symbol-map* table)
+         (log-event :info "clhs" "action" "loaded symbol map"
+                    "count" (hash-table-count table))
+         table)))))
 
 (defun %get-symbol-map ()
-  "Return the cached symbol map, loading it on first use. NIL when unresolvable."
-  (or *clhs-symbol-map* (%load-symbol-map)))
+  "Return the cached symbol map, loading it on first use. Returns NIL when no
+HyperSpec resolves; the unresolved state is remembered (the :UNRESOLVED
+sentinel) so resolution and the gated tier-3 network install are attempted at
+most once per session, not on every lookup."
+  (cond
+    ((hash-table-p *clhs-symbol-map*) *clhs-symbol-map*)
+    ((eq *clhs-symbol-map* :unresolved) nil)
+    (t (%load-symbol-map))))
 
 (defun %get-clhs-root ()
   "Return the resolved HyperSpec root, ensuring the map is loaded. NIL when
 unresolvable."
   (%get-symbol-map)
   *clhs-root*)
+
+(defun reset-clhs-cache ()
+  "Forget any cached HyperSpec resolution (including the negative-cache
+sentinel) so the next lookup re-resolves from scratch. Useful after setting
+DSMR_HYPERSPEC_DIR or placing a tree mid-session."
+  (setf *clhs-symbol-map* nil
+        *clhs-root* nil)
+  (values))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Section number -> filename math (ported verbatim)
