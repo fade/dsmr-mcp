@@ -84,7 +84,9 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/tools/lsp-completions"
                "dsmr-mcp/src/tools/lsp-hover"
                "dsmr-mcp/src/tools/lsp-diagnostics"
-               "dsmr-mcp/src/tools/lsp-code-actions")
+               "dsmr-mcp/src/tools/lsp-code-actions"
+               "dsmr-mcp/src/project-scaffold-templates"
+               "dsmr-mcp/src/project-scaffold-core")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"
