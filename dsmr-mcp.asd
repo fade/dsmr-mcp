@@ -84,7 +84,13 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/tools/lsp-completions"
                "dsmr-mcp/src/tools/lsp-hover"
                "dsmr-mcp/src/tools/lsp-diagnostics"
-               "dsmr-mcp/src/tools/lsp-code-actions")
+               "dsmr-mcp/src/tools/lsp-code-actions"
+               "dsmr-mcp/src/project-scaffold-templates"
+               "dsmr-mcp/src/project-scaffold-core"
+               "dsmr-mcp/src/project-scaffold"
+               "dsmr-mcp/src/tools/project-scaffold"
+               "dsmr-mcp/src/clhs"
+               "dsmr-mcp/src/tools/clhs-lookup")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"
@@ -105,6 +111,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/protocol/tools-call-test"
                "dsmr-mcp/tests/protocol/prompts-test"
                "dsmr-mcp/tests/protocol/argument-validation-test"
+               "dsmr-mcp/tests/protocol/wire-string-normalization-test"
                "dsmr-mcp/tests/transport/stdio-test"
                "dsmr-mcp/tests/transport/stdio-integration-test"
                "dsmr-mcp/tests/run-test"
@@ -146,7 +153,9 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/support/lsp-mock"
                "dsmr-mcp/tests/lsp/client-test"
                "dsmr-mcp/tests/lsp/document-test"
-               "dsmr-mcp/tests/lsp/bridge-test")
+               "dsmr-mcp/tests/lsp/bridge-test"
+               "dsmr-mcp/tests/scaffold/project-scaffold-test"
+               "dsmr-mcp/tests/clhs/clhs-lookup-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
