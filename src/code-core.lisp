@@ -242,7 +242,15 @@ the file cannot be read or the offset is out of range."
                     (t (return)))))
               (1+ (count #\Newline content :end (min i len))))))
       (error (e)
-        (log-event :warn "code.find.line-error"
+        ;; An untranslatable logical pathname (SBCL's own SYS:OBJ;... contrib
+        ;; sources have no host translation) is an expected, benign miss for a
+        ;; cross-system reference set — not a failure. Keep :warn for genuine
+        ;; read errors on physical files; downgrade the logical-pathname case to
+        ;; :debug so it stops flooding the log when xref spans system code.
+        (log-event (if (ignore-errors (typep (pathname pathname) 'logical-pathname))
+                       :debug
+                       :warn)
+                   "code.find.line-error"
                    "path" (princ-to-string pathname)
                    "error" (princ-to-string e))
         nil))))
