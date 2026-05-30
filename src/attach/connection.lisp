@@ -28,6 +28,8 @@
                 #:condition-notify)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
+  (:import-from #:dsmr-mcp/src/wire-strings
+                #:coerce-wire-strings)
   (:export #:get-or-open-connection
            #:drop-connection
            #:close-connection
@@ -98,34 +100,12 @@ Signals a plain error for a non-empty string that contains no colon."
 Used by with-attach-dispatch to gate the attached eval path."
   (and (stringp attach-string) (plusp (length attach-string))))
 
-;;; Form-tree wire-string normalisation -------------------------------------
-;;;
-;;; A SIMPLE-BASE-STRING anywhere inside a form sent to slynk-client prints,
-;;; under the rex encoder's *print-readably* t, as #A((N) BASE-CHAR ...) — an
-;;; array literal longer than the byte count Slynk's length prefix was computed
-;;; from.  The remote reader hits EOF mid-form and drops the connection, which
-;;; surfaces as slime-network-error.  process-json-line normalises strings that
-;;; arrive over the wire, but a form builder can re-introduce a base-string from
-;;; a source the wire boundary never sees — e.g. (namestring project-root),
-;;; which is a SIMPLE-BASE-STRING on SBCL for an ASCII path.  Coercing every
-;;; embedded string to element-type CHARACTER here, at the single funnel every
-;;; attached form passes through, keeps any base-string out of the wire
-;;; regardless of which builder produced the form or where its strings came
-;;; from.  The failure only manifests against a real external image (an
-;;; in-process eval shares one reader), so it escapes the in-process fixture.
-(defun %coerce-wire-strings (form)
-  "Return FORM with every embedded string coerced to element-type CHARACTER.
-Conses are rebuilt structurally; strings are coerced; every other atom passes
-through unchanged.  A SIMPLE-BASE-STRING is the failure mode; a string already
-of element-type CHARACTER is returned as-is."
-  (cond
-    ((consp form)
-     (cons (%coerce-wire-strings (car form))
-           (%coerce-wire-strings (cdr form))))
-    ((and (stringp form)
-          (not (typep form '(simple-array character (*)))))
-     (map '(simple-array character (*)) #'identity form))
-    (t form)))
+;;; Form-tree wire-string normalisation is shared with the inbound JSON-RPC
+;;; parse; the rationale and the recursive coercion live in
+;;; dsmr-mcp/src/wire-strings.  bounded-slime-eval runs coerce-wire-strings on
+;;; every outbound form so a base-string a builder introduced after the wire-in
+;;; boundary (e.g. (namestring project-root), a SIMPLE-BASE-STRING on SBCL for
+;;; an ASCII path) cannot reach the rex encoder.
 
 ;;; Bounded slime-eval -------------------------------------------------------
 ;;;
@@ -146,10 +126,10 @@ of element-type CHARACTER is returned as-is."
 remote result, or signals slynk-client:slime-network-error if no reply arrives
 within TIMEOUT.
 
-FORM is passed through %coerce-wire-strings first so a SIMPLE-BASE-STRING
+FORM is passed through coerce-wire-strings first so a SIMPLE-BASE-STRING
 embedded by any form builder (e.g. a pathname namestring) cannot reach the rex
 encoder and corrupt the length-prefixed message."
-  (let ((form      (%coerce-wire-strings form))
+  (let ((form      (coerce-wire-strings form))
         (done-lock (make-lock "dsmr-bounded-slime-eval"))
         (done      (make-condition-variable))
         (available nil)
