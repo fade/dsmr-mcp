@@ -41,7 +41,8 @@
   (:import-from #:dsmr-mcp/src/hermetic/dispatch
                 #:dispatch-hermetic-call)
   (:import-from #:dsmr-mcp/src/code-core
-                #:%build-code-find-refs-form)
+                #:%build-code-find-refs-form
+                #:render-references-summary)
   (:import-from #:slynk-client
                 #:slime-network-error)
   (:import-from #:bordeaux-threads
@@ -124,25 +125,17 @@ RAW is either:
                 (text-content (format nil "~@[~A: ~]~A" name hint)))))
     ;; NIL — no references (valid, not an error).
     ((null raw)
-     (make-ht "content"    (text-content "No references found.")
+     (make-ht "content"    (text-content (render-references-summary nil))
               "references" #()))
     ;; List of reference plists.
     ((and (listp raw) (or (null raw) (listp (car raw))))
-     (let* ((refs (mapcar (lambda (ref)
-                            (make-ht "path"     (or (getf ref :path) "")
-                                     "line"     (or (getf ref :line) 0)
-                                     "caller"   (or (getf ref :caller) "")
-                                     "relation" (or (getf ref :relation) "")))
-                          raw))
-            (summary (with-output-to-string (s)
-                       (format s "~D reference~:P:~%" (length raw))
-                       (dolist (ref raw)
-                         (format s "  ~A:~A [~A] ~A~%"
-                                 (or (getf ref :path) "")
-                                 (or (getf ref :line) 0)
-                                 (or (getf ref :relation) "")
-                                 (or (getf ref :caller) ""))))))
-       (make-ht "content"    (text-content summary)
+     (let ((refs (mapcar (lambda (ref)
+                           (make-ht "path"     (or (getf ref :path) "")
+                                    "line"     (or (getf ref :line) 0)
+                                    "caller"   (or (getf ref :caller) "")
+                                    "relation" (or (getf ref :relation) "")))
+                         raw)))
+       (make-ht "content"    (text-content (render-references-summary raw))
                 "references" (coerce refs 'simple-vector))))
     ;; Unexpected shape.
     (t

@@ -42,6 +42,7 @@
                 #:dispatch-hermetic-call)
   (:import-from #:dsmr-mcp/src/code-core
                 #:%build-code-find-form
+                #:render-locations-summary
                 #:package-not-found
                 #:symbol-not-found
                 #:found-but-no-source-location)
@@ -130,19 +131,12 @@ RAW is either:
      (%decode-not-found raw))
     ;; Success: list of location plists — (car raw) is a cons (:path ...).
     ((and (listp raw) (listp (car raw)))
-     (let* ((locs (mapcar (lambda (loc)
-                            (make-ht "path" (or (getf loc :path) "")
-                                     "line" (or (getf loc :line) 0)
-                                     "kind" (or (getf loc :kind) "")))
-                          raw))
-            (summary (with-output-to-string (s)
-                       (format s "~D definition~:P:~%" (length raw))
-                       (dolist (loc raw)
-                         (format s "  ~A:~A [~A]~%"
-                                 (or (getf loc :path) "")
-                                 (or (getf loc :line) 0)
-                                 (or (getf loc :kind) ""))))))
-       (make-ht "content"   (text-content summary)
+     (let ((locs (mapcar (lambda (loc)
+                           (make-ht "path" (or (getf loc :path) "")
+                                    "line" (or (getf loc :line) 0)
+                                    "kind" (or (getf loc :kind) "")))
+                         raw)))
+       (make-ht "content"   (text-content (render-locations-summary raw))
                 "locations" (coerce locs 'simple-vector))))
     ;; Unexpected shape — log and return error.
     (t
