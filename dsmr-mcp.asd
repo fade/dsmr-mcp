@@ -135,7 +135,11 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/transport/tcp-test"
                "dsmr-mcp/tests/transport/http-test"
                "dsmr-mcp/tests/transport/transport-parity-test"
-               "dsmr-mcp/tests/transport/bridge-test")
+               "dsmr-mcp/tests/transport/bridge-test"
+               "dsmr-mcp/tests/support/lsp-mock"
+               "dsmr-mcp/tests/lsp/client-test"
+               "dsmr-mcp/tests/lsp/document-test"
+               "dsmr-mcp/tests/lsp/bridge-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
