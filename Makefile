@@ -11,6 +11,6 @@
 bridge:
 	@mkdir -p bin
 	sbcl --noinform --disable-debugger \
-	     --eval '(asdf:load-asd "dsmr-mcp.asd")' \
+	     --eval '(asdf:load-asd (truename "dsmr-mcp-bridge.asd"))' \
 	     --eval '(asdf:make :dsmr-mcp-bridge)' \
 	     --eval '(quit)'

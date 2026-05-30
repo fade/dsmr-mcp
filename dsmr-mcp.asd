@@ -129,6 +129,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/attach/inspect-thread-test"
                "dsmr-mcp/tests/attach/inspect-restart-test"
                "dsmr-mcp/tests/attach/inspect-condition-test"
+               "dsmr-mcp/tests/attach/wire-cross-process-test"
                "dsmr-mcp/tests/support/fs-fixture"
                "dsmr-mcp/tests/fs/sandbox-test"
                "dsmr-mcp/tests/fs/symlink-escape-test"
@@ -175,29 +176,3 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                             (setf any-failed t))))
                       (when any-failed
                         (error "dsmr-mcp/tests: one or more parachute tests failed.")))))
-
-;;; ---------------------------------------------------------------------------
-;;; Bridge binary: standalone stdio<->TCP proxy for stdio-only MCP clients.
-;;;
-;;; Produces bin/dsmr-mcp-bridge via (asdf:make :dsmr-mcp-bridge).
-;;; The bridge is a Lisp-only executable so the client machine needs no
-;;; Python runtime.  Per-platform CI artefacts are a later concern;
-;;; today the operator builds locally with `make bridge`.
-;;;
-;;; Build-operation note: the string form "program-op" is the CL Cookbook
-;;; recommended style for ASDF >= 3.1; if it fails with "operation not found"
-;;; on an older ASDF, replace with the symbol form 'asdf:program-op.
-;;; ---------------------------------------------------------------------------
-
-(asdf:defsystem "dsmr-mcp-bridge"
-  :class :package-inferred-system
-  :description "stdio<->TCP bridge binary for MCP clients that only speak stdio."
-  :author "Brian O'Reilly <fade@deepsky.com>"
-  :license "AGPL-3.0-or-later"
-  :version "0.1.0"
-  :depends-on ("usocket"
-               "bordeaux-threads"
-               "dsmr-mcp-bridge/scripts/stdio-tcp-bridge")
-  :build-operation "program-op"
-  :build-pathname "bin/dsmr-mcp-bridge"
-  :entry-point "dsmr-mcp-bridge/scripts/stdio-tcp-bridge:main")
