@@ -33,7 +33,10 @@
   (:import-from #:dsmr-mcp/src/code-core
                 #:code-find-definition
                 #:code-describe-symbol
-                #:code-find-references)
+                #:code-find-references
+                #:render-locations-summary
+                #:render-references-summary
+                #:render-describe-summary)
   (:import-from #:dsmr-mcp/src/system-loader-core
                 #:load-system)
   (:import-from #:dsmr-mcp/src/test-runner-core
@@ -221,15 +224,8 @@ Try load-system first, or clgrep-search for text search." symbol-name)))))
                                      (make-ht "path" (or (getf loc :path) "")
                                               "line" (or (getf loc :line) 0)
                                               "kind" (or (getf loc :kind) "")))
-                                   result))
-                     (summary (with-output-to-string (s)
-                                (format s "~D definition~:P:~%" (length result))
-                                (dolist (loc result)
-                                  (format s "  ~A:~A [~A]~%"
-                                          (or (getf loc :path) "")
-                                          (or (getf loc :line) 0)
-                                          (or (getf loc :kind) ""))))))
-                 (make-ht "content"   (text-content summary)
+                                   result)))
+                 (make-ht "content"   (text-content (render-locations-summary result))
                           "locations" (coerce locs 'simple-vector))))
               (t
                (make-ht "isError"    t
@@ -273,15 +269,9 @@ Returns the describe wire envelope or a typed not-found isError."
                       (doc     (or (getf result :doc)     ""))
                       (path    (or (getf result :path)    ""))
                       (line    (or (getf result :line)    0))
-                      (summary (with-output-to-string (s)
-                                 (format s "~A~@[ — ~A~]~%"
-                                         name (and (plusp (length type)) type))
-                                 (when (plusp (length arglist))
-                                   (format s "  arglist: ~A~%" arglist))
-                                 (when (plusp (length path))
-                                   (format s "  ~A:~A~%" path line))
-                                 (when (plusp (length doc))
-                                   (format s "~%~A" doc)))))
+                      (summary (render-describe-summary
+                                :name name :type type :arglist arglist
+                                :doc doc :path path :line line)))
                  (make-ht "content" (text-content summary)
                           "name"    name
                           "type"    type
@@ -342,18 +332,8 @@ Returns the references wire envelope or a typed error."
                                               "line"     (or (getf ref :line)     0)
                                               "caller"   (or (getf ref :caller)   "")
                                               "relation" (or (getf ref :relation) "")))
-                                   (or result '())))
-                     (summary (if result
-                                  (with-output-to-string (s)
-                                    (format s "~D reference~:P:~%" (length result))
-                                    (dolist (ref result)
-                                      (format s "  ~A:~A [~A] ~A~%"
-                                              (or (getf ref :path) "")
-                                              (or (getf ref :line) 0)
-                                              (or (getf ref :relation) "")
-                                              (or (getf ref :caller) ""))))
-                                  "No references found.")))
-                 (make-ht "content"    (text-content summary)
+                                   (or result '()))))
+                 (make-ht "content"    (text-content (render-references-summary result))
                           "references" (coerce refs 'simple-vector)))))))
       (sb-ext:timeout ()
         (make-ht "isError"    t

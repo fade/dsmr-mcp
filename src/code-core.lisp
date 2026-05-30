@@ -48,7 +48,11 @@
    ;; Injected-form builders (attached path)
    #:%build-code-find-form
    #:%build-code-describe-form
-   #:%build-code-find-refs-form))
+   #:%build-code-find-refs-form
+   ;; Shared content-summary renderers (attached + hermetic parity)
+   #:render-locations-summary
+   #:render-references-summary
+   #:render-describe-summary))
 
 (in-package #:dsmr-mcp/src/code-core)
 
@@ -943,3 +947,55 @@ or a typed not-found plist. Uses CL-USER symbol hygiene; no loop; coerces string
                 (nreverse ,s-results)
                 ;; Return empty list (not a not-found error) when no references.
                 nil))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Shared content-summary renderers
+;;;
+;;; code-find / code-describe / code-find-references each return a structured
+;;; envelope plus a human-readable "content" summary. The attached (dispatcher)
+;;; and hermetic (worker) paths produce the SAME envelope shapes, so the summary
+;;; rendering lives here and is called from both — otherwise the two modes drift
+;;; and the same query reads differently depending on dispatch mode.
+;;; ---------------------------------------------------------------------------
+
+(defun render-locations-summary (locations)
+  "Render the human-readable summary for a list of definition-location plists
+(:path :line :kind). Shared by the attached and hermetic code-find paths."
+  (with-output-to-string (s)
+    (format s "~D definition~:P:~%" (length locations))
+    (dolist (loc locations)
+      (format s "  ~A:~A [~A]~%"
+              (or (getf loc :path) "")
+              (or (getf loc :line) 0)
+              (or (getf loc :kind) "")))))
+
+(defun render-references-summary (references)
+  "Render the human-readable summary for a list of xref reference plists
+(:path :line :caller :relation), or the empty-set message when REFERENCES is
+NIL. Shared by the attached and hermetic code-find-references paths."
+  (if references
+      (with-output-to-string (s)
+        (format s "~D reference~:P:~%" (length references))
+        (dolist (ref references)
+          (format s "  ~A:~A [~A] ~A~%"
+                  (or (getf ref :path) "")
+                  (or (getf ref :line) 0)
+                  (or (getf ref :relation) "")
+                  (or (getf ref :caller) ""))))
+      "No references found."))
+
+(defun render-describe-summary (&key name type arglist doc (path "") (line 0))
+  "Render the human-readable describe summary from the structured fields.
+Shared by the attached and hermetic code-describe paths so both modes emit one
+consistent rendering. TYPE, ARGLIST, PATH, and DOC are omitted when empty, so
+the attached path — which carries no type or source location — degrades cleanly
+to just the name, arglist, and docstring."
+  (with-output-to-string (s)
+    (format s "~A~@[ — ~A~]~%"
+            name (and (plusp (length (or type ""))) type))
+    (when (plusp (length (or arglist "")))
+      (format s "  arglist: ~A~%" arglist))
+    (when (plusp (length (or path "")))
+      (format s "  ~A:~A~%" path line))
+    (when (plusp (length (or doc "")))
+      (format s "~%~A" doc))))
