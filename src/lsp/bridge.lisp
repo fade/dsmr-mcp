@@ -37,8 +37,12 @@
   (:use #:cl)
   (:import-from #:dsmr-mcp/src/lsp/client
                 #:lsp-send-request
+                #:lsp-send-notification
                 #:lsp-client-project-root
-                #:lsp-connection-lost)
+                #:lsp-client-opened-uris
+                #:lsp-client-opened-uris-lock
+                #:lsp-connection-lost
+                #:bump-uri-version)
   (:import-from #:dsmr-mcp/src/lsp/document
                 #:path->file-uri)
   (:import-from #:dsmr-mcp/src/validate
@@ -212,6 +216,54 @@ this fallback catches only structural paren/reader issues."
              "messages"        messages)))
 
 ;;; ---------------------------------------------------------------------------
+;;; Document-open sync — ensure alive-lsp has the current file buffer
+;;; ---------------------------------------------------------------------------
+
+(defun %ensure-document-open (client uri path-str)
+  "Ensure alive-lsp has an up-to-date in-memory buffer for URI/PATH-STR.
+
+Reads PATH-STR from disk and sends textDocument/didOpen on the first call for
+this URI, so alive-lsp allocates a buffer.  Sends textDocument/didChange on
+subsequent calls so the buffer reflects current on-disk state.
+
+alive-lsp's completion and hover handlers operate on their in-memory buffer,
+not the filesystem.  A URI never opened returns empty results.  The diagnostics
+path ($/alive/tryCompile) reads from disk and does not need this priming;
+position-based verbs do.
+
+Best-effort: any error (missing file, notification failure) is silently ignored
+so the bridge still attempts the LSP request with whatever state the server has."
+  (ignore-errors
+    (let ((text (uiop:read-file-string path-str)))
+      (unless (stringp text) (return-from %ensure-document-open nil))
+      (with-lock-held ((lsp-client-opened-uris-lock client))
+        (if (gethash uri (lsp-client-opened-uris client))
+            ;; Already opened — send didChange with a bumped version.
+            (let* ((version (bump-uri-version client uri))
+                   (params  (make-hash-table :test 'equal))
+                   (doc     (make-hash-table :test 'equal))
+                   (change  (make-hash-table :test 'equal)))
+              (setf (gethash "uri"            doc)    uri
+                    (gethash "version"        doc)    version
+                    (gethash "text"           change) text
+                    (gethash "textDocument"   params) doc
+                    (gethash "contentChanges" params) (vector change))
+              (lsp-send-notification client "textDocument/didChange" params)
+              (log-event :debug "lsp.bridge.did-change" "uri" uri "version" version))
+            ;; First time — send didOpen.
+            (let ((params (make-hash-table :test 'equal))
+                  (doc    (make-hash-table :test 'equal)))
+              (setf (gethash "uri"          doc)    uri
+                    (gethash "languageId"   doc)    "lisp"
+                    (gethash "version"      doc)    1
+                    (gethash "text"         doc)    text
+                    (gethash "textDocument" params) doc)
+              (lsp-send-notification client "textDocument/didOpen" params)
+              (setf (gethash uri (lsp-client-opened-uris client)) t)
+              (log-event :debug "lsp.bridge.did-open" "uri" uri))))))
+  nil)
+
+;;; ---------------------------------------------------------------------------
 ;;; LSP-02: bridge-completions
 ;;; ---------------------------------------------------------------------------
 
@@ -224,6 +276,10 @@ Signals LSP-CONNECTION-LOST on wire failure."
   (declare (ignore id))
   (let* ((uri    (path->file-uri path-str))
          (params (%make-text-document-position uri line char)))
+    ;; Ensure alive-lsp has the file's current text before requesting completions.
+    ;; alive-lsp's completion handler reads from its in-memory buffer; a URI
+    ;; that was never opened returns an empty items list.
+    (%ensure-document-open client uri path-str)
     (log-event :debug "lsp.bridge.completions"
                "path" path-str "line" line "char" char)
     (let ((result (lsp-send-request client "textDocument/completion" params)))
@@ -245,6 +301,8 @@ Signals LSP-CONNECTION-LOST on wire failure."
   (declare (ignore id))
   (let* ((uri    (path->file-uri path-str))
          (params (%make-text-document-position uri line char)))
+    ;; Ensure alive-lsp has the file's current text before requesting hover.
+    (%ensure-document-open client uri path-str)
     (log-event :debug "lsp.bridge.hover"
                "path" path-str "line" line "char" char)
     (let ((result (lsp-send-request client "textDocument/hover" params)))
@@ -458,6 +516,8 @@ Includes 'format' when a surrounding form is found (rangeFormatting requires
 a valid range; without bounds there is no form to format, so the action is
 omitted rather than sending a null range).
 Includes 'remove-from-export' when a symbol is found at the position."
+  ;; Ensure alive-lsp has the file's current text before position probes.
+  (%ensure-document-open client uri path-str)
   (let ((package (or (%get-package-for-position client uri line char) "CL-USER"))
         (bounds  (%get-surrounding-form-bounds client uri line char))
         (symbol  (%get-symbol-at-position client uri line char))

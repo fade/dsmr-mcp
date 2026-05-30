@@ -40,6 +40,8 @@
            #:lsp-client-project-root
            #:lsp-client-last-active
            #:lsp-client-active-requests
+           #:lsp-client-opened-uris
+           #:lsp-client-opened-uris-lock
            #:ensure-lsp-client
            #:find-lsp-client
            #:connect-lsp-client
@@ -120,7 +122,12 @@ Protected by *LSP-REGISTRY-LOCK*.")
   (%connected      nil  :type boolean)  ; set T after handshake, NIL on disconnect
   ;; per-URI version counter for textDocument/didChange
   (uri-versions    (make-hash-table :test 'equal))
-  (uri-versions-lock (make-lock "lsp-uri-versions-lock")))
+  (uri-versions-lock (make-lock "lsp-uri-versions-lock"))
+  ;; opened-uris: tracks URIs for which textDocument/didOpen has been sent.
+  ;; The bridge sends didOpen on first position query and didChange on
+  ;; subsequent queries so alive-lsp's in-memory buffer matches disk.
+  (opened-uris     (make-hash-table :test 'equal))
+  (opened-uris-lock (make-lock "lsp-opened-uris-lock")))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Condition
@@ -718,7 +725,14 @@ Stdout-redirect ordering:
      uses it in the spawned server thread — the [STARTING] line must reach fd 1.
   3. Redirect again after start returns to suppress runtime noise on fd 1.
 
---no-userinit prevents ~/.sbclrc from polluting stdout before the STARTING line."
+--no-userinit prevents ~/.sbclrc from polluting stdout before the STARTING line.
+
+Warning muffling: cold alive-lsp compiles emit warnings that abort without
+muffling; handler-bind silences them so first-spawn cold compiles succeed.
+
+Blocking join: alive/server:start is non-blocking — it returns a thread.
+The child must block after starting or SBCL exits and kills the server thread.
+We bind the result to *alive-lsp-thread* in the child and join it."
   (let ((alive-dir *alive-lsp-dir*)
         (ql-setup  (%quicklisp-setup-path)))
     (unless alive-dir
@@ -737,12 +751,17 @@ Stdout-redirect ordering:
       (format nil
               "(asdf:initialize-source-registry '(:source-registry :inherit-configuration (:tree ~S)))"
               alive-dir)
-      "--eval" "(asdf:load-system \"alive-lsp\")"
+      ;; Load alive-lsp with warnings muffled so cold compiles succeed.
+      "--eval"
+      "(handler-bind ((warning #'muffle-warning)) (asdf:load-system \"alive-lsp\"))"
       ;; Step 2: restore stdout before start so [STARTING] reaches fd 1.
       "--eval" "(setf *standard-output* sb-sys:*stdout*)"
-      "--eval" "(alive/server:start)"
+      ;; Start the server and save the returned thread so we can join it.
+      "--eval" "(defvar *alive-lsp-thread* (alive/server:start))"
       ;; Step 3: redirect stdout again to suppress runtime noise.
-      "--eval" "(setf *standard-output* *error-output*)"))))
+      "--eval" "(setf *standard-output* *error-output*)"
+      ;; Block until the server thread exits — keeps the child alive.
+      "--eval" "(sb-thread:join-thread *alive-lsp-thread*)"))))
 
 (defun %parse-lsp-started-line (stdout)
   "Read lines from STDOUT until the [STARTING] Started on port N line.
