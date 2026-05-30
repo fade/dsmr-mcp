@@ -196,8 +196,9 @@ value of gethash so a value of 'null (jzon JSON null) still counts as
 present (addendum §6).
 
 Type checks: when a property has a :type, verifies the value type when
-the key is present. Unknown extra keys are silently allowed (permissive
-per JSON Schema default).
+the key is present. When a property has an :enum, verifies the present,
+non-null value is a member of the closed set. Unknown extra keys are
+silently allowed (permissive per JSON Schema default).
 
 Both passes use the same (%kebab->snake (string-downcase (string name)))
 normalization so a :required entry and its matching property descriptor
@@ -221,18 +222,24 @@ Returns T on success. Signals arg-validation-error on failure."
             (error 'arg-validation-error
                    :field req
                    :message (format nil "Missing required field: ~A" key))))))
-    ;; Type-check pass on present fields.
+    ;; Type-check and enum-membership pass on present fields.
     (dolist (prop properties)
-      (destructuring-bind (name &key type &allow-other-keys) prop
-        (when type
-          (let ((key (%kebab->snake (string-downcase (string name)))))
-            (multiple-value-bind (val presentp)
-                (gethash key (or args (make-hash-table :test 'equal)))
-              (when presentp
-                ;; Skip type check for jzon null sentinel; null is
-                ;; "present but null" — its type compliance depends on
-                ;; whether the schema allows null, which validate-args
-                ;; does not currently enforce.
-                (unless (eq val 'null)
-                  (%check-type-match val type key))))))))
+      (destructuring-bind (name &key type enum &allow-other-keys) prop
+        (let ((key (%kebab->snake (string-downcase (string name)))))
+          (multiple-value-bind (val presentp)
+              (gethash key (or args (make-hash-table :test 'equal)))
+            ;; Skip both checks for the jzon null sentinel; null is
+            ;; "present but null" — its compliance depends on whether the
+            ;; schema allows null, which validate-args does not enforce.
+            (when (and presentp (not (eq val 'null)))
+              (when type
+                (%check-type-match val type key))
+              ;; Enum is a closed set: a present, non-null value must be a
+              ;; member. Without this, an enum is advertised in tools/list
+              ;; but never enforced — a client could pass any string.
+              (when (and enum (not (member val enum :test #'equal)))
+                (error 'arg-validation-error
+                       :field name
+                       :message (format nil "~A must be one of ~{~S~^, ~} (got ~S)"
+                                        key enum val))))))))
     t))
