@@ -15,7 +15,7 @@
 ;;;; No percent-encoding is applied; typical Linux paths need none.
 ;;;;
 ;;;; Version counter: per-URI monotonically increasing integer, owned by
-;;;; the LSP client struct (bump-uri-version in client.lisp, Pitfall 4).
+;;;; the LSP client struct (bump-uri-version in client.lisp).
 ;;;; The caller supplies the version; this module is responsible only for
 ;;;; building the correct notification payload shape.
 
@@ -101,7 +101,7 @@ silent no-op — fire-and-forget (D-10)."
 
 (defun notify-did-change (client path text version)
   "Send a textDocument/didChange notification to CLIENT for PATH with TEXT.
-VERSION is the monotonically increasing per-URI version integer (Pitfall 4).
+VERSION is the monotonically increasing per-URI version integer.
 The caller is responsible for obtaining VERSION via bump-uri-version.
 Full document sync: contentChanges carries the entire buffer (D-10).
 The path must be inside the client's write jail (D-11).
