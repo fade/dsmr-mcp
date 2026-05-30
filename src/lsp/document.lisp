@@ -9,7 +9,7 @@
 ;;;; write jail (current project root).  A path outside the jail is a silent
 ;;;; no-op — a notification failure must never fail the edit tool call (D-10).
 ;;;;
-;;;; URI encoding (RESEARCH.md Domain 4, Linux-only):
+;;;; URI encoding (Linux-only):
 ;;;;   Path → URI: "file://<namestring>"
 ;;;;   URI → Path: strip the leading "file://" prefix (7 chars).
 ;;;; No percent-encoding is applied; typical Linux paths need none.
@@ -81,7 +81,7 @@ The root is taken from the client struct (D-11: sync jail mirrors write jail)."
 
 (defun notify-did-open (client path text)
   "Send a textDocument/didOpen notification to CLIENT for PATH with TEXT.
-Uses languageId \"lisp\" and version 1 (RESEARCH.md Domain 4).
+Uses languageId \"lisp\" and version 1 (alive-lsp's didOpen handler requires these).
 The path must be inside the client's write jail (D-11).
 Returns NIL.  A notification failure (client not connected, outside jail) is a
 silent no-op — fire-and-forget (D-10)."
