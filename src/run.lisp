@@ -27,6 +27,9 @@
                 #:configure-log4cl-for-server)
   (:import-from #:dsmr-mcp/src/attach/connection
                 #:parse-slynk-attach)
+  (:import-from #:dsmr-mcp/src/attach/dispatch
+                #:*attach-concurrency*
+                #:%resolve-attach-concurrency)
   (:import-from #:dsmr-mcp/src/hermetic/pool
                 #:initialize-pool #:shutdown-pool #:release-session)
   (:import-from #:usocket)
@@ -41,6 +44,7 @@
   (:export #:run
            #:resolve-transport
            #:resolve-mode
+           #:%check-remote-bind
            #:transport-not-implemented-error
            #:invalid-config-value
            #:invalid-config-value-name
@@ -176,6 +180,14 @@ than being discarded as though the key were absent."
          ;; Use a unique sentinel so a legitimately-falsy conf value
          ;; (nil, 0, "") is honoured over DEFAULT rather than treated as absent.
          (t
+          ;; Conf key is derived by stripping the DSMR_ prefix and
+          ;; folding underscores to dashes.  Assert the prefix so a
+          ;; future non-DSMR_ env var name does not silently misderive
+          ;; the conf key.
+          (assert (and (>= (length env-name) 5)
+                       (string= env-name "DSMR_" :end1 5))
+                  () "%or-from-env requires DSMR_-prefixed env var, got ~S"
+                  env-name)
           (let* ((bare  (subseq env-name 5))
                  (pkey  (intern (string-upcase (substitute #\- #\_ bare)) :keyword))
                  (missing '#:missing)
@@ -200,6 +212,24 @@ pass :project-root nil to mean \"use the cwd explicitly\"."
         (if (and env (not (string= env "")))
             (pathname env)
             (uiop:getcwd)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Remote-bind safety gate
+;;; ---------------------------------------------------------------------------
+
+(defun %check-remote-bind (bind)
+  "Signal INVALID-CONFIG-VALUE when BIND is a non-loopback address and the
+operator has not set DSMR_ALLOW_REMOTE to 1, true, or yes. Called before
+any listener socket is created so no network surface is exposed on accident."
+  (let ((loopback-p (or (string= bind "127.0.0.1")
+                        (string= bind "::1")
+                        (string= bind "localhost"))))
+    (unless (or loopback-p
+                (member (uiop:getenv "DSMR_ALLOW_REMOTE")
+                        '("1" "true" "yes") :test #'string=))
+      (error 'invalid-config-value
+             :name "DSMR_BIND"
+             :raw  bind))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; :auto Slynk reachability probe
@@ -311,8 +341,8 @@ Config precedence: keyword > DSMR_<KEYWORD> env var >
 
 Blocking behaviour:
   :stdio  -- blocks reading *STANDARD-INPUT* until EOF, then returns T.
-  :tcp    -- not yet implemented (signals TRANSPORT-NOT-IMPLEMENTED-ERROR).
-  :http   -- not yet implemented (signals TRANSPORT-NOT-IMPLEMENTED-ERROR).
+  :tcp    -- blocks accepting TCP connections; per-connection sessions until stop signal.
+  :http   -- blocks running Hunchentoot acceptor; per-session lifecycle managed by the HTTP layer.
 
 Malformed DSMR_* env values signal INVALID-CONFIG-VALUE (a typed subclass
 of ERROR) so operator mistakes produce a clean diagnostic.  This includes
@@ -360,10 +390,37 @@ The dsmr-mcp:run nickname (re-exported by src/main.lisp) resolves to this functi
          (resolved-slynk-attach
            (%or-from-env slynk-attach-supplied-p slynk-attach
                          "DSMR_SLYNK_ATTACH" conf nil
-                         :parse #'identity)))
+                         :parse #'identity))
 
-    ;; Suppress unused-variable notes for settings not yet wired.
-    (declare (ignore resolved-bind resolved-port))
+         (resolved-attach-concurrency
+           (%or-from-env nil nil "DSMR_ATTACH_CONCURRENCY" conf :serialised
+                         :parse #'%resolve-attach-concurrency))
+
+         (resolved-http-session-timeout
+           (%or-from-env nil nil "DSMR_HTTP_SESSION_TIMEOUT" conf 3600
+                         :parse (lambda (v)
+                                  (etypecase v
+                                    (integer v)
+                                    (string
+                                     (handler-case
+                                         (parse-integer v :junk-allowed nil)
+                                       (error ()
+                                         (error 'invalid-config-value
+                                                :name "DSMR_HTTP_SESSION_TIMEOUT"
+                                                :raw  v))))))))
+
+         (resolved-http-cleanup-interval
+           (%or-from-env nil nil "DSMR_HTTP_CLEANUP_INTERVAL" conf 60
+                         :parse (lambda (v)
+                                  (etypecase v
+                                    (integer v)
+                                    (string
+                                     (handler-case
+                                         (parse-integer v :junk-allowed nil)
+                                       (error ()
+                                         (error 'invalid-config-value
+                                                :name "DSMR_HTTP_CLEANUP_INTERVAL"
+                                                :raw  v)))))))))
 
     ;; Apply resolved log level.
     (setf *log-level* resolved-log-level)
@@ -372,6 +429,9 @@ The dsmr-mcp:run nickname (re-exported by src/main.lisp) resolves to this functi
     ;; Slynk probe's :warn log line lands on stderr, never on the JSON-RPC
     ;; stdout channel.
     (configure-log4cl-for-server resolved-log-level)
+
+    ;; Apply attach-concurrency policy before any session accepts requests.
+    (setf *attach-concurrency* resolved-attach-concurrency)
 
     ;; Resolve the effective mode, performing the real :auto Slynk probe now
     ;; that the log appender is installed.
@@ -392,8 +452,24 @@ The dsmr-mcp:run nickname (re-exported by src/main.lisp) resolves to this functi
             (serve-streams *standard-input* *standard-output*
                            :session (make-session :id "stdio"
                                                   :slynk-attach resolved-slynk-attach)))
-           ((:tcp :http)
-            (error 'transport-not-implemented-error :transport resolved-transport)))
+           (:tcp
+            (%check-remote-bind resolved-bind)
+            (log-event :info "run.start" "transport" :tcp "mode" *mode*)
+            (uiop:symbol-call :dsmr-mcp/src/transport/tcp :serve-tcp
+                              :host resolved-bind
+                              :port resolved-port
+                              :slynk-attach resolved-slynk-attach
+                              :project-root resolved-root))
+           (:http
+            (%check-remote-bind resolved-bind)
+            (log-event :info "run.start" "transport" :http "mode" *mode*)
+            (uiop:symbol-call :dsmr-mcp/src/transport/http :serve-http
+                              :host resolved-bind
+                              :port resolved-port
+                              :slynk-attach resolved-slynk-attach
+                              :project-root resolved-root
+                              :session-timeout resolved-http-session-timeout
+                              :cleanup-interval resolved-http-cleanup-interval)))
       ;; Cleanup: always log run.stop, even on unwind from typed errors.
       ;; When hermetic, release the stdio session worker so it is reaped.
       (when (eq *mode* :hermetic)

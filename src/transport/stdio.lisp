@@ -31,7 +31,9 @@
                 #:log-event)
   (:export #:serve-streams
            #:+max-json-line-bytes+
-           #:line-too-long))
+           #:line-too-long
+           #:%read-line-limited
+           #:%dispatch-with-stdout-guard))
 
 (in-package #:dsmr-mcp/src/transport/stdio)
 

@@ -35,6 +35,11 @@
                 #:call-with-lenient-packages)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
+  (:import-from #:dsmr-mcp/src/lsp/client
+                #:find-lsp-client
+                #:bump-uri-version)
+  (:import-from #:dsmr-mcp/src/lsp/document
+                #:notify-did-change)
   (:export #:edit-form
            #:validate-and-repair-content))
 
@@ -294,6 +299,10 @@ CONTENT is the replacement form text (required for non-delete operations).
 When DRY-RUN is non-nil, returns a result hash-table with original/preview
 without writing; otherwise writes atomically through the write jail (D-13).
 
+After a successful write, fires a fire-and-forget textDocument/didChange
+notification to the project's alive-lsp instance when one is registered (D-10).
+Notification failures never propagate to the caller.
+
 Returns:
   On dry-run: a hash-table with would_change/original/preview/path/operation
               and optionally parinfer_warning.
@@ -335,7 +344,14 @@ Returns:
                (let ((abs-write (ensure-write-path rel session-root)))
                  (unless abs-write
                    (error "Write path ~A is outside the session root ~A" rel session-root))
-                 (write-file-string-atomically abs-write updated))
+                 (write-file-string-atomically abs-write updated)
+                 ;; D-10: fire-and-forget didChange after the successful write.
+                 (ignore-errors
+                   (let ((lsp-client (find-lsp-client session-root)))
+                     (when lsp-client
+                       (notify-did-change
+                        lsp-client abs-write updated
+                        (bump-uri-version lsp-client (namestring abs-write)))))))
                (values updated nil t))
               (t (values updated nil nil))))
           ;; Non-delete: validate and repair content.
@@ -363,6 +379,13 @@ Returns:
                  (let ((abs-write (ensure-write-path rel session-root)))
                    (unless abs-write
                      (error "Write path ~A is outside the session root ~A" rel session-root))
-                   (write-file-string-atomically abs-write updated))
+                   (write-file-string-atomically abs-write updated)
+                   ;; D-10: fire-and-forget didChange after the successful write.
+                   (ignore-errors
+                     (let ((lsp-client (find-lsp-client session-root)))
+                       (when lsp-client
+                         (notify-did-change
+                          lsp-client abs-write updated
+                          (bump-uri-version lsp-client (namestring abs-write)))))))
                  (values updated parinfer-warning t))
                 (t (values updated parinfer-warning nil)))))))))

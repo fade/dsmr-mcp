@@ -24,7 +24,12 @@
                 #:write-file-string-atomically
                 #:lisp-source-path-p)
   (:import-from #:dsmr-mcp/src/log
-                #:log-event))
+                #:log-event)
+  (:import-from #:dsmr-mcp/src/lsp/client
+                #:find-lsp-client
+                #:bump-uri-version)
+  (:import-from #:dsmr-mcp/src/lsp/document
+                #:notify-did-change))
 
 (in-package #:dsmr-mcp/src/tools/fs-write-file)
 
@@ -104,6 +109,15 @@ Lisp source file ~A. Use lisp-edit-form for structural edits." (namestring pn)))
         (handler-case
             (progn
               (write-file-string-atomically pn content)
+              ;; D-10: fire-and-forget didChange after successful write.
+              ;; The ignore-errors wrapper ensures a notification failure (alive-lsp
+              ;; not running, no registered client) never fails the edit tool call.
+              (ignore-errors
+                (let ((lsp-client (find-lsp-client root)))
+                  (when lsp-client
+                    (notify-did-change
+                     lsp-client pn content
+                     (bump-uri-version lsp-client (namestring pn))))))
               (result id
                       (make-ht "success" t
                                "content" (text-content
