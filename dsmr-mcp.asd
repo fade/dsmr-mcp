@@ -25,6 +25,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "bordeaux-threads"
                "eclector"
                "hunchentoot"
+               "flexi-streams"
                "log4cl"
                "slynk-client"
                "dsmr-mcp/src/main"
@@ -73,7 +74,17 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/tools/inspect-restart"
                "dsmr-mcp/src/tools/inspect-condition"
                "dsmr-mcp/src/tools/pool-status"
-               "dsmr-mcp/src/tools/pool-kill-worker")
+               "dsmr-mcp/src/tools/pool-kill-worker"
+               "dsmr-mcp/src/notify"
+               "dsmr-mcp/src/transport/tcp"
+               "dsmr-mcp/src/transport/http"
+               "dsmr-mcp/src/lsp/client"
+               "dsmr-mcp/src/lsp/document"
+               "dsmr-mcp/src/lsp/bridge"
+               "dsmr-mcp/src/tools/lsp-completions"
+               "dsmr-mcp/src/tools/lsp-hover"
+               "dsmr-mcp/src/tools/lsp-diagnostics"
+               "dsmr-mcp/src/tools/lsp-code-actions")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"
@@ -125,7 +136,17 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/code-intelligence/code-describe-test"
                "dsmr-mcp/tests/code-intelligence/code-find-refs-test"
                "dsmr-mcp/tests/code-intelligence/load-system-test"
-               "dsmr-mcp/tests/code-intelligence/run-tests-test")
+               "dsmr-mcp/tests/code-intelligence/run-tests-test"
+               "dsmr-mcp/tests/notify/notify-test"
+               "dsmr-mcp/tests/attach/call-lock-test"
+               "dsmr-mcp/tests/transport/tcp-test"
+               "dsmr-mcp/tests/transport/http-test"
+               "dsmr-mcp/tests/transport/transport-parity-test"
+               "dsmr-mcp/tests/transport/bridge-test"
+               "dsmr-mcp/tests/support/lsp-mock"
+               "dsmr-mcp/tests/lsp/client-test"
+               "dsmr-mcp/tests/lsp/document-test"
+               "dsmr-mcp/tests/lsp/bridge-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
@@ -144,3 +165,29 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                             (setf any-failed t))))
                       (when any-failed
                         (error "dsmr-mcp/tests: one or more parachute tests failed.")))))
+
+;;; ---------------------------------------------------------------------------
+;;; Bridge binary: standalone stdio<->TCP proxy for stdio-only MCP clients.
+;;;
+;;; Produces bin/dsmr-mcp-bridge via (asdf:make :dsmr-mcp-bridge).
+;;; The bridge is a Lisp-only executable so the client machine needs no
+;;; Python runtime.  Per-platform CI artefacts are a later concern;
+;;; today the operator builds locally with `make bridge`.
+;;;
+;;; Build-operation note: the string form "program-op" is the CL Cookbook
+;;; recommended style for ASDF >= 3.1; if it fails with "operation not found"
+;;; on an older ASDF, replace with the symbol form 'asdf:program-op.
+;;; ---------------------------------------------------------------------------
+
+(asdf:defsystem "dsmr-mcp-bridge"
+  :class :package-inferred-system
+  :description "stdio<->TCP bridge binary for MCP clients that only speak stdio."
+  :author "Brian O'Reilly <fade@deepsky.com>"
+  :license "AGPL-3.0-or-later"
+  :version "0.1.0"
+  :depends-on ("usocket"
+               "bordeaux-threads"
+               "dsmr-mcp-bridge/scripts/stdio-tcp-bridge")
+  :build-operation "program-op"
+  :build-pathname "bin/dsmr-mcp-bridge"
+  :entry-point "dsmr-mcp-bridge/scripts/stdio-tcp-bridge:main")
