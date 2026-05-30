@@ -158,18 +158,25 @@ or clgrep-search for text search." symbol-name))))
                         (text-content
                          (format nil "Symbol ~S not found in image. \
 Try load-system first, or clgrep-search for text search." symbol-name)))
-               (make-ht "name"    (map 'string #'identity symbol-name)
-                        "type"    ""
-                        "arglist" (or (and (stringp args-text)
-                                          (plusp (length args-text))
-                                          (map 'string #'identity args-text))
-                                     "()")
-                        "doc"     (or (and (stringp desc-text)
-                                           (plusp (length desc-text))
-                                           (map 'string #'identity desc-text))
-                                     "")
-                        "path"    ""
-                        "line"    0))))))))
+               (let* ((arglist (or (and (stringp args-text)
+                                        (plusp (length args-text))
+                                        (map 'string #'identity args-text))
+                                   "()"))
+                      (doc     (or (and (stringp desc-text)
+                                        (plusp (length desc-text))
+                                        (map 'string #'identity desc-text))
+                                   ""))
+                      (summary (with-output-to-string (s)
+                                 (format s "~A ~A~%" symbol-name arglist)
+                                 (when (plusp (length doc))
+                                   (format s "~%~A" doc)))))
+                 (make-ht "content" (text-content summary)
+                          "name"    (map 'string #'identity symbol-name)
+                          "type"    ""
+                          "arglist" arglist
+                          "doc"     doc
+                          "path"    ""
+                          "line"    0)))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; tool-handle method
