@@ -15,7 +15,6 @@
 ;;;;   {{copyright}}    — copyright holder (name or org)
 ;;;;   {{year}}         — copyright year (e.g. 2026)
 ;;;;   {{license-body}} — full text of the chosen license
-;;;;   {{parent-prompts}} — relative path from <dest>/<name>/ back to prompts/
 
 (defpackage #:dsmr-mcp/src/project-scaffold-templates
   (:use #:cl)
@@ -28,6 +27,7 @@
            #:*claude-md-template*
            #:*readme-template*
            #:*gitignore-template*
+           #:*prompt-template*
            #:*license-template*
            #:license-body-for-spdx))
 
@@ -101,23 +101,23 @@ package-inferred-system + Parachute convention of dsmr-mcp itself.")
 
 (defun show-help ()
   \"Print usage information and exit.\"
-  (format t \"{{name}} v~A~%%~%\" *version*)
-  (format t \"Usage: {{name}} [options]~%%~%\")
-  (format t \"Options:~%%\")
-  (format t \"  --daemon   Run headless in the background~%%\")
-  (format t \"  --dev      Start with Slynk dev listener (SLYNK_PORT, SLYNK_HOST)~%%\")
-  (format t \"  --version  Print version and exit~%%\")
-  (format t \"  --help     Show this message~%%\"))
+  (format t \"{{name}} v~A~%~%\" *version*)
+  (format t \"Usage: {{name}} [options]~%~%\")
+  (format t \"Options:~%\")
+  (format t \"  --daemon   Run headless in the background~%\")
+  (format t \"  --dev      Start with Slynk dev listener (SLYNK_PORT, SLYNK_HOST)~%\")
+  (format t \"  --version  Print version and exit~%\")
+  (format t \"  --help     Show this message~%\"))
 
 (defun run-foreground ()
   \"Foreground run mode. Replace this with your application logic.\"
-  (format t \"{{name}}: running in foreground mode~%%\")
+  (format t \"{{name}}: running in foreground mode~%\")
   ;; TODO: add foreground run logic here.
   )
 
 (defun run-daemon ()
   \"Headless daemon mode. Replace this with your background logic.\"
-  (format t \"{{name}}: running in daemon mode~%%\")
+  (format t \"{{name}}: running in daemon mode~%\")
   ;; TODO: add daemon/background logic here.
   )
 
@@ -129,7 +129,7 @@ package-inferred-system + Parachute convention of dsmr-mcp itself.")
         (host (or (uiop:getenv \"SLYNK_HOST\") \"127.0.0.1\")))
     (asdf:load-system :slynk)
     (uiop:symbol-call :slynk :create-server :port port :interface host :dont-close t)
-    (format t \"{{name}}: Slynk listening on ~A:~A~%%\" host port)
+    (format t \"{{name}}: Slynk listening on ~A:~A~%\" host port)
     ;; Fall through to foreground run so the process stays alive.
     (run-foreground)))
 
@@ -140,7 +140,7 @@ package-inferred-system + Parachute convention of dsmr-mcp itself.")
       (cond ((string= arg \"--daemon\")  (setf mode :daemon))
             ((string= arg \"--dev\")     (setf mode :dev))
             ((string= arg \"--version\")
-             (format t \"{{name}} v~A~%%\" *version*)
+             (format t \"{{name}} v~A~%\" *version*)
              (return-from main 0))
             ((string= arg \"--help\")
              (show-help)
@@ -338,7 +338,7 @@ adds its own dev-init.lisp hook.")
 (defparameter *agents-md-template*
   "# Repository Guidelines
 
-@{{parent-prompts}}/repl-driven-development.md
+@prompts/repl-driven-development.md
 
 ## Project: {{name}}
 
@@ -396,7 +396,7 @@ Encodes the dep-preference hierarchy and references the copied prompt.")
 (defparameter *claude-md-template*
   "# CLAUDE.md
 
-@{{parent-prompts}}/repl-driven-development.md
+@prompts/repl-driven-development.md
 
 ## Project: {{name}}
 
@@ -499,6 +499,29 @@ bin/
 *.pid
 "
   "Template for the generated project's .gitignore.")
+
+;;; ---------------------------------------------------------------------------
+;;; REPL-driven-development prompt template (D-12)
+;;;
+;;; Read at load time from the dsmr-mcp source tree rather than inlined as an
+;;; escaped Lisp string: the prompt is markdown full of JSON examples (and thus
+;;; double-quotes), and keeping it as a real .md sidecar means it stays editable
+;;; and lint-able as markdown.  asdf:system-relative-pathname resolves against
+;;; the source directory, so an edit to the .md is picked up on the next load
+;;; (no stale-fasl coupling that a read-time #. would introduce).  plan-scaffold
+;;; copies the rendered result into every scaffolded project's own prompts/ dir,
+;;; so generated projects are self-contained (no parent-pointing @-include).
+;;; ---------------------------------------------------------------------------
+
+(defparameter *prompt-template*
+  (uiop:read-file-string
+   (asdf:system-relative-pathname
+    "dsmr-mcp" "templates/repl-driven-development.md"))
+  "Template for the generated project's prompts/repl-driven-development.md (D-12).
+A dsmr-discipline REPL-driven-development guide reframed for the scaffolded
+project; {{name}} and {{spdx}} are substituted by plan-scaffold.  Distinct from
+dsmr-mcp's own prompts/repl-driven-development.md seed (D-11), which is the
+self-referential version.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; LICENSE template (placeholder — full body injected from license-body-for-spdx)

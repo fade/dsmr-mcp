@@ -22,13 +22,13 @@
                 #:*claude-md-template*
                 #:*readme-template*
                 #:*gitignore-template*
+                #:*prompt-template*
                 #:*license-template*
                 #:license-body-for-spdx)
   (:export #:validate-project-name
            #:validate-destination
            #:validate-text-field
            #:render-template
-           #:compute-parent-prompts-path
            #:plan-scaffold
            #:invalid-argument-error
            #:invalid-argument-field
@@ -147,30 +147,6 @@ cl-ppcre's :simple-calls replacement callback."
    :simple-calls t))
 
 ;;; ---------------------------------------------------------------------------
-;;; Path math helpers
-;;; ---------------------------------------------------------------------------
-
-(defun compute-parent-prompts-path (destination)
-  "Return the relative path from DESTINATION/<name> back to <root>/prompts.
-DESTINATION is a slash-separated relative directory (e.g. \"scaffolds\",
-\"work/samples\"). The returned path goes up by one '..' for every real
-path segment in DESTINATION plus one for the project directory itself,
-then descends into 'prompts'.
-
-Empty segments and '.' segments are skipped when counting depth."
-  (let* ((raw-segments (uiop:split-string destination :separator "/"))
-         (segments (remove-if (lambda (s)
-                                (or (zerop (length s))
-                                    (string= s ".")))
-                              raw-segments))
-         (depth (1+ (length segments)))
-         (ups (with-output-to-string (s)
-                (dotimes (i depth)
-                  (declare (ignore i))
-                  (write-string "../" s)))))
-    (concatenate 'string ups "prompts")))
-
-;;; ---------------------------------------------------------------------------
 ;;; Manifest builder
 ;;; ---------------------------------------------------------------------------
 
@@ -182,9 +158,13 @@ plan-scaffold assumes its arguments are already normalized strings.
 
 The full D-17 file set is emitted: <name>.asd, src/main.lisp,
 tests/main-test.lisp, build.sh, scripts/dev-boot.sh, AGENTS.md, CLAUDE.md,
-README.md, .gitignore, LICENSE, prompts/repl-driven-development.md."
-  (let* ((parent-prompts (compute-parent-prompts-path destination))
-         (spdx           (or license "AGPL-3.0-or-later"))
+README.md, .gitignore, LICENSE, prompts/repl-driven-development.md.
+
+DESTINATION is accepted for caller symmetry with write-scaffold but is not used
+here: the prompt is copied into the project's own prompts/ dir, so no path back
+to a parent prompts/ directory is computed."
+  (declare (ignore destination))
+  (let* ((spdx           (or license "AGPL-3.0-or-later"))
          (raw-license-body (license-body-for-spdx spdx))
          (license-body   (or raw-license-body
                              (format nil "License: ~A~%See: https://spdx.org/licenses/~A.html~%"
@@ -196,9 +176,7 @@ README.md, .gitignore, LICENSE, prompts/repl-driven-development.md."
                      ("spdx"          . ,spdx)
                      ("copyright"     . ,(or copyright author "Unknown"))
                      ("year"          . ,(or year "2026"))
-                     ("license-body"  . ,license-body)
-                     ("parent-prompts" . ,parent-prompts)))
-         (render (lambda (tpl) (render-template tpl bindings))))
+                     ("license-body"  . ,license-body))))
     ;; Render the license body with copyright/year substitutions
     (let ((bindings-with-rendered-license
            (cons (cons "license-body" (render-template license-body bindings))
@@ -214,4 +192,6 @@ README.md, .gitignore, LICENSE, prompts/repl-driven-development.md."
          (cons "CLAUDE.md"               (funcall render2 *claude-md-template*))
          (cons "README.md"               (funcall render2 *readme-template*))
          (cons ".gitignore"              (funcall render2 *gitignore-template*))
+         (cons "prompts/repl-driven-development.md"
+                                         (funcall render2 *prompt-template*))
          (cons "LICENSE"                 (funcall render2 *license-template*)))))))

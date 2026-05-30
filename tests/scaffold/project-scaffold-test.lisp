@@ -164,7 +164,32 @@
     (true (find "CLAUDE.md" keys :test #'string=) "CLAUDE.md missing")
     (true (find "README.md" keys :test #'string=) "README.md missing")
     (true (find ".gitignore" keys :test #'string=) ".gitignore missing")
+    (true (find "prompts/repl-driven-development.md" keys :test #'string=)
+          "prompts/repl-driven-development.md missing (D-12: self-contained prompt)")
     (true (find "LICENSE" keys :test #'string=) "LICENSE missing")))
+
+(define-test scaffold-copies-prompt-into-tree
+  "The scaffold bakes the dsmr-discipline prompt into the project itself (D-12),
+so the generated CLAUDE.md/AGENTS.md @-include resolves locally with no
+parent-pointing path."
+  (let* ((manifest (plan-scaffold :name "promptful"
+                                  :description "prompt test"
+                                  :author "Tester"
+                                  :license "AGPL-3.0-or-later"
+                                  :copyright "Tester"
+                                  :year "2026"
+                                  :destination "scaffolds"))
+         (prompt (cdr (assoc "prompts/repl-driven-development.md" manifest
+                             :test #'string=)))
+         (claude (cdr (assoc "CLAUDE.md" manifest :test #'string=))))
+    (true prompt "prompt entry missing from manifest")
+    ;; The copied prompt carries the dsmr biases, not a bare stub.
+    (true (search "DSMR biases" prompt) "prompt missing the conventions section")
+    (false (search "{{name}}" prompt) "prompt has an unrendered placeholder")
+    ;; CLAUDE.md points at the project-local prompt, never a parent path.
+    (true (search "@prompts/repl-driven-development.md" claude)
+          "CLAUDE.md @-include is not project-local")
+    (false (search ".." claude) "CLAUDE.md still contains a parent-pointing path")))
 
 ;;; --- write-scaffold: outside-root jail rejection (T-11-02) ------------------
 
@@ -200,12 +225,6 @@
 (define-test scaffold-e2e-load-and-smoke
   "A fresh scaffold load-systems clean AND its Parachute smoke test passes."
   (with-temp-project-root (session root)
-    ;; Provide a prompts/ stub so the generated CLAUDE.md @-include resolves.
-    (let ((prompts-dir (merge-pathnames "prompts/" root)))
-      (ensure-directories-exist prompts-dir)
-      (with-open-file (s (merge-pathnames "repl-driven-development.md" prompts-dir)
-                         :direction :output :if-exists :supersede)
-        (write-string "stub" s)))
     (let* ((result (write-scaffold :session-root root
                                    :name "e2e-smoke"
                                    :description "e2e smoke test project"
@@ -220,6 +239,11 @@
       (true (uiop:directory-exists-p target-dir)
             "scaffold target directory was not created")
       (true (probe-file asd-path) "generated .asd not found")
+      ;; The project is self-contained: the prompt the agent docs @-include is
+      ;; written into the tree, no session-root stub required (D-12).
+      (true (probe-file (merge-pathnames "prompts/repl-driven-development.md"
+                                         target-dir))
+            "generated project is missing its own prompts/ copy")
       (asdf:load-asd asd-path)
       (unwind-protect
            (progn
