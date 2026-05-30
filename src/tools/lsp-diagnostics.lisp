@@ -18,7 +18,7 @@
 ;;;; edit. Only set load=true when you intentionally want to update the
 ;;;; alive-lsp image's compiled definitions.
 ;;;;
-;;;; NOTE (Pitfall 5 from RESEARCH.md): an empty messages list does not guarantee
+;;;; NOTE: an empty messages list does not guarantee
 ;;;; clean compilation. Some SBCL compiler errors lack source locations and are
 ;;;; silently dropped by alive-lsp's send-message filter.
 
