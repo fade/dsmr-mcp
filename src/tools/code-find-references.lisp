@@ -124,7 +124,8 @@ RAW is either:
                 (text-content (format nil "~@[~A: ~]~A" name hint)))))
     ;; NIL — no references (valid, not an error).
     ((null raw)
-     (make-ht "references" #()))
+     (make-ht "content"    (text-content "No references found.")
+              "references" #()))
     ;; List of reference plists.
     ((and (listp raw) (or (null raw) (listp (car raw))))
      (let* ((refs (mapcar (lambda (ref)
@@ -132,8 +133,17 @@ RAW is either:
                                      "line"     (or (getf ref :line) 0)
                                      "caller"   (or (getf ref :caller) "")
                                      "relation" (or (getf ref :relation) "")))
-                          raw)))
-       (make-ht "references" (coerce refs 'simple-vector))))
+                          raw))
+            (summary (with-output-to-string (s)
+                       (format s "~D reference~:P:~%" (length raw))
+                       (dolist (ref raw)
+                         (format s "  ~A:~A [~A] ~A~%"
+                                 (or (getf ref :path) "")
+                                 (or (getf ref :line) 0)
+                                 (or (getf ref :relation) "")
+                                 (or (getf ref :caller) ""))))))
+       (make-ht "content"    (text-content summary)
+                "references" (coerce refs 'simple-vector))))
     ;; Unexpected shape.
     (t
      (log-event :warn "code-find-references.unexpected-result"

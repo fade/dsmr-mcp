@@ -134,8 +134,16 @@ RAW is either:
                             (make-ht "path" (or (getf loc :path) "")
                                      "line" (or (getf loc :line) 0)
                                      "kind" (or (getf loc :kind) "")))
-                          raw)))
-       (make-ht "locations" (coerce locs 'simple-vector))))
+                          raw))
+            (summary (with-output-to-string (s)
+                       (format s "~D definition~:P:~%" (length raw))
+                       (dolist (loc raw)
+                         (format s "  ~A:~A [~A]~%"
+                                 (or (getf loc :path) "")
+                                 (or (getf loc :line) 0)
+                                 (or (getf loc :kind) ""))))))
+       (make-ht "content"   (text-content summary)
+                "locations" (coerce locs 'simple-vector))))
     ;; Unexpected shape — log and return error.
     (t
      (log-event :warn "code-find.unexpected-result" "type" (princ-to-string (type-of raw)))

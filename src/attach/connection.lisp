@@ -98,6 +98,35 @@ Signals a plain error for a non-empty string that contains no colon."
 Used by with-attach-dispatch to gate the attached eval path."
   (and (stringp attach-string) (plusp (length attach-string))))
 
+;;; Form-tree wire-string normalisation -------------------------------------
+;;;
+;;; A SIMPLE-BASE-STRING anywhere inside a form sent to slynk-client prints,
+;;; under the rex encoder's *print-readably* t, as #A((N) BASE-CHAR ...) — an
+;;; array literal longer than the byte count Slynk's length prefix was computed
+;;; from.  The remote reader hits EOF mid-form and drops the connection, which
+;;; surfaces as slime-network-error.  process-json-line normalises strings that
+;;; arrive over the wire, but a form builder can re-introduce a base-string from
+;;; a source the wire boundary never sees — e.g. (namestring project-root),
+;;; which is a SIMPLE-BASE-STRING on SBCL for an ASCII path.  Coercing every
+;;; embedded string to element-type CHARACTER here, at the single funnel every
+;;; attached form passes through, keeps any base-string out of the wire
+;;; regardless of which builder produced the form or where its strings came
+;;; from.  The failure only manifests against a real external image (an
+;;; in-process eval shares one reader), so it escapes the in-process fixture.
+(defun %coerce-wire-strings (form)
+  "Return FORM with every embedded string coerced to element-type CHARACTER.
+Conses are rebuilt structurally; strings are coerced; every other atom passes
+through unchanged.  A SIMPLE-BASE-STRING is the failure mode; a string already
+of element-type CHARACTER is returned as-is."
+  (cond
+    ((consp form)
+     (cons (%coerce-wire-strings (car form))
+           (%coerce-wire-strings (cdr form))))
+    ((and (stringp form)
+          (not (typep form '(simple-array character (*)))))
+     (map '(simple-array character (*)) #'identity form))
+    (t form)))
+
 ;;; Bounded slime-eval -------------------------------------------------------
 ;;;
 ;;; slynk-client:slime-eval waits for the reply unconditionally, so a reply the
@@ -115,8 +144,13 @@ Used by with-attach-dispatch to gate the attached eval path."
 (defun bounded-slime-eval (form conn &key (timeout 30))
   "Evaluate FORM on CONN, bounding the wait to TIMEOUT seconds.  Returns the
 remote result, or signals slynk-client:slime-network-error if no reply arrives
-within TIMEOUT."
-  (let ((done-lock (make-lock "dsmr-bounded-slime-eval"))
+within TIMEOUT.
+
+FORM is passed through %coerce-wire-strings first so a SIMPLE-BASE-STRING
+embedded by any form builder (e.g. a pathname namestring) cannot reach the rex
+encoder and corrupt the length-prefixed message."
+  (let ((form      (%coerce-wire-strings form))
+        (done-lock (make-lock "dsmr-bounded-slime-eval"))
         (done      (make-condition-variable))
         (available nil)
         (result    nil))
