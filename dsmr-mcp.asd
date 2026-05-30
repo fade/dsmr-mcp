@@ -88,7 +88,9 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/project-scaffold-templates"
                "dsmr-mcp/src/project-scaffold-core"
                "dsmr-mcp/src/project-scaffold"
-               "dsmr-mcp/src/tools/project-scaffold")
+               "dsmr-mcp/src/tools/project-scaffold"
+               "dsmr-mcp/src/clhs"
+               "dsmr-mcp/src/tools/clhs-lookup")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"
