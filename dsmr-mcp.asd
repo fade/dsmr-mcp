@@ -79,7 +79,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/transport/tcp"
                "dsmr-mcp/src/transport/http"
                "dsmr-mcp/src/lsp/client"
-               "dsmr-mcp/src/lsp/document")
+               "dsmr-mcp/src/lsp/document"
+               "dsmr-mcp/src/lsp/bridge")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"
