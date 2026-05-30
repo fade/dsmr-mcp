@@ -671,7 +671,11 @@ Uses CL-USER symbol hygiene; no loop; coerces all strings."
           (s-limit     (cs "%DSMR-CODE-LIM"))
           (s-i         (cs "%DSMR-CODE-I"))
           (s-ch        (cs "%DSMR-CODE-CH"))
-          (s-nl        (cs "%DSMR-CODE-NL")))
+          (s-nl        (cs "%DSMR-CODE-NL"))
+          (s-pn-tr     (cs "%DSMR-CODE-PNTR"))
+          (s-pn-res    (cs "%DSMR-CODE-PNRES"))
+          (s-rdir      (cs "%DSMR-CODE-RDIR"))
+          (s-prel      (cs "%DSMR-CODE-PREL")))
       `(let* ((,s-pkg  (and ,package-name (find-package ,package-name)))
               (,s-sym  (let ((*package* (or ,s-pkg (find-package :common-lisp-user)))
                              (*read-eval* nil)
@@ -740,21 +744,21 @@ Uses CL-USER symbol hygiene; no loop; coerces all strings."
                          (,s-path
                            (and ,s-pn
                              (ignore-errors
-                               (let* ((%pn-tr  (translate-logical-pathname ,s-pn))
-                                      (%pn-res (or (handler-case (truename %pn-tr)
-                                                     (file-error () nil))
-                                                   %pn-tr)))
+                               (let* ((,s-pn-tr  (translate-logical-pathname ,s-pn))
+                                      (,s-pn-res (or (handler-case (truename ,s-pn-tr)
+                                                       (file-error () nil))
+                                                     ,s-pn-tr)))
                                  (map 'string #'identity
                                       (if ,root-namestring
-                                          (let* ((%rdir (uiop:ensure-directory-pathname
-                                                         ,root-namestring))
-                                                 (%rel  (ignore-errors
-                                                          (uiop:enough-pathname
-                                                           %pn-res %rdir))))
-                                            (if %rel
-                                                (uiop:native-namestring %rel)
-                                                (namestring %pn-tr)))
-                                          (namestring %pn-tr))))))))
+                                          (let* ((,s-rdir (uiop:ensure-directory-pathname
+                                                           ,root-namestring))
+                                                 (,s-prel (ignore-errors
+                                                            (uiop:enough-pathname
+                                                             ,s-pn-res ,s-rdir))))
+                                            (if ,s-prel
+                                                (uiop:native-namestring ,s-prel)
+                                                (namestring ,s-pn-tr)))
+                                          (namestring ,s-pn-tr))))))))
                     (when (and ,s-path ,s-line)
                       (push (list :path ,s-path :line ,s-line
                                   :kind (map 'string #'identity
@@ -828,7 +832,13 @@ or a typed not-found plist. Uses CL-USER symbol hygiene; no loop; coerces string
           (s-limit     (cs "%DSMR-CODE-RLIM"))
           (s-i         (cs "%DSMR-CODE-RI"))
           (s-ch        (cs "%DSMR-CODE-RCH"))
-          (s-nl        (cs "%DSMR-CODE-RNL")))
+          (s-nl        (cs "%DSMR-CODE-RNL"))
+          (s-pn-tr     (cs "%DSMR-CODE-RPNTR"))
+          (s-pn-res    (cs "%DSMR-CODE-RPNRES"))
+          (s-rdir      (cs "%DSMR-CODE-RRDIR"))
+          (s-prel      (cs "%DSMR-CODE-RPREL"))
+          (s-pn-tr2    (cs "%DSMR-CODE-RPNTR2"))
+          (s-pn-res2   (cs "%DSMR-CODE-RPNRES2")))
       `(let* ((,s-pkg    (and ,package-name (find-package ,package-name)))
               (,s-sym    (let ((*package* (or ,s-pkg (find-package :common-lisp-user)))
                                (*read-eval* nil)
@@ -893,21 +903,21 @@ or a typed not-found plist. Uses CL-USER symbol hygiene; no loop; coerces string
                                (,s-path
                                  (and ,s-pn
                                    (ignore-errors
-                                     (let* ((%pn-tr  (translate-logical-pathname ,s-pn))
-                                            (%pn-res (or (handler-case (truename %pn-tr)
-                                                           (file-error () nil))
-                                                         %pn-tr)))
+                                     (let* ((,s-pn-tr  (translate-logical-pathname ,s-pn))
+                                            (,s-pn-res (or (handler-case (truename ,s-pn-tr)
+                                                             (file-error () nil))
+                                                           ,s-pn-tr)))
                                        (map 'string #'identity
                                             (if ,root-namestring
-                                                (let* ((%rdir (uiop:ensure-directory-pathname
-                                                               ,root-namestring))
-                                                       (%rel  (ignore-errors
-                                                                (uiop:enough-pathname
-                                                                 %pn-res %rdir))))
-                                                  (if %rel
-                                                      (uiop:native-namestring %rel)
-                                                      (namestring %pn-tr)))
-                                                (namestring %pn-tr)))))))
+                                                (let* ((,s-rdir (uiop:ensure-directory-pathname
+                                                                 ,root-namestring))
+                                                       (,s-prel (ignore-errors
+                                                                  (uiop:enough-pathname
+                                                                   ,s-pn-res ,s-rdir))))
+                                                  (if ,s-prel
+                                                      (uiop:native-namestring ,s-prel)
+                                                      (namestring ,s-pn-tr)))
+                                                (namestring ,s-pn-tr)))))))
                                (,s-cstr
                                  ;; Simplified caller formatting inline.
                                  (when ,s-cname
@@ -937,11 +947,11 @@ or a typed not-found plist. Uses CL-USER symbol hygiene; no loop; coerces string
                                            (uiop:ensure-directory-pathname ,root-namestring))
                                           ;; Compare against the absolute path for filtering,
                                           ;; even when the displayed path is relative.
-                                          (let* ((%pn-tr2 (translate-logical-pathname ,s-pn))
-                                                 (%pn-res2 (or (handler-case (truename %pn-tr2)
-                                                                 (file-error () nil))
-                                                               %pn-tr2)))
-                                            (namestring %pn-res2)))))
+                                          (let* ((,s-pn-tr2 (translate-logical-pathname ,s-pn))
+                                                 (,s-pn-res2 (or (handler-case (truename ,s-pn-tr2)
+                                                                   (file-error () nil))
+                                                                 ,s-pn-tr2)))
+                                            (namestring ,s-pn-res2)))))
                             (let ((,s-key (format nil "~A:~A:~A:~A"
                                                   ,s-path ,s-line ,s-rel
                                                   (or ,s-cstr ""))))
