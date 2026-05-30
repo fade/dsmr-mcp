@@ -58,6 +58,9 @@
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht
                 #:rpc-error)
+  (:import-from #:dsmr-mcp/src/lsp/client
+                #:start-lsp-cleanup
+                #:stop-lsp-cleanup)
   (:import-from #:bordeaux-threads
                 #:make-lock
                 #:with-lock-held
@@ -942,8 +945,9 @@ never another session's."
     (setf *http-server* acceptor)
     (setf *http-server-port* (hunchentoot:acceptor-port acceptor))
 
-    ;; Start the idle-eviction background thread.
+    ;; Start idle-eviction background threads for HTTP sessions and LSP clients.
     (%start-session-cleanup)
+    (start-lsp-cleanup)
 
     (log-event :info "http.start"
                "host" host
@@ -990,6 +994,7 @@ otherwise leaves the Slynk peer without a FIN)."
   (when (http-server-running-p)
     (log-event :info "http.stop" "port" *http-server-port*)
     (%stop-session-cleanup)
+    (stop-lsp-cleanup)
     ;; Snapshot live sessions under *sessions-lock*, then release before
     ;; touching any per-session lock.  delete-session and the cleanup sweep
     ;; release *sessions-lock* before reaching for sse-channel-lock; this

@@ -4,40 +4,43 @@
 ;;;; LSP-02: four MCP verb implementations that delegate to alive-lsp.
 ;;;; LSP-04: in-process Eclector fallback when alive-lsp is unavailable.
 ;;;;
-;;;; Verb → LSP method mapping (RESEARCH.md Domain 5):
+;;;; Verb → LSP method mapping:
 ;;;;   completions   → textDocument/completion
 ;;;;   hover         → textDocument/hover
 ;;;;   diagnostics   → $/alive/tryCompile (default) or $/alive/compile (:load-p)
-;;;;   code-actions  → synthesized discover-then-apply menu (D-01/D-02/D-04)
+;;;;   code-actions  → synthesized discover-then-apply menu
 ;;;;                   backed by: $/alive/macroexpand1, $/alive/macroexpand,
 ;;;;                              $/alive/unexportSymbol, textDocument/rangeFormatting,
 ;;;;                              $/alive/getPackageForPosition,
 ;;;;                              $/alive/surroundingFormBounds,
 ;;;;                              $/alive/topFormBounds, $/alive/symbol
 ;;;;
-;;;; Fallback policy (D-12):
+;;;; Fallback policy: when alive-lsp is unavailable —
 ;;;;   diagnostics  → degraded-diagnostics (Eclector paren/reader check)
 ;;;;   completions/hover/code-actions → lsp-unavailable error envelope
 ;;;;
-;;;; Security (T-lsp-bridge-01): callers must resolve file_path through
-;;;; allowed-read-path before passing it here. The bridge receives only
-;;;; pre-validated paths.
+;;;; Security: callers must resolve file_path through allowed-read-path before
+;;;; passing it here. The bridge receives only pre-validated paths.
 ;;;;
-;;;; Position semantics (RESEARCH.md Domain 4): 0-based {line, character}
-;;;; integers. The key is "character" (not "col").
+;;;; Position semantics: 0-based {line, character} integers.
+;;;; The column key is "character" (not "col") — this matches the LSP spec and
+;;;; alive-lsp's own position structures.
 ;;;;
-;;;; rangeFormatting serialization (RESEARCH.md Pitfall 6): concurrent
-;;;; rangeFormatting calls to the same client are serialized via a per-client
-;;;; formatting lock (stored in the tool layer, accessed via *formatting-locks*).
+;;;; rangeFormatting serialization: concurrent rangeFormatting calls to the same
+;;;; client are serialized via a per-client formatting lock in *formatting-locks*.
+;;;; alive-lsp's handle-formatting blocks on a workspace/configuration round-trip
+;;;; before replying; the reader thread answers that server-initiated request
+;;;; automatically, but interleaving two formatting requests on the same session
+;;;; state object corrupts the sequence.
 
 (defpackage #:dsmr-mcp/src/lsp/bridge
   (:use #:cl)
   (:import-from #:dsmr-mcp/src/lsp/client
                 #:lsp-send-request
+                #:lsp-client-project-root
                 #:lsp-connection-lost)
   (:import-from #:dsmr-mcp/src/lsp/document
-                #:path->file-uri
-                #:notify-did-open)
+                #:path->file-uri)
   (:import-from #:dsmr-mcp/src/validate
                 #:scan-parens
                 #:try-reader-check)
@@ -54,7 +57,8 @@
            #:bridge-diagnostics
            #:bridge-code-actions
            #:degraded-diagnostics
-           #:make-lsp-unavailable-envelope))
+           #:make-lsp-unavailable-envelope
+           #:%remove-formatting-lock))
 
 (in-package #:dsmr-mcp/src/lsp/bridge)
 
@@ -63,21 +67,35 @@
 ;;; ---------------------------------------------------------------------------
 
 (defvar *formatting-locks* (make-hash-table :test 'equal)
-  "Hash-table mapping LSP-CLIENT identity (by eq-hash) to a bordeaux-threads lock.
+  "Hash-table mapping LSP-CLIENT project-root string to a bordeaux-threads lock.
 Serializes concurrent textDocument/rangeFormatting calls to the same client.
-The workspace/configuration round-trip inside handle-formatting requires that
-no two formatting requests interleave on the same session state object.")
+alive-lsp's handle-formatting blocks on a workspace/configuration round-trip
+before replying; interleaving two formatting requests on the same session state
+object corrupts the sequence.  Keyed by project-root (a portable, stable string)
+rather than object address so the key survives GC and is CL-implementation neutral.")
 
 (defvar *formatting-locks-lock* (make-lock "formatting-locks-lock")
   "Lock protecting *formatting-locks* for thread-safe read/write.")
 
 (defun %formatting-lock-for (client)
-  "Return (or create) the serialization lock for FORMATTING requests to CLIENT."
-  (let ((key (format nil "~A" (sb-kernel:get-lisp-obj-address client))))
+  "Return (or create) the serialization lock for rangeFormatting requests to CLIENT.
+Keyed by the client's project-root string so the lock is stable across GC and
+portable across CL implementations."
+  (let ((key (let ((root (lsp-client-project-root client)))
+               (if root (namestring root) ""))))
     (with-lock-held (*formatting-locks-lock*)
       (or (gethash key *formatting-locks*)
           (setf (gethash key *formatting-locks*)
                 (make-lock (format nil "lsp-formatting-~A" key)))))))
+
+(defun %remove-formatting-lock (client)
+  "Remove the rangeFormatting serialization lock for CLIENT from *formatting-locks*.
+Called when a client is evicted or shut down to prevent the table growing without
+bound across the server's lifetime."
+  (let ((key (let ((root (lsp-client-project-root client)))
+               (if root (namestring root) ""))))
+    (with-lock-held (*formatting-locks-lock*)
+      (remhash key *formatting-locks*))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Position helpers
@@ -85,7 +103,8 @@ no two formatting requests interleave on the same session state object.")
 
 (defun %make-position (line char)
   "Build a {line, character} LSP Position hash-table (0-based integers).
-The column key is \"character\" per RESEARCH.md position.lisp verification."
+The column key is \"character\" per the LSP spec and alive-lsp's own
+position handling."
   (let ((ht (make-hash-table :test 'equal)))
     (setf (gethash "line"      ht) line
           (gethash "character" ht) char)
@@ -171,7 +190,8 @@ over reader errors). Returns:
    messages: [... LSP-style {severity,location,message} entries ...]}
 
 When text is clean, messages is an empty vector. An empty messages list does not
-guarantee clean compilation (Pitfall 5 from RESEARCH.md applies here too)."
+guarantee clean compilation — alive-lsp catches SBCL errors with source locations;
+this fallback catches only structural paren/reader issues."
   (let* ((paren-result (scan-parens text :base-offset 0))
          (reader-info  (try-reader-check text 0))
          (messages
@@ -217,7 +237,8 @@ Signals LSP-CONNECTION-LOST on wire failure."
   "Delegate textDocument/hover to CLIENT for PATH-STR at LINE/CHAR.
 Returns the result hash-table (contains 'value' key: string or empty string).
 Empty string means no hover available at this position — not an error.
-Never signals when alive-lsp is up (RESEARCH.md Domain 5 hover section).
+Never signals when alive-lsp is up (alive-lsp returns :null rather than an
+error when there is no hover at a given position).
 Signals LSP-CONNECTION-LOST on wire failure."
   (declare (ignore id))
   (let* ((uri    (path->file-uri path-str))
@@ -245,7 +266,7 @@ Signals LSP-CONNECTION-LOST on wire failure."
 (defun bridge-diagnostics (client id path-str &key load-p)
   "Delegate $/alive/tryCompile (or $/alive/compile when LOAD-P is set) to CLIENT.
 PATH-STR is an absolute filesystem path (NOT a file:// URI) — alive-lsp's
-tryCompile/compile handlers expect a raw filesystem path (RESEARCH.md Domain 5).
+tryCompile/compile handlers expect a raw filesystem path, not a URI.
 ID is the MCP request id (unused by the LSP layer; kept for logging).
 
 When LOAD-P is NIL (default): issues $/alive/tryCompile (safe, no evaluation).
@@ -253,9 +274,9 @@ When LOAD-P is T: issues $/alive/compile (loads and evaluates code in the
 alive-lsp image — mutating, opt-in by the agent, documented in tool description).
 
 Returns the result hash-table (contains 'messages' key).
-NOTE (Pitfall 5): an empty messages list does not guarantee clean compilation.
-Some SBCL compiler errors lack source locations and are silently dropped by
-alive-lsp's send-message filter.
+NOTE: an empty messages list does not guarantee clean compilation — some SBCL
+compiler errors lack source locations and are silently dropped by alive-lsp's
+send-message filter.
 Signals LSP-CONNECTION-LOST on wire failure."
   (declare (ignore id))
   (let ((method (if load-p "$/alive/compile" "$/alive/tryCompile"))
@@ -350,25 +371,75 @@ Returns T on success, NIL on failure."
             (gethash "result" result)))
       (error () nil))))
 
+;;; Helpers for CR-01: extract the form text covered by LSP bounds.
+
+(defun %lsp-position-to-offset (text line char)
+  "Convert a 0-based {line, char} LSP position to a character offset in TEXT.
+Returns the character offset, or 0 on failure.
+Scans TEXT line-by-line counting newlines to reach the target line, then adds
+the character column.  Clips to the string length on out-of-range inputs."
+  (let ((len (length text)))
+    (if (zerop line)
+        (min char len)
+        (let ((current-line 0)
+              (offset 0))
+          (loop while (< offset len)
+                do (let ((ch (char text offset)))
+                     (incf offset)
+                     (when (char= ch #\Newline)
+                       (incf current-line)
+                       (when (= current-line line)
+                         (return-from %lsp-position-to-offset
+                           (min (+ offset char) len))))))
+          len))))
+
+(defun %extract-form-text (text bounds)
+  "Extract the substring of TEXT covered by BOUNDS (a cons of start-ht . end-ht).
+Each position hash-table has integer 'line' and 'character' keys (0-based).
+Returns the extracted substring, or NIL when bounds or text are invalid."
+  (when (and text bounds (consp bounds))
+    (let* ((start-ht (car bounds))
+           (end-ht   (cdr bounds)))
+      (when (and (hash-table-p start-ht) (hash-table-p end-ht))
+        (let* ((sl (or (gethash "line"      start-ht) 0))
+               (sc (or (gethash "character" start-ht) 0))
+               (el (or (gethash "line"      end-ht)   0))
+               (ec (or (gethash "character" end-ht)   0))
+               (start-off (%lsp-position-to-offset text sl sc))
+               (end-off   (%lsp-position-to-offset text el ec)))
+          (when (and (<= start-off end-off) (<= end-off (length text)))
+            (subseq text start-off end-off)))))))
+
 (defun %apply-range-format (client path-str bounds)
   "Format the range given by BOUNDS (a cons of start-ht . end-ht) via
 textDocument/rangeFormatting on PATH-STR.
-Serializes with the per-client formatting lock (Pitfall 6 — alive-lsp's
-handle-formatting blocks on workspace/configuration before replying; the Wave-1
-reader thread answers that server-initiated request automatically).
+BOUNDS must be a non-nil cons; returns NIL without calling the server when
+BOUNDS is nil.
+Serializes with the per-client formatting lock — alive-lsp's handle-formatting
+blocks on workspace/configuration before replying; the reader thread answers
+that server-initiated request automatically.
 Returns the result (array of text edit hash-tables), or NIL on failure."
+  (unless (consp bounds)
+    (return-from %apply-range-format nil))
   (let ((fmt-lock (%formatting-lock-for client))
         (uri      (path->file-uri path-str)))
     (with-lock-held (fmt-lock)
       (handler-case
           (let* ((params  (make-hash-table :test 'equal))
                  (td      (make-hash-table :test 'equal))
-                 (options (make-hash-table :test 'equal)))
+                 (options (make-hash-table :test 'equal))
+                 ;; Build a proper LSP Range object {start: ..., end: ...}.
+                 ;; bounds is (start-ht . end-ht); passing the cons directly
+                 ;; would serialize as a JSON array, not an object.
+                 (range   (let ((ht (make-hash-table :test 'equal)))
+                            (setf (gethash "start" ht) (car bounds)
+                                  (gethash "end"   ht) (cdr bounds))
+                            ht)))
             (setf (gethash "uri"          td) uri
                   (gethash "tabSize"      options) 2
                   (gethash "insertSpaces" options) t
                   (gethash "textDocument" params) td
-                  (gethash "range"        params) bounds
+                  (gethash "range"        params) range
                   (gethash "options"      params) options)
             (lsp-send-request client "textDocument/rangeFormatting" params))
         (error () nil)))))
@@ -380,11 +451,11 @@ Returns the result (array of text edit hash-tables), or NIL on failure."
 descriptors. Each descriptor is a hash-table with 'action' (string key) and
 optional context fields ('text', 'package', 'symbol', 'bounds').
 
-Always includes 'format' (textDocument/rangeFormatting is available unconditionally).
-Includes 'macroexpand' when a surrounding form is found (macro expansion attempt
-is always offered; alive-lsp returns the original text when it is not a macro).
-Includes 'remove-from-export' when a symbol is found at the position (the symbol
-may or may not be exported; the apply step will determine that)."
+Includes 'macroexpand' when a surrounding form is found.
+Includes 'format' when a surrounding form is found (rangeFormatting requires
+a valid range; without bounds there is no form to format, so the action is
+omitted rather than sending a null range).
+Includes 'remove-from-export' when a symbol is found at the position."
   (let ((package (or (%get-package-for-position client uri line char) "CL-USER"))
         (bounds  (%get-surrounding-form-bounds client uri line char))
         (symbol  (%get-symbol-at-position client uri line char))
@@ -410,22 +481,23 @@ may or may not be exported; the apply step will determine that)."
                   (gethash "symbol"  action-ht) sym-name
                   (gethash "package" action-ht) package)
             (push action-ht actions)))))
-    ;; Format action: always available (rangeFormatting is always offered).
-    (let ((format-ht (make-hash-table :test 'equal)))
-      (setf (gethash "action" format-ht) "format"
-            (gethash "path"   format-ht) path-str)
-      ;; Include bounds if we found them (for precise range formatting).
-      (when bounds
-        (setf (gethash "bounds" format-ht) bounds))
-      (push format-ht actions))
+    ;; Format action: only offered when bounds are available so that
+    ;; %apply-range-format always receives a valid cons range.  A null
+    ;; range would produce a protocol error from alive-lsp's rangeFormatting
+    ;; handler which expects a proper LSP Range object.
+    (when bounds
+      (let ((format-ht (make-hash-table :test 'equal)))
+        (setf (gethash "action" format-ht) "format"
+              (gethash "path"   format-ht) path-str
+              (gethash "bounds" format-ht) bounds)
+        (push format-ht actions)))
     (coerce (nreverse actions) 'simple-vector)))
-
 
 ;;; Apply mode: dispatch the chosen action.
 
 (defun %apply-action (client path-str action-ht text)
   "Apply the action described by ACTION-HT.
-TEXT is the full file content (used for macroexpand text extraction).
+TEXT is the full file content (used for macroexpand form extraction).
 Returns a result hash-table with 'action' echoed and 'result' filled in."
   (let ((action  (gethash "action"  action-ht))
         (package (or (gethash "package" action-ht) "CL-USER"))
@@ -434,15 +506,10 @@ Returns a result hash-table with 'action' echoed and 'result' filled in."
     (cond
       ;; macroexpand: extract form text from bounds, then expand.
       ((string= action "macroexpand")
-       (let* ((form-text
-                (if (and bounds text
-                         (hash-table-p bounds)
-                         (gethash "start" bounds)
-                         (gethash "end"   bounds))
-                    ;; Try to extract the form text from the file content.
-                    ;; Bounds are line/char positions — use the raw text as fallback.
-                    text
-                    text))
+       (let* (;; Extract only the bounded form text; fall back to full text
+              ;; only when bounds are absent (alive-lsp will handle gracefully).
+              (form-text (or (%extract-form-text text bounds)
+                             (or text "")))
               (expanded (%apply-macroexpand client form-text package)))
          (make-ht "action" "macroexpand" "result" (or expanded ""))))
       ;; remove-from-export: unexport the symbol.

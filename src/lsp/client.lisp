@@ -12,10 +12,10 @@
 ;;;; Never use the :timeout keyword on socket-connect — it sets SO_RCVTIMEO and
 ;;;; causes IO-TIMEOUT on every subsequent read (cl-mcp PR #67 bug).
 ;;;;
-;;;; Spawn stdout-redirect ordering (RESEARCH.md Pitfall 3):
-;;;; alive-lsp's start-server captures *standard-output* before threading.
-;;;; Redirect stdout→stderr during (asdf:load-system "alive-lsp"), restore to
-;;;; sb-sys:*stdout* before (alive/server:start), redirect again after start.
+;;;; Spawn stdout-redirect ordering: alive-lsp's start-server captures
+;;;; *standard-output* before threading.  Redirect stdout→stderr during
+;;;; (asdf:load-system "alive-lsp"), restore to sb-sys:*stdout* before
+;;;; (alive/server:start), redirect again after start returns.
 
 (defpackage #:dsmr-mcp/src/lsp/client
   (:use #:cl)
@@ -52,7 +52,9 @@
            #:*lsp-idle-timeout*
            #:*lsp-startup-timeout*
            #:*lsp-registry*
-           #:*lsp-registry-lock*))
+           #:*lsp-registry-lock*
+           #:start-lsp-cleanup
+           #:stop-lsp-cleanup))
 
 (in-package #:dsmr-mcp/src/lsp/client)
 
@@ -103,7 +105,9 @@ Protected by *LSP-REGISTRY-LOCK*.")
   (write-lock      (make-lock "lsp-write-lock"))
   (reader-thread   nil)
   ;; pending-requests: integer id → (condition-variable . result-cell)
-  ;; result-cell is a list of one element: the result ht or a condition object
+  ;; result-cell is a two-element list: (value errorp)
+  ;; Initial value is (+pending-sentinel+ nil); both fields are written
+  ;; atomically under pending-lock before condition-notify.
   (pending-requests (make-hash-table :test 'eql))
   (pending-lock    (make-lock "lsp-pending-lock"))
   (next-id         1    :type integer)
@@ -114,7 +118,7 @@ Protected by *LSP-REGISTRY-LOCK*.")
   (process-info    nil)                 ; sb-ext:process for spawned children
   (project-root    nil)                 ; project root namestring or pathname
   (%connected      nil  :type boolean)  ; set T after handshake, NIL on disconnect
-  ;; per-URI version counter for textDocument/didChange (Pitfall 4)
+  ;; per-URI version counter for textDocument/didChange
   (uri-versions    (make-hash-table :test 'equal))
   (uri-versions-lock (make-lock "lsp-uri-versions-lock")))
 
@@ -230,7 +234,8 @@ Dispatches known methods to canned replies; unknown requests get a null result."
         (id     (gethash "id"     msg)))
     (cond
       ;; workspace/configuration — alive-lsp sends this during rangeFormatting.
-      ;; Reply with an empty config so the server unblocks (Pitfall 1 / RESEARCH.md).
+      ;; Reply with an empty config so the server unblocks (alive-lsp blocks
+      ;; its formatting handler on this round-trip before replying).
       ((string= method "workspace/configuration")
        (let ((resp (%make-lsp-response id (vector (make-hash-table :test 'equal)))))
          (ignore-errors (%lsp-write-message client resp)))
@@ -467,7 +472,7 @@ Signals SIMPLE-ERROR for LSP protocol error responses."
          (let* ((id   (with-lock-held ((lsp-client-pending-lock client))
                         (incf (lsp-client-next-id client))))
                 (cv   (make-condition-variable :name (format nil "lsp-req-~A" id)))
-                ;; result cell: (value . errorp)
+                ;; result cell: (value errorp)
                 ;; initial value is +pending-sentinel+ to distinguish "not yet
                 ;; delivered" from a legitimate NIL result.
                 (cell (list +pending-sentinel+ nil))
@@ -484,28 +489,28 @@ Signals SIMPLE-ERROR for LSP protocol error responses."
                    (cons cv cell)))
            (unwind-protect
                 (handler-case
-                    (progn
+                    (let ((value nil) (errorp nil))
                       ;; Write the request.
                       (%lsp-write-message client req)
                       ;; Wait for the reader thread to deliver a result.
+                      ;; Read value and errorp while still holding the lock
+                      ;; so the write from %notify-pending is fully visible.
                       (with-lock-held ((lsp-client-pending-lock client))
                         (loop while (eq (car cell) +pending-sentinel+)
                               do (condition-wait cv (lsp-client-pending-lock client)
-                                                 :timeout 120)))
-                      ;; Inspect the result cell.
-                      (let ((value  (car cell))
-                            (errorp (cadr cell)))
-                        (cond
-                          ;; Still sentinel after timeout — treat as wire loss.
-                          ((eq value +pending-sentinel+)
-                           (error 'lsp-connection-lost :reason "response-timeout"))
-                          ;; Error cell — re-signal.
-                          (errorp
-                           (if (typep value 'lsp-connection-lost)
-                               (error value)
-                               (error value)))
-                          ;; Success.
-                          (t value))))
+                                                 :timeout 120))
+                        ;; Read inside the lock before releasing.
+                        (setf value  (car cell)
+                              errorp (cadr cell)))
+                      (cond
+                        ;; Still sentinel after timeout — treat as wire loss.
+                        ((eq value +pending-sentinel+)
+                         (error 'lsp-connection-lost :reason "response-timeout"))
+                        ;; Error cell — re-signal.
+                        (errorp
+                         (error value))
+                        ;; Success.
+                        (t value)))
                   (end-of-file ()
                     (error 'lsp-connection-lost :reason "eof"))
                   (stream-error (e)
@@ -552,7 +557,8 @@ Returns NIL. Signals LSP-CONNECTION-LOST on wire failure."
   "Increment and return the version counter for URI on CLIENT.
 The counter starts at 1 on first use and increments on each call.
 Used by document sync to populate the monotonic version field in
-textDocument/didChange (RESEARCH.md Pitfall 4)."
+textDocument/didChange — alive-lsp requires a strictly increasing version
+per URI to correctly sequence document changes."
   (with-lock-held ((lsp-client-uri-versions-lock client))
     (let ((v (or (gethash uri (lsp-client-uri-versions client)) 0)))
       (setf (gethash uri (lsp-client-uri-versions client)) (1+ v))
@@ -578,7 +584,7 @@ For spawned clients: close the socket, SIGTERM→SIGKILL the child process."
             (join-thread thr))
         (error () (ignore-errors (destroy-thread thr))))
       (setf (lsp-client-reader-thread client) nil)))
-  ;; Reap spawned child (D-09: attached servers left running).
+  ;; Reap spawned child (attached servers are left running).
   (unless (lsp-client-attached-p client)
     (let ((proc (lsp-client-process-info client)))
       (when proc
@@ -596,6 +602,10 @@ For spawned clients: close the socket, SIGTERM→SIGKILL the child process."
                        "error" (princ-to-string e))))
         (ignore-errors (sb-ext:process-close proc))
         (setf (lsp-client-process-info client) nil))))
+  ;; Remove the per-client formatting lock from the bridge table so it does
+  ;; not accumulate across the server's lifetime.
+  (ignore-errors
+    (uiop:symbol-call :dsmr-mcp/src/lsp/bridge :%remove-formatting-lock client))
   (log-event :info "lsp.client.shutdown"
              "root" (when (lsp-client-project-root client)
                       (namestring (lsp-client-project-root client)))
@@ -608,7 +618,7 @@ For spawned clients: close the socket, SIGTERM→SIGKILL the child process."
 
 (defun %evict-lsp-client (client root-str)
   "Evict CLIENT from the registry. Attached → close socket only.
-Spawned → close socket then SIGTERM→SIGKILL (D-09 eviction policy)."
+Spawned → close socket then SIGTERM→SIGKILL."
   (log-event :info "lsp.client.evicting" "root" root-str
              "attached" (lsp-client-attached-p client))
   (if (lsp-client-attached-p client)
@@ -620,8 +630,11 @@ Spawned → close socket then SIGTERM→SIGKILL (D-09 eviction policy)."
         (let ((thr (lsp-client-reader-thread client)))
           (when (and thr (thread-alive-p thr))
             (ignore-errors (destroy-thread thr))
-            (setf (lsp-client-reader-thread client) nil))))
-      ;; Spawned: full shutdown.
+            (setf (lsp-client-reader-thread client) nil)))
+        ;; Remove the per-client formatting lock from the bridge table.
+        (ignore-errors
+          (uiop:symbol-call :dsmr-mcp/src/lsp/bridge :%remove-formatting-lock client)))
+      ;; Spawned: full shutdown (lsp-shutdown handles the lock removal).
       (lsp-shutdown client)))
 
 ;;; ---------------------------------------------------------------------------
@@ -633,6 +646,25 @@ Spawned → close socket then SIGTERM→SIGKILL (D-09 eviction policy)."
 No side effects — does not attach or spawn."
   (with-lock-held (*lsp-registry-lock*)
     (gethash (namestring project-root) *lsp-registry*)))
+
+;;; Per-root connecting locks prevent duplicate initialize handshakes.
+;;; A thread reaching the slow path holds this lock for its root while
+;;; attaching/spawning; a concurrent caller for the same root blocks here
+;;; rather than both completing separate handshakes to the same server.
+
+(defvar *lsp-connecting-locks* (make-hash-table :test 'equal)
+  "Hash-table mapping project-root namestring to a per-root lock.
+Used to serialize the slow-path attach/spawn for a given root.")
+
+(defvar *lsp-connecting-locks-lock* (make-lock "lsp-connecting-locks-lock")
+  "Lock protecting *lsp-connecting-locks* for thread-safe read/write.")
+
+(defun %connecting-lock-for-root (root-str)
+  "Return (or create) the per-root connecting lock for ROOT-STR."
+  (with-lock-held (*lsp-connecting-locks-lock*)
+    (or (gethash root-str *lsp-connecting-locks*)
+        (setf (gethash root-str *lsp-connecting-locks*)
+              (make-lock (format nil "lsp-connecting-~A" root-str))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Spawn support
@@ -666,15 +698,19 @@ No side effects — does not attach or spawn."
               (namestring (merge-pathnames "setup.lisp" (namestring home))))))))))
 
 (defparameter *alive-lsp-dir*
-  "/home/fade/SourceCode/lisp/alive-lsp/"
-  "Filesystem path to the alive-lsp checkout used for spawning child processes.
-The ASDF source-registry is pointed here so the child loads alive-lsp without
-needing it in the parent image's dependency tree.")
+  (let ((v (uiop:getenv "DSMR_ALIVE_LSP_DIR")))
+    (if (and v (plusp (length v))) v nil))
+  "Filesystem path to the alive-lsp checkout for child-spawn mode.
+Set via the DSMR_ALIVE_LSP_DIR environment variable.  When NIL, spawn is
+disabled and only attach mode is attempted.  The ASDF source-registry is
+pointed here so the child loads alive-lsp without needing it in the parent
+image's dependency tree.")
 
 (defun %build-lsp-sbcl-args ()
   "Build argv for spawning a child SBCL running alive-lsp.
+Returns NIL when *alive-lsp-dir* is NIL (spawn disabled).
 
-Stdout-redirect ordering (RESEARCH.md Pitfall 3):
+Stdout-redirect ordering:
   1. Redirect *standard-output* → *error-output* before (asdf:load-system)
      so ASDF compile notes go to stderr, not the handshake pipe.
   2. Restore *standard-output* to sb-sys:*stdout* before (alive/server:start).
@@ -685,6 +721,8 @@ Stdout-redirect ordering (RESEARCH.md Pitfall 3):
 --no-userinit prevents ~/.sbclrc from polluting stdout before the STARTING line."
   (let ((alive-dir *alive-lsp-dir*)
         (ql-setup  (%quicklisp-setup-path)))
+    (unless alive-dir
+      (return-from %build-lsp-sbcl-args nil))
     (append
      (list "--noinform" "--non-interactive" "--no-userinit")
      (when ql-setup (list "--load" ql-setup))
@@ -741,82 +779,81 @@ on every stderr write, causing RPC calls to hang."
            (ignore-errors (close err))))
        :name (format nil "lsp-stderr-~A" root-str)))))
 
+(defun %kill-spawned-process (process)
+  "SIGTERM, wait up to 500 ms, SIGKILL if still alive, then close streams."
+  (ignore-errors
+    (when (sb-ext:process-alive-p process)
+      (sb-ext:process-kill process 15)
+      (sleep 0.5)
+      (when (sb-ext:process-alive-p process)
+        (sb-ext:process-kill process 9)))
+    (sb-ext:process-close process)))
+
 (defun %spawn-lsp-child (project-root)
   "Spawn a child SBCL running alive-lsp. Returns a connected LSP-CLIENT or NIL.
-Reads the [STARTING] port from stdout under *lsp-startup-timeout*."
-  (let ((sbcl-path (%find-sbcl-path))
-        (root-str  (namestring project-root)))
-    (log-event :info "lsp.client.spawning" "root" root-str)
-    (let ((process nil))
-      (handler-case
-          (progn
-            (setf process
-                  (sb-ext:run-program sbcl-path
-                                      (%build-lsp-sbcl-args)
-                                      :output :stream
-                                      :error  :stream
-                                      :wait   nil
-                                      :search t))
-            ;; Read back the ephemeral port under the startup timeout.
-            (let ((port
-                    (handler-case
-                        (sb-ext:with-timeout *lsp-startup-timeout*
-                          (%parse-lsp-started-line
-                           (sb-ext:process-output process)))
-                      (sb-ext:timeout ()
-                        (log-event :warn "lsp.client.spawn-timeout"
-                                   "root" root-str
-                                   "timeout" *lsp-startup-timeout*)
-                        nil)
-                      (error (e)
-                        (log-event :warn "lsp.client.spawn-readback-error"
-                                   "root" root-str
-                                   "error" (princ-to-string e))
-                        nil))))
-              (unless port
-                ;; Kill the partial child.
-                (ignore-errors
-                  (when (sb-ext:process-alive-p process)
-                    (sb-ext:process-kill process 15)
-                    (sleep 0.5)
-                    (when (sb-ext:process-alive-p process)
-                      (sb-ext:process-kill process 9)))
-                  (sb-ext:process-close process))
-                (return-from %spawn-lsp-child nil))
-              ;; Drain stderr in the background.
-              (%start-stderr-drain process root-str)
-              ;; Connect to the ephemeral port.
-              (let ((client (connect-lsp-client "127.0.0.1" port
-                                                :project-root project-root)))
-                (unless client
-                  (log-event :warn "lsp.client.spawn-connect-failed"
-                             "root" root-str "port" port)
-                  (ignore-errors
-                    (when (sb-ext:process-alive-p process)
-                      (sb-ext:process-kill process 15)
-                      (sleep 0.5)
-                      (when (sb-ext:process-alive-p process)
-                        (sb-ext:process-kill process 9)))
-                    (sb-ext:process-close process))
+Reads the [STARTING] port from stdout under *lsp-startup-timeout*.
+Returns NIL immediately when DSMR_ALIVE_LSP_DIR is unset — spawn requires a
+configured alive-lsp source tree; the operator must set DSMR_ALIVE_LSP_DIR."
+  (unless *alive-lsp-dir*
+    (log-event :warn "lsp.client.spawn-skipped"
+               "reason" "DSMR_ALIVE_LSP_DIR not set; spawn disabled")
+    (return-from %spawn-lsp-child nil))
+  (let ((sbcl-args (%build-lsp-sbcl-args)))
+    (unless sbcl-args
+      (return-from %spawn-lsp-child nil))
+    (let ((sbcl-path (%find-sbcl-path))
+          (root-str  (namestring project-root)))
+      (log-event :info "lsp.client.spawning" "root" root-str)
+      (let ((process nil))
+        (handler-case
+            (progn
+              (setf process
+                    (sb-ext:run-program sbcl-path sbcl-args
+                                        :output :stream
+                                        :error  :stream
+                                        :wait   nil
+                                        :search t))
+              ;; Read back the ephemeral port under the startup timeout.
+              (let ((port
+                      (handler-case
+                          (sb-ext:with-timeout *lsp-startup-timeout*
+                            (%parse-lsp-started-line
+                             (sb-ext:process-output process)))
+                        (sb-ext:timeout ()
+                          (log-event :warn "lsp.client.spawn-timeout"
+                                     "root" root-str
+                                     "timeout" *lsp-startup-timeout*)
+                          nil)
+                        (error (e)
+                          (log-event :warn "lsp.client.spawn-readback-error"
+                                     "root" root-str
+                                     "error" (princ-to-string e))
+                          nil))))
+                (unless port
+                  (%kill-spawned-process process)
                   (return-from %spawn-lsp-child nil))
-                ;; Mark as spawned (not attached) and store the process handle.
-                (setf (lsp-client-attached-p   client) nil
-                      (lsp-client-process-info client) process)
-                (log-event :info "lsp.client.spawned"
-                           "root" root-str "port" port)
-                client)))
-        (error (e)
-          (log-event :warn "lsp.client.spawn-error"
-                     "root" root-str "error" (princ-to-string e))
-          (when process
-            (ignore-errors
-              (when (sb-ext:process-alive-p process)
-                (sb-ext:process-kill process 15)
-                (sleep 0.5)
-                (when (sb-ext:process-alive-p process)
-                  (sb-ext:process-kill process 9)))
-              (sb-ext:process-close process)))
-          nil)))))
+                ;; Drain stderr in the background.
+                (%start-stderr-drain process root-str)
+                ;; Connect to the ephemeral port.
+                (let ((client (connect-lsp-client "127.0.0.1" port
+                                                  :project-root project-root)))
+                  (unless client
+                    (log-event :warn "lsp.client.spawn-connect-failed"
+                               "root" root-str "port" port)
+                    (%kill-spawned-process process)
+                    (return-from %spawn-lsp-child nil))
+                  ;; Mark as spawned (not attached) and store the process handle.
+                  (setf (lsp-client-attached-p   client) nil
+                        (lsp-client-process-info client) process)
+                  (log-event :info "lsp.client.spawned"
+                             "root" root-str "port" port)
+                  client)))
+          (error (e)
+            (log-event :warn "lsp.client.spawn-error"
+                       "root" root-str "error" (princ-to-string e))
+            (when process
+              (%kill-spawned-process process))
+            nil))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Attach-else-spawn + registry (D-07 / D-09)
@@ -824,47 +861,48 @@ Reads the [STARTING] port from stdout under *lsp-startup-timeout*."
 
 (defun ensure-lsp-client (project-root)
   "Return the cached LSP client for PROJECT-ROOT, creating one if necessary.
-Strategy (D-07 attach-else-spawn):
+Strategy (attach-else-spawn):
   1. Check the registry under *lsp-registry-lock*.
   2. If a live client exists, return it.
-  3. Probe 127.0.0.1:*lsp-attach-port* for an existing alive-lsp.
+  3. Acquire the per-root connecting lock so only one thread attaches/spawns
+     per root at a time (prevents duplicate initialize handshakes).
+  4. Re-check the registry under the connecting lock (second caller finds
+     the first caller's result after the lock is released).
+  5. Probe 127.0.0.1:*lsp-attach-port* for an existing alive-lsp.
      On success: cache as attached (attached-p T).
-  4. On probe failure: spawn a child alive-lsp, cache as spawned (attached-p NIL).
+  6. On probe failure: spawn a child alive-lsp, cache as spawned (attached-p NIL).
 Returns NIL when both attach and spawn fail."
   (let ((root-str (namestring project-root)))
-    ;; First: check the registry (fast path, avoids spawn).
+    ;; Fast path: check the registry (avoids the connecting lock on the common case).
     (let ((cached
             (with-lock-held (*lsp-registry-lock*)
               (let ((c (gethash root-str *lsp-registry*)))
-                ;; Return only if still connected.
                 (when (and c (lsp-client-connected-p c)) c)))))
       (when cached (return-from ensure-lsp-client cached)))
-    ;; Slow path: attach or spawn, then cache.
-    (let ((client
-            ;; Probe the configured port for an existing alive-lsp (D-07).
-            (or (let ((c (connect-lsp-client *lsp-attach-host* *lsp-attach-port*
-                                             :project-root project-root)))
-                  (when c
-                    ;; attached-p is T by default from connect-lsp-client.
-                    (log-event :info "lsp.client.attached"
-                               "root" root-str "port" *lsp-attach-port*)
-                    c))
-                ;; Probe failed — spawn a child process (D-07).
-                (%spawn-lsp-child project-root))))
-      (when client
-        (with-lock-held (*lsp-registry-lock*)
-          ;; Double-check: another thread may have added one while we were connecting.
-          (let ((existing (gethash root-str *lsp-registry*)))
-            (if (and existing (lsp-client-connected-p existing))
-                ;; Race: another thread won — shut ours down and return the winner.
-                (progn
-                  (ignore-errors (lsp-shutdown client))
-                  existing)
-                ;; Install ours.
-                (progn
-                  (setf (lsp-client-project-root client) project-root)
-                  (setf (gethash root-str *lsp-registry*) client)
-                  client))))))))
+    ;; Slow path: hold the per-root connecting lock so concurrent callers for
+    ;; the same root do not both attempt attach/spawn simultaneously.
+    (with-lock-held ((%connecting-lock-for-root root-str))
+      ;; Re-check inside the connecting lock: a concurrent caller may have
+      ;; already established and registered a client while we waited.
+      (let ((cached
+              (with-lock-held (*lsp-registry-lock*)
+                (let ((c (gethash root-str *lsp-registry*)))
+                  (when (and c (lsp-client-connected-p c)) c)))))
+        (when cached (return-from ensure-lsp-client cached)))
+      ;; Neither attach nor spawn has succeeded yet for this root.
+      (let ((client
+              (or (let ((c (connect-lsp-client *lsp-attach-host* *lsp-attach-port*
+                                               :project-root project-root)))
+                    (when c
+                      (log-event :info "lsp.client.attached"
+                                 "root" root-str "port" *lsp-attach-port*)
+                      c))
+                  (%spawn-lsp-child project-root))))
+        (when client
+          (with-lock-held (*lsp-registry-lock*)
+            (setf (lsp-client-project-root client) project-root)
+            (setf (gethash root-str *lsp-registry*) client))
+          client)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Idle-eviction sweeper (adapted from http.lisp %session-cleanup-loop)
