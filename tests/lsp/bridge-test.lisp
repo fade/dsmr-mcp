@@ -18,7 +18,8 @@
   (:use #:cl #:parachute)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/tests/support/lsp-mock
-                #:with-lsp-mock-server)
+                #:with-lsp-mock-server
+                #:mock-lsp-server-received-methods)
   (:import-from #:dsmr-mcp/tests/support/fs-fixture
                 #:with-temp-project-root
                 #:write-fixture-file)
@@ -337,4 +338,68 @@ This test uses the mock server to capture the params the bridge sends."
                                      client "/test.lisp" bounds)))
                 ;; A non-nil result means the server accepted the request.
                 ;; nil would mean the error handler caught a protocol error.
-                (true (not (null result))))))))))
+                (true (not (null result)))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Regression: bridge sends didOpen before completion (bug 1)
+;;; ---------------------------------------------------------------------------
+
+(define-test completions-sends-did-open-before-request
+  "bridge-completions must send textDocument/didOpen for a URI before sending
+textDocument/completion so alive-lsp has an in-memory buffer to search.
+Without the priming notification alive-lsp returns an empty items list.
+
+Verifies ordering: the mock records all inbound method strings; after the
+bridge-completions call, textDocument/didOpen must appear in the list and
+must come before textDocument/completion."
+  (if (not (socket-available-p))
+      (true t)
+      (progn
+        (unless (%bridge-pkg)
+          (fail "dsmr-mcp/src/lsp/bridge not loaded."))
+        (with-temp-project-root (session root)
+          (let ((completions-sym (%bridge-sym "BRIDGE-COMPLETIONS")))
+            (unless (and completions-sym (fboundp completions-sym))
+              (fail "BRIDGE-COMPLETIONS not defined."))
+            ;; Write a real file so %ensure-document-open can read it.
+            (let* ((test-file  (write-fixture-file root "demo.lisp"
+                                                   "(defun demo () (format nil \"~A\" 1))"))
+                   (path-str   (namestring test-file))
+                   ;; Canned completion response with a non-empty items vector.
+                   (item-ht    (let ((ht (make-hash-table :test 'equal)))
+                                 (setf (gethash "label" ht) "format")
+                                 ht))
+                   (result-ht  (let ((ht (make-hash-table :test 'equal)))
+                                 (setf (gethash "isIncomplete" ht) nil
+                                       (gethash "items"        ht) (vector item-ht))
+                                 ht)))
+              ;; with-lsp-mock-server binds the-server via :server keyword so
+              ;; the test body can read mock-lsp-server-received-methods.
+              (with-lsp-mock-server
+                  (client
+                   :canned-responses (list (cons "textDocument/completion" result-ht))
+                   :server the-server)
+                ;; Call bridge-completions with the real file path.
+                (let ((result (funcall completions-sym client 1 path-str 0 19)))
+                  ;; Give the mock's accept thread a moment to process the
+                  ;; notification before we read received-methods.
+                  (sleep 0.1)
+                  (let ((methods (mock-lsp-server-received-methods the-server)))
+                    ;; didOpen or didChange must have been sent.
+                    (true (or (find "textDocument/didOpen"   methods :test #'string=)
+                              (find "textDocument/didChange" methods :test #'string=))
+                          "bridge must prime alive-lsp buffer before completion")
+                    ;; textDocument/completion must be present.
+                    (true (find "textDocument/completion" methods :test #'string=)
+                          "bridge must send the completion request")
+                    ;; The open/change notification must precede the completion.
+                    (let ((open-pos   (or (position "textDocument/didOpen"   methods :test #'string=)
+                                         (position "textDocument/didChange"  methods :test #'string=)))
+                          (compl-pos  (position "textDocument/completion" methods :test #'string=)))
+                      (true (and open-pos compl-pos (< open-pos compl-pos))
+                            "didOpen/didChange must arrive before textDocument/completion"))
+                    ;; The completion result must carry the canned items.
+                    (true (hash-table-p result))
+                    (let ((items (when (hash-table-p result) (gethash "items" result))))
+                      (true (and items (plusp (length items)))
+                            "completions must return non-empty items when mock provides them"))))))))))))

@@ -52,7 +52,8 @@
                 #:destroy-thread)
   (:export #:with-lsp-mock-server
            #:%start-mock-lsp-server
-           #:%stop-mock-lsp-server))
+           #:%stop-mock-lsp-server
+           #:mock-lsp-server-received-methods))
 
 (in-package #:dsmr-mcp/tests/support/lsp-mock)
 
@@ -140,7 +141,12 @@ Returns a parsed jzon hash-table, or NIL on EOF."
   ;; Bound port — set by the accept thread before signalling ready.
   (port            nil)
   (port-lock       (make-lock "mock-port-lock"))
-  (port-cv         (make-condition-variable :name "mock-port-cv")))
+  (port-cv         (make-condition-variable :name "mock-port-cv"))
+  ;; received-methods: ordered list of all method strings received from the
+  ;; client (both requests and notifications), in arrival order.
+  ;; Protected by received-methods-lock.  Tests use this to assert ordering.
+  (received-methods      nil)
+  (received-methods-lock (make-lock "mock-recv-methods-lock")))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Accept loop
@@ -182,6 +188,13 @@ replies.  Handles server→client workspace/configuration requests."
                   ;; Dispatch the inbound message.
                   (let ((method (gethash "method" msg))
                         (id     (gethash "id" msg)))
+                    ;; Record every inbound method (requests and notifications)
+                    ;; in received-methods so tests can assert ordering.
+                    (when method
+                      (with-lock-held ((mock-lsp-server-received-methods-lock server))
+                        (setf (mock-lsp-server-received-methods server)
+                              (append (mock-lsp-server-received-methods server)
+                                      (list method)))))
                     (cond
                       ;; Server→client response (client is replying to OUR request).
                       ((and (null method) (or (gethash "result" msg)
@@ -206,9 +219,8 @@ replies.  Handles server→client workspace/configuration requests."
                                      (gethash "id"      reply) id
                                      (gethash "result"  reply) :null)
                                (send-ht reply)))))
-                      ;; Client→server notification (no id): record for test inspection.
-                      (method
-                       nil)             ; notifications are fire-and-forget in mock
+                      ;; Client→server notification (no id): already recorded above.
+                      (method nil)
                       ))))))
         ;; Teardown: close connection.
         (ignore-errors (socket-close conn))))))
@@ -284,7 +296,7 @@ ON-BOUND         — optional thunk called with the bound port integer once
 ;;; with-lsp-mock-server macro
 ;;; ---------------------------------------------------------------------------
 
-(defmacro with-lsp-mock-server ((client-var &key canned-responses) &body body)
+(defmacro with-lsp-mock-server ((client-var &key canned-responses server) &body body)
   "Start an in-process Content-Length LSP TCP server on an OS-assigned port.
 Bind CLIENT-VAR to a connected LSP client (via dsmr-mcp/src/lsp/client:connect-lsp-client
 once that package exists), execute BODY, then tear down both the client and
@@ -294,13 +306,16 @@ CANNED-RESPONSES is an alist of (method-string . response-hash-table) for
 scripting server replies.  The server answers an inbound request whose method
 matches a canned key, stamping the response with the request's id.
 
+SERVER, when provided as a symbol, is bound to the MOCK-LSP-SERVER struct.
+Tests use this to access MOCK-LSP-SERVER-RECEIVED-METHODS after the body runs.
+
 CLIENT-VAR is NIL when the mock is used before the Wave-1 LSP client package
 is loaded (Wave 0 tests that only exercise the server side use :no-client t).
 
 Mirrors with-temporary-slynk-listener's retry-connect loop (slynk-fixture.lisp)
 and unwind-protect teardown.  Binds to 127.0.0.1 only (T-lsp-scaffold-01)."
   (let ((port-var    (gensym "LSP-MOCK-PORT-"))
-        (server-var  (gensym "LSP-MOCK-SERVER-"))
+        (server-var  (or server (gensym "LSP-MOCK-SERVER-")))
         (attempt-var (gensym "LSP-MOCK-ATTEMPT-"))
         (max-var     (gensym "LSP-MOCK-MAX-")))
     `(let* ((,port-var   nil)
