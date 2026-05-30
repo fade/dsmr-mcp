@@ -65,6 +65,16 @@ anything with letters routes to symbol lookup."
   (false (%section-number-p "loop"))
   (false (%section-number-p "")))
 
+(define-test malformed-section-does-not-crash
+  "A token with an empty segment between dots (e.g. '22..3') is rejected by the
+detector — so it routes to symbol lookup instead of reaching the filename math
+and signalling on (parse-integer \"\"). The exported filename helper is also
+defensive: it folds away empty segments rather than crashing for a direct
+caller."
+  (false (%section-number-p "22..3"))
+  (false (%section-number-p ".5"))
+  (is string= "22_c.htm" (%section-to-filename "22..3")))
+
 ;;; --- Local content extraction (guarded on a resolvable HyperSpec) ----------
 
 (define-test symbol-returns-local-content
