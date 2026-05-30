@@ -27,14 +27,24 @@
 
 ;;; Registry ----------------------------------------------------------------
 
-(defparameter *tool-classes* (make-hash-table :test 'equal)
+(defvar *tool-classes* (make-hash-table :test 'equal)
   "Maps tool name (string) -> tool class (CLASS). Populated by the
 mcp-tool-class metaclass at class-finalization time. Last defclass
 wins for a given name string — this is intentional for hot-reload:
 re-evaluating a tool defclass refreshes its entry here. Treat
 name collisions as a developer footgun; there is no collision-detection
 or warning because the hot-reload benefit outweighs the risk in a
-single-image dev workflow.")
+single-image dev workflow.
+
+DEFVAR, not DEFPARAMETER: the registry is populated by side-effect from
+every concrete tool file's class finalization, not by this form. When a
+downstream system (e.g. a test leaf) is quickloaded after the server, ASDF
+re-runs this file's load-op as a transitive dependency — but it does NOT
+re-run the tool files, since they are not in that leaf's dependency
+closure. DEFPARAMETER would re-bind a fresh empty table on that reload,
+silently dropping every registration while no tool file re-registers,
+and get-tool-instance would then return NIL for every tool. DEFVAR
+initializes once and survives the reload, keeping registrations intact.")
 
 ;;; Metaclass ---------------------------------------------------------------
 
