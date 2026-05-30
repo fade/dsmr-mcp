@@ -62,6 +62,8 @@
                 #:*log-request-id*)
   (:import-from #:dsmr-mcp/src/dispatch
                 #:handle-tools-call)
+  (:import-from #:dsmr-mcp/src/wire-strings
+                #:coerce-wire-strings)
   (:export #:process-json-line
            #:+supported-protocol-versions+))
 
@@ -249,47 +251,10 @@ correlation id in the log context for the duration of its handling.")
   "Return a unique 'notif-<n>' string for a notification without a JSON-RPC id."
   (format nil "notif-~A" (incf *notif-counter*)))
 
-;;; Wire-string normalisation --------------------------------------------------
-;;;
-;;; jzon returns SIMPLE-BASE-STRING for pure-ASCII JSON strings on SBCL. A
-;;; base-string that later lands in a form passed to slynk-client:slime-eval is
-;;; printed by the rex encoder as #A((N) BASE-CHAR ...). That readable array
-;;; syntax is longer than the byte count Slynk's length prefix was computed
-;;; from, so the remote reader hits EOF mid-form and drops the connection —
-;;; surfacing to the caller as SLIME-NETWORK-ERROR. The failure only appears
-;;; against a real external image (an in-process eval shares one reader), so it
-;;; escapes the in-process attach fixture entirely.
-;;;
-;;; Coercing every parsed string to element-type CHARACTER at the single wire-in
-;;; boundary keeps any base-string from reaching an attached verb's injected
-;;; form (repl-eval, run-tests, code-find, code-find-references, inspect-*),
-;;; without each form-builder having to remember to do it.
-
-(defun %wire-string-to-character (s)
-  "Return S as a (SIMPLE-ARRAY CHARACTER (*)); a no-op when S already is one."
-  (if (typep s '(simple-array character (*)))
-      s
-      (map '(simple-array character (*)) #'identity s)))
-
-(defun %normalize-wire-strings (value)
-  "Recursively rebuild VALUE, coercing every string to element-type CHARACTER.
-Hash-tables (JSON objects) and vectors (JSON arrays) are rebuilt with their
-contents normalised; scalars pass through unchanged. Applied to the freshly
-parsed JSON-RPC message so no jzon SIMPLE-BASE-STRING survives into a form that
-crosses the Slynk wire."
-  (typecase value
-    (string (%wire-string-to-character value))
-    (hash-table
-     (let ((out (make-hash-table :test (hash-table-test value)
-                                 :size (hash-table-count value))))
-       (maphash (lambda (k v)
-                  (setf (gethash (%normalize-wire-strings k) out)
-                        (%normalize-wire-strings v)))
-                value)
-       out))
-    ((and vector (not string))
-     (map 'vector #'%normalize-wire-strings value))
-    (t value)))
+;;; Wire-string normalisation is shared with the attached-eval funnel; the
+;;; rationale and the recursive coercion live in dsmr-mcp/src/wire-strings.
+;;; The inbound JSON-RPC parse runs coerce-wire-strings so no jzon
+;;; SIMPLE-BASE-STRING survives into a form bound for the Slynk wire.
 
 ;;; Public entry point ---------------------------------------------------------
 
@@ -327,7 +292,7 @@ error-with-unknown-id responses use 'null as the id value."
                ;; Inner handler: catches JSON parse failures specifically.
                ;; Returns -32700 Parse error with id null (using 'null, not nil,
                ;; because jzon encodes nil as false, not null).
-               (%normalize-wire-strings
+               (coerce-wire-strings
                 (handler-case
                     (jzon:parse trimmed
                                 :max-depth +max-json-depth+

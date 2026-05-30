@@ -135,3 +135,22 @@ checks agree on one key.  Tests validate-args directly."
                         :required (code)))
           (args-present (dsmr-mcp/src/tools/helpers:make-ht "code" "hello")))
       (true (dsmr-mcp/src/tools/helpers:validate-args schema-sym args-present)))))
+
+(define-test enum-value-must-be-a-member
+  "A property with an :enum is a closed set: a present value outside the set
+signals arg-validation-error, while a member (and an absent optional field)
+passes. Without this the enum is advertised in tools/list but never enforced."
+  (let ((schema '(:object
+                  :properties ((mode :type :string
+                                     :enum ("read" "write" "append")))
+                  :required ())))
+    ;; In-set value passes.
+    (true (dsmr-mcp/src/tools/helpers:validate-args
+           schema (dsmr-mcp/src/tools/helpers:make-ht "mode" "write")))
+    ;; Absent optional enum field passes (enum constrains value, not presence).
+    (true (dsmr-mcp/src/tools/helpers:validate-args
+           schema (make-hash-table :test 'equal)))
+    ;; Out-of-set value fails.
+    (fail (dsmr-mcp/src/tools/helpers:validate-args
+           schema (dsmr-mcp/src/tools/helpers:make-ht "mode" "delete"))
+          dsmr-mcp/src/tools/helpers:arg-validation-error)))

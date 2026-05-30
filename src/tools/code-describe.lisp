@@ -40,7 +40,8 @@
   (:import-from #:dsmr-mcp/src/hermetic/dispatch
                 #:dispatch-hermetic-call)
   (:import-from #:dsmr-mcp/src/code-core
-                #:%build-code-describe-form)
+                #:%build-code-describe-form
+                #:render-describe-summary)
   (:import-from #:slynk-client
                 #:slime-network-error)
   (:import-from #:bordeaux-threads
@@ -166,10 +167,8 @@ Try load-system first, or clgrep-search for text search." symbol-name)))
                                         (plusp (length desc-text))
                                         (map 'string #'identity desc-text))
                                    ""))
-                      (summary (with-output-to-string (s)
-                                 (format s "~A ~A~%" symbol-name arglist)
-                                 (when (plusp (length doc))
-                                   (format s "~%~A" doc)))))
+                      (summary (render-describe-summary
+                                :name symbol-name :arglist arglist :doc doc)))
                  (make-ht "content" (text-content summary)
                           "name"    (map 'string #'identity symbol-name)
                           "type"    ""

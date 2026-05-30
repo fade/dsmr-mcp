@@ -15,9 +15,9 @@
 (defpackage #:dsmr-mcp/tests/protocol/wire-string-normalization-test
   (:use #:cl #:parachute)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
-  (:import-from #:dsmr-mcp/src/protocol
+  (:import-from #:dsmr-mcp/src/wire-strings
                 #:%wire-string-to-character
-                #:%normalize-wire-strings))
+                #:coerce-wire-strings))
 
 (in-package #:dsmr-mcp/tests/protocol/wire-string-normalization-test)
 
@@ -57,7 +57,7 @@ contents (no double-coercion hazard)."
     (true (character-string-p out))
     (is string= "" out)))
 
-;;; %normalize-wire-strings — recursion ---------------------------------------
+;;; coerce-wire-strings — recursion -------------------------------------------
 
 (define-test nested-object-and-array-strings-normalised
   "Strings nested in JSON objects and arrays are all coerced to character
@@ -67,7 +67,7 @@ strings; scalars pass through untouched."
     (setf (gethash "n" ht) 42)
     (setf (gethash "items" ht)
           (vector (coerce "a" 'base-string) (coerce "b" 'base-string) 7))
-    (let* ((out   (%normalize-wire-strings ht))
+    (let* ((out   (coerce-wire-strings ht))
            (items (gethash "items" out)))
       ;; Value coerced.
       (true (character-string-p (gethash "code" out)))
@@ -82,6 +82,33 @@ strings; scalars pass through untouched."
       (true (character-string-p (aref items 1)))
       (is = 7 (aref items 2)))))
 
+;;; Outbound forms: the attached-eval funnel path -----------------------------
+
+(define-test form-tree-base-strings-coerced
+  "The outbound boundary (bounded-slime-eval) coerces base-strings embedded in a
+Lisp form — including in nested sublists and an improper/dotted tail — while
+preserving the form's structure and its non-string atoms. This is the case a
+form builder introduces after the wire-in parse (e.g. a pathname namestring)."
+  (let* ((form (list 'foo
+                     (coerce "ascii-arg" 'base-string)
+                     (list :path (coerce "/tmp/x.lisp" 'base-string) :line 7)
+                     ;; improper tail: a dotted pair ending in a base-string
+                     (cons 'bar (coerce "tail" 'base-string))))
+         (out  (coerce-wire-strings form)))
+    ;; Structure preserved.
+    (is eq 'foo (first out))
+    (is eq :path (first (third out)))
+    (is = 7 (getf (third out) :line))
+    ;; Every embedded string coerced; no base-string survives anywhere.
+    (true (character-string-p (second out)))
+    (is string= "ascii-arg" (second out))
+    (true (character-string-p (getf (third out) :path)))
+    (is string= "/tmp/x.lisp" (getf (third out) :path))
+    ;; Dotted tail coerced in place.
+    (is eq 'bar (car (fourth out)))
+    (true (character-string-p (cdr (fourth out))))
+    (is string= "tail" (cdr (fourth out)))))
+
 ;;; End-to-end: the actual jzon parse path ------------------------------------
 
 (define-test parsed-ascii-json-yields-no-base-string
@@ -89,7 +116,7 @@ strings; scalars pass through untouched."
 character string — the post-condition that prevents the SLIME-NETWORK-ERROR,
 independent of whatever element-type jzon chose."
   (let* ((line "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"repl-eval\",\"arguments\":{\"code\":\"(+ 1 2)\"}}}")
-         (msg  (%normalize-wire-strings (jzon:parse line)))
+         (msg  (coerce-wire-strings (jzon:parse line)))
          (args (gethash "arguments" (gethash "params" msg))))
     (true (character-string-p (gethash "name" (gethash "params" msg))))
     (true (character-string-p (gethash "code" args)))
