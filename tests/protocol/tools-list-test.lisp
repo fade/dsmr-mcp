@@ -121,3 +121,29 @@ is a vector (not a list or nil)."
           (true (vectorp (gethash "required" schema)))
           (is = 1 (length (gethash "required" schema)))
           (is equal "msg" (aref (gethash "required" schema) 0)))))))
+
+(define-test reference-verb-schemas-encode-in-tools-list
+  "The full tools/list response enumerates the reference verbs clhs-lookup and
+project-scaffold with object inputSchemas. One unhandled schema type would
+break the whole response, so a clean parse plus both descriptors present
+guards that schema->json handles every registered tool's schema (incl. the
+:enum and :boolean keywords these two introduce)."
+  (let* ((session (make-session :id "tl-refverbs"))
+         (*current-session-id* "tl-refverbs"))
+    (%do-initialize session)
+    (let* ((resp (process-json-line
+                   "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}"
+                   session))
+           (obj (jzon:parse resp))
+           (tools (gethash* obj "result" "tools")))
+      (true (vectorp tools))
+      (dolist (name '("clhs-lookup" "project-scaffold"))
+        (let ((desc (loop for d across tools
+                          when (equal name (gethash "name" d))
+                          return d)))
+          (true desc (format nil "~A enumerated in tools/list" name))
+          (when desc
+            (let ((schema (gethash "inputSchema" desc)))
+              (true (hash-table-p schema)
+                    (format nil "~A inputSchema encoded to an object" name))
+              (is equal "object" (gethash "type" schema)))))))))
