@@ -158,7 +158,7 @@ DSMR_HYPERSPEC_DIR or placing a tree mid-session."
   "Convert a section number like '22.3.1' to a filename like '22_ca.htm'.
 Each subsection letter corresponds to a=1, b=2, c=3, etc.
 Chapter numbers are zero-padded to 2 digits (e.g., 7 -> 07)."
-  (let* ((parts (split "\\." section-string))
+  (let* ((parts (remove "" (split "\\." section-string) :test #'string=))
          (chapter-num (parse-integer (first parts)))
          (chapter (format nil "~2,'0D" chapter-num))
          (subsections (rest parts)))
@@ -171,10 +171,17 @@ Chapter numbers are zero-padded to 2 digits (e.g., 7 -> 07)."
                         subsections)))))
 
 (defun %section-number-p (string)
-  "Return T if STRING looks like a section number (e.g., '22.3', '3.1.2')."
+  "Return T if STRING is a well-formed section number (e.g., '22.3', '3.1.2').
+Requires a leading digit, only digits and dots, and no empty segment between
+dots — so a malformed token like '22..3' is rejected and routed to symbol
+lookup rather than reaching the filename math (where (parse-integer \"\") on the
+empty segment would signal)."
   (and (> (length string) 0)
+       (digit-char-p (char string 0))
        (every (lambda (c) (or (digit-char-p c) (char= c #\.))) string)
-       (digit-char-p (char string 0))))
+       (let ((parts (split "\\." string)))
+         (and parts
+              (notany (lambda (seg) (zerop (length seg))) parts)))))
 
 (defun %section-local-path (section-string)
   "Return the absolute local file path for a section number, or NIL if not found."
