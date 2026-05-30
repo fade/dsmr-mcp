@@ -114,8 +114,9 @@ Call fs-set-project-root first.")))))
                                :author (or author "Unknown")
                                :license (or license "AGPL-3.0-or-later")
                                :copyright (or copyright author "Unknown")
-                               :year (or year (format nil "~A"
-                                                      (nth-value 5 (get-decoded-time))))
+                               ;; year default (live current year) is owned by
+                               ;; the scaffold core; pass the raw arg through
+                               :year year
                                :destination (or destination "scaffolds")
                                :overwrite overwrite))
                  (target-dir  (getf res :target-dir))
