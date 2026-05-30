@@ -16,7 +16,8 @@
 ;;;; APPLY mode (action hash-table from a prior discover result):
 ;;;;   Dispatches to $/alive/macroexpand1, $/alive/unexportSymbol, or
 ;;;;   textDocument/rangeFormatting depending on the chosen action.
-;;;;   rangeFormatting is serialized (Pitfall 6).
+;;;;   rangeFormatting is serialized per client (alive-lsp's blocking
+;;;;   workspace/configuration round-trip is not concurrency-safe).
 ;;;;
 ;;;; When alive-lsp is unreachable, returns lsp-unavailable error (D-12).
 ;;;;

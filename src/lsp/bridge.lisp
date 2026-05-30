@@ -63,7 +63,9 @@
 (in-package #:dsmr-mcp/src/lsp/bridge)
 
 ;;; ---------------------------------------------------------------------------
-;;; Per-client rangeFormatting serialization lock (Pitfall 6)
+;;; Per-client rangeFormatting serialization lock: alive-lsp's formatting
+;;; path makes a blocking workspace/configuration round-trip, so concurrent
+;;; format calls against one client must be serialized.
 ;;; ---------------------------------------------------------------------------
 
 (defvar *formatting-locks* (make-hash-table :test 'equal)
@@ -541,7 +543,7 @@ APPLY mode (ACTION-HT is a hash-table from a prior discover result):
   Dispatches the chosen action to the appropriate alive-lsp verb:
     macroexpand        → $/alive/macroexpand1 (or $/alive/macroexpand)
     remove-from-export → $/alive/unexportSymbol
-    format             → textDocument/rangeFormatting (serialized, Pitfall 6)
+    format             → textDocument/rangeFormatting (serialized per client)
 
 PATH-STR must be a pre-validated absolute filesystem path (T-lsp-bridge-01).
 ID is the MCP request id (unused by the LSP layer; kept for logging).
