@@ -150,6 +150,11 @@ cl-ppcre's :simple-calls replacement callback."
 ;;; Manifest builder
 ;;; ---------------------------------------------------------------------------
 
+(defun %current-year ()
+  "Return the current calendar year as a string (the single source of the
+year default for generated LICENSE/.asd content)."
+  (format nil "~D" (nth-value 5 (get-decoded-time))))
+
 (defun plan-scaffold (&key name description author license copyright year destination)
   "Return an alist of (RELATIVE-PATH . CONTENT) for the scaffold manifest.
 Applies all template substitutions but performs no I/O. Callers are
@@ -175,7 +180,7 @@ to a parent prompts/ directory is computed."
                      ("license"       . ,spdx)
                      ("spdx"          . ,spdx)
                      ("copyright"     . ,(or copyright author "Unknown"))
-                     ("year"          . ,(or year "2026"))
+                     ("year"          . ,(or year (%current-year)))
                      ("license-body"  . ,license-body))))
     ;; Render the license body with copyright/year substitutions
     (let ((bindings-with-rendered-license

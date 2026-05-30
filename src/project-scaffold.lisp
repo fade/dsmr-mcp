@@ -117,7 +117,9 @@ underlying error after cleaning up the temp directory (no debris)."
                                       :author (or author "")
                                       :license (or license "AGPL-3.0-or-later")
                                       :copyright (or copyright author "Unknown")
-                                      :year (or year "2026")
+                                      ;; year default is owned by plan-scaffold
+                                      ;; (live current year); pass through as-is
+                                      :year year
                                       :destination effective-destination))
              (committed nil))
         (unwind-protect
