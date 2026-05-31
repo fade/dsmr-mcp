@@ -35,6 +35,14 @@ this directory. New here? Read [[file:introduction.org]] first, then
 - [[file:threat-model.org][Threat model]] — the trust posture, trust boundaries, and the project-wide
   STRIDE register. Read this before adopting the server.
 
+* Installing as an MCP server
+
+- [[file:configuration.org::*Wiring dsmr-mcp into an MCP client][Wiring into an MCP client]] — the bundled installer registers dsmr-mcp with
+  Claude Code (and prints a paste-ready entry for other agents), with a
+  coexistence/migration path for operators already running cl-mcp.
+- [[file:configuration.org::*Scaffolding a new project][Scaffolding a new project]] — the =scaffold-project= skill stands up a new
+  project from the skeleton in an empty directory.
+
 * Releases
 
 - [[file:release-notes.org][Release notes]] — what shipped in each version.
