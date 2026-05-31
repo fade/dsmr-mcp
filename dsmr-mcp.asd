@@ -190,3 +190,33 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                             (setf any-failed t))))
                       (when any-failed
                         (error "dsmr-mcp/tests: one or more parachute tests failed.")))))
+
+;; Slow cross-process integration tests, kept OUT of the fast dsmr-mcp/tests
+;; umbrella so the inner-loop suite stays quick. Each leaf here spawns a real
+;; dsmr-mcp server subprocess (~10-12s/scenario) and skips cleanly when the
+;; environment cannot spawn one. Run explicitly: (asdf:test-system "dsmr-mcp/tests/integration").
+(asdf:defsystem "dsmr-mcp/tests/integration"
+  :class :package-inferred-system
+  :description "Slow cross-process integration tests for dsmr-mcp."
+  :depends-on ("parachute"
+               "com.inuoe.jzon"
+               "dsmr-mcp"
+               "dsmr-mcp/tests/integration/stdio-elicitation-test")
+  :perform (test-op (o c)
+                    (declare (ignore o))
+                    (let* ((test-package-names
+                            (remove-if-not
+                             (lambda (dep)
+                               (and (stringp dep)
+                                    (uiop:string-prefix-p "dsmr-mcp/tests/integration/" dep)))
+                             (asdf:system-depends-on c)))
+                           (any-failed nil))
+                      (dolist (name test-package-names)
+                        (let* ((package (or (find-package (string-upcase name))
+                                            (error "Test package ~S not loaded." name)))
+                               (result (uiop:symbol-call :parachute :test package)))
+                          (when (uiop:symbol-call :parachute :results-with-status
+                                                  :failed result)
+                            (setf any-failed t))))
+                      (when any-failed
+                        (error "dsmr-mcp/tests/integration: one or more parachute tests failed.")))))
