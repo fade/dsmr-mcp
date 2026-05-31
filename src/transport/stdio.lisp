@@ -18,6 +18,22 @@
 ;;;;   - No worker-pool calls (initialize-pool / shutdown-pool).
 ;;;;   - No attach-disconnect-all.
 ;;;;   - Moved out of run.lisp into its own transport package.
+;;;;
+;;;; Launch-time .envrc consent (in-line round-trip model):
+;;;;   Before dispatching the first qualifying tools/call line, serve-streams
+;;;;   runs the consent intercept (maybe-prompt-and-write-envrc). stdio is
+;;;;   single-threaded -- the loop thread that runs the intercept is the same
+;;;;   thread that must read the client's elicitation response -- so the
+;;;;   intercept cannot block on a condition wait another thread would have to
+;;;;   satisfy. Instead it completes the round-trip IN-LINE: it writes the
+;;;;   elicitation/create request, then reads and answers interleaved client
+;;;;   lines itself (each fed through process-json-line, which routes the
+;;;;   response and replies to any non-response request, so no client request
+;;;;   is dropped) until the response resolves or the timeout elapses. The held
+;;;;   original tools/call line is dispatched normally afterward. The intercept
+;;;;   is wired via runtime symbol resolution so this file carries no
+;;;;   compile-time dependency on the envrc-init system (same technique as the
+;;;;   detach-session teardown call).
 
 (defpackage #:dsmr-mcp/src/transport/stdio
   (:use #:cl)
@@ -192,6 +208,23 @@ Divergences from cl-mcp src/run.lisp:
 
                ;; Normal line — dispatch with stdout guard, then flush.
                (t
+                ;; Launch-time .envrc consent: on the first qualifying
+                ;; tools/call line, complete the elicitation round-trip in-line
+                ;; (reading and answering interleaved client lines through the
+                ;; in-reader thunk) BEFORE dispatching the held tool-call line.
+                ;; The cheap (search "tools/call" ...) gate may produce false
+                ;; positives; the intercept body re-checks capability /
+                ;; once-per-session / qualifying-project, so a false positive is
+                ;; harmless. Runtime symbol resolution avoids a compile-time dep
+                ;; on dsmr-mcp/src/envrc-init.
+                (when (search "tools/call" line)
+                  (ignore-errors
+                   (uiop:symbol-call :dsmr-mcp/src/envrc-init
+                                     :maybe-prompt-and-write-envrc
+                                     session out
+                                     (lambda ()
+                                       (%read-line-limited
+                                        in :eof +max-json-line-bytes+)))))
                 (multiple-value-bind (resp captured)
                     (%dispatch-with-stdout-guard line session)
                   (when (plusp (length captured))
