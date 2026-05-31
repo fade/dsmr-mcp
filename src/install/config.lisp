@@ -48,15 +48,32 @@ object that participates in the config wire must use :test 'equal."
   "Return the args simple-vector for an SBCL stdio MCP launcher loading and
 running SYSTEM-NAME (a keyword-name string such as \"dsmr-mcp\").
 
-The args mirror the verified ~/.claude.json shape: SBCL is launched
-quiet, with the debugger disabled, ASDF required, the local-projects
-source tree pushed onto asdf:*central-registry* (preferring a non-tilde
-LISP_WORKSPACE, falling back to ~/SourceCode/lisp/), then the system is
-loaded and its run entry started on the stdio transport."
+The args mirror the verified ~/.claude.json shape with one hardening: the
+launcher keeps stdout free of everything except JSON-RPC.  SBCL is launched
+quiet, debugger disabled, with --no-userinit so the operator's ~/.sbclrc
+(and its Quicklisp quickload banner, which prints to stdout before any
+--eval form runs) never executes.  Because --no-userinit drops the .sbclrc
+Quicklisp bootstrap, the launcher loads Quicklisp's setup.lisp explicitly
+with its output redirected to *error-output* (and gracefully no-ops when
+setup.lisp is absent).  ASDF is required, the local-projects source tree is
+pushed onto asdf:*central-registry* (preferring a non-tilde LISP_WORKSPACE,
+falling back to ~/SourceCode/lisp/), the system is loaded with ASDF/UIOP
+compile+load chatter wrapped to *error-output*, and finally its run entry
+takes over a now-pristine stdout on the stdio transport."
   (%vec
    "--noinform"
    "--disable-debugger"
+   "--no-userinit"
    "--eval" "(require :asdf)"
+   ;; --no-userinit dropped the .sbclrc Quicklisp bootstrap; load setup.lisp
+   ;; explicitly so dependencies resolve, redirecting its "To load X:" /
+   ;; banner output to stderr and no-opping gracefully when it is absent.
+   "--eval"
+   (concatenate
+    'string
+    "(let ((s (merge-pathnames \"quicklisp/setup.lisp\" (user-homedir-pathname)))) "
+    "(when (probe-file s) "
+    "(let ((*standard-output* *error-output*)) (load s))))")
    "--eval"
    (concatenate
     'string
@@ -64,7 +81,10 @@ loaded and its run entry started on the stdio transport."
     "(when (and w (not (uiop:string-prefix-p \"~\" w))) w)) "
     "(namestring (merge-pathnames #P\"SourceCode/lisp/\" "
     "(user-homedir-pathname)))) asdf:*central-registry*)")
-   "--eval" (format nil "(asdf:load-system :~A)" system-name)
+   ;; ASDF/UIOP compile+load output also goes to stderr so the JSON-RPC
+   ;; channel (stdout) carries nothing until run takes over.
+   "--eval" (format nil "(let ((*standard-output* *error-output*)) (asdf:load-system :~A))"
+                    system-name)
    "--eval" (format nil "(~A:run :transport :stdio)" system-name)))
 
 (defun canonical-server-entry (&optional (system-name +dsmr-server-name+))
