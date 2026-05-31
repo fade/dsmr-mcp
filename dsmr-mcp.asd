@@ -95,6 +95,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/clhs"
                "dsmr-mcp/src/tools/clhs-lookup"
                "dsmr-mcp/src/install/config"
+               "dsmr-mcp/src/install/defaults"
                "dsmr-mcp/src/install/claude"
                "dsmr-mcp/src/install")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
