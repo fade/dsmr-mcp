@@ -129,3 +129,110 @@ connection to the attached image is live end-to-end. A structured
 `isError` with a `NETWORK_ERROR`-class message means the listener is
 unreachable or the connection dropped — see "Attached-mode degradation"
 below. Because the connection is opened eagerly at session
+initialize and reopened lazily on the next call after a drop, this probe
+doubles as a reconnect trigger.
+
+## Attached-mode degradation
+
+The Slynk listener `dsmr-mcp` attaches to is gone, or the connection
+dropped mid-call.
+
+- **Symptom.** `repl-eval` and the `inspect-*` verbs return a structured
+  `isError` whose message names a Slynk connection error
+  (`NETWORK_ERROR` class — "attach: Slynk connection error: ...").
+  Output and inspection verbs stop working; the rest of the protocol
+  (tools/list, filesystem verbs) keeps responding.
+- **Cause.** The attached image's Slynk listener is unreachable — the
+  host image was stopped or restarted, the listener was never started on
+  the configured `host:port`, or the TCP connection was severed
+  mid-eval.
+- **Behaviour (fail-closed, reconnect on next call).** Network errors
+  fail closed: the dispatcher catches the connection error, **discards
+  the cached connection**, and returns the structured `isError` — it
+  does **not** retry inside the same call, and it does **not** silently
+  fall back to a hermetic worker. The next call reopens the connection
+  lazily on demand. When a call reopens a previously-dropped connection,
+  its `stdout` is prefixed with a reconnect note warning that in-image
+  state may have reset (definitions, packages, and registered object
+  IDs from before the drop are gone).
+- **Check.** Confirm the Slynk listener is actually up on the configured
+  address. The target is whatever `DSMR_SLYNK_ATTACH` (or the
+  `:slynk-attach` keyword) points at — e.g. `127.0.0.1:4005`. A plain
+  TCP probe to that host:port tells you whether the listener is
+  accepting connections.
+- **Fix.** Bring the listener back up on the configured `host:port`
+  (start Slynk in the host image again), then **re-issue the call** —
+  the dispatcher reconnects on the next request. No server restart is
+  needed; the connection cache self-heals. Expect the one-time reconnect
+  note on the first successful call after recovery.
+
+## Hermetic-worker crash loop
+
+A session's hermetic worker keeps crashing, and calls for that session
+start failing fast.
+
+- **Symptom.** Tool calls for the affected session begin returning an
+  error immediately (fail-fast), with a message naming the **circuit
+  breaker** and a remaining cooldown. Earlier you may have seen a single
+  crash/reset notification followed by a normal call, then repeated
+  crashes.
+- **Cause.** The circuit breaker tripped. Each session gets exactly one
+  crash-reset notification per crash and the next call after a crash
+  normally succeeds against a fresh replacement worker — but if a
+  worker crashes **3 times within a 5-minute (300-second) window**, the
+  breaker trips for that session. While tripped, `get-or-assign-worker`
+  fails fast for a **60-second cooldown** instead of spawning yet
+  another replacement, so a genuinely broken workload (an eval that
+  reliably kills the worker) cannot burn the machine down in a tight
+  respawn loop.
+- **Check.** Call `pool-status` (hermetic mode only). Inspect
+  `pool_running`, `bound_count`, and the per-worker `state` entries to
+  see whether the session has a live worker or the breaker has removed
+  it. A repeatedly-shrinking `total_workers` for the session, paired
+  with the fail-fast error, confirms the crash loop.
+- **Fix.**
+  - **Wait out the window.** The breaker self-clears after the
+    60-second cooldown; the next call for the session then spawns a
+    fresh worker normally. If the underlying workload is transient, this
+    is the whole fix.
+  - **Reset manually.** Ending and re-establishing the session
+    (`release-session`) clears the breaker state immediately, so a
+    restarted session is not held back by a prior trip.
+  - **Clear a wedged worker.** If a worker is hung rather than crashing,
+    `pool-kill-worker` kills the bound worker without ending the
+    session; the next call spawns a fresh one. (Its reset variant also
+    clears the breaker for the session.)
+  - **Address the root cause.** A breaker that keeps tripping means the
+    workload itself reliably kills the worker — fix the offending code
+    or input rather than repeatedly resetting the breaker.
+
+## alive-lsp absence
+
+The syntax-intelligence verbs degrade because no alive-lsp server is
+available.
+
+- **Symptom.** `completions`, `hover`, `diagnostics`, and `code-actions`
+  return reduced or empty results compared to a fully-attached
+  alive-lsp. They do not hard-fail — the server stays up and the rest of
+  the verb surface is unaffected.
+- **Cause.** `dsmr-mcp` resolves an LSP server per project root with an
+  **attach-else-spawn** strategy: it first probes `127.0.0.1:8006` for
+  an already-running alive-lsp, and on refusal spawns a child SBCL
+  running alive-lsp. Both paths can be unavailable: no listener on 8006
+  **and** spawn disabled because `DSMR_ALIVE_LSP_DIR` is unset (spawn
+  requires a configured alive-lsp source tree). When neither attach nor
+  spawn succeeds, the LSP-backed verbs fall back to **in-process Eclector
+  parsing** (LSP-04) — enough for structural/paren-level answers, but
+  without alive-lsp's full completion/hover/diagnostic intelligence.
+- **Check.** Confirm whether an alive-lsp is reachable. Either something
+  should be listening on `127.0.0.1:8006`, or `DSMR_ALIVE_LSP_DIR`
+  should point at an alive-lsp checkout so the server can spawn its own.
+  With neither, you are on the Eclector fallback.
+- **Fix.** Point `dsmr-mcp` at a real alive-lsp:
+  - **Spawn mode.** Set `DSMR_ALIVE_LSP_DIR` to the alive-lsp source
+    checkout and restart the server. It will spawn a child alive-lsp on
+    an OS-assigned port on first use and cache it per project root.
+  - **Attach mode.** Start an alive-lsp listener on `127.0.0.1:8006`
+    before launching `dsmr-mcp`; the server attaches to it instead of
+    spawning. (`DSMR_LSP_STARTUP_TIMEOUT` bounds how long a spawn waits
+    for the server's startup line, default 30 s.)
