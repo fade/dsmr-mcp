@@ -1,0 +1,112 @@
+#+TITLE: dsmr-mcp
+#+SUBTITLE: DeepSky Systems Model-context-Reagent for Common Lisp
+
+=dsmr-mcp= is an [[https://modelcontextprotocol.io][Model Context Protocol]] (MCP)
+server that lets an AI agent work *inside your live Common Lisp image*. It
+connects an MCP client to a running Lisp over Slynk, so an agent can evaluate
+code, inspect live objects and threads, edit source structurally, run tests,
+navigate a codebase, and look up documentation — in the same image you are
+developing in.
+
+* TL;DR — Quickstart
+
+Prerequisites: SBCL, Quicklisp, and the source on your ASDF source path (e.g.
+under =~/SourceCode/lisp/=).
+
+#+begin_src sh
+# 1. Load and smoke-test the server (stdio transport, the default)
+sbcl --non-interactive \
+     --eval '(ql:quickload :dsmr-mcp)' \
+     --eval '(dsmr-mcp:run)'
+#+end_src
+
+To attach to a Lisp image you are already running, start a Slynk listener in
+that image and point dsmr-mcp at it:
+
+#+begin_src sh
+DSMR_MODE=attached DSMR_SLYNK_ATTACH=127.0.0.1:4005 \
+  sbcl --non-interactive \
+       --eval '(ql:quickload :dsmr-mcp)' \
+       --eval '(dsmr-mcp:run)'
+#+end_src
+
+No image to attach to? Use =DSMR_MODE=hermetic= (a forked, crash-isolated SBCL
+worker pool) or =DSMR_MODE=auto= (attach if a listener is reachable, else
+hermetic). Then wire it into your MCP client (Claude Code and others) — see
+[[file:docs/configuration.org][Configuration]] for the client setup and the full
+environment-variable reference.
+
+Verify with a trivial =repl-eval= round trip: evaluating =(+ 1 2)= should
+return =3=.
+
+* What it is
+
+Lisp development is *image-based*: a developer builds up a running world of
+definitions, packages, threads, CLOS instances, and application state over a
+session. Conventional AI coding tools ignore that — they operate on files and a
+freshly spawned process, discarding the live context that makes Lisp productive.
+
+=dsmr-mcp= takes the opposite stance, the *attached-image-first* thesis: the
+agent should work in the same running world the developer already inhabits, where
+a redefined function takes effect immediately, a live CLOS instance can be
+inspected, and a restart can be invoked. It is the Common Lisp analogue of a
+language server for an AI — a structured set of verbs over a live image.
+
+The name expands to *DeepSky Systems Model-context-Reagent for Common Lisp*.
+
+* Intended use case
+
+The intended use is a developer *pair-programming with an AI agent in their own
+running Lisp*. The developer starts their project image with a Slynk listener;
+dsmr-mcp attaches to it; the agent then has the same live, image-resident tools
+the developer has at the REPL. It is explicitly a *single-operator, localhost
+developer tool* — not a multi-tenant or hosted service.
+
+Who uses it:
+
+- A Common Lisp developer who wants an AI agent to work in their live image.
+- An AI agent (Claude and others) acting as that developer's pair, via an MCP
+  client.
+
+The operator is the trust root: they already trust the agent to evaluate code in
+their image. See the [[file:docs/threat-model.org][threat model]] for the full
+posture — in short, =dsmr-mcp= is a trust-amplifier for an agent the operator
+already trusts, *not* a containment layer against a hostile one.
+
+* What you get
+
+- *28 verbs* across REPL evaluation and build (=repl-eval=, =load-system=,
+  =run-tests=), filesystem access (=fs-*=), structural Lisp editing (=lisp-*=),
+  code intelligence (=code-find=, =code-describe=, =clgrep-search=,
+  =clhs-lookup=, …), live-image inspection (=inspect-*=), an LSP bridge
+  (=lsp-*=), hermetic operations (=pool-status=, =pool-kill-worker=), and
+  project scaffolding (=project-scaffold=).
+- *Three transports*: stdio (default), TCP, and Streamable HTTP (with a bundled
+  bridge). Loopback-only by default.
+- *Three execution modes*: attached, hermetic, and auto.
+- A *filesystem sandbox* as the one enforced agent-facing control, structured
+  logging, a reviewable threat model, and an operations runbook.
+
+* Documentation
+
+The full manual lives in [[file:docs/index.org][=docs/=]]:
+
+- [[file:docs/introduction.org][Introduction]] — overview and the attached-image-first thesis.
+- [[file:docs/installation.org][Installation & Build]] — prerequisites, loading, running, testing.
+- [[file:docs/configuration.org][Configuration]] — environment variables, modes, transports, MCP-client wiring.
+- [[file:docs/architecture.org][Architecture]] — how a request flows from client to image.
+- [[file:docs/modes-and-transports.org][Modes & Transports]] — when to use each mode and transport.
+- [[file:docs/tools.org][Tool reference]] — every verb, generated from the live registry.
+- [[file:docs/operations.org][Operations & Runbook]] — health checks and field recipes.
+- [[file:docs/threat-model.org][Threat model]] — trust boundaries and the STRIDE register.
+- [[file:docs/release-notes.org][Release notes]].
+
+* Status
+
+v0.1.0 — first tagged release. See [[file:docs/release-notes.org][the release notes]].
+
+* License
+
+AGPL-3.0-or-later
+
+© Brian O'Reilly / DeepSky Systems

@@ -1,0 +1,111 @@
+#+TITLE: dsmr-mcp — Introduction
+#+SUBTITLE: An MCP server that puts an AI agent to work inside your live Common Lisp image
+
+This is the front door to the dsmr-mcp manual. It explains what the
+project is, the problem it solves, who it is for, and the trust posture
+you sign up for by running it. For the rest of the manual, start from the
+[[file:index.org][manual index]].
+
+* What dsmr-mcp is
+
+dsmr-mcp is a Model Context Protocol (MCP) server for Common Lisp. It
+gives an AI agent a verb surface — a catalogue of tools spoken over
+JSON-RPC 2.0 — for writing, evaluating, and debugging Lisp /inside a
+developer's live, running image/.
+
+The defining choice is the *attached-image-first thesis*: the agent works
+inside the developer's long-running Lisp process, where the definitions,
+packages, threads, CLOS instances, and application state already exist,
+rather than in a fork that has to learn the world from scratch. The agent
+sees the same world the developer sees. When you ask it to re-evaluate a
+function, inspect a condition at a live break, or enumerate the running
+threads, it is operating on the real image you are developing in.
+
+When there is no image to attach to — or when you deliberately want an
+isolated worker for parallel, throwaway work — dsmr-mcp falls back to a
+*hermetic* mode: a forked SBCL child process per session, reachable over a
+documented JSON-RPC wire. Attached mode is the default; hermetic is the
+fallback. The fallback is never silent: a call that asked for the attached
+image and could not reach it fails closed with a structured error rather
+than quietly swapping in a worker. See [[file:architecture.org][Architecture]] for how the two modes
+are wired together.
+
+* The problem it solves
+
+Common Lisp development is image-resident by nature. A Lisp developer does
+not edit-compile-restart; they grow a running image incrementally,
+redefining functions and classes against live state, inspecting objects in
+place, and recovering from errors at an interactive break without losing
+the world. The image /is/ the development environment — and for the kinds
+of systems this tooling targets (long-lived strategy servers, McCLIM
+frames, market-data collectors, MUD daemons) restarting to pick up a
+change is expensive or impossible.
+
+A tool that gives an AI agent a fresh, empty subprocess for every request
+throws all of that away. The agent cannot see the state the developer is
+debugging, cannot redefine against the running system, and pays a
+cold-start cost on every call. dsmr-mcp is built the other way around: the
+agent's tools reach into the image the developer already has open, so the
+agent can pair-program in the same live context — definitions, restarts,
+conditions, threads, and accumulated application state all persisting
+across calls.
+
+* Who uses it
+
+dsmr-mcp is for a developer pair-programming with an AI agent in their own
+running Lisp. The operator boots their development image (with a Slynk
+listener), points dsmr-mcp at it, and connects an MCP client such as
+Claude Code. From then on the agent can evaluate, edit, inspect, and test
+inside that image alongside the human.
+
+Its primary home is the DeepSky Systems AGPL Lisp toolchain and developers
+working in that style. It is a clean-room, independent AGPL-3.0-or-later
+reimplementation in the same problem space as
+[[https://github.com/cl-ai-project/cl-mcp][cl-mcp]] — which remains a fine
+choice for teams that prefer the hermetic-worker-first posture. dsmr-mcp
+inverts that default for the attached-image-first workflow. See
+[[file:installation.org][Installation]] to get a server running.
+
+* Trust posture
+
+dsmr-mcp is a *trusted, localhost-only developer tool — not a security
+sandbox against a malicious agent*. The foundational assumption is that
+the operator already trusts the agent to evaluate arbitrary code in their
+image: arbitrary eval is the product, not a vulnerability. There is no
+privilege boundary between the agent and the operator's image — an agent
+that can call ~repl-eval~ can already do anything the image can. The
+server binds to loopback by default and ships one enforced agent-facing
+guardrail (the filesystem project-root sandbox), but that is a guard
+against accidental reach, not containment against an adversary who also
+has eval. In short: dsmr-mcp is a trust-amplifier for an agent you already
+trust, not a containment layer for one you do not. The full statement,
+including trust boundaries and the STRIDE register, is in the
+[[file:threat-model.org][Threat model]].
+
+* What you get
+
+Twenty-eight shipped verbs span the developer workflow:
+
+- *REPL evaluation* — evaluate Common Lisp forms in the attached image and
+  get back printed values, captured output, and structured error context
+  (condition type, message, restarts, backtrace).
+- *Filesystem and structural Lisp editing* — sandboxed file read/write
+  plus CST-aware editing of top-level forms that preserves formatting and
+  comments.
+- *Code intelligence* — Lisp-aware semantic grep, symbol definition and
+  description lookup, and cross-reference search.
+- *Live-image inspection* — drill into held objects, threads, restarts,
+  and the current debugger condition.
+- *An LSP bridge* — completions, hover, diagnostics, and code actions via
+  alive-lsp, degrading gracefully when it is absent.
+- *Scaffolding and HyperSpec lookup* — generate a complete project
+  skeleton, and look symbols up in the local Common Lisp HyperSpec.
+
+The server speaks three transports: *stdio* (the default, launched as a
+subprocess by an MCP client), *TCP* (threaded, multi-client,
+line-delimited JSON-RPC), and *Streamable HTTP* (over Hunchentoot, for
+Claude Code URL mode). A bundled stdio-to-TCP bridge binary lets stdio-only
+clients reach a TCP server with no client-side runtime.
+
+For the complete, per-verb reference and transport details, follow the
+[[file:index.org][manual index]].
