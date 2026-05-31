@@ -71,15 +71,25 @@ a spawned server cannot load dsmr-mcp."
 Reused verbatim so this test guards the SAME launch command operators run."
   (coerce (gethash "args" (canonical-server-entry)) 'list))
 
-(defun %spawn-server ()
+(defun %spawn-server (&key project-root)
   "Spawn a child sbcl running dsmr-mcp :stdio with the generated launch args.
 Returns a UIOP process-info with :stream input/output/error.  The caller
-closes the input stream to trigger EOF and reaps the process."
-  (uiop:launch-program
-   (cons (%sbcl-path) (%launch-args))
-   :input        :stream
-   :output       :stream
-   :error-output :stream))
+closes the input stream to trigger EOF and reaps the process.
+
+When PROJECT-ROOT is supplied, DSMR_PROJECT_ROOT is set in the CHILD's
+environment to that path so run seeds the stdio session's root at launch
+(precedence: explicit :project-root > DSMR_PROJECT_ROOT > getcwd).  The child's
+cwd is not relied upon -- it is harder to control across spawn backends, and the
+env var is exactly the launch seam the operator's .envrc itself exports."
+  (apply #'uiop:launch-program
+         (cons (%sbcl-path) (%launch-args))
+         :input        :stream
+         :output       :stream
+         :error-output :stream
+         (when project-root
+           (list :environment
+                 (cons (format nil "DSMR_PROJECT_ROOT=~A" (namestring project-root))
+                       (sb-ext:posix-environ))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; JSON-RPC line plumbing
@@ -149,7 +159,7 @@ Non-JSON lines (a stray banner that slipped through) are ignored defensively."
   (and (hash-table-p obj)
        (equal "elicitation/create" (gethash "method" obj))))
 
-(defun %drain-stdout (out &key (deadline-seconds 30))
+(defun %drain-stdout (out &key (deadline-seconds 120))
   "Read every line available on OUT until EOF or DEADLINE-SECONDS elapse,
 returning the parsed JSON objects (non-JSON lines dropped).  The caller closes
 the child's stdin first so the child reaches EOF, exits, and closes its stdout
@@ -169,6 +179,55 @@ end, terminating this drain."
 
 (defun %count-elicitation-creates (objs)
   (count-if #'%elicitation-create-p objs))
+
+(defun %result-with-id-p (obj id)
+  "True when OBJ is a JSON-RPC response (result OR error) bearing ID.
+Used by the handshake reader to detect that a specific request has been
+answered -- proof the server processed everything up to and including it."
+  (and (hash-table-p obj)
+       (eql id (gethash "id" obj))
+       (or (nth-value 1 (gethash "result" obj))
+           (nth-value 1 (gethash "error" obj)))))
+
+(defun %send-line (line in)
+  "Write LINE to the child's stdin and flush it immediately, so the child's
+single-threaded read loop sees it without waiting on buffer fill."
+  (write-line line in)
+  (finish-output in))
+
+(defun %read-until (out predicate accumulator &key (deadline-seconds 120))
+  "Read JSON-RPC lines from OUT, pushing each parsed object onto ACCUMULATOR (a
+list, returned extended), until one SATISFIES PREDICATE or the deadline / EOF is
+reached.  Each individual READ-LINE is itself bounded so a child that never
+answers cannot pin the reader forever.  Returns two values: the (reverse-built)
+accumulator with newly-read objects appended in arrival order, and the matching
+object (or NIL when the deadline/EOF was hit first).
+
+This is the core of the request/response handshake: rather than blasting all
+input and guessing at timing, each step writes its line(s) then waits here for
+the server's own acknowledgement (a specific result id, or an
+elicitation/create) before proceeding.  Waiting on the server's reply -- not a
+wall clock -- is what makes the driver deterministic across the child's
+variable boot time."
+  (let ((deadline (+ (get-internal-real-time)
+                     (* deadline-seconds internal-time-units-per-second)))
+        (match nil)
+        (objs accumulator))
+    (loop
+      (when (> (get-internal-real-time) deadline) (return))
+      (let* ((budget (max 1 (/ (- deadline (get-internal-real-time))
+                               internal-time-units-per-second)))
+             (line (handler-case
+                       (sb-ext:with-timeout budget (read-line out nil :eof))
+                     (sb-ext:timeout () :eof))))
+        (when (eq line :eof) (return))
+        (let ((obj (%parse-json-line line)))
+          (when obj
+            (push obj objs)
+            (when (funcall predicate obj)
+              (setf match obj)
+              (return))))))
+    (values objs match)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Scenario driver
@@ -206,16 +265,25 @@ that content first.  Always tear the directory down."
 stdout, and return the parsed response objects.
 
 The stdin sequence: initialize, notifications/initialized, fs-set-project-root,
-trigger.  The first tools/call line is fs-set-project-root, on which the
-intercept is a no-op (root still NIL); that line's dispatch sets the root.  The
-NEXT tools/call (the trigger) is the first qualifying one, so it fires the
-prompt.  When ELICITATION and RESPONSE-ACTION are set, the elicitation response
-line is queued immediately after the trigger so the in-line read loop consumes
-it.  When SECOND-TRIGGER is true, a second trigger follows to prove the
-once-per-session guard yields no further prompt.
+trigger.  The launch root is seeded (via DSMR_PROJECT_ROOT in the child env) to
+the non-qualifying `/tmp` directory -- /tmp holds no `*.asd`, so the intercept
+no-ops on the first tools/call line (fs-set-project-root), preserving the
+original pre-launch-seeding precondition.  That line's dispatch then re-roots
+the session to ROOT (a qualifying temp dir).  The NEXT tools/call (the trigger)
+is the first qualifying one, so it fires the prompt against ROOT.  When
+ELICITATION and RESPONSE-ACTION are set, the elicitation response line is queued
+immediately after the trigger so the in-line read loop consumes it.  When
+SECOND-TRIGGER is true, a second trigger follows to prove the once-per-session
+guard yields no further prompt.
+
+Seeding the launch root at `/tmp` is necessary because run now seeds the
+session's project root at launch (parity with the tcp/http transports): without
+the override the launch root would be the harness cwd (the dsmr-mcp project
+directory), which IS qualifying, and the intercept would fire on the
+fs-set-project-root line itself -- writing a `.envrc` into the project tree.
 
 stdin is closed after the last line so the child reaches EOF and exits."
-  (let ((proc (%spawn-server))
+  (let ((proc (%spawn-server :project-root #p"/tmp/"))
         (root-str (namestring root)))
     (unwind-protect
          (let ((in  (uiop:process-info-input proc))
@@ -231,7 +299,37 @@ stdin is closed after the last line so the child reaches EOF and exits."
            (force-output in)
            ;; Close stdin -> child hits EOF on the loop -> exits cleanly.
            (close in)
-           (prog1 (%drain-stdout out :deadline-seconds 30)
+           (prog1 (%drain-stdout out :deadline-seconds 120)
+             (ignore-errors (uiop:wait-process proc))))
+      (ignore-errors (close (uiop:process-info-input proc)))
+      (ignore-errors (uiop:terminate-process proc))
+      (ignore-errors (uiop:wait-process proc)))))
+
+(defun %run-launch-seeded-scenario (root &key elicitation (response-action "accept"))
+  "Spawn a real server with the launch root seeded via DSMR_PROJECT_ROOT in the
+CHILD environment (NO fs-set-project-root sent), feed the client sequence over
+stdin, drain stdout, and return the parsed response objects.
+
+The stdin sequence is initialize, notifications/initialized, then a SINGLE
+tools/call trigger.  Because the root is already seeded at launch, that first
+qualifying tools/call is the one that fires the prompt -- proving the
+seeded-at-launch behavior end-to-end with no prior re-root.  When ELICITATION
+and RESPONSE-ACTION are set, the elicitation response line is queued right after
+the trigger so the in-line read loop consumes it.
+
+stdin is closed after the last line so the child reaches EOF and exits."
+  (let ((proc (%spawn-server :project-root root)))
+    (unwind-protect
+         (let ((in  (uiop:process-info-input proc))
+               (out (uiop:process-info-output proc)))
+           (write-line (%initialize-line :elicitation elicitation) in)
+           (write-line (%initialized-line) in)
+           (write-line (%trigger-line 1) in)
+           (when (and elicitation response-action)
+             (write-line (%elicit-response-line :action response-action) in))
+           (force-output in)
+           (close in)
+           (prog1 (%drain-stdout out :deadline-seconds 120)
              (ignore-errors (uiop:wait-process proc))))
       (ignore-errors (close (uiop:process-info-input proc)))
       (ignore-errors (uiop:terminate-process proc))
@@ -240,6 +338,28 @@ stdin is closed after the last line so the child reaches EOF and exits."
 ;;; ---------------------------------------------------------------------------
 ;;; Scenarios (mirror 13-UAT.md, all assert hard)
 ;;; ---------------------------------------------------------------------------
+
+(define-test stdio-elicitation-launch-seeded-root-prompts
+  "Launch-time seeding: with the root seeded at launch via DSMR_PROJECT_ROOT and
+NO fs-set-project-root sent, the FIRST qualifying tools/call fires exactly ONE
+elicitation/create; on accept the .envrc is created byte-for-byte equal to the
+template.  This proves run seeds the stdio session root at launch (the prompt
+fires without any prior re-root)."
+  (unless (%spawnable-p)
+    (skip "cannot spawn a server subprocess (sbcl / quicklisp setup.lisp absent)"))
+  (%with-temp-root (root)
+    (let* ((objs (%run-launch-seeded-scenario root :elicitation t
+                                                   :response-action "accept"))
+           (prompts (remove-if-not #'%elicitation-create-p objs)))
+      (is = 1 (length prompts)
+          "exactly one elicitation/create on the first qualifying tools/call")
+      (when (= 1 (length prompts))
+        (is = 1 (gethash "id" (first prompts)) "first prompt id is 1"))
+      (let ((envrc (merge-pathnames ".envrc" root)))
+        (true (probe-file envrc) ".envrc written on accept")
+        (when (probe-file envrc)
+          (is string= (read-envrc-template) (uiop:read-file-string envrc)
+              ".envrc is byte-for-byte the template"))))))
 
 (define-test stdio-elicitation-accept-writes-envrc
   "Accept + once-per-session: exactly ONE elicitation/create (id 1) despite two
