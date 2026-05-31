@@ -15,6 +15,8 @@
 ;;;;   --print      print the canonical JSON snippet to stdout instead of
 ;;;;                writing ~/.claude.json (for non-Claude agents)
 ;;;;   --no-skill   do not copy the scaffold skill into ~/.claude/skills/
+;;;;   --no-envrc-defaults  skip the interactive site-wide .envrc defaults step
+;;;;                (otherwise it runs after the install when stdin is a tty)
 ;;;;
 ;;;; --keep/--migrate/--replace are mutually exclusive; the last one wins.
 ;;;; Like scripts/dev-boot.lisp, this resolves the local-projects source
@@ -56,16 +58,18 @@
 ;;; Parse flags.
 (let ((on-existing :keep)
       (agent :claude-code)
-      (install-skill t))
+      (install-skill t)
+      (site-defaults :interactive))
   (dolist (arg (uiop:command-line-arguments))
     (cond ((string= arg "--keep")     (setf on-existing :keep))
           ((string= arg "--migrate")  (setf on-existing :remove))
           ((string= arg "--replace")  (setf on-existing :replace))
           ((string= arg "--print")    (setf agent :print))
           ((string= arg "--no-skill") (setf install-skill nil))
+          ((string= arg "--no-envrc-defaults") (setf site-defaults :skip))
           ((or (string= arg "-h") (string= arg "--help"))
            (format t "~&Usage: sbcl --script scripts/install.lisp ~
-[--keep|--migrate|--replace] [--print] [--no-skill]~%")
+[--keep|--migrate|--replace] [--print] [--no-skill] [--no-envrc-defaults]~%")
            (uiop:quit 0))
           (t
            (format *error-output* "~&[install] unknown flag: ~A~%" arg)
@@ -79,4 +83,5 @@
   (funcall (read-from-string "dsmr-mcp/src/install:install")
            :agent agent
            :on-existing-cl-mcp on-existing
-           :install-skill install-skill))
+           :install-skill install-skill
+           :site-defaults site-defaults))
