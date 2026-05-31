@@ -33,7 +33,8 @@
   (:use #:cl #:parachute)
   (:import-from #:dsmr-mcp/src/envrc-init
                 #:maybe-prompt-and-write-envrc
-                #:lisp-project-without-envrc-p)
+                #:lisp-project-without-envrc-p
+                #:lisp-project-envrc-needs-setup-p)
   (:import-from #:dsmr-mcp/src/envrc-template
                 #:read-envrc-template)
   (:import-from #:dsmr-mcp/src/state
@@ -136,18 +137,27 @@ no-op (prompted flag set) and does not write again."
 ;;; ---------------------------------------------------------------------------
 
 (define-test no-prompt-when-envrc-exists
-  "A root that already has .envrc yields a false predicate, no write, and the
-original content is preserved (no clobber)."
+  "A root whose .envrc is already complete (exports DSMR_SLYNK_ATTACH) yields a
+false create predicate AND a false update predicate: neither trigger fires, no
+round-trip starts, and the original content is preserved (no clobber)."
   (with-temp-project-root (s root)
     (write-fixture-file root "foo.asd" "x")
-    (write-fixture-file root ".envrc" "ORIGINAL")
+    (write-fixture-file root ".envrc"
+                        "ORIGINAL
+export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+")
     (setf (session-elicitation-p s) t)
     (false (lisp-project-without-envrc-p root)
-           "an existing .envrc makes the project non-qualifying")
+           "an existing .envrc makes the create predicate false")
+    (false (lisp-project-envrc-needs-setup-p root)
+           "a complete .envrc makes the update predicate false")
     ;; No router needed: the intercept short-circuits before any round-trip.
     (false (maybe-prompt-and-write-envrc s (make-string-output-stream))
-           "no write when .envrc already exists")
-    (is string= "ORIGINAL" (uiop:read-file-string (merge-pathnames ".envrc" root))
+           "no write when a complete .envrc already exists")
+    (is string= "ORIGINAL
+export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+"
+        (uiop:read-file-string (merge-pathnames ".envrc" root))
         "existing .envrc content must be preserved")))
 
 ;;; ---------------------------------------------------------------------------
@@ -197,3 +207,93 @@ content and lives at root/.envrc (resolved through the write jail)."
            "no .envrc written on decline")
     (true (session-envrc-prompted-p s)
           "prompted flag should be set even on decline")))
+
+;;; ---------------------------------------------------------------------------
+;;; Update path: an existing .envrc that lacks the dsmr-mcp setup
+;;; ---------------------------------------------------------------------------
+
+(define-test needs-setup-predicate
+  "lisp-project-envrc-needs-setup-p is true only for a *.asd dir whose existing
+.envrc lacks DSMR_SLYNK_ATTACH; false for a complete .envrc, no .envrc, no
+*.asd, or a nil root."
+  (with-temp-project-root (s root)
+    (setf (session-elicitation-p s) nil) ; s unused by the predicate; touch it.
+    ;; No *.asd yet, no .envrc.
+    (false (lisp-project-envrc-needs-setup-p root)
+           "false with neither *.asd nor .envrc")
+    (false (lisp-project-envrc-needs-setup-p nil) "false for a nil root")
+    ;; .envrc present but still no *.asd -> not a Lisp project.
+    (write-fixture-file root ".envrc" "export FOO=bar
+")
+    (false (lisp-project-envrc-needs-setup-p root)
+           "false without a *.asd even when an incomplete .envrc exists")
+    ;; Now a real project with an incomplete .envrc -> needs setup.
+    (write-fixture-file root "foo.asd" "x")
+    (true (lisp-project-envrc-needs-setup-p root)
+          "true for a *.asd dir whose .envrc lacks DSMR_SLYNK_ATTACH")
+    ;; The create predicate must be false here (an .envrc exists).
+    (false (lisp-project-without-envrc-p root)
+           "create predicate is false once an .envrc exists")
+    ;; A complete .envrc (carries the marker export) is never flagged.
+    (write-fixture-file root ".envrc" "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+")
+    (false (lisp-project-envrc-needs-setup-p root)
+           "false once the .envrc exports DSMR_SLYNK_ATTACH")))
+
+(define-test update-appends-on-accept
+  "A qualifying needs-setup root + thread-driven accept appends the dsmr-mcp
+managed block while preserving the user's original content (append, not
+clobber)."
+  (with-temp-project-root (s root)
+    (write-fixture-file root "foo.asd" "x")
+    (write-fixture-file root ".envrc" "export FOO=bar
+")
+    (setf (session-elicitation-p s) t)
+    (true (lisp-project-envrc-needs-setup-p root)
+          "qualifying needs-setup project before the prompt")
+    (true (%prompt-with-consent s "accept")
+          "accept should append and return true")
+    (let ((text (uiop:read-file-string (merge-pathnames ".envrc" root))))
+      (true (search "FOO=bar" text)
+            "the user's original line is preserved")
+      (true (search "DSMR_SLYNK_ATTACH" text)
+            "the dsmr-mcp managed block was appended")
+      (true (session-envrc-prompted-p s) "prompted flag set after the update"))))
+
+(define-test update-decline-writes-nothing
+  "A thread-driven decline on a needs-setup root leaves the .envrc unchanged."
+  (with-temp-project-root (s root)
+    (write-fixture-file root "foo.asd" "x")
+    (write-fixture-file root ".envrc" "export FOO=bar
+")
+    (setf (session-elicitation-p s) t)
+    (false (%prompt-with-consent s "decline")
+           "decline should not append and should return nil")
+    (is string= "export FOO=bar
+" (uiop:read-file-string (merge-pathnames ".envrc" root))
+        "the .envrc is unchanged on decline")
+    (true (session-envrc-prompted-p s)
+          "prompted flag set even on decline")))
+
+(define-test update-no-double-append
+  "An .envrc that already exports DSMR_SLYNK_ATTACH yields a false predicate, no
+prompt fires, and the file is left unchanged (idempotent)."
+  (with-temp-project-root (s root)
+    (write-fixture-file root "foo.asd" "x")
+    (write-fixture-file root ".envrc"
+                        "export FOO=bar
+export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+")
+    (setf (session-elicitation-p s) t)
+    (false (lisp-project-envrc-needs-setup-p root)
+           "a complete .envrc does not need setup")
+    ;; No router: neither trigger state qualifies, so no round-trip is started.
+    (false (maybe-prompt-and-write-envrc s (make-string-output-stream))
+           "no prompt and no write for a complete .envrc")
+    (is string= "export FOO=bar
+export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+"
+        (uiop:read-file-string (merge-pathnames ".envrc" root))
+        "the complete .envrc is left unchanged")
+    (false (session-envrc-prompted-p s)
+           "prompted flag stays nil when neither trigger state qualifies")))

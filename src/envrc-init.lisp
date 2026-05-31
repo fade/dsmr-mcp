@@ -64,6 +64,7 @@
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
   (:export #:lisp-project-without-envrc-p
+           #:lisp-project-envrc-needs-setup-p
            #:maybe-prompt-and-write-envrc
            #:envrc-elicitation-schema))
 
@@ -83,6 +84,23 @@ already exists makes the predicate false, which is the no-clobber guard."
        (not (probe-file (merge-pathnames ".envrc" project-root)))
        t))
 
+(defun lisp-project-envrc-needs-setup-p (project-root)
+  "Return T when PROJECT-ROOT names a Lisp project (`*.asd` present) whose
+`.envrc` EXISTS but does NOT export `DSMR_SLYNK_ATTACH` -- the essential
+dsmr-mcp variable, present in every template-written or hand-configured-complete
+`.envrc`. This is the update trigger gate: an `.envrc` created from the template
+already carries the marker, so it is never re-nagged, and a hand-written one that
+already exports it is respected. Nil-safe: a NIL root yields NIL. The `.envrc`
+is read under IGNORE-ERRORS so an unreadable file yields NIL rather than an
+error."
+  (and project-root
+       (some #'identity (directory (merge-pathnames "*.asd" project-root)))
+       (let ((envrc (merge-pathnames ".envrc" project-root)))
+         (and (probe-file envrc)
+              (let ((text (ignore-errors (uiop:read-file-string envrc))))
+                (and text (not (search "DSMR_SLYNK_ATTACH" text))))))
+       t))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Wire-string coercion
 ;;; ---------------------------------------------------------------------------
@@ -94,6 +112,31 @@ SBCL; a base-string that reaches the JSON-RPC wire serializes as a
 `#A(... BASE-CHAR ...)` reader literal that breaks framing. Coercing here keeps
 the round-trip's wire payload safe."
   (map 'string #'identity s))
+
+;;; ---------------------------------------------------------------------------
+;;; Managed append block (marker-delimited)
+;;; ---------------------------------------------------------------------------
+
+(defun envrc-managed-block ()
+  "Return the dsmr-mcp managed `.envrc` block as an element-type CHARACTER
+string. The block is wrapped in `# >>> dsmr-mcp ... >>>` / `# <<< dsmr-mcp <<<`
+markers so it can be located, re-edited, or removed by hand, and carries the
+same export lines (values and forms) as the body of
+templates/dsmr-mcp.envrc.template -- without that file's header comment. It is
+appended verbatim to an existing `.envrc` that lacks the dsmr-mcp setup; the
+user's own lines are never touched. Built via FORMAT then coerced through
+%wire-string so nothing on it is a simple-base-string."
+  (%wire-string
+   (format nil
+"# >>> dsmr-mcp (added automatically; edit or remove freely) >>>
+export LISP_WORKSPACE=\"${LISP_WORKSPACE:-$HOME/SourceCode/lisp/}\"
+export SLYNK_HOST=\"${SLYNK_HOST:-127.0.0.1}\"
+export SLYNK_PORT=\"${SLYNK_PORT:-4005}\"
+export DSMR_MODE=auto
+export DSMR_SLYNK_ATTACH=\"${SLYNK_HOST}:${SLYNK_PORT}\"
+export DSMR_LOG_LEVEL=info
+# <<< dsmr-mcp <<<
+")))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Elicitation schema
@@ -211,7 +254,12 @@ that, on the single stdio thread, nothing else could ever satisfy."
 
 (defparameter +envrc-prompt-message+
   "No .envrc found. Create one for this project?"
-  "The human-readable prompt shown to the operator for the .envrc consent.")
+  "The human-readable prompt shown to the operator for the .envrc CREATE consent.")
+
+(defparameter +envrc-update-message+
+  "Your .envrc is missing the dsmr-mcp setup. Append it? You'll need to run 'direnv allow' again."
+  "The human-readable prompt shown when an existing .envrc lacks the dsmr-mcp
+setup and the operator is asked to APPEND it.")
 
 (defparameter +envrc-prompt-timeout+ 30
   "Seconds to wait for the operator's elicitation response before giving up.")
@@ -244,15 +292,63 @@ submitted `confirm` is explicitly false or when a `.envrc` already exists
        (log-event :info "envrc.write.created" "path" (namestring target))
        t))))
 
-(defun maybe-prompt-and-write-envrc (session out &optional in-reader)
-  "Launch-time consent gate for creating a project `.envrc`.
+(defun %append-envrc-on-accept (session content)
+  "Append the dsmr-mcp managed block to an EXISTING `.envrc` under the session
+root when the operator confirmed. Returns T when the block was appended, NIL
+otherwise. The write goes only through the session write jail
+(ensure-write-path) and is skipped when the operator's submitted `confirm` is
+explicitly false, when the file no longer exists (never created here -- the
+create path owns that), or when the file already exports `DSMR_SLYNK_ATTACH`
+(re-checked here so a concurrent edit cannot double-append). The user's existing
+lines are preserved: the block is appended after a blank-line separator (an extra
+newline is added when the file does not already end in one, so lines never join).
+CONTENT is the accept response content."
+  ;; Honour an explicit false confirm; a missing confirm defaults to write
+  ;; (the accept action already expressed consent).
+  (when (and (hash-table-p content)
+             (nth-value 1 (gethash "confirm" content))
+             (not (gethash "confirm" content)))
+    (log-event :info "envrc.append.declined-in-content")
+    (return-from %append-envrc-on-accept nil))
+  (let* ((root   (session-project-root session))
+         (target (ensure-write-path ".envrc" root)))
+    (cond
+      ((null target)
+       (log-event :warn "envrc.append.outside-jail")
+       nil)
+      ((not (probe-file target))
+       (log-event :info "envrc.append.missing-no-create"
+                  "path" (namestring target))
+       nil)
+      (t
+       (let ((existing (ignore-errors (uiop:read-file-string target))))
+         (cond
+           ((null existing)
+            (log-event :warn "envrc.append.unreadable" "path" (namestring target))
+            nil)
+           ;; Idempotency re-check: a `.envrc` that already carries the marker
+           ;; export is left untouched (no double-append).
+           ((search "DSMR_SLYNK_ATTACH" existing)
+            (log-event :info "envrc.append.already-present"
+                       "path" (namestring target))
+            nil)
+           (t
+            (let* ((ends-nl (and (plusp (length existing))
+                                 (char= #\Newline
+                                        (char existing (1- (length existing))))))
+                   ;; A blank line precedes the block. When the file already
+                   ;; ends in a newline a single newline yields that blank line;
+                   ;; otherwise two are needed (one to end the last line, one
+                   ;; blank) so the appended marker never joins a user line.
+                   (sep (if ends-nl (format nil "~%") (format nil "~%~%")))
+                   (full (%wire-string
+                          (concatenate 'string existing sep (envrc-managed-block)))))
+              (write-file-string-atomically target full)
+              (log-event :info "envrc.append.added" "path" (namestring target))
+              t))))))))
 
-A no-op (returns NIL, writes nothing, sets no flag) unless ALL hold: the client
-declared elicitation, this session has not been prompted yet, and the session's
-project root is a Lisp project (`*.asd` present) with no `.envrc`. When all
-hold, set the once-per-session guard FIRST (so a decline / cancel / timeout
-still suppresses any later prompt this session), obtain the operator's consent,
-and on :accept write `.envrc` through the write jail.
+(defun %prompt-and-act (session out in-reader message on-accept-fn)
+  "Run one consent round-trip for MESSAGE and act on the verdict.
 
 The consent action is obtained on ONE of two paths keyed on IN-READER:
   - IN-READER supplied (stdio, single-threaded): drive the round-trip in-line
@@ -260,28 +356,56 @@ The consent action is obtained on ONE of two paths keyed on IN-READER:
   - IN-READER nil (tests / non-stdio): send-elicitation-request, which blocks
     on a condition variable until another thread routes the response.
 
-OUT is the JSON-RPC output stream. Returns T when a `.envrc` was written, NIL
-otherwise."
+Both create and update share this front half (same flat `confirm` schema); they
+differ only in MESSAGE and ON-ACCEPT-FN. The action is validated before acting
+(V5): only the known keywords are honoured, and only :accept reaches ON-ACCEPT-FN
+(called with SESSION and the response CONTENT). Returns whatever ON-ACCEPT-FN
+returns on :accept, NIL otherwise."
+  (let ((schema (envrc-elicitation-schema)))
+    (multiple-value-bind (action content)
+        (if in-reader
+            (%elicit-via-read-loop session out message schema
+                                   in-reader :timeout +envrc-prompt-timeout+)
+            (send-elicitation-request session out message schema
+                                      :timeout +envrc-prompt-timeout+))
+      (case action
+        (:accept (funcall on-accept-fn session content))
+        ((:decline :cancel :timeout)
+         (log-event :info "envrc.prompt.outcome" "action" action)
+         nil)
+        (t
+         (log-event :warn "envrc.prompt.unexpected-action" "action" action)
+         nil)))))
+
+(defun maybe-prompt-and-write-envrc (session out &optional in-reader)
+  "Launch-time consent gate for bringing a project `.envrc` up to date.
+
+A no-op (returns NIL, writes nothing, sets no flag) unless the client declared
+elicitation and this session has not been prompted yet. When those hold, the
+session's project root is matched against two mutually exclusive trigger states,
+in order:
+  - no `.envrc` at all (a qualifying Lisp project): prompt to CREATE one from
+    the template; on :accept write through the write jail.
+  - an `.envrc` that exists but lacks the dsmr-mcp setup: prompt to APPEND the
+    managed block; on :accept append (the user's lines are preserved).
+A complete `.envrc` (one that already exports DSMR_SLYNK_ATTACH) matches neither
+state, so it is never re-prompted. When a branch fires, the once-per-session
+guard is set FIRST (inside the branch) so even a decline / cancel / timeout
+suppresses any later prompt this session; when neither state qualifies the guard
+is left untouched so a later qualifying call can still prompt.
+
+OUT is the JSON-RPC output stream; IN-READER selects the stdio vs non-stdio
+consent path (see %prompt-and-act). Returns T when a `.envrc` was written or
+appended, NIL otherwise."
   (when (and (session-elicitation-p session)
-             (not (session-envrc-prompted-p session))
-             (lisp-project-without-envrc-p (session-project-root session)))
-    ;; Once-per-session guard fires before the round-trip, so even a decline or
-    ;; a timeout suppresses any later prompt this session.
-    (setf (session-envrc-prompted-p session) t)
-    (let ((schema (envrc-elicitation-schema)))
-      (multiple-value-bind (action content)
-          (if in-reader
-              (%elicit-via-read-loop session out +envrc-prompt-message+ schema
-                                     in-reader :timeout +envrc-prompt-timeout+)
-              (send-elicitation-request session out +envrc-prompt-message+ schema
-                                        :timeout +envrc-prompt-timeout+))
-        ;; Validate the action before acting (V5): only the known keywords are
-        ;; honoured, and only :accept can reach the write path.
-        (case action
-          (:accept (%write-envrc-on-accept session content))
-          ((:decline :cancel :timeout)
-           (log-event :info "envrc.prompt.outcome" "action" action)
-           nil)
-          (t
-           (log-event :warn "envrc.prompt.unexpected-action" "action" action)
-           nil))))))
+             (not (session-envrc-prompted-p session)))
+    (let ((root (session-project-root session)))
+      (cond
+        ((lisp-project-without-envrc-p root)
+         (setf (session-envrc-prompted-p session) t)
+         (%prompt-and-act session out in-reader
+                          +envrc-prompt-message+ #'%write-envrc-on-accept))
+        ((lisp-project-envrc-needs-setup-p root)
+         (setf (session-envrc-prompted-p session) t)
+         (%prompt-and-act session out in-reader
+                          +envrc-update-message+ #'%append-envrc-on-accept))))))
