@@ -1,0 +1,217 @@
+#+TITLE: dsmr-mcp — Configuration
+#+OPTIONS: toc:2 num:nil
+
+This page is the operator reference for configuring a dsmr-mcp server: the
+full environment-variable surface, how the dispatch mode and transport are
+resolved, how the loopback bind is relaxed, how the filesystem sandbox is
+scoped, and how to wire the server into an MCP client.
+
+See also: [[file:index.org]] · [[file:installation.org]] · [[file:modes-and-transports.org]] ·
+[[file:threat-model.org]] · [[file:operations.org]].
+
+* Configuration precedence
+
+Every server-startup knob resolves through one rule, in =src/run.lisp=:
+
+#+begin_src text
+keyword argument  >  DSMR_<NAME> env var  >  .dsmr-mcp.conf  >  built-in default
+#+end_src
+
+=.dsmr-mcp.conf= (at the project root) is read via =ubiquitous:value= and is
+never written; its absence is silent. A conf key is the env name minus the
+=DSMR_= prefix with underscores folded to dashes (e.g. =DSMR_LOG_LEVEL= ->
+=:log-level=). A malformed value for a typed knob (transport, mode,
+log-level, any port/seconds integer) raises =invalid-config-value= at
+startup naming the offending variable. Only =:transport=, =:mode=, =:port=,
+=:bind=, =:log-level=, and =:slynk-attach= participate in the conf layer;
+the worker, LSP, HTTP, attach-concurrency, and sandbox knobs read the
+environment (or their built-in default) directly.
+
+* Environment variables
+
+Exhaustive reference. =Read by= names the source file that consumes the
+variable.
+
+| Variable                       | Purpose                                                              | Default          | Read by                          |
+|--------------------------------+---------------------------------------------------------------------+------------------+----------------------------------|
+| =DSMR_TRANSPORT=               | Transport: =stdio= / =tcp= / =http=                                 | =stdio=          | =src/run.lisp=                     |
+| =DSMR_MODE=                    | Dispatch mode: =attached= / =hermetic= / =auto=                     | =attached=       | =src/run.lisp=                     |
+| =DSMR_SLYNK_ATTACH=            | =host:port= of the Slynk listener to attach to (attached mode)      | unset (nil)      | =src/run.lisp=                     |
+| =DSMR_PORT=                    | TCP/HTTP listener port (integer)                                    | unset (nil)      | =src/run.lisp=                     |
+| =DSMR_BIND=                    | TCP/HTTP bind address                                               | =127.0.0.1=      | =src/run.lisp=                     |
+| =DSMR_ALLOW_REMOTE=            | Permit a non-loopback bind (=1= / =true= / =yes=)                  | unset (refuse)   | =src/run.lisp= (=%check-remote-bind=) |
+| =DSMR_LOG_LEVEL=               | Verbosity: =debug= / =info= / =warn= / =error=                      | =info=           | =src/run.lisp= / =src/log.lisp=      |
+| =DSMR_PROJECT_ROOT=            | Server working root (conf reader + startup root)                    | process cwd      | =src/run.lisp=                     |
+| =DSMR_ATTACH_CONCURRENCY=      | Attach-call policy: =serialised= / =parallel=                       | =serialised=     | =src/run.lisp= / =src/attach/dispatch.lisp= |
+| =DSMR_HTTP_SESSION_TIMEOUT=    | HTTP idle-session eviction (seconds)                               | =3600=           | =src/run.lisp= -> =serve-http=       |
+| =DSMR_HTTP_CLEANUP_INTERVAL=   | HTTP idle-sweep interval (seconds)                                 | =60=             | =src/run.lisp= -> =serve-http=       |
+| =DSMR_WORKER_POOL_WARMUP=      | Standby hermetic workers to keep warm                              | =1= (min 0)      | =src/hermetic/pool.lisp=           |
+| =DSMR_MAX_POOL_SIZE=           | Max total hermetic workers (bound + standby)                       | =16= (min 1)     | =src/hermetic/pool.lisp=           |
+| =DSMR_WORKER_STARTUP_TIMEOUT=  | Seconds to await a worker handshake                               | =30=             | =src/hermetic/worker-client.lisp=  |
+| =DSMR_WORKER_KILL_GRACE_SECONDS= | Grace before the parent SIGKILLs a hung worker                  | =5= (min 1)      | =src/hermetic/pool.lisp=           |
+| =DSMR_ALIVE_LSP_DIR=           | alive-lsp source checkout to spawn for LSP-backed verbs            | unset (attach-only) | =src/lsp/client.lisp=           |
+| =DSMR_ALIVE_LSP_PORT=          | Port to probe for an already-running alive-lsp                     | =8006=           | =src/lsp/client.lisp=              |
+| =DSMR_LSP_STARTUP_TIMEOUT=     | Seconds to await a spawned alive-lsp startup line                  | =30=             | =src/lsp/client.lisp=              |
+| =DSMR_HYPERSPEC_DIR=           | Local HyperSpec directory for =clhs-lookup=                        | unset            | =src/clhs.lisp=                    |
+| =DSMR_RELATED_PROJECTS=        | Colon-separated re-root whitelist for the filesystem sandbox       | unset (nil)      | =src/tools/fs-set-project-root.lisp= |
+| =DSMR_BRIDGE_HOST=             | stdio<->TCP bridge target host                                    | =127.0.0.1=      | =scripts/stdio-tcp-bridge.lisp=    |
+| =DSMR_BRIDGE_PORT=             | stdio<->TCP bridge target port                                    | from argv        | =scripts/stdio-tcp-bridge.lisp=    |
+
+=DSMR_ALLOW_REMOTE= is true only for the literal values =1=, =true=, or
+=yes=. =DSMR_RELATED_PROJECTS= is consulted at re-root time inside the
+filesystem sandbox — *not* in =src/run.lisp='s startup config (see
+[[Filesystem sandbox]]).
+
+** Worker-internal variables (not operator knobs)
+
+The dispatcher sets these on each hermetic worker child; do not set them
+yourself: =DSMR_WORKER_SECRET= (128-bit auth handshake), =DSMR_WORKER_ID=,
+=DSMR_PARENT_PID=, =DSMR_WORKER_SWANK= (optional in-worker Slynk),
+=DSMR_WORKER_EVAL_TIMEOUT=, and =DSMR_NO_WORKER_POOL= (guards a worker from
+spawning its own pool). They are documented here only so they are not
+mistaken for configuration.
+
+* Mode selection
+
+=DSMR_MODE= chooses how dsmr-mcp obtains a Lisp image to drive:
+
+- =attached= (default) — connect to a user-supplied Slynk listener at
+  =DSMR_SLYNK_ATTACH= and operate inside that running image. An explicit
+  =attached= *never* falls back to hermetic: a dead listener fails closed
+  with a structured error, not a silent swap.
+- =hermetic= — spawn private, dsmr-mcp-owned SBCL worker processes (one per
+  session); the server never touches a user image.
+- =auto= — resolve at startup by probing the Slynk listener at
+  =DSMR_SLYNK_ATTACH= (a 3-second TCP connect): reachable collapses to
+  =attached=, unreachable collapses to =hermetic= and logs a one-time
+  startup warning. =auto= is the explicit opt-in for that logged fallback;
+  it is not the default.
+
+Resolution order is keyword =:mode= > =DSMR_MODE= > =.dsmr-mcp.conf= >
+=attached=. The =auto= probe runs only after the stderr log appender is
+installed, so the warning never lands on the stdout JSON-RPC channel. See
+[[file:modes-and-transports.org]] for the operational trade-offs.
+
+* Transport selection
+
+=DSMR_TRANSPORT= selects how MCP clients reach the server:
+
+- =stdio= (default) — JSON-RPC over stdin/stdout, one message per line.
+  This is the path MCP clients launch directly as a child process, and the
+  recommended configuration for Claude Code and similar agents.
+- =tcp= — newline-framed JSON-RPC on a socket at =DSMR_BIND:DSMR_PORT=,
+  one session per connection.
+- =http= — Streamable HTTP (MCP 2025-03-26 / 2025-06-18) over Hunchentoot
+  at =DSMR_BIND:DSMR_PORT=, for clients that speak the HTTP transport.
+
+Resolution order mirrors mode: keyword > =DSMR_TRANSPORT= > conf > =stdio=.
+
+** Bind address and loopback default
+
+Both networked transports bind to loopback (=127.0.0.1=) by default. Before
+any listener socket is created, =%check-remote-bind= refuses a non-loopback
+=DSMR_BIND= (anything other than =127.0.0.1=, =::1=, or =localhost=) unless
+=DSMR_ALLOW_REMOTE= is set to =1=, =true=, or =yes= — a refused bind raises
+=invalid-config-value= naming =DSMR_BIND=.
+
+#+begin_src sh
+# Loopback only (default):
+DSMR_TRANSPORT=tcp DSMR_PORT=7878 dsmr-mcp
+
+# Bind a routable interface — operator opt-in, no built-in auth (see safety note):
+DSMR_TRANSPORT=tcp DSMR_ALLOW_REMOTE=1 DSMR_BIND=0.0.0.0 DSMR_PORT=7878 dsmr-mcp
+#+end_src
+
+*Safety note.* =DSMR_ALLOW_REMOTE= is an explicit operator decision to
+expose the server beyond the local host. It only removes the loopback
+restriction — it adds *no authentication and no TLS*. A remotely reachable
+server grants its full tool surface (arbitrary REPL eval, filesystem
+reads/writes within the sandbox) to anyone who can reach the port.
+First-class auth/TLS is a v2 item. If you must expose it, front it with an
+authenticating reverse proxy or an SSH tunnel and restrict the network
+path. See [[file:threat-model.org]] for the full risk discussion.
+
+For clients that can only spawn a stdio subprocess but need to reach a TCP
+server, a bundled =stdio<->TCP= bridge (=DSMR_BRIDGE_HOST= /
+=DSMR_BRIDGE_PORT=) pumps bytes between the two; see
+[[file:modes-and-transports.org]].
+
+* Filesystem sandbox
+
+dsmr-mcp confines filesystem-touching tools to a session-scoped project
+root rather than a global one.
+
+- *Session project root.* The write/edit jail is the current session's
+  project root. It starts unset and is established with the
+  =fs-set-project-root= tool; an fs verb invoked before a root is set fails
+  with =project-root-not-set-error= rather than silently using the cwd.
+  (=DSMR_PROJECT_ROOT= seeds the server's startup working root and the conf
+  reader, but the per-session sandbox root is what the fs verbs enforce.)
+- *Re-root whitelist (=DSMR_RELATED_PROJECTS=).* A colon-separated list of
+  absolute directories (PATH-style) the session may re-root *into* without
+  human approval. It is parsed at re-root time in
+  =src/tools/fs-set-project-root.lisp=, not captured by =src/run.lisp='s
+  startup config. A re-root target outside both the current root and the
+  whitelist is denied and requires =human_approved: true= on the
+  =fs-set-project-root= call — and an autonomous agent cannot self-approve;
+  the violation raises =reroot-permission-required-error=.
+- *Read passthrough.* Reads are broader than writes: source under
+  registered ASDF source directories (sibling and dependency checkouts) is
+  readable, read-only, so code-intelligence verbs can follow definitions
+  into libraries even when those paths fall outside the write jail.
+
+#+begin_src sh
+# Permit re-rooting into two sibling checkouts without per-call approval:
+export DSMR_RELATED_PROJECTS="/home/me/SourceCode/lisp/cl-mcp:/home/me/SourceCode/lisp/eve-quant"
+#+end_src
+
+See [[file:threat-model.org]] for the re-root approval gate, the symlink-escape
+closure, the broad-root deny list, and the read-vs-write boundary in detail.
+
+* Wiring dsmr-mcp into an MCP client
+
+dsmr-mcp is itself an MCP server. The recommended transport for agent
+clients is =stdio=: the client launches dsmr-mcp as a child process and
+talks JSON-RPC over the pipe.
+
+** Claude Code
+
+Register the server under =mcpServers= in =~/.claude.json= (it coexists
+with other servers such as cl-mcp):
+
+#+begin_src json
+{
+  "mcpServers": {
+    "dsmr-mcp": {
+      "command": "dsmr-mcp",
+      "args": [],
+      "env": {
+        "DSMR_MODE": "auto",
+        "DSMR_TRANSPORT": "stdio"
+      }
+    }
+  }
+}
+#+end_src
+
+** Other agents
+
+Any MCP-capable agent launches dsmr-mcp the same way: invoke the =dsmr-mcp=
+entry point with =DSMR_TRANSPORT=stdio= and pass per-server environment
+through the client's own server-config block. For clients that prefer a
+socket, run a =tcp= (or =http=) transport instance and point the client at
+=DSMR_BIND:DSMR_PORT= (loopback unless =DSMR_ALLOW_REMOTE= is set).
+
+** Automated install / configure helper
+
+A helper utility automates this wiring end to end — it builds/locates the
+=dsmr-mcp= entry point, writes the =mcpServers= block into the client
+config, and *migrates an existing cl-mcp entry* so the two can coexist (or
+so dsmr-mcp can take over) without hand-editing JSON. Prefer the helper
+over manual edits: it keeps the env defaults and command path consistent
+with the installed build.
+
+This section is a placeholder for the helper, which is being added
+alongside this documentation; expand it with the exact invocation once the
+utility lands. Until then, the manual =~/.claude.json= block above is the
+supported path. See [[file:installation.org]] for build and install steps.
