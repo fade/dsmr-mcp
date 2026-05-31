@@ -97,7 +97,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/install/config"
                "dsmr-mcp/src/install/defaults"
                "dsmr-mcp/src/install/claude"
-               "dsmr-mcp/src/install")
+               "dsmr-mcp/src/install"
+               "dsmr-mcp/src/envrc-init")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"
