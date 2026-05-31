@@ -57,3 +57,39 @@ encryption** — it only removes the loopback restriction. Enabling it is an
 operator's deliberate choice to expose an unauthenticated arbitrary-eval
 surface to the network, and it should be paired with an external control
 (SSH tunnel, VPN, firewall) until `REM-01` lands first-class auth/TLS in v2.
+
+## STRIDE register
+
+The register is scoped to the whole project. Every row carries a disposition
+of exactly **mitigate**, **accept**, or **transfer**. Mitigations name the
+specific control (file / verb) rather than generic advice; an `accept` row is
+an honest statement that no control exists and none is intended at v1.
+
+| Threat ID | Category | Component | Disposition | Mitigation / Rationale |
+|-----------|----------|-----------|-------------|------------------------|
+| T-01 | Tampering / Elevation | Arbitrary code evaluation in the attached image (`repl-eval`, `load-system`, the attached dispatch into the operator's own Slynk image, `src/attach/dispatch.lisp`) | accept | By design. The operator already trusts the agent to run code in their image; eval is the product. There is no privilege boundary to enforce here, so none is claimed. |
+| T-02 | Tampering / Information disclosure | Filesystem access outside the project root (`fs-read-file`, `fs-write-file`, `fs-list-directory`, `lisp-edit-form`) | mitigate | Per-session project-root sandbox in `src/project-root.lisp`: `ensure-write-path` jails writes under the session root; `allowed-read-path` confines reads to the root plus registered ASDF source dirs; symlinks are truename-resolved before the containment check (a symlink escaping the root is rejected); a broad-root deny list blocks `/`, `/home/`, `/tmp/`, etc. |
+| T-03 | Elevation / Policy bypass | Re-rooting the session to an arbitrary directory to widen the write jail (`fs-set-project-root`) | mitigate | Re-rooting outside the configured whitelist (`DSMR_RELATED_PROJECTS`) requires `human_approved: true` (`reroot-permission-required-error`, `src/project-root.lisp`). An autonomous agent cannot self-approve the bypass. |
+| T-04 | Spoofing / Information disclosure | Off-loopback exposure of the unauthenticated eval surface (TCP / Streamable-HTTP transports) | accept (with documented opt-out) | Default bind is `127.0.0.1` and HTTP CORS is loopback-only (`src/transport/tcp.lisp`, `src/transport/http.lisp`, TRANS-04). Binding off loopback requires the operator to set `DSMR_ALLOW_REMOTE`; doing so is an explicit, documented decision. No auth/TLS at v1 — deferred to `REM-01`. |
+| T-05 | Denial of service | Hermetic worker resource exhaustion / crash loop | mitigate | A circuit breaker in `src/hermetic/pool.lisp` trips after 3 crashes within a 300-second window (60-second cooldown), preventing a crashing worker from being respawned in a tight loop (HERM-03). |
+| T-06 | Denial of service | A single hermetic call running unbounded (hung eval, infinite loop) | mitigate | `call-worker` (`src/hermetic/worker-client.lisp`) enforces a per-request timeout (default 30 s) and **hard-kills** the worker with SIGKILL on overrun, recording the kill as a crash against the breaker (SAFETY-05). This control is hermetic-only; the attached image is the operator's own and is not force-killed. |
+| T-07 | Information disclosure | Evaluated values, source contents, and error context appearing in logs | accept | Logs are local, structured (`log4cl` on stderr), and operator-owned. Disclosure to the operator's own log sink is acceptable in a localhost, trusted-operator deployment; there is no log-redaction control at v1. |
+
+## For reviewers
+
+Before adopting `dsmr-mcp`, confirm these three things hold in your
+environment:
+
+1. **You trust the agent.** The agent can evaluate arbitrary code in the
+   attached image. If you would not hand the agent a REPL to your process,
+   do not connect it.
+2. **The bind stays on loopback** unless you have deliberately fronted it
+   with your own authentication and encryption. Check that `DSMR_ALLOW_REMOTE`
+   is unset in any environment you do not fully control.
+3. **The session project root is set to the project you intend.** The
+   filesystem sandbox is the only agent-facing boundary the server enforces;
+   verify it is rooted where you expect and that re-rooting requires human
+   approval.
+
+In one sentence: **`dsmr-mcp` is a trust-amplifier for an agent the operator
+already trusts, not a containment layer for one they do not.**
