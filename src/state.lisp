@@ -26,6 +26,11 @@
            #:session-project-root
            #:session-notify-channel
            #:session-notify-channel-lock
+           #:session-elicitation-p
+           #:session-envrc-prompted-p
+           #:session-elicitation-id-counter
+           #:session-elicitation-lock
+           #:session-pending-elicitation
            #:make-session
            #:*current-session-id*
            #:*mode*
@@ -75,9 +80,14 @@ this session, or NIL. Set by run from the resolved config; read by
     :accessor session-project-root
     :initform nil
     :documentation "Absolute pathname of this session's project root.
-NIL until fs-set-project-root is called. Never modified by the process CWD;
-changed only via fs-set-project-root.  Session-local: one session's
-re-rooting does not reach another.")
+Seeded at launch from the resolved root (precedence: explicit :project-root >
+DSMR_PROJECT_ROOT env > getcwd) for every transport (stdio, TCP, HTTP), so the
+launch-time .envrc consent prompt can fire on the first qualifying tool call
+without a prior fs-set-project-root.  Session-local: one session's root never
+leaks to another.  May be RE-ROOTED later via fs-set-project-root, which is
+permission-gated: re-rooting away from the launch root to a non-whitelisted
+directory requires human_approved:true (D-05).  Directly-constructed sessions
+(e.g. unit fixtures that call make-session without :project-root) start NIL.")
    (notify-channel
     :initarg :notify-channel
     :accessor session-notify-channel
@@ -99,7 +109,41 @@ stays nil and no compile-time import of dsmr-mcp/src/notify is required.")
 HTTP GET and POST handlers run concurrently against the same session; without
 this lock the install half (read-prior + check + setf) of the channel swap is
 a check-then-act race that can orphan a subscriber or lose notifications.
-Every read-modify-write of notify-channel by a transport must hold this lock."))
+Every read-modify-write of notify-channel by a transport must hold this lock.")
+   (elicitation-p
+    :accessor session-elicitation-p
+    :initform nil
+    :documentation "T when the client declared the MCP `elicitation`
+capability in its initialize params. Gates whether the server may issue a
+server->client elicitation/create request; when NIL the launch-time .envrc
+prompt degrades to a silent no-op.")
+   (envrc-prompted-p
+    :accessor session-envrc-prompted-p
+    :initform nil
+    :documentation "Once-per-session guard for the launch-time .envrc prompt.
+Set T the first time the qualifying-project check runs, regardless of the
+operator's answer, so the dialog cannot re-fire on every tool call.")
+   (elicitation-id-counter
+    :accessor session-elicitation-id-counter
+    :initform 0
+    :documentation "Per-session source of monotonically increasing ids for
+server-initiated elicitation requests, so each in-flight request's id is
+unique within the session.")
+   (elicitation-lock
+    :reader session-elicitation-lock
+    :initform (make-lock "session-elicitation-lock")
+    :documentation "Guards the pending-elicitation cell. The request-issuing
+thread waits on a condition variable under this lock while the read loop
+fills the cell from the client's response; every read-modify-write of the
+pending cell must hold it.")
+   (pending-elicitation
+    :accessor session-pending-elicitation
+    :initform nil
+    :documentation "Single-slot pending-request holder for an in-flight
+elicitation request: (id cv cell) while a request awaits its response, NIL
+otherwise. cell is (result errorp) — the result hash-table from the client's
+response, or an error marker. Mirrors lsp/client's pending-request idiom,
+collapsed to one outstanding request per session."))
   (:documentation "Holds all per-connection state for one MCP session.
 One session is constructed per transport connection:
   - stdio: one session for the whole process lifetime
@@ -113,8 +157,12 @@ dynamic variable (only *current-session-id* is)."))
 ID defaults to \"stdio\" (the stdio transport's logical name).
 SLYNK-ATTACH is the resolved host:port config string (or NIL) passed
 through from run's resolved-slynk-attach.
-PROJECT-ROOT is the initial project root pathname (or NIL); can be set
-later via fs-set-project-root.
+PROJECT-ROOT is the initial project root pathname (or NIL). run seeds it at
+launch from the resolved root (explicit :project-root > DSMR_PROJECT_ROOT >
+getcwd) for every transport; callers that construct a session directly (e.g.
+unit fixtures) may omit it, in which case it defaults to NIL.  The root is
+session-local and may be re-rooted later via the permission-gated
+fs-set-project-root.
 The returned session has:
   - initialized-p: NIL
   - protocol-version: NIL

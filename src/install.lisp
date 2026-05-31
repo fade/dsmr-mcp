@@ -10,7 +10,8 @@
   (:use #:cl)
   (:local-nicknames (#:jzon #:com.inuoe.jzon)
                     (#:config #:dsmr-mcp/src/install/config)
-                    (#:claude #:dsmr-mcp/src/install/claude))
+                    (#:claude #:dsmr-mcp/src/install/claude)
+                    (#:defaults #:dsmr-mcp/src/install/defaults))
   (:export #:install))
 
 (in-package #:dsmr-mcp/src/install)
@@ -73,7 +74,8 @@ keyed by \"dsmr-mcp\"."
 (defun install (&key (agent :claude-code)
                      (on-existing-cl-mcp :keep)
                      (install-skill t)
-                     (skills-dir nil))
+                     (skills-dir nil)
+                     (site-defaults :interactive))
   "Install dsmr-mcp as an MCP server for the requested AGENT and report
 what was done.
 
@@ -89,6 +91,13 @@ AGENT selects the install target:
 
 ON-EXISTING-CL-MCP (:keep, :remove, :replace) governs an existing cl-mcp
 entry under Claude Code; see dsmr-mcp/src/install/config:ensure-server.
+
+SITE-DEFAULTS (:interactive, :skip) governs the site-wide `.envrc` defaults
+step run after the Claude Code install: :interactive prompts for the
+operator's Slynk host/port/workspace defaults and writes them to
+~/.config/dsmr-mcp/envrc.template (skipped automatically when stdin is not
+interactive); :skip suppresses the step entirely. The step never runs under
+the :print agent — print mode stays pure-stdout.
 
 To extend this installer to a new agent, add a new AGENT keyword here and
 a corresponding IO function (mirroring dsmr-mcp/src/install/claude) that
@@ -107,7 +116,9 @@ augmented with :skill-dir), or NIL for :print."
                      :on-existing-cl-mcp on-existing-cl-mcp))
             (skill-dest (when install-skill
                           (%copy-skill (or skills-dir (default-skills-dir)))))
-            (full (append result (list :skill-dir skill-dest))))
+            (envrc-template (defaults:install-envrc-defaults :mode site-defaults))
+            (full (append result (list :skill-dir skill-dest
+                                       :envrc-template-dir envrc-template))))
        (%print-claude-summary full)
        full))))
 
@@ -123,5 +134,8 @@ augmented with :skill-dir), or NIL for :print."
   (format t "  skill:        ~A~%"
           (let ((s (getf result :skill-dir)))
             (if s (namestring s) "(not installed)")))
+  (format t "  envrc tmpl:   ~A~%"
+          (let ((e (getf result :envrc-template-dir)))
+            (if e (namestring e) "(site-wide defaults skipped)")))
   (format t "~%Restart Claude Code (or reconnect MCP servers) to pick up ~
 the dsmr-mcp entry.~%"))

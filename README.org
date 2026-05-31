@@ -36,6 +36,11 @@ hermetic). Then wire it into your MCP client (Claude Code and others) — see
 [[file:docs/configuration.org][Configuration]] for the client setup and the full
 environment-variable reference.
 
+Driving more than one Lisp project from a single agent install? dsmr-mcp
+ships a per-project [[https://direnv.net][direnv]] =.envrc= so each project can
+point at its own image and port while the global MCP entry stays env-free —
+see [[file:docs/configuration.org::*direnv per-project setup][direnv per-project setup]].
+
 Verify with a trivial =repl-eval= round trip: evaluating =(+ 1 2)= should
 return =3=.
 

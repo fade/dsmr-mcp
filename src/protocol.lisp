@@ -41,7 +41,11 @@
                 #:initialized-p
                 #:protocol-version
                 #:client-info
+                #:session-elicitation-p
                 #:*current-session-id*)
+  (:import-from #:dsmr-mcp/src/elicitation
+                #:elicitation-response-message-p
+                #:route-elicitation-response)
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht
                 #:result
@@ -131,6 +135,14 @@ before dsmr-mcp/src/main is loaded."
           (initialized-p session) t)
     (when (and params (gethash "clientInfo" params))
       (setf (client-info session) (gethash "clientInfo" params)))
+    ;; Read the client's elicitation capability. The capability value is an
+    ;; empty object {} (a zero-entry hash-table), which gethash returns as NIL
+    ;; for both "present and empty" and "absent" — so the found-p second value
+    ;; (nth-value 1), not the value itself, is what distinguishes them.
+    (let ((caps (and params (gethash "capabilities" params))))
+      (setf (session-elicitation-p session)
+            (and (hash-table-p caps)
+                 (nth-value 1 (gethash "elicitation" caps)))))
     ;; Eager connect AFTER initialized-p flips.
     ;; Runtime symbol resolution (uiop:symbol-call) avoids a compile-time dep
     ;; on dsmr-mcp/src/attach/dispatch, matching the existing version lookup
@@ -318,6 +330,15 @@ error-with-unknown-id responses use 'null as the id value."
             (let ((*log-session-id* *current-session-id*)
                   (*log-request-id* (or id (%generate-notif-id))))
               (cond
+                ((and id (null method) (elicitation-response-message-p msg))
+                 ;; Response to a server-initiated request: an id with a
+                 ;; result/error and no method. This is the client's reply to
+                 ;; our elicitation/create, not a request — route it to the
+                 ;; waiting caller and return nil (a reply gets no wire
+                 ;; response). Ordered before the -32600 fallthrough so the
+                 ;; reply is never mistaken for a malformed request.
+                 (route-elicitation-response session msg)
+                 nil)
                 ((and method id)
                  ;; Request: has both method and id -> dispatch and return response.
                  (%encode-line (%handle-request session id method params)))
