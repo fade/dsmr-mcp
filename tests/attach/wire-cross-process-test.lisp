@@ -202,16 +202,17 @@ tool-handle methods pass to their %dispatch-attach-* functions."
       (true  (search "alexandria" (string-downcase (%content-text res)))
              "code-find did not return alexandria's source location"))
 
-    ;; code-describe: same target, different injected form.  The describe path
-    ;; resolves the symbol in the Slynk thread's package, so the probe uses a
-    ;; package-qualified name (bare "flatten" is not visible in the foreign
-    ;; image's CL-USER); this keeps the assertion about the wire, not about
-    ;; describe's package-resolution.
+    ;; code-describe: same target, different injected form.  The bare symbol with
+    ;; a separate package arg also guards describe's package-resolution: the
+    ;; builder must qualify the describe name with the package, since
+    ;; slynk:describe-symbol resolves in the foreign image's CL-USER where bare
+    ;; "flatten" is not visible.
     (let* ((tool (%attach-repl-tool "xproc-describe" conn))
            (res  (%dispatch-attach-code-describe
-                  tool 1 (make-ht "symbol" "alexandria:flatten" "package" "ALEXANDRIA") nil)))
+                  tool 1 (make-ht "symbol" "flatten" "package" "ALEXANDRIA") nil)))
       (false (%network-error-p res) "code-describe dropped the wire (NETWORK_ERROR)")
-      (false (gethash "isError" res) "code-describe returned isError for a known symbol")
+      (false (gethash "isError" res)
+             "code-describe could not resolve a known symbol via its package arg")
       (true  (plusp (length (%content-text res))) "code-describe returned empty content"))
 
     ;; code-find-references: who-calls form; may be empty, must not drop the wire.

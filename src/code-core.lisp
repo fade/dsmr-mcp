@@ -784,12 +784,24 @@ ROOT-NAMESTRING is accepted for signature consistency with the other form builde
 but is not used here: the attached code-describe path returns path=\"\" (Slynk's
 describe output contains no path field); the hermetic path relativizes via
 code-describe-symbol calling code-find-definition with :root.
-Uses CL-USER symbol hygiene; coerces all strings."
+Uses CL-USER symbol hygiene; coerces all strings.
+
+slynk:describe-symbol resolves its name argument in the Slynk connection's
+package (CL-USER here) and ignores PACKAGE-NAME, so an unqualified name for a
+symbol not visible in CL-USER describes as not-found even when it exists. Both
+arguments are known at build time, so qualify the describe name with PACKAGE-NAME
+when the caller gave a package and did not already qualify the name. ':' (the
+internal-access marker) is used so non-exported symbols resolve too."
   (declare (ignore root-namestring))
   (flet ((cs (n) (intern n (find-package :common-lisp-user))))
     (let ((s-desc (cs "%DSMR-CODE-DESC"))
-          (s-args (cs "%DSMR-CODE-ARGS")))
-      `(let ((,s-desc (ignore-errors (slynk:describe-symbol ,symbol-name)))
+          (s-args (cs "%DSMR-CODE-ARGS"))
+          (describe-name
+            (if (and (stringp package-name) (plusp (length package-name))
+                     (stringp symbol-name) (not (find #\: symbol-name)))
+                (concatenate 'string package-name "::" symbol-name)
+                symbol-name)))
+      `(let ((,s-desc (ignore-errors (slynk:describe-symbol ,describe-name)))
              (,s-args (ignore-errors (slynk:operator-arglist ,symbol-name ,package-name))))
          (list (and ,s-desc (map 'string #'identity ,s-desc))
                (and ,s-args (map 'string #'identity ,s-args)))))))
