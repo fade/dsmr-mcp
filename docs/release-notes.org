@@ -45,6 +45,15 @@ codebase, and look up documentation — inside the operator's own running Lisp.
 - *Hermetic operations* — =pool-status=, =pool-kill-worker=.
 - *Scaffolding* — =project-scaffold=.
 
+*** Installation & onboarding
+
+- An install/configure utility (=scripts/install.lisp=) registers dsmr-mcp as an
+  MCP server for Claude Code — backing up the config and re-parsing the result
+  before writing — with =--print= for other agents and =--migrate= / =--replace=
+  for operators moving from cl-mcp.
+- A bundled =scaffold-project= skill stands up a new, delivery-disciplined
+  project from the skeleton in an empty directory.
+
 *** Operability & safety
 
 - Structured logging on stderr (=log4cl=).
