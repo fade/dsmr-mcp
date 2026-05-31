@@ -134,6 +134,16 @@ start:
   session — a decline is remembered for the rest of the session. The prompt
   only appears with clients that support MCP elicitation and the stdio
   transport; with any other client it is a silent no-op, never an error.
+- *An existing =.envrc= missing the dsmr-mcp setup.* If your project already has
+  an =.envrc= — one you wrote by hand, or one from another tool — but it does not
+  export the dsmr-mcp variables, the server offers to *append* them rather than
+  leave the project unconfigured. On accept, a clearly marked block (delimited by
+  =# >>> dsmr-mcp ... >>>= / =# <<< dsmr-mcp <<<= comments) is added to the *end*
+  of the file; your own lines are untouched, and you can edit or delete the block
+  freely. You will need to run =direnv allow= again afterward. A file that
+  already exports the dsmr-mcp setup is recognised as complete and is never
+  re-prompted, so the offer appears at most once and never twice for the same
+  file.
 - *Site-wide defaults (installer).* The installer offers to write a
   personalized template to =~/.config/dsmr-mcp/envrc.template= (default Slynk
   host/port, =LISP_WORKSPACE=, mode, log level, related projects). Both paths

@@ -380,16 +380,38 @@ trigger produces no further prompt."
               ".envrc is byte-for-byte the template"))))))
 
 (define-test stdio-elicitation-no-clobber
-  "A pre-existing .envrc yields ZERO elicitation/create and is left unchanged."
+  "A pre-existing COMPLETE .envrc (one that already exports DSMR_SLYNK_ATTACH)
+yields ZERO elicitation/create and is left unchanged: neither the create nor the
+update trigger fires."
   (unless (%spawnable-p)
     (skip "cannot spawn a server subprocess (sbcl / quicklisp setup.lisp absent)"))
-  (%with-temp-root (root :envrc-content "SENTINEL")
+  (%with-temp-root (root :envrc-content "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+")
     (let ((objs (%run-scenario root :elicitation t :response-action nil)))
       (is = 0 (%count-elicitation-creates objs)
-          "no prompt when .envrc already exists")
-      (is string= "SENTINEL"
+          "no prompt when a complete .envrc already exists")
+      (is string= "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+"
           (uiop:read-file-string (merge-pathnames ".envrc" root))
-          "pre-existing .envrc content unchanged"))))
+          "pre-existing complete .envrc content unchanged"))))
+
+(define-test stdio-elicitation-update-appends-block
+  "An existing .envrc that lacks the dsmr-mcp setup fires exactly ONE
+elicitation/create; on accept the dsmr-mcp managed block is APPENDED while the
+user's original lines are preserved (append, not clobber)."
+  (unless (%spawnable-p)
+    (skip "cannot spawn a server subprocess (sbcl / quicklisp setup.lisp absent)"))
+  (%with-temp-root (root :envrc-content "export FOO=bar
+")
+    (let* ((objs (%run-scenario root :elicitation t :response-action "accept"))
+           (prompts (remove-if-not #'%elicitation-create-p objs)))
+      (is = 1 (length prompts)
+          "exactly one elicitation/create for the update prompt")
+      (let ((text (uiop:read-file-string (merge-pathnames ".envrc" root))))
+        (true (search "FOO=bar" text)
+              "the user's original line is preserved")
+        (true (search "DSMR_SLYNK_ATTACH" text)
+              "the dsmr-mcp managed block was appended")))))
 
 (define-test stdio-elicitation-decline-writes-nothing
   "Decline: exactly one elicitation/create; no .envrc written afterward."
