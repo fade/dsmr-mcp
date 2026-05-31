@@ -23,6 +23,7 @@
                 #:*readme-template*
                 #:*gitignore-template*
                 #:*prompt-template*
+                #:*envrc-template*
                 #:*license-template*
                 #:license-body-for-spdx)
   (:export #:validate-project-name
@@ -197,6 +198,7 @@ to a parent prompts/ directory is computed."
          (cons "CLAUDE.md"               (funcall render2 *claude-md-template*))
          (cons "README.md"               (funcall render2 *readme-template*))
          (cons ".gitignore"              (funcall render2 *gitignore-template*))
+         (cons ".envrc"                  (funcall render2 *envrc-template*))
          (cons "prompts/repl-driven-development.md"
                                          (funcall render2 *prompt-template*))
          (cons "LICENSE"                 (funcall render2 *license-template*)))))))
