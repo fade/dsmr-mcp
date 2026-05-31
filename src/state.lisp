@@ -26,6 +26,11 @@
            #:session-project-root
            #:session-notify-channel
            #:session-notify-channel-lock
+           #:session-elicitation-p
+           #:session-envrc-prompted-p
+           #:session-elicitation-id-counter
+           #:session-elicitation-lock
+           #:session-pending-elicitation
            #:make-session
            #:*current-session-id*
            #:*mode*
@@ -99,7 +104,41 @@ stays nil and no compile-time import of dsmr-mcp/src/notify is required.")
 HTTP GET and POST handlers run concurrently against the same session; without
 this lock the install half (read-prior + check + setf) of the channel swap is
 a check-then-act race that can orphan a subscriber or lose notifications.
-Every read-modify-write of notify-channel by a transport must hold this lock."))
+Every read-modify-write of notify-channel by a transport must hold this lock.")
+   (elicitation-p
+    :accessor session-elicitation-p
+    :initform nil
+    :documentation "T when the client declared the MCP `elicitation`
+capability in its initialize params. Gates whether the server may issue a
+server->client elicitation/create request; when NIL the launch-time .envrc
+prompt degrades to a silent no-op.")
+   (envrc-prompted-p
+    :accessor session-envrc-prompted-p
+    :initform nil
+    :documentation "Once-per-session guard for the launch-time .envrc prompt.
+Set T the first time the qualifying-project check runs, regardless of the
+operator's answer, so the dialog cannot re-fire on every tool call.")
+   (elicitation-id-counter
+    :accessor session-elicitation-id-counter
+    :initform 0
+    :documentation "Per-session source of monotonically increasing ids for
+server-initiated elicitation requests, so each in-flight request's id is
+unique within the session.")
+   (elicitation-lock
+    :reader session-elicitation-lock
+    :initform (make-lock "session-elicitation-lock")
+    :documentation "Guards the pending-elicitation cell. The request-issuing
+thread waits on a condition variable under this lock while the read loop
+fills the cell from the client's response; every read-modify-write of the
+pending cell must hold it.")
+   (pending-elicitation
+    :accessor session-pending-elicitation
+    :initform nil
+    :documentation "Single-slot pending-request holder for an in-flight
+elicitation request: (id cv cell) while a request awaits its response, NIL
+otherwise. cell is (result errorp) — the result hash-table from the client's
+response, or an error marker. Mirrors lsp/client's pending-request idiom,
+collapsed to one outstanding request per session."))
   (:documentation "Holds all per-connection state for one MCP session.
 One session is constructed per transport connection:
   - stdio: one session for the whole process lifetime
