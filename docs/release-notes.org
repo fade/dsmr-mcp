@@ -53,6 +53,13 @@ codebase, and look up documentation — inside the operator's own running Lisp.
   for operators moving from cl-mcp.
 - A bundled =scaffold-project= skill stands up a new, delivery-disciplined
   project from the skeleton in an empty directory.
+- *Per-project direnv configuration* (=.envrc=) so one agent install can drive
+  several Lisp projects, each pointing at its own image and Slynk port instead
+  of a single hardcoded global attach target. A scaffolded project gets its
+  =.envrc= automatically; an existing Lisp project is offered one through a
+  consent-gated prompt on first dsmr-mcp use (never clobbering an existing
+  file); and the installer can write personalized site-wide defaults that both
+  paths draw from. Activate the file with =direnv allow .=.
 
 *** Operability & safety
 

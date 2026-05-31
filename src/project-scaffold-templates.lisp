@@ -18,6 +18,8 @@
 
 (defpackage #:dsmr-mcp/src/project-scaffold-templates
   (:use #:cl)
+  (:import-from #:dsmr-mcp/src/envrc-template
+                #:read-envrc-template)
   (:export #:*asd-template*
            #:*main-lisp-template*
            #:*main-test-template*
@@ -28,6 +30,7 @@
            #:*readme-template*
            #:*gitignore-template*
            #:*prompt-template*
+           #:*envrc-template*
            #:*license-template*
            #:license-body-for-spdx))
 
@@ -522,6 +525,22 @@ A dsmr-discipline REPL-driven-development guide reframed for the scaffolded
 project; {{name}} and {{spdx}} are substituted by plan-scaffold.  Distinct from
 dsmr-mcp's own prompts/repl-driven-development.md seed (D-11), which is the
 self-referential version.")
+
+;;; ---------------------------------------------------------------------------
+;;; .envrc template (direnv per-project config)
+;;;
+;;; Read at load time via read-envrc-template, which prefers the operator's
+;;; site-wide template (~/.config/dsmr-mcp/envrc.template) over the repo
+;;; default. Copied verbatim into the scaffolded project's .envrc — it uses
+;;; shell ${VAR:-default} expansion, NOT {{key}} placeholders, so render2
+;;; passes it through unchanged.
+;;; ---------------------------------------------------------------------------
+
+(defparameter *envrc-template*
+  (read-envrc-template)
+  "Template for the generated project's .envrc file (direnv per-project config).
+Copied verbatim from the site-wide template or the repo default. Uses shell
+${VAR:-default} syntax, NOT {{key}} placeholders.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; LICENSE template (placeholder — full body injected from license-body-for-spdx)

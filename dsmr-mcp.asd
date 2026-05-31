@@ -31,6 +31,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/main"
                "dsmr-mcp/src/wire-strings"
                "dsmr-mcp/src/protocol"
+               "dsmr-mcp/src/elicitation"
                "dsmr-mcp/src/attach/registry"
                "dsmr-mcp/src/attach/dispatch"
                "dsmr-mcp/src/hermetic/worker-client"
@@ -86,6 +87,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/tools/lsp-hover"
                "dsmr-mcp/src/tools/lsp-diagnostics"
                "dsmr-mcp/src/tools/lsp-code-actions"
+               "dsmr-mcp/src/envrc-template"
                "dsmr-mcp/src/project-scaffold-templates"
                "dsmr-mcp/src/project-scaffold-core"
                "dsmr-mcp/src/project-scaffold"
@@ -93,8 +95,10 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/clhs"
                "dsmr-mcp/src/tools/clhs-lookup"
                "dsmr-mcp/src/install/config"
+               "dsmr-mcp/src/install/defaults"
                "dsmr-mcp/src/install/claude"
-               "dsmr-mcp/src/install")
+               "dsmr-mcp/src/install"
+               "dsmr-mcp/src/envrc-init")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"
@@ -162,7 +166,12 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/lsp/bridge-test"
                "dsmr-mcp/tests/scaffold/project-scaffold-test"
                "dsmr-mcp/tests/clhs/clhs-lookup-test"
-               "dsmr-mcp/tests/install/config-test")
+               "dsmr-mcp/tests/install/config-test"
+               "dsmr-mcp/tests/envrc-template/envrc-template-test"
+               "dsmr-mcp/tests/scaffold/project-scaffold-envrc-test"
+               "dsmr-mcp/tests/elicitation/elicitation-test"
+               "dsmr-mcp/tests/elicitation/launch-trigger-test"
+               "dsmr-mcp/tests/install/defaults-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
@@ -181,3 +190,33 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                             (setf any-failed t))))
                       (when any-failed
                         (error "dsmr-mcp/tests: one or more parachute tests failed.")))))
+
+;; Slow cross-process integration tests, kept OUT of the fast dsmr-mcp/tests
+;; umbrella so the inner-loop suite stays quick. Each leaf here spawns a real
+;; dsmr-mcp server subprocess (~10-12s/scenario) and skips cleanly when the
+;; environment cannot spawn one. Run explicitly: (asdf:test-system "dsmr-mcp/tests/integration").
+(asdf:defsystem "dsmr-mcp/tests/integration"
+  :class :package-inferred-system
+  :description "Slow cross-process integration tests for dsmr-mcp."
+  :depends-on ("parachute"
+               "com.inuoe.jzon"
+               "dsmr-mcp"
+               "dsmr-mcp/tests/integration/stdio-elicitation-test")
+  :perform (test-op (o c)
+                    (declare (ignore o))
+                    (let* ((test-package-names
+                            (remove-if-not
+                             (lambda (dep)
+                               (and (stringp dep)
+                                    (uiop:string-prefix-p "dsmr-mcp/tests/integration/" dep)))
+                             (asdf:system-depends-on c)))
+                           (any-failed nil))
+                      (dolist (name test-package-names)
+                        (let* ((package (or (find-package (string-upcase name))
+                                            (error "Test package ~S not loaded." name)))
+                               (result (uiop:symbol-call :parachute :test package)))
+                          (when (uiop:symbol-call :parachute :results-with-status
+                                                  :failed result)
+                            (setf any-failed t))))
+                      (when any-failed
+                        (error "dsmr-mcp/tests/integration: one or more parachute tests failed.")))))

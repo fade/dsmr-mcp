@@ -36,20 +36,57 @@
 
 ;;; canonical-server-entry ----------------------------------------------------
 
+(defun %find-arg (args predicate)
+  "Return the first member of ARGS satisfying PREDICATE, or NIL."
+  (find-if predicate args))
+
 (define-test canonical-entry-has-stdio-shape
   (let ((entry (canonical-server-entry)))
     (is string= "stdio" (gethash "type" entry))
     (is string= "sbcl" (gethash "command" entry))
     (true (vectorp (gethash "args" entry)))
-    ;; The args carry the load + run forms for the named system.
     (let ((args (coerce (gethash "args" entry) 'list)))
-      (true (member "(asdf:load-system :dsmr-mcp)" args :test #'string=))
+      ;; The args carry the stderr-wrapped load + run forms for the named system.
+      (true (member "(let ((*standard-output* *error-output*)) (asdf:load-system :dsmr-mcp))"
+                    args :test #'string=)
+            "asdf load is wrapped to *error-output*")
       (true (member "(dsmr-mcp:run :transport :stdio)" args :test #'string=)))))
+
+(define-test canonical-entry-keeps-stdout-clean
+  "The launcher must keep stdout (the JSON-RPC channel) free of the SBCL/
+Quicklisp bootstrap banner and ASDF load chatter."
+  (let* ((entry (canonical-server-entry))
+         (args  (coerce (gethash "args" entry) 'list)))
+    ;; --no-userinit so the operator's ~/.sbclrc (and its quickload banner) never runs.
+    (true (member "--no-userinit" args :test #'string=)
+          "--no-userinit suppresses the .sbclrc quickload banner")
+    ;; setup.lisp is loaded explicitly, redirected to *error-output*, and
+    ;; guarded by probe-file so it no-ops gracefully when Quicklisp is absent.
+    (let ((setup-form (%find-arg args
+                                 (lambda (a)
+                                   (and (stringp a)
+                                        (search "quicklisp/setup.lisp" a))))))
+      (true setup-form "explicit setup.lisp load present")
+      (when setup-form
+        (true (search "*error-output*" setup-form)
+              "setup.lisp load redirected to *error-output*")
+        (true (search "probe-file" setup-form)
+              "setup.lisp load guarded so it no-ops when absent")))
+    ;; The asdf load form is wrapped so compile+load output goes to stderr.
+    (let ((load-form (%find-arg args
+                                (lambda (a)
+                                  (and (stringp a)
+                                       (search "asdf:load-system" a))))))
+      (true load-form "asdf load form present")
+      (when load-form
+        (true (search "*error-output*" load-form)
+              "asdf load wrapped to *error-output*")))))
 
 (define-test canonical-entry-system-name-parameterized
   (let ((entry (canonical-server-entry "cl-mcp")))
     (let ((args (coerce (gethash "args" entry) 'list)))
-      (true (member "(asdf:load-system :cl-mcp)" args :test #'string=))
+      (true (member "(let ((*standard-output* *error-output*)) (asdf:load-system :cl-mcp))"
+                    args :test #'string=))
       (true (member "(cl-mcp:run :transport :stdio)" args :test #'string=)))))
 
 ;;; ensure-server: missing mcpServers -----------------------------------------
