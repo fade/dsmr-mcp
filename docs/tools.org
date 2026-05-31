@@ -1,14 +1,31 @@
-# dsmr-mcp Tool Reference
+#+TITLE: dsmr-mcp Tool Reference
 
-> Generated file — do not edit by hand. Every section below is rendered from
-> the live tool registry and the same schema encoder the wire protocol uses.
-> Edit a tool's class definition and regenerate; a hand edit will diverge from
-> the schema the server actually advertises and fail the parity test.
+# Generated file — do not edit by hand. Every heading below is rendered from
+# the live tool registry and the same schema encoder the wire (tools/list)
+# uses. Edit a tool's class definition and regenerate; a hand edit will
+# diverge from the schema the server actually advertises and fail the parity
+# test. Regenerate instead of editing.
 
-This reference lists every MCP verb dsmr-mcp ships: its name, its description,
-and its JSON input schema exactly as it appears in a `tools/list` response.
+* arg-val-test
 
-### clgrep-search
+Stub tool requiring a 'code' argument for validation tests.
+
+#+begin_src json
+{
+  "properties": {
+    "code": {
+      "description": "required code",
+      "type": "string"
+    }
+  },
+  "required": [
+    "code"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* clgrep-search
 
 Lisp-aware semantic grep over .lisp/.asd/.cl/.lsp/.ros source files. 
 Unlike plain text grep, returns the top-level form signature (defun/defmethod/etc.) 
@@ -18,9 +35,7 @@ Default: returns signatures only (token-efficient). Set include_form=true for fu
 form text. Set form_pattern to a shape like "(defun _ ...)" for structural matching 
 (D-11: _, ?name, ... wildcards; no predicates or full unification).
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "case_insensitive": {
@@ -61,9 +76,9 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### clhs-lookup
+* clhs-lookup
 
 Look up a symbol or section in the Common Lisp HyperSpec (ANSI standard). 
 Accepts a symbol name (loop, format, handler-case) or a section number (22.3, 3.1.2, 
@@ -71,9 +86,7 @@ auto-detected by the digit.dot shape) and returns the resolved entry URL plus ex
 plain text. Reads a local HyperSpec tree; resolves nothing over the network on the 
 primary path. Returns a structured not-found error when no HyperSpec is available.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "brief": {
@@ -94,9 +107,9 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### code-describe
+* code-describe
 
 Describe a symbol: type (function/macro/class/variable/etc.), 
 argument list, docstring, and source location. The attached path delegates to 
@@ -104,9 +117,7 @@ Slynk for rich arglist and description text; the hermetic path uses
 sb-introspect and cl:documentation. When the symbol is not found, returns a 
 typed error with a redirect hint. Requires attached or hermetic mode.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "package": {
@@ -123,9 +134,9 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### code-find
+* code-find
 
 Locate definition(s) for a symbol in the loaded image. 
 Returns project-relative path, line, and kind (function/method/class/etc.) 
@@ -133,9 +144,7 @@ for every definition. When the symbol is not found, returns a typed error
 with a redirect hint (e.g. try load-system, or clgrep-search for text search). 
 Requires attached or hermetic mode.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "package": {
@@ -152,9 +161,9 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### code-find-references
+* code-find-references
 
 Find all callers and references to a symbol using 
 sb-introspect xref (who-calls, who-references, who-binds, who-sets, 
@@ -165,9 +174,7 @@ to paths under the project root. relation optionally filters to one kind
 When the symbol is not found, returns a typed error with a redirect hint. 
 Requires attached or hermetic mode.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "package": {
@@ -192,29 +199,25 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### fs-get-project-info
+* fs-get-project-info
 
 Report the session project root and how it was set.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {},
   "required": [],
   "type": "object"
 }
-```
+#+end_src
 
-### fs-list-directory
+* fs-list-directory
 
 List directory entries. Hidden files and build artifacts are filtered by default.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "path": {
@@ -231,16 +234,14 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### fs-read-file
+* fs-read-file
 
 Read a text file within the project root or registered ASDF source dirs. 
 Bounded by a 2 MB cap; use offset/limit to paginate large files.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "limit": {
@@ -261,17 +262,15 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### fs-set-project-root
+* fs-set-project-root
 
 Set the session project root directory. All subsequent fs-* verbs 
 resolve paths relative to this root. Re-rooting outside the configured whitelist 
 (DSMR_RELATED_PROJECTS) requires human_approved: true.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "human_approved": {
@@ -288,17 +287,15 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### fs-write-file
+* fs-write-file
 
 Write text content to a file under the session root. 
 Parent directories are created automatically. For editing EXISTING Lisp source 
 files use lisp-edit-form instead.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "content": {
@@ -316,9 +313,9 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### inspect-condition
+* inspect-condition
 
 Drill into the current debugger condition at a live SLDB break: 
 returns the condition's slot values and its class-precedence-list type hierarchy. 
@@ -328,9 +325,7 @@ returns a structured not-at-break result with condition_p=false — not an error
 Inspecting an arbitrary captured condition that was not registered as a result 
 object is a follow-on capability not yet delivered.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "id": {
@@ -345,18 +340,16 @@ Input schema:
   "required": [],
   "type": "object"
 }
-```
+#+end_src
 
-### inspect-object
+* inspect-object
 
 Inspect a held object by ID from a previous repl-eval or 
 inspect-object call. Returns structural details (slots, elements, entries) 
 and nested object-ref IDs for drill-down. Both attached and hermetic modes 
 are supported; the envelope shape is identical.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "id": {
@@ -377,9 +370,9 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### inspect-restart
+* inspect-restart
 
 List the live restarts at the current SLDB debugger break in 
 the attached image, or invoke a chosen restart by index or name.  In attached 
@@ -388,9 +381,7 @@ etc.) — the same menu a SLIME user sees.  Invoking a restart is state-changing
 it unwinds the break thread's stack and resolves the break.  In hermetic mode 
 there is no interactive break, so an empty restart set is returned.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "invoke": {
@@ -409,18 +400,16 @@ Input schema:
   "required": [],
   "type": "object"
 }
-```
+#+end_src
 
-### inspect-thread
+* inspect-thread
 
 Enumerate threads in the attached developer image or the 
 hermetic worker process, with optional per-thread backtrace.  In attached 
 mode the result reflects the live image's thread list.  In hermetic mode 
 the result reflects the worker process's own threads.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "backtrace": {
@@ -435,9 +424,9 @@ Input schema:
   "required": [],
   "type": "object"
 }
-```
+#+end_src
 
-### lisp-check-parens
+* lisp-check-parens
 
 Check balanced parentheses and reader syntax in a Lisp file or 
 inline code snippet. Reports the first imbalance or reader error with 
@@ -445,9 +434,7 @@ line/column/offset. Ignores delimiters inside double-quoted strings, ; line
 comments, and #| |# block comments. Character literals #\x are not counted. 
 Provide either path (file read under sandbox) or code (inline text) — not both.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "code": {
@@ -470,9 +457,9 @@ Input schema:
   "required": [],
   "type": "object"
 }
-```
+#+end_src
 
-### lisp-edit-form
+* lisp-edit-form
 
 Structure-aware edit of a top-level Lisp form using Eclector CST parsing. 
 Supports replace, insert_before, insert_after, and delete operations while preserving 
@@ -480,9 +467,7 @@ formatting and comments. PREFERRED METHOD for editing existing Lisp source code.
 Automatically repairs missing closing parentheses using parinfer (non-delete ops). 
 ALWAYS use this tool instead of fs-write-file when modifying Lisp forms.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "content": {
@@ -532,9 +517,9 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### lisp-patch-form
+* lisp-patch-form
 
 Scoped text replacement within a matched top-level Lisp form. 
 Finds old_text (exact, whitespace-sensitive) within the form identified by 
@@ -544,9 +529,7 @@ to large forms. Does NOT auto-repair parentheses — if the patch breaks form
 structure it fails immediately and no changes are written to disk. 
 Use lisp-edit-form instead when replacing or inserting entire forms.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "dry_run": {
@@ -587,9 +570,9 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### lisp-read-file
+* lisp-read-file
 
 Read a Lisp source file with a collapsed signature view to save context tokens. 
 PREFER this over fs-read-file for .lisp and .asd files unless you need raw bytes. 
@@ -598,9 +581,7 @@ Use collapsed=true (default) to see only signatures, collapsed=false for full so
 When raw mode output is truncated a '[Showing lines A-B of N. Use offset=B to read more.]' 
 footer is appended to guide pagination.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "collapsed": {
@@ -637,9 +618,9 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### load-system
+* load-system
 
 Load an ASDF system with structured output and reload support. 
 Solves three problems with using (asdf:load-system) via repl-eval: 
@@ -649,9 +630,7 @@ returned in a structured list rather than flooding the terminal.
 3. Timeout: the load is wrapped in a real in-image timeout that actually 
 interrupts a runaway compile. Requires attached or hermetic mode.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "clear_fasls": {
@@ -676,9 +655,9 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### lsp-code-actions
+* lsp-code-actions
 
 Synthesized discover-then-apply code-actions menu for a position 
 in a Lisp file. Requires a running alive-lsp server. Two-step workflow: 
@@ -690,9 +669,7 @@ $/alive/unexportSymbol (remove symbol from package exports), and
 textDocument/rangeFormatting (format the surrounding form). 
 Returns lsp-unavailable when alive-lsp is not reachable.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "action": {
@@ -719,9 +696,9 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### lsp-completions
+* lsp-completions
 
 Get code completions from alive-lsp at a position in a Lisp file. 
 Requires a running alive-lsp server (attach-else-spawn per project root). 
@@ -729,9 +706,7 @@ Returns {items: [...]} where each item has label, kind, documentation,
 insertText, insertTextFormat fields. Returns lsp-unavailable when 
 alive-lsp is not reachable.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "character": {
@@ -754,9 +729,9 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### lsp-diagnostics
+* lsp-diagnostics
 
 Get compiler diagnostics from alive-lsp for a Lisp file. 
 Requires a running alive-lsp server (attach-else-spawn per project root). 
@@ -769,9 +744,7 @@ messages list does not guarantee clean compilation (some errors lack source
 locations and are silently dropped). When alive-lsp is not reachable, 
 returns a degraded Eclector parse check flagged degraded:lsp-unavailable.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "file_path": {
@@ -788,9 +761,9 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### lsp-hover
+* lsp-hover
 
 Get hover documentation from alive-lsp at a position in a Lisp file. 
 Requires a running alive-lsp server (attach-else-spawn per project root). 
@@ -799,9 +772,7 @@ documentation is found at the position. Quality depends on which packages
 are loaded in the alive-lsp image. Returns lsp-unavailable when alive-lsp 
 is not reachable.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "character": {
@@ -824,18 +795,16 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### pool-kill-worker
+* pool-kill-worker
 
 Kill the hermetic worker bound to the current session. 
 A replacement worker is spawned on the next tool call. In-image state 
 (loaded systems, REPL definitions) is lost. Use this to recover from a 
 stuck or corrupted worker. Only available in hermetic mode.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "reset": {
@@ -846,26 +815,24 @@ Input schema:
   "required": [],
   "type": "object"
 }
-```
+#+end_src
 
-### pool-status
+* pool-status
 
 Return the current status of the hermetic worker pool 
 (active workers, standbys, session affinity map, circuit breaker state). 
 Only available in hermetic mode. Returns pool_running, total_workers, 
 standby_count, bound_count, max_pool_size, warmup_target, and a workers array.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {},
   "required": [],
   "type": "object"
 }
-```
+#+end_src
 
-### project-scaffold
+* project-scaffold
 
 Generate a complete Lisp project skeleton under the session root. 
 Emits a package-inferred-system with a mode-dispatching executable, Parachute 
@@ -873,9 +840,7 @@ test suite, build recipe, dev-boot script, dependency-preference agent docs,
 a copied REPL-development guide, and a selectable license with per-file SPDX 
 headers. Returns a manifest of created files and next-step commands.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "author": {
@@ -927,18 +892,35 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### repl-eval
+* proto-test-echo
+
+Synthetic echo tool for tools-call tests.
+
+#+begin_src json
+{
+  "properties": {
+    "code": {
+      "description": "code to echo",
+      "type": "string"
+    }
+  },
+  "required": [
+    "code"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* repl-eval
 
 Evaluate Common Lisp forms in the attached Slynk image. 
 Returns printed values, captured stdout/stderr, and structured error context 
 (condition type, message, restarts, SBCL backtrace frames). 
 Requires :slynk-attach / DSMR_SLYNK_ATTACH to be configured.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "code": {
@@ -963,9 +945,9 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
 
-### run-tests
+* run-tests
 
 Run tests for an ASDF system and return structured results with 
 per-test pass/fail counts and source locations. 
@@ -977,9 +959,7 @@ Returns: passed/failed/pending counts, framework name, duration_ms, and a
 failed_tests array with test_name/reason/source{file,line} per failure. 
 Requires attached or hermetic mode.
 
-Input schema:
-
-```json
+#+begin_src json
 {
   "properties": {
     "framework": {
@@ -1012,6 +992,37 @@ Input schema:
   ],
   "type": "object"
 }
-```
+#+end_src
+
+* session-test-ping
+
+Synthetic ping tool used by session-test only.
+
+#+begin_src json
+{
+  "properties": {},
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
+* tools-list-echo
+
+Echo stub for tools-list shape tests.
+
+#+begin_src json
+{
+  "properties": {
+    "msg": {
+      "description": "message",
+      "type": "string"
+    }
+  },
+  "required": [
+    "msg"
+  ],
+  "type": "object"
+}
+#+end_src
 
 

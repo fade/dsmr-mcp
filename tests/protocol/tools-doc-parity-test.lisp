@@ -1,9 +1,9 @@
 ;;;; tests/protocol/tools-doc-parity-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Drift guard for docs/tools.md.
+;;;; Drift guard for docs/tools.org.
 ;;;;
-;;;; docs/tools.md is the verb reference: every shipped tool's name,
+;;;; docs/tools.org is the verb reference: every shipped tool's name,
 ;;;; description, and input schema. A hand-maintained reference rots the
 ;;;; moment a schema changes, so the doc is not hand-maintained — it is the
 ;;;; output of render-tools-reference, a deterministic renderer that walks the
@@ -33,20 +33,19 @@
 ;;; Renderer ------------------------------------------------------------------
 
 (defparameter +doc-preamble+
-  "# dsmr-mcp Tool Reference
+  "#+TITLE: dsmr-mcp Tool Reference
 
-> Generated file — do not edit by hand. Every section below is rendered from
-> the live tool registry and the same schema encoder the wire protocol uses.
-> Edit a tool's class definition and regenerate; a hand edit will diverge from
-> the schema the server actually advertises and fail the parity test.
-
-This reference lists every MCP verb dsmr-mcp ships: its name, its description,
-and its JSON input schema exactly as it appears in a `tools/list` response.
+# Generated file — do not edit by hand. Every heading below is rendered from
+# the live tool registry and the same schema encoder the wire (tools/list)
+# uses. Edit a tool's class definition and regenerate; a hand edit will
+# diverge from the schema the server actually advertises and fail the parity
+# test. Regenerate instead of editing.
 
 "
   "Fixed file header. The do-not-edit note states the regeneration behaviour as
 its own rationale: the doc is mechanically derived, so a manual edit cannot
-survive the next render and is therefore a drift bug.")
+survive the next render and is therefore a drift bug. Org comment lines (lines
+beginning with \"# \") carry the note without rendering into exported output.")
 
 (defparameter +doc-postamble+
   (format nil "~%")
@@ -79,14 +78,15 @@ prototype carries them without instantiating a real per-session tool."
   (c2mop:class-prototype class))
 
 (defun render-tools-reference ()
-  "Render the full intended contents of docs/tools.md as a single string.
+  "Render the full intended contents of docs/tools.org as a single string.
 
-Walks *tool-classes* in string< name order. For each tool, emits a
-\"### <name>\" heading, the tool's description, and its input schema rendered
-as canonical, pretty-printed JSON — the schema produced by the wire's own
-schema->json, so the doc matches what tools/list advertises byte-for-byte.
-Wrapped in a fixed preamble/postamble so the return value is the complete
-file. Deterministic by construction (sorted names, sorted JSON keys)."
+Walks *tool-classes* in string< name order. For each tool, emits a top-level
+org heading \"* <name>\", the tool's description as a paragraph (skipped when
+empty), and its input schema rendered as canonical, pretty-printed JSON inside
+a #+begin_src json / #+end_src org source block — the schema produced by the
+wire's own schema->json, so the doc matches what tools/list advertises
+byte-for-byte. Wrapped in a fixed preamble/postamble so the return value is the
+complete file. Deterministic by construction (sorted names, sorted JSON keys)."
   (let ((names (sort (loop for k being the hash-keys of *tool-classes* collect k)
                      #'string<)))
     (with-output-to-string (out)
@@ -97,29 +97,28 @@ file. Deterministic by construction (sorted names, sorted JSON keys)."
                (description (tool-description proto))
                (schema-json (%canonicalize
                              (schema->json (tool-input-schema proto)))))
-          (format out "### ~A~%~%" (tool-name proto))
+          (format out "* ~A~%~%" (tool-name proto))
           (when (and description (plusp (length description)))
             (format out "~A~%~%" description))
-          (write-string "Input schema:" out)
-          (format out "~%~%```json~%")
+          (format out "#+begin_src json~%")
           (write-string (jzon:stringify schema-json :pretty t) out)
-          (format out "~%```~%~%")))
+          (format out "~%#+end_src~%~%")))
       (write-string +doc-postamble+ out))))
 
 ;;; Tests ---------------------------------------------------------------------
 
 (define-test tools-doc-matches-registry
-  "docs/tools.md must equal render-tools-reference byte-for-byte. The renderer
+  "docs/tools.org must equal render-tools-reference byte-for-byte. The renderer
 walks the live *tool-classes* registry and the same schema->json the wire uses,
 so any drift — a hand edit, or a schema change without regenerating the doc —
 fails here. The file is read from the system source tree via
 asdf:system-relative-pathname; a missing file is reported as a clear string=
 mismatch (empty file vs rendered content), not an unparseable error."
   (let* ((expected (render-tools-reference))
-         (path (asdf:system-relative-pathname "dsmr-mcp" "docs/tools.md"))
+         (path (asdf:system-relative-pathname "dsmr-mcp" "docs/tools.org"))
          (actual (if (probe-file path)
                      (uiop:read-file-string path)
                      "")))
     (is string= expected actual
-        "docs/tools.md is stale. Regenerate it from render-tools-reference ~
+        "docs/tools.org is stale. Regenerate it from render-tools-reference ~
          (the doc is the renderer's output, never hand-edited).")))
