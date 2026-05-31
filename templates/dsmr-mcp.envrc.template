@@ -1,0 +1,19 @@
+# .envrc — dsmr-mcp per-project configuration (direnv). Run `direnv allow` to activate.
+# These DSMR_* vars are inherited by the dsmr-mcp MCP server when you launch your
+# agent (e.g. `claude`) from this directory — so the server drives THIS project's
+# image without hardcoding anything in your global ~/.claude.json.
+
+export LISP_WORKSPACE="${LISP_WORKSPACE:-$HOME/SourceCode/lisp/}"
+
+# This project's Slynk listener. scripts/dev-boot.sh reads the same two vars,
+# so dev-boot and dsmr-mcp stay in sync (single source of truth).
+export SLYNK_HOST="${SLYNK_HOST:-127.0.0.1}"
+export SLYNK_PORT="${SLYNK_PORT:-4005}"
+
+# auto = attach to the image above if reachable, else a private hermetic worker.
+export DSMR_MODE=auto
+export DSMR_SLYNK_ATTACH="${SLYNK_HOST}:${SLYNK_PORT}"
+export DSMR_LOG_LEVEL=info
+
+# Sibling projects this one may re-root into (filesystem sandbox whitelist):
+# export DSMR_RELATED_PROJECTS="$HOME/SourceCode/lisp/cl-mcp:$HOME/SourceCode/lisp/eve-quant"
