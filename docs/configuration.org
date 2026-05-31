@@ -71,6 +71,93 @@ yourself: =DSMR_WORKER_SECRET= (128-bit auth handshake), =DSMR_WORKER_ID=,
 spawning its own pool). They are documented here only so they are not
 mistaken for configuration.
 
+* direnv per-project setup
+
+A single global =~/.claude.json= dsmr-mcp entry can carry only one
+=DSMR_SLYNK_ATTACH=, so it cannot serve several Lisp projects at once —
+each with its own image and Slynk port. A per-project =.envrc= (managed by
+[[https://direnv.net][direnv]]) fixes this: it supplies the attach target and the
+related knobs *per project*, exported into the environment when you launch
+your agent from that project's directory. The dsmr-mcp server inherits those
+variables and drives *that* project's image, which lets the global MCP entry
+stay env-free and canonical instead of hardcoding one project's listener.
+
+** The shipped =.envrc=
+
+The template dsmr-mcp puts into position is copied verbatim — it uses shell
+=${VAR:-default}= expansion, so no per-project rendering is needed:
+
+#+begin_src bash
+# .envrc — dsmr-mcp per-project configuration (direnv). Run `direnv allow` to activate.
+# These DSMR_* vars are inherited by the dsmr-mcp MCP server when you launch your
+# agent (e.g. `claude`) from this directory — so the server drives THIS project's
+# image without hardcoding anything in your global ~/.claude.json.
+
+export LISP_WORKSPACE="${LISP_WORKSPACE:-$HOME/SourceCode/lisp/}"
+
+# This project's Slynk listener. scripts/dev-boot.sh reads the same two vars,
+# so dev-boot and dsmr-mcp stay in sync (single source of truth).
+export SLYNK_HOST="${SLYNK_HOST:-127.0.0.1}"
+export SLYNK_PORT="${SLYNK_PORT:-4005}"
+
+# auto = attach to the image above if reachable, else a private hermetic worker.
+export DSMR_MODE=auto
+export DSMR_SLYNK_ATTACH="${SLYNK_HOST}:${SLYNK_PORT}"
+export DSMR_LOG_LEVEL=info
+
+# Sibling projects this one may re-root into (filesystem sandbox whitelist):
+# export DSMR_RELATED_PROJECTS="$HOME/SourceCode/lisp/cl-mcp:$HOME/SourceCode/lisp/eve-quant"
+#+end_src
+
+The attach target is *derived*: =DSMR_SLYNK_ATTACH="${SLYNK_HOST}:${SLYNK_PORT}"=
+is built from the same two variables that =scripts/dev-boot.sh= reads to start
+the project's listener, so the listener you boot and the target dsmr-mcp
+attaches to are a single source of truth and cannot drift. =DSMR_MODE=auto=
+means the server attaches to that image when it is reachable and otherwise
+spins up a private hermetic worker, so the =.envrc= works whether or not your
+project image is running.
+
+** How the =.envrc= gets into place
+
+There are three ways a project ends up with this file, depending on how you
+start:
+
+- *Greenfield (scaffold).* When you stand up a new project with the scaffold,
+  the =.envrc= is emitted automatically as part of the generated file set —
+  scaffolding the project *is* the consent to write it.
+- *An existing Lisp project.* When dsmr-mcp runs in a project that already has
+  an =*.asd= file but no =.envrc=, it *asks* before writing one. On your first
+  dsmr-mcp tool use in that session, the server raises a native yes/no consent
+  dialog in the client; only on an explicit accept does it write the =.envrc=,
+  and it writes through the same filesystem write-jail every other tool obeys.
+  An existing =.envrc= is *never* clobbered, and you are asked at most once per
+  session — a decline is remembered for the rest of the session. The prompt
+  only appears with clients that support MCP elicitation and the stdio
+  transport; with any other client it is a silent no-op, never an error.
+- *Site-wide defaults (installer).* The installer offers to write a
+  personalized template to =~/.config/dsmr-mcp/envrc.template= (default Slynk
+  host/port, =LISP_WORKSPACE=, mode, log level, related projects). Both paths
+  above prefer that site template when it exists and fall back to the shipped
+  default otherwise, so every project you create starts from *your* defaults.
+  Pass =--no-envrc-defaults= to the installer to skip the offer; in a
+  non-interactive install it is a silent no-op and writes nothing.
+
+** Activating the file: =direnv allow .=
+
+direnv will not load a new or changed =.envrc= until you authorize it — this is
+direnv's trust model, and it is deliberate. After the file is created or
+edited, review it and run:
+
+#+begin_src sh
+direnv allow .
+#+end_src
+
+Until you do, the variables are not exported and dsmr-mcp sees none of them.
+dsmr-mcp does *not* require direnv to be installed: the =.envrc= is an inert
+text file without it, and the server falls back to its normal configuration
+sources ([[Configuration precedence]]). direnv is simply the most ergonomic way to
+scope these variables to a project directory.
+
 * Mode selection
 
 =DSMR_MODE= chooses how dsmr-mcp obtains a Lisp image to drive:
