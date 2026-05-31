@@ -80,9 +80,14 @@ this session, or NIL. Set by run from the resolved config; read by
     :accessor session-project-root
     :initform nil
     :documentation "Absolute pathname of this session's project root.
-NIL until fs-set-project-root is called. Never modified by the process CWD;
-changed only via fs-set-project-root.  Session-local: one session's
-re-rooting does not reach another.")
+Seeded at launch from the resolved root (precedence: explicit :project-root >
+DSMR_PROJECT_ROOT env > getcwd) for every transport (stdio, TCP, HTTP), so the
+launch-time .envrc consent prompt can fire on the first qualifying tool call
+without a prior fs-set-project-root.  Session-local: one session's root never
+leaks to another.  May be RE-ROOTED later via fs-set-project-root, which is
+permission-gated: re-rooting away from the launch root to a non-whitelisted
+directory requires human_approved:true (D-05).  Directly-constructed sessions
+(e.g. unit fixtures that call make-session without :project-root) start NIL.")
    (notify-channel
     :initarg :notify-channel
     :accessor session-notify-channel
@@ -152,8 +157,12 @@ dynamic variable (only *current-session-id* is)."))
 ID defaults to \"stdio\" (the stdio transport's logical name).
 SLYNK-ATTACH is the resolved host:port config string (or NIL) passed
 through from run's resolved-slynk-attach.
-PROJECT-ROOT is the initial project root pathname (or NIL); can be set
-later via fs-set-project-root.
+PROJECT-ROOT is the initial project root pathname (or NIL). run seeds it at
+launch from the resolved root (explicit :project-root > DSMR_PROJECT_ROOT >
+getcwd) for every transport; callers that construct a session directly (e.g.
+unit fixtures) may omit it, in which case it defaults to NIL.  The root is
+session-local and may be re-rooted later via the permission-gated
+fs-set-project-root.
 The returned session has:
   - initialized-p: NIL
   - protocol-version: NIL

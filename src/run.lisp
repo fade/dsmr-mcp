@@ -451,7 +451,8 @@ The dsmr-mcp:run nickname (re-exported by src/main.lisp) resolves to this functi
             (log-event :info "run.start" "transport" :stdio "mode" *mode*)
             (serve-streams *standard-input* *standard-output*
                            :session (make-session :id "stdio"
-                                                  :slynk-attach resolved-slynk-attach)))
+                                                  :slynk-attach resolved-slynk-attach
+                                                  :project-root resolved-root)))
            (:tcp
             (%check-remote-bind resolved-bind)
             (log-event :info "run.start" "transport" :tcp "mode" *mode*)
