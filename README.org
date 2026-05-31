@@ -52,7 +52,8 @@ a redefined function takes effect immediately, a live CLOS instance can be
 inspected, and a restart can be invoked. It is the Common Lisp analogue of a
 language server for an AI — a structured set of verbs over a live image.
 
-The name expands to *DeepSky Systems Model-context-Reagent for Common Lisp*.
+The name is a backronym, expanding (at your convenience) To: *DeepSky Systems
+Model-context-Reagent for Common Lisp*.
 
 * Intended use case
 

@@ -91,7 +91,10 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/project-scaffold"
                "dsmr-mcp/src/tools/project-scaffold"
                "dsmr-mcp/src/clhs"
-               "dsmr-mcp/src/tools/clhs-lookup")
+               "dsmr-mcp/src/tools/clhs-lookup"
+               "dsmr-mcp/src/install/config"
+               "dsmr-mcp/src/install/claude"
+               "dsmr-mcp/src/install")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"
@@ -158,7 +161,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/lsp/document-test"
                "dsmr-mcp/tests/lsp/bridge-test"
                "dsmr-mcp/tests/scaffold/project-scaffold-test"
-               "dsmr-mcp/tests/clhs/clhs-lookup-test")
+               "dsmr-mcp/tests/clhs/clhs-lookup-test"
+               "dsmr-mcp/tests/install/config-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
