@@ -1,0 +1,85 @@
+#+TITLE: dsmr-mcp — Release Notes
+#+SUBTITLE: v0.1.0
+
+* v0.1.0 — Attached-image-first MCP server
+
+This is the first tagged release of =dsmr-mcp=, an MCP (Model Context Protocol)
+server that connects an AI agent to a developer's live Common Lisp image. The
+milestone delivers a complete, dogfood-ready surface: an agent can evaluate
+code, inspect running state, edit source structurally, run tests, navigate a
+codebase, and look up documentation — inside the operator's own running Lisp.
+
+** What shipped
+
+*** Execution model
+
+- *Attached mode* (the default) routes evaluation and inspection into a
+  developer's already-running Lisp image over Slynk. This is the reason the
+  project exists: the agent works where definitions, packages, threads, and
+  application state already live.
+- *Hermetic mode* forks a clean, crash-isolated SBCL worker pool for when there
+  is no image to attach to, with a circuit breaker that stops a crashing worker
+  from being respawned in a tight loop and a per-request timeout backstop.
+- *Auto mode* probes for a reachable Slynk listener and resolves to attached if
+  one is found, otherwise falls back to hermetic.
+
+*** Transports
+
+- =stdio= (the default for editor MCP clients), =tcp=, and Streamable =http=
+  with a bundled bridge. All network transports bind loopback by default; moving
+  off loopback is an explicit operator decision (=DSMR_ALLOW_REMOTE=).
+
+*** Verb surface (28 verbs)
+
+- *REPL & build* — =repl-eval=, =load-system=, =run-tests=.
+- *Filesystem* — =fs-read-file=, =fs-write-file=, =fs-list-directory=,
+  =fs-get-project-info=, =fs-set-project-root=.
+- *Structural Lisp editing* — =lisp-read-file=, =lisp-edit-form=,
+  =lisp-patch-form=, =lisp-check-parens=.
+- *Code intelligence* — =code-find=, =code-find-references=, =code-describe=,
+  =clgrep-search=, =clhs-lookup=.
+- *Live-image inspection* — =inspect-object=, =inspect-condition=,
+  =inspect-restart=, =inspect-thread=.
+- *LSP bridge* — =lsp-hover=, =lsp-completions=, =lsp-diagnostics=,
+  =lsp-code-actions= (via alive-lsp, with an Eclector in-process fallback).
+- *Hermetic operations* — =pool-status=, =pool-kill-worker=.
+- *Scaffolding* — =project-scaffold=.
+
+*** Installation & onboarding
+
+- An install/configure utility (=scripts/install.lisp=) registers dsmr-mcp as an
+  MCP server for Claude Code — backing up the config and re-parsing the result
+  before writing — with =--print= for other agents and =--migrate= / =--replace=
+  for operators moving from cl-mcp.
+- A bundled =scaffold-project= skill stands up a new, delivery-disciplined
+  project from the skeleton in an empty directory.
+
+*** Operability & safety
+
+- Structured logging on stderr (=log4cl=).
+- A per-session filesystem sandbox — the one enforced agent-facing control:
+  writes are jailed under the session project root, reads extend to registered
+  ASDF source directories, symlinks are resolved before the containment check,
+  and re-rooting outside the configured whitelist requires human approval.
+- A reviewable threat model ([[file:threat-model.org]]), an operations runbook
+  ([[file:operations.org]]), and a generated, drift-guarded verb reference
+  ([[file:tools.org]]).
+
+** Why it matters
+
+Lisp development is image-based — a developer builds up a running world over a
+session. Conventional AI coding tools throw that away by operating on files and
+a fresh process. =dsmr-mcp= lets an agent participate in the image-based
+workflow directly, which is what makes Lisp productive in the first place.
+
+** Documentation
+
+The full manual is in [[file:index.org]]. Start with [[file:introduction.org]]
+for the overview and [[file:installation.org]] to get running.
+
+** Known limitations
+
+- Remote operation has no built-in authentication or TLS; off-loopback exposure
+  is an operator decision pending first-class auth in a future release.
+- Multi-image dispatch, persistent agent contexts, and non-SBCL implementations
+  are out of scope for this release.

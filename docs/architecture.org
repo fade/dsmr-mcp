@@ -1,0 +1,281 @@
+#+TITLE: dsmr-mcp — Architecture
+#+OPTIONS: toc:2 num:nil
+
+This document describes how a request travels through dsmr-mcp, the two
+execution paths it can take, and the major subsystems that make up the
+server. It is the structural overview; for the things adjacent to it see
+[[file:modes-and-transports.org]] (how modes and transports are selected and
+configured), [[file:threat-model.org]] (the trust posture and the controls the
+server actually enforces), [[file:tools.org][Tool reference]] (the verb surface), and
+[[file:index.org]] (documentation index).
+
+dsmr-mcp is an attached-image-first MCP server for Common Lisp: it exposes
+the verbs an AI agent needs to write and debug Lisp *inside a running
+development image*, where definitions, packages, threads, and application
+state already exist. A forked-worker pool is available as a fallback for
+crash isolation and parallel work. The whole system is a package-inferred
+ASDF system — one source file maps to one package — so the file names in
+this document are also the package names.
+
+* Request lifecycle
+
+A single MCP request crosses several layers before it reaches the code that
+does the work. The shape is the same regardless of which transport carries
+it and which execution path serves it.
+
+#+begin_example
+  MCP client
+     |
+     v
+  transport            src/transport/{stdio,tcp,http}.lisp
+     |  reads one JSON-RPC line, binds *current-session-id*
+     v
+  protocol             src/protocol.lisp  (process-json-line)
+     |  handshake / tools/list / tools/call / prompts
+     v
+  dispatcher           src/dispatch.lisp  (handle-tools-call)
+     |  resolve tool in *tool-classes*, validate args vs schema
+     |
+     +-- *mode* = :hermetic ------------> dispatch-hermetic-call
+     |                                    src/hermetic/dispatch.lisp
+     |                                       |
+     |                                       v
+     |                                    forked SBCL worker (own process)
+     |
+     +-- *mode* = :attached -----------> tool-handle on the per-session
+                                          tool instance
+                                            |  with-attach-dispatch
+                                            v
+                                          %dispatch-attach -> bounded-slime-eval
+                                          src/attach/dispatch.lisp
+                                            |  slynk-client
+                                            v
+                                          operator's own running Slynk image
+#+end_example
+
+The transport reads exactly one JSON-RPC message per line, binds the
+session identity special =*current-session-id*=, and hands the line to
+=process-json-line= in =src/protocol.lisp=. The protocol layer handles the
+MCP handshake (=initialize=, version negotiation), =tools/list=, =prompts=,
+and routes a =tools/call= to =handle-tools-call= in =src/dispatch.lisp=.
+
+The dispatcher is the mode router. It first asserts that the transport has
+bound a non-empty session id (a regression boundary that catches a caller
+who drives the protocol layer without establishing session identity). It
+then branches on the dynamic special =*mode*=: in =:hermetic= mode it
+returns straight into =dispatch-hermetic-call=; otherwise it resolves the
+tool class by name from the registry, fetches the per-session tool
+instance, validates the arguments against the tool's class-allocated
+schema (a missing required field becomes JSON-RPC =-32602=; an unknown
+tool name becomes =-32601=), and calls the tool's =tool-handle= method.
+
+* The two execution paths
+
+Every image-resident verb — evaluate, load a system, run tests, describe a
+symbol, inspect a live object — has to run *somewhere with a live Lisp
+image*. dsmr-mcp offers two such places, and the mode router chooses
+between them.
+
+** Attached (default)
+
+In attached mode the eval runs inside the operator's *own* long-running
+Lisp image, reached over a Slynk listener the operator started themselves.
+This is the project's central thesis: the agent works where the world
+already exists rather than in a worker that must rebuild it from scratch.
+
+The path is in =src/attach/=. =repl-eval-tool= (src/attach/dispatch.lisp)
+caches, per session, a single Slynk connection, a call-serialisation lock,
+and a connection-incarnation epoch counter — all per-instance slots, no
+global tables. =%dispatch-attach= builds a wrapping form (src/attach/wrap-form.lisp),
+sends it through =bounded-slime-eval= (src/attach/connection.lisp) over
+=slynk-client=, and turns the six-element result tuple from the remote image
+into a structured response: printed value, captured stdout/stderr, and rich
+error context (condition type, restarts, backtrace frames).
+
+Three properties matter for callers:
+
+- *Fail-closed, self-healing.* A lost listener surfaces a structured
+  =isError= (NETWORK_ERROR class), drops the cached connection, and bumps
+  the epoch so any previously-minted object handles read as stale. The
+  next call reopens the connection on demand and prefixes its output with
+  a reconnect note. There is no server restart and no silent fall-through
+  to hermetic.
+- *Concurrency policy.* Under the default =:serialised= policy a
+  process-wide lock is held around every eval so concurrent sessions take
+  turns inside the one live image; a queued notification is emitted before
+  a session blocks. =:parallel= drops the lock for read-mostly agents.
+- *Wire-serialization discipline.* Outbound injected forms must be
+  ANSI/portable (the attached image is the user's, of unknown
+  implementation) and free of literals the Slynk reader cannot round-trip;
+  strings are normalised at the parse boundary (src/wire-strings.lisp) so
+  an unprintable literal never kills the connection.
+
+** Hermetic (fallback / parallel isolation)
+
+In hermetic mode each session is served by a dedicated forked SBCL child
+process, so a crash takes down only that worker and never the operator's
+image. This is the path for when the live image is unavailable, or when an
+agent deliberately wants isolation from host state. The code is in
+=src/hermetic/=: the dispatcher-side pool and worker client, plus the
+worker program itself under =src/hermetic/worker/=.
+
+A worker is a bare SBCL child (=--noinform --non-interactive
+--no-userinit=) that loads the worker system, emits a one-line JSON
+handshake on stdout (its TCP port and pid), and then serves RPCs on that
+port. The dispatcher reads the handshake, connects, and authenticates with
+a shared secret. The wire between dispatcher and worker is *newline-delimited
+JSON-RPC* with a 16 MB line cap — not a length-prefixed envelope.
+
+** The mode router and :auto
+
+=*mode*= is resolved once at startup by =resolve-mode= in =src/run.lisp=,
+with precedence keyword arg > =DSMR_MODE= env > =.dsmr-mcp.conf= > the
+built-in default =:attached=. The third value, =:auto=, is the only place
+the two paths meet: it probes the configured Slynk listener with a 3-second
+TCP connect and resolves to =:attached= if reachable, =:hermetic= (with a
+one-time startup warning on stderr) if not. The probe runs only after the
+log appender is installed so the warning never lands on the JSON-RPC
+channel. Explicit =:attached= never falls back — a dead listener fails
+closed. See [[file:modes-and-transports.org]] for the full resolution rules.
+
+* The tool registry
+
+Verbs are not registered by a macro or a central list — they are CLOS
+classes that register themselves. The machinery lives in
+=src/tools/base.lisp=.
+
+- =mcp-tool= is the abstract base class. Each concrete verb subclasses it
+  and carries its MCP metadata — name, description, and input schema — in
+  =:allocation :class= slots, so every instance of a verb shares one
+  canonical name and schema literal at no per-instance cost.
+- =mcp-tool-class= is the metaclass. Because a concrete tool class inherits
+  this metaclass, closer-mop fires a =finalize-inheritance :after= method at
+  class-definition time that auto-registers the class into the registry
+  keyed by its name string. Re-evaluating a tool's =defclass= re-runs
+  finalization and refreshes the entry, so the registry is hot-reload
+  friendly. The abstract base class is skipped by a name guard.
+- =*tool-classes*= is the registry: a hash table from name string to tool
+  class. It is a =defvar= deliberately — a =defparameter= would re-bind a
+  fresh empty table whenever ASDF transitively reloads =base.lisp= for a
+  downstream leaf, silently dropping every registration. =defvar=
+  initialises once and survives the reload.
+
+The dispatcher reads from this same table, and =tools/list= renders it (the
+documentation in [[file:tools.org][Tool reference]] is generated from the live registry, with a
+parity test enforcing that the docs match what ships). Each verb is its own
+file under =src/tools/<verb>.lisp=.
+
+* Hermetic worker pool and circuit breaker
+
+The hermetic pool (=src/hermetic/pool.lisp=) manages worker processes with
+*strict exclusive session affinity*: one session is bound to exactly one
+worker, never shared. The pool keeps a small set of warm standby workers
+ready (=DSMR_WORKER_POOL_WARMUP=, default 1) and spawns on demand up to a
+ceiling (=DSMR_MAX_POOL_SIZE=, default 16); exceeding the ceiling signals a
+typed capacity error. At hermetic startup =initialize-pool= pre-warms the
+worker system's FASL cache once in the parent so concurrent child spawns
+never race to compile the same files, starts a background health monitor,
+and registers a shutdown hook.
+
+When a worker dies the health monitor detects it and asynchronously spawns a
+replacement bound to the same session. The session receives exactly *one*
+crash notification — the next call after a crash succeeds against the fresh
+worker, prefixed once with a notice that in-image state was lost.
+
+Two safety mechanisms guard against runaway sessions:
+
+- *Circuit breaker.* If one session's worker crashes three times within a
+  five-minute window the breaker trips: further calls for that session fail
+  fast for a 60-second cooldown rather than spawning yet another doomed
+  replacement. The breaker self-clears when the cooldown expires;
+  =release-session= and =pool-kill-worker :reset= clear it immediately.
+  This protects the host from a crash loop consuming process slots without
+  bound. (This is a dsmr-mcp addition over its cl-mcp lineage.)
+- *Per-request timeout with a hard-kill backstop.* Every worker call carries
+  a soft eval budget (=*default-eval-timeout*=, default 120 s) enforced
+  inside the worker, which returns a structured TIMEOUT payload on overrun.
+  As a backstop, if the worker does not respond within the soft budget plus
+  a kill grace (=DSMR_WORKER_KILL_GRACE_SECONDS=, default 5 s) — for example
+  a runaway FFI call the soft timeout cannot interrupt — the parent SIGKILLs
+  the worker via its process object (avoiding the PID-reuse hazard of
+  killing by raw pid), routes it through the normal crash-recovery path, and
+  surfaces a structured crash error. This control is *hermetic-only*; the
+  attached image is the operator's own and is never force-killed.
+
+The =pool-status= verb exposes the pool's health — running flag, worker
+counts, and a per-worker summary — but deliberately omits each worker's
+Slynk/swank port so the health view cannot be used to bypass MCP policy.
+
+* Filesystem sandbox
+
+The one control the server enforces against the agent is the filesystem
+sandbox (=src/project-root.lisp=, =src/fs.lisp=). The project root is a
+*per-session* slot, never a process global and never a =chdir=, so
+concurrent sessions can each be rooted at a different project without
+racing. Reads are allowed under the session root *and* under any registered
+ASDF source directory (so an agent can read sibling and dependency source);
+writes are jailed to the session root only. Symlink resolution runs before
+the containment check, broad roots like =/= or =/home/= are refused, and
+re-rooting outside a configured whitelist requires explicit human approval
+an agent cannot grant itself.
+
+This is a guardrail against accidental reach, not containment against an
+adversary — an agent with eval can touch the filesystem directly. The full
+trust posture, and why this is the only enforced agent-facing boundary, is
+in [[file:threat-model.org]].
+
+* The alive-lsp bridge
+
+Syntax intelligence (completions, hover, diagnostics, code actions) is
+delegated to alive-lsp rather than re-implemented. The bridge in =src/lsp/=
+follows an *attach-else-spawn* policy: it talks to an alive-lsp already
+listening on the configured port, or spawns one from a configured source
+checkout (=DSMR_ALIVE_LSP_DIR=). When neither is available the LSP verbs
+*degrade* rather than hard-fail — diagnostics, for instance, fall back to an
+in-process Eclector parse check that still catches paren and reader-level
+errors. The agent always gets *some* answer.
+
+* Structured logging
+
+All logging goes through =log-event= in =src/log.lisp=, backed by log4cl. A
+single appender writes one structured JSON object per line to *stderr* —
+never stdout, because stdout is the JSON-RPC channel and a stray log line
+there would corrupt the protocol. The threshold is set from =DSMR_LOG_LEVEL=
+at startup. The stdio transport additionally guards dispatch by rebinding
+=*standard-output*= so stray library prints are captured and logged rather
+than leaking onto the wire.
+
+* Module map
+
+A guide to the main areas under =src/=.
+
+- =src/main.lisp= — public API and root package; owns the =dsmr-mcp= /
+  =dsmr= nicknames and re-exports =run=, =process-json-line=,
+  =make-session=.
+- =src/run.lisp= — boot, config-precedence resolution, mode and transport
+  routing, the loopback safety gate, the =:auto= Slynk probe.
+- =src/protocol.lisp= — MCP/JSON-RPC: handshake, version negotiation,
+  =tools/list=, =tools/call=, =prompts=.
+- =src/dispatch.lisp= — per-session tool dispatch and the attached/hermetic
+  mode branch.
+- =src/state.lisp= — session objects and the mutable specials (=*mode*=,
+  =*current-session-id*=); the project's single home for global state.
+- =src/tools/base.lisp= — the CLOS tool-registry protocol (metaclass, base
+  class, =*tool-classes*=); =src/tools/<verb>.lisp= — one file per verb.
+- =src/transport/{stdio,tcp,http}.lisp= — the three transports; plus the
+  standalone stdio↔TCP bridge (=scripts/stdio-tcp-bridge.lisp=,
+  =dsmr-mcp-bridge.asd=).
+- =src/attach/{connection,dispatch,registry,wrap-form}.lisp= — the attached
+  execution path into the operator's Slynk image.
+- =src/hermetic/{pool,worker-client,dispatch}.lisp= and
+  =src/hermetic/worker/*= — the forked-worker pool and the worker program.
+- =src/project-root.lisp=, =src/fs.lisp= — the filesystem sandbox.
+- =src/lsp/{client,document,bridge}.lisp= — the alive-lsp bridge.
+- Code intelligence and structural editing — =src/code-core.lisp=,
+  =src/clgrep.lisp=, =src/clhs.lisp=, =src/system-loader-core.lisp=,
+  =src/test-runner-core.lisp=, and the Eclector-based editors
+  (=src/cst.lisp=, =src/lisp-edit-form*.lisp=, =src/lisp-patch-form.lisp=,
+  =src/parinfer.lisp=, =src/validate.lisp=).
+- =src/project-scaffold*.lisp= — project skeleton generation.
+- =src/log.lisp= (structured logging), =src/notify.lisp= (notification
+  channels), =src/wire-strings.lisp= (wire-string normalisation).

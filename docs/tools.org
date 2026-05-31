@@ -1,0 +1,1028 @@
+#+TITLE: dsmr-mcp Tool Reference
+
+# Generated file — do not edit by hand. Every heading below is rendered from
+# the live tool registry and the same schema encoder the wire (tools/list)
+# uses. Edit a tool's class definition and regenerate; a hand edit will
+# diverge from the schema the server actually advertises and fail the parity
+# test. Regenerate instead of editing.
+
+* arg-val-test
+
+Stub tool requiring a 'code' argument for validation tests.
+
+#+begin_src json
+{
+  "properties": {
+    "code": {
+      "description": "required code",
+      "type": "string"
+    }
+  },
+  "required": [
+    "code"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* clgrep-search
+
+Lisp-aware semantic grep over .lisp/.asd/.cl/.lsp/.ros source files. 
+Unlike plain text grep, returns the top-level form signature (defun/defmethod/etc.) 
+containing each match. Works WITHOUT loading any Lisp system — no side effects. 
+Use this first for code exploration; follow with lisp-read-file for definition detail. 
+Default: returns signatures only (token-efficient). Set include_form=true for full 
+form text. Set form_pattern to a shape like "(defun _ ...)" for structural matching 
+(D-11: _, ?name, ... wildcards; no predicates or full unification).
+
+#+begin_src json
+{
+  "properties": {
+    "case_insensitive": {
+      "description": "Case-insensitive regex matching (default: false).",
+      "type": "boolean"
+    },
+    "form_pattern": {
+      "description": "Structural form-shape pattern (D-11 opt-in). Uses _, ?name, \n... wildcards. Example: \"(defun _ ...)\". When supplied, pattern is ignored and structural \nmatching replaces the regex fast path.",
+      "type": "string"
+    },
+    "form_types": {
+      "description": "Restrict to these form types, e.g. [\"defun\", \"defmethod\"] \n(optional, all types by default).",
+      "type": "array"
+    },
+    "include_form": {
+      "description": "Include full form text in each result (default: false).",
+      "type": "boolean"
+    },
+    "limit": {
+      "description": "Maximum number of results to return (default: 200).",
+      "type": "integer"
+    },
+    "path": {
+      "description": "Search root: absolute path or relative to project root. \nDefaults to project root.",
+      "type": "string"
+    },
+    "pattern": {
+      "description": "cl-ppcre regular expression to search for (required in regex mode).",
+      "type": "string"
+    },
+    "recursive": {
+      "description": "Search subdirectories recursively (default: true).",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "pattern"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* clhs-lookup
+
+Look up a symbol or section in the Common Lisp HyperSpec (ANSI standard). 
+Accepts a symbol name (loop, format, handler-case) or a section number (22.3, 3.1.2, 
+auto-detected by the digit.dot shape) and returns the resolved entry URL plus extracted 
+plain text. Reads a local HyperSpec tree; resolves nothing over the network on the 
+primary path. Returns a structured not-found error when no HyperSpec is available.
+
+#+begin_src json
+{
+  "properties": {
+    "brief": {
+      "description": "Return only Syntax + Arguments (compact; omits \nDescription, Examples, Notes for token efficiency).",
+      "type": "boolean"
+    },
+    "include_content": {
+      "description": "Include extracted text content (default: true).",
+      "type": "boolean"
+    },
+    "query": {
+      "description": "Symbol name or section number (e.g. loop, 22.3).",
+      "type": "string"
+    }
+  },
+  "required": [
+    "query"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* code-describe
+
+Describe a symbol: type (function/macro/class/variable/etc.), 
+argument list, docstring, and source location. The attached path delegates to 
+Slynk for rich arglist and description text; the hermetic path uses 
+sb-introspect and cl:documentation. When the symbol is not found, returns a 
+typed error with a redirect hint. Requires attached or hermetic mode.
+
+#+begin_src json
+{
+  "properties": {
+    "package": {
+      "description": "Package name for unqualified symbols. \nOptional; defaults to CL-USER when omitted.",
+      "type": "string"
+    },
+    "symbol": {
+      "description": "Symbol name to describe. Package-qualified form \npreferred (e.g. \"my-pkg:my-fn\"). Unqualified names use the optional package arg.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "symbol"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* code-find
+
+Locate definition(s) for a symbol in the loaded image. 
+Returns project-relative path, line, and kind (function/method/class/etc.) 
+for every definition. When the symbol is not found, returns a typed error 
+with a redirect hint (e.g. try load-system, or clgrep-search for text search). 
+Requires attached or hermetic mode.
+
+#+begin_src json
+{
+  "properties": {
+    "package": {
+      "description": "Package name for unqualified symbols. \nOptional; defaults to CL-USER when omitted.",
+      "type": "string"
+    },
+    "symbol": {
+      "description": "Symbol name to locate. Package-qualified form \npreferred (e.g. \"my-pkg:my-fn\"). Unqualified names use the optional package arg.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "symbol"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* code-find-references
+
+Find all callers and references to a symbol using 
+sb-introspect xref (who-calls, who-references, who-binds, who-sets, 
+who-macroexpands). Returns entries with project-relative path, line, 
+caller name, and relation. project_only (default true) restricts results 
+to paths under the project root. relation optionally filters to one kind 
+("calls", "references", "binds", "sets", "macroexpands"). 
+When the symbol is not found, returns a typed error with a redirect hint. 
+Requires attached or hermetic mode.
+
+#+begin_src json
+{
+  "properties": {
+    "package": {
+      "description": "Package name for unqualified symbols. Optional.",
+      "type": "string"
+    },
+    "project_only": {
+      "description": "Restrict results to paths under *project-root* \n(default: true). Set to false to include all loaded systems.",
+      "type": "boolean"
+    },
+    "relation": {
+      "description": "Filter to one xref relation: \"calls\", \n\"references\", \"binds\", \"sets\", or \"macroexpands\". Omit for all.",
+      "type": "string"
+    },
+    "symbol": {
+      "description": "Symbol name to find references to. \nPackage-qualified form preferred (e.g. \"my-pkg:my-fn\").",
+      "type": "string"
+    }
+  },
+  "required": [
+    "symbol"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* fs-get-project-info
+
+Report the session project root and how it was set.
+
+#+begin_src json
+{
+  "properties": {},
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
+* fs-list-directory
+
+List directory entries. Hidden files and build artifacts are filtered by default.
+
+#+begin_src json
+{
+  "properties": {
+    "path": {
+      "description": "Absolute or project-relative directory path.",
+      "type": "string"
+    },
+    "show_hidden": {
+      "description": "Include hidden files (default false). Build artifacts always filtered.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "path"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* fs-read-file
+
+Read a text file within the project root or registered ASDF source dirs. 
+Bounded by a 2 MB cap; use offset/limit to paginate large files.
+
+#+begin_src json
+{
+  "properties": {
+    "limit": {
+      "description": "Maximum characters to return (optional; capped at 2 MB).",
+      "type": "integer"
+    },
+    "offset": {
+      "description": "0-based character offset to start reading (optional).",
+      "type": "integer"
+    },
+    "path": {
+      "description": "Absolute or project-relative path to the file.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "path"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* fs-set-project-root
+
+Set the session project root directory. All subsequent fs-* verbs 
+resolve paths relative to this root. Re-rooting outside the configured whitelist 
+(DSMR_RELATED_PROJECTS) requires human_approved: true.
+
+#+begin_src json
+{
+  "properties": {
+    "human_approved": {
+      "description": "Set to true (by a human, not an agent) to authorize \nre-rooting to a path outside the configured whitelist. An autonomous agent cannot \nself-approve this bypass (D-05).",
+      "type": "boolean"
+    },
+    "path": {
+      "description": "Absolute path to the project root directory.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "path"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* fs-write-file
+
+Write text content to a file under the session root. 
+Parent directories are created automatically. For editing EXISTING Lisp source 
+files use lisp-edit-form instead.
+
+#+begin_src json
+{
+  "properties": {
+    "content": {
+      "description": "Text content to write.",
+      "type": "string"
+    },
+    "path": {
+      "description": "Relative or absolute path under the project root.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "path",
+    "content"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* inspect-condition
+
+Drill into the current debugger condition at a live SLDB break: 
+returns the condition's slot values and its class-precedence-list type hierarchy. 
+When supplied with a result_object_id pointing to a held condition, inspects that 
+object instead of the live break condition.  When not at a break (and no id given), 
+returns a structured not-at-break result with condition_p=false — not an error. 
+Inspecting an arbitrary captured condition that was not registered as a result 
+object is a follow-on capability not yet delivered.
+
+#+begin_src json
+{
+  "properties": {
+    "id": {
+      "description": "Optional result_object_id from a previous repl-eval \nor inspect-object call pointing to a held condition.  When supplied, inspects that \nregistered object instead of the live debugger condition.",
+      "type": "string"
+    },
+    "max_elements": {
+      "description": "Maximum number of slots to return (default: 50).",
+      "type": "integer"
+    }
+  },
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
+* inspect-object
+
+Inspect a held object by ID from a previous repl-eval or 
+inspect-object call. Returns structural details (slots, elements, entries) 
+and nested object-ref IDs for drill-down. Both attached and hermetic modes 
+are supported; the envelope shape is identical.
+
+#+begin_src json
+{
+  "properties": {
+    "id": {
+      "description": "Object ID string (epoch:session:raw-id) from \nresult_object_id or a previous inspect-object response.",
+      "type": "string"
+    },
+    "max_depth": {
+      "description": "Nesting depth cap (0=summary only, default=1).",
+      "type": "integer"
+    },
+    "max_elements": {
+      "description": "Max elements for lists/arrays/hash-tables (default=50).",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "id"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* inspect-restart
+
+List the live restarts at the current SLDB debugger break in 
+the attached image, or invoke a chosen restart by index or name.  In attached 
+mode this surfaces the restarts visible to the break thread (ABORT, CONTINUE, 
+etc.) — the same menu a SLIME user sees.  Invoking a restart is state-changing: 
+it unwinds the break thread's stack and resolves the break.  In hermetic mode 
+there is no interactive break, so an empty restart set is returned.
+
+#+begin_src json
+{
+  "properties": {
+    "invoke": {
+      "description": "0-based index of the restart to invoke.  When \nsupplied, bounds-checked against the listed restarts before the slyfun call.  \nMutually exclusive with invoke_name; invoke takes precedence.",
+      "type": "integer"
+    },
+    "invoke_name": {
+      "description": "Name of the restart to invoke (e.g. \"ABORT\", \n\"CONTINUE\").  Case-insensitive match against the listed restart names.  \nResolved to an index before the slyfun call.  Ignored when invoke is supplied.",
+      "type": "string"
+    },
+    "level": {
+      "description": "SLDB level for the break to query or invoke against. \nDefaults to 1 (the first break level).  Must match *sly-db-level* in the break \nthread or an invoke call is silently ignored by Slynk.",
+      "type": "integer"
+    }
+  },
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
+* inspect-thread
+
+Enumerate threads in the attached developer image or the 
+hermetic worker process, with optional per-thread backtrace.  In attached 
+mode the result reflects the live image's thread list.  In hermetic mode 
+the result reflects the worker process's own threads.
+
+#+begin_src json
+{
+  "properties": {
+    "backtrace": {
+      "description": "When true, the response carries an \n'eval_thread_frames' vector at the top level: a single snapshot of the \nEVAL thread's call stack (SBCL only; capped at 20 frames; empty vector on \n#-sbcl).  Frames are NOT attached per-thread because there is only one \nsnapshot — attaching the same vector to every thread entry would mislead \nthe caller about which thread the frames belong to.",
+      "type": "boolean"
+    },
+    "thread_id": {
+      "description": "Reserved for future targeted backtrace capture. \nCurrently accepted but not used for thread selection.",
+      "type": "integer"
+    }
+  },
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
+* lisp-check-parens
+
+Check balanced parentheses and reader syntax in a Lisp file or 
+inline code snippet. Reports the first imbalance or reader error with 
+line/column/offset. Ignores delimiters inside double-quoted strings, ; line 
+comments, and #| |# block comments. Character literals #\x are not counted. 
+Provide either path (file read under sandbox) or code (inline text) — not both.
+
+#+begin_src json
+{
+  "properties": {
+    "code": {
+      "description": "Raw Lisp code string to check (mutually exclusive \nwith path).",
+      "type": "string"
+    },
+    "limit": {
+      "description": "Maximum characters to read from path (optional).",
+      "type": "integer"
+    },
+    "offset": {
+      "description": "0-based character offset when reading from path (optional).",
+      "type": "integer"
+    },
+    "path": {
+      "description": "Absolute or project-relative path to a Lisp file \n(mutually exclusive with code).",
+      "type": "string"
+    }
+  },
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
+* lisp-edit-form
+
+Structure-aware edit of a top-level Lisp form using Eclector CST parsing. 
+Supports replace, insert_before, insert_after, and delete operations while preserving 
+formatting and comments. PREFERRED METHOD for editing existing Lisp source code. 
+Automatically repairs missing closing parentheses using parinfer (non-delete ops). 
+ALWAYS use this tool instead of fs-write-file when modifying Lisp forms.
+
+#+begin_src json
+{
+  "properties": {
+    "content": {
+      "description": "Full Lisp form text for replace/insert operations. \nRequired for replace/insert_before/insert_after; ignored for delete. \nMust contain exactly one top-level form. Missing closing parens are auto-repaired.",
+      "type": "string"
+    },
+    "dry_run": {
+      "description": "When true, return a preview without writing to disk.",
+      "type": "boolean"
+    },
+    "file_path": {
+      "description": "Target file path (absolute, or relative to project root).",
+      "type": "string"
+    },
+    "form_name": {
+      "description": "Form name to match. For defmethod include specializers, \ne.g. \"print-object ((obj my-class) stream)\". Reader macro prefixes #: and : are \nstripped automatically.",
+      "type": "string"
+    },
+    "form_type": {
+      "description": "Form type to search, e.g. \"defun\", \"defmacro\", \"defmethod\".",
+      "type": "string"
+    },
+    "normalize_blank_lines": {
+      "description": "When true (default), normalize blank lines around top-level forms.",
+      "type": "boolean"
+    },
+    "operation": {
+      "description": "Operation: replace, insert_before, insert_after, or delete.",
+      "enum": [
+        "replace",
+        "insert_before",
+        "insert_after",
+        "delete"
+      ],
+      "type": "string"
+    },
+    "readtable": {
+      "description": "Named-readtable designator for files using custom reader macros.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "file_path",
+    "form_type",
+    "form_name",
+    "operation"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* lisp-patch-form
+
+Scoped text replacement within a matched top-level Lisp form. 
+Finds old_text (exact, whitespace-sensitive) within the form identified by 
+form_type and form_name, and replaces it with new_text. old_text must match 
+exactly once within the form. Most token-efficient way to make small changes 
+to large forms. Does NOT auto-repair parentheses — if the patch breaks form 
+structure it fails immediately and no changes are written to disk. 
+Use lisp-edit-form instead when replacing or inserting entire forms.
+
+#+begin_src json
+{
+  "properties": {
+    "dry_run": {
+      "description": "When true, return a preview without writing to disk.",
+      "type": "boolean"
+    },
+    "file_path": {
+      "description": "Target file path (absolute, or relative to project root).",
+      "type": "string"
+    },
+    "form_name": {
+      "description": "Form name to match. Reader macro prefixes #: and : are stripped automatically.",
+      "type": "string"
+    },
+    "form_type": {
+      "description": "Form type to search, e.g. \"defun\", \"defmacro\", \"defmethod\".",
+      "type": "string"
+    },
+    "new_text": {
+      "description": "Replacement text for old_text.",
+      "type": "string"
+    },
+    "old_text": {
+      "description": "Text to find within the matched form. Exact, whitespace-sensitive. \nMust occur exactly once in the form.",
+      "type": "string"
+    },
+    "readtable": {
+      "description": "Named-readtable designator for files using custom reader macros.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "file_path",
+    "form_type",
+    "form_name",
+    "old_text",
+    "new_text"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* lisp-read-file
+
+Read a Lisp source file with a collapsed signature view to save context tokens. 
+PREFER this over fs-read-file for .lisp and .asd files unless you need raw bytes. 
+Use name_pattern to locate specific definitions. 
+Use collapsed=true (default) to see only signatures, collapsed=false for full source. 
+When raw mode output is truncated a '[Showing lines A-B of N. Use offset=B to read more.]' 
+footer is appended to guide pagination.
+
+#+begin_src json
+{
+  "properties": {
+    "collapsed": {
+      "description": "When true (default) collapse definitions to signatures; false for raw lines.",
+      "type": "boolean"
+    },
+    "content_pattern": {
+      "description": "CL-PPCRE regex to match form content to expand in collapsed view.",
+      "type": "string"
+    },
+    "limit": {
+      "description": "Maximum lines to return in raw mode (default 500).",
+      "type": "integer"
+    },
+    "name_pattern": {
+      "description": "CL-PPCRE regex to match definition names to expand in collapsed view.",
+      "type": "string"
+    },
+    "offset": {
+      "description": "0-based line offset for raw mode (collapsed=false) pagination.",
+      "type": "integer"
+    },
+    "path": {
+      "description": "Path to the Lisp source file (absolute, or relative to project root).",
+      "type": "string"
+    },
+    "readtable": {
+      "description": "Named-readtable designator for files using custom reader macros.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "path"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* load-system
+
+Load an ASDF system with structured output and reload support. 
+Solves three problems with using (asdf:load-system) via repl-eval: 
+1. Staleness: force=true (default) clears loaded state so edits from 
+lisp-edit-form become live. 2. Output noise: warnings are collected and 
+returned in a structured list rather than flooding the terminal. 
+3. Timeout: the load is wrapped in a real in-image timeout that actually 
+interrupts a runaway compile. Requires attached or hermetic mode.
+
+#+begin_src json
+{
+  "properties": {
+    "clear_fasls": {
+      "description": "Force full recompilation from source by clearing \nthe ASDF output cache before loading (default: false).",
+      "type": "boolean"
+    },
+    "force": {
+      "description": "Clear loaded state before loading to pick up \nchanges from lisp-edit-form (default: true).",
+      "type": "boolean"
+    },
+    "system": {
+      "description": "ASDF system name (e.g. \"my-project\", \n\"my-project/tests\"). Must be findable by ASDF (registered via asdf:load-asd \nor on the ASDF source registry / Quicklisp search paths).",
+      "type": "string"
+    },
+    "timeout_seconds": {
+      "description": "Timeout in seconds before the load is \ninterrupted (default: 120). The timeout fires inside the target image \nso a runaway compile is actually aborted.",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "system"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* lsp-code-actions
+
+Synthesized discover-then-apply code-actions menu for a position 
+in a Lisp file. Requires a running alive-lsp server. Two-step workflow: 
+(1) Call without action to DISCOVER applicable actions at line/character — 
+returns a vector of action descriptors (macroexpand, remove-from-export, format). 
+(2) Call with action set to one of those descriptors to APPLY it. Actions are 
+backed by $/alive/macroexpand1 (macro expansion at point), 
+$/alive/unexportSymbol (remove symbol from package exports), and 
+textDocument/rangeFormatting (format the surrounding form). 
+Returns lsp-unavailable when alive-lsp is not reachable.
+
+#+begin_src json
+{
+  "properties": {
+    "action": {
+      "description": "Action descriptor hash-table from a prior discover \ncall. Absent for discover mode; present to apply a chosen action.",
+      "type": "object"
+    },
+    "character": {
+      "description": "0-based character offset within the line.",
+      "type": "integer"
+    },
+    "file_path": {
+      "description": "Absolute path to the Lisp file (within session root).",
+      "type": "string"
+    },
+    "line": {
+      "description": "0-based line number of the cursor position.",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "file_path",
+    "line",
+    "character"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* lsp-completions
+
+Get code completions from alive-lsp at a position in a Lisp file. 
+Requires a running alive-lsp server (attach-else-spawn per project root). 
+Returns {items: [...]} where each item has label, kind, documentation, 
+insertText, insertTextFormat fields. Returns lsp-unavailable when 
+alive-lsp is not reachable.
+
+#+begin_src json
+{
+  "properties": {
+    "character": {
+      "description": "0-based character offset within the line.",
+      "type": "integer"
+    },
+    "file_path": {
+      "description": "Absolute path to the Lisp file (within session root).",
+      "type": "string"
+    },
+    "line": {
+      "description": "0-based line number of the cursor position.",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "file_path",
+    "line",
+    "character"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* lsp-diagnostics
+
+Get compiler diagnostics from alive-lsp for a Lisp file. 
+Requires a running alive-lsp server (attach-else-spawn per project root). 
+Default (load=false): uses $/alive/tryCompile — safe read-only compilation 
+check, does not evaluate or load the file. Optional load=true: uses 
+$/alive/compile — evaluates and loads the file into the alive-lsp image 
+(mutating, use with caution). Returns {messages: [{severity, location, 
+message}]} where severity is 'error', 'warning', or 'info'. An empty 
+messages list does not guarantee clean compilation (some errors lack source 
+locations and are silently dropped). When alive-lsp is not reachable, 
+returns a degraded Eclector parse check flagged degraded:lsp-unavailable.
+
+#+begin_src json
+{
+  "properties": {
+    "file_path": {
+      "description": "Absolute path to the Lisp file (within session root).",
+      "type": "string"
+    },
+    "load": {
+      "description": "When true, use $/alive/compile (evaluates/loads \nthe file in the alive-lsp image — mutating). Default false uses \n$/alive/tryCompile (safe, no evaluation).",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "file_path"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* lsp-hover
+
+Get hover documentation from alive-lsp at a position in a Lisp file. 
+Requires a running alive-lsp server (attach-else-spawn per project root). 
+Returns {value: "<docstring>"} where value is an empty string when no 
+documentation is found at the position. Quality depends on which packages 
+are loaded in the alive-lsp image. Returns lsp-unavailable when alive-lsp 
+is not reachable.
+
+#+begin_src json
+{
+  "properties": {
+    "character": {
+      "description": "0-based character offset within the line.",
+      "type": "integer"
+    },
+    "file_path": {
+      "description": "Absolute path to the Lisp file (within session root).",
+      "type": "string"
+    },
+    "line": {
+      "description": "0-based line number of the cursor position.",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "file_path",
+    "line",
+    "character"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* pool-kill-worker
+
+Kill the hermetic worker bound to the current session. 
+A replacement worker is spawned on the next tool call. In-image state 
+(loaded systems, REPL definitions) is lost. Use this to recover from a 
+stuck or corrupted worker. Only available in hermetic mode.
+
+#+begin_src json
+{
+  "properties": {
+    "reset": {
+      "description": "When true, also clears the session circuit breaker state \nso the next call can spawn without waiting for the 60-second cool-down.",
+      "type": "boolean"
+    }
+  },
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
+* pool-status
+
+Return the current status of the hermetic worker pool 
+(active workers, standbys, session affinity map, circuit breaker state). 
+Only available in hermetic mode. Returns pool_running, total_workers, 
+standby_count, bound_count, max_pool_size, warmup_target, and a workers array.
+
+#+begin_src json
+{
+  "properties": {},
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
+* project-scaffold
+
+Generate a complete Lisp project skeleton under the session root. 
+Emits a package-inferred-system with a mode-dispatching executable, Parachute 
+test suite, build recipe, dev-boot script, dependency-preference agent docs, 
+a copied REPL-development guide, and a selectable license with per-file SPDX 
+headers. Returns a manifest of created files and next-step commands.
+
+#+begin_src json
+{
+  "properties": {
+    "author": {
+      "description": "Author string for .asd :author. No newlines.",
+      "type": "string"
+    },
+    "copyright": {
+      "description": "Copyright holder for LICENSE file (defaults to author). No newlines.",
+      "type": "string"
+    },
+    "description": {
+      "description": "One-line project description for .asd and README. No newlines.",
+      "type": "string"
+    },
+    "destination": {
+      "description": "Relative parent directory under the session root \nwhere <name>/ is created (default: scaffolds). No leading / or .. segments.",
+      "type": "string"
+    },
+    "license": {
+      "description": "SPDX license identifier (default: AGPL-3.0-or-later).",
+      "enum": [
+        "AGPL-3.0-or-later",
+        "GPL-3.0-or-later",
+        "GPL-2.0-or-later",
+        "LGPL-3.0-or-later",
+        "LGPL-2.1-or-later",
+        "MIT",
+        "BSD-2-Clause",
+        "BSD-3-Clause",
+        "Apache-2.0"
+      ],
+      "type": "string"
+    },
+    "name": {
+      "description": "Project name in lisp-case (e.g. foo-lib). \nMust match ^[a-z][a-z0-9-]*$ and be 1-64 characters.",
+      "type": "string"
+    },
+    "overwrite": {
+      "description": "When true, replace an existing scaffold directory. Default: false.",
+      "type": "boolean"
+    },
+    "year": {
+      "description": "Copyright year for LICENSE (default: current year).",
+      "type": "string"
+    }
+  },
+  "required": [
+    "name"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* proto-test-echo
+
+Synthetic echo tool for tools-call tests.
+
+#+begin_src json
+{
+  "properties": {
+    "code": {
+      "description": "code to echo",
+      "type": "string"
+    }
+  },
+  "required": [
+    "code"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* repl-eval
+
+Evaluate Common Lisp forms in the attached Slynk image. 
+Returns printed values, captured stdout/stderr, and structured error context 
+(condition type, message, restarts, SBCL backtrace frames). 
+Requires :slynk-attach / DSMR_SLYNK_ATTACH to be configured.
+
+#+begin_src json
+{
+  "properties": {
+    "code": {
+      "description": "One or more top-level Common Lisp forms to evaluate.",
+      "type": "string"
+    },
+    "max_output_length": {
+      "description": "Maximum characters for captured stdout/stderr output (default: 50000).",
+      "type": "integer"
+    },
+    "package": {
+      "description": "Package name in which to evaluate; defaults to CL-USER.",
+      "type": "string"
+    },
+    "register_result": {
+      "description": "When true (the default), registers the last form's first \nreturn value in the image-resident handle table and returns result_object_id. \nSet to false to suppress registration for hot loops or uninteresting results.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "code"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* run-tests
+
+Run tests for an ASDF system and return structured results with 
+per-test pass/fail counts and source locations. 
+Supports automatic framework detection (parachute/rove/fiveam) or explicit 
+selection via the framework argument. 
+By default, the test system is reloaded before running so edits from 
+lisp-edit-form become live; pass reload=false to opt out. 
+Returns: passed/failed/pending counts, framework name, duration_ms, and a 
+failed_tests array with test_name/reason/source{file,line} per failure. 
+Requires attached or hermetic mode.
+
+#+begin_src json
+{
+  "properties": {
+    "framework": {
+      "description": "Force framework: \"parachute\", \"rove\", \"fiveam\", \nor \"auto\" (default: auto-detect from ASDF :depends-on).",
+      "type": "string"
+    },
+    "reload": {
+      "description": "Reload the test system before running (default: true). \nPass false to skip reload for tight hot-reload loops.",
+      "type": "boolean"
+    },
+    "system": {
+      "description": "ASDF system name to test (e.g. \"my-project/tests\").",
+      "type": "string"
+    },
+    "test": {
+      "description": "Run only this specific test (fully qualified: \n\"package::test-name\"). Supported for Rove.",
+      "type": "string"
+    },
+    "tests": {
+      "description": "Run only these specific tests (array of \n\"package::test-name\" strings). Supported for Rove.",
+      "type": "array"
+    },
+    "timeout_seconds": {
+      "description": "Timeout in seconds before the run is interrupted \n(default: 300). The timeout fires inside the target image.",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "system"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* session-test-ping
+
+Synthetic ping tool used by session-test only.
+
+#+begin_src json
+{
+  "properties": {},
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
+* tools-list-echo
+
+Echo stub for tools-list shape tests.
+
+#+begin_src json
+{
+  "properties": {
+    "msg": {
+      "description": "message",
+      "type": "string"
+    }
+  },
+  "required": [
+    "msg"
+  ],
+  "type": "object"
+}
+#+end_src
+
+
