@@ -1,0 +1,188 @@
+#+TITLE: dsmr-mcp — Modes & Transports
+#+OPTIONS: toc:2 num:nil
+
+dsmr-mcp answers two orthogonal questions at startup: *where does Lisp code
+run* (the /mode/) and *how do MCP clients reach the dispatcher* (the
+/transport/). The two axes are independent — any mode combines with any
+transport — and both resolve through the same precedence chain:
+
+: keyword argument  >  DSMR_<KEYWORD> env var  >  .dsmr-mcp.conf  >  built-in default
+
+See [[file:configuration.org]] for the full environment-variable reference, and
+[[file:architecture.org]] for how the resolved values thread through the request
+flow. Return to [[file:index.org]] for the documentation map.
+
+* Modes
+
+A mode decides /where evaluation happens/. The active mode lives in the
+special =dsmr-mcp/src/state:*mode*=; the parser accepts only =:attached=,
+=:hermetic=, and =:auto= (any other value signals =invalid-config-value=
+naming =DSMR_MODE=). The default is =:attached= — dsmr-mcp's defining posture
+is to work /inside the operator's own running image/.
+
+** :auto — probe, then resolve
+
+=:auto= is an explicit opt-in for an attached-else-hermetic fallback. When the
+resolved mode is =:auto=, =run= probes the configured Slynk listener with a
+3-second TCP connect (=%slynk-reachable-p=):
+
+- reachable   → resolves to =:attached=
+- unreachable → resolves to =:hermetic=, emitting a one-time startup =:warn=
+  ("auto: no attached Slynk listener, using hermetic")
+
+The probe runs only /after/ the stderr log appender is installed, so the warn
+never lands on the stdout JSON-RPC channel. =:auto= is not the default — you
+opt into the logged fallback deliberately.
+
+** :attached (default) — eval into the operator's image
+
+Attached mode routes =repl-eval= and the image-resident verbs into a
+user-supplied Slynk listener over =slynk-client=. This is the point of the
+project: the agent works where the operator's definitions, packages, threads,
+and CLOS state already live, rather than in a worker that learns the world from
+scratch. =DSMR_SLYNK_ATTACH= (or =:slynk-attach=) must name that listener.
+
+*Explicit =:attached= never falls back to hermetic.* A dead listener fails
+closed with a structured =isError= — never a silent hermetic swap.
+
+*Fail-closed, then reconnect on the next call.* On a Slynk network error the
+dispatcher drops the cached connection (invalidating prior =result_object_id=
+handles) and returns a =NETWORK_ERROR=-class =isError=. It does /not/ retry
+inside the same call. The *next* call reopens the connection lazily; its stdout
+is prefixed with a one-time "[reconnected to Slynk listener ...]" note. No
+server restart is needed — the connection cache self-heals.
+
+*Wire forms must be portable and printable.* Every injected form is normalized
+at the parse boundary (=coerce-wire-strings=) because of a documented,
+recurring bug class: an unprintable literal on the wire — a =simple-base-string=
+(an ASCII pathname or jzon output, which prints as ~#A((N) BASE-CHAR ...)~ under
+~*print-readably*~), a raw ~#\~ char literal, a ~#()~ vector literal, or a bare
+internal-package symbol — is unreadable by the host, which then closes the
+connection and produces a =NETWORK_ERROR=. Injected code must also be
+ANSI/portable (the attached image may be a non-SBCL implementation). See
+[[file:operations.org]] for the attached-degradation runbook.
+
+** :hermetic — forked-SBCL worker pool
+
+Hermetic mode forks SBCL child workers, one dedicated worker per session
+(strict affinity, no sharing). Use it when no live image is available, or when
+parallel agents intentionally want isolation from host state. When =*mode*= is
+=:hermetic=, every =tools/call= routes straight to =dispatch-hermetic-call=.
+
+The worker wire is *newline-delimited JSON-RPC* (one message per line, 16 MB
+cap) over a loopback TCP port, authenticated with a 128-bit shared secret —
+*not* a length-prefixed envelope.
+
+Hermetic mode isolates a /crash/, not a worker's /actions/. Two safety
+controls bound that isolation:
+
+- *Circuit breaker* — 3 worker crashes within a 300-second (5-minute) window
+  for one session trips the breaker. While tripped, new worker assignment
+  fails fast for a 60-second cooldown (instead of spawning yet another doomed
+  replacement). The breaker self-clears after the cooldown;
+  =pool-kill-worker :reset= or session release clears it immediately.
+- *Hard-kill backstop* — a per-request soft timeout returns a TIMEOUT payload;
+  if the worker does not respond within that soft timeout plus
+  =DSMR_WORKER_KILL_GRACE_SECONDS= (default 5s), the parent =SIGKILL=s the
+  worker and surfaces =worker-crashed=. This control is hermetic-only — the
+  attached image is the operator's own and is never force-killed.
+
+A crashed worker yields exactly one one-shot reset notice on the next call;
+that next call succeeds against a fresh replacement. See [[file:operations.org]]
+for the pool's lifecycle, health monitor, and =pool-status= surface.
+
+** Mode comparison
+
+| Mode      | Where code runs                | Isolation              | Use when                                              |
+|-----------+--------------------------------+------------------------+------------------------------------------------------|
+| :attached | operator's own Slynk image     | none (by design)       | working in a live dev image — your packages & state  |
+| :hermetic | forked SBCL child workers      | crash isolation        | no live image, or parallel agents wanting isolation  |
+| :auto     | attached if reachable, else "" | per the resolved mode  | you want attached-when-possible with a safe fallback |
+
+* Transports
+
+A transport decides /how clients reach the dispatcher/. The selected transport
+lives behind =DSMR_TRANSPORT=; the parser accepts only =:stdio=, =:tcp=, and
+=:http= (else =invalid-config-value= naming =DSMR_TRANSPORT=). The default is
+=:stdio=. Both =:tcp= and =:http= /are/ served — an old comment at the top of
+=run.lisp= claiming they raise =transport-not-implemented-error= is stale; the
+live =ecase= dispatches both.
+
+** stdio (default)
+
+The transport an MCP client launches as a subprocess. =(dsmr-mcp:run)= blocks
+reading =*standard-input*= until EOF, one JSON-RPC message per line. Trust is
+implicit — it is a local pipe with no network surface. A stdout guard binds
+=*standard-output*= to a string stream during dispatch so stray library prints
+never corrupt the JSON-RPC channel.
+
+** tcp (loopback default)
+
+=(dsmr-mcp:run :transport :tcp :port 7000)=. Threaded and multi-client:
+line-delimited JSON-RPC (newline framing, 16 MB max line), one fresh session
+per connection on its own thread, each with its own =slynk-attach= and project
+root. Binds =127.0.0.1= by default.
+
+** streamable HTTP (+ bundled bridge)
+
+=(dsmr-mcp:run :transport :http :port 7000)=. Streamable HTTP over Hunchentoot
+(MCP 2025-03-26 / 2025-06-18), serving =POST=/=GET=/=DELETE=/=OPTIONS= on
+=/mcp=. Sessions are identified by a 64-char-hex =Mcp-Session-Id= minted on the
+=initialize= POST. There is *no Bearer token and no client cert* — a
+*loopback-only CORS Origin check is the entire trust boundary* (non-loopback
+origins get no =Access-Control-Allow-Origin= and are logged at =:warn=).
+
+For MCP clients that can only spawn a stdio subprocess but need to reach an
+HTTP/TCP dsmr-mcp server, a *bundled bridge* ships in =dsmr-mcp-bridge.asd= — a
+standalone, Lisp-only stdio↔TCP byte pump (deps: =usocket= + =bordeaux-threads=
+only; no Python runtime). Build it with =(asdf:make :dsmr-mcp-bridge)= or
+=make bridge=; target it with =DSMR_BRIDGE_HOST= / =DSMR_BRIDGE_PORT=.
+
+** Bind and the off-loopback opt-out
+
+All network transports default to =127.0.0.1= (=DSMR_BIND=). Before any
+listener socket is created, =%check-remote-bind= *refuses* a non-loopback bind
+with =invalid-config-value= unless =DSMR_ALLOW_REMOTE= is =1=, =true=, or
+=yes=. That opt-out is an *operator decision that removes only the loopback
+restriction — it adds no authentication and no TLS*, exposing an
+unauthenticated arbitrary-eval surface. Pair it with an SSH tunnel, VPN, or
+firewall. See [[file:threat-model.org]] for the full posture.
+
+** Transport comparison
+
+| Transport      | Bind          | Selected by              | Notes                                                       |
+|----------------+---------------+--------------------------+------------------------------------------------------------|
+| stdio          | none (pipe)   | default / DSMR_TRANSPORT | client spawns it as a subprocess; implicit local trust     |
+| tcp            | 127.0.0.1     | DSMR_TRANSPORT=tcp       | threaded, multi-client, newline JSON-RPC; no auth          |
+| streamable http| 127.0.0.1     | DSMR_TRANSPORT=http      | Hunchentoot; loopback-only CORS is the trust boundary      |
+| (bridge)       | n/a (client)  | dsmr-mcp-bridge binary   | stdio↔TCP byte pump for stdio-only clients                 |
+
+* Combining modes and transports
+
+The two axes are fully independent: =:stdio + :attached= is the canonical MCP
+client setup; =:http + :hermetic= fronts a loopback HTTP endpoint over isolated
+forked workers; =:tcp + :auto= takes whatever the Slynk probe finds. Select
+each axis with its keyword, env var, or =.dsmr-mcp.conf= key:
+
+#+begin_src lisp
+;; stdio + attached (default): eval into a Slynk image at 127.0.0.1:4005
+(dsmr-mcp:run :slynk-attach "127.0.0.1:4005")
+
+;; loopback TCP, forked-worker isolation
+(dsmr-mcp:run :transport :tcp :port 7000 :mode :hermetic)
+
+;; streamable HTTP, attached-when-reachable
+(dsmr-mcp:run :transport :http :port 7000 :mode :auto
+              :slynk-attach "127.0.0.1:4005")
+#+end_src
+
+#+begin_src sh
+# Same selections via environment (equivalent precedence below keyword args)
+DSMR_TRANSPORT=tcp DSMR_MODE=hermetic DSMR_PORT=7000 sbcl --eval '(dsmr-mcp:run)'
+#+end_src
+
+For the exhaustive list of env vars (=DSMR_MODE=, =DSMR_TRANSPORT=,
+=DSMR_SLYNK_ATTACH=, =DSMR_BIND=, =DSMR_ALLOW_REMOTE=, the worker-pool and HTTP
+knobs, and more) and their defaults, see [[file:configuration.org]]. For the
+field runbook covering attached degradation and hermetic crash loops, see
+[[file:operations.org]].

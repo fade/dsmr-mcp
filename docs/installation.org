@@ -1,0 +1,162 @@
+#+TITLE: dsmr-mcp — Installation & Build
+#+OPTIONS: toc:2 num:nil
+
+dsmr-mcp is a Common Lisp development MCP server for AI coding assistants
+(version 0.1.0). This page covers prerequisites, getting the source, loading
+the system, running the server in each mode and transport, the cold test
+verification recipe, and a first smoke test.
+
+See also: [[file:index.org]], [[file:configuration.org]],
+[[file:modes-and-transports.org]], [[file:operations.org]].
+
+* Prerequisites
+
+- *SBCL* — the supported Common Lisp implementation.
+- *Quicklisp* — must be available at launch so dependencies (including
+  =slynk=) load. The normal launch relies on your user init loading Quicklisp;
+  do *not* pass =--no-userinit= for a normal launch, or Quicklisp will not be
+  on the path.
+- *git* — to clone the source.
+
+The system =dsmr-mcp= is a package-inferred ASDF system. ASDF must be able to
+find the repository. Place the checkout where your ASDF source-registry looks,
+for example under =~/SourceCode/lisp/= or on =$LISP_WORKSPACE=, so that
+=:dsmr-mcp= resolves. A common arrangement is to symlink or register the
+checkout directory with the source-registry:
+
+#+begin_src sh
+# Example: make the checkout visible to ASDF via $LISP_WORKSPACE
+ls "$LISP_WORKSPACE/dsmr-mcp"   # the repo, or a symlink to it
+#+end_src
+
+* Getting the source
+
+Clone into your Lisp workspace so ASDF finds it:
+
+#+begin_src sh
+cd ~/SourceCode/lisp
+git clone <repo-url> dsmr-mcp
+cd dsmr-mcp
+#+end_src
+
+* Loading the system
+
+From a REPL with Quicklisp loaded:
+
+#+begin_src lisp
+(ql:quickload :dsmr-mcp)
+;; or, if dependencies are already present:
+(asdf:load-system :dsmr-mcp)
+#+end_src
+
+Because this is a package-inferred system, a *warm* REPL that already has the
+relevant packages loaded can hide missing inter-file dependency declarations.
+A *cold* build (cleared FASL cache, fresh SBCL) is what surfaces errors such
+as "Package X does not exist". Always cold-verify before trusting a build —
+see the test recipe below.
+
+* Running the server
+
+The entry point is =dsmr-mcp:run=. It reads the dispatch *mode* and
+*transport* from the environment, so you select behavior by setting
+=DSMR_*= variables before launch. The env surface below is the minimum needed
+to start; [[file:configuration.org]] documents the full table.
+
+| Variable             | Purpose                                          | Default    |
+|----------------------+--------------------------------------------------+------------|
+| =DSMR_MODE=          | dispatch mode: =attached=, =hermetic=, =auto=    | =attached= |
+| =DSMR_SLYNK_ATTACH=  | =host:port= of the target image (attached mode)  | (none)     |
+| =DSMR_TRANSPORT=     | =stdio=, =tcp=, or =http=                         | =stdio=    |
+| =DSMR_PORT=          | port for =tcp= / =http= transports (required for those) | (none)  |
+| =DSMR_ALLOW_REMOTE=  | allow non-loopback binds for =tcp= / =http=       | off        |
+
+** stdio (editor / MCP client default)
+
+stdio is the default and is what editor MCP clients use. The process speaks
+JSON-RPC over stdin/stdout, so launch non-interactively:
+
+#+begin_src sh
+sbcl --non-interactive \
+     --eval '(ql:quickload :dsmr-mcp)' \
+     --eval '(dsmr-mcp:run)'
+#+end_src
+
+** attached mode against a running Slynk image
+
+Attached mode (the default) connects to a developer's running Lisp image over
+Slynk. Point it at the target with =DSMR_SLYNK_ATTACH=:
+
+#+begin_src sh
+DSMR_MODE=attached DSMR_SLYNK_ATTACH=127.0.0.1:4005 \
+  sbcl --non-interactive \
+       --eval '(ql:quickload :dsmr-mcp)' \
+       --eval '(dsmr-mcp:run)'
+#+end_src
+
+** hermetic and auto modes
+
+=hermetic= runs evaluation in a forked-SBCL worker pool (no image to attach
+to); =auto= probes for a reachable Slynk listener and resolves to =attached=
+if one is found, otherwise falls back to =hermetic=.
+
+#+begin_src sh
+DSMR_MODE=hermetic sbcl --non-interactive \
+  --eval '(ql:quickload :dsmr-mcp)' --eval '(dsmr-mcp:run)'
+
+DSMR_MODE=auto sbcl --non-interactive \
+  --eval '(ql:quickload :dsmr-mcp)' --eval '(dsmr-mcp:run)'
+#+end_src
+
+See [[file:modes-and-transports.org]] for the semantics of each mode.
+
+** tcp / http transports
+
+These bind a socket. Non-loopback binds are gated by =DSMR_ALLOW_REMOTE=;
+without it, the server stays on loopback.
+
+#+begin_src sh
+DSMR_TRANSPORT=tcp  DSMR_PORT=7000 \
+  sbcl --non-interactive \
+       --eval '(ql:quickload :dsmr-mcp)' --eval '(dsmr-mcp:run)'
+
+DSMR_TRANSPORT=http DSMR_PORT=8080 DSMR_ALLOW_REMOTE=1 \
+  sbcl --non-interactive \
+       --eval '(ql:quickload :dsmr-mcp)' --eval '(dsmr-mcp:run)'
+#+end_src
+
+* Running the test suite (cold verification)
+
+The test system is =dsmr-mcp/tests=. The reliable check is a *cold* run: clear
+the FASL cache and start a fresh SBCL so package-inferred dependency gaps
+cannot be masked by an already-warm image.
+
+#+begin_src sh
+# 1. Clear the SBCL FASL cache
+rm -rf ~/.cache/common-lisp/sbcl-*
+
+# 2. Fresh SBCL: load Quicklisp, quickload tests, run the suite
+sbcl --non-interactive \
+     --eval '(require :asdf)' \
+     --eval '(load "~/quicklisp/setup.lisp")' \
+     --eval '(ql:quickload :dsmr-mcp/tests :silent t)' \
+     --eval '(asdf:test-system :dsmr-mcp)'
+#+end_src
+
+=test-system= runs the Parachute suite. A green cold run is the build's
+acceptance signal.
+
+* First smoke test
+
+Once the server is live, a trivial =repl-eval= round trip confirms it. Send a
+simple form through your MCP client (or transport) and verify a result comes
+back — for example evaluating =(+ 1 2)= should return =3=. A successful round
+trip means transport, protocol, and dispatch are all wired correctly. See
+[[file:operations.org]] for the health-check details.
+
+* Wiring into an MCP client
+
+An install/configure helper utility is the recommended path for registering
+dsmr-mcp with MCP clients (e.g. adding it to your client's =mcpServers=
+configuration). The utility and the full client-wiring walkthrough are
+documented in [[file:configuration.org]] — use that as the entry point for
+client setup rather than editing client config by hand.

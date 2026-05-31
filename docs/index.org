@@ -1,0 +1,54 @@
+#+TITLE: dsmr-mcp — Manual
+#+SUBTITLE: An MCP server that puts an AI agent inside your live Common Lisp image
+
+This is the manual for =dsmr-mcp= — the DeepSky Systems Model-context-Reagent for
+Common Lisp. It is the entry point that ties together the per-topic documents in
+this directory. New here? Read [[file:introduction.org]] first, then
+[[file:installation.org]].
+
+* Getting started
+
+- [[file:introduction.org][Introduction]] — what dsmr-mcp is, the attached-image-first thesis, and the
+  intended use case.
+- [[file:installation.org][Installation & Build]] — prerequisites, getting the source, loading the system,
+  running each mode/transport, and the cold test recipe.
+- [[file:configuration.org][Configuration]] — the full environment-variable reference, mode and transport
+  selection, the filesystem sandbox, and wiring dsmr-mcp into an MCP client.
+
+* Understanding the system
+
+- [[file:architecture.org][Architecture]] — how a request flows from MCP client through the transport,
+  dispatcher, and tool registry to an execution path.
+- [[file:modes-and-transports.org][Modes & Transports]] — attached / hermetic / auto, and stdio / TCP / Streamable
+  HTTP: what each is for and when to use it.
+
+* Reference
+
+- [[file:tools.org][Tool reference]] — every shipped verb's name, description, and input schema,
+  generated from the live tool registry and guarded against drift by a test.
+- [[file:configuration.org][Configuration]] — also the canonical environment-variable table.
+
+* Operating it
+
+- [[file:operations.org][Operations & Runbook]] — cold start, the health surface, and symptom→cause→
+  check→fix recipes for the field failure modes.
+- [[file:threat-model.org][Threat model]] — the trust posture, trust boundaries, and the project-wide
+  STRIDE register. Read this before adopting the server.
+
+* Installing as an MCP server
+
+- [[file:configuration.org::*Wiring dsmr-mcp into an MCP client][Wiring into an MCP client]] — the bundled installer registers dsmr-mcp with
+  Claude Code (and prints a paste-ready entry for other agents), with a
+  coexistence/migration path for operators already running cl-mcp.
+- [[file:configuration.org::*Scaffolding a new project][Scaffolding a new project]] — the =scaffold-project= skill stands up a new
+  project from the skeleton in an empty directory.
+
+* Releases
+
+- [[file:release-notes.org][Release notes]] — what shipped in each version.
+
+* About the name (Backronym)
+
+=dsmr-mcp= expands to: *DeepSky Systems Model-context-Reagent for Common Lisp*. It
+speaks the *Model Context Protocol* (MCP), the open protocol AI agents use to
+talk to external tools.
