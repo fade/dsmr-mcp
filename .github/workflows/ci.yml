@@ -53,14 +53,21 @@ jobs:
       - name: Install Quicklisp
         run: |
           set -euo pipefail
+          # Pin a recent ASDF: the bundled sbcl-bin ASDF is too old to parse
+          # :local-nicknames in package-inferred-system dependency analysis,
+          # which this project's defpackages use. Load it ahead of Quicklisp.
+          curl -fsSL https://asdf.common-lisp.dev/archives/asdf-3.3.7.lisp -o "$HOME/asdf.lisp"
           curl -fsSL -O https://beta.quicklisp.org/quicklisp.lisp
-          sbcl --non-interactive --load quicklisp.lisp \
+          sbcl --non-interactive --load "$HOME/asdf.lisp" --load quicklisp.lisp \
                --eval '(quicklisp-quickstart:install)'
           # Make every subsequent bare `sbcl` (the `make test` recipe included)
-          # load Quicklisp, so ASDF can resolve the test dependencies
-          # (parachute, jzon, log4cl, …) from the dist on demand.
-          printf '%s\n' '#-quicklisp (let ((q (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file q) (load q)))' >> "$HOME/.sbclrc"
-          sbcl --non-interactive --eval '(format t "quicklisp loaded: ~A~%" (and (find-package :ql) t))'
+          # load the pinned ASDF, then Quicklisp, so ASDF resolves the test
+          # dependencies (parachute, jzon, log4cl, …) from the dist on demand.
+          {
+            printf '%s\n' '(let ((a (merge-pathnames "asdf.lisp" (user-homedir-pathname)))) (when (probe-file a) (load a)))'
+            printf '%s\n' '#-quicklisp (let ((q (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file q) (load q)))'
+          } >> "$HOME/.sbclrc"
+          sbcl --non-interactive --eval '(format t "asdf=~A quicklisp=~A~%" (asdf:asdf-version) (and (find-package :ql) t))'
 
       - name: Resolve SBCL fingerprint
         id: lisp
@@ -145,14 +152,21 @@ jobs:
       - name: Install Quicklisp
         run: |
           set -euo pipefail
+          # Pin a recent ASDF: the bundled sbcl-bin ASDF is too old to parse
+          # :local-nicknames in package-inferred-system dependency analysis,
+          # which this project's defpackages use. Load it ahead of Quicklisp.
+          curl -fsSL https://asdf.common-lisp.dev/archives/asdf-3.3.7.lisp -o "$HOME/asdf.lisp"
           curl -fsSL -O https://beta.quicklisp.org/quicklisp.lisp
-          sbcl --non-interactive --load quicklisp.lisp \
+          sbcl --non-interactive --load "$HOME/asdf.lisp" --load quicklisp.lisp \
                --eval '(quicklisp-quickstart:install)'
           # Make every subsequent bare `sbcl` (the `make test` recipe included)
-          # load Quicklisp, so ASDF can resolve the test dependencies
-          # (parachute, jzon, log4cl, …) from the dist on demand.
-          printf '%s\n' '#-quicklisp (let ((q (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file q) (load q)))' >> "$HOME/.sbclrc"
-          sbcl --non-interactive --eval '(format t "quicklisp loaded: ~A~%" (and (find-package :ql) t))'
+          # load the pinned ASDF, then Quicklisp, so ASDF resolves the test
+          # dependencies (parachute, jzon, log4cl, …) from the dist on demand.
+          {
+            printf '%s\n' '(let ((a (merge-pathnames "asdf.lisp" (user-homedir-pathname)))) (when (probe-file a) (load a)))'
+            printf '%s\n' '#-quicklisp (let ((q (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file q) (load q)))'
+          } >> "$HOME/.sbclrc"
+          sbcl --non-interactive --eval '(format t "asdf=~A quicklisp=~A~%" (asdf:asdf-version) (and (find-package :ql) t))'
 
       - name: Resolve SBCL fingerprint
         id: lisp
