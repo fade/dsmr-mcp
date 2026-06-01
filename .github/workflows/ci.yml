@@ -55,8 +55,12 @@ jobs:
           set -euo pipefail
           curl -fsSL -O https://beta.quicklisp.org/quicklisp.lisp
           sbcl --non-interactive --load quicklisp.lisp \
-               --eval '(quicklisp-quickstart:install)' \
-               --eval '(ql-util:without-prompting (ql:add-to-init-file))'
+               --eval '(quicklisp-quickstart:install)'
+          # Make every subsequent bare `sbcl` (the `make test` recipe included)
+          # load Quicklisp, so ASDF can resolve the test dependencies
+          # (parachute, jzon, log4cl, …) from the dist on demand.
+          printf '%s\n' '#-quicklisp (let ((q (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file q) (load q)))' >> "$HOME/.sbclrc"
+          sbcl --non-interactive --eval '(format t "quicklisp loaded: ~A~%" (and (find-package :ql) t))'
 
       - name: Resolve SBCL fingerprint
         id: lisp
@@ -128,8 +132,12 @@ jobs:
           set -euo pipefail
           curl -fsSL -O https://beta.quicklisp.org/quicklisp.lisp
           sbcl --non-interactive --load quicklisp.lisp \
-               --eval '(quicklisp-quickstart:install)' \
-               --eval '(ql-util:without-prompting (ql:add-to-init-file))'
+               --eval '(quicklisp-quickstart:install)'
+          # Make every subsequent bare `sbcl` (the `make test` recipe included)
+          # load Quicklisp, so ASDF can resolve the test dependencies
+          # (parachute, jzon, log4cl, …) from the dist on demand.
+          printf '%s\n' '#-quicklisp (let ((q (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file q) (load q)))' >> "$HOME/.sbclrc"
+          sbcl --non-interactive --eval '(format t "quicklisp loaded: ~A~%" (and (find-package :ql) t))'
 
       - name: Resolve SBCL fingerprint
         id: lisp
