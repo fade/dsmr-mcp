@@ -12,7 +12,12 @@ SBCL ?= sbcl
 # cache miss + recompile. Safe to override in the environment on a warm runner.
 export XDG_CACHE_HOME ?= $(CURDIR)/.ci-cache
 
-.PHONY: bridge test test-integration
+# Prebuilt core image (deps+system+test-deps via save-lisp-and-die). Override
+# CORE to point `test-warm` at an alternate path; rebuild with `make core`
+# whenever the dependencies, the SBCL build, or the project source change.
+CORE ?= dsmr.core
+
+.PHONY: bridge test test-integration core test-warm
 
 ## bridge: build the standalone stdio<->TCP bridge binary.
 ##
@@ -53,3 +58,23 @@ test-integration:
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests/integration")' \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests/integration") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))'
+
+## core: build the prebuilt deps+system+test-deps core image ($(CORE)).
+##
+##   Runs scripts/build-core.lisp (save-lisp-and-die) to amortize the Quicklisp
+##   load and the system+test compile. The core is GC-safe (SBCL refuses a
+##   cross-build --core) and large — it is .gitignored, never committed.
+##   Rebuild after any dependency, SBCL-build, or project-source change.
+core:
+	DSMR_CORE_OUTPUT=$(CORE) $(SBCL) --noinform --disable-debugger \
+	     --load scripts/build-core.lisp
+
+## test-warm: run the fast suite against the prebuilt core ($(CORE)).
+##
+##   Skips the Quicklisp load and the recompile entirely — the core already
+##   holds dsmr-mcp + the test leaves — so only the assertions run. Build the
+##   core first with `make core`. `make test` remains the no-core load path and
+##   works whether or not a core is present.
+test-warm:
+	$(SBCL) --core $(CORE) --noinform --disable-debugger --non-interactive \
+	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))'
