@@ -15,7 +15,7 @@
 ;;;; contains "Circuit breaker". The error fires within *circuit-breaker-cooldown*
 ;;;; (60 s) without attempting another spawn.
 
-(defpackage #:dsmr-mcp/tests/hermetic/circuit-breaker-test
+(defpackage #:dsmr-mcp/tests/integration/hermetic/circuit-breaker-test
   (:use #:cl #:parachute)
   (:import-from #:dsmr-mcp/src/hermetic/pool
                 #:initialize-pool #:shutdown-pool
@@ -32,7 +32,28 @@
                 #:configure-log4cl-for-server)
   (:import-from #:sb-posix))
 
-(in-package #:dsmr-mcp/tests/hermetic/circuit-breaker-test)
+(in-package #:dsmr-mcp/tests/integration/hermetic/circuit-breaker-test)
+
+;;; ---------------------------------------------------------------------------
+;;; Spawn guard: these tests fork (and SIGKILL) real SBCL worker subprocesses,
+;;; so they skip cleanly (parachute skip, not fail) when the environment cannot
+;;; spawn one — no sbcl on PATH, or no Quicklisp setup.lisp for the child.
+;;; ---------------------------------------------------------------------------
+
+(defun %sbcl-path ()
+  (or (ignore-errors
+        (let ((r (string-trim '(#\Newline #\Return #\Space)
+                              (uiop:run-program '("which" "sbcl")
+                                                :output :string
+                                                :ignore-error-status t))))
+          (and (plusp (length r)) r)))
+      (find-if #'probe-file '("/usr/local/bin/sbcl" "/usr/bin/sbcl" "/opt/local/bin/sbcl"))))
+
+(defun %quicklisp-setup-present-p ()
+  (and (probe-file (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))) t))
+
+(defun %spawnable-p ()
+  (and (%sbcl-path) (%quicklisp-setup-present-p)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Helper: kill-and-wait
@@ -54,6 +75,8 @@ we wait INTERVAL + 3 seconds to be safe."
 get-or-assign-worker returns a replacement worker whose
 check-and-clear-reset-notification is T exactly once. The second call returns
 NIL, confirming the one-notification guarantee."
+  (unless (%spawnable-p)
+    (skip "cannot spawn a worker subprocess (sbcl / quicklisp setup.lisp absent)"))
   (let ((*mode* :hermetic)
         (*error-output* (make-string-output-stream))
         ;; Short health-check interval so the test doesn't take forever.
@@ -88,6 +111,8 @@ NIL, confirming the one-notification guarantee."
 succession causes the next get-or-assign-worker call to signal an error whose
 message contains 'Circuit breaker'. No spawn attempt is made during the
 *circuit-breaker-cooldown* (60 s) window."
+  (unless (%spawnable-p)
+    (skip "cannot spawn a worker subprocess (sbcl / quicklisp setup.lisp absent)"))
   (let ((*mode* :hermetic)
         (*error-output* (make-string-output-stream))
         ;; Short health-check interval so recovery + crash cycling is faster.
