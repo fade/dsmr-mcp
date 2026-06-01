@@ -33,21 +33,23 @@ bridge:
 ##   ASDF must locate the checkout + deps via CL_SOURCE_REGISTRY: local dev
 ##   resolves them through $LISP_WORKSPACE (and ~/.sbclrc / Quicklisp); CI sets
 ##   CL_SOURCE_REGISTRY to the checkout or lets Qlot/Quicklisp resolve. The
-##   suite exits non-zero on failure (the :perform test-op signals an error
-##   under --disable-debugger --non-interactive), so CI fails correctly.
+##   test-system call is wrapped so a failing leaf exits non-zero promptly: the
+##   suite loads slynk (a test dependency) which installs a debugger hook, and
+##   without the wrapper an unhandled :perform error is caught by that hook and
+##   the process hangs waiting for a debugger connection instead of failing.
 test:
 	$(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests")' \
-	     --eval '(asdf:test-system "dsmr-mcp/tests")'
+	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))'
 
 ## test-integration: slow cross-process suite (gated, off the push hot-path).
 ##
 ##   Runs dsmr-mcp/tests/integration — each leaf spawns a real child SBCL and
 ##   skips cleanly when none can be spawned. Same CL_SOURCE_REGISTRY and
-##   exit-code contract as `test`. Run on a schedule / label, not every push.
+##   fail-fast contract as `test`. Run on a schedule / label, not every push.
 test-integration:
 	$(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests/integration")' \
-	     --eval '(asdf:test-system "dsmr-mcp/tests/integration")'
+	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests/integration") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))'
