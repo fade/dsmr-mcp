@@ -82,20 +82,25 @@ jobs:
           restore-keys: |
             cl-fasl-${{ runner.os }}-${{ steps.lisp.outputs.fp }}-
 
-      - name: Fast suite (cold + warm)
-        # Same `make test` a contributor runs (PERF-01). Two timed runs: the
-        # first pays whatever the restored cache did not cover (cold-ish), the
-        # second is warm. Both must be green; the log carries the numbers.
+      - name: Prime dependencies (cold — download dist deps + compile)
+        # `make test` uses asdf:load-system, which resolves only systems already
+        # on disk; it does not download from the dist. ql:quickload does the
+        # download + compile once, populating the fasl cache. This step's time is
+        # the cold cost (dep build); on a warm cache restore it is fast.
         run: |
           set -euo pipefail
-          echo "::group::cold run"
-          /usr/bin/time -v make test 2> cold.time || { cat cold.time; exit 1; }
-          grep -E 'Elapsed|wall clock' cold.time || true
-          echo "::endgroup::"
-          echo "::group::warm run"
-          /usr/bin/time -v make test 2> warm.time
-          grep -E 'Elapsed|wall clock' warm.time || true
-          echo "::endgroup::"
+          /usr/bin/time -v sbcl --non-interactive \
+            --eval '(ql:quickload "dsmr-mcp/tests" :verbose nil)' 2> cold.time \
+            || { cat cold.time; exit 1; }
+          grep -E 'Elapsed \(wall' cold.time || true
+
+      - name: Fast suite (warm)
+        # The same `make test` a contributor runs (PERF-01). Deps are now on
+        # disk, so this is the warm fast-suite number.
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v make test 2> warm.time || { cat warm.time; exit 1; }
+          grep -E 'Elapsed \(wall' warm.time || true
 
   integration:
     name: Cross-process integration suite (gated)
@@ -155,6 +160,12 @@ jobs:
           key: cl-fasl-${{ runner.os }}-${{ steps.lisp.outputs.fp }}-${{ hashFiles('**/*.asd') }}
           restore-keys: |
             cl-fasl-${{ runner.os }}-${{ steps.lisp.outputs.fp }}-
+
+      - name: Prime dependencies (download dist deps + compile)
+        run: |
+          set -euo pipefail
+          sbcl --non-interactive \
+            --eval '(ql:quickload "dsmr-mcp/tests/integration" :verbose nil)'
 
       - name: Integration suite
         # sbcl is on PATH (installed above), so the gated leaves actually spawn
