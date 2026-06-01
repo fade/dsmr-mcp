@@ -42,8 +42,13 @@ jobs:
           sudo dpkg -i ros.deb
           ros install sbcl-bin/2.5.5
           ros use sbcl-bin/2.5.5
-          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
-          ros run -- --version
+          # The roswell bin dir only carries `ros`, not a bare `sbcl` shim, so
+          # symlink the installed sbcl-bin binary onto PATH for later steps
+          # (make test / quicklisp install invoke `sbcl` directly).
+          SBCL_BIN="$(find "$HOME/.roswell/impls" -type f -name sbcl -path '*sbcl-bin*' | head -1)"
+          test -n "$SBCL_BIN" || { echo "sbcl-bin binary not found under ~/.roswell/impls" >&2; exit 1; }
+          sudo ln -sf "$SBCL_BIN" /usr/local/bin/sbcl
+          sbcl --version
 
       - name: Install Quicklisp
         run: |
@@ -110,8 +115,13 @@ jobs:
           sudo dpkg -i ros.deb
           ros install sbcl-bin/2.5.5
           ros use sbcl-bin/2.5.5
-          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
-          ros run -- --version
+          # The roswell bin dir only carries `ros`, not a bare `sbcl` shim, so
+          # symlink the installed sbcl-bin binary onto PATH for later steps
+          # (make test / quicklisp install invoke `sbcl` directly).
+          SBCL_BIN="$(find "$HOME/.roswell/impls" -type f -name sbcl -path '*sbcl-bin*' | head -1)"
+          test -n "$SBCL_BIN" || { echo "sbcl-bin binary not found under ~/.roswell/impls" >&2; exit 1; }
+          sudo ln -sf "$SBCL_BIN" /usr/local/bin/sbcl
+          sbcl --version
 
       - name: Install Quicklisp
         run: |
