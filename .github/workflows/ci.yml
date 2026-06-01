@@ -82,6 +82,16 @@ jobs:
           restore-keys: |
             cl-fasl-${{ runner.os }}-${{ steps.lisp.outputs.fp }}-
 
+      - name: Vendor slynk-client (not in the Quicklisp dist)
+        # slynk-client is sourced from a fork branch, not the QL dist. Clone it,
+        # pinned to the exact commit, into a non-hidden dir the recursive
+        # CL_SOURCE_REGISTRY scans, so ASDF resolves it locally while every other
+        # dependency comes from the dist.
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/fade/slynk-client.git vendor/slynk-client
+          git -C vendor/slynk-client checkout 32691172ee0a5619f084145c0304464f5c4b67c3
+
       - name: Prime dependencies (cold — download dist deps + compile)
         # `make test` uses asdf:load-system, which resolves only systems already
         # on disk; it does not download from the dist. ql:quickload does the
@@ -160,6 +170,12 @@ jobs:
           key: cl-fasl-${{ runner.os }}-${{ steps.lisp.outputs.fp }}-${{ hashFiles('**/*.asd') }}
           restore-keys: |
             cl-fasl-${{ runner.os }}-${{ steps.lisp.outputs.fp }}-
+
+      - name: Vendor slynk-client (not in the Quicklisp dist)
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/fade/slynk-client.git vendor/slynk-client
+          git -C vendor/slynk-client checkout 32691172ee0a5619f084145c0304464f5c4b67c3
 
       - name: Prime dependencies (download dist deps + compile)
         run: |
