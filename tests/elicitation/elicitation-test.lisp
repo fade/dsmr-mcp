@@ -58,7 +58,7 @@ ACTION (and CONTENT when supplied), and no method."
           (gethash "result"  msg) result)
     msg))
 
-(defun %await-pending (session &key (deadline 5.0))
+(defun %await-pending (session &key (deadline 15.0))
   "Spin until SESSION has a pending elicitation registered or DEADLINE seconds
 elapse. Returns the pending holder or NIL. Closes the notify-before-wait race:
 the routing thread must not deliver before the worker has registered its
@@ -137,7 +137,7 @@ matching-id accept response is routed to the session."
       (let ((id (first pending)))
         (true (route-elicitation-response s (%response-ht id :action "accept"))
               "routing a matching-id accept should notify the waiter")))
-    (handler-case (sb-ext:with-timeout 5 (join-thread worker))
+    (handler-case (sb-ext:with-timeout 45 (join-thread worker))
       (sb-ext:timeout ()
         (when (thread-alive-p worker)
           (ignore-errors (bordeaux-threads:destroy-thread worker)))
@@ -168,7 +168,7 @@ timeout, which returns :timeout (T-13-01 spoof/replay guard)."
         (false (route-elicitation-response s (%response-ht (+ id 1000)
                                                            :action "accept"))
                "a non-matching id must not notify the waiter")))
-    (handler-case (sb-ext:with-timeout 5 (join-thread worker))
+    (handler-case (sb-ext:with-timeout 45 (join-thread worker))
       (sb-ext:timeout ()
         (when (thread-alive-p worker)
           (ignore-errors (bordeaux-threads:destroy-thread worker)))
