@@ -1,0 +1,122 @@
+#+TITLE: dsmr-mcp — Testing
+#+OPTIONS: toc:2 num:nil
+
+This page is the contributor reference for running the dsmr-mcp test suite:
+the canonical entrypoints, the fast-versus-gated split, the pinned SBCL build
+that keeps runs reproducible, and the project-local cache guard that prevents a
+fatal fasl-cache crash on a developer machine.
+
+See also: [[file:index.org]] · [[file:architecture.org]] · [[file:operations.org]] ·
+[[file:installation.org]].
+
+* Canonical entrypoints
+
+Run the suite through the Makefile — a contributor and CI invoke the *same*
+targets, so "it passes on my machine" and "it passes in CI" mean the same thing.
+
+#+begin_src sh
+make test              # fast in-process unit suite (run this constantly)
+make test-integration  # slow cross-process suite (run before a release / on CI gate)
+#+end_src
+
+Both exit non-zero when any test fails: the =:perform (test-op …)= in
+=dsmr-mcp.asd= signals an error on a failed leaf, and under =--disable-debugger
+--non-interactive= an unhandled error terminates the process with a non-zero
+code. No extra exit-code plumbing is needed.
+
+ASDF has to find the checkout and its dependencies. Locally that resolution
+goes through =$LISP_WORKSPACE= (and your =~/.sbclrc= / Quicklisp); in CI it
+goes through =CL_SOURCE_REGISTRY= set to the checkout, or through Qlot /
+Quicklisp. Every dependency dsmr-mcp uses is in the Quicklisp distribution, so
+CI does not need any local source checkouts.
+
+* Fast versus gated
+
+The suite is split across two ASDF systems so the inner-loop run stays quick:
+
+- =dsmr-mcp/tests= (=make test=) — true *in-process* unit tests. No test in
+  this system forks a child process; the assertions are effectively free. This
+  is the push hot-path: it runs on every push and every pull request.
+- =dsmr-mcp/tests/integration= (=make test-integration=) — the *cross-process*
+  tests. Each leaf here spawns a real child SBCL (a stdio server, a foreign
+  Slynk image, or a hermetic worker pool) and so costs seconds-to-minutes per
+  scenario. These run gated — on a schedule and on demand — not on every push.
+  Each leaf skips cleanly (it reports a skip, not a failure) when the
+  environment cannot spawn a child, so a constrained runner is never red-flagged.
+
+The cost of a full run lives almost entirely in that integration system's
+process spawning; keeping it off the push hot-path is what makes the fast suite
+fast.
+
+* Pinned SBCL build, and why it matters
+
+CI pins the SBCL build to the upstream prebuilt binary (=sbcl-bin=). That binary
+has one fixed garbage-collector flavor, so every CI run compiles and loads fasls
+under the same flavor and the cache is always coherent.
+
+This matters because SBCL keys its compiled-fasl cache on the implementation
+*version string* but not on the GC flavor. Two SBCLs that share a version string
+but were built with different collectors (for example a stock =GENCGC= build
+versus a =MARK-REGION= build) write fasls into the same cache directory yet
+cannot load each other's output: loading a fasl from the wrong flavor aborts
+with =INVALID-FASL-FEATURES=. Pinning a single build removes the ambiguity — and
+a prebuilt =--core= image is immune by construction, because SBCL refuses to load
+a core produced by a different build at all.
+
+You can fingerprint a running SBCL with =(lisp-implementation-version)= together
+with the GC-related markers in =*features*= (e.g. =:mark-region-gc= vs
+=:gencgc=); a cache built under one fingerprint should only be loaded by an SBCL
+with the same one.
+
+* The local cache guard
+
+=make test= isolates its fasl cache to a project-local directory
+(=XDG_CACHE_HOME= defaults to =.ci-cache/= under the project root) instead of
+the shared =~/.cache/common-lisp=. This is deliberate: on a developer box whose
+=sbcl= was rebuilt with a different GC flavor than the one that populated the
+shared cache, a plain run would try to load flavor-mismatched fasls and crash
+with =INVALID-FASL-FEATURES=. Pointing the cache at a project-local directory
+turns that crash into a clean cache miss followed by a recompile — the suite
+just rebuilds what it needs and runs.
+
+If you ever hit =INVALID-FASL-FEATURES= from a tool that does *not* go through
+the Makefile, the fix is the same: clear the offending cache directory and let
+it recompile, or point =XDG_CACHE_HOME= at a fresh directory for that run.
+
+=.ci-cache/= (and the profiling harness's =.measure-cache/=, and any prebuilt
+=dsmr.core=) are build artifacts — they are git-ignored and never committed.
+
+* Measured numbers
+
+Recorded on the development box (=sbcl 2.6.5=, isolated =.ci-cache=) and on a
+GitHub =ubuntu-latest= CI runner (pinned upstream =sbcl-bin=, ASDF 3.3.7).
+
+Development box:
+
+| Run | Command | Wall clock | Result |
+|-----+---------+------------+--------|
+| Cold fast suite (empty cache) | =make test= | ~2 min 33 s | 1364 pass / 0 fail |
+| Warm fast suite (core image) | =make test-warm= | ~1 min 25 s | 1364 pass / 0 fail |
+| Core image build | =make core= | ~14 s (warm) | 175 MB =dsmr.core= |
+
+CI runner (observed on the first pull-request run):
+
+| Stage | Wall clock | Result |
+|-------+------------+--------|
+| Dependency prime (download dist + compile, cold cache) | ~27 s | — |
+| Fast suite (=make test=) | ~1 min 47 s | 1364 pass / 0 fail |
+| Integration job on a push/PR | — | skipped (gated) |
+
+The CI fast job completes well within a few-minute budget. Its warm fast-suite
+time tracks the dev box's (~1.5–2 min), confirming the same conclusion: the
+floor is set by the in-process timed-wait tests, not by load or compilation.
+
+The cold fast suite is comfortably under a 3-minute budget. The warm number is
+dominated not by load or compilation — the core image removes both — but by a
+handful of in-process tests that deliberately wait on a slynk debugger break or
+a condition-variable timeout (the =attach/inspect-*= and elicitation leaves).
+Driving the warm fast suite below ~45 s therefore depends on trimming those
+timed waits, not on further caching; that work is tracked separately.
+
+The gated integration suite (=make test-integration=) runs in minutes — each
+leaf spawns a real child SBCL — and is intentionally kept off the push hot-path.

@@ -15,7 +15,7 @@
 ;;;;       defined
 ;;;;   (4) bridge-help-exits-zero -- --help short-circuit path
 
-(defpackage #:dsmr-mcp/tests/transport/bridge-test
+(defpackage #:dsmr-mcp/tests/integration/transport/bridge-test
   (:use #:cl #:parachute)
   (:import-from #:dsmr-mcp/src/transport/tcp
                 #:serve-tcp)
@@ -25,7 +25,7 @@
                 #:thread-alive-p)
   (:import-from #:usocket))
 
-(in-package #:dsmr-mcp/tests/transport/bridge-test)
+(in-package #:dsmr-mcp/tests/integration/transport/bridge-test)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Helpers
