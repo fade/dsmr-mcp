@@ -33,3 +33,13 @@ graphify-out/graph.json
 
 # Bridge build artefact (produced by asdf:make :dsmr-mcp-bridge / make bridge)
 bin/dsmr-mcp-bridge
+
+# Test/CI build artefacts — rebuilt on demand, never committed.
+# Project-local fasl cache isolating `make test` from the shared
+# ~/.cache/common-lisp fasls (GC-flavor crash dodge):
+.ci-cache
+# Profiling harness cache (scripts/measure-phases.sh --warm):
+.measure-cache
+# Prebuilt deps+system core image (save-lisp-and-die; large, GC-build-specific):
+dsmr.core
+*.core

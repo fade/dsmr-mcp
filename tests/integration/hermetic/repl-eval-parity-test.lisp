@@ -18,7 +18,7 @@
 ;;;; All tests use *worker-pool-warmup* 0 / *max-pool-size* 4 to keep the
 ;;;; test fast and avoid spawning unnecessary standby workers.
 
-(defpackage #:dsmr-mcp/tests/hermetic/repl-eval-parity-test
+(defpackage #:dsmr-mcp/tests/integration/hermetic/repl-eval-parity-test
   (:use #:cl #:parachute)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/hermetic/pool
@@ -40,7 +40,28 @@
   (:import-from #:dsmr-mcp/src/log
                 #:configure-log4cl-for-server))
 
-(in-package #:dsmr-mcp/tests/hermetic/repl-eval-parity-test)
+(in-package #:dsmr-mcp/tests/integration/hermetic/repl-eval-parity-test)
+
+;;; ---------------------------------------------------------------------------
+;;; Spawn guard: the pool tests fork real SBCL worker subprocesses, so they skip
+;;; cleanly (parachute skip, not fail) when the environment cannot spawn one —
+;;; no sbcl on PATH, or no Quicklisp setup.lisp for the child to load dsmr-mcp.
+;;; ---------------------------------------------------------------------------
+
+(defun %sbcl-path ()
+  (or (ignore-errors
+        (let ((r (string-trim '(#\Newline #\Return #\Space)
+                              (uiop:run-program '("which" "sbcl")
+                                                :output :string
+                                                :ignore-error-status t))))
+          (and (plusp (length r)) r)))
+      (find-if #'probe-file '("/usr/local/bin/sbcl" "/usr/bin/sbcl" "/opt/local/bin/sbcl"))))
+
+(defun %quicklisp-setup-present-p ()
+  (and (probe-file (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))) t))
+
+(defun %spawnable-p ()
+  (and (%sbcl-path) (%quicklisp-setup-present-p)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Helper: run a form in a fresh hermetic pool and return the worker/eval response
@@ -50,7 +71,12 @@
   "Spawn a pool with warmup=0, get a worker for SESSION-ID, call worker/eval
 with PARAMS-HT, shutdown the pool, and return the response hash-table.
 Uses pool-rpc-with-hard-kill when SOFT-TIMEOUT is provided (the two-level
-timeout path: soft in-worker timeout plus parent SIGKILL backstop)."
+timeout path: soft in-worker timeout plus parent SIGKILL backstop).
+
+Skips the calling test (parachute skip unwinds to the test boundary) when the
+environment cannot spawn a worker subprocess."
+  (unless (%spawnable-p)
+    (skip "cannot spawn a worker subprocess (sbcl / quicklisp setup.lisp absent)"))
   (let ((*worker-pool-warmup* 0)
         (*max-pool-size* 4))
     (initialize-pool)
@@ -138,6 +164,8 @@ whether the eval runs locally or in a hermetic worker."
   "Eval of (sleep 200) with timeout_seconds=1 returns a structured TIMEOUT
 response naming SB-EXT:TIMEOUT in condition_type. A subsequent eval on the
 SAME worker (same session) succeeds — the worker survived the timeout."
+  (unless (%spawnable-p)
+    (skip "cannot spawn a worker subprocess (sbcl / quicklisp setup.lisp absent)"))
   (let* ((dsmr-mcp/src/state:*mode* :hermetic)
          (capture (make-string-output-stream))
          (*error-output* capture)
@@ -228,6 +256,8 @@ Catches: stdout-pipe restore regression in start() where the handshake
 goes to stderr instead of the parent's pipe (causing a timeout), and
 placeholder-coordination regressions in the pool where a concurrent spawn
 is left in :spawning state indefinitely."
+  (unless (%spawnable-p)
+    (skip "cannot spawn a worker subprocess (sbcl / quicklisp setup.lisp absent)"))
   (let* ((dsmr-mcp/src/state:*mode* :hermetic)
          (capture (make-string-output-stream))
          (*error-output* capture)

@@ -29,11 +29,11 @@
 ;;;; reader, not just an in-image one.
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (let ((pkg (find-package '#:dsmr-mcp/tests/attach/wire-cross-process-test)))
+  (let ((pkg (find-package '#:dsmr-mcp/tests/integration/attach/wire-cross-process-test)))
     (when pkg
       (sb-ext:without-package-locks (delete-package pkg)))))
 
-(defpackage #:dsmr-mcp/tests/attach/wire-cross-process-test
+(defpackage #:dsmr-mcp/tests/integration/attach/wire-cross-process-test
   (:use #:cl #:parachute)
   (:import-from #:dsmr-mcp/src/attach/dispatch
                 #:repl-eval-tool-slynk-conn
@@ -55,7 +55,29 @@
                 #:slime-close
                 #:slime-eval))
 
-(in-package #:dsmr-mcp/tests/attach/wire-cross-process-test)
+(in-package #:dsmr-mcp/tests/integration/attach/wire-cross-process-test)
+
+;;; ---------------------------------------------------------------------------
+;;; Spawn guard: this test forks a foreign SBCL that quickloads slynk +
+;;; alexandria, so it skips cleanly (parachute skip, not fail) when the
+;;; environment cannot spawn one — no sbcl on PATH, or no Quicklisp setup.lisp
+;;; for the child to quickload from.
+;;; ---------------------------------------------------------------------------
+
+(defun %sbcl-path ()
+  (or (ignore-errors
+        (let ((r (string-trim '(#\Newline #\Return #\Space)
+                              (uiop:run-program '("which" "sbcl")
+                                                :output :string
+                                                :ignore-error-status t))))
+          (and (plusp (length r)) r)))
+      (find-if #'probe-file '("/usr/local/bin/sbcl" "/usr/bin/sbcl" "/opt/local/bin/sbcl"))))
+
+(defun %quicklisp-setup-present-p ()
+  (and (probe-file (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))) t))
+
+(defun %spawnable-p ()
+  (and (%sbcl-path) (%quicklisp-setup-present-p)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Foreign-image launcher
@@ -179,6 +201,8 @@ tool-handle methods pass to their %dispatch-attach-* functions."
 
 (define-test wire-survives-foreign-reader
   "Every attached code-intel verb round-trips against a foreign Slynk image."
+  (unless (%spawnable-p)
+    (skip "cannot spawn a foreign sbcl (sbcl / quicklisp setup.lisp absent)"))
   (with-foreign-slynk-image (conn)
     ;; Sanity: the foreign image evaluates a trivial form (proves the link).
     (is = 3 (slime-eval '(+ 1 2) conn))

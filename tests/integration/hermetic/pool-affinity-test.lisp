@@ -11,7 +11,7 @@
 ;;;; return a worker with the same pid. A different session-id gets a different
 ;;;; worker pid (scale-out isolation).
 
-(defpackage #:dsmr-mcp/tests/hermetic/pool-affinity-test
+(defpackage #:dsmr-mcp/tests/integration/hermetic/pool-affinity-test
   (:use #:cl #:parachute)
   (:import-from #:dsmr-mcp/src/hermetic/pool
                 #:initialize-pool #:shutdown-pool
@@ -24,7 +24,28 @@
   (:import-from #:dsmr-mcp/src/log
                 #:configure-log4cl-for-server))
 
-(in-package #:dsmr-mcp/tests/hermetic/pool-affinity-test)
+(in-package #:dsmr-mcp/tests/integration/hermetic/pool-affinity-test)
+
+;;; ---------------------------------------------------------------------------
+;;; Spawn guard: these tests fork real SBCL worker subprocesses, so they skip
+;;; cleanly (parachute skip, not fail) when the environment cannot spawn one —
+;;; no sbcl on PATH, or no Quicklisp setup.lisp for the child to load dsmr-mcp.
+;;; ---------------------------------------------------------------------------
+
+(defun %sbcl-path ()
+  (or (ignore-errors
+        (let ((r (string-trim '(#\Newline #\Return #\Space)
+                              (uiop:run-program '("which" "sbcl")
+                                                :output :string
+                                                :ignore-error-status t))))
+          (and (plusp (length r)) r)))
+      (find-if #'probe-file '("/usr/local/bin/sbcl" "/usr/bin/sbcl" "/opt/local/bin/sbcl"))))
+
+(defun %quicklisp-setup-present-p ()
+  (and (probe-file (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))) t))
+
+(defun %spawnable-p ()
+  (and (%sbcl-path) (%quicklisp-setup-present-p)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Warmup: initialize-pool spawns standby workers asynchronously
@@ -34,6 +55,8 @@
   "initialize-pool with *worker-pool-warmup* = 1 spawns at least one standby
 worker in the background. The test sleeps briefly to let the asynchronous
 replenish thread complete, then verifies via pool-status-info."
+  (unless (%spawnable-p)
+    (skip "cannot spawn a worker subprocess (sbcl / quicklisp setup.lisp absent)"))
   (let ((*mode* :hermetic)
         (*error-output* (make-string-output-stream)))
     (configure-log4cl-for-server :warn)
@@ -65,6 +88,8 @@ replenish thread complete, then verifies via pool-status-info."
   "Two sequential get-or-assign-worker calls for the same session-id return
 the same worker (same pid). A second session-id gets a different worker with a
 different pid, confirming scale-out assigns new workers per session."
+  (unless (%spawnable-p)
+    (skip "cannot spawn a worker subprocess (sbcl / quicklisp setup.lisp absent)"))
   (let ((*mode* :hermetic)
         (*error-output* (make-string-output-stream)))
     (configure-log4cl-for-server :warn)
