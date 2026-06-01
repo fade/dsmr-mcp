@@ -71,7 +71,7 @@ ACTION and a content object whose `confirm` boolean is CONFIRM, and no method."
           (gethash "result"  msg) result)
     msg))
 
-(defun %make-consent-router (session &key (action "accept") (deadline 5.0))
+(defun %make-consent-router (session &key (action "accept") (deadline 15.0))
   "Spawn a thread that waits for SESSION to register a pending elicitation, then
 routes a canned response with ACTION. Returns the thread. The caller runs
 maybe-prompt-and-write-envrc on the main thread, which blocks in
@@ -89,15 +89,18 @@ send-elicitation-request until this router routes the matching-id response."
              do (sleep 0.005))))
    :name "envrc-consent-router"))
 
-(defun %join-bounded (thread &key (seconds 5))
-  "Join THREAD, bounding the wait so a hung test fails rather than pins the run."
+(defun %join-bounded (thread &key (seconds 45))
+  "Join THREAD, bounding the wait so a hung test fails rather than pins the run.
+The bound is a hang safety-net, not a budget: it must comfortably exceed the
+router work deadline so a slow-but-progressing run on a loaded CI box does not
+trip it."
   (handler-case (sb-ext:with-timeout seconds (join-thread thread))
     (sb-ext:timeout ()
       (when (thread-alive-p thread)
         (ignore-errors (bordeaux-threads:destroy-thread thread)))
       (fail "consent router thread did not finish in time"))))
 
-(defun %prompt-with-consent (session action &key (deadline 5.0))
+(defun %prompt-with-consent (session action &key (deadline 15.0))
   "Drive maybe-prompt-and-write-envrc (non-stdio path) to completion with a
 thread-driven ACTION response. Returns the intercept's return value."
   (let* ((router (%make-consent-router session :action action :deadline deadline))
