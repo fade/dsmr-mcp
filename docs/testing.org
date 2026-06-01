@@ -85,3 +85,26 @@ it recompile, or point =XDG_CACHE_HOME= at a fresh directory for that run.
 
 =.ci-cache/= (and the profiling harness's =.measure-cache/=, and any prebuilt
 =dsmr.core=) are build artifacts — they are git-ignored and never committed.
+
+* Measured numbers
+
+Recorded on the development box (=sbcl 2.6.5=, isolated =.ci-cache=). CI runs on
+a standard GitHub =ubuntu-latest= runner with the pinned upstream =sbcl-bin=; its
+own cold and warm timings appear in the =Fast unit suite= job log on each push
+(the job runs =make test= twice and prints the wall clock of each).
+
+| Run | Command | Wall clock | Result |
+|-----+---------+------------+--------|
+| Cold fast suite (empty cache) | =make test= | ~2 min 33 s | 1364 pass / 0 fail |
+| Warm fast suite (core image) | =make test-warm= | ~1 min 25 s | 1364 pass / 0 fail |
+| Core image build | =make core= | ~14 s (warm) | 175 MB =dsmr.core= |
+
+The cold fast suite is comfortably under a 3-minute budget. The warm number is
+dominated not by load or compilation — the core image removes both — but by a
+handful of in-process tests that deliberately wait on a slynk debugger break or
+a condition-variable timeout (the =attach/inspect-*= and elicitation leaves).
+Driving the warm fast suite below ~45 s therefore depends on trimming those
+timed waits, not on further caching; that work is tracked separately.
+
+The gated integration suite (=make test-integration=) runs in minutes — each
+leaf spawns a real child SBCL — and is intentionally kept off the push hot-path.
