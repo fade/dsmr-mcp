@@ -1,0 +1,144 @@
+name: CI
+
+# Fast in-process unit suite on every push/PR; the slow cross-process
+# integration suite only on a nightly schedule, manual dispatch, or a PR label —
+# never on the push hot-path.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+# Least privilege: the test pipeline only reads the repo. No write token, no
+# secrets — a compromised step cannot push, tag, or alter releases.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    name: Fast unit suite
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      # ASDF finds the project at the checkout root; dependencies resolve from
+      # the Quicklisp dist (every dep is in the dist — no local checkouts needed).
+      CL_SOURCE_REGISTRY: '${{ github.workspace }}//:'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned SBCL (sbcl-bin via Roswell)
+        # Pin the exact sbcl-bin version so the GC flavor is deterministic
+        # (upstream sbcl-bin is GENCGC) — this is what makes the fasl cache safe.
+        run: |
+          set -euo pipefail
+          ROSWELL_VERSION=v23.10.14.114
+          curl -fsSL "https://github.com/roswell/roswell/releases/download/${ROSWELL_VERSION}/roswell_${ROSWELL_VERSION#v}-1_amd64.deb" -o ros.deb
+          sudo dpkg -i ros.deb
+          ros install sbcl-bin/2.5.5
+          ros use sbcl-bin/2.5.5
+          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
+          ros run -- --version
+
+      - name: Install Quicklisp
+        run: |
+          set -euo pipefail
+          curl -fsSL -O https://beta.quicklisp.org/quicklisp.lisp
+          sbcl --non-interactive --load quicklisp.lisp \
+               --eval '(quicklisp-quickstart:install)' \
+               --eval '(ql-util:without-prompting (ql:add-to-init-file))'
+
+      - name: Resolve SBCL fingerprint
+        id: lisp
+        # version + GC flavor: a flavor or version change must invalidate the
+        # fasl cache (a clean recompile), never load a mismatched fasl.
+        run: |
+          set -euo pipefail
+          FP=$(sbcl --noinform --no-sysinit --no-userinit --non-interactive --eval \
+            '(progn (format t "~a-~a~%" (lisp-implementation-version) (cond ((member :mark-region-gc *features*) "mark-region") ((member :gencgc *features*) "gencgc") (t "unknown"))) (sb-ext:exit))' \
+            | tail -n1)
+          echo "fp=$FP" >> "$GITHUB_OUTPUT"
+          echo "SBCL fingerprint: $FP"
+
+      - name: Cache compiled fasls
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/common-lisp
+          key: cl-fasl-${{ runner.os }}-${{ steps.lisp.outputs.fp }}-${{ hashFiles('**/*.asd') }}
+          restore-keys: |
+            cl-fasl-${{ runner.os }}-${{ steps.lisp.outputs.fp }}-
+
+      - name: Fast suite (cold + warm)
+        # Same `make test` a contributor runs (PERF-01). Two timed runs: the
+        # first pays whatever the restored cache did not cover (cold-ish), the
+        # second is warm. Both must be green; the log carries the numbers.
+        run: |
+          set -euo pipefail
+          echo "::group::cold run"
+          /usr/bin/time -v make test 2> cold.time || { cat cold.time; exit 1; }
+          grep -E 'Elapsed|wall clock' cold.time || true
+          echo "::endgroup::"
+          echo "::group::warm run"
+          /usr/bin/time -v make test 2> warm.time
+          grep -E 'Elapsed|wall clock' warm.time || true
+          echo "::endgroup::"
+
+  integration:
+    name: Cross-process integration suite (gated)
+    # Off the push hot-path: nightly, manual dispatch, or a PR carrying the
+    # run-integration label only.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'run-integration')
+    runs-on: ubuntu-latest
+    env:
+      CL_SOURCE_REGISTRY: '${{ github.workspace }}//:'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned SBCL (sbcl-bin via Roswell)
+        run: |
+          set -euo pipefail
+          ROSWELL_VERSION=v23.10.14.114
+          curl -fsSL "https://github.com/roswell/roswell/releases/download/${ROSWELL_VERSION}/roswell_${ROSWELL_VERSION#v}-1_amd64.deb" -o ros.deb
+          sudo dpkg -i ros.deb
+          ros install sbcl-bin/2.5.5
+          ros use sbcl-bin/2.5.5
+          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
+          ros run -- --version
+
+      - name: Install Quicklisp
+        run: |
+          set -euo pipefail
+          curl -fsSL -O https://beta.quicklisp.org/quicklisp.lisp
+          sbcl --non-interactive --load quicklisp.lisp \
+               --eval '(quicklisp-quickstart:install)' \
+               --eval '(ql-util:without-prompting (ql:add-to-init-file))'
+
+      - name: Resolve SBCL fingerprint
+        id: lisp
+        run: |
+          set -euo pipefail
+          FP=$(sbcl --noinform --no-sysinit --no-userinit --non-interactive --eval \
+            '(progn (format t "~a-~a~%" (lisp-implementation-version) (cond ((member :mark-region-gc *features*) "mark-region") ((member :gencgc *features*) "gencgc") (t "unknown"))) (sb-ext:exit))' \
+            | tail -n1)
+          echo "fp=$FP" >> "$GITHUB_OUTPUT"
+
+      - name: Cache compiled fasls
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/common-lisp
+          key: cl-fasl-${{ runner.os }}-${{ steps.lisp.outputs.fp }}-${{ hashFiles('**/*.asd') }}
+          restore-keys: |
+            cl-fasl-${{ runner.os }}-${{ steps.lisp.outputs.fp }}-
+
+      - name: Integration suite
+        # sbcl is on PATH (installed above), so the gated leaves actually spawn
+        # their child SBCLs and run — they do not all-skip.
+        run: make test-integration
