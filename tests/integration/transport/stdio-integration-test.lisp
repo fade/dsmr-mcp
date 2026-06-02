@@ -36,40 +36,34 @@ Uses 'which sbcl' first; falls back to checking common fixed locations."
                      "/usr/bin/sbcl"
                      "/opt/local/bin/sbcl"))))
 
-(defun %asdf-source-registry-dir ()
-  "Return the source-registry directory hint so the child can find dsmr-mcp."
-  (namestring
-   (uiop/pathname:ensure-directory-pathname
-    (asdf:system-source-directory "dsmr-mcp"))))
+(defun %child-source-registry-form ()
+  "Return a single --eval form (as a string) that installs an explicit ASDF
+source registry in the child, rooted at stable directories rather than
+reconstructed from the parent's mutable already-loaded-systems set: the project
+source directory, the local-projects workspace, the project's vendor tree, and
+the quicklisp 'software' tree where dist dependencies live.
 
-(defun %extra-registry-push-evals ()
-  "Return a list of --eval strings that push extra *central-registry* directories
-into the child process.  These are directories hosting .asd files for dsmr-mcp
-transitive dependencies that live outside ~/SourceCode/lisp/ (typically quicklisp
-software directories).  Computed from the parent process's live ASDF knowledge so
-no paths are hardcoded.
-
-The quicklisp client directory itself is excluded to prevent the child from
-accidentally loading quicklisp (which prints 'To load X:' messages to stdout)."
-  (let* ((workspace    (uiop:truename* "~/SourceCode/lisp/"))
-         (ql-quicklisp (uiop:truename* "~/quicklisp/quicklisp/"))
-         (dirs (remove-duplicates
-                (remove nil
-                  (mapcar (lambda (sys)
-                            (let ((s (ignore-errors (asdf:find-system sys nil))))
-                              (when s
-                                (let ((src (ignore-errors
-                                            (asdf:system-source-directory s))))
-                                  (when (and src
-                                             (not (uiop:subpathp src workspace))
-                                             ;; Skip the quicklisp client dir itself.
-                                             (not (equal src ql-quicklisp)))
-                                    src)))))
-                          (asdf:already-loaded-systems)))
-                :test #'equal)))
-    (mapcar (lambda (dir)
-              (format nil "(push ~S asdf:*central-registry*)" (namestring dir)))
-            dirs)))
+Making the registry explicit and invocation-independent removes the fragile
+coupling on which load path started the parent (a bare run, a warm core image,
+or the CI prime step each leave a different transitive closure loaded). The
+quicklisp client directory itself is NOT added, so the child never loads
+quicklisp (which would print 'To load X:' lines onto the JSON-RPC stdout pipe).
+Missing roots are dropped, so a runner without ~/SourceCode/lisp or a global
+quicklisp still gets a well-formed config from whatever roots do exist."
+  (let* ((project     (uiop:truename* (asdf:system-source-directory "dsmr-mcp")))
+         (workspace   (uiop:truename* "~/SourceCode/lisp/"))
+         (ql-software (uiop:truename* "~/quicklisp/dists/quicklisp/software/"))
+         (vendor      (and project
+                           (uiop:truename* (merge-pathnames "vendor/" project))))
+         ;; (:directory D) is the dir itself; (:tree D) recurses D for .asd files.
+         (entries (remove nil
+                    (list (when project     (format nil "(:directory ~S)" (namestring project)))
+                          (when workspace   (format nil "(:tree ~S)" (namestring workspace)))
+                          (when vendor      (format nil "(:tree ~S)" (namestring vendor)))
+                          (when ql-software (format nil "(:tree ~S)" (namestring ql-software)))))))
+    (format nil
+            "(asdf:initialize-source-registry '(:source-registry ~{~A ~}:inherit-configuration))"
+            entries)))
 
 (defun %spawn-dsmr-mcp ()
   "Spawn a child sbcl running dsmr-mcp in :stdio mode.
@@ -79,30 +73,29 @@ input stream (triggering EOF and thus child exit) and waiting for the
 process.
 
 Uses --no-userinit to prevent the sbclrc from loading quicklisp, which would
-write 'To load X:' messages to stdout (the JSON-RPC pipe).  Instead, extra
-ASDF *central-registry* directories are pushed explicitly from the parent
-process's live ASDF knowledge (see %extra-registry-push-evals)."
-  (let* ((dir   (%asdf-source-registry-dir))
-         (extra (%extra-registry-push-evals))
-         ;; Build the --eval argument list: require asdf, push dirs, load, run.
-         (evals (append
-                 (list "--eval" "(require :asdf)")
-                 (list "--eval" (format nil "(push ~S asdf:*central-registry*)" dir))
-                 ;; Push one extra dir per --eval (each --eval must be single form).
-                 (loop for e in extra append (list "--eval" e))
+write 'To load X:' messages to stdout (the JSON-RPC pipe).  The child resolves
+dsmr-mcp and its dependencies through an explicit source registry installed at
+startup (see %child-source-registry-form), rooted at stable directories so
+resolution does not depend on how the parent process was started."
+  (let* ((evals (list
+                 "--eval" "(require :asdf)"
+                 ;; Install the explicit, invocation-independent source registry
+                 ;; before any load-system so dsmr-mcp + deps resolve from stable
+                 ;; roots rather than the parent's mutable loaded-systems set.
+                 "--eval" (%child-source-registry-form)
                  ;; Route diagnostic streams to stderr for the child's whole
                  ;; life so nothing but JSON-RPC reaches stdout. *debug-io* in
                  ;; particular is how SLYNK's ASDF loader prints its
                  ;; "SLYNK's ASDF loader finished." banner (slynk.asd) — a
                  ;; let-binding of *standard-output* alone does not catch it,
                  ;; and the banner would otherwise corrupt the JSON pipe.
-                 (list "--eval"
-                       "(setf *debug-io* *error-output* *trace-output* *error-output*)")
-                 (list "--eval"
-                       ;; Suppress any remaining ASDF load output (advisory notes
-                       ;; from asdf:load-system itself) from reaching the JSON pipe.
-                       "(let ((*standard-output* *error-output*)) (asdf:load-system :dsmr-mcp))")
-                 (list "--eval" "(dsmr-mcp:run :transport :stdio)"))))
+                 "--eval"
+                 "(setf *debug-io* *error-output* *trace-output* *error-output*)"
+                 ;; Suppress any remaining ASDF load output (advisory notes
+                 ;; from asdf:load-system itself) from reaching the JSON pipe.
+                 "--eval"
+                 "(let ((*standard-output* *error-output*)) (asdf:load-system :dsmr-mcp))"
+                 "--eval" "(dsmr-mcp:run :transport :stdio)")))
     (uiop:launch-program
      (append
       (list (%sbcl-path)

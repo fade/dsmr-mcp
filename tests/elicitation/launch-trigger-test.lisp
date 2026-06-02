@@ -1,7 +1,8 @@
 ;;;; tests/elicitation/launch-trigger-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Launch-time consent-gated `.envrc` bring-up (ENVRC-10..12, T-13-03/04).
+;;;; Launch-time consent-gated `.envrc` bring-up: the once-per-session prompt,
+;;;; the no-clobber guard, the capability gate, and the jailed write.
 ;;;;
 ;;;; These exercise the NON-stdio path of maybe-prompt-and-write-envrc
 ;;;; (in-reader nil), so the intercept obtains consent via
@@ -110,7 +111,7 @@ thread-driven ACTION response. Returns the intercept's return value."
     ret))
 
 ;;; ---------------------------------------------------------------------------
-;;; ENVRC-10 / T-13-03: once-per-session
+;;; Once-per-session: a second call is a no-op
 ;;; ---------------------------------------------------------------------------
 
 (define-test prompt-fires-once
@@ -136,7 +137,7 @@ no-op (prompted flag set) and does not write again."
           "second call must not rewrite .envrc"))))
 
 ;;; ---------------------------------------------------------------------------
-;;; ENVRC-11 / T-13-04: no-clobber when .envrc already exists
+;;; No-clobber when .envrc already exists
 ;;; ---------------------------------------------------------------------------
 
 (define-test no-prompt-when-envrc-exists
@@ -164,7 +165,7 @@ export DSMR_SLYNK_ATTACH=127.0.0.1:4005
         "existing .envrc content must be preserved")))
 
 ;;; ---------------------------------------------------------------------------
-;;; ENVRC-12: no prompt without the elicitation capability
+;;; No prompt without the elicitation capability
 ;;; ---------------------------------------------------------------------------
 
 (define-test no-prompt-without-capability
@@ -180,7 +181,7 @@ export DSMR_SLYNK_ATTACH=127.0.0.1:4005
            "prompted flag should stay nil when the gate never opens")))
 
 ;;; ---------------------------------------------------------------------------
-;;; T-13-04: jailed write on accept lands the template at root/.envrc
+;;; Jailed write on accept lands the template at root/.envrc
 ;;; ---------------------------------------------------------------------------
 
 (define-test jailed-write-on-accept
@@ -196,7 +197,7 @@ content and lives at root/.envrc (resolved through the write jail)."
           "written content should be exactly the template"))))
 
 ;;; ---------------------------------------------------------------------------
-;;; ENVRC-10: decline writes nothing
+;;; Decline writes nothing
 ;;; ---------------------------------------------------------------------------
 
 (define-test decline-writes-nothing
