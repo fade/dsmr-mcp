@@ -25,59 +25,40 @@
                 #:*circuit-breaker-cooldown*
                 #:*health-check-interval-seconds*)
   (:import-from #:dsmr-mcp/src/hermetic/worker-client
-                #:worker-pid #:check-and-clear-reset-notification)
+                #:worker-pid #:worker-state #:check-and-clear-reset-notification)
   (:import-from #:dsmr-mcp/src/state
                 #:*mode*)
   (:import-from #:dsmr-mcp/src/log
                 #:configure-log4cl-for-server)
+  (:import-from #:dsmr-mcp/tests/integration/support
+                #:with-worker-child-or-skip)
   (:import-from #:sb-posix))
 
 (in-package #:dsmr-mcp/tests/integration/hermetic/circuit-breaker-test)
 
 ;;; ---------------------------------------------------------------------------
-;;; Spawn guard: these tests fork (and SIGKILL) real SBCL worker subprocesses,
-;;; so they skip cleanly (parachute skip, not fail) when the environment cannot
-;;; spawn one — no sbcl on PATH, or no Quicklisp setup.lisp for the child.
-;;;
-;;; Assumption: the guard checks that sbcl and a Quicklisp setup.lisp exist; it
-;;; does NOT verify that dsmr-mcp itself is resolvable in the child's source
-;;; registry. On a runner with Quicklisp present but the project not on the
-;;; child's CL_SOURCE_REGISTRY, the guard passes and the child fails to build,
-;;; which surfaces as a test failure rather than the intended clean skip. A
-;;; constrained runner must therefore make dsmr-mcp resolvable for the child.
+;;; These tests fork (and SIGKILL) real SBCL worker subprocesses, so they skip
+;;; cleanly — and only when the environment genuinely cannot build a worker
+;;; child — via WITH-WORKER-CHILD-OR-SKIP (see tests/integration/support.lisp).
 ;;; ---------------------------------------------------------------------------
-
-(defun %sbcl-path ()
-  (or (ignore-errors
-        (let ((r (string-trim '(#\Newline #\Return #\Space)
-                              (uiop:run-program '("which" "sbcl")
-                                                :output :string
-                                                :ignore-error-status t))))
-          (and (plusp (length r)) r)))
-      (find-if #'probe-file '("/usr/local/bin/sbcl" "/usr/bin/sbcl" "/opt/local/bin/sbcl"))))
-
-(defun %quicklisp-setup-present-p ()
-  (and (probe-file (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))) t))
-
-(defun %spawnable-p ()
-  (and (%sbcl-path) (%quicklisp-setup-present-p)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Helper: kill-and-wait
 ;;; ---------------------------------------------------------------------------
 
-(defun kill-and-wait-for-health-monitor (pid interval)
-  "SIGKILL the process at PID, then poll until the OS has reaped it (so the
-health monitor, which polls every INTERVAL seconds, can no longer see it
-alive). Bounds the wait at a deadline of INTERVAL*4 seconds rather than
-sleeping a fixed worst case: the wait is as short as the actual reap and
-fails fast if reaping never completes."
-  (ignore-errors (sb-posix:kill pid 9))
-  ;; kill(pid, 0) signals ESRCH (caught by ignore-errors → NIL) once the
-  ;; process is gone; loop until then or the deadline.
-  (loop repeat (ceiling (* interval 4) 0.25)
-        while (ignore-errors (sb-posix:kill pid 0))
-        do (sleep 0.25)))
+(defun kill-and-wait-for-health-monitor (worker interval)
+  "SIGKILL WORKER's OS process, then poll until the health monitor has OBSERVED
+the death and marked WORKER :crashed — not merely until the OS reaps the pid.
+The monitor only checks liveness every INTERVAL seconds and then recovers
+asynchronously, so returning at OS-reap (which is near-instant) would let the
+following get-or-assign-worker race an as-yet-undetected crash and reuse the
+dead worker; waiting for the :crashed transition is what makes recovery
+deterministic. Bounds the wait at a deadline of INTERVAL*8 seconds so a monitor
+that never fires fails fast rather than hanging."
+  (ignore-errors (sb-posix:kill (worker-pid worker) 9))
+  (loop repeat (ceiling (* interval 8) 0.1)
+        until (eq (worker-state worker) :crashed)
+        do (sleep 0.1)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; One reset notification after crash + replacement
@@ -88,32 +69,30 @@ fails fast if reaping never completes."
 get-or-assign-worker returns a replacement worker whose
 check-and-clear-reset-notification is T exactly once. The second call returns
 NIL, confirming the one-notification guarantee."
-  (unless (%spawnable-p)
-    (skip "cannot spawn a worker subprocess (sbcl / quicklisp setup.lisp absent)"))
-  (let ((*mode* :hermetic)
-        (*error-output* (make-string-output-stream))
-        ;; Short health-check interval so the test doesn't take forever.
-        (*health-check-interval-seconds* 2.0d0))
-    (configure-log4cl-for-server :warn)
-    (let ((dsmr-mcp/src/hermetic/pool:*worker-pool-warmup* 0)
-          (dsmr-mcp/src/hermetic/pool:*max-pool-size* 4))
-      (initialize-pool)
-      (unwind-protect
-           (let* ((worker  (get-or-assign-worker "crash-recovery-session"))
-                  (pid     (worker-pid worker)))
-             ;; Hard-kill the worker at OS level and wait for the health monitor.
-             (kill-and-wait-for-health-monitor pid *health-check-interval-seconds*)
-             ;; The next call must succeed: recovery spawned a replacement.
-             (let* ((next-worker (get-or-assign-worker "crash-recovery-session"))
-                    (had-reset   (check-and-clear-reset-notification next-worker)))
-               ;; Reset notification was set exactly once.
-               (true had-reset)
-               ;; Second call returns NIL — one-notification guarantee.
-               (false (check-and-clear-reset-notification next-worker))
-               ;; The replacement is a live worker with a different pid.
-               (true (integerp (worker-pid next-worker)))
-               (true (plusp (worker-pid next-worker)))))
-        (ignore-errors (shutdown-pool))))))
+  (with-worker-child-or-skip
+    (let ((*mode* :hermetic)
+          (*error-output* (make-string-output-stream))
+          ;; Short health-check interval so the test doesn't take forever.
+          (*health-check-interval-seconds* 2.0d0))
+      (configure-log4cl-for-server :warn)
+      (let ((dsmr-mcp/src/hermetic/pool:*worker-pool-warmup* 0)
+            (dsmr-mcp/src/hermetic/pool:*max-pool-size* 4))
+        (initialize-pool)
+        (unwind-protect
+             (let ((worker (get-or-assign-worker "crash-recovery-session")))
+               ;; Hard-kill the worker at OS level and wait for the health monitor.
+               (kill-and-wait-for-health-monitor worker *health-check-interval-seconds*)
+               ;; The next call must succeed: recovery spawned a replacement.
+               (let* ((next-worker (get-or-assign-worker "crash-recovery-session"))
+                      (had-reset   (check-and-clear-reset-notification next-worker)))
+                 ;; Reset notification was set exactly once.
+                 (true had-reset)
+                 ;; Second call returns NIL — one-notification guarantee.
+                 (false (check-and-clear-reset-notification next-worker))
+                 ;; The replacement is a live worker with a different pid.
+                 (true (integerp (worker-pid next-worker)))
+                 (true (plusp (worker-pid next-worker)))))
+          (ignore-errors (shutdown-pool)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Circuit breaker trips after threshold crashes
@@ -124,43 +103,41 @@ NIL, confirming the one-notification guarantee."
 succession causes the next get-or-assign-worker call to signal an error whose
 message contains 'Circuit breaker'. No spawn attempt is made during the
 *circuit-breaker-cooldown* (60 s) window."
-  (unless (%spawnable-p)
-    (skip "cannot spawn a worker subprocess (sbcl / quicklisp setup.lisp absent)"))
-  (let ((*mode* :hermetic)
-        (*error-output* (make-string-output-stream))
-        ;; Short health-check interval so recovery + crash cycling is faster.
-        (*health-check-interval-seconds* 2.0d0)
-        ;; Keep the production-default 300 s breaker window: the three crash +
-        ;; recovery cycles complete well inside it, so all three crashes fall in
-        ;; one window and the breaker trips. A shorter window risks the early
-        ;; crashes ageing out before the threshold is reached, which would make
-        ;; the breaker never trip and flake the test.
-        (*crash-breaker-window* 300))
-    (configure-log4cl-for-server :warn)
-    (let ((dsmr-mcp/src/hermetic/pool:*worker-pool-warmup* 0)
-          (dsmr-mcp/src/hermetic/pool:*max-pool-size* 8))
-      (initialize-pool)
-      (unwind-protect
-           (progn
-             ;; Induce *crash-breaker-threshold* crashes for the breaker session.
-             ;; Each crash-then-recovery cycle: SIGKILL → wait → get-or-assign-worker
-             ;; (which ensures recovery completed before we try again).
-             (dotimes (i *crash-breaker-threshold*)
-               (let* ((w   (get-or-assign-worker "breaker-session"))
-                      (pid (worker-pid w)))
-                 (kill-and-wait-for-health-monitor
-                  pid *health-check-interval-seconds*)))
-             ;; 4th call must signal an error referencing "Circuit breaker".
-             (let ((signalled-p nil)
-                   (error-message nil))
-               (handler-case
-                   (get-or-assign-worker "breaker-session")
-                 (error (e)
-                   (setf signalled-p t
-                         error-message (princ-to-string e))))
-               (true signalled-p)
-               (true error-message)
-               ;; The message must name the circuit breaker so the caller can
-               ;; distinguish this from generic pool errors.
-               (true (search "Circuit breaker" error-message))))
-        (ignore-errors (shutdown-pool))))))
+  (with-worker-child-or-skip
+    (let ((*mode* :hermetic)
+          (*error-output* (make-string-output-stream))
+          ;; Short health-check interval so recovery + crash cycling is faster.
+          (*health-check-interval-seconds* 2.0d0)
+          ;; Keep the production-default 300 s breaker window: the three crash +
+          ;; recovery cycles complete well inside it, so all three crashes fall in
+          ;; one window and the breaker trips. A shorter window risks the early
+          ;; crashes ageing out before the threshold is reached, which would make
+          ;; the breaker never trip and flake the test.
+          (*crash-breaker-window* 300))
+      (configure-log4cl-for-server :warn)
+      (let ((dsmr-mcp/src/hermetic/pool:*worker-pool-warmup* 0)
+            (dsmr-mcp/src/hermetic/pool:*max-pool-size* 8))
+        (initialize-pool)
+        (unwind-protect
+             (progn
+               ;; Induce *crash-breaker-threshold* crashes for the breaker session.
+               ;; Each crash-then-recovery cycle: SIGKILL → wait → get-or-assign-worker
+               ;; (which ensures recovery completed before we try again).
+               (dotimes (i *crash-breaker-threshold*)
+                 (let ((w (get-or-assign-worker "breaker-session")))
+                   (kill-and-wait-for-health-monitor
+                    w *health-check-interval-seconds*)))
+               ;; 4th call must signal an error referencing "Circuit breaker".
+               (let ((signalled-p nil)
+                     (error-message nil))
+                 (handler-case
+                     (get-or-assign-worker "breaker-session")
+                   (error (e)
+                     (setf signalled-p t
+                           error-message (princ-to-string e))))
+                 (true signalled-p)
+                 (true error-message)
+                 ;; The message must name the circuit breaker so the caller can
+                 ;; distinguish this from generic pool errors.
+                 (true (search "Circuit breaker" error-message))))
+          (ignore-errors (shutdown-pool)))))))
