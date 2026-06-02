@@ -34,7 +34,8 @@ jobs:
 
       - name: Install pinned SBCL (sbcl-bin via Roswell)
         # Pin the exact sbcl-bin version so the GC flavor is deterministic
-        # (upstream sbcl-bin is GENCGC) — this is what makes the fasl cache safe.
+        # (this sbcl-bin ships the MARK-REGION collector) — a fixed flavor is
+        # what makes the flavor-keyed fasl cache safe to restore across runs.
         run: |
           set -euo pipefail
           ROSWELL_VERSION=v23.10.14.114
@@ -75,16 +76,22 @@ jobs:
         # fasl cache (a clean recompile), never load a mismatched fasl.
         run: |
           set -euo pipefail
-          FP=$(sbcl --noinform --no-sysinit --no-userinit --non-interactive --eval \
-            '(progn (format t "~a-~a~%" (lisp-implementation-version) (cond ((member :mark-region-gc *features*) "mark-region") ((member :gencgc *features*) "gencgc") (t "unknown"))) (sb-ext:exit))' \
-            | tail -n1)
+          RAW=$(sbcl --noinform --no-sysinit --no-userinit --non-interactive --eval \
+            '(progn (format t "~a-~a~%" (lisp-implementation-version) (cond ((member :mark-region-gc *features*) "mark-region") ((member :gencgc *features*) "gencgc") (t "UNKNOWN"))) (sb-ext:exit))')
+          FP=$(printf '%s\n' "$RAW" | tail -n1)
+          case "$FP" in *-UNKNOWN) echo "unrecognized GC flavor: $FP" >&2; exit 1;; esac
           echo "fp=$FP" >> "$GITHUB_OUTPUT"
           echo "SBCL fingerprint: $FP"
 
       - name: Cache compiled fasls
         uses: actions/cache@v4
         with:
-          path: ~/.cache/common-lisp
+          # Cache the same project-local dir `make test` writes to (the Makefile
+          # exports XDG_CACHE_HOME=$(CURDIR)/.ci-cache), and the prime step below
+          # exports the same dir — so the warm `make test` run actually reloads
+          # primed fasls. Keying on the GC fingerprint keeps a flavor change from
+          # ever loading a mismatched fasl.
+          path: .ci-cache/common-lisp
           key: cl-fasl-${{ runner.os }}-${{ steps.lisp.outputs.fp }}-${{ hashFiles('**/*.asd') }}
           restore-keys: |
             cl-fasl-${{ runner.os }}-${{ steps.lisp.outputs.fp }}-
@@ -102,18 +109,21 @@ jobs:
       - name: Prime dependencies (cold — download dist deps + compile)
         # `make test` uses asdf:load-system, which resolves only systems already
         # on disk; it does not download from the dist. ql:quickload does the
-        # download + compile once, populating the fasl cache. This step's time is
-        # the cold cost (dep build); on a warm cache restore it is fast.
+        # download + compile once, populating the fasl cache. Export the same
+        # project-local XDG_CACHE_HOME the Makefile uses so the primed fasls land
+        # in the cached dir and the warm `make test` run reloads them instead of
+        # recompiling from cold.
         run: |
           set -euo pipefail
+          export XDG_CACHE_HOME="$PWD/.ci-cache"
           /usr/bin/time -v sbcl --non-interactive \
             --eval '(ql:quickload "dsmr-mcp/tests" :verbose nil)' 2> cold.time \
             || { cat cold.time; exit 1; }
           grep -E 'Elapsed \(wall' cold.time || true
 
       - name: Fast suite (warm)
-        # The same `make test` a contributor runs (PERF-01). Deps are now on
-        # disk, so this is the warm fast-suite number.
+        # The same `make test` a contributor runs. Deps are now compiled into the
+        # shared .ci-cache, so this is the warm fast-suite number.
         run: |
           set -euo pipefail
           /usr/bin/time -v make test 2> warm.time || { cat warm.time; exit 1; }
@@ -172,15 +182,20 @@ jobs:
         id: lisp
         run: |
           set -euo pipefail
-          FP=$(sbcl --noinform --no-sysinit --no-userinit --non-interactive --eval \
-            '(progn (format t "~a-~a~%" (lisp-implementation-version) (cond ((member :mark-region-gc *features*) "mark-region") ((member :gencgc *features*) "gencgc") (t "unknown"))) (sb-ext:exit))' \
-            | tail -n1)
+          RAW=$(sbcl --noinform --no-sysinit --no-userinit --non-interactive --eval \
+            '(progn (format t "~a-~a~%" (lisp-implementation-version) (cond ((member :mark-region-gc *features*) "mark-region") ((member :gencgc *features*) "gencgc") (t "UNKNOWN"))) (sb-ext:exit))')
+          FP=$(printf '%s\n' "$RAW" | tail -n1)
+          case "$FP" in *-UNKNOWN) echo "unrecognized GC flavor: $FP" >&2; exit 1;; esac
           echo "fp=$FP" >> "$GITHUB_OUTPUT"
 
       - name: Cache compiled fasls
         uses: actions/cache@v4
         with:
-          path: ~/.cache/common-lisp
+          # Cache the same project-local dir `make test-integration` writes to
+          # (the Makefile exports XDG_CACHE_HOME=$(CURDIR)/.ci-cache), and the
+          # prime step below exports the same dir, so the gated suite reloads
+          # primed fasls. Keyed on the GC fingerprint against a flavor mismatch.
+          path: .ci-cache/common-lisp
           key: cl-fasl-${{ runner.os }}-${{ steps.lisp.outputs.fp }}-${{ hashFiles('**/*.asd') }}
           restore-keys: |
             cl-fasl-${{ runner.os }}-${{ steps.lisp.outputs.fp }}-
@@ -192,8 +207,11 @@ jobs:
           git -C vendor/slynk-client checkout 32691172ee0a5619f084145c0304464f5c4b67c3
 
       - name: Prime dependencies (download dist deps + compile)
+        # Export the same project-local XDG_CACHE_HOME the Makefile uses so the
+        # primed fasls land in the cached dir that `make test-integration` reads.
         run: |
           set -euo pipefail
+          export XDG_CACHE_HOME="$PWD/.ci-cache"
           sbcl --non-interactive \
             --eval '(ql:quickload "dsmr-mcp/tests/integration" :verbose nil)'
 

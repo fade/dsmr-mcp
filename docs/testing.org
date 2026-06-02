@@ -50,9 +50,10 @@ fast.
 
 * Pinned SBCL build, and why it matters
 
-CI pins the SBCL build to the upstream prebuilt binary (=sbcl-bin=). That binary
-has one fixed garbage-collector flavor, so every CI run compiles and loads fasls
-under the same flavor and the cache is always coherent.
+CI pins the SBCL build to the upstream prebuilt binary (=sbcl-bin/2.5.5=). That
+binary has one fixed garbage-collector flavor — the pinned =sbcl-bin= ships the
+=MARK-REGION= collector — so every CI run compiles and loads fasls under the same
+flavor and the cache is always coherent.
 
 This matters because SBCL keys its compiled-fasl cache on the implementation
 *version string* but not on the GC flavor. Two SBCLs that share a version string
