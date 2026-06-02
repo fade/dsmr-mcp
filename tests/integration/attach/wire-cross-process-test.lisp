@@ -62,6 +62,13 @@
 ;;; alexandria, so it skips cleanly (parachute skip, not fail) when the
 ;;; environment cannot spawn one — no sbcl on PATH, or no Quicklisp setup.lisp
 ;;; for the child to quickload from.
+;;;
+;;; Assumption: the guard checks that sbcl and a Quicklisp setup.lisp exist; it
+;;; does NOT verify that slynk + alexandria are actually quickloadable in the
+;;; child (e.g. an offline runner with no cached dist). If the child cannot
+;;; bring slynk up, with-foreign-slynk-image surfaces the child's captured log
+;;; as an error rather than a skip — a constrained runner must keep those two
+;;; systems resolvable for the child.
 ;;; ---------------------------------------------------------------------------
 
 (defun %sbcl-path ()
