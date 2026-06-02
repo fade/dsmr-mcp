@@ -129,7 +129,7 @@ Exercises both pool-not-running and the :attached fallthrough."
 ;;; :auto mode fallback
 ;;; ---------------------------------------------------------------------------
 
-(define-test criterion-4-auto-no-slynk-resolves-hermetic
+(define-test auto-no-slynk-resolves-hermetic
   "With mode :auto and no reachable Slynk listener (slynk-attach nil),
 resolve-mode emits a run.auto-mode :warn line on stderr and resolves to
 :hermetic. The warn line is startup-time only (not per-call)."
