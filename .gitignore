@@ -43,3 +43,8 @@ bin/dsmr-mcp-bridge
 # Prebuilt deps+system core image (save-lisp-and-die; large, GC-build-specific):
 dsmr.core
 *.core
+
+# Per-developer direnv config (points at a local LISP_WORKSPACE / Slynk port).
+# dsmr-mcp can write one from its template via the launch-time consent prompt;
+# it is local environment, never committed.
+.envrc
