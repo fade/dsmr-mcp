@@ -143,21 +143,18 @@ export DSMR_LOG_LEVEL=info
 ;;; ---------------------------------------------------------------------------
 
 (defun envrc-elicitation-schema ()
-  "Return the flat requestedSchema hash-table for the `.envrc` consent prompt.
+  "Return the requestedSchema hash-table for the `.envrc` consent prompt.
 
-A single required boolean property `confirm`. MCP elicitation schemas are
-restricted to flat objects of primitive properties, so there is no nesting.
-Built with make-ht and a fresh vector so nothing on the wire is a
+A confirmation-only elicitation: the accept/decline action already carries the
+operator's consent, so the schema requests no input fields (an empty flat
+object). MCP elicitation schemas are restricted to flat objects of primitive
+properties; an empty `properties` renders as a plain Accept/Decline
+confirmation with no field for the client to demand. (A required boolean here
+made the client reject an accept until the box was ticked -- only decline could
+clear the dialog.) Built with make-ht so nothing on the wire is a
 simple-base-string or a reader literal."
   (make-ht "type" "object"
-           "properties"
-           (make-ht "confirm"
-                    (make-ht "type" "boolean"
-                             "title" "Create .envrc"
-                             "description"
-                             (%wire-string
-                              "Create a .envrc for this project from the dsmr-mcp template, then run 'direnv allow .' to load it.")))
-           "required" (vector "confirm")))
+           "properties" (make-ht)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Consent action -> keyword (mirrors elicitation's mapping for the stdio path)
@@ -253,7 +250,7 @@ that, on the single stdio thread, nothing else could ever satisfy."
 ;;; ---------------------------------------------------------------------------
 
 (defparameter +envrc-prompt-message+
-  "No .envrc found. Create one for this project?"
+  "No .envrc found. Create one for this project from the dsmr-mcp template? You'll then run 'direnv allow .' to load it."
   "The human-readable prompt shown to the operator for the .envrc CREATE consent.")
 
 (defparameter +envrc-update-message+
