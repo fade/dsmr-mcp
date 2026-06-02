@@ -38,6 +38,13 @@
 ;;; Spawn guard: these tests fork (and SIGKILL) real SBCL worker subprocesses,
 ;;; so they skip cleanly (parachute skip, not fail) when the environment cannot
 ;;; spawn one — no sbcl on PATH, or no Quicklisp setup.lisp for the child.
+;;;
+;;; Assumption: the guard checks that sbcl and a Quicklisp setup.lisp exist; it
+;;; does NOT verify that dsmr-mcp itself is resolvable in the child's source
+;;; registry. On a runner with Quicklisp present but the project not on the
+;;; child's CL_SOURCE_REGISTRY, the guard passes and the child fails to build,
+;;; which surfaces as a test failure rather than the intended clean skip. A
+;;; constrained runner must therefore make dsmr-mcp resolvable for the child.
 ;;; ---------------------------------------------------------------------------
 
 (defun %sbcl-path ()
