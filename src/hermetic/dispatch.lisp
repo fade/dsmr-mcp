@@ -34,9 +34,38 @@
                 #:*default-eval-timeout*)
   (:import-from #:dsmr-mcp/src/attach/registry
                 #:decode-object-id)
-  (:export #:dispatch-hermetic-call))
+  (:export #:dispatch-hermetic-call
+           #:worker-routed-tool-p
+           #:+worker-routed-tools+))
 
 (in-package #:dsmr-mcp/src/hermetic/dispatch)
+
+;;; ---------------------------------------------------------------------------
+;;; Which tools need the live worker image
+;;; ---------------------------------------------------------------------------
+
+(defparameter +worker-routed-tools+
+  '("repl-eval"
+    "load-system" "run-tests"
+    "code-find" "code-describe" "code-find-references"
+    "inspect-object" "inspect-thread" "inspect-restart" "inspect-condition")
+  "Tool names whose handling needs the live worker image. These are exactly the
+verbs dispatch-hermetic-call routes to a worker (repl-eval via the worker/eval
+default; the rest via explicit branches). Every other tool is dispatcher-side --
+filesystem (fs-*), HyperSpec (clhs-lookup), source grep (clgrep-search), LSP
+(lsp-*), structural editing (lisp-*), scaffolding (project-scaffold), and pool
+management (pool-status, pool-kill-worker) -- and is served locally through
+*tool-classes*, exactly as in attached mode. Pool-management tools in particular
+MUST stay dispatcher-side: they inspect and act on the pool from the parent
+process and cannot be answered by a worker.")
+
+(defun worker-routed-tool-p (name)
+  "True when NAME (a tool-name string) must run in the hermetic worker image.
+Used by the mode router to send only image-bound verbs to the worker pool while
+dispatcher-side tools fall through to the local tool dispatch."
+  (and (stringp name)
+       (member name +worker-routed-tools+ :test #'string=)
+       t))
 
 (defun dispatch-hermetic-call (session id name args)
   "Route one tools/call to the session's dedicated hermetic worker.
