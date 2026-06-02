@@ -38,37 +38,19 @@
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht)
   (:import-from #:dsmr-mcp/src/log
-                #:configure-log4cl-for-server))
+                #:configure-log4cl-for-server)
+  (:import-from #:dsmr-mcp/tests/integration/support
+                #:with-worker-child-or-skip))
 
 (in-package #:dsmr-mcp/tests/integration/hermetic/repl-eval-parity-test)
 
 ;;; ---------------------------------------------------------------------------
-;;; Spawn guard: the pool tests fork real SBCL worker subprocesses, so they skip
-;;; cleanly (parachute skip, not fail) when the environment cannot spawn one —
-;;; no sbcl on PATH, or no Quicklisp setup.lisp for the child to load dsmr-mcp.
-;;;
-;;; Assumption: the guard checks that sbcl and a Quicklisp setup.lisp exist; it
-;;; does NOT verify that dsmr-mcp itself is resolvable in the child's source
-;;; registry. On a runner with Quicklisp present but the project not on the
-;;; child's CL_SOURCE_REGISTRY, the guard passes and the child fails to build,
-;;; which surfaces as a test failure rather than the intended clean skip. A
-;;; constrained runner must therefore make dsmr-mcp resolvable for the child.
+;;; The pool tests fork real SBCL worker subprocesses, so each wraps its body in
+;;; WITH-WORKER-CHILD-OR-SKIP: it runs only when a fresh child can build the
+;;; worker system, and skips cleanly otherwise (see tests/integration/support.lisp).
+;;; Once that guard passes, %with-pool-eval assumes a buildable child — any
+;;; bring-up failure from here is a genuine defect, not an environment skip.
 ;;; ---------------------------------------------------------------------------
-
-(defun %sbcl-path ()
-  (or (ignore-errors
-        (let ((r (string-trim '(#\Newline #\Return #\Space)
-                              (uiop:run-program '("which" "sbcl")
-                                                :output :string
-                                                :ignore-error-status t))))
-          (and (plusp (length r)) r)))
-      (find-if #'probe-file '("/usr/local/bin/sbcl" "/usr/bin/sbcl" "/opt/local/bin/sbcl"))))
-
-(defun %quicklisp-setup-present-p ()
-  (and (probe-file (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))) t))
-
-(defun %spawnable-p ()
-  (and (%sbcl-path) (%quicklisp-setup-present-p)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Helper: run a form in a fresh hermetic pool and return the worker/eval response
@@ -80,10 +62,8 @@ with PARAMS-HT, shutdown the pool, and return the response hash-table.
 Uses pool-rpc-with-hard-kill when SOFT-TIMEOUT is provided (the two-level
 timeout path: soft in-worker timeout plus parent SIGKILL backstop).
 
-Skips the calling test (parachute skip unwinds to the test boundary) when the
-environment cannot spawn a worker subprocess."
-  (unless (%spawnable-p)
-    (skip "cannot spawn a worker subprocess (sbcl / quicklisp setup.lisp absent)"))
+Callers must guard with WITH-WORKER-CHILD-OR-SKIP; this helper assumes a
+buildable worker child."
   (let ((*worker-pool-warmup* 0)
         (*max-pool-size* 4))
     (initialize-pool)
@@ -105,22 +85,23 @@ environment cannot spawn a worker subprocess."
   "A benign eval of (+ 40 2) round-trips end-to-end through the pool → worker
 → result path. The response has no error_context and the content field
 contains the printed value 42."
-  (let* ((dsmr-mcp/src/state:*mode* :hermetic)
-         (capture (make-string-output-stream))
-         (*error-output* capture))
-    (configure-log4cl-for-server :warn)
-    (let* ((params (make-ht "code" "(+ 40 2)"))
-           (resp (%with-pool-eval "parity-benign" params)))
-      ;; Result is a hash-table with content and no error_context.
-      (true (hash-table-p resp))
-      (false (gethash "error_context" resp))
-      ;; Content is a simple-vector of content blocks.
-      (let ((content (gethash "content" resp)))
-        (true content)
-        (true (plusp (length content)))
-        ;; The printed value "42" must appear in the text.
-        (let ((text (gethash "text" (aref content 0))))
-          (true (search "42" text)))))))
+  (with-worker-child-or-skip
+    (let* ((dsmr-mcp/src/state:*mode* :hermetic)
+           (capture (make-string-output-stream))
+           (*error-output* capture))
+      (configure-log4cl-for-server :warn)
+      (let* ((params (make-ht "code" "(+ 40 2)"))
+             (resp (%with-pool-eval "parity-benign" params)))
+        ;; Result is a hash-table with content and no error_context.
+        (true (hash-table-p resp))
+        (false (gethash "error_context" resp))
+        ;; Content is a simple-vector of content blocks.
+        (let ((content (gethash "content" resp)))
+          (true content)
+          (true (plusp (length content)))
+          ;; The printed value "42" must appear in the text.
+          (let ((text (gethash "text" (aref content 0))))
+            (true (search "42" text))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Error context parity with the attached path
@@ -132,36 +113,37 @@ envelope shape as the attached path: non-empty condition_type, message, restarts
 (simple-vector), and frames (simple-vector). Proves the build-wrapping-form
 + eval + build-eval-response pipeline gives identical output regardless of
 whether the eval runs locally or in a hermetic worker."
-  (let* ((dsmr-mcp/src/state:*mode* :hermetic)
-         (capture (make-string-output-stream))
-         (*error-output* capture))
-    (configure-log4cl-for-server :warn)
-    (let* ((params (make-ht "code" "(error \"boom\")"))
-           (resp (%with-pool-eval "parity-error" params))
-           (ec (gethash "error_context" resp)))
-      ;; error_context must be present.
-      (true ec)
-      (true (hash-table-p ec))
-      ;; condition_type: non-empty string naming the condition class.
-      (let ((ctype (gethash "condition_type" ec)))
-        (true (stringp ctype))
-        (true (plusp (length ctype))))
-      ;; message: non-empty string with the condition text.
-      (let ((msg (gethash "message" ec)))
-        (true (stringp msg))
-        (true (search "boom" msg)))
-      ;; restarts: simple-vector (may be empty but must be present).
-      (true (simple-vector-p (gethash "restarts" ec)))
-      ;; frames: simple-vector with at least one frame.
-      (let ((frames (gethash "frames" ec)))
-        (true (simple-vector-p frames))
-        (true (plusp (length frames)))
-        ;; Each frame has index (integer), function (string), locals (simple-vector).
-        (let ((frame0 (aref frames 0)))
-          (true (hash-table-p frame0))
-          (true (integerp (gethash "index" frame0)))
-          (true (stringp (gethash "function" frame0)))
-          (true (simple-vector-p (gethash "locals" frame0))))))))
+  (with-worker-child-or-skip
+    (let* ((dsmr-mcp/src/state:*mode* :hermetic)
+           (capture (make-string-output-stream))
+           (*error-output* capture))
+      (configure-log4cl-for-server :warn)
+      (let* ((params (make-ht "code" "(error \"boom\")"))
+             (resp (%with-pool-eval "parity-error" params))
+             (ec (gethash "error_context" resp)))
+        ;; error_context must be present.
+        (true ec)
+        (true (hash-table-p ec))
+        ;; condition_type: non-empty string naming the condition class.
+        (let ((ctype (gethash "condition_type" ec)))
+          (true (stringp ctype))
+          (true (plusp (length ctype))))
+        ;; message: non-empty string with the condition text.
+        (let ((msg (gethash "message" ec)))
+          (true (stringp msg))
+          (true (search "boom" msg)))
+        ;; restarts: simple-vector (may be empty but must be present).
+        (true (simple-vector-p (gethash "restarts" ec)))
+        ;; frames: simple-vector with at least one frame.
+        (let ((frames (gethash "frames" ec)))
+          (true (simple-vector-p frames))
+          (true (plusp (length frames)))
+          ;; Each frame has index (integer), function (string), locals (simple-vector).
+          (let ((frame0 (aref frames 0)))
+            (true (hash-table-p frame0))
+            (true (integerp (gethash "index" frame0)))
+            (true (stringp (gethash "function" frame0)))
+            (true (simple-vector-p (gethash "locals" frame0)))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Soft timeout — structured TIMEOUT result; worker survives
@@ -171,16 +153,15 @@ whether the eval runs locally or in a hermetic worker."
   "Eval of (sleep 200) with timeout_seconds=1 returns a structured TIMEOUT
 response naming SB-EXT:TIMEOUT in condition_type. A subsequent eval on the
 SAME worker (same session) succeeds — the worker survived the timeout."
-  (unless (%spawnable-p)
-    (skip "cannot spawn a worker subprocess (sbcl / quicklisp setup.lisp absent)"))
-  (let* ((dsmr-mcp/src/state:*mode* :hermetic)
-         (capture (make-string-output-stream))
-         (*error-output* capture)
-         (*worker-pool-warmup* 0)
-         (*max-pool-size* 4))
-    (configure-log4cl-for-server :warn)
-    (initialize-pool)
-    (unwind-protect
+  (with-worker-child-or-skip
+   (let* ((dsmr-mcp/src/state:*mode* :hermetic)
+          (capture (make-string-output-stream))
+          (*error-output* capture)
+          (*worker-pool-warmup* 0)
+          (*max-pool-size* 4))
+     (configure-log4cl-for-server :warn)
+     (initialize-pool)
+     (unwind-protect
          (let ((worker (get-or-assign-worker "parity-timeout")))
            ;; Send a sleep that will be interrupted by the soft timeout.
            (let* ((sleep-params (make-ht "code" "(sleep 200)"
@@ -218,7 +199,7 @@ SAME worker (same session) succeeds — the worker survived the timeout."
                      (true content)
                      (let ((text (gethash "text" (aref content 0))))
                        (true (search "3" text)))))))))
-      (ignore-errors (shutdown-pool)))))
+       (ignore-errors (shutdown-pool))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Auto fallback — :auto + no Slynk → :hermetic + run.auto-mode warn
@@ -276,33 +257,32 @@ Catches: stdout-pipe restore regression in start() where the handshake
 goes to stderr instead of the parent's pipe (causing a timeout), and
 placeholder-coordination regressions in the pool where a concurrent spawn
 is left in :spawning state indefinitely."
-  (unless (%spawnable-p)
-    (skip "cannot spawn a worker subprocess (sbcl / quicklisp setup.lisp absent)"))
-  (let* ((dsmr-mcp/src/state:*mode* :hermetic)
-         (capture (make-string-output-stream))
-         (*error-output* capture)
-         (*worker-pool-warmup* 1)
-         (*max-pool-size* 4))
-    (configure-log4cl-for-server :warn)
-    (initialize-pool)
-    (unwind-protect
-         (progn
-           ;; Wait for the standby worker to appear (replenish is async).
-           (loop repeat 60
-                 until (let ((info (pool-status-info)))
-                         (plusp (gethash "standby_count" info)))
-                 do (sleep 0.5))
-           ;; Get a session worker — the pool now has both a standby (id=1)
-           ;; and a newly-bound session worker (id=2) at the same time.
-           (let* ((worker (get-or-assign-worker "concurrent-spawn-session"))
-                  (params (make-ht "code" "(+ 40 2)"))
-                  (resp (worker-rpc worker "worker/eval" params)))
-             ;; Session worker must return the correct value.
-             (true (hash-table-p resp))
-             (false (gethash "error_context" resp))
-             (let ((content (gethash "content" resp)))
-               (true content)
-               (true (plusp (length content)))
-               (let ((text (gethash "text" (aref content 0))))
-                 (true (search "42" text))))))
-      (ignore-errors (shutdown-pool)))))
+  (with-worker-child-or-skip
+    (let* ((dsmr-mcp/src/state:*mode* :hermetic)
+           (capture (make-string-output-stream))
+           (*error-output* capture)
+           (*worker-pool-warmup* 1)
+           (*max-pool-size* 4))
+      (configure-log4cl-for-server :warn)
+      (initialize-pool)
+      (unwind-protect
+           (progn
+             ;; Wait for the standby worker to appear (replenish is async).
+             (loop repeat 60
+                   until (let ((info (pool-status-info)))
+                           (plusp (gethash "standby_count" info)))
+                   do (sleep 0.5))
+             ;; Get a session worker — the pool now has both a standby (id=1)
+             ;; and a newly-bound session worker (id=2) at the same time.
+             (let* ((worker (get-or-assign-worker "concurrent-spawn-session"))
+                    (params (make-ht "code" "(+ 40 2)"))
+                    (resp (worker-rpc worker "worker/eval" params)))
+               ;; Session worker must return the correct value.
+               (true (hash-table-p resp))
+               (false (gethash "error_context" resp))
+               (let ((content (gethash "content" resp)))
+                 (true content)
+                 (true (plusp (length content)))
+                 (let ((text (gethash "text" (aref content 0))))
+                   (true (search "42" text))))))
+        (ignore-errors (shutdown-pool))))))
