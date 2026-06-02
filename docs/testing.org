@@ -89,6 +89,10 @@ it recompile, or point =XDG_CACHE_HOME= at a fresh directory for that run.
 
 * Measured numbers
 
+These tables are an illustrative snapshot, not an invariant: the wall-clock
+figures and pass counts drift as leaves are added and the toolchain moves, so
+read them as "what one run looked like on the build below," not as a contract.
+
 Recorded on the development box (=sbcl 2.6.5=, isolated =.ci-cache=) and on a
 GitHub =ubuntu-latest= CI runner (pinned upstream =sbcl-bin=, ASDF 3.3.7).
 
