@@ -60,11 +60,17 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun kill-and-wait-for-health-monitor (pid interval)
-  "SIGKILL the process at PID, then wait long enough for the health monitor
-to detect the crash. The health monitor polls every INTERVAL seconds so
-we wait INTERVAL + 3 seconds to be safe."
+  "SIGKILL the process at PID, then poll until the OS has reaped it (so the
+health monitor, which polls every INTERVAL seconds, can no longer see it
+alive). Bounds the wait at a deadline of INTERVAL*4 seconds rather than
+sleeping a fixed worst case: the wait is as short as the actual reap and
+fails fast if reaping never completes."
   (ignore-errors (sb-posix:kill pid 9))
-  (sleep (+ interval 3)))
+  ;; kill(pid, 0) signals ESRCH (caught by ignore-errors → NIL) once the
+  ;; process is gone; loop until then or the deadline.
+  (loop repeat (ceiling (* interval 4) 0.25)
+        while (ignore-errors (sb-posix:kill pid 0))
+        do (sleep 0.25)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; One reset notification after crash + replacement
@@ -117,8 +123,11 @@ message contains 'Circuit breaker'. No spawn attempt is made during the
         (*error-output* (make-string-output-stream))
         ;; Short health-check interval so recovery + crash cycling is faster.
         (*health-check-interval-seconds* 2.0d0)
-        ;; Short breaker window to avoid very long test: 30 s is enough for
-        ;; 3 crash + recovery cycles with 2s health monitor intervals.
+        ;; Keep the production-default 300 s breaker window: the three crash +
+        ;; recovery cycles complete well inside it, so all three crashes fall in
+        ;; one window and the breaker trips. A shorter window risks the early
+        ;; crashes ageing out before the threshold is reached, which would make
+        ;; the breaker never trip and flake the test.
         (*crash-breaker-window* 300))
     (configure-log4cl-for-server :warn)
     (let ((dsmr-mcp/src/hermetic/pool:*worker-pool-warmup* 0)
