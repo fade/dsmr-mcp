@@ -46,6 +46,13 @@
 ;;; Spawn guard: the pool tests fork real SBCL worker subprocesses, so they skip
 ;;; cleanly (parachute skip, not fail) when the environment cannot spawn one —
 ;;; no sbcl on PATH, or no Quicklisp setup.lisp for the child to load dsmr-mcp.
+;;;
+;;; Assumption: the guard checks that sbcl and a Quicklisp setup.lisp exist; it
+;;; does NOT verify that dsmr-mcp itself is resolvable in the child's source
+;;; registry. On a runner with Quicklisp present but the project not on the
+;;; child's CL_SOURCE_REGISTRY, the guard passes and the child fails to build,
+;;; which surfaces as a test failure rather than the intended clean skip. A
+;;; constrained runner must therefore make dsmr-mcp resolvable for the child.
 ;;; ---------------------------------------------------------------------------
 
 (defun %sbcl-path ()
@@ -94,7 +101,7 @@ environment cannot spawn a worker subprocess."
 ;;; Benign eval round-trip
 ;;; ---------------------------------------------------------------------------
 
-(define-test criterion-1-benign-eval-round-trip
+(define-test benign-eval-round-trip
   "A benign eval of (+ 40 2) round-trips end-to-end through the pool → worker
 → result path. The response has no error_context and the content field
 contains the printed value 42."
@@ -119,7 +126,7 @@ contains the printed value 42."
 ;;; Error context parity with the attached path
 ;;; ---------------------------------------------------------------------------
 
-(define-test d-17-error-context-parity
+(define-test error-context-parity
   "hermetic repl-eval of (error \"boom\") returns the same error_context
 envelope shape as the attached path: non-empty condition_type, message, restarts
 (simple-vector), and frames (simple-vector). Proves the build-wrapping-form
@@ -160,7 +167,7 @@ whether the eval runs locally or in a hermetic worker."
 ;;; Soft timeout — structured TIMEOUT result; worker survives
 ;;; ---------------------------------------------------------------------------
 
-(define-test safety-05-timeout-and-worker-survival
+(define-test timeout-and-worker-survival
   "Eval of (sleep 200) with timeout_seconds=1 returns a structured TIMEOUT
 response naming SB-EXT:TIMEOUT in condition_type. A subsequent eval on the
 SAME worker (same session) succeeds — the worker survived the timeout."
@@ -178,33 +185,46 @@ SAME worker (same session) succeeds — the worker survived the timeout."
            ;; Send a sleep that will be interrupted by the soft timeout.
            (let* ((sleep-params (make-ht "code" "(sleep 200)"
                                          "timeout_seconds" 1))
-                  (timeout-resp (pool-rpc-with-hard-kill
-                                 worker "worker/eval" sleep-params
-                                 :soft-timeout 1
-                                 :grace 5))
-                  (ec (gethash "error_context" timeout-resp)))
+                  ;; Outer deadline backstops the backstop: if both the in-worker
+                  ;; soft timeout AND the parent hard-kill regress, the (sleep 200)
+                  ;; would otherwise hang the run for 200 s. A 30 s bound is far
+                  ;; above the 1 s soft + 5 s grace path (so it never flakes) and
+                  ;; far below 200 s, turning a regression into a prompt failure.
+                  ;; On the timeout path it records the failure and leaves
+                  ;; timeout-resp NIL so the survival assertions are skipped.
+                  (timeout-resp (handler-case
+                                    (sb-ext:with-timeout 30
+                                      (pool-rpc-with-hard-kill
+                                       worker "worker/eval" sleep-params
+                                       :soft-timeout 1
+                                       :grace 5))
+                                  (sb-ext:timeout ()
+                                    (fail "soft timeout + hard-kill backstop both failed to fire within 30 s")
+                                    nil)))
+                  (ec (and timeout-resp (gethash "error_context" timeout-resp))))
              ;; Must have an error_context naming SB-EXT:TIMEOUT.
              (true ec)
-             (is string= "SB-EXT:TIMEOUT" (gethash "condition_type" ec))
-             ;; Worker must still be alive (pid unchanged).
-             (let ((pid-before (worker-pid worker)))
-               (true (integerp pid-before))
-               (true (plusp pid-before))
-               ;; Subsequent eval must succeed — proves the worker survived.
-               (let* ((ok-params (make-ht "code" "(+ 1 2)"))
-                      (ok-resp (worker-rpc worker "worker/eval" ok-params)))
-                 (false (gethash "error_context" ok-resp))
-                 (let ((content (gethash "content" ok-resp)))
-                   (true content)
-                   (let ((text (gethash "text" (aref content 0))))
-                     (true (search "3" text))))))))
+             (when ec
+               (is string= "SB-EXT:TIMEOUT" (gethash "condition_type" ec))
+               ;; Worker must still be alive (pid unchanged).
+               (let ((pid-before (worker-pid worker)))
+                 (true (integerp pid-before))
+                 (true (plusp pid-before))
+                 ;; Subsequent eval must succeed — proves the worker survived.
+                 (let* ((ok-params (make-ht "code" "(+ 1 2)"))
+                        (ok-resp (worker-rpc worker "worker/eval" ok-params)))
+                   (false (gethash "error_context" ok-resp))
+                   (let ((content (gethash "content" ok-resp)))
+                     (true content)
+                     (let ((text (gethash "text" (aref content 0))))
+                       (true (search "3" text)))))))))
       (ignore-errors (shutdown-pool)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Auto fallback — :auto + no Slynk → :hermetic + run.auto-mode warn
 ;;; ---------------------------------------------------------------------------
 
-(define-test criterion-4-auto-fallback-logs-warn-and-resolves-hermetic
+(define-test auto-fallback-logs-warn-and-resolves-hermetic
   "With mode :auto and no reachable Slynk listener (slynk-attach nil),
 resolve-mode resolves :hermetic and emits a run.auto-mode :warn line on stderr.
 This is the logged fallback that distinguishes :auto from a silent alias of :attached.

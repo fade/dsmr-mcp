@@ -10,7 +10,7 @@
 #
 #   setup    Quicklisp / ASDF bootstrap load (require :asdf + setup.lisp)
 #   compile  asdf:load-system "dsmr-mcp"        (deps + system compiled+loaded)
-#   leaves   asdf:load-system "dsmr-mcp/tests"  (the 65 test leaves loaded)
+#   leaves   asdf:load-system "dsmr-mcp/tests"  (all test leaves loaded)
 #   exec     asdf:test-system "dsmr-mcp/tests"  (assertions actually run)
 #
 # Each stage is timed by a separate fresh sbcl process so its cost is isolated;
@@ -62,7 +62,10 @@ for arg in "$@"; do
   case "$arg" in
     --warm) WARM=1 ;;
     --help|-h)
-      sed -n '4,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+      # Print the whole leading comment banner (through the Env block) to
+      # stderr, stripping the leading "# " — not just up to the first blank
+      # comment line, which would cut off the Usage/Env section.
+      sed -n '4,44{s/^# \{0,1\}//;p}' "$0" >&2
       exit 0
       ;;
     *)
@@ -103,6 +106,13 @@ if [ "$WARM" -eq 1 ]; then
   CACHE_OWNED=0
   if [ ! -d "$CACHE_DIR" ]; then
     echo "WARN: --warm but $CACHE_DIR does not exist; the first run will be cold." >&2
+    mkdir -p "$CACHE_DIR"
+  elif [ ! -f "$CACHE_DIR/.complete" ]; then
+    # A prior --warm run left no completion sentinel, so its cache is partial
+    # (a stage crashed before exec finished). Reusing it would silently load a
+    # fragmentary fasl set. Start honestly cold.
+    echo "WARN: $CACHE_DIR is incomplete (a prior run did not finish); clearing it for a cold run." >&2
+    rm -rf "$CACHE_DIR"
     mkdir -p "$CACHE_DIR"
   fi
 else
@@ -180,7 +190,7 @@ run_stage setup
 run_stage compile \
   --eval '(asdf:load-system "dsmr-mcp")'
 
-# leaves: load the test umbrella (all 65 test leaves compiled and loaded).
+# leaves: load the test umbrella (all test leaves compiled and loaded).
 run_stage leaves \
   --eval '(asdf:load-system "dsmr-mcp/tests")'
 
@@ -189,5 +199,10 @@ run_stage leaves \
 run_stage exec \
   --eval '(asdf:load-system "dsmr-mcp/tests")' \
   --eval '(asdf:test-system "dsmr-mcp/tests")'
+
+# All stages succeeded (set -e would have aborted otherwise): mark the cache
+# complete so a later --warm run can trust it is fully populated rather than a
+# fragment left by a crashed stage.
+: > "$CACHE_DIR/.complete"
 
 echo "[measure] done." >&2

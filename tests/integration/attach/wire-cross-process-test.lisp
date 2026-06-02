@@ -62,6 +62,13 @@
 ;;; alexandria, so it skips cleanly (parachute skip, not fail) when the
 ;;; environment cannot spawn one — no sbcl on PATH, or no Quicklisp setup.lisp
 ;;; for the child to quickload from.
+;;;
+;;; Assumption: the guard checks that sbcl and a Quicklisp setup.lisp exist; it
+;;; does NOT verify that slynk + alexandria are actually quickloadable in the
+;;; child (e.g. an offline runner with no cached dist). If the child cannot
+;;; bring slynk up, with-foreign-slynk-image surfaces the child's captured log
+;;; as an error rather than a skip — a constrained runner must keep those two
+;;; systems resolvable for the child.
 ;;; ---------------------------------------------------------------------------
 
 (defun %sbcl-path ()
@@ -85,8 +92,12 @@
 
 (defun %free-tcp-port ()
   "Bind an OS-assigned loopback port, read it back, release it, return it.
-There is a small race between releasing the socket and the child rebinding it,
-but the connect loop retries, so a transient EADDRINUSE just costs a retry."
+There is a small race between releasing the socket and the child rebinding it.
+The connect loop covers only the benign case where the child loses the rebind
+race and retries (a transient EADDRINUSE just costs a retry); it does NOT cover
+the case where an unrelated process grabs the just-released port first — then
+the test connects to the wrong server, and the (is = 3 (slime-eval '(+ 1 2)))
+sanity check is the only thing that catches the mismatch."
   (let ((listener (usocket:socket-listen "127.0.0.1" 0 :reuse-address t)))
     (unwind-protect (usocket:get-local-port listener)
       (usocket:socket-close listener))))

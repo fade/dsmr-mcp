@@ -50,9 +50,10 @@ fast.
 
 * Pinned SBCL build, and why it matters
 
-CI pins the SBCL build to the upstream prebuilt binary (=sbcl-bin=). That binary
-has one fixed garbage-collector flavor, so every CI run compiles and loads fasls
-under the same flavor and the cache is always coherent.
+CI pins the SBCL build to the upstream prebuilt binary (=sbcl-bin/2.5.5=). That
+binary has one fixed garbage-collector flavor — the pinned =sbcl-bin= ships the
+=MARK-REGION= collector — so every CI run compiles and loads fasls under the same
+flavor and the cache is always coherent.
 
 This matters because SBCL keys its compiled-fasl cache on the implementation
 *version string* but not on the GC flavor. Two SBCLs that share a version string
@@ -87,6 +88,10 @@ it recompile, or point =XDG_CACHE_HOME= at a fresh directory for that run.
 =dsmr.core=) are build artifacts — they are git-ignored and never committed.
 
 * Measured numbers
+
+These tables are an illustrative snapshot, not an invariant: the wall-clock
+figures and pass counts drift as leaves are added and the toolchain moves, so
+read them as "what one run looked like on the build below," not as a contract.
 
 Recorded on the development box (=sbcl 2.6.5=, isolated =.ci-cache=) and on a
 GitHub =ubuntu-latest= CI runner (pinned upstream =sbcl-bin=, ASDF 3.3.7).

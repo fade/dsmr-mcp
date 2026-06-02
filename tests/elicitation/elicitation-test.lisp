@@ -2,8 +2,8 @@
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
 ;;;; Elicitation capability negotiation, graceful degradation, and the
-;;;; server->client request/response round-trip (ENVRC-05..07 and the T-13-01
-;;;; spoof/replay guard).
+;;;; server->client request/response round-trip, including the id-matching
+;;;; spoof/replay guard.
 ;;;;
 ;;;;   - capability-set-when-declared: an initialize carrying
 ;;;;     capabilities.elicitation {} sets session-elicitation-p true.
@@ -71,7 +71,7 @@ pending entry."
           do (sleep 0.01))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Capability negotiation (ENVRC-05 / ENVRC-06)
+;;; Capability negotiation
 ;;; ---------------------------------------------------------------------------
 
 (define-test capability-set-when-declared
@@ -100,7 +100,7 @@ normal result (no error)."
              "initialize response should carry no error object"))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Response routing / graceful degradation (ENVRC-07)
+;;; Response routing / graceful degradation
 ;;; ---------------------------------------------------------------------------
 
 (define-test response-routes-not-errors
@@ -113,7 +113,7 @@ normal result (no error)."
         "an elicitation response should produce no wire response")))
 
 ;;; ---------------------------------------------------------------------------
-;;; Round-trip (T-13-01 plus the accept/timeout paths)
+;;; Round-trip (the accept and timeout paths)
 ;;; ---------------------------------------------------------------------------
 
 (define-test round-trip-accept
@@ -147,7 +147,7 @@ matching-id accept response is routed to the session."
 
 (define-test mismatched-id-ignored
   "A non-matching response id leaves the worker blocked until its bounded
-timeout, which returns :timeout (T-13-01 spoof/replay guard)."
+timeout, which returns :timeout — the id-matching spoof/replay guard."
   (let* ((s   (make-session :id "mismatch"))
          (out (make-string-output-stream))
          (result-box (list nil))
