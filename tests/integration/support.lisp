@@ -40,9 +40,11 @@
            #:quicklisp-setup-path
            #:worker-child-buildable
            #:foreign-slynk-child-buildable
+           #:mcp-server-child-buildable
            #:reset-build-probes
            #:with-worker-child-or-skip
-           #:with-foreign-slynk-child-or-skip))
+           #:with-foreign-slynk-child-or-skip
+           #:with-mcp-server-child-or-skip))
 
 (in-package #:dsmr-mcp/tests/integration/support)
 
@@ -163,6 +165,27 @@ child needs: load Quicklisp if present, then quickload slynk + alexandria. Exits
               "(error (e) (format *error-output* \"BUILD-PROBE-FAILED: ~A~%\" e) "
               "(sb-ext:exit :code 7)))")))
 
+(defun %mcp-server-build-eval-program ()
+  "The --eval program a build probe runs to mirror what a spawned full stdio
+server child does up to (but not including) starting the transport: load
+Quicklisp so dependencies resolve to their dist-pinned versions, register the
+project directory plus :inherit-configuration, then load the whole dsmr-mcp
+system. Exits 0 on success, 7 on any build/resolution error."
+  (let ((project (uiop:truename* (asdf:system-source-directory "dsmr-mcp")))
+        (ql (quicklisp-setup-path)))
+    (append
+     (when ql (list "--load" ql))
+     (list "--eval"
+           (concatenate 'string
+             "(handler-case (progn "
+             "(asdf:initialize-source-registry '(:source-registry"
+             (if project (format nil " (:directory ~S)" (namestring project)) "")
+             " :inherit-configuration)) "
+             "(asdf:load-system :dsmr-mcp) "
+             "(sb-ext:exit :code 0)) "
+             "(error (e) (format *error-output* \"BUILD-PROBE-FAILED: ~A~%\" e) "
+             "(sb-ext:exit :code 7)))")))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Memoized verdicts
 ;;; ---------------------------------------------------------------------------
@@ -171,12 +194,15 @@ child needs: load Quicklisp if present, then quickload slynk + alexandria. Exits
   "Memoized worker-child build verdict: :UNKNOWN, :OK, or (:UNAVAILABLE . detail).")
 (defvar *foreign-slynk-child-build* :unknown
   "Memoized foreign-slynk-child build verdict, same shape as *WORKER-CHILD-BUILD*.")
+(defvar *mcp-server-child-build* :unknown
+  "Memoized full-dsmr-mcp-server-child build verdict, same shape as *WORKER-CHILD-BUILD*.")
 
 (defun reset-build-probes ()
   "Forget memoized build verdicts so the next consult re-probes. Mainly for
 interactive re-runs after fixing a registry."
   (setf *worker-child-build* :unknown
-        *foreign-slynk-child-build* :unknown)
+        *foreign-slynk-child-build* :unknown
+        *mcp-server-child-build* :unknown)
   (values))
 
 (defun %verdict (place-symbol program-fn)
@@ -203,6 +229,12 @@ hermetic worker system in this environment."
 alexandria in this environment."
   (%verdict '*foreign-slynk-child-build* #'%foreign-slynk-build-eval-program))
 
+(defun mcp-server-child-buildable ()
+  "Memoized (values OK-P DETAIL): true iff a fresh child can resolve and load the
+full dsmr-mcp system in this environment — the precondition for spawning a real
+stdio server subprocess."
+  (%verdict '*mcp-server-child-build* #'%mcp-server-build-eval-program))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Guard macros — run BODY only on a buildable environment, else SKIP it
 ;;; ---------------------------------------------------------------------------
@@ -228,3 +260,14 @@ child (port race, dropped wire) is a genuine failure and is left to fail."
        (if ,ok
            (progn ,@body)
            (skip ("foreign slynk child could not build in this environment: ~A" ,detail))))))
+
+(defmacro with-mcp-server-child-or-skip (&body body)
+  "Evaluate BODY only when a fresh child can build the full dsmr-mcp system here;
+otherwise parachute:skip the enclosing test WITHOUT evaluating BODY. Skips only on
+a build/resolution failure — once the server child is known buildable, a spawned
+server that misbehaves is a genuine failure and is left to fail."
+  (let ((ok (gensym "OK")) (detail (gensym "DETAIL")))
+    `(multiple-value-bind (,ok ,detail) (mcp-server-child-buildable)
+       (if ,ok
+           (progn ,@body)
+           (skip ("dsmr-mcp server child could not build in this environment: ~A" ,detail))))))

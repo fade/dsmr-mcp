@@ -15,28 +15,15 @@
   (:import-from #:dsmr-mcp/tests/support/json-asserts
                 #:gethash*)
   (:import-from #:dsmr-mcp/tests/integration/support
-                #:quicklisp-setup-path))
+                #:sbcl-path
+                #:quicklisp-setup-path
+                #:with-mcp-server-child-or-skip))
 
 (in-package #:dsmr-mcp/tests/integration/transport/stdio-integration-test)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Helpers
 ;;; ---------------------------------------------------------------------------
-
-(defun %sbcl-path ()
-  "Return the path string to the sbcl binary, or NIL when not on PATH.
-Uses 'which sbcl' first; falls back to checking common fixed locations."
-  (or (ignore-errors
-        (let ((result (string-trim
-                       '(#\Newline #\Return #\Space)
-                       (uiop:run-program '("which" "sbcl")
-                                         :output :string
-                                         :ignore-error-status t))))
-          (and (plusp (length result)) result)))
-      (find-if #'probe-file
-               (list "/usr/local/bin/sbcl"
-                     "/usr/bin/sbcl"
-                     "/opt/local/bin/sbcl"))))
 
 (defun %child-source-registry-form ()
   "Return a single --eval form (as a string) installing the child's ASDF source
@@ -69,7 +56,7 @@ dist-pinned versions. Diagnostic streams are routed to stderr for the child's
 whole life, so the only thing that reaches stdout is the JSON-RPC traffic."
   (let* ((ql (quicklisp-setup-path))
          (args (append
-                (list (%sbcl-path)
+                (list (sbcl-path)
                       "--noinform"        ; suppress "This is SBCL 2.x.y..." banner
                       "--non-interactive"
                       "--no-userinit")    ; do not run the user's sbclrc
@@ -113,73 +100,67 @@ whole life, so the only thing that reaches stdout is the JSON-RPC traffic."
 (define-test initialize-over-real-pipes
   "A spawned SBCL child answers an initialize line on its stdout with
 a structurally correct JSON-RPC response containing protocolVersion."
-  ;; Skip cleanly when sbcl is not on PATH.
-  (unless (%sbcl-path)
-    (skip "sbcl not on PATH — skipping spawned-subprocess test"))
+  (with-mcp-server-child-or-skip
+    (let ((proc (%spawn-dsmr-mcp)))
+      (unwind-protect
+           (let ((child-in  (uiop:process-info-input  proc))
+                 (child-out (uiop:process-info-output proc)))
+             ;; Send the initialize line.
+             (write-line (%init-line) child-in)
+             (force-output child-in)
 
-  (let ((proc (%spawn-dsmr-mcp)))
-    (unwind-protect
-         (let ((child-in  (uiop:process-info-input  proc))
-               (child-out (uiop:process-info-output proc)))
-           ;; Send the initialize line.
-           (write-line (%init-line) child-in)
-           (force-output child-in)
+             ;; Read one response line from child stdout.
+             (let* ((response (read-line child-out nil nil))
+                    (parsed   (and response (jzon:parse response))))
+               ;; Assert protocolVersion is present in the result.
+               (true response)
+               (true parsed)
+               (is equal "2.0" (gethash "jsonrpc" parsed))
+               (is = 1 (gethash "id" parsed))
+               (let ((ver (gethash* parsed "result" "protocolVersion")))
+                 (true (stringp ver))
+                 (true (> (length ver) 0))))
 
-           ;; Read one response line from child stdout.
-           (let* ((response (read-line child-out nil nil))
-                  (parsed   (and response (jzon:parse response))))
-             ;; Assert protocolVersion is present in the result.
-             (true response)
-             (true parsed)
-             (is equal "2.0" (gethash "jsonrpc" parsed))
-             (is = 1 (gethash "id" parsed))
-             (let ((ver (gethash* parsed "result" "protocolVersion")))
-               (true (stringp ver))
-               (true (> (length ver) 0))))
+             ;; Close input to trigger EOF; child should exit.
+             (close child-in)
+             (uiop:wait-process proc))
 
-           ;; Close input to trigger EOF; child should exit.
-           (close child-in)
-           (uiop:wait-process proc))
-
-      ;; Ensure the process is reaped even if assertions fail.
-      (ignore-errors
-        (close (uiop:process-info-input proc)))
-      (ignore-errors
-        (uiop:terminate-process proc))
-      (ignore-errors
-        (uiop:wait-process proc)))))
+        ;; Ensure the process is reaped even if assertions fail.
+        (ignore-errors
+          (close (uiop:process-info-input proc)))
+        (ignore-errors
+          (uiop:terminate-process proc))
+        (ignore-errors
+          (uiop:wait-process proc))))))
 
 (define-test stdio-start-appears-in-child-stderr
   "Child stderr contains a stdio.start log event, proving the transport
 logged its start."
-  ;; Skip cleanly when sbcl is not on PATH.
-  (unless (%sbcl-path)
-    (skip "sbcl not on PATH — skipping spawned-subprocess test"))
+  (with-mcp-server-child-or-skip
+    (let ((proc (%spawn-dsmr-mcp)))
+      (unwind-protect
+           (let ((child-in  (uiop:process-info-input  proc))
+                 (child-out (uiop:process-info-output proc)))
+             ;; Send and receive one initialize exchange so the server starts.
+             (write-line (%init-line) child-in)
+             (force-output child-in)
+             ;; Read the response (ignore content — just drain so the child
+             ;; has had a chance to write its log lines).
+             (read-line child-out nil nil)
+             ;; Close to trigger EOF, wait for child to exit.
+             (close child-in)
+             (uiop:wait-process proc)
+             ;; Drain stderr into a string (the stream is now at EOF
+             ;; because the child has exited and closed its end).
+             (let* ((err-stream (uiop:process-info-error-output proc))
+                    (stderr     (with-output-to-string (s)
+                                  (loop for line = (read-line err-stream nil nil)
+                                        while line
+                                        do (write-line line s)))))
+               (true (stringp stderr))
+               (true (search "stdio.start" stderr))))
 
-  (let ((proc (%spawn-dsmr-mcp)))
-    (unwind-protect
-         (let ((child-in  (uiop:process-info-input  proc))
-               (child-out (uiop:process-info-output proc)))
-           ;; Send and receive one initialize exchange so the server starts.
-           (write-line (%init-line) child-in)
-           (force-output child-in)
-           ;; Read the response (ignore content — just drain so the child
-           ;; has had a chance to write its log lines).
-           (read-line child-out nil nil)
-           ;; Close to trigger EOF, wait for child to exit.
-           (close child-in)
-           (uiop:wait-process proc)
-           ;; Drain stderr into a string (the stream is now at EOF
-           ;; because the child has exited and closed its end).
-           (let* ((err-stream (uiop:process-info-error-output proc))
-                  (stderr     (with-output-to-string (s)
-                                (loop for line = (read-line err-stream nil nil)
-                                      while line
-                                      do (write-line line s)))))
-             (true (stringp stderr))
-             (true (search "stdio.start" stderr))))
-
-      ;; Ensure process cleanup.
-      (ignore-errors (close (uiop:process-info-input proc)))
-      (ignore-errors (uiop:terminate-process proc))
-      (ignore-errors (uiop:wait-process proc)))))
+        ;; Ensure process cleanup.
+        (ignore-errors (close (uiop:process-info-input proc)))
+        (ignore-errors (uiop:terminate-process proc))
+        (ignore-errors (uiop:wait-process proc))))))
