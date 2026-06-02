@@ -32,39 +32,16 @@
   (:import-from #:dsmr-mcp/src/install/config
                 #:canonical-server-entry)
   (:import-from #:dsmr-mcp/src/envrc-template
-                #:read-envrc-template))
+                #:read-envrc-template)
+  (:import-from #:dsmr-mcp/tests/integration/support
+                #:sbcl-path
+                #:with-mcp-server-child-or-skip))
 
 (in-package #:dsmr-mcp/tests/integration/stdio-elicitation-test)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Environment probes / spawn
 ;;; ---------------------------------------------------------------------------
-
-(defun %sbcl-path ()
-  "Return the path string to the sbcl binary, or NIL when not on PATH."
-  (or (ignore-errors
-        (let ((result (string-trim
-                       '(#\Newline #\Return #\Space)
-                       (uiop:run-program '("which" "sbcl")
-                                         :output :string
-                                         :ignore-error-status t))))
-          (and (plusp (length result)) result)))
-      (find-if #'probe-file
-               (list "/usr/local/bin/sbcl"
-                     "/usr/bin/sbcl"
-                     "/opt/local/bin/sbcl"))))
-
-(defun %quicklisp-setup-present-p ()
-  "True when Quicklisp's setup.lisp exists in the home directory.
-The generated launcher resolves its dependencies through it, so without it
-a spawned server cannot load dsmr-mcp."
-  (and (probe-file (merge-pathnames "quicklisp/setup.lisp"
-                                    (user-homedir-pathname)))
-       t))
-
-(defun %spawnable-p ()
-  "True when this environment can spawn a real dsmr-mcp server subprocess."
-  (and (%sbcl-path) (%quicklisp-setup-present-p)))
 
 (defun %launch-args ()
   "Return the SBCL args list the installer would generate for dsmr-mcp.
@@ -82,7 +59,7 @@ environment to that path so run seeds the stdio session's root at launch
 cwd is not relied upon -- it is harder to control across spawn backends, and the
 env var is exactly the launch seam the operator's .envrc itself exports."
   (apply #'uiop:launch-program
-         (cons (%sbcl-path) (%launch-args))
+         (cons (sbcl-path) (%launch-args))
          :input        :stream
          :output       :stream
          :error-output :stream
@@ -345,46 +322,43 @@ NO fs-set-project-root sent, the FIRST qualifying tools/call fires exactly ONE
 elicitation/create; on accept the .envrc is created byte-for-byte equal to the
 template.  This proves run seeds the stdio session root at launch (the prompt
 fires without any prior re-root)."
-  (unless (%spawnable-p)
-    (skip "cannot spawn a server subprocess (sbcl / quicklisp setup.lisp absent)"))
-  (%with-temp-root (root)
-    (let* ((objs (%run-launch-seeded-scenario root :elicitation t
-                                                   :response-action "accept"))
-           (prompts (remove-if-not #'%elicitation-create-p objs)))
-      (is = 1 (length prompts)
-          "exactly one elicitation/create on the first qualifying tools/call")
-      (when (= 1 (length prompts))
-        (is = 1 (gethash "id" (first prompts)) "first prompt id is 1"))
-      (let ((envrc (merge-pathnames ".envrc" root)))
-        (true (probe-file envrc) ".envrc written on accept")
-        (when (probe-file envrc)
-          (is string= (read-envrc-template) (uiop:read-file-string envrc)
-              ".envrc is byte-for-byte the template"))))))
+  (with-mcp-server-child-or-skip
+    (%with-temp-root (root)
+      (let* ((objs (%run-launch-seeded-scenario root :elicitation t
+                                                     :response-action "accept"))
+             (prompts (remove-if-not #'%elicitation-create-p objs)))
+        (is = 1 (length prompts)
+            "exactly one elicitation/create on the first qualifying tools/call")
+        (when (= 1 (length prompts))
+          (is = 1 (gethash "id" (first prompts)) "first prompt id is 1"))
+        (let ((envrc (merge-pathnames ".envrc" root)))
+          (true (probe-file envrc) ".envrc written on accept")
+          (when (probe-file envrc)
+            (is string= (read-envrc-template) (uiop:read-file-string envrc)
+                ".envrc is byte-for-byte the template")))))))
 
 (define-test stdio-elicitation-accept-writes-envrc
   "Accept + once-per-session: exactly ONE elicitation/create (id 1) despite two
 tool triggers; .envrc created byte-for-byte equal to the template; the second
 trigger produces no further prompt."
-  (unless (%spawnable-p)
-    (skip "cannot spawn a server subprocess (sbcl / quicklisp setup.lisp absent)"))
-  (%with-temp-root (root)
-    (let* ((objs (%run-scenario root :elicitation t :response-action "accept"))
-           (prompts (remove-if-not #'%elicitation-create-p objs)))
-      (is = 1 (length prompts) "exactly one elicitation/create across two triggers")
-      (when (= 1 (length prompts))
-        (is = 1 (gethash "id" (first prompts)) "first prompt id is 1"))
-      (let ((envrc (merge-pathnames ".envrc" root)))
-        (true (probe-file envrc) ".envrc written on accept")
-        (when (probe-file envrc)
-          (is string= (read-envrc-template) (uiop:read-file-string envrc)
-              ".envrc is byte-for-byte the template"))))))
+  (with-mcp-server-child-or-skip
+    (%with-temp-root (root)
+      (let* ((objs (%run-scenario root :elicitation t :response-action "accept"))
+             (prompts (remove-if-not #'%elicitation-create-p objs)))
+        (is = 1 (length prompts) "exactly one elicitation/create across two triggers")
+        (when (= 1 (length prompts))
+          (is = 1 (gethash "id" (first prompts)) "first prompt id is 1"))
+        (let ((envrc (merge-pathnames ".envrc" root)))
+          (true (probe-file envrc) ".envrc written on accept")
+          (when (probe-file envrc)
+            (is string= (read-envrc-template) (uiop:read-file-string envrc)
+                ".envrc is byte-for-byte the template")))))))
 
 (define-test stdio-elicitation-no-clobber
   "A pre-existing COMPLETE .envrc (one that already exports DSMR_SLYNK_ATTACH)
 yields ZERO elicitation/create and is left unchanged: neither the create nor the
 update trigger fires."
-  (unless (%spawnable-p)
-    (skip "cannot spawn a server subprocess (sbcl / quicklisp setup.lisp absent)"))
+  (with-mcp-server-child-or-skip
   (%with-temp-root (root :envrc-content "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 ")
     (let ((objs (%run-scenario root :elicitation t :response-action nil)))
@@ -393,14 +367,13 @@ update trigger fires."
       (is string= "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 "
           (uiop:read-file-string (merge-pathnames ".envrc" root))
-          "pre-existing complete .envrc content unchanged"))))
+          "pre-existing complete .envrc content unchanged")))))
 
 (define-test stdio-elicitation-update-appends-block
   "An existing .envrc that lacks the dsmr-mcp setup fires exactly ONE
 elicitation/create; on accept the dsmr-mcp managed block is APPENDED while the
 user's original lines are preserved (append, not clobber)."
-  (unless (%spawnable-p)
-    (skip "cannot spawn a server subprocess (sbcl / quicklisp setup.lisp absent)"))
+  (with-mcp-server-child-or-skip
   (%with-temp-root (root :envrc-content "export FOO=bar
 ")
     (let* ((objs (%run-scenario root :elicitation t :response-action "accept"))
@@ -411,34 +384,32 @@ user's original lines are preserved (append, not clobber)."
         (true (search "FOO=bar" text)
               "the user's original line is preserved")
         (true (search "DSMR_SLYNK_ATTACH" text)
-              "the dsmr-mcp managed block was appended")))))
+              "the dsmr-mcp managed block was appended"))))))
 
 (define-test stdio-elicitation-decline-writes-nothing
   "Decline: exactly one elicitation/create; no .envrc written afterward."
-  (unless (%spawnable-p)
-    (skip "cannot spawn a server subprocess (sbcl / quicklisp setup.lisp absent)"))
-  (%with-temp-root (root)
-    (let ((objs (%run-scenario root :elicitation t :response-action "decline")))
-      (is = 1 (%count-elicitation-creates objs)
-          "exactly one elicitation/create on decline")
-      (false (probe-file (merge-pathnames ".envrc" root))
-             "no .envrc written on decline"))))
+  (with-mcp-server-child-or-skip
+    (%with-temp-root (root)
+      (let ((objs (%run-scenario root :elicitation t :response-action "decline")))
+        (is = 1 (%count-elicitation-creates objs)
+            "exactly one elicitation/create on decline")
+        (false (probe-file (merge-pathnames ".envrc" root))
+               "no .envrc written on decline")))))
 
 (define-test stdio-elicitation-no-capability
   "Without the elicitation capability: zero elicitation/create, no error, the
 tool is still answered."
-  (unless (%spawnable-p)
-    (skip "cannot spawn a server subprocess (sbcl / quicklisp setup.lisp absent)"))
-  (%with-temp-root (root)
-    (let ((objs (%run-scenario root :elicitation nil :response-action nil)))
-      (is = 0 (%count-elicitation-creates objs)
-          "no prompt without the elicitation capability")
-      (false (probe-file (merge-pathnames ".envrc" root))
-             "no .envrc written without capability")
-      ;; The trigger tools/call still received a JSON-RPC response (id 3 or 4),
-      ;; proving the server stayed alive and answered.
-      (true (some (lambda (o)
-                    (and (hash-table-p o)
-                         (member (gethash "id" o) '(3 4) :test #'eql)))
-                  objs)
-            "trigger tool call was answered"))))
+  (with-mcp-server-child-or-skip
+    (%with-temp-root (root)
+      (let ((objs (%run-scenario root :elicitation nil :response-action nil)))
+        (is = 0 (%count-elicitation-creates objs)
+            "no prompt without the elicitation capability")
+        (false (probe-file (merge-pathnames ".envrc" root))
+               "no .envrc written without capability")
+        ;; The trigger tools/call still received a JSON-RPC response (id 3 or 4),
+        ;; proving the server stayed alive and answered.
+        (true (some (lambda (o)
+                      (and (hash-table-p o)
+                           (member (gethash "id" o) '(3 4) :test #'eql)))
+                    objs)
+              "trigger tool call was answered")))))

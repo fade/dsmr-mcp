@@ -53,38 +53,20 @@
   (:import-from #:slynk-client
                 #:slime-connect
                 #:slime-close
-                #:slime-eval))
+                #:slime-eval)
+  (:import-from #:dsmr-mcp/tests/integration/support
+                #:with-foreign-slynk-child-or-skip))
 
 (in-package #:dsmr-mcp/tests/integration/attach/wire-cross-process-test)
 
 ;;; ---------------------------------------------------------------------------
-;;; Spawn guard: this test forks a foreign SBCL that quickloads slynk +
-;;; alexandria, so it skips cleanly (parachute skip, not fail) when the
-;;; environment cannot spawn one — no sbcl on PATH, or no Quicklisp setup.lisp
-;;; for the child to quickload from.
-;;;
-;;; Assumption: the guard checks that sbcl and a Quicklisp setup.lisp exist; it
-;;; does NOT verify that slynk + alexandria are actually quickloadable in the
-;;; child (e.g. an offline runner with no cached dist). If the child cannot
-;;; bring slynk up, with-foreign-slynk-image surfaces the child's captured log
-;;; as an error rather than a skip — a constrained runner must keep those two
-;;; systems resolvable for the child.
+;;; This test forks a foreign SBCL that quickloads slynk + alexandria, so it
+;;; wraps its body in WITH-FOREIGN-SLYNK-CHILD-OR-SKIP: it runs only when a fresh
+;;; child can actually quickload those systems, and skips cleanly otherwise (see
+;;; tests/integration/support.lisp). Once that guard passes, an unreachable child
+;;; (a lost port-rebind race, a dropped wire) is a genuine failure, not a skip —
+;;; with-foreign-slynk-image surfaces it as an error with the child's log tail.
 ;;; ---------------------------------------------------------------------------
-
-(defun %sbcl-path ()
-  (or (ignore-errors
-        (let ((r (string-trim '(#\Newline #\Return #\Space)
-                              (uiop:run-program '("which" "sbcl")
-                                                :output :string
-                                                :ignore-error-status t))))
-          (and (plusp (length r)) r)))
-      (find-if #'probe-file '("/usr/local/bin/sbcl" "/usr/bin/sbcl" "/opt/local/bin/sbcl"))))
-
-(defun %quicklisp-setup-present-p ()
-  (and (probe-file (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))) t))
-
-(defun %spawnable-p ()
-  (and (%sbcl-path) (%quicklisp-setup-present-p)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Foreign-image launcher
@@ -212,47 +194,46 @@ tool-handle methods pass to their %dispatch-attach-* functions."
 
 (define-test wire-survives-foreign-reader
   "Every attached code-intel verb round-trips against a foreign Slynk image."
-  (unless (%spawnable-p)
-    (skip "cannot spawn a foreign sbcl (sbcl / quicklisp setup.lisp absent)"))
-  (with-foreign-slynk-image (conn)
-    ;; Sanity: the foreign image evaluates a trivial form (proves the link).
-    (is = 3 (slime-eval '(+ 1 2) conn))
-    (is equal "ALEXANDRIA"
-        (slime-eval '(package-name (symbol-package 'alexandria:flatten)) conn))
+  (with-foreign-slynk-child-or-skip
+    (with-foreign-slynk-image (conn)
+      ;; Sanity: the foreign image evaluates a trivial form (proves the link).
+      (is = 3 (slime-eval '(+ 1 2) conn))
+      (is equal "ALEXANDRIA"
+          (slime-eval '(package-name (symbol-package 'alexandria:flatten)) conn))
 
-    ;; repl-eval: a base-string-producing expression must survive the round-trip.
-    (let* ((tool (%attach-repl-tool "xproc-repl" conn))
-           (res  (%dispatch-attach tool (make-ht "code" "(format nil \"~A\" (list 1 2 3))"))))
-      (false (%network-error-p res) "repl-eval dropped the wire (NETWORK_ERROR)")
-      (false (gethash "isError" res) "repl-eval returned isError")
-      (true  (search "(1 2 3)" (%content-text res))
-             "repl-eval lost the base-string value across the wire"))
+      ;; repl-eval: a base-string-producing expression must survive the round-trip.
+      (let* ((tool (%attach-repl-tool "xproc-repl" conn))
+             (res  (%dispatch-attach tool (make-ht "code" "(format nil \"~A\" (list 1 2 3))"))))
+        (false (%network-error-p res) "repl-eval dropped the wire (NETWORK_ERROR)")
+        (false (gethash "isError" res) "repl-eval returned isError")
+        (true  (search "(1 2 3)" (%content-text res))
+               "repl-eval lost the base-string value across the wire"))
 
-    ;; code-find: locate a foreign library symbol with a physical source file.
-    (let* ((tool (%attach-repl-tool "xproc-find" conn))
-           (res  (%dispatch-attach-code-find
-                  tool 1 (make-ht "symbol" "flatten" "package" "ALEXANDRIA") nil)))
-      (false (%network-error-p res) "code-find dropped the wire (NETWORK_ERROR)")
-      (false (gethash "isError" res) "code-find returned isError for a known symbol")
-      (true  (search "alexandria" (string-downcase (%content-text res)))
-             "code-find did not return alexandria's source location"))
+      ;; code-find: locate a foreign library symbol with a physical source file.
+      (let* ((tool (%attach-repl-tool "xproc-find" conn))
+             (res  (%dispatch-attach-code-find
+                    tool 1 (make-ht "symbol" "flatten" "package" "ALEXANDRIA") nil)))
+        (false (%network-error-p res) "code-find dropped the wire (NETWORK_ERROR)")
+        (false (gethash "isError" res) "code-find returned isError for a known symbol")
+        (true  (search "alexandria" (string-downcase (%content-text res)))
+               "code-find did not return alexandria's source location"))
 
-    ;; code-describe: same target, different injected form.  The bare symbol with
-    ;; a separate package arg also guards describe's package-resolution: the
-    ;; builder must qualify the describe name with the package, since
-    ;; slynk:describe-symbol resolves in the foreign image's CL-USER where bare
-    ;; "flatten" is not visible.
-    (let* ((tool (%attach-repl-tool "xproc-describe" conn))
-           (res  (%dispatch-attach-code-describe
-                  tool 1 (make-ht "symbol" "flatten" "package" "ALEXANDRIA") nil)))
-      (false (%network-error-p res) "code-describe dropped the wire (NETWORK_ERROR)")
-      (false (gethash "isError" res)
-             "code-describe could not resolve a known symbol via its package arg")
-      (true  (plusp (length (%content-text res))) "code-describe returned empty content"))
+      ;; code-describe: same target, different injected form.  The bare symbol with
+      ;; a separate package arg also guards describe's package-resolution: the
+      ;; builder must qualify the describe name with the package, since
+      ;; slynk:describe-symbol resolves in the foreign image's CL-USER where bare
+      ;; "flatten" is not visible.
+      (let* ((tool (%attach-repl-tool "xproc-describe" conn))
+             (res  (%dispatch-attach-code-describe
+                    tool 1 (make-ht "symbol" "flatten" "package" "ALEXANDRIA") nil)))
+        (false (%network-error-p res) "code-describe dropped the wire (NETWORK_ERROR)")
+        (false (gethash "isError" res)
+               "code-describe could not resolve a known symbol via its package arg")
+        (true  (plusp (length (%content-text res))) "code-describe returned empty content"))
 
-    ;; code-find-references: who-calls form; may be empty, must not drop the wire.
-    (let* ((tool (%attach-repl-tool "xproc-refs" conn))
-           (res  (%dispatch-attach-code-find-references
-                  tool 1 (make-ht "symbol" "flatten" "package" "ALEXANDRIA") nil)))
-      (false (%network-error-p res) "code-find-references dropped the wire (NETWORK_ERROR)")
-      (true  (hash-table-p res) "code-find-references returned a malformed envelope"))))
+      ;; code-find-references: who-calls form; may be empty, must not drop the wire.
+      (let* ((tool (%attach-repl-tool "xproc-refs" conn))
+             (res  (%dispatch-attach-code-find-references
+                    tool 1 (make-ht "symbol" "flatten" "package" "ALEXANDRIA") nil)))
+        (false (%network-error-p res) "code-find-references dropped the wire (NETWORK_ERROR)")
+        (true  (hash-table-p res) "code-find-references returned a malformed envelope")))))
