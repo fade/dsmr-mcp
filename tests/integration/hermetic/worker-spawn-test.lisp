@@ -21,38 +21,19 @@
                 #:worker-tcp-port
                 #:kill-worker)
   (:import-from #:dsmr-mcp/src/log
-                #:configure-log4cl-for-server))
+                #:configure-log4cl-for-server)
+  (:import-from #:dsmr-mcp/tests/integration/support
+                #:with-worker-child-or-skip))
 
 (in-package #:dsmr-mcp/tests/integration/hermetic/worker-spawn-test)
 
 ;;; ---------------------------------------------------------------------------
-;;; Spawn guard: the handshake test forks a real SBCL worker subprocess, so it
-;;; skips cleanly (parachute skip, not fail) when the environment cannot spawn
-;;; one — no sbcl on PATH, or no Quicklisp setup.lisp for the child to load
-;;; dsmr-mcp. The framing tests below are pure in-process units and need no guard.
-;;;
-;;; Assumption: the guard checks that sbcl and a Quicklisp setup.lisp exist; it
-;;; does NOT verify that dsmr-mcp itself is resolvable in the child's source
-;;; registry. On a runner with Quicklisp present but the project not on the
-;;; child's CL_SOURCE_REGISTRY, the guard passes and the child fails to build,
-;;; which surfaces as a test failure rather than the intended clean skip. A
-;;; constrained runner must therefore make dsmr-mcp resolvable for the child.
+;;; The handshake test forks a real SBCL worker subprocess, so it skips cleanly
+;;; (and only when the environment genuinely cannot build a worker child) via
+;;; WITH-WORKER-CHILD-OR-SKIP — see tests/integration/support.lisp for why a
+;;; presence check alone is insufficient. The framing tests below are pure
+;;; in-process units and need no guard.
 ;;; ---------------------------------------------------------------------------
-
-(defun %sbcl-path ()
-  (or (ignore-errors
-        (let ((r (string-trim '(#\Newline #\Return #\Space)
-                              (uiop:run-program '("which" "sbcl")
-                                                :output :string
-                                                :ignore-error-status t))))
-          (and (plusp (length r)) r)))
-      (find-if #'probe-file '("/usr/local/bin/sbcl" "/usr/bin/sbcl" "/opt/local/bin/sbcl"))))
-
-(defun %quicklisp-setup-present-p ()
-  (and (probe-file (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))) t))
-
-(defun %spawnable-p ()
-  (and (%sbcl-path) (%quicklisp-setup-present-p)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Framing — unit tests (no process spawn, run cold)
@@ -111,18 +92,17 @@ limit. Uses a small synthetic limit to avoid allocating 16 MB."
 (define-test worker-spawns-and-handshakes
   "spawn-worker launches a fresh SBCL image, reads the handshake,
 connects to the TCP port, and returns a worker with a valid pid."
-  (unless (%spawnable-p)
-    (skip "cannot spawn a worker subprocess (sbcl / quicklisp setup.lisp absent)"))
-  (let* ((capture (make-string-output-stream))
-         (*error-output* capture))
-    (configure-log4cl-for-server :debug)
-    (let ((w nil))
-      (unwind-protect
-           (progn
-             (setf w (spawn-worker))
-             (true (integerp (worker-pid w)))
-             (true (plusp (worker-pid w)))
-             (true (integerp (worker-tcp-port w)))
-             (true (plusp (worker-tcp-port w))))
-        (when w
-          (ignore-errors (kill-worker w)))))))
+  (with-worker-child-or-skip
+    (let* ((capture (make-string-output-stream))
+           (*error-output* capture))
+      (configure-log4cl-for-server :debug)
+      (let ((w nil))
+        (unwind-protect
+             (progn
+               (setf w (spawn-worker))
+               (true (integerp (worker-pid w)))
+               (true (plusp (worker-pid w)))
+               (true (integerp (worker-tcp-port w)))
+               (true (plusp (worker-tcp-port w))))
+          (when w
+            (ignore-errors (kill-worker w))))))))
