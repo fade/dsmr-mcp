@@ -57,10 +57,12 @@ down condition caught) rather than crashing the serve loop."
       (is = -32000 (gethash "code" rpc-err))
       (true (search "pool" (string-downcase (gethash "message" rpc-err)))))))
 
-(define-test criterion-3-hermetic-unknown-tool-also-returns-rpc-error
-  "With *mode* :hermetic, the mode router fires BEFORE tool lookup — an
-unknown tool name returns a pool rpc-error (not a -32601 not-found error)
-because the :hermetic branch short-circuits before tool resolution."
+(define-test hermetic-unknown-tool-returns-not-found
+  "With *mode* :hermetic, an unknown tool name is NOT a worker-routed verb, so
+the mode router falls through to the local tool lookup and returns -32601
+tool-not-found — the same answer it would give in attached mode. (Previously the
+router blanket-routed every hermetic call to the pool, so an unknown tool died as
+a pool error / \"code is required\" instead of a clear not-found.)"
   (let* ((*mode* :hermetic)
          (capture (make-string-output-stream))
          (*error-output* capture)
@@ -72,11 +74,35 @@ because the :hermetic branch short-circuits before tool resolution."
                  session "req-2"
                  (make-ht "name" "no-such-tool" "arguments" (make-ht))))
            (rpc-err (gethash "error" env)))
-      ;; Pool error, not a tool-not-found error.
+      ;; Tool-not-found, not a pool error.
       (true rpc-err)
-      (is = -32000 (gethash "code" rpc-err))
-      ;; Not a -32601 tool-not-found.
-      (false (= -32601 (gethash "code" rpc-err))))))
+      (is = -32601 (gethash "code" rpc-err)))))
+
+(define-test hermetic-dispatcher-side-tool-served-locally
+  "With *mode* :hermetic and NO pool running, a dispatcher-side tool
+(pool-status) is served on the local *tool-classes* path rather than routed to a
+worker. It returns a normal result envelope — never the pool rpc-error -32000 or
+the worker/eval \"code is required\" failure that a blanket hermetic route caused.
+This is the regression guard for the launch-time wedge where every non-eval tool
+was misrouted to worker/eval."
+  (let* ((*mode* :hermetic)
+         (capture (make-string-output-stream))
+         (*error-output* capture)
+         (*log-level* :debug)
+         (session (make-session :id "hermetic-local-tool"))
+         (*current-session-id* "hermetic-local-tool"))
+    (configure-log4cl-for-server :debug)
+    (let* ((env (handle-tools-call
+                 session "req-local"
+                 (make-ht "name" "pool-status" "arguments" (make-ht))))
+           (rpc-err (gethash "error" env))
+           (res     (gethash "result" env)))
+      ;; Local path: a result envelope, not an rpc-error envelope.
+      (false rpc-err)
+      (true res)
+      ;; And specifically not the misrouted-to-worker failure text.
+      (let ((blob (jzon:stringify env)))
+        (false (search "code is required" blob))))))
 
 (define-test server-does-not-crash
   "handle-tools-call returns normally under :hermetic regardless of pool state

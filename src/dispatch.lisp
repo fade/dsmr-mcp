@@ -37,7 +37,8 @@
                 #:text-content
                 #:result)
   (:import-from #:dsmr-mcp/src/hermetic/dispatch
-                #:dispatch-hermetic-call)
+                #:dispatch-hermetic-call
+                #:worker-routed-tool-p)
   (:export #:handle-tools-call))
 
 (in-package #:dsmr-mcp/src/dispatch)
@@ -47,9 +48,12 @@
 
 1. Assert *current-session-id* is a bound, non-empty string (regression
    boundary — the transport must bind this before calling process-json-line).
-2. When *mode* is :hermetic, route directly to dispatch-hermetic-call which
-   handles pool assignment, the one-notification crash path, and
-   all structured pool error conditions.
+2. When *mode* is :hermetic AND the tool is a worker-routed (image-bound) verb,
+   route to dispatch-hermetic-call which handles pool assignment, the
+   one-notification crash path, and all structured pool error conditions.
+   Dispatcher-side tools (fs-*, clhs-lookup, lsp-*, pool-status, ...) fall
+   through to the local path below, the same way they are served in attached
+   mode -- they need no worker image.
 3. Extract tool name from params.
 4. Look up the class in *tool-classes* — return -32601 if not found.
 5. Resolve the per-session instance via get-tool-instance.
@@ -67,14 +71,19 @@
     (error "handle-tools-call: *current-session-id* is not a bound non-empty string. ~
             The transport (or test setup) must bind it before calling ~
             process-json-line."))
-  ;; Hermetic mode: route to the pool dispatcher. dispatch-hermetic-call
-  ;; handles get-or-assign-worker, the one-notification reset path,
-  ;; and all pool/worker conditions — nothing unhandled escapes.
-  (when (eq *mode* :hermetic)
-    (let ((name (and params (gethash "name" params)))
-          (args (and params (gethash "arguments" params))))
-      (return-from handle-tools-call
-        (dispatch-hermetic-call session id name args))))
+  ;; Hermetic mode: route ONLY image-bound verbs to the pool dispatcher.
+  ;; dispatch-hermetic-call handles get-or-assign-worker, the one-notification
+  ;; reset path, and all pool/worker conditions — nothing unhandled escapes.
+  ;; Dispatcher-side tools (fs-*, clhs-lookup, lsp-*, pool-status, ...) are NOT
+  ;; routed to a worker; they fall through to the local *tool-classes* path,
+  ;; exactly as in attached mode. A blanket route would send them to worker/eval,
+  ;; which then fails with "code is required" — and would make the pool-management
+  ;; tools, which must act on the pool from this process, unreachable.
+  (let ((name (and params (gethash "name" params))))
+    (when (and (eq *mode* :hermetic) (worker-routed-tool-p name))
+      (let ((args (and params (gethash "arguments" params))))
+        (return-from handle-tools-call
+          (dispatch-hermetic-call session id name args)))))
   (let* ((name (and params (gethash "name" params)))
          (args (and params (gethash "arguments" params)))
          (class (and name (gethash name *tool-classes*))))
