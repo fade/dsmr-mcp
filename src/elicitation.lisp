@@ -144,14 +144,24 @@ before return."
            (let ((value nil) (errorp nil))
              ;; Wait for route-elicitation-response to fill the cell, reading
              ;; value+errorp while still holding the lock so the notifier's
-             ;; write is fully visible before release. condition-wait with a
-             ;; :timeout returns NIL when the deadline elapses with no notify;
-             ;; a single wait then a re-test of the cell distinguishes a real
-             ;; delivery from a timeout (the cell still holding the sentinel).
+             ;; write is fully visible before release. condition-wait may wake
+             ;; spuriously -- bordeaux-threads makes no single-wakeup guarantee
+             ;; -- so loop on the cell predicate against a recomputed remaining
+             ;; deadline: a spurious wakeup simply re-waits, and only the
+             ;; deadline truly elapsing leaves the sentinel in place (a real
+             ;; timeout). A single un-looped wait would misread a spurious
+             ;; wakeup as a timeout, returning and tearing the pending slot
+             ;; down within milliseconds of the request being sent.
              (with-lock-held ((session-elicitation-lock session))
-               (when (eq (car cell) +pending-sentinel+)
-                 (condition-wait cv (session-elicitation-lock session)
-                                 :timeout timeout))
+               (let ((deadline (+ (get-internal-real-time)
+                                  (* timeout internal-time-units-per-second))))
+                 (loop while (eq (car cell) +pending-sentinel+)
+                       for remaining = (- deadline (get-internal-real-time))
+                       while (plusp remaining)
+                       do (condition-wait
+                           cv (session-elicitation-lock session)
+                           :timeout (/ remaining
+                                       internal-time-units-per-second))))
                (setf value  (car cell)
                      errorp (cadr cell)))
              (cond
