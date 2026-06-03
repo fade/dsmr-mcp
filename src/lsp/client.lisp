@@ -22,7 +22,7 @@
   (:import-from #:bordeaux-threads
                 #:make-lock #:with-lock-held #:make-thread
                 #:make-condition-variable #:condition-wait #:condition-notify
-                #:thread-alive-p #:join-thread #:destroy-thread)
+                #:thread-alive-p #:join-thread #:destroy-thread #:interrupt-thread)
   (:import-from #:dsmr-mcp/src/log #:log-event)
   (:import-from #:usocket
                 #:socket-connect #:socket-close #:socket-stream
@@ -575,6 +575,21 @@ per URI to correctly sequence document changes."
 ;;; Shutdown
 ;;; ---------------------------------------------------------------------------
 
+(defun %reap-reader-thread (thread)
+  "Stop the reader THREAD promptly and return.
+
+Closing the socket from another thread does NOT reliably wake a thread blocked
+in a socket read on SBCL, so a plain join waits out its full timeout (~2s) every
+time. Instead interrupt the reader to unwind its blocked read, then join under a
+short bound. sb-ext:with-timeout signals SB-EXT:TIMEOUT, which is a
+SERIOUS-CONDITION and NOT an ERROR -- the join guard must catch serious-condition
+or the timeout escapes; on the rare miss, terminate the thread outright."
+  (when (and thread (thread-alive-p thread))
+    (ignore-errors (interrupt-thread thread #'sb-thread:abort-thread))
+    (handler-case
+        (sb-ext:with-timeout 1 (join-thread thread))
+      (serious-condition () (ignore-errors (destroy-thread thread))))))
+
 (defun lsp-shutdown (client)
   "Close the LSP connection and reap spawned children.
 For attached clients: close the socket only (do not kill the process).
@@ -586,10 +601,7 @@ For spawned clients: close the socket, SIGTERM→SIGKILL the child process."
   ;; Stop the reader thread.
   (let ((thr (lsp-client-reader-thread client)))
     (when (and thr (thread-alive-p thr))
-      (handler-case
-          (sb-ext:with-timeout 2
-            (join-thread thr))
-        (error () (ignore-errors (destroy-thread thr))))
+      (%reap-reader-thread thr)
       (setf (lsp-client-reader-thread client) nil)))
   ;; Reap spawned child (attached servers are left running).
   (unless (lsp-client-attached-p client)
@@ -636,7 +648,7 @@ Spawned → close socket then SIGTERM→SIGKILL."
         (setf (lsp-client-socket client) nil)
         (let ((thr (lsp-client-reader-thread client)))
           (when (and thr (thread-alive-p thr))
-            (ignore-errors (destroy-thread thr))
+            (%reap-reader-thread thr)
             (setf (lsp-client-reader-thread client) nil)))
         ;; Remove the per-client formatting lock from the bridge table.
         (ignore-errors
@@ -935,12 +947,13 @@ Returns NIL when both attach and spawn fail."
 
 (defun %lsp-cleanup-loop ()
   "Periodically evict idle LSP clients from the registry.
-Mirrors http.lisp %session-cleanup-loop: 1-second sub-sleeps,
-active-requests guard, eviction outside the registry lock."
+Mirrors http.lisp %session-cleanup-loop: 100ms sub-sleeps so shutdown is
+observed within ~100ms, active-requests guard, eviction outside the registry
+lock."
   (loop while *lsp-cleanup-running*
-        do (loop repeat (max 1 *lsp-cleanup-interval*)
+        do (loop repeat (max 1 (* 10 *lsp-cleanup-interval*))
                  while *lsp-cleanup-running*
-                 do (sleep 1))
+                 do (sleep 1/10))
            (when *lsp-cleanup-running*
              (handler-case
                  (let ((expired nil)
