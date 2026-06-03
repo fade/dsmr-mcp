@@ -79,9 +79,12 @@ systems."
   "When project_only is absent from params (defaulting to true), the result
 still has a 'references' vector key (may be empty if no in-project callers
 are loaded at test time, but the envelope shape must be correct)."
-  (let* (;; Use a CL built-in — unlikely to have project callers, but the
-         ;; shape must be correct regardless of the number of results.
-         (params (make-params "symbol" "cl:car"))
+  (let* (;; Use a low-fan-in CL built-in — unlikely to have project callers, but
+         ;; the shape must be correct regardless of the number of results. (A
+         ;; pervasive built-in like CL:CAR resolves the same envelope but forces
+         ;; who-calls to enumerate thousands of callers, ~19s for no added
+         ;; coverage — the assertion checks shape, not count.)
+         (params (make-params "symbol" "cl:get-decoded-time"))
          (result (%handle-code-find-references params nil)))
     (true (hash-table-p result))
     ;; Either a references envelope or a typed not-found; both are valid.
