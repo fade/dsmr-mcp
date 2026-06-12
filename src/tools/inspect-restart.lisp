@@ -41,6 +41,7 @@
   (:import-from #:dsmr-mcp/src/attach/dispatch
                 #:repl-eval-tool
                 #:repl-eval-tool-slynk-conn
+                #:attached-connection
                 #:repl-eval-tool-call-lock)
   (:import-from #:dsmr-mcp/src/attach/connection
                 #:bounded-slime-eval)
@@ -198,7 +199,18 @@ caller's id, per the JSON-RPC 2.0 spec."
                              (t nil))))
          (invoke-nm  (gethash "invoke_name" p))
          (lock       (repl-eval-tool-call-lock tool))
-         (conn       (repl-eval-tool-slynk-conn tool)))
+         ;; Resolve under the lock so concurrent first-callers cannot both
+         ;; open a connection; a failed open gets the same graceful
+         ;; empty-set response as a probe timeout below.
+         (conn       (handler-case
+                         (with-lock-held (lock)
+                           (attached-connection tool))
+                       (slime-network-error ()
+                         (return-from %dispatch-attach-inspect-restart
+                           (make-ht "restarts" (vector)
+                                    "message"
+                                    "No active debugger break (or connection unavailable)."
+                                    "level" level))))))
     ;; LIST path: fetch debugger-info and decode.
     ;; Use a short probe timeout: debugger-info-for-emacs blocks when no break
     ;; is active (waits in sly-db-loop's event queue).  A 3-second timeout

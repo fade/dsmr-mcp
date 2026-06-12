@@ -34,6 +34,7 @@
   (:import-from #:dsmr-mcp/src/attach/dispatch
                 #:repl-eval-tool
                 #:repl-eval-tool-slynk-conn
+                #:attached-connection
                 #:repl-eval-tool-call-lock)
   (:import-from #:dsmr-mcp/src/attach/connection
                 #:bounded-slime-eval)
@@ -286,7 +287,7 @@ broadening the function signature."
     (handler-case
         (let* ((raw         (with-lock-held (lock)
                               (bounded-slime-eval
-                               form (repl-eval-tool-slynk-conn tool))))
+                               form (attached-connection tool))))
                (raw-threads (when (listp raw) (getf raw :threads)))
                (raw-frames  (when (listp raw) (getf raw :eval-thread-frames)))
                (threads     (if (listp raw-threads)

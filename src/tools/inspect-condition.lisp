@@ -58,6 +58,7 @@
   (:import-from #:dsmr-mcp/src/attach/dispatch
                 #:repl-eval-tool
                 #:repl-eval-tool-slynk-conn
+                #:attached-connection
                 #:repl-eval-tool-call-lock
                 #:repl-eval-tool-connection-epoch)
   (:import-from #:dsmr-mcp/src/attach/connection
@@ -378,7 +379,7 @@ without broadening the function signature."
          (lock         (repl-eval-tool-call-lock tool)))
     (handler-case
         (let* ((raw (with-lock-held (lock)
-                      (bounded-slime-eval form (repl-eval-tool-slynk-conn tool))))
+                      (bounded-slime-eval form (attached-connection tool))))
                (ht  (%plist->condition-ht (if (listp raw) raw '()) max-elements)))
           ht)
       (slime-network-error (e)
