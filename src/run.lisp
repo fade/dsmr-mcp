@@ -2,9 +2,9 @@
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
 ;;;; Top-level entry point for dsmr-mcp: resolves keyword/env/conf precedence
-;;;; and dispatches to the appropriate transport.  For :stdio this call is
-;;;; blocking (returns T at EOF); :tcp and :http raise transport-not-implemented-error
-;;;; until those transports are implemented.
+;;;; and dispatches to the appropriate transport.  All three transports are
+;;;; served: :stdio blocks reading the wire (returns T at EOF); :tcp and
+;;;; :http start their listeners after the loopback bind check.
 ;;;;
 ;;;; Config precedence: keyword > DSMR_<KEYWORD> env var > .dsmr-mcp.conf > built-in default.
 ;;;; .dsmr-mcp.conf is read via ubiquitous:value (never defaulted-value, which writes the
@@ -63,9 +63,9 @@
   (:report (lambda (c s)
              (format s "Transport ~A is not yet implemented."
                      (transport-not-implemented-transport c))))
-  (:documentation "Signaled by RUN when :transport is :tcp or :http.
-These transports are not yet implemented; this typed condition lets tests
-assert the correct condition class rather than a generic error."))
+  (:documentation "Retained for callers and tests that assert a transport
+does NOT signal it: all three transports (:stdio, :tcp, :http) are served,
+so RUN no longer signals this condition for any accepted transport value."))
 
 (define-condition invalid-config-value (error)
   ((name :initarg :name :reader invalid-config-value-name
