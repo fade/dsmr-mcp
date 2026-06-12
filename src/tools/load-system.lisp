@@ -52,7 +52,8 @@
   (:import-from #:dsmr-mcp/src/hermetic/dispatch
                 #:dispatch-hermetic-call)
   (:import-from #:dsmr-mcp/src/system-loader-core
-                #:%build-load-system-form)
+                #:%build-load-system-form
+                #:load-status-summary)
   (:import-from #:slynk-client
                 #:slime-network-error)
   (:import-from #:bordeaux-threads
@@ -138,7 +139,11 @@ Returns a hash-table suitable for (result id ...)."
                                 "system"      (map 'string #'identity sys-name)
                                 "duration_ms" elapsed-ms
                                 "forced"      force
-                                "warnings"    (or n-warns 0))))
+                                "warnings"    (or n-warns 0)
+                                "content"
+                                (text-content
+                                 (load-status-summary
+                                  "loaded" sys-name elapsed-ms (or n-warns 0) nil)))))
          (when (and n-warns (plusp n-warns) warns)
            (setf (gethash "warning_details" ht)
                  (mapcar (lambda (w) (map 'string #'identity w))
@@ -146,19 +151,25 @@ Returns a hash-table suitable for (result id ...)."
          ht))
       ;; Timeout
       ((and (listp raw) (eq (car raw) :timeout))
-       (let ((timeout-secs (second raw)))
+       (let* ((timeout-secs (second raw))
+              (msg (format nil "Load timed out after ~A seconds" timeout-secs)))
          (make-ht "status"      "timeout"
                   "system"      (map 'string #'identity sys-name)
                   "duration_ms" elapsed-ms
-                  "message"     (format nil "Load timed out after ~A seconds"
-                                        timeout-secs))))
+                  "message"     msg
+                  "content"
+                  (text-content
+                   (load-status-summary "timeout" sys-name elapsed-ms nil msg)))))
       ;; Error
       ((and (listp raw) (eq (car raw) :error))
        (let ((msg (map 'string #'identity (or (second raw) "unknown error"))))
          (make-ht "status"      "error"
                   "system"      (map 'string #'identity sys-name)
                   "duration_ms" elapsed-ms
-                  "message"     msg)))
+                  "message"     msg
+                  "content"
+                  (text-content
+                   (load-status-summary "error" sys-name elapsed-ms nil msg)))))
       ;; Unexpected shape
       (t
        (log-event :warn "load-system.attach.unexpected-result"
