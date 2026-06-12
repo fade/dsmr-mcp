@@ -283,7 +283,10 @@ A guide to the main areas under =src/=.
 - =src/lsp/{client,document,bridge}.lisp= — the alive-lsp bridge.
 - Code intelligence and structural editing — =src/code-core.lisp=,
   =src/clgrep.lisp=, =src/clhs.lisp=, =src/system-loader-core.lisp=,
-  =src/test-runner-core.lisp=, and the Eclector-based editors
+  =src/test-runner-engine.lisp= (the dependency-free test engine, loaded
+  into the attached image on demand and version-gated by a content
+  fingerprint), =src/test-runner-core.lisp= (its server-side facade and
+  the injected-form builders), and the Eclector-based editors
   (=src/cst.lisp=, =src/lisp-edit-form*.lisp=, =src/lisp-patch-form.lisp=,
   =src/parinfer.lisp=, =src/validate.lisp=).
 - =src/project-scaffold*.lisp= — project skeleton generation.
