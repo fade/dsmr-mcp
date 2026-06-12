@@ -37,6 +37,7 @@
   (:export #:run-tests
            #:detect-test-framework
            #:test-result-summary
+           #:%resolve-test-packages
            #:%parachute-purge-ghost-suites
            #:%rove-purge-ghost-suites
            #:*test-debug-output*
@@ -141,21 +142,36 @@ Outside of test execution this is a broadcast-stream; output is discarded.")
 The client renders a tools/call result through its content block alone, so
 every envelope needs this alongside the structured fields, which remain
 authoritative. FAILED-TESTS is a vector of failure-detail hash-tables (or
-nil); the first few failing test names are included so the headline is
-actionable without parsing the structure."
+nil); the first few failing tests are shown with name AND a truncated
+reason so the headline says what broke without the caller parsing the
+structure (counts alone once hid a target-resolution crash behind a bare
+\"0 passed, 1 failed\")."
   (let ((head (format nil "~D passed, ~D failed~@[, ~D pending~] (~A, ~D ms)"
                       (or passed 0) (or failed 0)
                       (and pending (plusp pending) pending)
                       (or framework "unknown") (or duration-ms 0))))
     (if (and failed-tests (plusp (length failed-tests)))
-        (let* ((names (map 'list
-                           (lambda (f)
-                             (or (and (hash-table-p f) (gethash "test_name" f))
-                                 "?"))
-                           failed-tests))
-               (shown (subseq names 0 (min 3 (length names))))
-               (more  (- (length names) (length shown))))
-          (format nil "~A; failing: ~{~A~^, ~}~[~:; (+~:*~D more)~]"
+        (let* ((entries
+                 (map 'list
+                      (lambda (f)
+                        (let* ((name (or (and (hash-table-p f)
+                                              (gethash "test_name" f))
+                                         "?"))
+                               (reason (and (hash-table-p f)
+                                            (gethash "reason" f)))
+                               (snippet (and (stringp reason)
+                                             (plusp (length reason))
+                                             (substitute
+                                              #\Space #\Newline
+                                              (subseq reason 0 (min 80 (length reason)))))))
+                          (if snippet
+                              (format nil "~A — ~A~:[~;…~]" name snippet
+                                      (> (length reason) 80))
+                              (format nil "~A" name))))
+                      failed-tests))
+               (shown (subseq entries 0 (min 3 (length entries))))
+               (more  (- (length entries) (length shown))))
+          (format nil "~A; failing: ~{~A~^; ~}~[~:; (+~:*~D more)~]"
                   head shown more))
         head)))
 
@@ -445,9 +461,18 @@ reachable twice; the EQ visited set counts each result exactly once
 Parent result nodes carry the test name symbol as the NAME of their expression
 (a PARACHUTE:TEST object).  That symbol is propagated down to leaf failures so
 source locations are populated for file-defined tests even when the leaf's own
-expression is an assertion form rather than a test object."
-  (let ((failures nil))
+expression is an assertion form rather than a test object.
+
+A report lists every result FLAT while test-results also nest the same
+children; the EQ visited set records each failure once.  The walk reaches
+the nested copy (which carries its test's name) before the flat duplicate,
+so the surviving entry is the well-named one."
+  (let ((failures nil)
+        (seen (make-hash-table :test 'eq)))
     (labels ((walk (r parent-test-sym)
+               (when (gethash r seen)
+                 (return-from walk))
+               (setf (gethash r seen) t)
                (let* ((pkg (find-package :org.shirakumo.parachute))
                       (status-fn  (and pkg (find-symbol "STATUS" pkg)))
                       (results-fn (and pkg (find-symbol "RESULTS" pkg)))
@@ -499,6 +524,55 @@ expression is an assertion form rather than a test object."
       (walk result-obj nil))
     (nreverse failures)))
 
+(defun %package-has-parachute-tests-p (pkg)
+  "True when PKG (a package or NIL) has registered Parachute tests."
+  (let* ((para (find-package :org.shirakumo.parachute))
+         (fn (and para (find-symbol "PACKAGE-TESTS" para))))
+    (and fn pkg
+         (ignore-errors (and (funcall fn pkg) t)))))
+
+(defun %resolve-test-packages (system-name)
+  "Resolve SYSTEM-NAME to the list of packages a Parachute run should cover.
+
+1:1 fast path: a package named like the system that actually CONTAINS
+registered tests.  Otherwise SYSTEM-NAME is treated as an umbrella (the
+package-inferred norm: \"proj/tests\" has no same-named package; the tests
+live in per-file subsystem packages): walk its :depends-on closure with a
+visited set, keeping only subsystems whose ASDF primary system matches the
+umbrella's — the constraint that keeps foreign dependencies like parachute
+itself, which every test umbrella depends on, out of the run — and map each
+kept subsystem to its same-named package when that package has tests.
+
+Returns NIL when nothing is found; the caller decides the fallback.  This
+resolver only READS system metadata — reload/purge policy stays with the
+caller."
+  (let ((direct (find-package (string-upcase system-name))))
+    (if (%package-has-parachute-tests-p direct)
+        (list direct)
+        (let ((primary (ignore-errors (asdf:primary-system-name system-name)))
+              (visited (make-hash-table :test #'equal))
+              (packages '()))
+          (when primary
+            (labels ((walk (name)
+                       (when (and (stringp name)
+                                  (not (gethash name visited))
+                                  (equal primary
+                                         (ignore-errors
+                                           (asdf:primary-system-name name))))
+                         (setf (gethash name visited) t)
+                         (let ((pkg (find-package (string-upcase name))))
+                           (when (%package-has-parachute-tests-p pkg)
+                             (push pkg packages)))
+                         (let ((sys (ignore-errors (asdf:find-system name nil))))
+                           (when sys
+                             (dolist (dep (ignore-errors
+                                            (asdf:system-depends-on sys)))
+                               (let ((dep-name (if (consp dep) (second dep) dep)))
+                                 (when (stringp dep-name)
+                                   (walk dep-name)))))))))
+              (walk system-name)))
+          (nreverse packages)))))
+
 (defun %run-parachute-tests (system-name)
   "Run tests using Parachute for SYSTEM-NAME and return the uniform envelope.
 Invokes (parachute:test SYSTEM-DESIGNATOR) via dynamic symbol lookup so
@@ -508,9 +582,15 @@ or parachute."
   (let* ((pkg (find-package :org.shirakumo.parachute))
          (test-fn (and pkg (find-symbol "TEST" pkg)))
          (context-var (and pkg (find-symbol "*CONTEXT*" pkg)))
-         (parent-var  (and pkg (find-symbol "*PARENT*" pkg))))
+         (parent-var  (and pkg (find-symbol "*PARENT*" pkg)))
+         (targets (and test-fn (%resolve-test-packages system-name))))
     (unless test-fn
       (%log :warn "test-runner" "message" "Parachute not loaded; falling back to ASDF")
+      (return-from %run-parachute-tests (%run-asdf-fallback system-name)))
+    (unless targets
+      (%log :warn "test-runner" "message"
+            "no Parachute test packages resolve for system; falling back to ASDF"
+            "system" system-name)
       (return-from %run-parachute-tests (%run-asdf-fallback system-name)))
     (let ((start-time (get-internal-real-time))
           (stdout-stream (make-string-output-stream))
@@ -532,9 +612,11 @@ or parachute."
             (let ((isolation-vars (remove nil (list context-var parent-var))))
               (setf result-obj
                     (progv isolation-vars (make-list (length isolation-vars))
-                      (funcall test-fn
-                               (or (find-package (string-upcase system-name))
-                                   (intern (string-upcase system-name) :keyword)))))))
+                      ;; TARGETS is a list of packages; parachute:test on a
+                      ;; list returns one merged report, so umbrella systems
+                      ;; (several sub-packages) and the 1:1 case (singleton)
+                      ;; take the same path.
+                      (funcall test-fn targets)))))
         (error (c)
           (setf run-error (princ-to-string c))))
       (let* ((end-time (get-internal-real-time))
