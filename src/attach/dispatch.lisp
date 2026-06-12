@@ -61,6 +61,7 @@
            #:repl-eval-tool-slynk-conn
            #:repl-eval-tool-call-lock
            #:repl-eval-tool-connection-epoch
+           #:attached-connection
            #:%dispatch-attach
            #:try-eager-connect
            #:detach-session
@@ -223,7 +224,13 @@ Requires :slynk-attach / DSMR_SLYNK_ATTACH to be configured.")
                   :type :boolean
                   :description "When true (the default), registers the last form's first \
 return value in the image-resident handle table and returns result_object_id. \
-Set to false to suppress registration for hot loops or uninteresting results."))
+Set to false to suppress registration for hot loops or uninteresting results.")
+                 (timeout-seconds
+                  :type :integer
+                  :description "Seconds to wait for the eval's reply before returning a \
+connection error (default: 30). Raise for long-running forms such as big \
+compiles. The bound applies to the wait for the reply; the form itself is \
+not interrupted in the attached image."))
                 :required ("code")))
    ;; Per-instance (per-session) connection state — NOT :allocation :class.
    ;; One connection cache per session, living on the tool instance.
@@ -254,6 +261,26 @@ connection-incarnation epoch so sessions are fully isolated from each other."))
 ;; :after finalize-inheritance method fires at load time and registers
 ;; \"repl-eval\" in *tool-classes*. (See src/tools/base.lisp line 162.)
 (c2mop:ensure-finalized (find-class 'repl-eval-tool))
+
+;;; Connection resolution -------------------------------------------------------
+
+(defun attached-connection (tool)
+  "Return TOOL's live Slynk connection, opening one on demand.
+
+Resolves host/port from the tool session's :slynk-attach config and routes
+through get-or-open-connection, so the first call after a drop-connection
+reopens instead of evaluating against the nil cached slot.  Every attached
+dispatcher should obtain its connection here, under the tool's call-lock.
+
+Signals slime-network-error when the config is missing or malformed, or
+when the connect itself fails (from get-or-open-connection)."
+  (multiple-value-bind (host port)
+      (parse-slynk-attach (session-slynk-attach (tool-session tool)))
+    (unless (and host port)
+      (error 'slime-network-error
+             :format-control
+             "attach: :slynk-attach config is missing or malformed"))
+    (get-or-open-connection tool host port)))
 
 ;;; Error-context hash-table builder ------------------------------------------
 ;;;
@@ -405,6 +432,8 @@ so IDs minted before a drop-connection can be detected as stale."
   (let* ((code              (gethash "code" params))
          (package-name      (gethash "package" params))
          (max-output-length (gethash "max_output_length" params))
+         (timeout-seconds   (let ((v (gethash "timeout_seconds" params)))
+                              (if (and (integerp v) (plusp v)) v 30)))
          ;; register_result: absent or true => t; explicit jzon false/nil => nil.
          (register-result   (let ((v (gethash "register_result" params :missing)))
                               (if (eq v :missing) t (not (null v)))))
@@ -446,8 +475,11 @@ so IDs minted before a drop-connection can be detected as stale."
                                                            :session-id sess-id)))
                        ;; Bounded slime-eval inside the lock: a lost reply
                        ;; becomes a clean slime-network-error after the timeout
-                       ;; instead of blocking the caller indefinitely.
-                       (bounded-slime-eval form conn :timeout 30)))))
+                       ;; instead of blocking the caller indefinitely.  The
+                       ;; +15s margin keeps the client bound from firing
+                       ;; before an honest eval of timeout_seconds finishes.
+                       (bounded-slime-eval form conn
+                                           :timeout (+ timeout-seconds 15))))))
             ;; Destructure the 6-element result tuple from the remote image.
             ;; Shape: (printed raw stdout stderr error-context raw-id-or-nil)
             ;; Pad with nils when the remote returns a shorter list (defensive).

@@ -30,6 +30,7 @@
                 #:log-event)
   (:import-from #:dsmr-mcp/src/wire-strings
                 #:coerce-wire-strings)
+  (:import-from #:usocket)
   (:export #:get-or-open-connection
            #:drop-connection
            #:close-connection
@@ -176,10 +177,16 @@ on TOOL's slynk-conn slot and logs attach.connection.opened."
         conn)))
 
 (defun drop-connection (tool &key (reason "network-error"))
-  "Nil out the cached connection on TOOL without calling slime-close.
-The connection is presumed dead on a network error; attempting slime-close on
-a dead socket could block.  The nil slot causes the next get-or-open-connection
-call to reopen on demand (fail-closed semantics).
+  "Drop the cached connection on TOOL, best-effort shutting down its socket.
+The connection is presumed dead on a network error, so the graceful
+slime-close round-trip is skipped — it evals on the dead peer and can
+block.  A socket shutdown cannot block, and it matters beyond hygiene: it
+delivers EOF to both sides, so the client's event-dispatcher thread exits
+through its connection-closed path (closing the socket as it goes) instead
+of lingering to print late events from an abandoned connection, and the
+attached image's reader and control threads unwind instead of parking
+forever.  The nil slot causes the next get-or-open-connection call to
+reopen on demand (fail-closed semantics).
 
 Also increments the connection-incarnation epoch counter on TOOL via the
 forward-reference accessor pattern (the accessor is defined in dispatch.lisp
@@ -188,7 +195,22 @@ before dispatch is loaded never escapes.  The epoch bump invalidates all
 result_object_ids minted before the drop.
 
 Returns NIL."
-  (setf (%conn tool) nil)
+  (let ((conn (%conn tool)))
+    (setf (%conn tool) nil)
+    (when conn
+      ;; shutdown, NOT close.  close(2) does not wake a thread parked in a
+      ;; blocking read on the same socket — the event-dispatcher thread
+      ;; would stay parked forever — and closing the fd while that thread
+      ;; is between its shutdown wake-up and its next read leaves it parked
+      ;; in SBCL's fd-wait on a dead fd.  shutdown(2) delivers EOF to the
+      ;; parked read; the dispatcher then exits through its
+      ;; connection-closed path, which is where the socket actually gets
+      ;; closed.  shutdown cannot block (no SO_LINGER semantics apply).
+      ;; slynk-client does not export its usocket reader; this is our fork,
+      ;; so the internal reference is stable.
+      (handler-case
+          (usocket:socket-shutdown (slynk-client::usocket conn) :io)
+        (error () nil))))
   ;; Bump epoch via the forward-referenced accessor.  Uses the same
   ;; (fdefinition (list 'setf (find-symbol ...))) pattern as (setf %conn)
   ;; above — dispatch.lisp depends on connection.lisp, so a direct import

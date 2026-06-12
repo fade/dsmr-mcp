@@ -39,6 +39,8 @@
                 #:*mode*)
   (:import-from #:dsmr-mcp/src/attach/dispatch
                 #:repl-eval-tool-slynk-conn)
+  (:import-from #:dsmr-mcp/src/attach/connection
+                #:drop-connection)
   (:import-from #:dsmr-mcp/src/tools/base
                 #:tool-handle)
   (:import-from #:dsmr-mcp/src/tools/load-system
@@ -186,6 +188,50 @@ the (:ok N WARNS) result decoder in attached mode."
         (is string= "loaded" (gethash "status" result))
         (is string= "alexandria" (gethash "system" result))
         (true (integerp (gethash "duration_ms" result)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; load-system-attached-reopens-after-drop
+;;;
+;;; The dispatcher resolves its connection via attached-connection, so a call
+;;; made after drop-connection nils the cached slot must reopen on demand
+;;; from the session's :slynk-attach config — never evaluate against the nil
+;;; slot (which crashed instead of reconnecting).
+;;; ---------------------------------------------------------------------------
+
+(define-test load-system-attached-reopens-after-drop
+  "An attached load-system call with a nil cached connection opens one from
+the session's :slynk-attach config; after drop-connection, the next call
+reopens and succeeds rather than failing on the nil slot."
+  (let* ((port (slynk:create-server :port 0 :dont-close t))
+         (session (make-session :id "ls-attach-reopen"
+                                :slynk-attach (format nil "127.0.0.1:~A" port)))
+         (*current-session-id* "ls-attach-reopen")
+         (repl-tool (get-tool-instance session "repl-eval")))
+    (unwind-protect
+         (progn
+           (sleep 0.1)
+           ;; Cached slot starts nil — the dispatcher must open on demand.
+           (true (null (repl-eval-tool-slynk-conn repl-tool)))
+           (let ((r1 (%dispatch-attach-load-system
+                      repl-tool nil
+                      (make-ht "system"          "alexandria"
+                               "force"           t
+                               "timeout_seconds" 120))))
+             (false (gethash "isError" r1))
+             (is string= "loaded" (gethash "status" r1))
+             (true (repl-eval-tool-slynk-conn repl-tool)))
+           ;; Drop: slot is nil again; the next call must reopen, not crash.
+           (drop-connection repl-tool :reason "test-drop")
+           (true (null (repl-eval-tool-slynk-conn repl-tool)))
+           (let ((r2 (%dispatch-attach-load-system
+                      repl-tool nil
+                      (make-ht "system"          "alexandria"
+                               "force"           t
+                               "timeout_seconds" 120))))
+             (false (gethash "isError" r2))
+             (is string= "loaded" (gethash "status" r2))
+             (true (repl-eval-tool-slynk-conn repl-tool))))
+      (ignore-errors (slynk:stop-server port)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; load-system-inline-returns-mode-error

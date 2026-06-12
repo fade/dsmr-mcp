@@ -110,9 +110,31 @@ Returns (list :ok WARN-COUNT WARNS), (list :timeout TIMEOUT), or
     (let ((s-warns    (cs "%DSMR-LOADER-WARNS"))
           (s-w        (cs "%DSMR-LOADER-W"))
           (s-e        (cs "%DSMR-LOADER-E"))
-          (s-sys      (cs "%DSMR-LOADER-SYS")))
-      `(handler-case
-           (sb-ext:with-timeout ,(or timeout-seconds 120)
+          (s-sys      (cs "%DSMR-LOADER-SYS"))
+          (s-hook     (cs "%DSMR-LOADER-DEBUG-HOOK"))
+          (s-c        (cs "%DSMR-LOADER-C"))
+          (s-h        (cs "%DSMR-LOADER-H")))
+      ;; Debugger backstop around the whole load: anything that would enter
+      ;; the image's debugger despite the handler-case (BREAK or a direct
+      ;; INVOKE-DEBUGGER in compile-time code of the system being loaded)
+      ;; is converted to the (:error MSG) arm via throw.  A parked debugger
+      ;; in a rex worker hangs the batch client forever; see wrap-form.lisp
+      ;; for the full rationale.  This form already requires an SBCL target
+      ;; (sb-ext:with-timeout), so SB-EXT:*INVOKE-DEBUGGER-HOOK* — the hook
+      ;; BREAK cannot bypass — is referenced directly.
+      `(catch :%dsmr-loader-debug-unwind
+         (let ((,s-hook (lambda (,s-c ,s-h)
+                          (declare (ignore ,s-h))
+                          (throw :%dsmr-loader-debug-unwind
+                            (list :error
+                                  (or (ignore-errors
+                                        (map 'string #'identity
+                                             (princ-to-string ,s-c)))
+                                      "<error formatting condition>"))))))
+           (let ((*debugger-hook* ,s-hook)
+                 (sb-ext:*invoke-debugger-hook* ,s-hook))
+             (handler-case
+                 (sb-ext:with-timeout ,(or timeout-seconds 120)
              ;; Force-reload: clear loaded state so changed definitions
              ;; are recompiled and become live.
              ,@(when force
@@ -136,17 +158,20 @@ Returns (list :ok WARN-COUNT WARNS), (list :timeout TIMEOUT), or
                                      ,s-warns)
                                (when (find-restart 'muffle-warning)
                                  (invoke-restart 'muffle-warning)))))
-                 ,(if clear-fasls
-                      `(asdf:load-system ,sys-name :force t)
-                      `(asdf:load-system ,sys-name)))
-               (list :ok (length ,s-warns) (nreverse ,s-warns))))
-         ;; sb-ext:timeout is a serious-condition, not error, so it passes
-         ;; through the handler-bind (error ...) arm inside the form without
-         ;; being swallowed — only this outer handler-case arm catches it.
-         (sb-ext:timeout ()
-           (list :timeout ,(or timeout-seconds 120)))
-         (error (,s-e)
-           (list :error (map 'string #'identity (princ-to-string ,s-e))))))))
+                       ,(if clear-fasls
+                            `(asdf:load-system ,sys-name :force t)
+                            `(asdf:load-system ,sys-name)))
+                     (list :ok (length ,s-warns) (nreverse ,s-warns))))
+               ;; sb-ext:timeout is a serious-condition, not error — the
+               ;; earlier-clause rule routes it here, not to the arm below.
+               (sb-ext:timeout ()
+                 (list :timeout ,(or timeout-seconds 120)))
+               ;; serious-condition, not error: STORAGE-CONDITION and
+               ;; SB-SYS:INTERACTIVE-INTERRUPT are serious-but-not-error and
+               ;; would otherwise reach the image's debugger.
+               (serious-condition (,s-e)
+                 (list :error (map 'string #'identity
+                                   (princ-to-string ,s-e)))))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; load-system
