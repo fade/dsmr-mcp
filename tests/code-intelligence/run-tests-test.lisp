@@ -475,3 +475,33 @@ parachute are excluded; an unknown system resolves to NIL."
               (%resolve-test-packages "dsmr-scratch-umb/tests/suite-a")))
   ;; Unknown system: NIL, so the caller can choose the fallback.
   (false (%resolve-test-packages "dsmr-no-such-system-exists")))
+
+(define-test failure-reasons-survive-the-injected-form
+  "The injected run form carries failure names + reasons (bounded) back to
+the dispatcher, and the decoded envelope renders them: failed_tests holds
+one well-named entry per failing test (not a flat+nested duplicate), and
+the summary line names the failing test with a reason snippet — counts
+alone once hid a target-resolution crash."
+  (unless (find-package "DSMR-SCRATCH-REASONS-PROBE")
+    (make-package "DSMR-SCRATCH-REASONS-PROBE" :use '("COMMON-LISP")))
+  (let ((*package* (find-package "DSMR-SCRATCH-REASONS-PROBE")))
+    (eval (read-from-string
+           "(progn (parachute:define-test reasons-probe-passes (parachute:true t))
+                   (parachute:define-test reasons-probe-fails (parachute:is = 1 2)))")))
+  (let* ((form (%build-run-tests-form
+                "dsmr-scratch-reasons-probe" "parachute" nil nil 60 nil))
+         (raw (eval form))
+         (ht (dsmr-mcp/src/tools/run-tests::%decode-run-tests-result
+              raw "dsmr-scratch-reasons-probe" (get-internal-real-time))))
+    (is = 1 (gethash "passed" ht))
+    (is = 1 (gethash "failed" ht))
+    ;; Exactly one failure detail, carrying the TEST's name and a reason.
+    (let ((fails (gethash "failed_tests" ht)))
+      (is = 1 (length fails))
+      (let ((f (aref fails 0)))
+        (true (search "REASONS-PROBE-FAILS" (gethash "test_name" f)))
+        (true (plusp (length (gethash "reason" f))))))
+    ;; The rendered summary names the failure and includes reason text.
+    (let ((summary (gethash "text" (aref (gethash "content" ht) 0))))
+      (true (search "REASONS-PROBE-FAILS" summary))
+      (true (search "—" summary)))))

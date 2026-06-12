@@ -136,17 +136,30 @@ Returns a hash-table suitable for (result id ...)."
               (duration (or (getf plist :duration) elapsed-ms))
               (fw       (map 'string #'identity
                              (or (getf plist :framework) "unknown")))
+              ;; The injected form carries up to 10 (name reason) pairs so
+              ;; the summary can say WHAT failed; rebuild them as
+              ;; failure-detail hash-tables for the structured envelope.
+              (failures (coerce
+                         (mapcar (lambda (pair)
+                                   (make-ht "test_name"
+                                            (map 'string #'identity
+                                                 (or (first pair) "?"))
+                                            "reason"
+                                            (map 'string #'identity
+                                                 (or (second pair) ""))))
+                                 (getf plist :failures))
+                         'vector))
               (ht       (make-ht "passed"      passed
                                  "failed"      failed
                                  "pending"     pending
                                  "framework"   fw
                                  "duration_ms" duration
-                                 "failed_tests" #()
+                                 "failed_tests" failures
                                  "system"      (map 'string #'identity sys-name)
                                  "content"
                                  (text-content
                                   (test-result-summary passed failed pending
-                                                       fw duration nil)))))
+                                                       fw duration failures)))))
          ht))
       ;; Timeout
       ((and (listp raw) (eq (car raw) :timeout))
