@@ -31,6 +31,10 @@
                 #:%parachute-purge-ghost-suites
                 #:run-tests
                 #:%build-run-tests-form
+                #:%build-engine-ensure-form
+                #:*engine-source-path*
+                #:engine-source-path
+                #:engine-fingerprint
                 #:*test-debug-output*)
   (:import-from #:dsmr-mcp/src/tools/base
                 #:tool-handle)
@@ -380,3 +384,50 @@ cannot be READ in an attached image that does not have dsmr-mcp loaded."
   "%build-run-tests-form must emit no symbol from a DSMR-MCP-internal package."
   (is equal '() (%dsmr-package-leaks
                  (%build-run-tests-form "alexandria" nil nil nil 300 t))))
+
+(define-test engine-ensure-form-is-portable
+  "%build-engine-ensure-form must emit no symbol from a DSMR-MCP-internal
+package — it is READ in the attached image before the engine exists there."
+  (let ((path (engine-source-path)))
+    (is equal '() (%dsmr-package-leaks
+                   (%build-engine-ensure-form path (engine-fingerprint path))))))
+
+(define-test engine-bootstrap-version-gate
+  "The engine bootstrap reloads on fingerprint mismatch, not bare package
+presence. Sequence: a fresh ensure against the shipped engine loads and
+stamps (:LOADED) — or reports :CURRENT when an earlier leaf already
+stamped it — then an identical ensure is :CURRENT; then an ensure built
+against a MODIFIED engine copy (different fingerprint, same package
+already present) must reload (:LOADED) and make the copy's definitions
+live. Guards the long-lived-image upgrade path: package presence alone
+would pin an attached image to the first engine it ever loaded."
+  (let* ((orig (engine-source-path))
+         (fp1  (engine-fingerprint orig))
+         (tmp  (uiop:tmpize-pathname
+                (merge-pathnames "dsmr-stale-engine.lisp"
+                                 (uiop:temporary-directory)))))
+    (unwind-protect
+         (progn
+           ;; Gate settles on the shipped engine: second ensure is :CURRENT.
+           (eval (%build-engine-ensure-form orig fp1))
+           (is eq :current (eval (%build-engine-ensure-form orig fp1)))
+           ;; Stale path: a modified copy with a new fingerprint must reload
+           ;; even though the engine package already exists in this image.
+           (uiop:concatenate-files (list (pathname orig)) tmp)
+           (with-open-file (s tmp :direction :output :if-exists :append)
+             (write-line "(defparameter dsmr-mcp/src/test-runner-engine::*bootstrap-probe* 42)" s))
+           (let* ((tmp-path (map 'string #'identity (namestring (truename tmp))))
+                  (fp2 (engine-fingerprint tmp-path)))
+             (false (equal fp1 fp2))
+             (is eq :loaded (eval (%build-engine-ensure-form tmp-path fp2)))
+             ;; The reloaded copy's definitions are live in the image.
+             (let ((probe (find-symbol "*BOOTSTRAP-PROBE*"
+                                       :dsmr-mcp/src/test-runner-engine)))
+               (true (and probe (boundp probe) (eql 42 (symbol-value probe)))))
+             ;; And the stamp now carries the copy's fingerprint.
+             (let ((stamp (find-symbol "*LOADED-FINGERPRINT*"
+                                       :dsmr-mcp/src/test-runner-engine)))
+               (is equal fp2 (symbol-value stamp)))))
+      ;; Restore the pristine engine so later leaves see shipped definitions.
+      (eval (%build-engine-ensure-form orig fp1))
+      (ignore-errors (delete-file tmp)))))

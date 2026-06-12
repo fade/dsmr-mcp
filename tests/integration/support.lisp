@@ -151,8 +151,9 @@ load the worker system. Exits 0 on success, 7 on any build/resolution error."
 
 (defun %foreign-slynk-build-eval-program ()
   "The --eval program a build probe runs to mirror what the cross-process foreign
-child needs: load Quicklisp if present, then quickload slynk + alexandria. Exits
-0 on success, 7 on any resolution error."
+children need: load Quicklisp if present, then quickload slynk + alexandria +
+parachute (the wire leaf probes alexandria; the run-tests leaf runs a parachute
+suite). Exits 0 on success, 7 on any resolution error."
   (list
    "--eval" "(require :asdf)"
    "--eval" (concatenate 'string
@@ -160,7 +161,7 @@ child needs: load Quicklisp if present, then quickload slynk + alexandria. Exits
               "(when (and (probe-file q) (not (find-package :ql))) (load q)))")
    "--eval" (concatenate 'string
               "(handler-case (progn "
-              "(funcall (read-from-string \"ql:quickload\") (list :slynk :alexandria) :silent t) "
+              "(funcall (read-from-string \"ql:quickload\") (list :slynk :alexandria :parachute) :silent t) "
               "(sb-ext:exit :code 0)) "
               "(error (e) (format *error-output* \"BUILD-PROBE-FAILED: ~A~%\" e) "
               "(sb-ext:exit :code 7)))")))
@@ -226,7 +227,7 @@ hermetic worker system in this environment."
 
 (defun foreign-slynk-child-buildable ()
   "Memoized (values OK-P DETAIL): true iff a fresh child can quickload slynk +
-alexandria in this environment."
+alexandria + parachute in this environment."
   (%verdict '*foreign-slynk-child-build* #'%foreign-slynk-build-eval-program))
 
 (defun mcp-server-child-buildable ()
