@@ -27,7 +27,10 @@
   (:import-from #:dsmr-mcp/tests/support/json-asserts
                 #:jsonrpc-error-code
                 #:jsonrpc-result
-                #:gethash*))
+                #:gethash*)
+  (:import-from #:dsmr-mcp/tests/support/scoped-tools
+                #:unregister-tool
+                #:with-scoped-tools))
 
 (in-package #:dsmr-mcp/tests/protocol/argument-validation-test)
 
@@ -53,6 +56,12 @@
 
 (c2mop:ensure-finalized (find-class 'arg-val-test-tool))
 
+;; The metaclass registered the stub globally at finalization. Remove it:
+;; a test fixture must not be visible to anything that walks the registry
+;; (tools/list, the docs/tools.org parity renderer). The tests below hand
+;; the dispatcher a registry COPY carrying the stub, scoped dynamically.
+(unregister-tool "arg-val-test")
+
 (defmethod dsmr-mcp/src/tools/base:tool-handle ((tool arg-val-test-tool) id args)
   "This method should only be reached with valid args; returns ok."
   (result id (make-ht "ok" t)))
@@ -60,27 +69,31 @@
 ;;; Helpers -------------------------------------------------------------------
 
 (defun %initialize-and-call (tool-name arguments-json)
-  "Initialize a fresh session and call TOOL-NAME with ARGUMENTS-JSON.
+  "Initialize a fresh session and call TOOL-NAME with ARGUMENTS-JSON,
+with the stub tool visible through a scoped registry copy.
 Returns the parsed response object."
-  (let* ((session (make-session :id "av-test"))
-         (*current-session-id* "av-test"))
-    (process-json-line
-      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}"
-      session)
-    (jzon:parse
+  (with-scoped-tools (("arg-val-test" arg-val-test-tool))
+    (let* ((session (make-session :id "av-test"))
+           (*current-session-id* "av-test"))
       (process-json-line
-        (format nil
-                "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",~
-                 \"params\":{\"name\":\"~A\",\"arguments\":~A}}"
-                tool-name arguments-json)
-        session))))
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}"
+        session)
+      (jzon:parse
+        (process-json-line
+          (format nil
+                  "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",~
+                   \"params\":{\"name\":\"~A\",\"arguments\":~A}}"
+                  tool-name arguments-json)
+          session)))))
 
 ;;; Tests ---------------------------------------------------------------------
 
 (define-test missing-required-arg-returns-32602
   "Calling a tool with an empty arguments object when a required
 field exists returns -32602 Invalid Params."
-  (true (gethash "arg-val-test" *tool-classes*))
+  ;; The fixture must stay out of the global registry (tools/list and the
+  ;; docs parity renderer walk it); calls see it via the scoped copy.
+  (false (gethash "arg-val-test" *tool-classes*))
   (let ((obj (%initialize-and-call "arg-val-test" "{}")))
     (is = -32602 (jsonrpc-error-code obj))))
 

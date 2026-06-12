@@ -6,25 +6,6 @@
 # diverge from the schema the server actually advertises and fail the parity
 # test. Regenerate instead of editing.
 
-* arg-val-test
-
-Stub tool requiring a 'code' argument for validation tests.
-
-#+begin_src json
-{
-  "properties": {
-    "code": {
-      "description": "required code",
-      "type": "string"
-    }
-  },
-  "required": [
-    "code"
-  ],
-  "type": "object"
-}
-#+end_src
-
 * clgrep-search
 
 Lisp-aware semantic grep over .lisp/.asd/.cl/.lsp/.ros source files. 
@@ -894,25 +875,6 @@ headers. Returns a manifest of created files and next-step commands.
 }
 #+end_src
 
-* proto-test-echo
-
-Synthetic echo tool for tools-call tests.
-
-#+begin_src json
-{
-  "properties": {
-    "code": {
-      "description": "code to echo",
-      "type": "string"
-    }
-  },
-  "required": [
-    "code"
-  ],
-  "type": "object"
-}
-#+end_src
-
 * repl-eval
 
 Evaluate Common Lisp forms in the attached Slynk image. 
@@ -993,37 +955,6 @@ Requires attached or hermetic mode.
   },
   "required": [
     "system"
-  ],
-  "type": "object"
-}
-#+end_src
-
-* session-test-ping
-
-Synthetic ping tool used by session-test only.
-
-#+begin_src json
-{
-  "properties": {},
-  "required": [],
-  "type": "object"
-}
-#+end_src
-
-* tools-list-echo
-
-Echo stub for tools-list shape tests.
-
-#+begin_src json
-{
-  "properties": {
-    "msg": {
-      "description": "message",
-      "type": "string"
-    }
-  },
-  "required": [
-    "msg"
   ],
   "type": "object"
 }
