@@ -7,7 +7,7 @@ the system, running the server in each mode and transport, the cold test
 verification recipe, and a first smoke test.
 
 See also: [[file:index.org]], [[file:configuration.org]],
-[[file:modes-and-transports.org]], [[file:operations.org]].
+[[file:modes-and-transports.org]], [[file:operations.org]], [[file:testing.org]].
 
 * Prerequisites
 
@@ -126,24 +126,20 @@ DSMR_TRANSPORT=http DSMR_PORT=8080 DSMR_ALLOW_REMOTE=1 \
 
 * Running the test suite (cold verification)
 
-The test system is =dsmr-mcp/tests=. The reliable check is a *cold* run: clear
-the FASL cache and start a fresh SBCL so package-inferred dependency gaps
-cannot be masked by an already-warm image.
+Run the suite through the Makefile — the same targets a contributor and CI
+both use:
 
 #+begin_src sh
-# 1. Clear the SBCL FASL cache
-rm -rf ~/.cache/common-lisp/sbcl-*
-
-# 2. Fresh SBCL: load Quicklisp, quickload tests, run the suite
-sbcl --non-interactive \
-     --eval '(require :asdf)' \
-     --eval '(load "~/quicklisp/setup.lisp")' \
-     --eval '(ql:quickload :dsmr-mcp/tests :silent t)' \
-     --eval '(asdf:test-system :dsmr-mcp)'
+make test              # fast in-process unit suite
+make test-integration  # slow cross-process suite (gated)
 #+end_src
 
-=test-system= runs the Parachute suite. A green cold run is the build's
-acceptance signal.
+=make test= isolates its FASL cache to a project-local directory, so every
+run is effectively cold for the project's own files: package-inferred
+dependency gaps cannot be masked by an already-warm image. A green run is
+the build's acceptance signal. The full contributor reference — the
+fast-versus-gated split, the pinned SBCL build, and the cache guard — is in
+[[file:testing.org]].
 
 * First smoke test
 
@@ -155,8 +151,9 @@ trip means transport, protocol, and dispatch are all wired correctly. See
 
 * Wiring into an MCP client
 
-An install/configure helper utility is the recommended path for registering
-dsmr-mcp with MCP clients (e.g. adding it to your client's =mcpServers=
-configuration). The utility and the full client-wiring walkthrough are
-documented in [[file:configuration.org]] — use that as the entry point for
-client setup rather than editing client config by hand.
+The bundled installer (=sbcl --script scripts/install.lisp=) is the
+recommended path for registering dsmr-mcp with MCP clients (e.g. adding it
+to your client's =mcpServers= configuration). Its flags and the full
+client-wiring walkthrough are documented in [[file:configuration.org]] — use
+that as the entry point for client setup rather than editing client config
+by hand.

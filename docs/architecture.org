@@ -69,6 +69,13 @@ instance, validates the arguments against the tool's class-allocated
 schema (a missing required field becomes JSON-RPC =-32602=; an unknown
 tool name becomes =-32601=), and calls the tool's =tool-handle= method.
 
+On the way out, the dispatcher guarantees that every =tools/call= success
+carries renderable =content=: a tool that returns only structured fields gets
+a synthesized, size-bounded text block rendering those fields (and a warning
+is logged naming the tool), so no client ever displays an empty result for a
+call that succeeded. JSON-RPC errors and results that already carry content
+pass through untouched.
+
 * The two execution paths
 
 Every image-resident verb — evaluate, load a system, run tests, describe a
@@ -241,9 +248,12 @@ All logging goes through =log-event= in =src/log.lisp=, backed by log4cl. A
 single appender writes one structured JSON object per line to *stderr* —
 never stdout, because stdout is the JSON-RPC channel and a stray log line
 there would corrupt the protocol. The threshold is set from =DSMR_LOG_LEVEL=
-at startup. The stdio transport additionally guards dispatch by rebinding
-=*standard-output*= so stray library prints are captured and logged rather
-than leaking onto the wire.
+at startup. On the stdio transport the protection is process-wide: before
+serving, the server claims the stdio streams for the wire and re-points the
+global standard-stream specials for every thread — output specials to
+stderr, input specials to an always-EOF stream — so no library code on any
+thread, including threads spawned later (Slynk dispatchers, pool workers),
+can touch the JSON-RPC channel.
 
 * Module map
 
@@ -277,5 +287,11 @@ A guide to the main areas under =src/=.
   (=src/cst.lisp=, =src/lisp-edit-form*.lisp=, =src/lisp-patch-form.lisp=,
   =src/parinfer.lisp=, =src/validate.lisp=).
 - =src/project-scaffold*.lisp= — project skeleton generation.
+- =src/install.lisp=, =src/install/= — the install/configure helper behind
+  =scripts/install.lisp= (client-config wiring, cl-mcp migration).
+- =src/elicitation.lisp=, =src/envrc-init.lisp=, =src/envrc-template.lisp= —
+  the consent-gated per-project =.envrc= offer and its template.
+- =src/package-context.lisp= — lenient package-context synthesis for the
+  structural file-reading verbs.
 - =src/log.lisp= (structured logging), =src/notify.lisp= (notification
   channels), =src/wire-strings.lisp= (wire-string normalisation).

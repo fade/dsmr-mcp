@@ -25,7 +25,10 @@
   (:import-from #:dsmr-mcp/tests/support/json-asserts
                 #:jsonrpc-error-code
                 #:jsonrpc-result
-                #:gethash*))
+                #:gethash*)
+  (:import-from #:dsmr-mcp/tests/support/scoped-tools
+                #:unregister-tool
+                #:with-scoped-tools))
 
 (in-package #:dsmr-mcp/tests/transport/stdio-test)
 
@@ -131,6 +134,11 @@ the OUT stream; all lines on OUT must still parse as valid JSON."
       :allocation :class :initform '(:object :properties () :required ())))
     (:metaclass mcp-tool-class))
   (c2mop:ensure-finalized (find-class 'stdio-leak-tool))
+  ;; The defclass above runs at TEST time, so without this the fixture would
+  ;; sit in the global registry from this test onward — visible to tools/list
+  ;; and the docs/tools.org parity renderer, and dependent on test order.
+  ;; Scrub it and serve the call through a scoped registry copy instead.
+  (unregister-tool "stdio-leak-tool")
 
   (defmethod tool-handle ((tool stdio-leak-tool) id args)
     (declare (ignore args))
@@ -138,25 +146,26 @@ the OUT stream; all lines on OUT must still parse as valid JSON."
     (dsmr-mcp/src/tools/helpers:result id (dsmr-mcp/src/tools/helpers:make-ht "ok" t)))
 
   ;; Run an initialize + tools/call for the leaking tool.
-  (let* ((call-req (format nil
-                            "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/call\",~
-                             \"params\":{\"name\":\"stdio-leak-tool\",\"arguments\":{}}}"))
-         (lines (list (%init-req 1)
-                      (%notif-initialized)
-                      call-req))
-         (input  (make-string-input-stream (format nil "~{~A~%~}" lines)))
-         (output (make-string-output-stream)))
-    (serve-streams input output)
-    (let ((out-str (get-output-stream-string output)))
-      ;; "LEAK" must NOT appear on OUT.
-      (false (search "LEAK" out-str))
-      ;; Every non-empty line on OUT must be valid JSON.
-      (let ((split (remove "" (uiop:split-string out-str
-                                                  :separator (list #\Newline))
-                            :test #'string=)))
-        (is >= 2 (length split))
-        (dolist (line split)
-          (true (hash-table-p (jzon:parse line))))))))
+  (with-scoped-tools (("stdio-leak-tool" stdio-leak-tool))
+    (let* ((call-req (format nil
+                              "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/call\",~
+                               \"params\":{\"name\":\"stdio-leak-tool\",\"arguments\":{}}}"))
+           (lines (list (%init-req 1)
+                        (%notif-initialized)
+                        call-req))
+           (input  (make-string-input-stream (format nil "~{~A~%~}" lines)))
+           (output (make-string-output-stream)))
+      (serve-streams input output)
+      (let ((out-str (get-output-stream-string output)))
+        ;; "LEAK" must NOT appear on OUT.
+        (false (search "LEAK" out-str))
+        ;; Every non-empty line on OUT must be valid JSON.
+        (let ((split (remove "" (uiop:split-string out-str
+                                                    :separator (list #\Newline))
+                              :test #'string=)))
+          (is >= 2 (length split))
+          (dolist (line split)
+            (true (hash-table-p (jzon:parse line)))))))))
 
 (define-test oversized-line-with-trailing-newline-emits-error-and-continues
   "An oversized line (exceeds +max-json-line-bytes+) followed by a terminating
