@@ -938,6 +938,10 @@ Requires :slynk-attach / DSMR_SLYNK_ATTACH to be configured.
     "register_result": {
       "description": "When true (the default), registers the last form's first \nreturn value in the image-resident handle table and returns result_object_id. \nSet to false to suppress registration for hot loops or uninteresting results.",
       "type": "boolean"
+    },
+    "timeout_seconds": {
+      "description": "Seconds to wait for the eval's reply before returning a \nconnection error (default: 30). Raise for long-running forms such as big \ncompiles. The bound applies to the wait for the reply; the form itself is \nnot interrupted in the attached image.",
+      "type": "integer"
     }
   },
   "required": [

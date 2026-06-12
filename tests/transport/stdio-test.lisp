@@ -11,7 +11,11 @@
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/transport/stdio
                 #:serve-streams
+                #:isolate-stdio-wire
                 #:+max-json-line-bytes+)
+  (:import-from #:bordeaux-threads
+                #:make-thread
+                #:join-thread)
   (:import-from #:dsmr-mcp/src/state
                 #:make-session)
   (:import-from #:dsmr-mcp/src/tools/base
@@ -197,3 +201,60 @@ unbounded hostile stream.  Uses a small bound via let-rebind."
            (result (serve-streams input output)))
       ;; serve-streams must return (not block) — the result is T (terminated).
       (true (eq t result)))))
+
+(define-test wire-isolation-walls-off-fresh-threads
+  "isolate-stdio-wire must (a) hand back the original stdio streams as the
+private wire, (b) make a FRESH thread's *standard-output* / *trace-output*
+writes land on the stderr side instead of the wire, (c) make a fresh
+thread's reads of *standard-input* and *terminal-io* see immediate EOF so a
+stray read-line can never eat a JSON-RPC request, and (d) restore every
+re-pointed special when the returned thunk runs.
+
+The per-request stdout guard cannot provide any of this: it rebinds
+thread-locally on the serve loop thread, and slynk-client event dispatchers
+(the observed poisoning source) run on their own threads, which see the
+global stream values."
+  (let ((fake-wire   (make-string-output-stream))
+        (fake-in     (make-string-input-stream ""))
+        (err-capture (make-string-output-stream))
+        (old-global-err (sb-ext:symbol-global-value '*error-output*))
+        (old-global-out (sb-ext:symbol-global-value '*standard-output*)))
+    (unwind-protect
+         ;; Fresh threads resolve the stderr synonym stream against the
+         ;; GLOBAL *error-output*, so capture must be installed globally.
+         (progn
+           (setf (sb-ext:symbol-global-value '*error-output*) err-capture)
+           (let ((*standard-input*  fake-in)
+                 (*standard-output* fake-wire))
+             (multiple-value-bind (wire-out wire-in restore)
+                 (isolate-stdio-wire)
+               (unwind-protect
+                    (let ((stdin-read :unset)
+                          (terminal-read :unset))
+                      ;; (a) The wire is the stream pair we came in with.
+                      (is eq fake-wire wire-out)
+                      (is eq fake-in   wire-in)
+                      ;; (b)+(c) Observed from a thread created AFTER the
+                      ;; isolation call — the poisoning scenario.
+                      (join-thread
+                       (make-thread
+                        (lambda ()
+                          (format t "leaked-stdout")
+                          (format *trace-output* "leaked-trace")
+                          (setf stdin-read
+                                (read-line *standard-input* nil :eof))
+                          (setf terminal-read
+                                (read-line *terminal-io* nil :eof)))))
+                      (is eq :eof stdin-read)
+                      (is eq :eof terminal-read)
+                      ;; Nothing reached the wire.
+                      (is equal "" (get-output-stream-string fake-wire))
+                      ;; Both leaks drained to the stderr side.
+                      (let ((err-text (get-output-stream-string err-capture)))
+                        (true (search "leaked-stdout" err-text))
+                        (true (search "leaked-trace" err-text))))
+                 (funcall restore))
+               ;; (d) The restore thunk put the globals back.
+               (is eq old-global-out
+                   (sb-ext:symbol-global-value '*standard-output*)))))
+      (setf (sb-ext:symbol-global-value '*error-output*) old-global-err))))

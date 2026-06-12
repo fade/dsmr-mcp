@@ -37,6 +37,9 @@
 
 (defpackage #:dsmr-mcp/src/transport/stdio
   (:use #:cl)
+  (:import-from #:bordeaux-threads
+                #:make-lock
+                #:with-lock-held)
   (:import-from #:dsmr-mcp/src/state
                 #:make-session
                 #:session-id
@@ -45,11 +48,14 @@
                 #:process-json-line)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
+  (:import-from #:sb-ext)
   (:export #:serve-streams
+           #:isolate-stdio-wire
            #:+max-json-line-bytes+
            #:line-too-long
            #:%read-line-limited
-           #:%dispatch-with-stdout-guard))
+           #:%dispatch-with-stdout-guard
+           #:%write-wire-line))
 
 (in-package #:dsmr-mcp/src/transport/stdio)
 
@@ -131,6 +137,96 @@ is non-empty."
     (values response (get-output-stream-string capture))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Process-wide wire isolation
+;;; ---------------------------------------------------------------------------
+;;;
+;;; %dispatch-with-stdout-guard above is thread-local: it protects the wire
+;;; from tool code running on the serve loop thread, and nothing else.  Any
+;;; OTHER thread in the image — a Slynk client event dispatcher, a worker
+;;; pool thread, a library timer — sees the GLOBAL values of the standard
+;;; streams, and on a stdio server those point at the JSON-RPC wire.  A
+;;; single stray print from such a thread corrupts the protocol stream and
+;;; the client tears the connection down.
+;;;
+;;; isolate-stdio-wire closes that hole at the process level: it captures
+;;; the real stdio streams privately for the wire, then re-points the global
+;;; standard streams so that
+;;;   - all output specials drain to *error-output* (stderr), and
+;;;   - all input specials read from an always-EOF stream — stdin IS the
+;;;     request wire, so a stray (read-line) anywhere must never eat a
+;;;     JSON-RPC request.
+;;; After this, no thread can reach the wire except through the two captured
+;;; stream objects, which only serve-streams holds.
+
+(defparameter *isolated-stream-specials*
+  '(*standard-input* *standard-output* *trace-output*
+    *terminal-io* *debug-io* *query-io*)
+  "The standard stream specials re-pointed by isolate-stdio-wire.
+*error-output* is deliberately absent: stderr is the one channel that must
+keep working as-is — it is where everything else is redirected to.")
+
+(defun isolate-stdio-wire ()
+  "Claim the current stdio streams for the JSON-RPC wire and wall off the
+global standard streams from every thread in the process.
+
+Captures *STANDARD-INPUT* / *STANDARD-OUTPUT* (the wire), then sets BOTH the
+thread-local and the global value of each special in
+*ISOLATED-STREAM-SPECIALS*:
+  output specials -> a synonym stream of *ERROR-OUTPUT*
+  input specials  -> an empty (always-EOF) concatenated stream
+  *TERMINAL-IO*   -> a two-way stream of the two above
+Threads created after this call inherit the global values, so no library
+code on any thread can write to — or read from — the wire again.
+
+Returns three values: WIRE-OUT, WIRE-IN, and a restore thunk that puts every
+saved value back (used by tests and by the server's unwind path; for the
+real server process the restore is moot — the process exits)."
+  (let* ((wire-in    *standard-input*)
+         (wire-out   *standard-output*)
+         (to-stderr  (make-synonym-stream '*error-output*))
+         (always-eof (make-concatenated-stream))
+         (terminal   (make-two-way-stream always-eof to-stderr))
+         (saved-globals (mapcar (lambda (sym)
+                                  (cons sym (sb-ext:symbol-global-value sym)))
+                                *isolated-stream-specials*))
+         (saved-locals  (mapcar (lambda (sym)
+                                  (cons sym (symbol-value sym)))
+                                *isolated-stream-specials*)))
+    (flet ((repoint (sym value)
+             ;; Global value first (covers threads created from here on),
+             ;; then the current binding (covers this thread, which may be
+             ;; running under a dynamic rebinding, e.g. a test harness).
+             (setf (sb-ext:symbol-global-value sym) value)
+             (setf (symbol-value sym) value)))
+      (repoint '*standard-input*  always-eof)
+      (repoint '*standard-output* to-stderr)
+      (repoint '*trace-output*    to-stderr)
+      (repoint '*terminal-io*     terminal)
+      (repoint '*debug-io*        (make-synonym-stream '*terminal-io*))
+      (repoint '*query-io*        (make-synonym-stream '*terminal-io*))
+      (values wire-out
+              wire-in
+              (lambda ()
+                (dolist (entry saved-globals)
+                  (setf (sb-ext:symbol-global-value (car entry)) (cdr entry)))
+                (dolist (entry saved-locals)
+                  (setf (symbol-value (car entry)) (cdr entry))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Serialized wire writes
+;;; ---------------------------------------------------------------------------
+
+(defun %write-wire-line (line out lock)
+  "Write LINE + newline to OUT and FORCE-OUTPUT, holding LOCK.
+The stdio loop is single-threaded today (stdio sessions carry a
+null notify-channel and the elicitation round-trip runs in-line on the loop
+thread), so the lock is the single-writer guarantee for any future
+server-initiated message path, not a fix for a current race."
+  (with-lock-held (lock)
+    (write-line line out)
+    (force-output out)))
+
+;;; ---------------------------------------------------------------------------
 ;;; Entry point
 ;;; ---------------------------------------------------------------------------
 
@@ -165,7 +261,8 @@ Divergences from cl-mcp src/run.lisp:
   - detach-session closes the attached Slynk connection on teardown; called
     before the stdio.stop log via runtime symbol resolution so this file
     compiles before dsmr-mcp/src/attach/dispatch is loaded."
-  (let ((*current-session-id* (session-id session)))
+  (let ((*current-session-id* (session-id session))
+        (write-lock (make-lock "dsmr-stdio-wire-write")))
     (log-event :info "stdio.start" "session" (session-id session))
     (unwind-protect
          (loop
@@ -196,11 +293,9 @@ Divergences from cl-mcp src/run.lisp:
                ;; Oversized line — emit the literal error envelope and continue.
                ((eq line :too-long)
                 (handler-case
-                    (progn
-                      (write-line
-                       "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"Request too large\"}}"
-                       out)
-                      (force-output out))
+                    (%write-wire-line
+                     "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"Request too large\"}}"
+                     out write-lock)
                   (stream-error (e)
                     (log-event :warn "stdio.write.error"
                                "error" (princ-to-string e))
@@ -234,9 +329,7 @@ Divergences from cl-mcp src/run.lisp:
                                                   (min 200 (length captured)))))
                   (when resp
                     (handler-case
-                        (progn
-                          (write-line resp out)
-                          (force-output out))
+                        (%write-wire-line resp out write-lock)
                       (stream-error (e)
                         (log-event :warn "stdio.write.error"
                                    "error" (princ-to-string e))
