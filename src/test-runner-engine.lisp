@@ -409,27 +409,32 @@ test sub-systems in a package-inferred layout."
 
 (defun %parachute-result-counts (result-obj)
   "Walk a Parachute test-result or parent-result tree and return
-(values passed failed pending) counts."
-  (let ((passed 0) (failed 0) (pending 0))
+(values passed failed pending) counts.
+
+A report's RESULTS vector lists every recorded result FLAT while each
+test-result also nests its own children, so the same comparison-result is
+reachable twice; the EQ visited set counts each result exactly once
+(without it a 1-pass/1-fail suite reads as 2/2)."
+  (let ((passed 0) (failed 0) (pending 0)
+        (seen (make-hash-table :test 'eq)))
     (labels ((count-result (r)
-               (let* ((pkg (find-package :org.shirakumo.parachute))
-                      (status-fn (and pkg (find-symbol "STATUS" pkg)))
-                      (results-fn (and pkg (find-symbol "RESULTS" pkg)))
-                      (status (and status-fn (ignore-errors (funcall status-fn r)))))
-                 (cond
-                   ;; If this is a leaf result (not a parent-result), count it.
-                   ((not (ignore-errors (funcall results-fn r)))
-                    (case status
-                      (:passed (incf passed))
-                      (:failed (incf failed))
-                      (:skipped (incf pending))
-                      (t)))
-                   ;; Parent result: recurse into children.
-                   (t
-                    (let ((children (ignore-errors (funcall results-fn r))))
-                      (when children
-                        (dotimes (i (length children))
-                          (count-result (aref children i))))))))))
+               (unless (gethash r seen)
+                 (setf (gethash r seen) t)
+                 (let* ((pkg (find-package :org.shirakumo.parachute))
+                        (status-fn (and pkg (find-symbol "STATUS" pkg)))
+                        (results-fn (and pkg (find-symbol "RESULTS" pkg)))
+                        (status (and status-fn (ignore-errors (funcall status-fn r))))
+                        (children (ignore-errors (funcall results-fn r))))
+                   (if (and children (plusp (length children)))
+                       ;; Parent result: recurse into children.
+                       (dotimes (i (length children))
+                         (count-result (aref children i)))
+                       ;; Leaf result: count it.
+                       (case status
+                         (:passed (incf passed))
+                         (:failed (incf failed))
+                         (:skipped (incf pending))
+                         (t)))))))
       (count-result result-obj))
     (values passed failed pending)))
 
