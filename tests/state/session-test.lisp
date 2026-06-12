@@ -23,6 +23,9 @@
                 #:jsonrpc-error-code
                 #:jsonrpc-result
                 #:gethash*)
+  (:import-from #:dsmr-mcp/tests/support/scoped-tools
+                #:unregister-tool
+                #:with-scoped-tools)
   ;; Use :shadowing-import-from so helpers:result wins over parachute:result.
   ;; parachute:result is a low-level timing accessor unused in these tests.
   (:shadowing-import-from #:dsmr-mcp/src/tools/helpers
@@ -38,8 +41,7 @@
 (in-package #:dsmr-mcp/tests/state/session-test)
 
 ;;; Synthetic tool subclass for in-test auto-registration -----------------
-;;; This class is defined in the test file as recommended by Open-Question
-;;; Q1 in 01-RESEARCH.md. It exercises the metaclass machinery without
+;;; Defined in the test file so the metaclass machinery is exercised without
 ;;; shipping any real tool in the production tree.
 ;;;
 ;;; NOTE: class-allocated slots are initialized via :initform on the slot
@@ -69,10 +71,21 @@
     :initform '(:object :properties () :required ())))
   (:metaclass mcp-tool-class))
 
-;; Force finalization so *tool-classes* is populated at load time.
-;; Without this, SBCL may delay finalization until first instantiation
-;; (closer-mop pitfall documented in 01-PATTERNS.md).
+;; Force finalization so the registration hook fires at load time. Without
+;; this, SBCL may delay finalization until first instantiation, so the
+;; finalize-inheritance :after registration would never run.
 (c2mop:ensure-finalized (find-class 'session-test-ping-tool))
+
+;; Capture the registration fact the auto-registration test asserts, then
+;; scrub the fixture from the global registry: a test stub must not be
+;; visible to anything that walks it (tools/list, the docs/tools.org parity
+;; renderer). Tests that need the stub use a scoped registry copy.
+(defparameter *ping-registered-at-load-p*
+  (and (gethash "session-test-ping" *tool-classes*) t)
+  "Whether the metaclass hook registered the stub at class-definition time,
+captured before the fixture is removed from the global registry.")
+
+(unregister-tool "session-test-ping")
 
 ;;; Session unit tests -------------------------------------------------------
 
@@ -89,25 +102,30 @@ tool-instances table. The session-id matches the supplied :id keyword."
   "A defclass subclassing mcp-tool with :metaclass mcp-tool-class
 auto-registers in *tool-classes* under its :name string at class-
 definition time — no register-tool call required. The abstract mcp-tool
-base class itself is NOT registered."
-  ;; The synthetic tool above was defined and ensure-finalized'd at load.
-  (true (gethash "session-test-ping" *tool-classes*))
+base class itself is NOT registered, and the test fixture is scrubbed
+from the global registry after the fact is captured."
+  ;; The synthetic tool above was defined and ensure-finalized'd at load;
+  ;; the hook's effect was captured before the fixture was unregistered.
+  (true *ping-registered-at-load-p*)
   ;; mcp-tool is abstract and must NOT appear in the registry.
-  (false (gethash "mcp-tool" *tool-classes*)))
+  (false (gethash "mcp-tool" *tool-classes*))
+  ;; The fixture itself must no longer be globally visible.
+  (false (gethash "session-test-ping" *tool-classes*)))
 
 (define-test per-session-instance-identity
   "get-tool-instance returns the SAME (eq) object on two calls for the
 same (session, tool-name) pair. Different sessions return different
 instances (non-eq)."
-  (let* ((s1 (make-session :id "s1"))
-         (s2 (make-session :id "s2"))
-         (i1a (get-tool-instance s1 "session-test-ping"))
-         (i1b (get-tool-instance s1 "session-test-ping"))
-         (i2  (get-tool-instance s2 "session-test-ping")))
-    ;; Same session, same tool → same object.
-    (true (eq i1a i1b))
-    ;; Different sessions → different objects.
-    (false (eq i1a i2))))
+  (with-scoped-tools (("session-test-ping" session-test-ping-tool))
+    (let* ((s1 (make-session :id "s1"))
+           (s2 (make-session :id "s2"))
+           (i1a (get-tool-instance s1 "session-test-ping"))
+           (i1b (get-tool-instance s1 "session-test-ping"))
+           (i2  (get-tool-instance s2 "session-test-ping")))
+      ;; Same session, same tool → same object.
+      (true (eq i1a i1b))
+      ;; Different sessions → different objects.
+      (false (eq i1a i2)))))
 
 (define-test session-id-no-leak
   "*current-session-id* is a defvar; a let-binding inside one body does

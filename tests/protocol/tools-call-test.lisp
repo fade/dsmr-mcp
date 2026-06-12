@@ -26,7 +26,10 @@
   (:import-from #:dsmr-mcp/tests/support/json-asserts
                 #:jsonrpc-error-code
                 #:jsonrpc-result
-                #:gethash*))
+                #:gethash*)
+  (:import-from #:dsmr-mcp/tests/support/scoped-tools
+                #:unregister-tool
+                #:with-scoped-tools))
 
 (in-package #:dsmr-mcp/tests/protocol/tools-call-test)
 
@@ -50,6 +53,12 @@
   (:metaclass mcp-tool-class))
 
 (c2mop:ensure-finalized (find-class 'proto-test-echo-tool))
+
+;; The metaclass registered the stub globally at finalization. Remove it:
+;; a test fixture must not be visible to anything that walks the registry
+;; (tools/list, the docs/tools.org parity renderer). The test below hands
+;; the dispatcher a registry COPY carrying the stub, scoped dynamically.
+(unregister-tool "proto-test-echo")
 
 (defmethod dsmr-mcp/src/tools/base:tool-handle ((tool proto-test-echo-tool) id args)
   "Return the supplied code value in a result envelope."
@@ -81,20 +90,23 @@
       (is = -32601 (jsonrpc-error-code obj)))))
 
 (define-test known-tool-valid-args-returns-result
-  "tools/call for a registered stub tool with valid arguments
+  "tools/call for a scoped stub tool with valid arguments
 returns a structured success result (no error key)."
-  (true (gethash "proto-test-echo" *tool-classes*))
-  (let* ((session (make-session :id "tc-valid"))
-         (*current-session-id* "tc-valid"))
-    (%initialize-session session)
-    (let* ((resp (process-json-line
-                   "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"proto-test-echo\",\"arguments\":{\"code\":\"hello\"}}}"
-                   session))
-           (obj (jzon:parse resp)))
-      ;; No error.
-      (false (gethash "error" obj))
-      ;; Result is present.
-      (true (hash-table-p (gethash "result" obj)))
-      ;; Our tool echoes back the code.
-      (is equal t (gethash "ok" (gethash "result" obj)))
-      (is equal "hello" (gethash "code" (gethash "result" obj))))))
+  ;; The fixture must stay out of the global registry (tools/list and the
+  ;; docs parity renderer walk it); the call sees it via the scoped copy.
+  (false (gethash "proto-test-echo" *tool-classes*))
+  (with-scoped-tools (("proto-test-echo" proto-test-echo-tool))
+    (let* ((session (make-session :id "tc-valid"))
+           (*current-session-id* "tc-valid"))
+      (%initialize-session session)
+      (let* ((resp (process-json-line
+                     "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"proto-test-echo\",\"arguments\":{\"code\":\"hello\"}}}"
+                     session))
+             (obj (jzon:parse resp)))
+        ;; No error.
+        (false (gethash "error" obj))
+        ;; Result is present.
+        (true (hash-table-p (gethash "result" obj)))
+        ;; Our tool echoes back the code.
+        (is equal t (gethash "ok" (gethash "result" obj)))
+        (is equal "hello" (gethash "code" (gethash "result" obj)))))))

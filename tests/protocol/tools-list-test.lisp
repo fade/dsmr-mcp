@@ -25,7 +25,10 @@
   (:import-from #:dsmr-mcp/tests/support/json-asserts
                 #:jsonrpc-error-code
                 #:jsonrpc-result
-                #:gethash*))
+                #:gethash*)
+  (:import-from #:dsmr-mcp/tests/support/scoped-tools
+                #:unregister-tool
+                #:with-scoped-tools))
 
 (in-package #:dsmr-mcp/tests/protocol/tools-list-test)
 
@@ -50,6 +53,12 @@
   (:metaclass mcp-tool-class))
 
 (c2mop:ensure-finalized (find-class 'tools-list-echo-tool))
+
+;; The metaclass registered the stub globally at finalization. Remove it:
+;; a test fixture must not be visible to anything that walks the registry
+;; (tools/list, the docs/tools.org parity renderer). The tests below hand
+;; the protocol layer a registry COPY carrying the stub, scoped dynamically.
+(unregister-tool "tools-list-echo")
 
 (defmethod dsmr-mcp/src/tools/base:tool-handle ((tool tools-list-echo-tool) id args)
   (result id (make-ht "echoed" (and args (gethash "msg" args)))))
@@ -80,42 +89,45 @@ arrays). We assert with (vectorp tools) to match jzon's type mapping."
       (true (vectorp tools)))))
 
 (define-test tools-list-stub-tool-registered
-  "The tools-list-echo stub tool is registered and appears in
+  "The tools-list-echo stub tool, scoped into a registry copy, appears in
 tools/list with the expected name, description, and inputSchema."
-  ;; Confirm registration before testing.
-  (true (gethash "tools-list-echo" *tool-classes*))
-  (let* ((session (make-session :id "tl-stub"))
-         (*current-session-id* "tl-stub"))
-    (%do-initialize session)
-    (let* ((resp (process-json-line
-                   "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}"
-                   session))
-           (obj (jzon:parse resp))
-           (tools (gethash* obj "result" "tools"))
-           ;; Find our specific tool among all registered tools.
-           (echo-desc (loop for d across tools
-                            when (equal "tools-list-echo" (gethash "name" d))
-                            return d)))
-      (true echo-desc)
-      (is equal "tools-list-echo" (gethash "name" echo-desc))
-      (is equal "Echo stub for tools-list shape tests." (gethash "description" echo-desc))
-      (true (hash-table-p (gethash "inputSchema" echo-desc))))))
+  ;; The fixture must stay out of the global registry (the docs parity
+  ;; renderer walks it); tools/list sees it via the scoped copy.
+  (false (gethash "tools-list-echo" *tool-classes*))
+  (with-scoped-tools (("tools-list-echo" tools-list-echo-tool))
+    (let* ((session (make-session :id "tl-stub"))
+           (*current-session-id* "tl-stub"))
+      (%do-initialize session)
+      (let* ((resp (process-json-line
+                     "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}"
+                     session))
+             (obj (jzon:parse resp))
+             (tools (gethash* obj "result" "tools"))
+             ;; Find our specific tool among all registered tools.
+             (echo-desc (loop for d across tools
+                              when (equal "tools-list-echo" (gethash "name" d))
+                              return d)))
+        (true echo-desc)
+        (is equal "tools-list-echo" (gethash "name" echo-desc))
+        (is equal "Echo stub for tools-list shape tests." (gethash "description" echo-desc))
+        (true (hash-table-p (gethash "inputSchema" echo-desc)))))))
 
 (define-test tools-list-input-schema-has-required
   "The inputSchema for the stub tool has a \"required\" key that
 is a vector (not a list or nil)."
-  (let* ((session (make-session :id "tl-schema"))
-         (*current-session-id* "tl-schema"))
-    (%do-initialize session)
-    (let* ((resp (process-json-line
-                   "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}"
-                   session))
-           (obj (jzon:parse resp))
-           (tools (gethash* obj "result" "tools"))
-           (echo-desc (loop for d across tools
-                            when (equal "tools-list-echo" (gethash "name" d))
-                            return d)))
-      (when echo-desc
+  (with-scoped-tools (("tools-list-echo" tools-list-echo-tool))
+    (let* ((session (make-session :id "tl-schema"))
+           (*current-session-id* "tl-schema"))
+      (%do-initialize session)
+      (let* ((resp (process-json-line
+                     "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}"
+                     session))
+             (obj (jzon:parse resp))
+             (tools (gethash* obj "result" "tools"))
+             (echo-desc (loop for d across tools
+                              when (equal "tools-list-echo" (gethash "name" d))
+                              return d)))
+        (true echo-desc)
         (let ((schema (gethash "inputSchema" echo-desc)))
           (is equal "object" (gethash "type" schema))
           (true (vectorp (gethash "required" schema)))
