@@ -26,6 +26,8 @@
   (:use #:cl #:parachute)
   (:import-from #:dsmr-mcp/tests/support/slynk-fixture
                 #:with-temporary-slynk-listener)
+  (:import-from #:dsmr-mcp/src/test-runner-engine
+                #:%resolve-test-packages)
   (:import-from #:dsmr-mcp/src/test-runner-core
                 #:detect-test-framework
                 #:%parachute-purge-ghost-suites
@@ -431,3 +433,45 @@ would pin an attached image to the first engine it ever loaded."
       ;; Restore the pristine engine so later leaves see shipped definitions.
       (eval (%build-engine-ensure-form orig fp1))
       (ignore-errors (delete-file tmp)))))
+
+(define-test resolver-handles-umbrella-systems
+  "%resolve-test-packages: a same-named package with tests short-circuits
+\(1:1 fast path); an umbrella system with NO same-named package resolves
+through its :depends-on closure to the sub-packages that contain tests,
+constrained to subsystems of the same primary system — a dependency from a
+DIFFERENT primary (even one full of tests) and framework deps like
+parachute are excluded; an unknown system resolves to NIL."
+  ;; Scratch umbrella: two test-bearing sub-packages, one foreign-primary
+  ;; dep that must be excluded, parachute in :depends-on as in real
+  ;; umbrellas. In-memory defsystems are fine — the resolver only READS.
+  (dolist (spec '("(asdf:defsystem \"dsmr-scratch-umb/tests\"
+                     :depends-on (\"parachute\"
+                                  \"dsmr-mcp/tests/state/session-test\"
+                                  \"dsmr-scratch-umb/tests/suite-a\"
+                                  \"dsmr-scratch-umb/tests/suite-b\"))"
+                  "(asdf:defsystem \"dsmr-scratch-umb/tests/suite-a\")"
+                  "(asdf:defsystem \"dsmr-scratch-umb/tests/suite-b\")"))
+    (eval (read-from-string spec)))
+  (dolist (name '("DSMR-SCRATCH-UMB/TESTS/SUITE-A"
+                  "DSMR-SCRATCH-UMB/TESTS/SUITE-B"))
+    (unless (find-package name)
+      (make-package name :use '("COMMON-LISP")))
+    (let ((*package* (find-package name)))
+      (eval (read-from-string
+             "(parachute:define-test umb-scratch-probe (parachute:true t))"))))
+  ;; Umbrella: exactly the two same-primary, test-bearing sub-packages.
+  (let ((resolved (%resolve-test-packages "dsmr-scratch-umb/tests")))
+    (is = 2 (length resolved))
+    (true (member "DSMR-SCRATCH-UMB/TESTS/SUITE-A" resolved
+                  :key #'package-name :test #'string=))
+    (true (member "DSMR-SCRATCH-UMB/TESTS/SUITE-B" resolved
+                  :key #'package-name :test #'string=))
+    ;; The foreign-primary dep has tests but must not be swept in.
+    (false (member "DSMR-MCP/TESTS/STATE/SESSION-TEST" resolved
+                   :key #'package-name :test #'string=)))
+  ;; 1:1 fast path: a test-bearing package named like the system.
+  (is equal '("DSMR-SCRATCH-UMB/TESTS/SUITE-A")
+      (mapcar #'package-name
+              (%resolve-test-packages "dsmr-scratch-umb/tests/suite-a")))
+  ;; Unknown system: NIL, so the caller can choose the fallback.
+  (false (%resolve-test-packages "dsmr-no-such-system-exists")))
