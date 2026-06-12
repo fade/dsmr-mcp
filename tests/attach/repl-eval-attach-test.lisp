@@ -33,7 +33,12 @@
                 #:try-eager-connect
                 #:detach-session)
   (:import-from #:dsmr-mcp/src/attach/connection
-                #:parse-slynk-attach)
+                #:parse-slynk-attach
+                #:drop-connection)
+  (:import-from #:bordeaux-threads
+                #:all-threads
+                #:thread-name
+                #:thread-alive-p)
   (:import-from #:dsmr-mcp/src/state
                 #:make-session
                 #:*current-session-id*
@@ -326,6 +331,34 @@ itself fail and fall through to the debugger."
       (let ((restarts (gethash "restarts" ec)))
         (true (or (null restarts)
                   (and (vectorp restarts) (zerop (length restarts)))))))))
+
+(define-test drop-connection-closes-socket-and-dispatcher-exits
+  "drop-connection best-effort-closes the abandoned connection's socket, so
+the client-side event-dispatcher thread gets EOF and exits promptly. An
+abandoned dispatcher would otherwise linger for the life of the process and
+print any late protocol event arriving on the dead connection."
+  (let ((port (slynk:create-server :port 0 :dont-close t)))
+    (unwind-protect
+         (progn
+           (sleep 0.1)
+           (let* ((before (all-threads))
+                  (conn   (slynk-client:slime-connect "127.0.0.1" port))
+                  (dispatcher
+                    (find-if (lambda (th)
+                               (search "slynk dispatcher" (thread-name th)))
+                             (set-difference (all-threads) before))))
+             (true conn)
+             (true dispatcher)
+             (multiple-value-bind (session tool)
+                 (%make-attach-session "drop-closes-socket" conn)
+               (declare (ignore session))
+               (drop-connection tool :reason "test-drop")
+               ;; Bounded wait — EOF reaches the dispatcher within ~2s.
+               (loop repeat 40
+                     while (thread-alive-p dispatcher)
+                     do (sleep 0.05))
+               (false (thread-alive-p dispatcher)))))
+      (ignore-errors (slynk:stop-server port)))))
 
 (define-test break-returns-error-context-without-debugger
   "BREAK bypasses handlers and *debugger-hook* by definition; the

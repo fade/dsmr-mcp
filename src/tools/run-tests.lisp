@@ -34,9 +34,11 @@
   (:import-from #:dsmr-mcp/src/attach/dispatch
                 #:repl-eval-tool
                 #:repl-eval-tool-slynk-conn
-                #:repl-eval-tool-call-lock)
+                #:repl-eval-tool-call-lock
+                #:attached-connection)
   (:import-from #:dsmr-mcp/src/attach/connection
-                #:bounded-slime-eval)
+                #:bounded-slime-eval
+                #:drop-connection)
   (:import-from #:dsmr-mcp/src/state
                 #:*mode*
                 #:get-tool-instance)
@@ -201,11 +203,18 @@ Returns a hash-table (without the result wrapper) so the caller can wrap it."
                                        (format nil "run-tests: form build error: ~A"
                                                e)))))))
            (lock       (repl-eval-tool-call-lock tool))
+           ;; Client bound = in-image bound + margin: the injected
+           ;; sb-ext:with-timeout owns the real deadline; the +15s margin
+           ;; keeps the client wait from firing first on an honest long
+           ;; run, which would drop a healthy connection mid-eval.
            (raw        (handler-case
                            (with-lock-held (lock)
-                             (bounded-slime-eval form
-                                                 (repl-eval-tool-slynk-conn tool)))
+                             (bounded-slime-eval form (attached-connection tool)
+                                                 :timeout (+ timeout-seconds 15)))
                          (slime-network-error (e)
+                           ;; Fail-closed like %dispatch-attach: the rex state
+                           ;; on this connection is suspect after a lost reply.
+                           (drop-connection tool :reason "network-error")
                            (log-event :warn "run-tests.attach.network-error"
                                       "error" (handler-case (princ-to-string e)
                                                 (error () "")))

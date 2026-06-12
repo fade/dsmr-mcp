@@ -28,6 +28,7 @@
   (:import-from #:dsmr-mcp/src/attach/dispatch
                 #:repl-eval-tool
                 #:repl-eval-tool-slynk-conn
+                #:attached-connection
                 #:repl-eval-tool-call-lock)
   (:import-from #:dsmr-mcp/src/attach/connection
                 #:bounded-slime-eval)
@@ -122,7 +123,7 @@ Returns a wire envelope hash-table (without the result wrapper)."
            (lock (repl-eval-tool-call-lock tool))
            (raw  (handler-case
                      (with-lock-held (lock)
-                       (bounded-slime-eval form (repl-eval-tool-slynk-conn tool)))
+                       (bounded-slime-eval form (attached-connection tool)))
                    (slime-network-error (e)
                      (log-event :warn "code-describe.attach.network-error"
                                 "error" (handler-case (princ-to-string e)

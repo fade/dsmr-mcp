@@ -43,6 +43,7 @@
   (:import-from #:dsmr-mcp/src/attach/dispatch
                 #:repl-eval-tool
                 #:repl-eval-tool-slynk-conn
+                #:attached-connection
                 #:repl-eval-tool-call-lock
                 #:repl-eval-tool-connection-epoch)
   (:import-from #:dsmr-mcp/src/attach/connection
@@ -415,7 +416,7 @@ epoch mismatch); the object id is no longer valid."))))
                    (lock       (repl-eval-tool-call-lock tool))
                    (raw-result (with-lock-held (lock)
                                  (%slime-eval/retry
-                                  form (repl-eval-tool-slynk-conn tool)))))
+                                  form (attached-connection tool)))))
               (cond
                 ;; Object not found or session mismatch -> OBJECT_NOT_FOUND.
                 ((and (listp raw-result)
