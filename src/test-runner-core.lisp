@@ -187,6 +187,11 @@ Returns one of:
             (s-testfn  (cs "%DSMR-RUNNER-TESTFN"))
             (s-e       (cs "%DSMR-RUNNER-E"))
             (s-be      (cs "%DSMR-RUNNER-BE"))
+            (s-acc     (cs "%DSMR-RUNNER-FAIL-ACC"))
+            (s-i       (cs "%DSMR-RUNNER-FAIL-I"))
+            (s-f       (cs "%DSMR-RUNNER-FAIL-F"))
+            (s-nm      (cs "%DSMR-RUNNER-FAIL-NAME"))
+            (s-rs      (cs "%DSMR-RUNNER-FAIL-REASON"))
             (s-hook    (cs "%DSMR-RUNNER-DEBUG-HOOK"))
             (s-c       (cs "%DSMR-RUNNER-C"))
             (s-h       (cs "%DSMR-RUNNER-H")))
@@ -285,7 +290,31 @@ Returns one of:
                                          :pending ,s-pending
                                          :duration ,s-dur
                                          :framework (map 'string #'identity ,s-fw)
-                                         :failed-count (length ,s-fails)))))
+                                         :failed-count (length ,s-fails)
+                                         ;; Bounded failure details so the
+                                         ;; dispatcher can render names and
+                                         ;; reasons: at most 10 entries, each
+                                         ;; reason cut to 200 chars, every
+                                         ;; string coerced to character type
+                                         ;; for the wire.  do*, not loop.
+                                         :failures
+                                         (let ((,s-acc (list)))
+                                           (do* ((,s-i 0 (+ ,s-i 1)))
+                                                ((or (>= ,s-i (length ,s-fails))
+                                                     (>= ,s-i 10))
+                                                 (nreverse ,s-acc))
+                                             (let* ((,s-f (aref ,s-fails ,s-i))
+                                                    (,s-nm (and (hash-table-p ,s-f)
+                                                                (gethash "test_name" ,s-f)))
+                                                    (,s-rs (and (hash-table-p ,s-f)
+                                                                (gethash "reason" ,s-f))))
+                                               (push (list (map 'string #'identity
+                                                                (if (stringp ,s-nm) ,s-nm "?"))
+                                                           (map 'string #'identity
+                                                                (if (stringp ,s-rs)
+                                                                    (subseq ,s-rs 0 (min 200 (length ,s-rs)))
+                                                                    "")))
+                                                     ,s-acc))))))))
                          ;; Unreachable unless the bootstrap loaded a file
                          ;; that does not define the engine — report it.
                          (list :error (map 'string #'identity
