@@ -49,7 +49,8 @@
                 #:lsp-connection-lost)
   (:import-from #:dsmr-mcp/src/lsp/bridge
                 #:bridge-code-actions
-                #:make-lsp-unavailable-envelope)
+                #:make-lsp-unavailable-envelope
+                #:add-lsp-result-summary)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event))
 
@@ -139,10 +140,12 @@ the read allow-list." file-path))
                                 (handler-case
                                     (read-file-string pn)
                                   (error () nil)))))
-                    (result id (bridge-code-actions client id (namestring pn)
-                                                    line char
-                                                    :action-ht action-ht
-                                                    :text text)))
+                    (result id (add-lsp-result-summary
+                                (bridge-code-actions client id (namestring pn)
+                                                     line char
+                                                     :action-ht action-ht
+                                                     :text text)
+                                "code-actions")))
                 (lsp-connection-lost (e)
                   (log-event :warn "lsp.tool.code-actions.conn-lost"
                              "error" (princ-to-string e))

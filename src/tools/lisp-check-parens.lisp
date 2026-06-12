@@ -96,7 +96,10 @@ reader checking to avoid false positives on custom syntax."))
 ;;; ---------------------------------------------------------------------------
 
 (defun %build-failure-envelope (id paren-result reader-info base-offset)
-  "Build the error wire envelope. Paren errors take priority over reader errors."
+  "Build the error wire envelope. Paren errors take priority over reader errors.
+Every envelope carries a content text block — the client renders the result
+through content alone, so a structured-fields-only response displays as
+nothing."
   (destructuring-bind (&key ok kind expected found
                             (offset base-offset) (line 1) (column 1)
                        &allow-other-keys)
@@ -109,7 +112,12 @@ reader checking to avoid false positives on custom syntax."))
                             "offset" offset)))
          (let ((ht (make-ht "ok"       nil
                              "kind"     kind
-                             "position" pos)))
+                             "position" pos
+                             "content"
+                             (text-content
+                              (format nil "~A at line ~A, column ~A (offset ~A)~
+                                           ~@[ — expected ~A~]~@[, found ~A~]"
+                                      kind line column offset expected found)))))
            (when expected (setf (gethash "expected" ht) expected))
            (when found    (setf (gethash "found"    ht) found))
            (result id ht))))
@@ -123,10 +131,17 @@ reader checking to avoid false positives on custom syntax."))
          (result id (make-ht "ok"       nil
                               "kind"     (getf reader-info :kind)
                               "message"  (getf reader-info :message)
-                              "position" pos))))
+                              "position" pos
+                              "content"
+                              (text-content
+                               (format nil "~A~@[ at line ~A~]~@[, column ~A~]: ~A"
+                                       (getf reader-info :kind)
+                                       r-line r-col
+                                       (or (getf reader-info :message) "")))))))
       (t
        ;; Both passes clean
-       (result id (make-ht "ok" t))))))
+       (result id (make-ht "ok" t
+                            "content" (text-content "balanced")))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; tool-handle
@@ -201,7 +216,13 @@ the read allow-list (project root + ASDF source dirs)." path-str))
                                "kind"     "too-large"
                                "position" (make-ht "offset" base-off
                                                     "line"   1
-                                                    "column" 1)))))
+                                                    "column" 1)
+                               "content"
+                               (text-content
+                                (format nil "input is ~D characters — exceeds the ~
+                                             ~D-character check limit"
+                                        (length text)
+                                        *check-parens-max-bytes*))))))
       ;; Run both passes; apply priority
       (let ((paren-result (scan-parens text :base-offset base-off))
             (reader-info  (try-reader-check text base-off)))

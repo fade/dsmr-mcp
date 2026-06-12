@@ -303,6 +303,15 @@ broadening the function signature."
             ;; implementation returned no frames'.
             (setf (gethash "eval_thread_frames" ht)
                   (%frames->vector raw-frames)))
+          ;; Content summary — the client renders results through the
+          ;; content block alone; the structured fields stay authoritative.
+          (setf (gethash "content" ht)
+                (text-content
+                 (format nil "~D thread~:P in the attached image~@[; eval-thread ~
+                              backtrace: ~D frame~:P~]"
+                         (length threads)
+                         (when backtrace-p
+                           (length (gethash "eval_thread_frames" ht))))))
           ht)
       (slime-network-error (e)
         (log-event :warn "inspect-thread.attach.network-error"
