@@ -39,9 +39,61 @@
   (:import-from #:dsmr-mcp/src/hermetic/dispatch
                 #:dispatch-hermetic-call
                 #:worker-routed-tool-p)
-  (:export #:handle-tools-call))
+  (:import-from #:com.inuoe.jzon)
+  (:export #:handle-tools-call
+           #:%ensure-rendered-result
+           #:*synthesized-content-max-chars*))
 
 (in-package #:dsmr-mcp/src/dispatch)
+
+;;; ---------------------------------------------------------------------------
+;;; Result-content guard
+;;; ---------------------------------------------------------------------------
+;;;
+;;; MCP clients render a tools/call result through its content block array
+;;; and nothing else; a result carrying only structured fields displays as
+;;; empty, silently. Several tools shipped exactly that shape on their
+;;; success paths (their error paths all built content, which kept the
+;;; defect invisible: errors rendered, results vanished). This guard makes
+;;; the failure structurally impossible: every tools/call result leaves the
+;;; dispatcher with a content array, synthesized from the structured fields
+;;; when the tool did not provide one.
+
+(defparameter *synthesized-content-max-chars* 4096
+  "Cap on synthesized content text. The guard is a backstop, not a
+renderer — a tool returning a large structured payload (a threads array, a
+diagnostics dump) must not get megabytes of JSON synthesized into a text
+block. Past the cap the text is cut and marked elided; the structured
+fields remain complete and authoritative.")
+
+(defun %ensure-rendered-result (envelope tool-name)
+  "Guarantee that a tools/call response ENVELOPE carries renderable content.
+When ENVELOPE is a JSON-RPC success whose result hash-table lacks a
+\"content\" key, synthesize one — the structured fields rendered as JSON
+text, bounded by *synthesized-content-max-chars* — and log a warning naming
+TOOL-NAME so the missing summary surfaces during development. JSON-RPC
+error envelopes and results that already carry content pass through
+untouched. Returns ENVELOPE."
+  (let ((payload (and (hash-table-p envelope)
+                      (not (gethash "error" envelope))
+                      (gethash "result" envelope))))
+    (when (and (hash-table-p payload)
+               (not (nth-value 1 (gethash "content" payload))))
+      (let* ((rendered (handler-case (com.inuoe.jzon:stringify payload)
+                         (error () "(unrenderable structured result)")))
+             (bounded (if (> (length rendered) *synthesized-content-max-chars*)
+                          (concatenate 'string
+                                       (subseq rendered 0 *synthesized-content-max-chars*)
+                                       (format nil "...[elided ~D of ~D chars]"
+                                               (- (length rendered)
+                                                  *synthesized-content-max-chars*)
+                                               (length rendered)))
+                          rendered)))
+        (setf (gethash "content" payload) (text-content bounded))
+        (log-event :warn "tools-call.result.missing-content"
+                   "tool" (or tool-name "")
+                   "chars" (length rendered)))))
+  envelope)
 
 (defun handle-tools-call (session id params)
   "Dispatch a tools/call request.
@@ -83,7 +135,8 @@
     (when (and (eq *mode* :hermetic) (worker-routed-tool-p name))
       (let ((args (and params (gethash "arguments" params))))
         (return-from handle-tools-call
-          (dispatch-hermetic-call session id name args)))))
+          (%ensure-rendered-result
+           (dispatch-hermetic-call session id name args) name)))))
   (let* ((name (and params (gethash "name" params)))
          (args (and params (gethash "arguments" params)))
          (class (and name (gethash name *tool-classes*))))
@@ -95,6 +148,6 @@
       (handler-case
           (let ((schema (tool-input-schema instance)))
             (validate-args schema args)
-            (tool-handle instance id args))
+            (%ensure-rendered-result (tool-handle instance id args) name))
         (arg-validation-error (e)
           (rpc-error id -32602 (arg-validation-message e)))))))

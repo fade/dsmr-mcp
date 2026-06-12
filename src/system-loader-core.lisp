@@ -47,10 +47,29 @@
   (:import-from #:asdf)
   (:import-from #:uiop)
   (:export #:load-system
+           #:load-status-summary
            #:%redefinition-warning-p
            #:%build-load-system-form))
 
 (in-package #:dsmr-mcp/src/system-loader-core)
+
+;;; ---------------------------------------------------------------------------
+;;; Wire-envelope summary
+;;; ---------------------------------------------------------------------------
+
+(defun load-status-summary (status system duration-ms warnings message)
+  "One-line human text for a load-system result envelope.
+The client renders a tools/call result through its content block alone, so
+every envelope needs this alongside the structured fields. Shared by the
+in-process (hermetic) path and the attached decoder."
+  (cond
+    ((equal status "loaded")
+     (format nil "loaded ~A in ~D ms~[~:; (~:*~D warning~:P)~]"
+             system (or duration-ms 0) (or warnings 0)))
+    ((equal status "timeout")
+     (or message (format nil "load of ~A timed out" system)))
+    (t
+     (format nil "load of ~A failed: ~A" system (or message "unknown error")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; %redefinition-warning-p
@@ -246,6 +265,9 @@ returns status=timeout."
                                       "warnings" n-warns)))
               (when (plusp n-warns)
                 (setf (gethash "warning_details" ht) (nreverse warns)))
+              (setf (gethash "content" ht)
+                    (text-content
+                     (load-status-summary "loaded" sys-name elapsed n-warns nil)))
               (log-event :info "load-system-complete"
                          "system" sys-name "duration_ms" elapsed
                          "warnings" n-warns)
@@ -257,11 +279,15 @@ returns status=timeout."
           (let ((elapsed (elapsed-ms)))
             (log-event :warn "load-system-timeout"
                        "system" sys-name "timeout" timeout-seconds)
-            (make-ht "status"      "timeout"
-                     "system"      sys-name
-                     "duration_ms" elapsed
-                     "message"     (format nil "Load timed out after ~A seconds"
-                                           (or timeout-seconds 120)))))
+            (let ((msg (format nil "Load timed out after ~A seconds"
+                               (or timeout-seconds 120))))
+              (make-ht "status"      "timeout"
+                       "system"      sys-name
+                       "duration_ms" elapsed
+                       "message"     msg
+                       "content"
+                       (text-content
+                        (load-status-summary "timeout" sys-name elapsed nil msg))))))
         (error (e)
           (let ((elapsed  (elapsed-ms))
                 (msg      (map 'string #'identity (princ-to-string e))))
@@ -269,4 +295,7 @@ returns status=timeout."
             (make-ht "status"      "error"
                      "system"      sys-name
                      "duration_ms" elapsed
-                     "message"     msg)))))))
+                     "message"     msg
+                     "content"
+                     (text-content
+                      (load-status-summary "error" sys-name elapsed nil msg)))))))))

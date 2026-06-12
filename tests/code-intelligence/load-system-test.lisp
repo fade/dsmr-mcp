@@ -187,7 +187,13 @@ the (:ok N WARNS) result decoder in attached mode."
         (false (gethash "isError" result))
         (is string= "loaded" (gethash "status" result))
         (is string= "alexandria" (gethash "system" result))
-        (true (integerp (gethash "duration_ms" result)))))))
+        (true (integerp (gethash "duration_ms" result)))
+        ;; The client renders results through content alone — the summary
+        ;; text block must be present alongside the structured fields.
+        (let ((content (gethash "content" result)))
+          (true (vectorp content))
+          (true (search "loaded alexandria"
+                        (gethash "text" (aref content 0)))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; load-system-attached-reopens-after-drop

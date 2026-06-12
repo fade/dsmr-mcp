@@ -29,7 +29,8 @@
                 #:lsp-connection-lost)
   (:import-from #:dsmr-mcp/src/lsp/bridge
                 #:bridge-completions
-                #:make-lsp-unavailable-envelope)
+                #:make-lsp-unavailable-envelope
+                #:add-lsp-result-summary)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event))
 
@@ -108,7 +109,9 @@ the read allow-list." file-path))
               (result id (make-lsp-unavailable-envelope "lsp-completions"))
               ;; Delegate to bridge; catch wire-loss.
               (handler-case
-                  (result id (bridge-completions client id (namestring pn) line char))
+                  (result id (add-lsp-result-summary
+                              (bridge-completions client id (namestring pn) line char)
+                              "completions"))
                 (lsp-connection-lost (e)
                   (log-event :warn "lsp.tool.completions.conn-lost"
                              "error" (princ-to-string e))

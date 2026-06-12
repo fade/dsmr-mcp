@@ -46,6 +46,7 @@
   (:import-from #:uiop)
   (:export #:run-tests
            #:detect-test-framework
+           #:test-result-summary
            #:%parachute-purge-ghost-suites
            #:%rove-purge-ghost-suites
            #:*test-debug-output*
@@ -88,19 +89,49 @@ Outside of test execution this is a broadcast-stream; output is discarded.")
 ;;; make-failure-detail builds one entry in the failed_tests array.
 ;;; ---------------------------------------------------------------------------
 
+(defun test-result-summary (passed failed pending framework duration-ms
+                            failed-tests)
+  "One-line human text for a run-tests result envelope.
+The client renders a tools/call result through its content block alone, so
+every envelope needs this alongside the structured fields, which remain
+authoritative. FAILED-TESTS is a vector of failure-detail hash-tables (or
+nil); the first few failing test names are included so the headline is
+actionable without parsing the structure."
+  (let ((head (format nil "~D passed, ~D failed~@[, ~D pending~] (~A, ~D ms)"
+                      (or passed 0) (or failed 0)
+                      (and pending (plusp pending) pending)
+                      (or framework "unknown") (or duration-ms 0))))
+    (if (and failed-tests (plusp (length failed-tests)))
+        (let* ((names (map 'list
+                           (lambda (f)
+                             (or (and (hash-table-p f) (gethash "test_name" f))
+                                 "?"))
+                           failed-tests))
+               (shown (subseq names 0 (min 3 (length names))))
+               (more  (- (length names) (length shown))))
+          (format nil "~A; failing: ~{~A~^, ~}~[~:; (+~:*~D more)~]"
+                  head shown more))
+        head)))
+
 (defun make-test-result (&key passed failed pending passed-tests failed-tests
                            framework duration)
   "Create a unified test result hash table.
 Fields: passed, failed, pending (counts), framework (string), duration_ms
-(integer), failed_tests (vector of failure-detail hash-tables)."
+(integer), failed_tests (vector of failure-detail hash-tables), content
+(text block summary — the client renders results through content alone)."
   (let* ((normalized-failed-tests (if (vectorp failed-tests)
                                       failed-tests
                                       (coerce (or failed-tests '()) 'vector)))
+         (fw (string-downcase (symbol-name framework)))
          (ht (make-ht "passed"      (or passed 0)
                       "failed"      (or failed 0)
-                      "framework"   (string-downcase (symbol-name framework))
+                      "framework"   fw
                       "failed_tests" normalized-failed-tests
-                      "duration_ms" (or duration 0))))
+                      "duration_ms" (or duration 0)
+                      "content"
+                      (text-content
+                       (test-result-summary passed failed pending fw
+                                            duration normalized-failed-tests)))))
     (when pending
       (setf (gethash "pending" ht) pending))
     (when passed-tests

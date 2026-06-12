@@ -341,6 +341,15 @@ Shapes the response regardless of whether condition-p is true or false."
                            capped)
                    'simple-vector)
                   (vector)))))
+    ;; Content summary — the client renders results through the content
+    ;; block alone; the structured fields stay authoritative.
+    (setf (gethash "content" ht)
+          (text-content
+           (if condition-p
+               (format nil "condition held: ~A (~D slot~:P)"
+                       (or (gethash "condition_type" ht) "unknown type")
+                       (length (gethash "slots" ht)))
+               "no condition currently held in the attached image")))
     ht))
 
 ;;; ---------------------------------------------------------------------------
