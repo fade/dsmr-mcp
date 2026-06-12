@@ -11,10 +11,13 @@
 ;;;; file into the image, version-gated by a content fingerprint.  The
 ;;;; in-process slynk fixture structurally cannot prove that (its image
 ;;;; already carries the engine via ASDF), so this leaf spawns a genuinely
-;;;; foreign SBCL — CL + slynk + parachute only — registers a tiny two-test
-;;;; parachute system in it, and drives the real tool dispatch end to end:
-;;;; bootstrap, ASDF-deps framework detection, ghost-purge + reload, run,
-;;;; and the plist decode back into structured counts.
+;;;; foreign SBCL — CL + slynk + parachute only — gives it a tiny UMBRELLA
+;;;; test system (no package named like the system; one passing and one
+;;;; failing test across two sub-suite packages, the package-inferred
+;;;; norm), and drives the real tool dispatch end to end: bootstrap,
+;;;; ASDF-deps framework detection, the umbrella package resolver,
+;;;; ghost-purge + reload, the merged run, and the plist decode back into
+;;;; structured counts with rendered failure reasons.
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (let ((pkg (find-package '#:dsmr-mcp/tests/integration/attach/run-tests-cross-process-test)))
@@ -53,32 +56,54 @@
 ;;; an empty run.
 ;;; ---------------------------------------------------------------------------
 
-(defparameter +probe-source+
-  "(defpackage #:dsmr-xproc-runner-probe (:use #:cl))
-(in-package #:dsmr-xproc-runner-probe)
-(parachute:define-test xproc-probe-passes (parachute:true t))
-(parachute:define-test xproc-probe-fails (parachute:true nil))
+(defparameter +probe-asd+
+  "(defsystem \"dsmr-xproc-runner-probe\"
+  :depends-on (\"parachute\"
+               \"dsmr-xproc-runner-probe/suite-a\"
+               \"dsmr-xproc-runner-probe/suite-b\"))
+(defsystem \"dsmr-xproc-runner-probe/suite-a\"
+  :depends-on (\"parachute\")
+  :components ((:file \"suite-a\")))
+(defsystem \"dsmr-xproc-runner-probe/suite-b\"
+  :depends-on (\"parachute\")
+  :components ((:file \"suite-b\")))
 "
-  "Contents of the probe system's single file.")
+  "UMBRELLA system definition: the top system has NO components and no
+same-named package — its tests live entirely in the two slashy
+subsystems, the package-inferred norm this leaf exists to prove.")
+
+(defparameter +probe-suite-a+
+  "(defpackage #:dsmr-xproc-runner-probe/suite-a (:use #:cl))
+(in-package #:dsmr-xproc-runner-probe/suite-a)
+(parachute:define-test xproc-probe-passes (parachute:true t))
+"
+  "First sub-suite: one passing test.")
+
+(defparameter +probe-suite-b+
+  "(defpackage #:dsmr-xproc-runner-probe/suite-b (:use #:cl))
+(in-package #:dsmr-xproc-runner-probe/suite-b)
+(parachute:define-test xproc-probe-fails (parachute:is = 1 2))
+"
+  "Second sub-suite: one deliberately failing test, so the merged counts
+and the rendered failure reason are both observable.")
 
 (defun %write-probe-system (dir)
-  "Write the probe system into DIR — a real probe.asd plus probe.lisp — and
-return DIR.  The .asd must exist on disk (not an in-memory defsystem):
-the engine's default force-reload makes ASDF re-resolve the system
-definition, and a system with no backing .asd is dropped mid-reload with
-\"Component ... not found\"."
+  "Write the umbrella probe system into DIR — dsmr-xproc-runner-probe.asd
+plus suite-a.lisp and suite-b.lisp — and return DIR.  The .asd must exist
+on disk under the system's own name (not an in-memory defsystem): ASDF's
+central-registry search looks for <system-name>.asd exactly, and the
+engine's force-reload re-resolves the definition, dropping systems with no
+backing file."
   (ensure-directories-exist dir)
-  ;; ASDF's central-registry search looks for <system-name>.asd exactly;
-  ;; any other file name is invisible to it.
   (with-open-file (s (merge-pathnames "dsmr-xproc-runner-probe.asd" dir)
                      :direction :output :if-exists :supersede)
-    (write-string "(defsystem \"dsmr-xproc-runner-probe\"
-  :depends-on (\"parachute\")
-  :components ((:file \"probe\")))
-" s))
-  (with-open-file (s (merge-pathnames "probe.lisp" dir)
+    (write-string +probe-asd+ s))
+  (with-open-file (s (merge-pathnames "suite-a.lisp" dir)
                      :direction :output :if-exists :supersede)
-    (write-string +probe-source+ s))
+    (write-string +probe-suite-a+ s))
+  (with-open-file (s (merge-pathnames "suite-b.lisp" dir)
+                     :direction :output :if-exists :supersede)
+    (write-string +probe-suite-b+ s))
   dir)
 
 (defun %free-tcp-port ()
@@ -177,10 +202,12 @@ tool-handle path provides it."
 
 (define-test run-tests-works-against-foreign-image
   "Attached run-tests returns structured pass/fail counts from an image that
-never loaded dsmr-mcp: the engine bootstraps over the wire, the framework is
-detected from the probe system's ASDF deps, and the deliberate 1-pass /
-1-fail split comes back intact.  A second call succeeds through the
-bootstrap's :CURRENT path, proving the version gate settles."
+never loaded dsmr-mcp, for an UMBRELLA system: the probe has no package
+named like the system — its tests live in two sub-suite packages — so this
+exercises the engine bootstrap, ASDF-deps framework detection, the
+umbrella package resolver, the merged multi-package run, and the
+failure-reason rendering, end to end through the real tool dispatch.  A
+second call succeeds through the bootstrap's :CURRENT path."
   (with-foreign-slynk-child-or-skip
     (with-foreign-test-image (conn probe-dir)
       (declare (ignorable probe-dir))
@@ -197,10 +224,21 @@ bootstrap's :CURRENT path, proving the version gate settles."
                "run-tests dropped the wire (NETWORK_ERROR)")
         (false (gethash "isError" res) "run-tests returned isError")
         (is equal "parachute" (gethash "framework" res))
+        ;; Merged counts across the two sub-suites: 1 pass + 1 fail.
         (is = 1 (gethash "passed" res))
         (is = 1 (gethash "failed" res))
-        ;; The bootstrap actually installed the engine in the foreign image.
+        ;; The failing test's name and a reason crossed the rex and render
+        ;; in the summary — counts alone once hid the real failure.
+        (let ((fails (gethash "failed_tests" res)))
+          (is = 1 (length fails))
+          (true (search "XPROC-PROBE-FAILS" (gethash "test_name" (aref fails 0))))
+          (true (plusp (length (gethash "reason" (aref fails 0))))))
+        (let ((summary (gethash "text" (aref (gethash "content" res) 0))))
+          (true (search "XPROC-PROBE-FAILS" summary)))
+        ;; The bootstrap installed the engine; the umbrella stayed
+        ;; packageless (resolution went through ASDF, not a name match).
         (true (slime-eval '(and (find-package "DSMR-MCP/SRC/TEST-RUNNER-ENGINE") t) conn))
+        (false (slime-eval '(find-package "DSMR-XPROC-RUNNER-PROBE") conn))
         ;; Second call: the version gate is :CURRENT, the run still works.
         (let ((res2 (%dispatch-attach-run-tests tool 2 params)))
           (false (gethash "isError" res2))
