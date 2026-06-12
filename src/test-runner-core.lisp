@@ -1192,9 +1192,28 @@ Returns one of:
             (s-fails   (cs "%DSMR-RUNNER-FAILS"))
             (s-pkg     (cs "%DSMR-RUNNER-PKG"))
             (s-testfn  (cs "%DSMR-RUNNER-TESTFN"))
-            (s-e       (cs "%DSMR-RUNNER-E")))
-        `(handler-case
-             (sb-ext:with-timeout ,effective-timeout
+            (s-e       (cs "%DSMR-RUNNER-E"))
+            (s-hook    (cs "%DSMR-RUNNER-DEBUG-HOOK"))
+            (s-c       (cs "%DSMR-RUNNER-C"))
+            (s-h       (cs "%DSMR-RUNNER-H")))
+        ;; Debugger backstop + serious-condition arm: same rationale and
+        ;; same shape as %build-load-system-form (system-loader-core.lisp) —
+        ;; a debugger entry in the attached image parks the rex worker
+        ;; forever, so BREAK / INVOKE-DEBUGGER inside a test body must be
+        ;; converted to the (:error MSG) arm via throw.
+        `(catch :%dsmr-runner-debug-unwind
+           (let ((,s-hook (lambda (,s-c ,s-h)
+                            (declare (ignore ,s-h))
+                            (throw :%dsmr-runner-debug-unwind
+                              (list :error
+                                    (or (ignore-errors
+                                          (map 'string #'identity
+                                               (princ-to-string ,s-c)))
+                                        "<error formatting condition>"))))))
+             (let ((*debugger-hook* ,s-hook)
+                   (sb-ext:*invoke-debugger-hook* ,s-hook))
+               (handler-case
+                   (sb-ext:with-timeout ,effective-timeout
                (let ((,s-sys ,system-name))
                  ;; Run via the test-runner-core's run-tests function in-image.
                  ;; The core is loaded in the attached image since dsmr-mcp is
@@ -1231,7 +1250,13 @@ Returns one of:
                        ;; test-runner-core not loaded in attached image — fall back.
                        (list :error (map 'string #'identity
                                          "test-runner-core not loaded in attached image; use hermetic mode"))))))
-           (sb-ext:timeout ()
-             (list :timeout ,effective-timeout))
-           (error (,s-e)
-             (list :error (map 'string #'identity (princ-to-string ,s-e)))))))))
+                 ;; sb-ext:timeout is a serious-condition, not error — the
+                 ;; earlier-clause rule routes it here, not to the arm below.
+                 (sb-ext:timeout ()
+                   (list :timeout ,effective-timeout))
+                 ;; serious-condition, not error: STORAGE-CONDITION and
+                 ;; SB-SYS:INTERACTIVE-INTERRUPT are serious-but-not-error and
+                 ;; would otherwise reach the image's debugger.
+                 (serious-condition (,s-e)
+                   (list :error (map 'string #'identity
+                                     (princ-to-string ,s-e))))))))))))

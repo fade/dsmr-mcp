@@ -248,7 +248,16 @@ SURFACE-RAW-VALUE when true adds a 7th element to the result list: the live
           (s-vlen      (cl-user-sym "%DSMR-MCP-ATTACH-VLEN"))
           ;; All-vals variable and locals accumulator for frame walk
           (s-vals      (cl-user-sym "%DSMR-MCP-ATTACH-VALS"))
-          (s-lacc      (cl-user-sym "%DSMR-MCP-ATTACH-LACC")))
+          (s-lacc      (cl-user-sym "%DSMR-MCP-ATTACH-LACC"))
+          ;; Debugger-backstop variables
+          (s-hook-fn   (cl-user-sym "%DSMR-MCP-ATTACH-DEBUG-HOOK"))
+          (s-prev-hook (cl-user-sym "%DSMR-MCP-ATTACH-PREV-HOOK"))
+          (s-ihook     (cl-user-sym "%DSMR-MCP-ATTACH-IHOOK-SYM"))
+          (s-sbext     (cl-user-sym "%DSMR-MCP-ATTACH-SBEXT-PKG"))
+          ;; Condition-type label helper
+          (s-type-label (cl-user-sym "%DSMR-MCP-ATTACH-TYPE-LABEL"))
+          (s-tt         (cl-user-sym "%DSMR-MCP-ATTACH-TT"))
+          (s-tpkg       (cl-user-sym "%DSMR-MCP-ATTACH-TPKG")))
       ;;
       ;; The returned form has three body forms in the outer let*:
       ;;   1. (unless ...) — registry-ensure prologue; idempotent ANSI form
@@ -278,72 +287,135 @@ SURFACE-RAW-VALUE when true adds a 7th element to the result list: the live
          ;; *read-eval* is T here — a future safety pass can wrap the
          ;; with-input-from-string reader call with (*read-eval* nil).
          ;;
-         (block nil
-           (let* ((,s-pkg-name ,(or package-name "CL-USER"))
-                  (,s-pkg (or (find-package ,s-pkg-name)
-                              (error "Package ~S not found in the attached image"
-                                     ,s-pkg-name)))
-                  ;; Read all forms from CODE-STRING using do* (not loop —
-                  ;; see Critical Constraint 2 above).
-                  (,s-forms
-                    (let ((*package* ,s-pkg))
-                      (with-input-from-string (,s-stream ,code-string)
-                        (do* ((,s-eof  '#:eof)
-                              (,s-acc  nil)
-                              (,s-read-form (read ,s-stream nil ,s-eof)
-                                            (read ,s-stream nil ,s-eof)))
-                             ((eq ,s-read-form ,s-eof) (nreverse ,s-acc))
-                          (push ,s-read-form ,s-acc))))))
-             ;; handler-bind (not handler-case!) so the stack is live when
-             ;; the handler runs — restarts and frames are non-nil.
-             (handler-bind
-                 ;; end-of-file: annotate with the stdin-empty hint.
-                 ((end-of-file
+         ;; Guard layers, outermost first.  The invariant they enforce: an
+         ;; in-image failure of ANY kind returns a structured error context
+         ;; over the rex — it never enters the image's debugger, because a
+         ;; batch client never answers :debug events, which parks the Slynk
+         ;; rex worker forever and sprays async debugger events at the
+         ;; client.
+         ;;
+         ;;   catch + debugger hooks — the backstop.  Anything that would
+         ;;     enter the debugger despite the handlers (BREAK, a direct
+         ;;     INVOKE-DEBUGGER, a condition signaled inside our own
+         ;;     handler code) is converted to a minimal error context and
+         ;;     thrown out.  *DEBUGGER-HOOK* is the ANSI hook;
+         ;;     SB-EXT:*INVOKE-DEBUGGER-HOOK* is bound via runtime
+         ;;     find-symbol + progv — BREAK binds *DEBUGGER-HOOK* to nil by
+         ;;     definition, and only the SB-EXT hook survives that, so this
+         ;;     covers BREAK on SBCL images while the form stays portable
+         ;;     ANSI for other implementations.
+         ;;   handler-bind — the rich-context path, stack still live so
+         ;;     restarts and frames are real.  SERIOUS-CONDITION, not ERROR:
+         ;;     SB-EXT:TIMEOUT, STORAGE-CONDITION, and
+         ;;     SB-SYS:INTERACTIVE-INTERRUPT are serious-but-not-error and
+         ;;     sailed past the previous ERROR handler into the debugger.
+         ;;     STORAGE-CONDITION takes a minimal type+message branch:
+         ;;     consing restarts and a 20-frame backtrace inside a
+         ;;     heap-exhaustion handler can itself fail and fall through to
+         ;;     the very debugger this code exists to avoid.
+         ;;   The package lookup and the READ of the code string sit INSIDE
+         ;;     the guarded region: a typo'd package name or a reader error
+         ;;     must produce an error context, not a debugger entry.
+         ;;
+         (catch :%dsmr-mcp-attach-debug-unwind
+           (let* (;; Condition-type label: package-qualified unless the type's
+                  ;; home package is COMMON-LISP.  prin1 under the eval
+                  ;; package is ambiguous — SBCL's CL-USER uses SB-EXT, so
+                  ;; SB-EXT:TIMEOUT printed as bare "TIMEOUT" and broke the
+                  ;; hermetic worker's documented "SB-EXT:TIMEOUT" label.
+                  (,s-type-label
                     (lambda (,s-cond)
-                      (setf ,s-err-ctx
-                            (list :condition-type
-                                  (prin1-to-string (type-of ,s-cond))
-                                  :message
+                      (let ((,s-tt (type-of ,s-cond)))
+                        (if (symbolp ,s-tt)
+                            (let ((,s-tpkg (symbol-package ,s-tt)))
+                              (if (or (null ,s-tpkg)
+                                      (eq ,s-tpkg (find-package "COMMON-LISP")))
+                                  (symbol-name ,s-tt)
                                   (concatenate 'string
-                                               (handler-case (princ-to-string ,s-cond)
-                                                 (error () "<error formatting condition>"))
-                                               " [attached eval has no interactive *standard-input*]")
-                                  :restarts
-                                  ;; do-based restarts collector (not loop —
-                                  ;; Critical Constraint 2).
-                                  (do ((,s-rlist (compute-restarts) (cdr ,s-rlist))
-                                       (,s-racc  nil))
-                                      ((null ,s-rlist) (nreverse ,s-racc))
-                                    (push (list :name
-                                                (string (restart-name (car ,s-rlist)))
-                                                :description
-                                                (or (ignore-errors
-                                                      (princ-to-string (car ,s-rlist)))
-                                                    ""))
-                                          ,s-racc))
-                                  :frames nil))
-                      (return)))
-                  ;; error: full restarts + SBCL backtrace.
-                  (error
-                    (lambda (,s-cond)
+                                               (package-name ,s-tpkg)
+                                               ":"
+                                               (symbol-name ,s-tt))))
+                            (prin1-to-string ,s-tt)))))
+                  (,s-hook-fn
+                    (lambda (,s-cond ,s-prev-hook)
+                      (declare (ignore ,s-prev-hook))
                       (setf ,s-err-ctx
                             (list :condition-type
-                                  (prin1-to-string (type-of ,s-cond))
+                                  (funcall ,s-type-label ,s-cond)
                                   :message
-                                  (handler-case (princ-to-string ,s-cond)
-                                    (error () "<error formatting condition>"))
-                                  :restarts
-                                  ;; do-based restarts collector (not loop).
-                                  (do ((,s-rlist (compute-restarts) (cdr ,s-rlist))
-                                       (,s-racc  nil))
-                                      ((null ,s-rlist) (nreverse ,s-racc))
-                                    (push (list :name
-                                                (string (restart-name (car ,s-rlist)))
-                                                :description
-                                                (or (ignore-errors
-                                                      (princ-to-string (car ,s-rlist)))
-                                                    ""))
-                                          ,s-racc))
+                                  (or (ignore-errors (princ-to-string ,s-cond))
+                                      "<error formatting condition>")
+                                  :restarts nil
+                                  :frames nil))
+                      (throw :%dsmr-mcp-attach-debug-unwind nil)))
+                  (,s-ihook
+                    (let ((,s-sbext (find-package "SB-EXT")))
+                      (and ,s-sbext
+                           (find-symbol "*INVOKE-DEBUGGER-HOOK*" ,s-sbext)))))
+             (let ((*debugger-hook* ,s-hook-fn))
+               ;; progv with an empty symbol list ignores the excess value,
+               ;; so this is a no-op on images without SB-EXT.
+               (progv (if ,s-ihook (list ,s-ihook) nil) (list ,s-hook-fn)
+                 (block nil
+                   ;; handler-bind (not handler-case!) so the stack is live
+                   ;; when the handler runs — restarts and frames are non-nil.
+                   (handler-bind
+                       ;; end-of-file: annotate with the stdin-empty hint.
+                       ((end-of-file
+                          (lambda (,s-cond)
+                            (setf ,s-err-ctx
+                                  (list :condition-type
+                                        (funcall ,s-type-label ,s-cond)
+                                        :message
+                                        (concatenate 'string
+                                                     (handler-case (princ-to-string ,s-cond)
+                                                       (error () "<error formatting condition>"))
+                                                     " [attached eval has no interactive *standard-input*]")
+                                        :restarts
+                                        ;; do-based restarts collector (not loop —
+                                        ;; Critical Constraint 2).
+                                        (do ((,s-rlist (compute-restarts) (cdr ,s-rlist))
+                                             (,s-racc  nil))
+                                            ((null ,s-rlist) (nreverse ,s-racc))
+                                          (push (list :name
+                                                      (string (restart-name (car ,s-rlist)))
+                                                      :description
+                                                      (or (ignore-errors
+                                                            (princ-to-string (car ,s-rlist)))
+                                                          ""))
+                                                ,s-racc))
+                                        :frames nil))
+                            (return)))
+                        ;; serious-condition: full restarts + SBCL backtrace,
+                        ;; except storage-condition (minimal branch, above).
+                        (serious-condition
+                          (lambda (,s-cond)
+                            (setf ,s-err-ctx
+                                  (if (typep ,s-cond 'storage-condition)
+                                      (list :condition-type
+                                            (funcall ,s-type-label ,s-cond)
+                                            :message
+                                            (handler-case (princ-to-string ,s-cond)
+                                              (error () "<error formatting condition>"))
+                                            :restarts nil
+                                            :frames nil)
+                                      (list :condition-type
+                                            (funcall ,s-type-label ,s-cond)
+                                            :message
+                                            (handler-case (princ-to-string ,s-cond)
+                                              (error () "<error formatting condition>"))
+                                            :restarts
+                                            ;; do-based restarts collector (not loop).
+                                            (do ((,s-rlist (compute-restarts) (cdr ,s-rlist))
+                                                 (,s-racc  nil))
+                                                ((null ,s-rlist) (nreverse ,s-racc))
+                                              (push (list :name
+                                                          (string (restart-name (car ,s-rlist)))
+                                                          :description
+                                                          (or (ignore-errors
+                                                                (princ-to-string (car ,s-rlist)))
+                                                              ""))
+                                                    ,s-racc))
                                   ;; Frames: SBCL only, resolved at runtime via
                                   ;; fdefinition/find-symbol to avoid a hard
                                   ;; compile-time SB-DEBUG dep.
@@ -410,37 +482,56 @@ SURFACE-RAW-VALUE when true adds a 7th element to the result list: the live
                                                       ,s-frames)
                                                      (incf ,s-fidx))))
                                         (nreverse ,s-frames))))
-                                  #-sbcl nil))
-                      (return))))
-               ;; FULL 7-stream rebinding — all interactive and standard
-               ;; streams shadowed so TUI applications and Quicklisp banners in
-               ;; the attached image never reach the dispatcher's JSON-RPC stdout.
-               (let ((*standard-output* ,s-stdout)
-                     (*error-output*    ,s-stderr)
-                     (*trace-output*    ,s-stdout) ; trace → stdout buffer
-                     (*debug-io*        ,s-io)
-                     (*query-io*        ,s-io)
-                     (*terminal-io*     ,s-io)     ; TUI-safe
-                     (*standard-input*  (make-string-input-stream ""))
-                     (*package*         ,s-pkg))
-                 ;; Eval loop: collect ALL values from ALL forms using
-                 ;; do (not loop — Critical Constraint 2).
-                 (do ((,s-rest ,s-forms (cdr ,s-rest)))
-                     ((null ,s-rest))
-                   (push (multiple-value-list (eval (car ,s-rest)))
-                         ,s-all-vals)))
-               ;; Success path: format the printed value string.
-               (setf ,s-all-vals (nreverse ,s-all-vals))
-               ;; Format: values within a form separated by ", ",
-               ;; forms by newline.
-               (let ((*print-readably* nil) (*print-circle* t))
-                 (setf ,s-printed
-                       (format nil "~{~{~A~^, ~}~^~%~}"
-                               (mapcar (lambda (,s-vals)
-                                         (mapcar #'prin1-to-string ,s-vals))
-                                       ,s-all-vals))))))) ; closes: inner-mapcar, lambda,
-                                                          ;   outer-mapcar, format, setf,
-                                                          ;   let (*print-readably*), block
+                                            #-sbcl nil)))
+                            (return))))
+                     ;; Package lookup and READ are inside the guarded
+                     ;; region — see the guard-layers note above.
+                     (let* ((,s-pkg-name ,(or package-name "CL-USER"))
+                            (,s-pkg (or (find-package ,s-pkg-name)
+                                        (error "Package ~S not found in the attached image"
+                                               ,s-pkg-name)))
+                            ;; Read all forms from CODE-STRING using do* (not
+                            ;; loop — see Critical Constraint 2 above).
+                            (,s-forms
+                              (let ((*package* ,s-pkg))
+                                (with-input-from-string (,s-stream ,code-string)
+                                  (do* ((,s-eof  '#:eof)
+                                        (,s-acc  nil)
+                                        (,s-read-form (read ,s-stream nil ,s-eof)
+                                                      (read ,s-stream nil ,s-eof)))
+                                       ((eq ,s-read-form ,s-eof) (nreverse ,s-acc))
+                                    (push ,s-read-form ,s-acc))))))
+                       ;; FULL 7-stream rebinding — all interactive and standard
+                       ;; streams shadowed so TUI applications and Quicklisp banners in
+                       ;; the attached image never reach the dispatcher's JSON-RPC stdout.
+                       (let ((*standard-output* ,s-stdout)
+                             (*error-output*    ,s-stderr)
+                             (*trace-output*    ,s-stdout) ; trace → stdout buffer
+                             (*debug-io*        ,s-io)
+                             (*query-io*        ,s-io)
+                             (*terminal-io*     ,s-io)     ; TUI-safe
+                             (*standard-input*  (make-string-input-stream ""))
+                             (*package*         ,s-pkg))
+                         ;; Eval loop: collect ALL values from ALL forms using
+                         ;; do (not loop — Critical Constraint 2).
+                         (do ((,s-rest ,s-forms (cdr ,s-rest)))
+                             ((null ,s-rest))
+                           (push (multiple-value-list (eval (car ,s-rest)))
+                                 ,s-all-vals)))
+                       ;; Success path: format the printed value string.
+                       (setf ,s-all-vals (nreverse ,s-all-vals))
+                       ;; Format: values within a form separated by ", ",
+                       ;; forms by newline.
+                       (let ((*print-readably* nil) (*print-circle* t))
+                         (setf ,s-printed
+                               (format nil "~{~{~A~^, ~}~^~%~}"
+                                       (mapcar (lambda (,s-vals)
+                                                 (mapcar #'prin1-to-string ,s-vals))
+                                               ,s-all-vals))))))))))) ; closes: outer-mapcar,
+                                          ; format, setf, let (*print-readably*),
+                                          ; let* (pkg/forms), handler-bind, block,
+                                          ; progv, let (*debugger-hook*),
+                                          ; let* (hook-fn), catch
          ;;
          ;; BODY FORM 3 of outer let* — always executes after the block.
          ;; When (return) fires in a handler-bind clause, the block above exits
