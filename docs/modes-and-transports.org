@@ -104,17 +104,18 @@ for the pool's lifecycle, health monitor, and =pool-status= surface.
 A transport decides /how clients reach the dispatcher/. The selected transport
 lives behind =DSMR_TRANSPORT=; the parser accepts only =:stdio=, =:tcp=, and
 =:http= (else =invalid-config-value= naming =DSMR_TRANSPORT=). The default is
-=:stdio=. Both =:tcp= and =:http= /are/ served — an old comment at the top of
-=run.lisp= claiming they raise =transport-not-implemented-error= is stale; the
-live =ecase= dispatches both.
+=:stdio=. All three are served.
 
 ** stdio (default)
 
 The transport an MCP client launches as a subprocess. =(dsmr-mcp:run)= blocks
-reading =*standard-input*= until EOF, one JSON-RPC message per line. Trust is
-implicit — it is a local pipe with no network surface. A stdout guard binds
-=*standard-output*= to a string stream during dispatch so stray library prints
-never corrupt the JSON-RPC channel.
+reading the wire until EOF, one JSON-RPC message per line. Trust is implicit —
+it is a local pipe with no network surface. Before serving, the process claims
+the stdio streams for the wire and walls off the global standard streams from
+*every thread in the process*: output specials are re-pointed at stderr and
+input specials at an always-EOF stream, so no library code on any thread —
+including threads spawned later — can write to or read from the JSON-RPC
+channel.
 
 ** tcp (loopback default)
 
@@ -136,7 +137,8 @@ For MCP clients that can only spawn a stdio subprocess but need to reach an
 HTTP/TCP dsmr-mcp server, a *bundled bridge* ships in =dsmr-mcp-bridge.asd= — a
 standalone, Lisp-only stdio↔TCP byte pump (deps: =usocket= + =bordeaux-threads=
 only; no Python runtime). Build it with =(asdf:make :dsmr-mcp-bridge)= or
-=make bridge=; target it with =DSMR_BRIDGE_HOST= / =DSMR_BRIDGE_PORT=.
+=make bridge=; target it with =--host= / =--port= arguments, or the
+=DSMR_MCP_HOST= / =DSMR_MCP_PORT= environment variables when those are absent.
 
 ** Bind and the off-loopback opt-out
 
