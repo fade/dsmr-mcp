@@ -16,7 +16,8 @@
   (:use #:cl)
   (:local-nicknames (#:ubiquitous #:ubiquitous))
   (:import-from #:dsmr-mcp/src/transport/stdio
-                #:serve-streams)
+                #:serve-streams
+                #:isolate-stdio-wire)
   (:import-from #:dsmr-mcp/src/state
                 #:make-session
                 #:*mode*)
@@ -449,10 +450,20 @@ The dsmr-mcp:run nickname (re-exported by src/main.lisp) resolves to this functi
          (ecase resolved-transport
            (:stdio
             (log-event :info "run.start" "transport" :stdio "mode" *mode*)
-            (serve-streams *standard-input* *standard-output*
-                           :session (make-session :id "stdio"
-                                                  :slynk-attach resolved-slynk-attach
-                                                  :project-root resolved-root)))
+            ;; Claim stdio for the wire and wall off the global standard
+            ;; streams BEFORE serving: any thread spawned during the session
+            ;; (Slynk client dispatchers in attached mode, pool workers, ...)
+            ;; inherits the re-pointed globals, so nothing it prints — or
+            ;; reads — can touch the JSON-RPC channel.  The restore matters
+            ;; only for in-image callers (tests); the real server exits.
+            (multiple-value-bind (wire-out wire-in restore-streams)
+                (isolate-stdio-wire)
+              (unwind-protect
+                   (serve-streams wire-in wire-out
+                                  :session (make-session :id "stdio"
+                                                         :slynk-attach resolved-slynk-attach
+                                                         :project-root resolved-root))
+                (funcall restore-streams))))
            (:tcp
             (%check-remote-bind resolved-bind)
             (log-event :info "run.start" "transport" :tcp "mode" *mode*)
