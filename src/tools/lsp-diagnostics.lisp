@@ -44,7 +44,8 @@
                 #:lsp-connection-lost)
   (:import-from #:dsmr-mcp/src/lsp/bridge
                 #:bridge-diagnostics
-                #:degraded-diagnostics)
+                #:degraded-diagnostics
+                #:add-lsp-result-summary)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event))
 
@@ -127,11 +128,14 @@ the read allow-list." file-path))
                                           "error" (princ-to-string e))
                                ;; Return empty text — degraded-diagnostics handles empty cleanly.
                                ""))))
-                (result id (degraded-diagnostics text)))
+                (result id (add-lsp-result-summary
+                            (degraded-diagnostics text) "diagnostics")))
               ;; alive-lsp available — delegate to bridge.
               (handler-case
-                  (result id (bridge-diagnostics client id (namestring pn)
-                                                 :load-p (and load-p (not (eq load-p 'null)))))
+                  (result id (add-lsp-result-summary
+                              (bridge-diagnostics client id (namestring pn)
+                                                  :load-p (and load-p (not (eq load-p (quote null)))))
+                              "diagnostics"))
                 (lsp-connection-lost (e)
                   (log-event :warn "lsp.tool.diagnostics.conn-lost"
                              "error" (princ-to-string e))
@@ -139,4 +143,5 @@ the read allow-list." file-path))
                   (let ((text (handler-case
                                    (read-file-string pn)
                                  (error () ""))))
-                    (result id (degraded-diagnostics text)))))))))))
+                    (result id (add-lsp-result-summary
+                            (degraded-diagnostics text) "diagnostics")))))))))))

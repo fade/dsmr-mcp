@@ -26,7 +26,10 @@
                 #:make-ht
                 #:text-content)
   (:shadowing-import-from #:dsmr-mcp/src/tools/helpers
-                          #:result))
+                          #:result)
+  ;; Dependency only: registers the lisp-check-parens tool for the
+  ;; end-to-end render test below.
+  (:import-from #:dsmr-mcp/src/tools/lisp-check-parens))
 
 (in-package #:dsmr-mcp/tests/dispatch/result-content-guard-test)
 
@@ -128,3 +131,35 @@ never the full rendering."
     (true (gethash "error" resp))
     (false (gethash "result" resp))))
 
+(define-test check-parens-imbalance-renders
+  "The defect's decisive repro: an unbalanced snippet must yield a content
+text that names the imbalance — previously the result carried only
+structured fields and the client displayed nothing."
+  (let* ((*mode* :attached)
+         (*current-session-id* "content-guard-cp")
+         (session (make-session :id "content-guard-cp"))
+         (resp (handle-tools-call
+                session 9
+                (let ((p (make-ht "name" "lisp-check-parens")))
+                  (setf (gethash "arguments" p)
+                        (make-ht "code" "(defun broken (x"))
+                  p)))
+         (res (gethash "result" resp))
+         (text (gethash "text" (aref (gethash "content" res) 0))))
+    (false (gethash "ok" res))
+    (true (search "unclosed" text))
+    (true (search "line 1" text))
+    (true (search "column" text)))
+  ;; Balanced input renders too.
+  (let* ((*mode* :attached)
+         (*current-session-id* "content-guard-cp2")
+         (session (make-session :id "content-guard-cp2"))
+         (resp (handle-tools-call
+                session 10
+                (let ((p (make-ht "name" "lisp-check-parens")))
+                  (setf (gethash "arguments" p) (make-ht "code" "(+ 1 2)"))
+                  p)))
+         (res (gethash "result" resp)))
+    (is eq t (gethash "ok" res))
+    (is equal "balanced"
+        (gethash "text" (aref (gethash "content" res) 0)))))

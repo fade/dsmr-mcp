@@ -47,7 +47,8 @@
   (:import-from #:dsmr-mcp/src/hermetic/dispatch
                 #:dispatch-hermetic-call)
   (:import-from #:dsmr-mcp/src/test-runner-core
-                #:%build-run-tests-form)
+                #:%build-run-tests-form
+                #:test-result-summary)
   (:import-from #:slynk-client
                 #:slime-network-error)
   (:import-from #:bordeaux-threads
@@ -141,21 +142,29 @@ Returns a hash-table suitable for (result id ...)."
                                  "framework"   fw
                                  "duration_ms" duration
                                  "failed_tests" #()
-                                 "system"      (map 'string #'identity sys-name))))
+                                 "system"      (map 'string #'identity sys-name)
+                                 "content"
+                                 (text-content
+                                  (test-result-summary passed failed pending
+                                                       fw duration nil)))))
          ht))
       ;; Timeout
       ((and (listp raw) (eq (car raw) :timeout))
-       (let ((timeout-secs (second raw)))
+       (let* ((timeout-secs (second raw))
+              (failed-tests
+                (vector (make-ht "test_name" "TIMEOUT"
+                                 "reason"
+                                 (format nil "Tests timed out after ~A seconds"
+                                         timeout-secs)))))
          (make-ht "passed"      0
                   "failed"      1
                   "pending"     0
                   "framework"   "timeout"
                   "duration_ms" elapsed-ms
-                  "failed_tests"
-                  (vector (make-ht "test_name" "TIMEOUT"
-                                   "reason"
-                                   (format nil "Tests timed out after ~A seconds"
-                                           timeout-secs))))))
+                  "failed_tests" failed-tests
+                  "content"
+                  (text-content
+                   (format nil "tests timed out after ~A seconds" timeout-secs)))))
       ;; Error
       ((and (listp raw) (eq (car raw) :error))
        (let ((msg (map 'string #'identity (or (second raw) "unknown error"))))

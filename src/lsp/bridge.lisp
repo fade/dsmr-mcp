@@ -62,6 +62,7 @@
            #:bridge-code-actions
            #:degraded-diagnostics
            #:make-lsp-unavailable-envelope
+           #:add-lsp-result-summary
            #:%remove-formatting-lock))
 
 (in-package #:dsmr-mcp/src/lsp/bridge)
@@ -138,6 +139,82 @@ Shape: {isError: true, error_type: \"lsp-unavailable\", content: [{type, text}]}
            "content"    (text-content
                          (format nil "~A requires alive-lsp, which is not running."
                                  verb-name))))
+
+;;; ---------------------------------------------------------------------------
+;;; Result-content summaries
+;;; ---------------------------------------------------------------------------
+
+(defun %first-labels (items key cap)
+  "Collect up to CAP values of KEY from the ITEMS vector/list of hash-tables."
+  (let ((acc nil) (n 0))
+    (map nil (lambda (item)
+               (when (and (< n cap) (hash-table-p item))
+                 (let ((v (gethash key item)))
+                   (when (stringp v)
+                     (push v acc)
+                     (incf n)))))
+         items)
+    (nreverse acc)))
+
+(defun add-lsp-result-summary (payload verb)
+  "Attach a content text block to an LSP bridge result PAYLOAD.
+The client renders a tools/call result through its content block alone; the
+bridge results carry only structured fields from alive-lsp. VERB selects the
+summary shape. A non-hash PAYLOAD (code-actions discover mode returns a bare
+descriptor vector) is wrapped into a hash-table first — a JSON-RPC result
+must be an object to carry content at all. Returns the (possibly new)
+payload hash-table; error envelopes pass through untouched."
+  (when (and (hash-table-p payload) (gethash "isError" payload))
+    (return-from add-lsp-result-summary payload))
+  (let ((ht (if (hash-table-p payload)
+                payload
+                (make-ht "actions" payload))))
+    (unless (nth-value 1 (gethash "content" ht))
+      (setf (gethash "content" ht)
+            (text-content
+             (cond
+               ((string= verb "hover")
+                (let ((value (gethash "value" ht)))
+                  (if (and (stringp value) (plusp (length value)))
+                      value
+                      "(no hover info at this position)")))
+               ((string= verb "completions")
+                (let ((items (gethash "items" ht)))
+                  (if (and items (plusp (length items)))
+                      (format nil "~D completion~:P: ~{~A~^, ~}~
+                                   ~[~:; (+~:*~D more)~]"
+                              (length items)
+                              (%first-labels items "label" 8)
+                              (max 0 (- (length items) 8)))
+                      "no completions at this position")))
+               ((string= verb "diagnostics")
+                (let ((messages (gethash "messages" ht))
+                      (degraded (gethash "degraded" ht)))
+                  (if (and messages (plusp (length messages)))
+                      (format nil "~D diagnostic~:P~@[ (degraded: Eclector ~
+                                   structural check only)~]: ~{~A~^; ~}~
+                                   ~[~:; (+~:*~D more)~]"
+                              (length messages)
+                              degraded
+                              (%first-labels messages "message" 3)
+                              (max 0 (- (length messages) 3)))
+                      (format nil "no diagnostics~@[ (degraded: Eclector ~
+                                   structural check only)~]"
+                              degraded))))
+               ((string= verb "code-actions")
+                (let ((actions (gethash "actions" ht)))
+                  (if actions
+                      ;; Discover mode (wrapped vector of descriptors).
+                      (if (plusp (length actions))
+                          (format nil "~D applicable action~:P: ~{~A~^, ~}"
+                                  (length actions)
+                                  (%first-labels actions "action" 8))
+                          "no applicable actions at this position")
+                      ;; Apply mode: action echoed alongside its result.
+                      (format nil "applied ~A"
+                              (or (gethash "action" ht) "action")))))
+               (t "(structured result)")))))
+    ht))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Degraded diagnostics — Eclector fallback (D-12 / LSP-04)

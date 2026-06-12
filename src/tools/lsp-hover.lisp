@@ -33,7 +33,8 @@
                 #:lsp-connection-lost)
   (:import-from #:dsmr-mcp/src/lsp/bridge
                 #:bridge-hover
-                #:make-lsp-unavailable-envelope)
+                #:make-lsp-unavailable-envelope
+                #:add-lsp-result-summary)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event))
 
@@ -107,7 +108,9 @@ the read allow-list." file-path))
           (if (null client)
               (result id (make-lsp-unavailable-envelope "lsp-hover"))
               (handler-case
-                  (result id (bridge-hover client id (namestring pn) line char))
+                  (result id (add-lsp-result-summary
+                              (bridge-hover client id (namestring pn) line char)
+                              "hover"))
                 (lsp-connection-lost (e)
                   (log-event :warn "lsp.tool.hover.conn-lost"
                              "error" (princ-to-string e))

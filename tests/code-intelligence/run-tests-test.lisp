@@ -313,7 +313,12 @@ in-image and recurse until the call-lock deadline fires."
         (true (integerp (gethash "passed"    result)))
         (true (integerp (gethash "failed"    result)))
         (true (integerp (gethash "pending"   result)))
-        (true (stringp  (gethash "framework" result)))))))
+        (true (stringp  (gethash "framework" result)))
+        ;; The client renders results through content alone — the summary
+        ;; text block must be present alongside the structured counts.
+        (let ((content (gethash "content" result)))
+          (true (vectorp content))
+          (true (search "passed" (gethash "text" (aref content 0)))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; run-tests-inline-returns-mode-error

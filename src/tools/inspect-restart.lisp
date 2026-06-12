@@ -210,7 +210,10 @@ caller's id, per the JSON-RPC 2.0 spec."
                            (make-ht "restarts" (vector)
                                     "message"
                                     "No active debugger break (or connection unavailable)."
-                                    "level" level))))))
+                                    "level" level
+                                    "content"
+                                    (text-content
+                                     "No active debugger break (or connection unavailable).")))))))
     ;; LIST path: fetch debugger-info and decode.
     ;; Use a short probe timeout: debugger-info-for-emacs blocks when no break
     ;; is active (waits in sly-db-loop's event queue).  A 3-second timeout
@@ -231,7 +234,10 @@ caller's id, per the JSON-RPC 2.0 spec."
                       (make-ht "restarts" (vector)
                                "message"
                                "No active debugger break (or connection unavailable)."
-                               "level" level))))))
+                               "level" level
+                               "content"
+                               (text-content
+                                "No active debugger break (or connection unavailable).")))))))
       ;; debugger-info-for-emacs → (CONDITION-INFO RESTARTS FRAMES PENDING...)
       ;; CONDITION-INFO is documented as (message type extras) on current
       ;; Slynk but the contract has shifted historically (older SLIME
@@ -268,7 +274,8 @@ caller's id, per the JSON-RPC 2.0 spec."
           (return-from %dispatch-attach-inspect-restart
             (make-ht "restarts" restarts-vec
                      "message"  "No active debugger break."
-                     "level"    level)))
+                     "level"    level
+                     "content"  (text-content "No active debugger break."))))
         ;; INVOKE path: resolve index, bounds-check, then invoke.
         (when (or invoke-idx invoke-nm)
           (let* ((resolved-idx
@@ -313,12 +320,13 @@ caller's id, per the JSON-RPC 2.0 spec."
                    (cond
                      ((eq invoke-result :post-invoke-network-disconnect)
                       ;; Break thread closed the connection — restart resolved.
-                      (make-ht "invoked" t
-                               "index"   resolved-idx
-                               "level"   level
-                               "message"
-                               "Restart invoked; break thread closed the \
+                      (let ((msg "Restart invoked; break thread closed the \
 connection (expected on resolving restarts)."))
+                        (make-ht "invoked" t
+                                 "index"   resolved-idx
+                                 "level"   level
+                                 "message" msg
+                                 "content" (text-content msg))))
                      (t
                       ;; The slyfun returned a value rather than disconnecting.
                       ;; A non-disconnect result can mean (a) the level did not
@@ -326,18 +334,25 @@ connection (expected on resolving restarts)."))
                       ;; nil; or (b) the restart did not unwind the break.
                       ;; Surface the raw result so callers can distinguish a
                       ;; resolving invoke from a no-op.
-                      (make-ht "invoked" t
-                               "index"   resolved-idx
-                               "level"   level
-                               "result"  (handler-case
-                                             (princ-to-string invoke-result)
-                                           (error () "<unprintable>"))
-                               "message"
-                               "Restart invoked; the break may have resolved.")))))))))
+                      (let ((msg "Restart invoked; the break may have resolved."))
+                        (make-ht "invoked" t
+                                 "index"   resolved-idx
+                                 "level"   level
+                                 "result"  (handler-case
+                                               (princ-to-string invoke-result)
+                                             (error () "<unprintable>"))
+                                 "message" msg
+                                 "content" (text-content msg)))))))))))
         ;; LIST path result: restarts were found, no invoke requested.
         (make-ht "restarts"  restarts-vec
                  "condition" condition-ht
-                 "level"     level)))))
+                 "level"     level
+                 "content"
+                 (text-content
+                  (format nil "~D restart~:P at level ~A: ~{~A~^, ~}"
+                          (length restarts-vec) level
+                          (map 'list (lambda (r) (gethash "name" r ""))
+                               restarts-vec))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; tool-handle method
