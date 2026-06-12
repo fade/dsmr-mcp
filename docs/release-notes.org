@@ -1,6 +1,28 @@
 #+TITLE: dsmr-mcp — Release Notes
 #+SUBTITLE: v0.1.0
 
+* Unreleased (since v0.1.0)
+
+Fixes on =main= after the v0.1.0 tag, ahead of the next release:
+
+- *Every tool result renders.* A =tools/call= success that carried only
+  structured fields could display as an empty result in some clients; the
+  dispatcher now guarantees renderable content on every success, and
+  eleven tools gained one-line summaries of their structured output.
+- *stdio wire isolation.* The JSON-RPC channel is walled off from every
+  thread in the process for the life of the session, so no library print
+  on any thread can corrupt the protocol.
+- *Attached-mode hardening.* An in-image failure can no longer reach the
+  attached image's debugger (SBCL images fully covered); client waits are
+  honestly bounded; dropped connections are cleaned up on detection.
+- *Dispatch routing.* In hermetic mode, only image-bound tools route to
+  the worker — filesystem and structural verbs run in the dispatcher.
+- *.envrc consent prompt.* The first-use consent dialog no longer blocks
+  the accept button in clients that enforce required elicitation fields.
+- *Test suite & CI.* The warm fast suite dropped from ~85 s to ~32 s;
+  cross-process leaves skip cleanly on constrained runners; CI pins the
+  SBCL build and ASDF version and vendors the one non-dist dependency.
+
 * v0.1.0 — Attached-image-first MCP server
 
 This is the first tagged release of =dsmr-mcp=, an MCP (Model Context Protocol)

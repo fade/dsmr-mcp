@@ -35,6 +35,11 @@ this directory. New here? Read [[file:introduction.org]] first, then
 - [[file:threat-model.org][Threat model]] — the trust posture, trust boundaries, and the project-wide
   STRIDE register. Read this before adopting the server.
 
+* Contributing
+
+- [[file:testing.org][Testing]] — the canonical test entrypoints, the fast-versus-gated suite
+  split, the pinned SBCL build, and the project-local cache guard.
+
 * Installing as an MCP server
 
 - [[file:configuration.org::*Wiring dsmr-mcp into an MCP client][Wiring into an MCP client]] — the bundled installer registers dsmr-mcp with
