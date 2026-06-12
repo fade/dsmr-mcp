@@ -27,8 +27,11 @@ code. No extra exit-code plumbing is needed.
 ASDF has to find the checkout and its dependencies. Locally that resolution
 goes through =$LISP_WORKSPACE= (and your =~/.sbclrc= / Quicklisp); in CI it
 goes through =CL_SOURCE_REGISTRY= set to the checkout, or through Qlot /
-Quicklisp. Every dependency dsmr-mcp uses is in the Quicklisp distribution, so
-CI does not need any local source checkouts.
+Quicklisp. Every dependency resolves from the Quicklisp distribution *except*
+=slynk-client=, which is sourced from a fork branch and is not published to
+the dist — CI clones it, pinned to an exact commit, into a directory the
+recursive =CL_SOURCE_REGISTRY= scans (see the workflow's vendor step), and a
+local setup needs an equivalent checkout on the ASDF search path.
 
 * Fast versus gated
 

@@ -81,11 +81,15 @@ cold compile, clear the ASDF output cache first (typically
    missing an =:import-from= for the package it uses. Always confirm the
    cold load, not just the warm one.
 2. *Quicklisp / userinit noise on the stdio channel.* On the stdio
-   transport, anything written to =*standard-output*= that is not a
-   JSON-RPC message corrupts the channel and the client sees a protocol
-   error. A =~/.sbclrc= or Quicklisp banner that prints to stdout at
-   startup is the usual culprit. Logs are deliberately routed to stderr
-   for this reason; keep startup chatter off stdout.
+   transport, anything written to stdout that is not a JSON-RPC message
+   corrupts the channel and the client sees a protocol error. Once the
+   server is serving, this cannot happen — it claims the stdio streams for
+   the wire and walls the global standard streams off from every thread —
+   so the remaining hazard is *startup* chatter printed before that claim:
+   a =~/.sbclrc= or Quicklisp banner that writes to stdout while the
+   system loads is the usual culprit. Logs are deliberately routed to
+   stderr for this reason; keep startup chatter off stdout (redirect the
+   load phase to stderr in your launch wrapper if your init files print).
 3. *Non-loopback bind refused.* If =tcp= / =http= startup signals
    =invalid-config-value= for =DSMR_BIND=, the bind address is not
    loopback and =DSMR_ALLOW_REMOTE= is not set. This is the safety gate
