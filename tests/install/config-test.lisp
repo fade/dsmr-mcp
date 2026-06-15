@@ -47,7 +47,7 @@
     (true (vectorp (gethash "args" entry)))
     (let ((args (coerce (gethash "args" entry) 'list)))
       ;; The args carry the stderr-wrapped load + run forms for the named system.
-      (true (member "(let ((*standard-output* *error-output*)) (asdf:load-system :dsmr-mcp))"
+      (true (member "(let ((*standard-output* *error-output*) (*trace-output* *error-output*) (*debug-io* (make-two-way-stream *standard-input* *error-output*))) (asdf:load-system :dsmr-mcp))"
                     args :test #'string=)
             "asdf load is wrapped to *error-output*")
       (true (member "(dsmr-mcp:run :transport :stdio)" args :test #'string=)))))
@@ -82,10 +82,30 @@ Quicklisp bootstrap banner and ASDF load chatter."
         (true (search "*error-output*" load-form)
               "asdf load wrapped to *error-output*")))))
 
+(define-test canonical-entry-redirects-debug-io
+  "SLYNK emits its \"ASDF loader finished.\" banner to *debug-io*, not
+*standard-output*. The load form must rebind *debug-io* (and *trace-output*)
+to *error-output* alongside *standard-output*, or that one banner line still
+leaks onto fd 1 and breaks the stdio handshake."
+  (let* ((entry (canonical-server-entry))
+         (args  (coerce (gethash "args" entry) 'list))
+         (load-form (%find-arg args
+                               (lambda (a)
+                                 (and (stringp a)
+                                      (search "asdf:load-system" a))))))
+    (true load-form "asdf load form present")
+    (when load-form
+      (true (search "*debug-io*" load-form)
+            "load form rebinds *debug-io* (carries the SLYNK loader banner)")
+      (true (search "*trace-output*" load-form)
+            "load form rebinds *trace-output*")
+      (true (search "*standard-output*" load-form)
+            "load form rebinds *standard-output*"))))
+
 (define-test canonical-entry-system-name-parameterized
   (let ((entry (canonical-server-entry "cl-mcp")))
     (let ((args (coerce (gethash "args" entry) 'list)))
-      (true (member "(let ((*standard-output* *error-output*)) (asdf:load-system :cl-mcp))"
+      (true (member "(let ((*standard-output* *error-output*) (*trace-output* *error-output*) (*debug-io* (make-two-way-stream *standard-input* *error-output*))) (asdf:load-system :cl-mcp))"
                     args :test #'string=))
       (true (member "(cl-mcp:run :transport :stdio)" args :test #'string=)))))
 

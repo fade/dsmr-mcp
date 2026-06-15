@@ -82,8 +82,14 @@ takes over a now-pristine stdout on the stdio transport."
     "(namestring (merge-pathnames #P\"SourceCode/lisp/\" "
     "(user-homedir-pathname)))) asdf:*central-registry*)")
    ;; ASDF/UIOP compile+load output also goes to stderr so the JSON-RPC
-   ;; channel (stdout) carries nothing until run takes over.
-   "--eval" (format nil "(let ((*standard-output* *error-output*)) (asdf:load-system :~A))"
+   ;; channel (stdout) carries nothing until run takes over.  *debug-io* and
+   ;; *trace-output* are rebound alongside *standard-output* because SLYNK's
+   ;; loader prints its "SLYNK's ASDF loader finished." banner to *debug-io*,
+   ;; not *standard-output* — binding only the latter still leaks that one line
+   ;; onto fd 1 and breaks the handshake.  Mirrors the worker launcher in
+   ;; src/hermetic/worker-client.lisp; the LET restores all three after the
+   ;; load so run takes over a pristine stdout.
+   "--eval" (format nil "(let ((*standard-output* *error-output*) (*trace-output* *error-output*) (*debug-io* (make-two-way-stream *standard-input* *error-output*))) (asdf:load-system :~A))"
                     system-name)
    "--eval" (format nil "(~A:run :transport :stdio)" system-name)))
 
