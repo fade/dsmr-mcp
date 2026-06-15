@@ -63,7 +63,44 @@
   (let ((*standard-output* *error-output*))
     (asdf:load-system system)))
 
+;;; Staleness manifest. A launch wrapper reads this (with plain shell tools, so
+;;; an SBCL upgrade can't break the check) to decide whether the image is still
+;;; current or must be regenerated. It records the SBCL identity plus the source
+;;; root of every system the build loaded, so a patched workspace library or a
+;;; Quicklisp dist update is detected the same way a project edit is.
+(defun build-core-write-manifest (output)
+  (let* ((project-dir (ignore-errors
+                       (namestring (asdf:system-source-directory :dsmr-mcp))))
+         (roots '()))
+    (flet ((add (p) (when p (pushnew (namestring p) roots :test #'string=))))
+      ;; Project: scan only src/ and the .asd, never the whole repo — the repo
+      ;; root also holds .git, the core itself, and generated output, any of
+      ;; which would otherwise trip a false "stale" on unrelated activity.
+      (when project-dir
+        (add (merge-pathnames "src/" project-dir))
+        (add (merge-pathnames "dsmr-mcp.asd" project-dir)))
+      ;; Every other loaded system contributes its source directory. Test-only
+      ;; systems resolve to the project root and are skipped here on purpose:
+      ;; the server core does not change behavior when only tests change.
+      (dolist (name (asdf:already-loaded-systems))
+        (let ((sys (asdf:find-system name nil)))
+          (when sys
+            (let ((dir (ignore-errors (asdf:system-source-directory sys))))
+              (when (and dir
+                         (not (and project-dir
+                                   (string= (namestring dir) project-dir))))
+                (add dir)))))))
+    (let ((manifest (concatenate 'string output ".manifest")))
+      (with-open-file (out manifest :direction :output :if-exists :supersede
+                                    :if-does-not-exist :create)
+        (format out "sbcl-version ~A~%" (lisp-implementation-version))
+        (dolist (r (nreverse roots))
+          (format out "root ~A~%" r)))
+      (format *error-output* "~&[build-core] wrote staleness manifest ~A~%"
+              manifest))))
+
 (let ((output (build-core-getenv "DSMR_CORE_OUTPUT" "dsmr.core")))
+  (build-core-write-manifest output)
   (format *error-output* "~&[build-core] saving core to ~A …~%" output)
   (finish-output *error-output*)
   ;; :purify t maps the static heap read-only (smaller, faster start). The save
