@@ -13,6 +13,8 @@
   (:local-nicknames (#:jzon #:com.inuoe.jzon)
                     (#:config #:dsmr-mcp/src/install/config))
   (:export #:claude-config-path
+           #:wrapper-launcher-path
+           #:launcher-if-present
            #:install-into-claude))
 
 (in-package #:dsmr-mcp/src/install/claude)
@@ -23,6 +25,22 @@
   "Return the pathname of Claude Code's MCP-server config file,
 ~/.claude.json, resolved against the home directory."
   (merge-pathnames ".claude.json" (user-homedir-pathname)))
+
+(defun wrapper-launcher-path ()
+  "Absolute namestring of the lifecycle launch wrapper shipped in the repo,
+scripts/dsmr-mcp-launch.sh, resolved against the dsmr-mcp source tree. This
+is the command an installed entry invokes so the server boots from the
+prebuilt core and self-regenerates it on SBCL/source/dependency drift."
+  (namestring
+   (merge-pathnames "scripts/dsmr-mcp-launch.sh"
+                    (asdf:system-source-directory :dsmr-mcp))))
+
+(defun launcher-if-present ()
+  "Return the wrapper-launcher-path when that script actually exists in this
+checkout, else NIL — so an install from a partial tree degrades to the
+source-load launcher rather than pointing at a missing command."
+  (let ((p (wrapper-launcher-path)))
+    (when (probe-file p) p)))
 
 ;;; Timestamp ----------------------------------------------------------------
 
@@ -78,7 +96,8 @@ Returns a plist:
          (original (and existed (%read-config path)))
          (cl-mcp-present (and original (config:has-cl-mcp-p original)))
          (updated (config:ensure-server original
-                                        :on-existing-cl-mcp on-existing-cl-mcp))
+                                        :on-existing-cl-mcp on-existing-cl-mcp
+                                        :launcher (launcher-if-present)))
          (rendered (jzon:stringify updated :pretty t)))
     ;; Validate the rendered output by re-parsing it before any write.
     (handler-case (jzon:parse rendered)
