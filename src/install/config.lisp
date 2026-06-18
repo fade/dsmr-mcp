@@ -93,16 +93,26 @@ takes over a now-pristine stdout on the stdio transport."
                     system-name)
    "--eval" (format nil "(~A:run :transport :stdio)" system-name)))
 
-(defun canonical-server-entry (&optional (system-name +dsmr-server-name+))
+(defun canonical-server-entry (&optional (system-name +dsmr-server-name+)
+                               &key launcher)
   "Return a NEW jzon hash-table describing the canonical stdio MCP server
 entry for SYSTEM-NAME (default \"dsmr-mcp\").
 
-The shape is {\"type\":\"stdio\",\"command\":\"sbcl\",\"args\":[...]}.
-SYSTEM-NAME is parameterized so the same constructor can describe cl-mcp
-or any sibling system that follows the load-then-run launcher convention."
-  (%ht "type"    "stdio"
-       "command" "sbcl"
-       "args"    (%args-vector system-name)))
+When LAUNCHER is a non-nil path string, the entry invokes that executable
+directly with no arguments — the lifecycle launch wrapper
+(scripts/dsmr-mcp-launch.sh), which boots the prebuilt core when it is fresh
+and regenerates it on SBCL/source/dependency drift. The shape is
+{\"type\":\"stdio\",\"command\":LAUNCHER,\"args\":[]}.
+
+When LAUNCHER is NIL the entry is the source-load fallback shape
+{\"type\":\"stdio\",\"command\":\"sbcl\",\"args\":[...]}, parameterized by
+SYSTEM-NAME so the same constructor can describe cl-mcp or any sibling
+system that follows the load-then-run convention."
+  (if launcher
+      (%ht "type" "stdio" "command" launcher "args" (%vec))
+      (%ht "type"    "stdio"
+           "command" "sbcl"
+           "args"    (%args-vector system-name))))
 
 ;;; Detector -----------------------------------------------------------------
 
@@ -137,7 +147,8 @@ are copied here, so unrelated values stay untouched in the original."
 ;;; Core transform -----------------------------------------------------------
 
 (defun ensure-server (config &key (system-name +dsmr-server-name+)
-                                  (on-existing-cl-mcp :keep))
+                                  (on-existing-cl-mcp :keep)
+                                  launcher)
   "Return a NEW config object derived from parsed CONFIG with the
 SYSTEM-NAME server entry ensured under \"mcpServers\" and the cl-mcp
 migration policy applied. CONFIG is never mutated.
@@ -145,6 +156,10 @@ migration policy applied. CONFIG is never mutated.
 CONFIG may be a jzon hash-table or NIL; NIL is treated as an empty config
 and a minimal {\"mcpServers\":{...}} object is produced. Unrelated
 top-level keys and unrelated mcpServers entries are preserved verbatim.
+
+LAUNCHER is threaded into canonical-server-entry: a non-nil path string
+makes the dsmr-mcp entry invoke that wrapper directly; NIL yields the
+source-load fallback shape.
 
 ON-EXISTING-CL-MCP selects what happens to any existing cl-mcp entry:
   :keep    (default) leave cl-mcp untouched; coexist with dsmr-mcp.
@@ -168,6 +183,6 @@ canonical value and cl-mcp removal is a no-op when cl-mcp is absent."
       (remhash +cl-mcp-server-name+ servers))
     ;; Always (re)set the dsmr-mcp entry to the canonical value.
     (setf (gethash system-name servers)
-          (canonical-server-entry system-name))
+          (canonical-server-entry system-name :launcher launcher))
     (setf (gethash "mcpServers" base) servers)
     base))
