@@ -65,7 +65,8 @@ snippet is the object that belongs under the host's \"mcpServers\" map
 keyed by \"dsmr-mcp\"."
   (let ((wrapper (make-hash-table :test 'equal)))
     (setf (gethash config:+dsmr-server-name+ wrapper)
-          (config:canonical-server-entry))
+          (config:canonical-server-entry config:+dsmr-server-name+
+                                          :launcher (claude:launcher-if-present)))
     (format t "~&Add this entry under your agent's \"mcpServers\" map:~%~%~A~%"
             (jzon:stringify wrapper :pretty t))))
 

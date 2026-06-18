@@ -15,7 +15,9 @@
                 #:+dsmr-server-name+
                 #:+cl-mcp-server-name+)
   (:import-from #:dsmr-mcp/src/install/claude
-                #:install-into-claude))
+                #:install-into-claude
+                #:wrapper-launcher-path
+                #:launcher-if-present))
 
 (in-package #:dsmr-mcp/tests/install/config-test)
 
@@ -101,6 +103,42 @@ leaks onto fd 1 and breaks the stdio handshake."
             "load form rebinds *trace-output*")
       (true (search "*standard-output*" load-form)
             "load form rebinds *standard-output*"))))
+
+(define-test canonical-entry-launcher-emits-wrapper-command
+  "With a launcher path, the entry invokes the wrapper directly with no args
+— the prebuilt-core lifecycle launcher — instead of the source-load argv."
+  (let ((entry (canonical-server-entry
+                +dsmr-server-name+
+                :launcher "/opt/dsmr/scripts/dsmr-mcp-launch.sh")))
+    (is string= "stdio" (gethash "type" entry))
+    (is string= "/opt/dsmr/scripts/dsmr-mcp-launch.sh" (gethash "command" entry))
+    (true (vectorp (gethash "args" entry)))
+    (is = 0 (length (gethash "args" entry)) "wrapper launcher takes no args")))
+
+(define-test canonical-entry-without-launcher-is-source-load
+  "No launcher keeps the source-load fallback shape (sbcl + a non-empty argv)."
+  (let ((entry (canonical-server-entry)))
+    (is string= "sbcl" (gethash "command" entry))
+    (true (plusp (length (gethash "args" entry))))))
+
+(define-test ensure-server-threads-launcher
+  "ensure-server forwards :launcher so the written dsmr-mcp entry is the
+wrapper command."
+  (let* ((out (ensure-server nil
+                             :launcher "/opt/dsmr/scripts/dsmr-mcp-launch.sh"))
+         (entry (gethash +dsmr-server-name+ (servers out))))
+    (is string= "/opt/dsmr/scripts/dsmr-mcp-launch.sh" (gethash "command" entry))
+    (is = 0 (length (gethash "args" entry)))))
+
+(define-test wrapper-launcher-path-names-and-finds-shipped-script
+  "The resolver names the wrapper shipped in the repo, and it exists in this
+checkout — so a real install emits a launcher that is actually present and
+executable."
+  (let ((p (wrapper-launcher-path)))
+    (true (search "scripts/dsmr-mcp-launch.sh" p) "names the shipped wrapper")
+    (true (probe-file p) "wrapper exists in the checkout")
+    (is string= p (launcher-if-present)
+        "launcher-if-present returns the path when the script exists")))
 
 (define-test canonical-entry-system-name-parameterized
   (let ((entry (canonical-server-entry "cl-mcp")))
