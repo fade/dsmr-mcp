@@ -28,7 +28,7 @@
 #   kill $(cat /tmp/dsmr-mcp-dev.pid)     (hard, --background only)
 #
 # Env (all optional):
-#   SLYNK_PORT       slynk listen port      (default 4006)
+#   SLYNK_PORT       slynk listen port      (default 18709)
 #   SLYNK_HOST       slynk listen address   (default 127.0.0.1)
 #   LISP_WORKSPACE   local-projects tree    (default ~/SourceCode/lisp/)
 #   QUICKLISP_SETUP  quicklisp setup.lisp   (default ~/quicklisp/setup.lisp)
@@ -37,7 +37,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SLYNK_PORT="${SLYNK_PORT:-4006}"
+SLYNK_PORT="${SLYNK_PORT:-18709}"
 SLYNK_HOST="${SLYNK_HOST:-127.0.0.1}"
 LISP_WORKSPACE="${LISP_WORKSPACE:-${HOME}/SourceCode/lisp}"
 QUICKLISP_SETUP="${QUICKLISP_SETUP:-${HOME}/quicklisp/setup.lisp}"
