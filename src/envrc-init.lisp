@@ -172,15 +172,20 @@ unchanged rather than writing a broken file."
     (return-from %envrc-with-derived-port template))
   (let ((derived (handler-case (derive-slynk-port project-root) (error () nil))))
     (unless derived (return-from %envrc-with-derived-port template))
-    ;; Target: SLYNK_PORT="${SLYNK_PORT:-<port>}" — replace only the numeric
-    ;; default inside the :- ... } expression. cl-ppcre is already a system dep.
+    ;; Rebuild the whole SLYNK_PORT="${SLYNK_PORT:-<port>}" line with the derived
+    ;; default. The prefix/suffix are fixed literals, so a register-free literal
+    ;; replacement is enough — and is the *only* safe form here: a `\1`-style
+    ;; back-reference would sit immediately before the port digits, and cl-ppcre
+    ;; reads `\16762` as register 16762, signals "non-existent register", and the
+    ;; surrounding handler-case would silently return the template with the
+    ;; default port unchanged.
     (let ((port-str (princ-to-string derived)))
       (handler-case
           (%wire-string
            (regex-replace
-            "(SLYNK_PORT=\"\\$\\{SLYNK_PORT:-)[0-9]+(\\}\")"
+            "SLYNK_PORT=\"\\$\\{SLYNK_PORT:-[0-9]+\\}\""
             template
-            (format nil "\\1~A\\2" port-str)))
+            (format nil "SLYNK_PORT=\"${SLYNK_PORT:-~A}\"" port-str)))
         (error () template)))))
 
 (defun envrc-content-with-derived-port (content project-root)

@@ -39,6 +39,8 @@
                 #:envrc-content-with-derived-port)
   (:import-from #:dsmr-mcp/src/envrc-template
                 #:read-envrc-template)
+  (:import-from #:dsmr-mcp/src/slynk-port
+                #:derive-slynk-port)
   (:import-from #:dsmr-mcp/src/state
                 #:make-session
                 #:session-elicitation-p
@@ -192,11 +194,20 @@ and lives at root/.envrc (resolved through the write jail)."
     (write-fixture-file root "foo.asd" "x")
     (setf (session-elicitation-p s) t)
     (true (%prompt-with-consent s "accept") "accept should write")
-    (let ((envrc (merge-pathnames ".envrc" root)))
+    (let* ((envrc (merge-pathnames ".envrc" root))
+           (written (uiop:read-file-string envrc))
+           (port (derive-slynk-port root)))
       (true (probe-file envrc) ".envrc should land at root/.envrc")
       (is string= (envrc-content-with-derived-port (read-envrc-template) root)
-          (uiop:read-file-string envrc)
-          "written content should be the template with the derived port"))))
+          written
+          "written content should be the template with the derived port")
+      ;; Guard against the substitution silently no-opping (returning the
+      ;; template with the default port): the derived port must actually land,
+      ;; and the literal default must be gone from the SLYNK_PORT line.
+      (true (search (format nil "SLYNK_PORT:-~A}" port) written)
+            "the derived port must be substituted into the SLYNK_PORT line")
+      (false (search "SLYNK_PORT:-4005}" written)
+             "the default port 4005 must not survive substitution"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Decline writes nothing
