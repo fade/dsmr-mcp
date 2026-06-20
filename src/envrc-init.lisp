@@ -59,6 +59,10 @@
                 #:write-file-string-atomically)
   (:import-from #:dsmr-mcp/src/envrc-template
                 #:read-envrc-template)
+  (:import-from #:dsmr-mcp/src/slynk-port
+                #:derive-slynk-port)
+  (:import-from #:cl-ppcre
+                #:regex-replace)
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht)
   (:import-from #:dsmr-mcp/src/log
@@ -66,7 +70,8 @@
   (:export #:lisp-project-without-envrc-p
            #:lisp-project-envrc-needs-setup-p
            #:maybe-prompt-and-write-envrc
-           #:envrc-elicitation-schema))
+           #:envrc-elicitation-schema
+           #:envrc-content-with-derived-port))
 
 (in-package #:dsmr-mcp/src/envrc-init)
 
@@ -117,7 +122,7 @@ the round-trip's wire payload safe."
 ;;; Managed append block (marker-delimited)
 ;;; ---------------------------------------------------------------------------
 
-(defun envrc-managed-block ()
+(defun envrc-managed-block (&optional project-root)
   "Return the dsmr-mcp managed `.envrc` block as an element-type CHARACTER
 string. The block is wrapped in `# >>> dsmr-mcp ... >>>` / `# <<< dsmr-mcp <<<`
 markers so it can be located, re-edited, or removed by hand, and carries the
@@ -125,18 +130,64 @@ same export lines (values and forms) as the body of
 templates/dsmr-mcp.envrc.template -- without that file's header comment. It is
 appended verbatim to an existing `.envrc` that lacks the dsmr-mcp setup; the
 user's own lines are never touched. Built via FORMAT then coerced through
-%wire-string so nothing on it is a simple-base-string."
-  (%wire-string
-   (format nil
+%wire-string so nothing on it is a simple-base-string.
+
+When PROJECT-ROOT is supplied, the SLYNK_PORT default is derived from it via
+FNV-1a into a stable per-project value in [4096, 32768), so concurrent projects
+get distinct ports and do not converge on one shared Slynk image. When
+PROJECT-ROOT is nil the legacy literal 4005 is used — valid for hand-editable
+blocks and operator overrides."
+  (let* ((derived (and project-root
+                       (handler-case (derive-slynk-port project-root)
+                         (error () nil))))
+         (port    (if derived (princ-to-string derived) "4005")))
+    (%wire-string
+     (format nil
 "# >>> dsmr-mcp (added automatically; edit or remove freely) >>>
 export LISP_WORKSPACE=\"${LISP_WORKSPACE:-$HOME/SourceCode/lisp/}\"
 export SLYNK_HOST=\"${SLYNK_HOST:-127.0.0.1}\"
-export SLYNK_PORT=\"${SLYNK_PORT:-4005}\"
+export SLYNK_PORT=\"${SLYNK_PORT:-~A}\"
 export DSMR_MODE=auto
 export DSMR_SLYNK_ATTACH=\"${SLYNK_HOST}:${SLYNK_PORT}\"
 export DSMR_LOG_LEVEL=info
 # <<< dsmr-mcp <<<
-")))
+"
+             port))))
+
+;;; ---------------------------------------------------------------------------
+;;; Template port substitution
+;;; ---------------------------------------------------------------------------
+
+(defun %envrc-with-derived-port (template project-root)
+  "Return TEMPLATE (a `.envrc` content string) with the SLYNK_PORT default
+substituted to the per-project derived value when PROJECT-ROOT is known.
+
+The substitution targets the shell expression `:-NNNN}` on the SLYNK_PORT line —
+the same override-preserving shape the template already uses. When derivation
+signals an error, or when no SLYNK_PORT line is found, TEMPLATE is returned
+unchanged rather than writing a broken file."
+  (when (or (null project-root)
+            (not (stringp template))
+            (zerop (length template)))
+    (return-from %envrc-with-derived-port template))
+  (let ((derived (handler-case (derive-slynk-port project-root) (error () nil))))
+    (unless derived (return-from %envrc-with-derived-port template))
+    ;; Target: SLYNK_PORT="${SLYNK_PORT:-<port>}" — replace only the numeric
+    ;; default inside the :- ... } expression. cl-ppcre is already a system dep.
+    (let ((port-str (princ-to-string derived)))
+      (handler-case
+          (%wire-string
+           (regex-replace
+            "(SLYNK_PORT=\"\\$\\{SLYNK_PORT:-)[0-9]+(\\}\")"
+            template
+            (format nil "\\1~A\\2" port-str)))
+        (error () template)))))
+
+(defun envrc-content-with-derived-port (content project-root)
+  "Return CONTENT (a `.envrc` template string) with the SLYNK_PORT default
+replaced by the per-project derived port for PROJECT-ROOT. Public seam used
+by the project scaffold and the per-project write paths."
+  (%envrc-with-derived-port content project-root))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Elicitation schema
@@ -285,7 +336,8 @@ submitted `confirm` is explicitly false or when a `.envrc` already exists
                   "path" (namestring target))
        nil)
       (t
-       (write-file-string-atomically target (read-envrc-template))
+       (let ((content (%envrc-with-derived-port (read-envrc-template) root)))
+         (write-file-string-atomically target content))
        (log-event :info "envrc.write.created" "path" (namestring target))
        t))))
 
@@ -339,7 +391,7 @@ CONTENT is the accept response content."
                    ;; blank) so the appended marker never joins a user line.
                    (sep (if ends-nl (format nil "~%") (format nil "~%~%")))
                    (full (%wire-string
-                          (concatenate 'string existing sep (envrc-managed-block)))))
+                          (concatenate 'string existing sep (envrc-managed-block root)))))
               (write-file-string-atomically target full)
               (log-event :info "envrc.append.added" "path" (namestring target))
               t))))))))
