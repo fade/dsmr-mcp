@@ -25,6 +25,8 @@
                 #:ensure-write-path)
   (:import-from #:dsmr-mcp/src/fs
                 #:write-file-string-atomically)
+  (:import-from #:dsmr-mcp/src/envrc-init
+                #:envrc-content-with-derived-port)
   (:export #:write-scaffold))
 
 (in-package #:dsmr-mcp/src/project-scaffold)
@@ -121,6 +123,19 @@ underlying error after cleaning up the temp directory (no debris)."
                                       ;; (live current year); pass through as-is
                                       :year year
                                       :destination effective-destination))
+             ;; Substitute the per-project derived Slynk port into the
+             ;; generated .envrc and scripts/dev-boot.sh, so the new project
+             ;; starts with its own port from day one rather than the shared
+             ;; literal 4005.
+             (manifest (mapcar
+                        (lambda (entry)
+                          (if (member (car entry) '(".envrc" "scripts/dev-boot.sh")
+                                      :test #'string=)
+                              (cons (car entry)
+                                    (envrc-content-with-derived-port
+                                     (cdr entry) target-dir))
+                              entry))
+                        manifest))
              (committed nil))
         (unwind-protect
              (progn
