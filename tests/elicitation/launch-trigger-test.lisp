@@ -35,7 +35,8 @@
   (:import-from #:dsmr-mcp/src/envrc-init
                 #:maybe-prompt-and-write-envrc
                 #:lisp-project-without-envrc-p
-                #:lisp-project-envrc-needs-setup-p)
+                #:lisp-project-envrc-needs-setup-p
+                #:envrc-content-with-derived-port)
   (:import-from #:dsmr-mcp/src/envrc-template
                 #:read-envrc-template)
   (:import-from #:dsmr-mcp/src/state
@@ -185,16 +186,17 @@ export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 ;;; ---------------------------------------------------------------------------
 
 (define-test jailed-write-on-accept
-  "On a thread-driven accept the written file is exactly the read-envrc-template
-content and lives at root/.envrc (resolved through the write jail)."
+  "On a thread-driven accept the written file carries the project-derived port
+and lives at root/.envrc (resolved through the write jail)."
   (with-temp-project-root (s root)
     (write-fixture-file root "foo.asd" "x")
     (setf (session-elicitation-p s) t)
     (true (%prompt-with-consent s "accept") "accept should write")
     (let ((envrc (merge-pathnames ".envrc" root)))
       (true (probe-file envrc) ".envrc should land at root/.envrc")
-      (is string= (read-envrc-template) (uiop:read-file-string envrc)
-          "written content should be exactly the template"))))
+      (is string= (envrc-content-with-derived-port (read-envrc-template) root)
+          (uiop:read-file-string envrc)
+          "written content should be the template with the derived port"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Decline writes nothing
