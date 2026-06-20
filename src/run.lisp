@@ -28,6 +28,8 @@
                 #:configure-log4cl-for-server)
   (:import-from #:dsmr-mcp/src/attach/connection
                 #:parse-slynk-attach)
+  (:import-from #:dsmr-mcp/src/attach/probe
+                #:resolve-slynk-target)
   (:import-from #:dsmr-mcp/src/attach/dispatch
                 #:*attach-concurrency*
                 #:%resolve-attach-concurrency)
@@ -434,10 +436,18 @@ The dsmr-mcp:run nickname (re-exported by src/main.lisp) resolves to this functi
     ;; Apply attach-concurrency policy before any session accepts requests.
     (setf *attach-concurrency* resolved-attach-concurrency)
 
-    ;; Resolve the effective mode, performing the real :auto Slynk probe now
-    ;; that the log appender is installed.
-    (setf *mode* (resolve-mode :mode resolved-mode
-                                :slynk-attach resolved-slynk-attach))
+    ;; Resolve the effective mode and attach target, now that the log
+    ;; appender is installed so probe warnings land on stderr.
+    ;;
+    ;; resolve-slynk-target prefers the handshake file written by dev-boot.sh
+    ;; (which reflects any port-bump the launcher did), then the configured
+    ;; DSMR_SLYNK_ATTACH target, with an identity check at each step so a
+    ;; foreign project's image on the same port is not silently adopted.
+    ;; resolve-mode is preserved for tests that assert the :auto probe seam.
+    (multiple-value-bind (effective-attach effective-mode)
+        (resolve-slynk-target resolved-slynk-attach resolved-root resolved-mode)
+      (setf resolved-slynk-attach effective-attach)
+      (setf *mode* effective-mode))
 
     ;; When hermetic mode is active, initialize the worker pool and register
     ;; the shutdown hook so workers are reaped when the process exits.

@@ -247,7 +247,7 @@ SBCL-only, matching the v1 scope.")
 # Pass --background to detach; logs go to /tmp/{{name}}-dev.log.
 #
 # Env (all optional):
-#   SLYNK_PORT       slynk listen port      (default 4005)
+#   SLYNK_PORT       slynk listen port      (default: project-specific)
 #   SLYNK_HOST       slynk listen address   (default 127.0.0.1)
 #   LISP_WORKSPACE   local-projects tree    (default ~/SourceCode/lisp/)
 #   QUICKLISP_SETUP  quicklisp setup.lisp   (default ~/quicklisp/setup.lisp)
@@ -290,7 +290,16 @@ if [ ! -d \"$LISP_WORKSPACE\" ]; then
   exit 1
 fi
 
-export SLYNK_PORT SLYNK_HOST LISP_WORKSPACE
+# Bump SLYNK_PORT past any occupied port so concurrent projects use distinct listeners.
+while nc -z \"${SLYNK_HOST}\" \"${SLYNK_PORT}\" 2>/dev/null; do
+  echo \"[dev-boot] port ${SLYNK_PORT} is occupied, bumping to $((SLYNK_PORT + 1))\" >&2
+  SLYNK_PORT=$((SLYNK_PORT + 1))
+done
+
+# Remove any stale handshake on exit so dsmr-mcp does not follow a dead pointer.
+trap 'rm -f \"${PROJECT_ROOT}/.dsmr-slynk.port\"' EXIT INT TERM
+
+export SLYNK_PORT SLYNK_HOST LISP_WORKSPACE PROJECT_ROOT
 
 SBCL_ARGS=(
   --noinform
@@ -301,13 +310,18 @@ SBCL_ARGS=(
   --eval \"(asdf:load-asd \\\"$PROJECT_ROOT/{{name}}.asd\\\")\"
   --eval \"(asdf:load-system :{{name}})\"
   --eval \"(asdf:load-system :slynk)\"
-  --eval \"(uiop:symbol-call :slynk :create-server
-             :port (parse-integer (uiop:getenv \\\"SLYNK_PORT\\\"))
-             :interface (uiop:getenv \\\"SLYNK_HOST\\\")
-             :dont-close t)\"
-  --eval \"(format t \\\"~&{{name}} dev image live — Slynk on ~A:~A~%\\\"
-                   (uiop:getenv \\\"SLYNK_HOST\\\")
-                   (uiop:getenv \\\"SLYNK_PORT\\\"))\"
+  --eval \"(let ((bound-port (uiop:symbol-call :slynk :create-server
+                               :port (parse-integer (uiop:getenv \\\"SLYNK_PORT\\\"))
+                               :interface (uiop:getenv \\\"SLYNK_HOST\\\")
+                               :dont-close t)))
+             (with-open-file (f (concatenate 'string
+                                              (uiop:getenv \\\"PROJECT_ROOT\\\")
+                                              \\\"/.dsmr-slynk.port\\\")
+                                :direction :output :if-exists :supersede
+                                :if-does-not-exist :create)
+               (format f \\\"~A:~A~%\\\" (uiop:getenv \\\"SLYNK_HOST\\\") bound-port))
+             (format t \\\"~&{{name}} dev image live — Slynk on ~A:~A~%\\\"
+                       (uiop:getenv \\\"SLYNK_HOST\\\") bound-port))\"
   --eval \";; Project dev-tooling hook: add your dev-only setup in scripts/dev-init.lisp\"
   --eval \"(let ((hook \\\"$PROJECT_ROOT/scripts/dev-init.lisp\\\"))
              (when (probe-file hook) (load hook)))\"
@@ -500,6 +514,7 @@ Copyright (c) {{year}} {{copyright}}.
 bin/
 *.log
 *.pid
+.dsmr-slynk.port
 "
   "Template for the generated project's .gitignore.")
 

@@ -87,6 +87,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/tools/lsp-hover"
                "dsmr-mcp/src/tools/lsp-diagnostics"
                "dsmr-mcp/src/tools/lsp-code-actions"
+               "dsmr-mcp/src/attach/probe"
+               "dsmr-mcp/src/slynk-port"
                "dsmr-mcp/src/envrc-template"
                "dsmr-mcp/src/project-scaffold-templates"
                "dsmr-mcp/src/project-scaffold-core"
@@ -150,6 +152,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/code-intelligence/load-system-test"
                "dsmr-mcp/tests/code-intelligence/run-tests-test"
                "dsmr-mcp/tests/notify/notify-test"
+               "dsmr-mcp/tests/attach/probe-test"
                "dsmr-mcp/tests/attach/call-lock-test"
                "dsmr-mcp/tests/transport/tcp-test"
                "dsmr-mcp/tests/transport/http-test"
@@ -165,7 +168,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/scaffold/project-scaffold-envrc-test"
                "dsmr-mcp/tests/elicitation/elicitation-test"
                "dsmr-mcp/tests/elicitation/launch-trigger-test"
-               "dsmr-mcp/tests/install/defaults-test")
+               "dsmr-mcp/tests/install/defaults-test"
+               "dsmr-mcp/tests/slynk-port-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
