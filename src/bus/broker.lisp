@@ -33,7 +33,8 @@
            #:ensure-bus-dirs
            #:broker #:broker-seq
            #:start-broker #:broker-step #:serve-broker #:stop-broker
-           #:join-members))
+           #:join-members
+           #:broker-running-p #:broker-main #:spawn-broker #:ensure-broker))
 
 (in-package #:dsmr-mcp/src/bus/broker)
 
@@ -137,3 +138,69 @@
   (when (broker-lock-fd broker)
     (ignore-errors (election:close-lock (broker-lock-fd broker))))
   (values))
+
+;;; ------------------------------------------------------- process lifecycle
+
+(defun broker-running-p (paths)
+  "True iff a broker currently holds the election lock — probed by trying to take
+   it non-blocking and immediately releasing on success. Inherently racy against a
+   broker starting up, so the authoritative election still happens in the broker
+   itself; this only spares the common case a redundant spawn."
+  (ensure-bus-dirs paths)
+  (let ((fd (election:open-lock (bus-paths-lock paths))))
+    (unwind-protect
+         (if (election:try-lock-exclusive fd)
+             (progn (election:unlock fd) nil)
+             t)
+      (election:close-lock fd))))
+
+(defvar *broker-stop* nil
+  "Set by the broker process's SIGTERM handler to break its serve loop.")
+
+(defun broker-main (root &key (block t))
+  "Entry point for a detached broker PROCESS. Elects on the bus rooted at ROOT
+   (a string or pathname); with BLOCK it waits as a standby to take over on the
+   incumbent's death, without BLOCK it exits 0 if the role is already taken.
+   Serves until SIGTERM, then archives on clean exit. SIGHUP is ignored so the
+   broker outlives the agent that spawned it."
+  (let* ((paths (make-bus-paths (uiop:ensure-directory-pathname root)))
+         (br (start-broker paths :block block)))
+    (unless br (uiop:quit 0))
+    (setf *broker-stop* nil)
+    (sb-sys:enable-interrupt sb-unix:sighup :ignore)
+    (sb-sys:enable-interrupt sb-unix:sigterm
+                             (lambda (&rest _) (declare (ignore _)) (setf *broker-stop* t)))
+    (unwind-protect (serve-broker br (lambda () *broker-stop*))
+      (stop-broker br :archive t))
+    (uiop:quit 0)))
+
+(defun %broker-spawn-args (root &key (block t))
+  "The sbcl command line for a detached broker process. Loads only the broker
+   subsystem (lighter than the full server) plus its pzmq dependency."
+  (let ((sbcl (or (uiop:getenv "SBCL") "sbcl"))
+        (project (namestring (asdf:system-source-directory "dsmr-mcp")))
+        (ql (namestring (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))))
+    (list sbcl "--non-interactive" "--disable-debugger"
+          "--eval" (format nil "(when (probe-file ~S) (load ~S))" ql ql)
+          "--eval" (format nil "(asdf:initialize-source-registry '(:source-registry (:directory ~S) :inherit-configuration))"
+                           project)
+          "--eval" "(funcall (read-from-string \"ql:quickload\") \"dsmr-mcp/src/bus/broker\" :silent t)"
+          "--eval" (format nil "(funcall (read-from-string \"dsmr-mcp/src/bus/broker:broker-main\") ~S :block ~:[nil~;t~])"
+                           (namestring (uiop:ensure-directory-pathname root)) block))))
+
+(defun spawn-broker (paths &key (block t))
+  "Launch a detached broker process serving the bus at PATHS, logging to
+   broker.log in the bus directory. Returns the uiop process handle (the caller
+   need not wait on it)."
+  (ensure-bus-dirs paths)
+  (uiop:launch-program (%broker-spawn-args (bus-paths-root paths) :block block)
+                       :output (merge-pathnames "broker.log" (bus-paths-root paths))
+                       :error-output :output))
+
+(defun ensure-broker (paths)
+  "Make sure a broker is serving the bus at PATHS. Returns :EXISTS if one already
+   holds the role, or :SPAWNED after launching one. The spawned process self-
+   elects, so a lost startup race just exits cleanly rather than double-serving."
+  (if (broker-running-p paths)
+      :exists
+      (progn (spawn-broker paths :block nil) :spawned)))
