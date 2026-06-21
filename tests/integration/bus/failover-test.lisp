@@ -62,7 +62,7 @@
       (error "broker did not become ready within ~Ds" *ready-timeout*))
     proc))
 
-(defun bodies (records) (mapcar #'wal:record-body-string records))
+(defun bodies (records) (mapcar #'bus:delivered-body-string records))
 
 (defun archive-files (paths)
   (directory (merge-pathnames "bus.wal.archive-*" (broker:bus-paths-root paths))))
