@@ -174,6 +174,36 @@ could leak into a later run's absence assertions."
         (is eq :already-present (getf second :action-taken))
         (is = 1 (length ss2))))))
 
+(define-test write-project-hook-backs-up-existing-file
+  ;; An existing settings.json is backed up to a timestamped .bak before the
+  ;; atomic overwrite, and the backup holds the operator's original bytes — so a
+  ;; whole-file re-stringify can never silently lose hand-formatting. A freshly
+  ;; created file has no backup.
+  (with-temp-dir (project-dir "hooks-backup-project")
+    (let* ((cmd "/abs/bus-arm.sh")
+           (settings-path (merge-pathnames ".claude/settings.json" project-dir))
+           ;; Seed an existing, hand-formatted settings file.
+           (original-text "{ \"model\": \"opus\", \"hooks\": {} }"))
+      ;; Fresh create: no backup.
+      (let ((first (%write-project-hook project-dir cmd)))
+        (is eq :created (getf first :action-taken))
+        (false (getf first :backup-path)
+               "a freshly created file has no backup"))
+      ;; Overwrite the file with operator content, then write again — now backed up.
+      (with-open-file (out settings-path :direction :output
+                                         :if-exists :supersede
+                                         :if-does-not-exist :create)
+        (write-string original-text out))
+      (let* ((second (%write-project-hook project-dir cmd))
+             (backup (getf second :backup-path)))
+        (true backup "an existing file was backed up before overwrite")
+        (true (probe-file backup) "the backup file exists on disk")
+        (is string= original-text (uiop:read-file-string backup)
+            "the backup holds the operator's original bytes verbatim")
+        ;; The live file now carries the merged hook.
+        (let ((parsed (jzon:parse (uiop:read-file-string settings-path))))
+          (true (hook-already-present-p parsed cmd)))))))
+
 (define-test install-hooks-skip-is-noop
   (with-temp-dir (project-dir "hooks-test-project")
     (with-temp-dir (lib-dir "hooks-test-lib")
