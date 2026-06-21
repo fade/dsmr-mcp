@@ -70,18 +70,41 @@
   (and (agent-stable agent) t))
 
 (defun agent-publish (agent message)
-  "Broadcast MESSAGE (string or octet vector) onto the bus. Returns MESSAGE."
-  (bus:publish (agent-client agent) message))
+  "Broadcast MESSAGE (string) onto the bus and return the EXACT broker-assigned seq
+   of this message (an integer, or NIL when it could not be matched within the
+   bound). The message embeds this agent's stable self-id so the agent's OWN
+   receive filters it back out — the agent never gets its own message returned to
+   it, with NO cursor manipulation and so no risk of skipping a foreign message.
+   The correlation-id match (not WAL position) is what disambiguates a concurrent
+   foreign publisher's record. PUBLISH defaults the read-back scan floor to the
+   WAL's current highest seq; that floor only BOUNDS the rescan window — its cost
+   scales with how much bus traffic accrues above the floor while waiting for the
+   id to appear, not with correctness."
+  (bus:publish (agent-client agent) message
+               :self-id (agent-id agent)))
 
 (defun agent-receive (agent &key (timeout-ms 0))
   "Receive messages addressed to the whole bus that this agent has not yet seen,
    advancing its cursor. With TIMEOUT-MS 0 this is a non-blocking catch-up; with a
    positive timeout it waits up to that long for the first message. Returns a list
-   of message strings (most recent last), empty if none."
+   of message strings (most recent last), empty if none. The delivery cursor
+   advances over EVERY pending record (including this agent's own), but records
+   carrying this agent's own self-id are filtered out of the RETURNED set — the
+   receive-side self-echo filter. A foreign record interleaved below this agent's
+   own seq was delivered in order and IS returned: no message is skipped."
   (let ((records (if (plusp timeout-ms)
                      (bus:await (agent-subscriber agent) :timeout-ms timeout-ms)
-                     (bus:poll (agent-subscriber agent)))))
-    (mapcar #'wal:record-body-string records)))
+                     (bus:poll (agent-subscriber agent))))
+        (own (bus:encode-id (agent-id agent)))
+        (out '()))
+    (dolist (record records (nreverse out))
+      (multiple-value-bind (text cid sid)
+          (bus:decode-envelope (wal:record-body-string record))
+        (declare (ignore cid))
+        ;; Keep a legacy un-enveloped message (sid NIL) and any FOREIGN message;
+        ;; drop only records carrying this agent's own encoded self-id.
+        (unless (and sid (string= sid own))
+          (push text out))))))
 
 (defun agent-status (agent)
   "A snapshot of this agent's view of the bus: its own identity (full id, the name

@@ -24,14 +24,19 @@
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:cursor #:dsmr-mcp/src/bus/cursor)
                     (#:election #:dsmr-mcp/src/bus/election)
+                    (#:wal #:dsmr-mcp/src/bus/wal)
                     (#:tz #:dsmr-mcp/src/bus/zmq))
   (:export #:client #:connect-client #:publish #:disconnect-client
            #:subscriber #:subscribe #:unsubscribe #:poll #:poll-count #:await
-           #:agent-id #:encode-id))
+           #:agent-id #:encode-id
+           #:decode-envelope #:delivered-body-string))
 
 (in-package #:dsmr-mcp/src/bus/bus)
 
 (defun %now-ms ()
+  "Milliseconds from GET-INTERNAL-REAL-TIME. This is a monotonic-ish counter from
+   an implementation-dependent fixed point in the past, used ONLY for measuring
+   relative durations (deadlines) — never as a wall clock the operator reads."
   (values (truncate (* 1000 (get-internal-real-time)) internal-time-units-per-second)))
 
 ;;; --------------------------------------------------------------- identity
@@ -64,6 +69,85 @@
 (defun %release-fd (fd)
   (when fd (ignore-errors (election:close-lock fd))))
 
+;;; ------------------------------------------------------ message envelope
+;;;
+;;; Two distinct needs ride one body envelope, with NO change to the WAL frame or
+;;; the broker (which appends the submission verbatim):
+;;;
+;;;   - SELF-WAKE: the publisher learns the broker-assigned seq of its OWN message
+;;;     by tagging it with a globally-unique correlation-id, then matching that id
+;;;     on the durable record it reads back. Matching by message IDENTITY (not WAL
+;;;     position) is what makes this race-free under concurrent cross-process
+;;;     publishing — a foreign agent's record simply fails the id match.
+;;;
+;;;   - SELF-ECHO suppression: the envelope also carries the publisher's stable
+;;;     self-id, so the publisher's OWN receive can filter its own messages out of
+;;;     the returned set (the agent layer does this) — without ever touching a
+;;;     cursor.
+;;;
+;;; Wire format of the body string:  correlation-id <DELIM> encoded-self-id <DELIM> payload
+;;; DELIM is a single char outside both the correlation-id alphabet and ENCODE-ID's
+;;; output, so neither field can ever contain it; the payload follows the SECOND
+;;; delimiter raw and may itself contain DELIM harmlessly (decoding splits on the
+;;; first two only).
+
+(defconstant +envelope-delimiter+ #\|
+  "The envelope field separator. Outside the correlation-id alphabet (lowercase
+   hex/alphanumerics) and outside ENCODE-ID's output (percent-encoding over
+   alphanumerics + . - _), so it can appear only in the payload — never in either
+   id field.")
+
+(defvar *correlation-random* (make-random-state t)
+  "A per-process random source, seeded from system entropy at load, for the random
+   nonce in a correlation-id. Distinct fresh images thus draw distinct nonces even
+   when pid + counter happen to align.")
+
+(defun %new-correlation-id ()
+  "A token unique across processes (pid), within one process (a monotonic counter),
+   and against accidental reuse (a random nonce). The alphabet is lowercase
+   hex/alphanumerics only, so the envelope delimiter can never appear inside it,
+   and two publishes anywhere on the host never collide."
+  (format nil "c~(~x~)x~(~x~)x~(~x~)"
+          (sb-posix:getpid)
+          (incf *local-counter*)
+          (random (expt 2 48) *correlation-random*)))
+
+(defun %wrap-envelope (correlation-id self-id payload)
+  "Build the wire body: CORRELATION-ID + DELIM + (ENCODE-ID SELF-ID) + DELIM +
+   PAYLOAD. A NIL SELF-ID embeds an empty encoded field; the wrap always emits two
+   delimiters so the format is uniform and decoding is unambiguous."
+  (format nil "~A~C~A~C~A"
+          correlation-id
+          +envelope-delimiter+
+          (if self-id (encode-id self-id) "")
+          +envelope-delimiter+
+          payload))
+
+(defun decode-envelope (body-string)
+  "Split a wire body into THREE values: the original user TEXT (everything past the
+   second delimiter), the CORRELATION-ID, and the ENCODED SELF-ID (compared
+   encoded-vs-encoded against (ENCODE-ID id), so it is returned in its encoded
+   form). The payload may itself contain the delimiter — only the first two
+   delimiter positions are used. A body WITHOUT two delimiters is a legacy,
+   un-enveloped message from an old-core publisher: it is returned verbatim as the
+   text with NIL ids, so the decoder is backward-compatible during a staggered
+   rollout."
+  (let ((d1 (position +envelope-delimiter+ body-string)))
+    (if d1
+        (let ((d2 (position +envelope-delimiter+ body-string :start (1+ d1))))
+          (if d2
+              (values (subseq body-string (1+ d2))
+                      (subseq body-string 0 d1)
+                      (let ((encoded (subseq body-string (1+ d1) d2)))
+                        (if (zerop (length encoded)) nil encoded)))
+              (values body-string nil nil)))
+        (values body-string nil nil))))
+
+(defun delivered-body-string (record)
+  "The original user text of RECORD — its body decoded through the envelope. A
+   single call for body-only readers that do not need the ids."
+  (values (decode-envelope (wal:record-body-string record))))
+
 ;;; --------------------------------------------------------------- client
 
 (defstruct (client (:constructor %make-client))
@@ -78,11 +162,43 @@
    :submitter (tz:make-submitter (broker:bus-paths-submit-endpoint paths))
    :members-fd (when join (broker:join-members paths))))
 
-(defun publish (client payload)
-  "Submit PAYLOAD (string or octet vector) to the broker. Fire-and-forget: the
-   broker appends it to the log and fans out a nudge. Returns PAYLOAD."
-  (tz:send-message (client-submitter client) payload)
-  payload)
+(defun %await-own-seq (paths correlation-id after &key (timeout-ms 2000) (poll-ms 5))
+  "Read the WAL (read-only) for records past AFTER and return the RECORD-SEQ of the
+   FIRST one whose decoded correlation-id STRING= CORRELATION-ID — that is the
+   publisher's OWN record, identified by message identity, never by WAL position.
+   A concurrent foreign agent's record fails the id match and is left for normal
+   delivery. Bounded by a deadline: returns NIL if the id has not appeared in time.
+   AFTER is not advanced between turns — re-scanning from the same floor is fine
+   because the id match, not the position, selects the record. Touches no cursor."
+  (let ((deadline (+ (%now-ms) timeout-ms))
+        (wal-path (broker:bus-paths-wal paths)))
+    (loop
+      (dolist (record (wal:read-records wal-path :after after))
+        (multiple-value-bind (text cid sid) (decode-envelope (wal:record-body-string record))
+          (declare (ignore text sid))
+          (when (and cid (string= cid correlation-id))
+            (return-from %await-own-seq (wal:record-seq record)))))
+      (when (>= (%now-ms) deadline) (return nil))
+      (sleep (/ poll-ms 1000.0)))))
+
+(defun publish (client payload &key after self-id)
+  "Submit PAYLOAD (string) to the broker, wrapped in a correlation-id + self-id
+   envelope. Delivery is still fire-and-forget — a ZeroMQ PUSH the broker appends
+   verbatim and fans out — but the call ALSO reports the EXACT broker-assigned seq
+   of this message, learned by matching its globally-unique correlation-id on the
+   durable record it reads back over the existing feed. Returns that integer seq,
+   or NIL when it could not be matched within the bound (the message was still
+   sent; only the seq-learnance is best-effort, never a failure). AFTER is the
+   pre-send floor for the read-back scan (the caller's last-seen seq); it defaults
+   to the WAL's current highest seq. SELF-ID is the publisher's stable bus id,
+   embedded so the publisher's own receive can filter the message out. Reads the
+   WAL read-only and touches NO cursor."
+  (let* ((correlation-id (%new-correlation-id))
+         (paths (client-paths client))
+         (floor (or after (wal:scan (broker:bus-paths-wal paths)))))
+    (tz:send-message (client-submitter client)
+                     (%wrap-envelope correlation-id self-id payload))
+    (%await-own-seq paths correlation-id floor)))
 
 (defun disconnect-client (client)
   "Close the client's socket and release its membership lock."
@@ -125,7 +241,13 @@
    Delivers any existing backlog first (catch-up), then waits on the live ZeroMQ
    nudge for more. The cursor — not the nudge — is the source of truth, so a
    missed nudge degrades to catch-up, never a lost message. Returns the delivered
-   records, or NIL if nothing arrived before the deadline."
+   records, or NIL if nothing arrived before the deadline.
+
+   TIMEOUT-MS is GRANULAR to the feed's own receive timeout (the FEED-TIMEOUT-MS
+   passed to SUBSCRIBE, default 100ms): the deadline is only checked between feed
+   receives, so a quiet AWAIT can overshoot TIMEOUT-MS by up to nearly one feed
+   interval. Pick a feed timeout no larger than the tightest AWAIT timeout a
+   caller needs honored. The clock is for relative durations only (see %NOW-MS)."
   (let ((deadline (+ (%now-ms) timeout-ms)))
     (loop
       (let ((delivered (cursor:deliver-pending (subscriber-cursor subscriber))))
