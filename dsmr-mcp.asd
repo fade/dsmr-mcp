@@ -28,6 +28,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "flexi-streams"
                "log4cl"
                "slynk-client"
+               "pzmq"
                "dsmr-mcp/src/main"
                "dsmr-mcp/src/wire-strings"
                "dsmr-mcp/src/protocol"
@@ -100,7 +101,20 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/install/defaults"
                "dsmr-mcp/src/install/claude"
                "dsmr-mcp/src/install"
-               "dsmr-mcp/src/envrc-init")
+               "dsmr-mcp/src/envrc-init"
+               "dsmr-mcp/src/bus/wal"
+               "dsmr-mcp/src/bus/cursor"
+               "dsmr-mcp/src/bus/election"
+               "dsmr-mcp/src/bus/wakeup"
+               "dsmr-mcp/src/bus/archive"
+               "dsmr-mcp/src/bus/zmq"
+               "dsmr-mcp/src/bus/broker"
+               "dsmr-mcp/src/bus/bus"
+               "dsmr-mcp/src/bus/agent"
+               "dsmr-mcp/src/tools/bus-helpers"
+               "dsmr-mcp/src/tools/bus-publish"
+               "dsmr-mcp/src/tools/bus-receive"
+               "dsmr-mcp/src/tools/bus-status")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"
@@ -113,6 +127,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/support/json-asserts"
                "dsmr-mcp/tests/support/slynk-fixture"
                "dsmr-mcp/tests/support/portability-guard"
+               "dsmr-mcp/tests/support/env-fixture"
                "dsmr-mcp/tests/state/session-test"
                "dsmr-mcp/tests/protocol/handshake-test"
                "dsmr-mcp/tests/protocol/version-negotiation-test"
@@ -169,7 +184,15 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/elicitation/elicitation-test"
                "dsmr-mcp/tests/elicitation/launch-trigger-test"
                "dsmr-mcp/tests/install/defaults-test"
-               "dsmr-mcp/tests/slynk-port-test")
+               "dsmr-mcp/tests/slynk-port-test"
+               "dsmr-mcp/tests/bus/wal-test"
+               "dsmr-mcp/tests/bus/cursor-test"
+               "dsmr-mcp/tests/bus/election-test"
+               "dsmr-mcp/tests/bus/wakeup-test"
+               "dsmr-mcp/tests/bus/archive-test"
+               "dsmr-mcp/tests/bus/zmq-test"
+               "dsmr-mcp/tests/bus/flow-test"
+               "dsmr-mcp/tests/bus/agent-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
@@ -208,7 +231,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/integration/hermetic/worker-spawn-test"
                "dsmr-mcp/tests/integration/hermetic/repl-eval-parity-test"
                "dsmr-mcp/tests/integration/hermetic/circuit-breaker-test"
-               "dsmr-mcp/tests/integration/hermetic/pool-affinity-test")
+               "dsmr-mcp/tests/integration/hermetic/pool-affinity-test"
+               "dsmr-mcp/tests/integration/bus/failover-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names

@@ -13,7 +13,9 @@
                 #:resolve-mode
                 #:%check-remote-bind
                 #:transport-not-implemented-error
-                #:invalid-config-value))
+                #:invalid-config-value)
+  (:import-from #:dsmr-mcp/tests/support/env-fixture
+                #:with-clean-resolution-env))
 
 (in-package #:dsmr-mcp/tests/run-test)
 
@@ -100,6 +102,9 @@ when no keyword is passed.  Uses resolve-transport (non-blocking seam)."
 over the built-in default.  Tests the sentinel-based %or-from-env logic that
 distinguishes 'key present with falsy value' from 'key absent'.
 Exercises the :slynk-attach nil and :port 0 cases."
+  ;; Clear DSMR_SLYNK_ATTACH / DSMR_PORT so a dev shell that exports them for the
+  ;; live server does not outrank the conf values under test.
+  (with-clean-resolution-env
   ;; :slynk-attach nil in conf => result should be nil, NOT the default "host:7777"
   (let ((result (dsmr-mcp/src/run::%or-from-env
                  nil            ; not supplied by caller
@@ -122,7 +127,7 @@ Exercises the :slynk-attach nil and :port 0 cases."
                  '(:transport :stdio)  ; slynk-attach key absent
                  "host:7777"
                  :parse #'identity)))
-    (is equal "host:7777" result)))
+    (is equal "host:7777" result))))
 
 (define-test bad-dsmr-transport-env-signals-typed-error
   "DSMR_TRANSPORT=banana must signal INVALID-CONFIG-VALUE (a typed error subclass)
@@ -158,7 +163,10 @@ parse fires eagerly inside the let* before the transport dispatch."
 (define-test criterion-1-keyword-slynk-attach-sets-attached
   "With a :slynk-attach target configured, the mode resolves to :ATTACHED.
 resolve-mode mirrors resolve-transport's seam and never enters the stdio loop."
-  (is eq :attached (resolve-mode :slynk-attach "127.0.0.1:9999")))
+  ;; Clear DSMR_MODE so a dev shell exporting DSMR_MODE=auto does not turn this
+  ;; into an :auto probe that resolves to :hermetic against the unreachable target.
+  (with-clean-resolution-env
+    (is eq :attached (resolve-mode :slynk-attach "127.0.0.1:9999"))))
 
 (define-test criterion-1-env-slynk-attach-sets-attached
   "With DSMR_SLYNK_ATTACH bound (and DSMR_MODE unset), mode resolves to :ATTACHED
