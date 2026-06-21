@@ -81,12 +81,17 @@ already trusts, *not* a containment layer against a hostile one.
 
 * What you get
 
-- *28 verbs* across REPL evaluation and build (=repl-eval=, =load-system=,
+- *31 verbs* across REPL evaluation and build (=repl-eval=, =load-system=,
   =run-tests=), filesystem access (=fs-*=), structural Lisp editing (=lisp-*=),
   code intelligence (=code-find=, =code-describe=, =clgrep-search=,
   =clhs-lookup=, …), live-image inspection (=inspect-*=), an LSP bridge
-  (=lsp-*=), hermetic operations (=pool-status=, =pool-kill-worker=), and
-  project scaffolding (=project-scaffold=).
+  (=lsp-*=), hermetic operations (=pool-status=, =pool-kill-worker=), project
+  scaffolding (=project-scaffold=), and an agent coordination bus
+  (=bus-publish=, =bus-receive=, =bus-status=).
+- A *single-host coordination bus* so several agents — one per Lisp project,
+  plus subagents — can pass messages to each other through a durable,
+  broker-mediated log, with per-agent cursors that resume across restarts. See
+  [[file:docs/coordination-bus.org][Agent coordination bus]].
 - *Three transports*: stdio (default), TCP, and Streamable HTTP (with a bundled
   bridge). Loopback-only by default.
 - *Three execution modes*: attached, hermetic, and auto.
@@ -102,6 +107,7 @@ The full manual lives in [[file:docs/index.org][=docs/=]]:
 - [[file:docs/configuration.org][Configuration]] — environment variables, modes, transports, MCP-client wiring.
 - [[file:docs/architecture.org][Architecture]] — how a request flows from client to image.
 - [[file:docs/modes-and-transports.org][Modes & Transports]] — when to use each mode and transport.
+- [[file:docs/coordination-bus.org][Agent coordination bus]] — how sibling agents and subagents coordinate on one host.
 - [[file:docs/tools.org][Tool reference]] — every verb, generated from the live registry.
 - [[file:docs/operations.org][Operations & Runbook]] — health checks and field recipes.
 - [[file:docs/threat-model.org][Threat model]] — trust boundaries and the STRIDE register.
