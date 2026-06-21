@@ -12,9 +12,10 @@
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht #:result #:text-content)
   (:import-from #:dsmr-mcp/src/tools/bus-helpers
-                #:session-agent #:no-project-root)
+                #:session-agent #:identity-summary #:no-project-root)
   (:import-from #:dsmr-mcp/src/bus/agent
-                #:agent-publish #:agent-id))
+                #:agent-publish #:agent-id #:agent-name #:agent-namespace
+                #:agent-stable-p))
 
 (in-package #:dsmr-mcp/src/tools/bus-publish)
 
@@ -62,9 +63,12 @@ identity so it never resumes the main agent's cursor."))
           (agent-publish a message)
           (result id (make-ht "published" t
                               "agent_id" (agent-id a)
+                              "agent_name" (agent-name a)
+                              "namespace" (agent-namespace a)
+                              "stable" (agent-stable-p a)
                               "content" (text-content
                                          (format nil "Published ~D char(s) to the bus as ~A."
-                                                 (length message) (agent-id a))))))
+                                                 (length message) (identity-summary a))))))
       (no-project-root ()
         (result id (make-ht "isError" t
                             "error_type" "project-root-not-set"

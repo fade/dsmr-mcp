@@ -12,9 +12,10 @@
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht #:result #:text-content)
   (:import-from #:dsmr-mcp/src/tools/bus-helpers
-                #:session-agent #:no-project-root)
+                #:session-agent #:identity-summary #:no-project-root)
   (:import-from #:dsmr-mcp/src/bus/agent
-                #:agent-receive #:agent-id))
+                #:agent-receive #:agent-id #:agent-name #:agent-namespace
+                #:agent-stable-p))
 
 (in-package #:dsmr-mcp/src/tools/bus-receive)
 
@@ -65,11 +66,15 @@ returning empty (default 0 = non-blocking catch-up)."))
           (result id (make-ht "messages" (coerce messages 'vector)
                               "count" (length messages)
                               "agent_id" (agent-id a)
+                              "agent_name" (agent-name a)
+                              "namespace" (agent-namespace a)
+                              "stable" (agent-stable-p a)
                               "content" (text-content
                                          (if messages
-                                             (format nil "~D message(s) for ~A:~%~{- ~A~^~%~}"
-                                                     (length messages) (agent-id a) messages)
-                                             (format nil "No new messages for ~A." (agent-id a)))))))
+                                             (format nil "You are ~A.~%~D message(s):~%~{- ~A~^~%~}"
+                                                     (identity-summary a) (length messages) messages)
+                                             (format nil "You are ~A. No new messages."
+                                                     (identity-summary a)))))))
       (no-project-root ()
         (result id (make-ht "isError" t
                             "error_type" "project-root-not-set"

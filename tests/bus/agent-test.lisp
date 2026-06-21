@@ -118,3 +118,36 @@
                (is = 1 (length (agent:agent-receive sub :timeout-ms 1000))))
           (agent:disconnect-agent pub)
           (agent:disconnect-agent sub))))))
+
+(define-test agent-reads-back-its-own-stable-identity
+  "A named agent can read its own name, namespace, and stable flag from the agent
+   layer — so it never has to infer its handle from message traffic. The name is
+   the supplied name even when the namespace ends with the same token."
+  (with-bus (paths)
+    (with-running-broker (br paths)
+      (let ((a (agent:connect-agent "/home/fade/seven/" :name "seven"
+                                    :paths paths :ensure-broker nil)))
+        (unwind-protect
+             (progn
+               (is string= "seven" (agent:agent-name a)
+                   "name is the supplied name, not the look-alike namespace")
+               (is string= "/home/fade/seven/" (agent:agent-namespace a))
+               (is eq t (agent:agent-stable-p a))
+               (let ((st (agent:agent-status a)))
+                 (is string= "seven" (getf st :name))
+                 (is eq t (getf st :stable))))
+          (agent:disconnect-agent a))))))
+
+(define-test anonymous-agent-reports-itself-ephemeral
+  "An unnamed agent reads back stable=NIL and a name distinct from the namespace,
+   so the tool can warn that its cursor will not persist."
+  (with-bus (paths)
+    (with-running-broker (br paths)
+      (let ((a (agent:connect-agent "/proj" :paths paths :ensure-broker nil)))
+        (unwind-protect
+             (progn
+               (is eq nil (agent:agent-stable-p a))
+               (false (string= "/proj" (agent:agent-name a))
+                      "the ephemeral name is not the bare namespace")
+               (is eq nil (getf (agent:agent-status a) :stable)))
+          (agent:disconnect-agent a))))))

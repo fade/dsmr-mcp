@@ -39,7 +39,7 @@
                 #:session-project-root
                 #:session-bus-agents)
   (:export #:bus-namespace #:session-agent #:disconnect-session-bus
-           #:no-project-root))
+           #:identity-summary #:no-project-root))
 
 (in-package #:dsmr-mcp/src/tools/bus-helpers)
 
@@ -89,6 +89,19 @@ root — there is no namespace to give the agent an identity under."))
     (or (gethash key table)
         (setf (gethash key table)
               (agent:connect-agent namespace :name stable-name)))))
+
+(defun identity-summary (a)
+  "A labeled \"who am I\" phrase for the bus participant A: its name, whether the
+   identity is stable or anonymous/ephemeral, and the project namespace it lives
+   under. The bus tools lead their output with this so an agent reads its own
+   identity from the tool result instead of inferring it from message traffic —
+   the inference path that lets an agent misattribute itself."
+  (if (agent:agent-stable-p a)
+      (format nil "~S (stable identity) in project namespace ~A"
+              (agent:agent-name a) (agent:agent-namespace a))
+      (format nil "~S (anonymous/ephemeral — no agent_id or DSMR_BUS_AGENT set, \
+so this cursor will not persist across restarts) in project namespace ~A"
+              (agent:agent-name a) (agent:agent-namespace a))))
 
 (defun disconnect-session-bus (session)
   "Disconnect every bus participant this session opened and forget them. Durable

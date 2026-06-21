@@ -20,14 +20,15 @@
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:bus #:dsmr-mcp/src/bus/bus)
                     (#:wal #:dsmr-mcp/src/bus/wal))
-  (:export #:agent #:agent-id #:agent-paths
+  (:export #:agent #:agent-id #:agent-name #:agent-namespace #:agent-stable-p
+           #:agent-paths
            #:connect-agent #:disconnect-agent
            #:agent-publish #:agent-receive #:agent-status))
 
 (in-package #:dsmr-mcp/src/bus/agent)
 
 (defstruct (agent (:constructor %make-agent))
-  id paths client subscriber)
+  id namespace stable paths client subscriber)
 
 (defun connect-agent (namespace &key name paths (ensure-broker t) (feed-timeout-ms 100))
   "Join the bus as one participant. NAMESPACE is the project root; NAME, if given,
@@ -41,9 +42,32 @@
     (let ((id (bus:agent-id namespace :name name)))
       (%make-agent
        :id id
+       :namespace namespace
+       :stable (and name t)
        :paths paths
        :client (bus:connect-client paths)
        :subscriber (bus:subscribe paths id :feed-timeout-ms feed-timeout-ms)))))
+
+(defun agent-name (agent)
+  "The agent's name within its namespace — the trailing segment of its id past the
+   namespace prefix. For a stable agent this is the name supplied via agent_id or
+   DSMR_BUS_AGENT; for an ephemeral one it is the auto-unique token. This is how an
+   agent reads its own handle without parsing the composite id by eye (the
+   namespace and a same-named project would otherwise be ambiguous)."
+  (let* ((ns (agent-namespace agent))
+         (prefix (and ns (concatenate 'string ns "/")))
+         (id (agent-id agent)))
+    (if (and prefix
+             (<= (length prefix) (length id))
+             (string= prefix id :end2 (length prefix)))
+        (subseq id (length prefix))
+        id)))
+
+(defun agent-stable-p (agent)
+  "True when this agent has a stable identity (a name was supplied via agent_id or
+   DSMR_BUS_AGENT), so it resumes its durable cursor across restarts. NIL for an
+   anonymous/ephemeral participant whose cursor does not persist."
+  (and (agent-stable agent) t))
 
 (defun agent-publish (agent message)
   "Broadcast MESSAGE (string or octet vector) onto the bus. Returns MESSAGE."
@@ -60,9 +84,13 @@
     (mapcar #'wal:record-body-string records)))
 
 (defun agent-status (agent)
-  "A snapshot of this agent's view of the bus: its id, whether a broker is live,
-   and how many messages are waiting for it right now."
+  "A snapshot of this agent's view of the bus: its own identity (full id, the name
+   within the namespace, the namespace, and whether the identity is stable), plus
+   whether a broker is live and how many messages are waiting for it right now."
   (list :id (agent-id agent)
+        :name (agent-name agent)
+        :namespace (agent-namespace agent)
+        :stable (agent-stable-p agent)
         :broker-running (broker:broker-running-p (agent-paths agent))
         :pending (bus:poll-count (agent-subscriber agent))))
 
