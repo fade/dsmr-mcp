@@ -21,6 +21,9 @@ this directory. New here? Read [[file:introduction.org]] first, then
   dispatcher, and tool registry to an execution path.
 - [[file:modes-and-transports.org][Modes & Transports]] — attached / hermetic / auto, and stdio / TCP / Streamable
   HTTP: what each is for and when to use it.
+- [[file:coordination-bus.org][Agent coordination bus]] — how sibling agents (one per project) and subagents
+  pass messages on a single host: the three bus verbs, agent identity, and the
+  durable broker-mediated log behind them.
 
 * Reference
 

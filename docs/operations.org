@@ -254,9 +254,38 @@ available.
     (=DSMR_LSP_STARTUP_TIMEOUT= bounds how long a spawn waits for the
     server's startup line, default 30 s.)
 
+* Coordination bus
+
+The [[file:coordination-bus.org][agent coordination bus]] is a single-host,
+broker-mediated message log shared by every =dsmr-mcp= process on the machine. It
+self-manages — the broker is elected lazily on first use and fails over
+automatically — so it has few operational knobs, but a handful of recipes cover
+the field cases.
+
+- *Is it up, and what is waiting?* =bus-status= returns =broker_running= (whether
+  any process holds the election lock) and =pending= (this agent's backlog). It
+  consumes nothing.
+- *Backlog not draining.* =bus-receive= with the default non-blocking timeout
+  delivers everything past your cursor and advances it. If =bus-status= shows a
+  broker but =pending= stays at zero when you expect messages, confirm you are
+  using the identity you published under — a different =DSMR_BUS_AGENT= or an
+  =ephemeral= call reads a *different* cursor. See [[file:coordination-bus.org::*Agent identity][agent identity]].
+- *Broker appears stuck.* Kill the broker process. The next participant
+  contending for the election lock takes over and replays the log; no message is
+  lost, because the write-ahead log is the authority and cursors are durable.
+- *Reset a participant.* Delete its cursor file under
+  =$XDG_STATE_HOME/dsmr-mcp/bus/cursors/= (or =~/.local/state/dsmr-mcp/bus/cursors/=)
+  to re-receive from the start of the current log.
+- *Inspect bus state.* Everything lives under =$XDG_STATE_HOME/dsmr-mcp/bus/= —
+  the active =bus.wal=, the =cursors/= directory, the broker's =broker.log=, and
+  any rotated =bus.wal.archive-*= logs from clean shutdowns.
+- *Single host only.* The bus is machine-local (=flock= election, =ipc://=
+  sockets); there is no cross-host transport.
+
 * See also
 
 - [[file:index.org]] — documentation index.
 - [[file:configuration.org]] — exhaustive environment-variable reference.
 - [[file:modes-and-transports.org]] — mode and transport selection.
+- [[file:coordination-bus.org]] — the agent coordination bus in full.
 - [[file:threat-model.org]] — trust posture and STRIDE register.

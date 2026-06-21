@@ -294,6 +294,12 @@ A guide to the main areas under =src/=.
   =scripts/install.lisp= (client-config wiring, cl-mcp migration).
 - =src/elicitation.lisp=, =src/envrc-init.lisp=, =src/envrc-template.lisp= —
   the consent-gated per-project =.envrc= offer and its template.
+- =src/bus/= — the single-host [[file:coordination-bus.org][agent coordination bus]]: =broker.lisp= and
+  =election.lisp= (flock-elected broker), =wal.lisp= (the write-ahead log that is
+  the message authority), =cursor.lisp= (durable per-agent exactly-once cursors),
+  =wakeup.lisp= and =zmq.lisp= (the level-triggered ZeroMQ notification path),
+  =archive.lisp= (orderly last-member log rotation), =agent.lisp= and =bus.lisp=
+  (the participant facade). The =bus-*= verbs in =src/tools/= front it.
 - =src/package-context.lisp= — lenient package-context synthesis for the
   structural file-reading verbs.
 - =src/log.lisp= (structured logging), =src/notify.lisp= (notification

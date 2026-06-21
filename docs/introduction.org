@@ -84,7 +84,7 @@ including trust boundaries and the STRIDE register, is in the
 
 * What you get
 
-Twenty-eight shipped verbs span the developer workflow:
+Thirty-one shipped verbs span the developer workflow:
 
 - *REPL evaluation* — evaluate Common Lisp forms in the attached image and
   get back printed values, captured output, and structured error context
@@ -100,6 +100,9 @@ Twenty-eight shipped verbs span the developer workflow:
   alive-lsp, degrading gracefully when it is absent.
 - *Scaffolding and HyperSpec lookup* — generate a complete project
   skeleton, and look symbols up in the local Common Lisp HyperSpec.
+- *Agent coordination* — a single-host message bus so sibling agents (one
+  per project) and subagents can publish, receive, and check status on a
+  durable, broker-mediated log. See [[file:coordination-bus.org][Agent coordination bus]].
 
 The server speaks three transports: *stdio* (the default, launched as a
 subprocess by an MCP client), *TCP* (threaded, multi-client,
