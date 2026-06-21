@@ -75,10 +75,12 @@
    bound). The message embeds this agent's stable self-id so the agent's OWN
    receive filters it back out — the agent never gets its own message returned to
    it, with NO cursor manipulation and so no risk of skipping a foreign message.
-   The :after floor is the WAL's current highest seq; the correlation-id match (not
-   the floor) is what disambiguates a concurrent foreign publisher's record."
+   The correlation-id match (not WAL position) is what disambiguates a concurrent
+   foreign publisher's record. PUBLISH defaults the read-back scan floor to the
+   WAL's current highest seq; that floor only BOUNDS the rescan window — its cost
+   scales with how much bus traffic accrues above the floor while waiting for the
+   id to appear, not with correctness."
   (bus:publish (agent-client agent) message
-               :after (wal:scan (broker:bus-paths-wal (agent-paths agent)))
                :self-id (agent-id agent)))
 
 (defun agent-receive (agent &key (timeout-ms 0))
