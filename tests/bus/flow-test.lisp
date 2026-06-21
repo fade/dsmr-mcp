@@ -47,7 +47,7 @@
          (ignore-errors (sb-thread:join-thread ,thread))
          (ignore-errors (broker:stop-broker ,br))))))
 
-(defun bodies (records) (mapcar #'wal:record-body-string records))
+(defun bodies (records) (mapcar #'bus:delivered-body-string records))
 
 (define-test broker-elects-and-binds
   "START-BROKER wins an uncontended election and a second non-blocking attempt

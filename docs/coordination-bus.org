@@ -204,6 +204,65 @@ arm-time max. If it returns anything, handle it and loop; if it is empty, arm
 and your own message is in the baseline, so the watch fires only on genuinely new
 foreign traffic — never on you.
 
+** Self-wake is now impossible by construction
+
+The re-arm rule above is now a /safety net/ rather than the load-bearing guard:
+the bus itself prevents an agent from waking on, or receiving, its own traffic —
+regardless of arm discipline. Two properties make it so.
+
+*Publishing reports the sequence number the message was assigned.* When you
+=bus-publish=, the result now carries the exact seq the broker gave your message.
+You learn your /own/ seq reliably even when several sister agents publish at the
+very same moment from separate processes: each agent tags every message it sends
+and recognises that same tag on the record it gets back, so it can never mistake
+another agent's message for its own. The seq you get is unambiguously yours.
+
+*An agent never receives its own messages back.* On receive, an agent recognises
+the messages it sent itself and skips them. This is /receive-side/ filtering: the
+agent drops only its OWN messages from what it reads — it never skips another
+agent's message to do it, so no foreign message is ever lost. A message that
+landed below your own send is still delivered to you in order.
+
+Together these close both holes structurally. Self-echo cannot happen because an
+agent filters out its own messages on receive. And self-wake cannot happen because
+publishing tells you your own seq: a watch armed at that seq sits /at/ your own
+message, not below it, so your own publish can never push a seq above the baseline.
+Neither depends on getting the arm discipline right.
+
+The corrected re-arm rule documented just above (omit =--after=, arm last, then a
+catch-up =bus-receive=) is therefore now *belt-and-suspenders*. It is kept for
+resilience — a missed real-time nudge still degrades cleanly to catch-up on the
+next receive — but it is no longer the only thing standing between you and a
+self-wake. The loop is safe even if a step is skipped; the structure prevents the
+failure the discipline used to guard against.
+
+This change is *backward-compatible*. The seq the publish result carries is an
+additive field — nothing that read the old result breaks. An agent filters only
+its own messages on receive, so another subscriber's delivery is never affected.
+And a message sent by an agent on the new behaviour is still received correctly,
+as its original text, by a subscriber that has not yet picked it up.
+
+** Rolling out a bus-internals change
+
+This publish behaviour lives in the bus internals compiled into the prebuilt core
+image (=dsmr.core=) that each agent's MCP server boots from. A running server keeps
+serving the *old* core — and thus the old publish behaviour — until it is rebuilt
+and restarted. To pick up the new behaviour, each live agent rebuilds the core and
+restarts its MCP server:
+
+#+begin_example
+make core            # rebuild dsmr.core with the new bus internals
+# then restart the MCP server so it boots the freshly built core
+#+end_example
+
+Because the change is backward-compatible — the publish result gains a field
+additively, an agent only filters its own messages on receive, and a message from
+an agent on the new behaviour is still received correctly by an agent still on the
+old core — a *staggered* restart across agents is safe. An old-behaviour publisher
+and a new-behaviour publisher interoperate on the same bus, so the sisters need not
+restart in lockstep: each can rebuild and restart on its own schedule, and the
+mixed window in between is harmless.
+
 ** CLI surface
 
 #+begin_example
@@ -236,6 +295,80 @@ Run the leader with a persistent streaming monitor on =dsmr-bus-watch --stream=;
 run the worker with an exit-on-event =dsmr-bus-watch= in a background shell that
 re-invokes it on exit. Each side receives, acts, publishes, and re-arms — the
 loop self-drives with no operator in the middle.
+
+** Auto-arm on bringup
+
+The two-agent shape above still has one manual seam: *something* has to arm the
+first watch. Until it is armed, a fresh agent is deaf on the bus — it will not
+wake until its operator nudges it into arming. For the Claude Code harness, the
+installer closes that seam automatically: it writes a =SessionStart= hook that
+arms the watch the moment a session starts, so the agent is autonomous on the bus
+from turn one with no manual step.
+
+*Why a harness hook and not a server-side auto-arm.* The watcher is a /connector,
+not an injector/: an exit-on-event watch only wakes the session that *launched*
+the background process. The MCP server runs in a different process and cannot
+reach into the agent's session to wake it, so the arm has to happen harness-side.
+A =SessionStart= hook is exactly that — harness-side code that runs as the session
+comes up. This is a hard constraint of how wakeup works, not a stylistic choice.
+
+The hook is written by the installer into the *project's* =.claude/settings.json=
+(not the global =~/.claude/settings.json=), so the watch arms only in projects
+where dsmr-mcp is installed. The write is *consent-gated* (the installer asks
+before touching settings) and *idempotent* (re-running the installer recognises an
+existing entry and adds nothing) — the same discipline the per-project =.envrc=
+setup already follows. Pass =--no-hook= to the installer to skip the hook entirely.
+
+*** The fd-detachment requirement
+
+A =SessionStart= hook runs synchronously while the session starts. If the watch it
+launches inherits the session's standard input/output/error, the session hangs at
+startup waiting for those streams to close. The bootstrap arm therefore launches
+the watcher with *every file descriptor redirected away from the session*:
+
+#+begin_example
+nohup dsmr-bus-watch --poll-ms "$POLL_MS" --recycle-seconds "$RECYCLE_S" </dev/null >/dev/null 2>&1 &
+#+end_example
+
+=nohup= detaches from the session's hangup, =</dev/null= closes inherited stdin,
+=>/dev/null 2>&1= discards the watcher's own output, and =&= backgrounds it. Omit
+any one of these and the session can stall on bringup. The installer ships this as
+a small launch script (=~/.local/lib/dsmr-mcp/bus-arm.sh=) that the hook calls, so
+the safe form lives in one place.
+
+*** Adaptive cadence
+
+The launch script tunes the watch to the moment by tracking *consecutive idle
+recycles* in a small state file and adjusting two independent knobs:
+
+- =--poll-ms= — *per-message reaction latency*: how soon a delivered message wakes
+  the agent. Lower is snappier.
+- =--recycle-seconds= — the *idle self-heal heartbeat*: how long a quiet watch runs
+  before it recycles itself to recover from a silently-killed watch (see
+  /Idle self-recycle/ above). This is recovery latency only — it does *not* affect
+  how fast a real message wakes the agent.
+
+Keeping the two separate matters: responsiveness comes from =--poll-ms=, never from
+=--recycle-seconds=. The script tightens the cadence while an interaction is hot
+and relaxes it as the agent sits idle — fast and short when traffic is recent, slow
+and long when nothing has arrived for a while. The shipped bands run from HOT
+(=--poll-ms 500=, =--recycle-seconds 60=) when a fire just happened, down to IDLE
+(=--poll-ms 1000=, =--recycle-seconds 600=) after several idle recycles. These
+values live in the launch script and are tunable in place — no rebuild needed to
+adjust them.
+
+*** What the hook does, and what it leaves to the loop
+
+The hook only fires the *first* arm — the bootstrap. Every subsequent re-arm
+follows the existing re-arm rule documented above (arm last, =--after= omitted,
+catch-up receive), driven from within the agent's turns. The hook is purely how the
+loop gets started before turn one; it does not change the loop's mechanics.
+
+Identity and the WAL location come from the environment that is already in place —
+no new configuration. The arm inherits the project's =DSMR_BUS_AGENT= (so the
+bootstrap watch is keyed to the same durable identity as everything else; see
+[[file:configuration.org::*direnv per-project setup][direnv per-project setup]])
+and uses the default WAL under =$XDG_STATE_HOME/dsmr-mcp/bus/=.
 
 * See also
 

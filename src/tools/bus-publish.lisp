@@ -59,16 +59,17 @@ identity so it never resumes the main agent's cursor."))
                             "error_type" "invalid-argument"
                             "content" (text-content "bus-publish: message must be a string.")))))
     (handler-case
-        (let ((a (session-agent (tool-session tool) agent-id-arg :ephemeral ephemeral)))
-          (agent-publish a message)
+        (let* ((a (session-agent (tool-session tool) agent-id-arg :ephemeral ephemeral))
+               (seq (agent-publish a message)))
           (result id (make-ht "published" t
                               "agent_id" (agent-id a)
                               "agent_name" (agent-name a)
                               "namespace" (agent-namespace a)
                               "stable" (agent-stable-p a)
+                              "seq" (or seq 'null)
                               "content" (text-content
-                                         (format nil "Published ~D char(s) to the bus as ~A."
-                                                 (length message) (identity-summary a))))))
+                                         (format nil "Published ~D char(s) to the bus as ~A~@[ (seq ~D)~]."
+                                                 (length message) (identity-summary a) seq)))))
       (no-project-root ()
         (result id (make-ht "isError" t
                             "error_type" "project-root-not-set"
