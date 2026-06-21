@@ -119,6 +119,24 @@ the round-trip's wire payload safe."
   (map 'string #'identity s))
 
 ;;; ---------------------------------------------------------------------------
+;;; Project-basename default for the bus identity
+;;; ---------------------------------------------------------------------------
+
+(defun %project-basename (project-root)
+  "Return the basename of PROJECT-ROOT's directory as a CHARACTER string -- the
+last directory component of the pathname (e.g. #p\"/tmp/myproj/\" -> \"myproj\").
+This is the default value for DSMR_BUS_AGENT: a project's stable main-agent bus
+identity. When PROJECT-ROOT is nil, or no directory component can be derived,
+fall back to the neutral literal \"agent\" so the managed block is always a
+valid override-preserving export."
+  (let ((dir (and project-root
+                  (pathname-directory (uiop:ensure-directory-pathname project-root)))))
+    (let ((last (and (consp dir) (car (last dir)))))
+      (if (and (stringp last) (plusp (length last)))
+          (%wire-string last)
+          "agent"))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Managed append block (marker-delimited)
 ;;; ---------------------------------------------------------------------------
 
@@ -140,7 +158,8 @@ blocks and operator overrides."
   (let* ((derived (and project-root
                        (handler-case (derive-slynk-port project-root)
                          (error () nil))))
-         (port    (if derived (princ-to-string derived) "4005")))
+         (port    (if derived (princ-to-string derived) "4005"))
+         (agent   (%project-basename project-root)))
     (%wire-string
      (format nil
 "# >>> dsmr-mcp (added automatically; edit or remove freely) >>>
@@ -150,9 +169,10 @@ export SLYNK_PORT=\"${SLYNK_PORT:-~A}\"
 export DSMR_MODE=auto
 export DSMR_SLYNK_ATTACH=\"${SLYNK_HOST}:${SLYNK_PORT}\"
 export DSMR_LOG_LEVEL=info
+export DSMR_BUS_AGENT=\"${DSMR_BUS_AGENT:-~A}\"
 # <<< dsmr-mcp <<<
 "
-             port))))
+             port agent))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Template port substitution
