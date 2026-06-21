@@ -12,7 +12,7 @@
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht #:result #:text-content)
   (:import-from #:dsmr-mcp/src/tools/bus-helpers
-                #:session-agent #:no-project-root)
+                #:session-agent #:identity-summary #:no-project-root)
   (:import-from #:dsmr-mcp/src/bus/agent
                 #:agent-status))
 
@@ -56,9 +56,14 @@ identity so it never resumes the main agent's cursor."))
           (result id (make-ht "broker_running" (and running t)
                               "pending" pending
                               "agent_id" aid
+                              "agent_name" (getf st :name)
+                              "namespace" (getf st :namespace)
+                              "stable" (and (getf st :stable) t)
                               "content" (text-content
-                                         (format nil "Bus ~A for ~A: ~D message(s) pending."
-                                                 (if running "up" "down (no broker)") aid pending)))))
+                                         (format nil "You are ~A. Bus ~A: ~D message(s) pending."
+                                                 (identity-summary a)
+                                                 (if running "up" "down (no broker)")
+                                                 pending)))))
       (no-project-root ()
         (result id (make-ht "isError" t
                             "error_type" "project-root-not-set"
