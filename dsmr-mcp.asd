@@ -110,7 +110,11 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/bus/zmq"
                "dsmr-mcp/src/bus/broker"
                "dsmr-mcp/src/bus/bus"
-               "dsmr-mcp/src/bus/agent")
+               "dsmr-mcp/src/bus/agent"
+               "dsmr-mcp/src/tools/bus-helpers"
+               "dsmr-mcp/src/tools/bus-publish"
+               "dsmr-mcp/src/tools/bus-receive"
+               "dsmr-mcp/src/tools/bus-status")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"

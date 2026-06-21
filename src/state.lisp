@@ -31,6 +31,7 @@
            #:session-elicitation-id-counter
            #:session-elicitation-lock
            #:session-pending-elicitation
+           #:session-bus-agents
            #:make-session
            #:*current-session-id*
            #:*mode*
@@ -143,7 +144,13 @@ pending cell must hold it.")
 elicitation request: (id cv cell) while a request awaits its response, NIL
 otherwise. cell is (result errorp) — the result hash-table from the client's
 response, or an error marker. Mirrors lsp/client's pending-request idiom,
-collapsed to one outstanding request per session."))
+collapsed to one outstanding request per session.")
+   (bus-agents
+    :accessor session-bus-agents
+    :initform (make-hash-table :test 'equal)
+    :documentation "Per-session coordination-bus participants, keyed by agent-id
+string, or the keyword :default for the anonymous default agent. Lazily populated
+on first bus tool use and disconnected at session teardown."))
   (:documentation "Holds all per-connection state for one MCP session.
 One session is constructed per transport connection:
   - stdio: one session for the whole process lifetime
