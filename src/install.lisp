@@ -11,7 +11,8 @@
   (:local-nicknames (#:jzon #:com.inuoe.jzon)
                     (#:config #:dsmr-mcp/src/install/config)
                     (#:claude #:dsmr-mcp/src/install/claude)
-                    (#:defaults #:dsmr-mcp/src/install/defaults))
+                    (#:defaults #:dsmr-mcp/src/install/defaults)
+                    (#:hooks #:dsmr-mcp/src/install/hooks))
   (:export #:install))
 
 (in-package #:dsmr-mcp/src/install)
@@ -109,6 +110,8 @@ keyed by \"dsmr-mcp\"."
                      (skills-dir nil)
                      (install-bus-watch t)
                      (bin-dir nil)
+                     (install-hook t)
+                     (lib-dir nil)
                      (site-defaults :interactive))
   "Install dsmr-mcp as an MCP server for the requested AGENT and report
 what was done.
@@ -133,6 +136,16 @@ operator's Slynk host/port/workspace defaults and writes them to
 interactive); :skip suppresses the step entirely. The step never runs under
 the :print agent — print mode stays pure-stdout.
 
+INSTALL-HOOK (default T) governs the SessionStart auto-arm hook step run after
+the Claude Code install: when true the hook step runs under the same consent
+posture as SITE-DEFAULTS (the SITE-DEFAULTS value is forwarded as the hook
+step's mode), copying the adaptive arm script into LIB-DIR (default
+~/.local/lib/dsmr-mcp/) and merging a SessionStart hook into the current
+project's .claude/settings.json so a fresh session auto-arms the bus watcher;
+when nil the hook step is skipped entirely (wired to --no-hook). Like the
+defaults step, the hook step never runs under the :print agent — print mode
+stays pure-stdout.
+
 To extend this installer to a new agent, add a new AGENT keyword here and
 a corresponding IO function (mirroring dsmr-mcp/src/install/claude) that
 reads, transforms via the config core, and writes that agent's config
@@ -153,9 +166,14 @@ augmented with :skill-dir), or NIL for :print."
             (bus-watch-dest (when install-bus-watch
                               (%copy-binary (or bin-dir (default-bin-dir)))))
             (envrc-template (defaults:install-envrc-defaults :mode site-defaults))
+            (hook-result (when install-hook
+                           (hooks:install-hooks
+                            :lib-dir (or lib-dir (hooks:default-lib-dir))
+                            :mode site-defaults)))
             (full (append result (list :skill-dir skill-dest
                                        :bus-watch-path bus-watch-dest
-                                       :envrc-template-dir envrc-template))))
+                                       :envrc-template-dir envrc-template
+                                       :hook-result hook-result))))
        (%print-claude-summary full)
        full))))
 
@@ -177,5 +195,9 @@ augmented with :skill-dir), or NIL for :print."
   (format t "  envrc tmpl:   ~A~%"
           (let ((e (getf result :envrc-template-dir)))
             (if e (namestring e) "(site-wide defaults skipped)")))
+  (format t "  hook:         ~A~%"
+          (let* ((h (getf result :hook-result))
+                 (path (getf (getf h :hook) :path)))
+            (if path (namestring path) "(not installed)")))
   (format t "~%Restart Claude Code (or reconnect MCP servers) to pick up ~
 the dsmr-mcp entry.~%"))
