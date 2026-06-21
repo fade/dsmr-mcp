@@ -32,6 +32,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install libzmq
+        # The coordination bus links libzmq through pzmq, so the C library and its
+        # headers must be present for the grovel step. pzmq itself is in the
+        # Quicklisp dist; only the native library needs installing here.
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libzmq3-dev
+
       - name: Install pinned SBCL (sbcl-bin via Roswell)
         # Pin the exact sbcl-bin version so the GC flavor is deterministic
         # (this sbcl-bin ships the MARK-REGION collector) — a fixed flavor is
@@ -142,6 +151,13 @@ jobs:
       CL_SOURCE_REGISTRY: '${{ github.workspace }}//:'
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install libzmq
+        # The bus integration tests spawn brokers that link libzmq via pzmq.
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libzmq3-dev
 
       - name: Install pinned SBCL (sbcl-bin via Roswell)
         run: |
