@@ -84,8 +84,11 @@ and is overridable for testing."
     (ensure-directories-exist dest)
     (uiop:copy-file src dest)
     ;; Set the execute bit without assuming sb-posix is loaded (the minimal
-    ;; install path does not pull in bus.lisp / its sb-posix users).
-    (uiop:run-program (list "chmod" "+x" (namestring dest)))
+    ;; install path does not pull in bus.lisp / its sb-posix users). A chmod
+    ;; failure (absent binary, odd platform) must not abort an already-completed
+    ;; file copy — ignore its status and let the operator chmod by hand if needed.
+    (uiop:run-program (list "chmod" "+x" (namestring dest))
+                      :ignore-error-status t)
     dest))
 
 ;;; Print-mode renderer ------------------------------------------------------
@@ -111,7 +114,9 @@ keyed by \"dsmr-mcp\"."
                      (install-bus-watch t)
                      (bin-dir nil)
                      (install-hook t)
+                     (project-root nil)
                      (lib-dir nil)
+                     (hook-mode nil)
                      (site-defaults :interactive))
   "Install dsmr-mcp as an MCP server for the requested AGENT and report
 what was done.
@@ -140,11 +145,23 @@ INSTALL-HOOK (default T) governs the SessionStart auto-arm hook step run after
 the Claude Code install: when true the hook step runs under the same consent
 posture as SITE-DEFAULTS (the SITE-DEFAULTS value is forwarded as the hook
 step's mode), copying the adaptive arm script into LIB-DIR (default
-~/.local/lib/dsmr-mcp/) and merging a SessionStart hook into the current
-project's .claude/settings.json so a fresh session auto-arms the bus watcher;
-when nil the hook step is skipped entirely (wired to --no-hook). Like the
-defaults step, the hook step never runs under the :print agent — print mode
+~/.local/lib/dsmr-mcp/) and merging a SessionStart hook into PROJECT-ROOT's
+.claude/settings.json so a fresh session in that project auto-arms the bus
+watcher; when nil the hook step is skipped entirely (wired to --no-hook). Like
+the defaults step, the hook step never runs under the :print agent — print mode
 stays pure-stdout.
+
+PROJECT-ROOT names the directory whose .claude/settings.json receives the hook.
+It defaults to (uiop:getcwd) ONLY at this outermost boundary — callers that know
+the intended target (e.g. scripts/install.lisp's --project flag) should pass it
+explicitly, because getcwd is the directory the installer was launched from, not
+necessarily the project to instrument. The resolved target is reported under
+:hook-project-root and printed in the summary so the operator can confirm it.
+
+HOOK-MODE, when non-NIL, overrides the hook step's consent mode independently of
+SITE-DEFAULTS (which it otherwise inherits). :force installs the hook without
+prompting — for a non-interactive opt-in given out of band, and for tests that
+drive the positive write end-to-end.
 
 To extend this installer to a new agent, add a new AGENT keyword here and
 a corresponding IO function (mirroring dsmr-mcp/src/install/claude) that
@@ -166,13 +183,28 @@ augmented with :skill-dir), or NIL for :print."
             (bus-watch-dest (when install-bus-watch
                               (%copy-binary (or bin-dir (default-bin-dir)))))
             (envrc-template (defaults:install-envrc-defaults :mode site-defaults))
+            ;; Resolve the hook target explicitly at this outermost boundary.
+            ;; install-hooks would otherwise default to (uiop:getcwd), which for
+            ;; an `sbcl --script scripts/install.lisp` run is wherever the
+            ;; operator stood when they ran the installer — not necessarily the
+            ;; project they mean to instrument. Resolve it here and carry it so
+            ;; the summary can name the directory the hook was written into.
+            (hook-target (uiop:ensure-directory-pathname
+                          (or project-root (uiop:getcwd))))
+            ;; The hook step's consent mode defaults to SITE-DEFAULTS (so a
+            ;; single consent posture covers both steps), but HOOK-MODE can
+            ;; override it independently — e.g. :force for a non-interactive
+            ;; opt-in already given out of band, or for a test that drives the
+            ;; positive write end-to-end without a tty.
             (hook-result (when install-hook
                            (hooks:install-hooks
+                            :project-root hook-target
                             :lib-dir (or lib-dir (hooks:default-lib-dir))
-                            :mode site-defaults)))
+                            :mode (or hook-mode site-defaults))))
             (full (append result (list :skill-dir skill-dest
                                        :bus-watch-path bus-watch-dest
                                        :envrc-template-dir envrc-template
+                                       :hook-project-root hook-target
                                        :hook-result hook-result))))
        (%print-claude-summary full)
        full))))
@@ -199,5 +231,16 @@ augmented with :skill-dir), or NIL for :print."
           (let* ((h (getf result :hook-result))
                  (path (getf (getf h :hook) :path)))
             (if path (namestring path) "(not installed)")))
+  ;; Name the project the hook was written into, so the operator can confirm it
+  ;; landed in the intended tree rather than an unrelated CWD. Printed whenever a
+  ;; hook target was resolved, even if the step itself declined/skipped.
+  (let ((root (getf result :hook-project-root)))
+    (when root
+      (format t "  hook project: ~A~%" (namestring root))))
+  ;; Report the settings.json backup when the hook step overwrote an existing
+  ;; file, mirroring the claude-config backup line above.
+  (let ((b (getf (getf (getf result :hook-result) :hook) :backup-path)))
+    (when b
+      (format t "  hook backup:  ~A~%" (namestring b))))
   (format t "~%Restart Claude Code (or reconnect MCP servers) to pick up ~
 the dsmr-mcp entry.~%"))

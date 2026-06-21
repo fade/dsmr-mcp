@@ -10,8 +10,11 @@
 ;;;; (ensure-hook-entry) that is unit-testable on in-memory hash-tables, and an
 ;;;; IO entry (install-hooks) that copies the arm script, reads the target
 ;;;; settings file, applies the transform, re-validates the rendered JSON by
-;;;; re-parsing, and writes it back atomically. The settings.json write has no
-;;;; backup step: the project file is low-stakes and the merge is additive only.
+;;;; re-parsing, backs up an existing file to a timestamped .bak, and writes it
+;;;; back atomically. The merge is additive at the hooks subtree, but jzon
+;;;; re-stringifies the whole file, so the backup guards an operator's
+;;;; hand-formatting against an irreversible reformat — mirroring the
+;;;; claude-config install path.
 
 (defpackage #:dsmr-mcp/src/install/hooks
   (:use #:cl)
@@ -147,7 +150,10 @@ to the repo's shipped script and is overridable for testing."
       (return-from %copy-arm-script nil))
     (ensure-directories-exist dest)
     (uiop:copy-file src dest)
-    (uiop:run-program (list "chmod" "+x" (namestring dest)))
+    ;; A chmod failure must not abort an already-completed copy; ignore its
+    ;; status (the operator can chmod by hand if the platform's chmod is odd).
+    (uiop:run-program (list "chmod" "+x" (namestring dest))
+                      :ignore-error-status t)
     dest))
 
 ;;; settings.json write -------------------------------------------------------
@@ -157,16 +163,28 @@ to the repo's shipped script and is overridable for testing."
   (merge-pathnames ".claude/settings.json"
                    (uiop:ensure-directory-pathname project-root)))
 
+(defun %timestamp ()
+  "A compact YYYYMMDDHHMMSS stamp for a unique backup suffix."
+  (multiple-value-bind (s m h d mo y) (decode-universal-time (get-universal-time))
+    (format nil "~4,'0D~2,'0D~2,'0D~2,'0D~2,'0D~2,'0D" y mo d h m s)))
+
+(defun %backup-path (path)
+  "Return the timestamped backup pathname for PATH: <path>.bak-YYYYMMDDHHMMSS.
+Mirrors the claude-config backup naming so both install paths look the same."
+  (pathname (format nil "~A.bak-~A" (namestring path) (%timestamp))))
+
 (defun %write-project-hook (project-root command-string)
   "Merge a SessionStart hook for COMMAND-STRING into
 <project-root>/.claude/settings.json, creating .claude/ and the file when
 absent. Parses any existing file, applies ensure-hook-entry, re-validates the
 rendered JSON by re-parsing (error -> abort, file untouched), then writes
-atomically. No backup: the merge is additive and the project file is
-low-stakes.
+atomically. When the file already existed it is backed up first to a
+timestamped <path>.bak-YYYYMMDDHHMMSS (mirroring the claude-config path), so the
+whole-file re-stringify can never silently lose an operator's hand-formatting or
+comments with no recovery path. A fresh-created file has no backup.
 
-Returns a plist (:path PATH :action-taken {:created | :updated |
-:already-present})."
+Returns a plist (:path PATH :backup-path {PATH | NIL} :action-taken
+{:created | :updated | :already-present})."
   (let* ((path (%project-settings-path project-root))
          (existed (and (probe-file path) t))
          (original (when existed (jzon:parse (uiop:read-file-string path))))
@@ -178,11 +196,23 @@ Returns a plist (:path PATH :action-taken {:created | :updated |
         (error "install-hooks: rendered settings did not re-parse; leaving ~A ~
                 untouched. (~A)" (namestring path) e)))
     (ensure-directories-exist path)
-    (write-file-string-atomically path rendered)
-    (list :path path
-          :action-taken (cond ((not existed) :created)
-                              (already :already-present)
-                              (t :updated)))))
+    ;; Back up an existing file before the atomic overwrite. The merge is
+    ;; additive at the hooks subtree, but jzon re-stringifies the WHOLE file from
+    ;; the parsed hash-table — key order, number formatting, and any hand-edits
+    ;; are re-rendered — so an operator who pretty-formatted their settings would
+    ;; otherwise lose it irretrievably on the first auto-arm install.
+    (let ((backup (when existed (%backup-path path))))
+      (when backup
+        (uiop:copy-file path backup)
+        (unless (probe-file backup)
+          (error "install-hooks: backup ~A was not created; leaving ~A untouched."
+                 (namestring backup) (namestring path))))
+      (write-file-string-atomically path rendered)
+      (list :path path
+            :backup-path backup
+            :action-taken (cond ((not existed) :created)
+                                (already :already-present)
+                                (t :updated))))))
 
 ;;; Gated installer entry -----------------------------------------------------
 
@@ -205,6 +235,10 @@ path. Returns a plist (:script-path ... :script-installed BOOL :hook ...)."
 
 MODE selects behavior:
   :skip         no-op; return NIL. (Used by tests and by --no-hook.)
+  :force        install the arm script + merge the project hook unconditionally,
+                without prompting. The non-interactive consent path (an explicit
+                operator opt-in already given out of band) and the path the entry
+                test drives to exercise the positive write end-to-end.
   :interactive  when stdin is interactive, prompt for consent and, on a yes,
                 install the arm script + merge the project hook; when stdin is
                 NOT interactive (piped / CI), return NIL without prompting so
@@ -217,6 +251,7 @@ PROJECT-ROOT is the directory whose .claude/settings.json receives the hook
 Returns the result plist from %do-install-hooks, or NIL when skipped/declined."
   (ecase mode
     (:skip nil)
+    (:force (%do-install-hooks project-root lib-dir))
     (:interactive
      (when (interactive-stream-p *standard-input*)
        (format *standard-output*

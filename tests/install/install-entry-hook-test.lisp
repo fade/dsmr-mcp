@@ -21,8 +21,12 @@
 
 (defpackage #:dsmr-mcp/tests/install/install-entry-hook-test
   (:use #:cl #:parachute)
+  (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/install
-                #:install))
+                #:install)
+  (:import-from #:dsmr-mcp/src/install/hooks
+                #:arm-script-path
+                #:hook-already-present-p))
 
 (in-package #:dsmr-mcp/tests/install/install-entry-hook-test)
 
@@ -85,6 +89,42 @@ this redirects every default install path — ~/.claude.json, ~/.claude/skills,
         (false (getf result :hook-result))
         ;; No hook artifact landed in the temp project root.
         (false (probe-file settings))))))
+
+(define-test hook-lands-in-the-passed-project-root-not-cwd
+  ;; The positive write path THROUGH install: with :hook-mode :force the hook
+  ;; step runs unconditionally (no tty needed), and the hook must be written into
+  ;; the explicitly-passed :project-root — NOT (uiop:getcwd). We deliberately do
+  ;; NOT chdir and do NOT bind *default-pathname-defaults*: getcwd reads the OS
+  ;; working directory, so if install ignored :project-root and fell back to
+  ;; getcwd the hook would NOT appear under PROJ and this test would fail. We also
+  ;; install the arm script into a temp lib-dir so a real command path lands in
+  ;; the settings file.
+  (with-temp-home (home "install-entry-hook-home")
+    (with-temp-dir (proj "install-entry-hook-proj")
+      (with-temp-dir (lib "install-entry-hook-lib")
+        (let* ((settings (merge-pathnames ".claude/settings.json" proj))
+               (cmd (namestring (arm-script-path lib)))
+               (result (install :agent :claude-code
+                                :project-root proj
+                                :hook-mode :force
+                                :lib-dir lib
+                                :site-defaults :skip
+                                :install-skill nil
+                                :install-bus-watch nil)))
+          ;; The hook actually landed in PROJ's .claude/settings.json.
+          (true (probe-file settings)
+                "the hook settings file was written under the passed project root")
+          ;; ...and it carries the command keyed on the installed arm script path.
+          (let ((parsed (jzon:parse (uiop:read-file-string settings))))
+            (true (hook-already-present-p parsed cmd)
+                  "the written settings carry the SessionStart arm command"))
+          ;; The resolved hook target is surfaced for the operator, and points at
+          ;; PROJ (so the summary names the right tree, per the install summary).
+          (is equal (uiop:ensure-directory-pathname proj)
+              (getf result :hook-project-root))
+          ;; The hook step's own result reports the created file.
+          (is eq :created
+              (getf (getf (getf result :hook-result) :hook) :action-taken)))))))
 
 (define-test skip-mode-returns-plist-without-blocking
   ;; install-hook t with a :skip consent posture forwards :skip to the hook
