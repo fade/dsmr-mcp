@@ -23,13 +23,27 @@
 ;;; helpers -------------------------------------------------------------------
 
 (defun %unique-temp-dir (stem)
-  "Create and return a fresh, unique temporary directory pathname named for STEM."
-  (let ((dir (uiop:ensure-directory-pathname
-              (merge-pathnames
-               (format nil "~A-~A/" stem (random (expt 2 48)))
-               (uiop:temporary-directory)))))
+  "Create and return a fresh, unique temporary directory pathname named for STEM.
+SBCL's default *random-state* is deterministic across process invocations, so the
+random suffix must be drawn from an entropy-seeded state minted at the call site —
+otherwise the \"unique\" names repeat run-to-run and a leftover dir can leak into a
+later run's absence assertions. Bind *random-state* before each random call."
+  (let* ((*random-state* (make-random-state t))
+         (dir (uiop:ensure-directory-pathname
+               (merge-pathnames
+                (format nil "~A-~A/" stem (random (expt 2 48)))
+                (uiop:temporary-directory)))))
     (ensure-directories-exist dir)
     dir))
+
+(defmacro with-temp-dir ((var stem) &body body)
+  "Bind VAR to a fresh process-unique temp dir for the dynamic extent of BODY,
+deleting it (and its contents) on exit so /tmp never accumulates leftovers that
+could leak into a later run's absence assertions."
+  `(let ((,var (%unique-temp-dir ,stem)))
+     (unwind-protect (progn ,@body)
+       (ignore-errors (uiop:delete-directory-tree
+                       ,var :validate t :if-does-not-exist :ignore)))))
 
 (defun %write-stub (path)
   "Write a tiny stub file at PATH and return it."
@@ -48,28 +62,29 @@
 ;;; tests ---------------------------------------------------------------------
 
 (define-test copies-stub-into-bin-dir-and-marks-executable
-  (let* ((src (%write-stub (merge-pathnames "dsmr-bus-watch"
-                                            (%unique-temp-dir "bus-watch-src"))))
-         (bin-dir (%unique-temp-dir "bus-watch-bin"))
-         (dest (%copy-binary bin-dir src)))
-    (true dest)
-    (is equal (merge-pathnames "dsmr-bus-watch"
-                               (uiop:ensure-directory-pathname bin-dir))
-        dest)
-    (true (probe-file dest))
-    (true (%executable-p dest))))
+  (with-temp-dir (src-dir "bus-watch-src")
+    (with-temp-dir (bin-dir "bus-watch-bin")
+      (let* ((src (%write-stub (merge-pathnames "dsmr-bus-watch" src-dir)))
+             (dest (%copy-binary bin-dir src)))
+        (true dest)
+        (is equal (merge-pathnames "dsmr-bus-watch"
+                                   (uiop:ensure-directory-pathname bin-dir))
+            dest)
+        (true (probe-file dest))
+        (true (%executable-p dest))))))
 
 (define-test returns-nil-when-source-absent
-  (let* ((bin-dir (%unique-temp-dir "bus-watch-bin"))
-         (missing (merge-pathnames "dsmr-bus-watch"
-                                   (%unique-temp-dir "bus-watch-missing")))
-         (dest nil))
-    ;; ensure the stub source truly does not exist
-    (ignore-errors (delete-file missing))
-    (finish (setf dest (%copy-binary bin-dir missing)))
-    (false dest)
-    (false (probe-file (merge-pathnames "dsmr-bus-watch"
-                                        (uiop:ensure-directory-pathname bin-dir))))))
+  (with-temp-dir (bin-dir "bus-watch-bin")
+    (with-temp-dir (missing-dir "bus-watch-missing")
+      (let ((missing (merge-pathnames "dsmr-bus-watch" missing-dir))
+            (dest-in-bin (merge-pathnames "dsmr-bus-watch"
+                                          (uiop:ensure-directory-pathname bin-dir))))
+        ;; pristine preconditions: no source, and nothing already at the dest
+        (ignore-errors (delete-file missing))
+        (ignore-errors (delete-file dest-in-bin))
+        (let ((result (%copy-binary bin-dir missing)))
+          (false result)
+          (false (probe-file dest-in-bin)))))))
 
 (define-test default-bin-dir-is-local-bin
   (is equal
