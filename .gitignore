@@ -34,6 +34,9 @@ graphify-out/graph.json
 # Bridge build artefact (produced by asdf:make :dsmr-mcp-bridge / make bridge)
 bin/dsmr-mcp-bridge
 
+# Bus-watch build artefact (produced by asdf:make :dsmr-bus-watch / make bus-watch)
+bin/dsmr-bus-watch
+
 # Test/CI build artefacts — rebuilt on demand, never committed.
 # Project-local fasl cache isolating `make test` from the shared
 # ~/.cache/common-lisp fasls (GC-flavor crash dodge):

@@ -155,6 +155,74 @@ already carries the =DSMR_BUS_AGENT= stanza.
   different machines each get their own independent bus. There is no cross-host
   transport.
 
+* Auto-watch (waking a dormant agent)
+
+An agent process only runs when its harness invokes it; between turns it is
+dormant. The bus delivers reliably, but nothing connects /a message arrived/ to
+/wake the agent/, so a reply can sit unread until an operator nudges the other
+side. The =dsmr-bus-watch= binary is that missing connector: it watches the WAL
+and turns a new message into one of the two events a harness can wake a dormant
+agent on. Build it with =make bus-watch= and install it on =PATH= via the
+installer (=~/.local/bin/dsmr-bus-watch=).
+
+** Two modes
+
+- *Exit-on-event* (default) — polls until a new message arrives, prints one
+  =bus:<SEQ>= line, and *exits 0*. Arm it in a background shell whose exit
+  re-invokes the agent: the agent wakes, drains the bus, acts, and re-arms.
+- *Streaming* (=--stream=) — prints =bus:<SEQ>= once per new message and keeps
+  running. Use it under a persistent monitor that delivers each line as it is
+  printed (the leader end of a two-agent loop).
+
+** The re-arm-after-publish rule (load-bearing)
+
+The watcher seeds a /baseline/ sequence number when it arms and fires only on a
+seq strictly greater than that baseline. This is what keeps an agent from waking
+on its *own* message — but only if you observe one rule:
+
+#+begin_quote
+*Always re-arm the watch AFTER you publish, never before.* Arming before you
+publish puts your own message above the baseline, and the watch fires on it. The
+no-author-field design is correct only with re-arm-after-publish.
+#+end_quote
+
+The worker loop is therefore: =bus-receive= → act → =bus-publish= → re-arm. Pass
+=--after <SEQ>= on re-arm using the seq you were last signalled (or omit it to
+re-seed from the WAL's current end at arm time).
+
+** CLI surface
+
+#+begin_example
+dsmr-bus-watch [--wal PATH] [--after SEQ] [--stream] [--poll-ms N] [--recycle-seconds N] [-h|--help]
+#+end_example
+
+- =--wal PATH= — WAL to watch. Default =$XDG_STATE_HOME/dsmr-mcp/bus/bus.wal=
+  (falls back to =~/.local/state/dsmr-mcp/bus/bus.wal=).
+- =--after SEQ= — baseline; fire on the first seq greater than =SEQ=. Default is
+  the WAL's current max seq, read at arm time (=0= fires on any record).
+- =--stream= — stream one line per new seq and keep running (else exit-on-event).
+- =--poll-ms N= — poll interval in milliseconds (default =1000=).
+- =--recycle-seconds N= — idle self-recycle window in seconds (default =600=).
+- =-h=, =--help= — print help and exit 0.
+
+*stdout is the signal channel* — only =bus:<SEQ>= (a new message) and =recycle:=
+(an idle self-recycle) ever go to stdout; usage, diagnostics, and errors go to
+stderr. A usage error exits =64=; a fired or recycled watch exits =0=.
+
+** Idle self-recycle
+
+With no new message, the watch exits cleanly after =--recycle-seconds= with a
+=recycle:= line instead of blocking forever. That way a watch silently killed by
+a harness restart heals itself: the next arm starts a fresh watch. Treat
+=recycle:= as "still alive, nothing new — re-arm".
+
+** Two-agent shape (no operator nudge)
+
+Run the leader with a persistent streaming monitor on =dsmr-bus-watch --stream=;
+run the worker with an exit-on-event =dsmr-bus-watch= in a background shell that
+re-invokes it on exit. Each side receives, acts, publishes, and re-arms — the
+loop self-drives with no operator in the middle.
+
 * See also
 
 - [[file:configuration.org::*direnv per-project setup][Configuration → direnv per-project setup]] — where =DSMR_BUS_AGENT= comes from.

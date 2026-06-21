@@ -56,6 +56,37 @@ or NIL when the skill source is not present in the repo."
       (uiop:copy-file file (merge-pathnames (file-namestring file) dest)))
     dest))
 
+;;; Bus-watch binary source / destination -----------------------------------
+
+(defparameter +bus-watch-name+ "dsmr-bus-watch"
+  "Filename of the coordination-bus wakeup watcher binary, both as built in the
+repo's bin/ and as installed on PATH.")
+
+(defun %bus-watch-source ()
+  "Return the pathname of the built watcher binary in the repo (bin/dsmr-bus-watch)."
+  (merge-pathnames (format nil "bin/~A" +bus-watch-name+) (%repo-root)))
+
+(defun default-bin-dir ()
+  "Return the default operator bin directory, ~/.local/bin/."
+  (merge-pathnames ".local/bin/" (user-homedir-pathname)))
+
+(defun %copy-binary (bin-dir &optional (src (%bus-watch-source)))
+  "Copy the built watcher binary SRC into BIN-DIR/dsmr-bus-watch and mark it
+executable, so a sister repo can arm it by bare command name. Returns the
+destination pathname, or NIL when SRC is absent (i.e. `make bus-watch` has not
+been run) — keeping install non-fatal. SRC defaults to the repo's built binary
+and is overridable for testing."
+  (let* ((dest (merge-pathnames +bus-watch-name+
+                                (uiop:ensure-directory-pathname bin-dir))))
+    (unless (probe-file src)
+      (return-from %copy-binary nil))
+    (ensure-directories-exist dest)
+    (uiop:copy-file src dest)
+    ;; Set the execute bit without assuming sb-posix is loaded (the minimal
+    ;; install path does not pull in bus.lisp / its sb-posix users).
+    (uiop:run-program (list "chmod" "+x" (namestring dest)))
+    dest))
+
 ;;; Print-mode renderer ------------------------------------------------------
 
 (defun %print-snippet ()
@@ -76,6 +107,8 @@ keyed by \"dsmr-mcp\"."
                      (on-existing-cl-mcp :keep)
                      (install-skill t)
                      (skills-dir nil)
+                     (install-bus-watch t)
+                     (bin-dir nil)
                      (site-defaults :interactive))
   "Install dsmr-mcp as an MCP server for the requested AGENT and report
 what was done.
@@ -117,8 +150,11 @@ augmented with :skill-dir), or NIL for :print."
                      :on-existing-cl-mcp on-existing-cl-mcp))
             (skill-dest (when install-skill
                           (%copy-skill (or skills-dir (default-skills-dir)))))
+            (bus-watch-dest (when install-bus-watch
+                              (%copy-binary (or bin-dir (default-bin-dir)))))
             (envrc-template (defaults:install-envrc-defaults :mode site-defaults))
             (full (append result (list :skill-dir skill-dest
+                                       :bus-watch-path bus-watch-dest
                                        :envrc-template-dir envrc-template))))
        (%print-claude-summary full)
        full))))
@@ -135,6 +171,9 @@ augmented with :skill-dir), or NIL for :print."
   (format t "  skill:        ~A~%"
           (let ((s (getf result :skill-dir)))
             (if s (namestring s) "(not installed)")))
+  (format t "  bus-watch:    ~A~%"
+          (let ((b (getf result :bus-watch-path)))
+            (if b (namestring b) "(not installed — run 'make bus-watch' first)")))
   (format t "  envrc tmpl:   ~A~%"
           (let ((e (getf result :envrc-template-dir)))
             (if e (namestring e) "(site-wide defaults skipped)")))
