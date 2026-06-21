@@ -192,7 +192,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/bus/archive-test"
                "dsmr-mcp/tests/bus/zmq-test"
                "dsmr-mcp/tests/bus/flow-test"
-               "dsmr-mcp/tests/bus/agent-test")
+               "dsmr-mcp/tests/bus/agent-test"
+               "dsmr-mcp/tests/tools/bus-identity-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names

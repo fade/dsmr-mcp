@@ -144,14 +144,16 @@ no-op (prompted flag set) and does not write again."
 ;;; ---------------------------------------------------------------------------
 
 (define-test no-prompt-when-envrc-exists
-  "A root whose .envrc is already complete (exports DSMR_SLYNK_ATTACH) yields a
-false create predicate AND a false update predicate: neither trigger fires, no
-round-trip starts, and the original content is preserved (no clobber)."
+  "A root whose .envrc is already complete (exports both DSMR_SLYNK_ATTACH and
+DSMR_BUS_AGENT) yields a false create predicate AND a false update predicate:
+neither trigger fires, no round-trip starts, and the original content is
+preserved (no clobber)."
   (with-temp-project-root (s root)
     (write-fixture-file root "foo.asd" "x")
     (write-fixture-file root ".envrc"
                         "ORIGINAL
 export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+export DSMR_BUS_AGENT=myproj
 ")
     (setf (session-elicitation-p s) t)
     (false (lisp-project-without-envrc-p root)
@@ -163,6 +165,7 @@ export DSMR_SLYNK_ATTACH=127.0.0.1:4005
            "no write when a complete .envrc already exists")
     (is string= "ORIGINAL
 export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+export DSMR_BUS_AGENT=myproj
 "
         (uiop:read-file-string (merge-pathnames ".envrc" root))
         "existing .envrc content must be preserved")))
@@ -230,9 +233,10 @@ and lives at root/.envrc (resolved through the write jail)."
 ;;; ---------------------------------------------------------------------------
 
 (define-test needs-setup-predicate
-  "lisp-project-envrc-needs-setup-p is true only for a *.asd dir whose existing
-.envrc lacks DSMR_SLYNK_ATTACH; false for a complete .envrc, no .envrc, no
-*.asd, or a nil root."
+  "lisp-project-envrc-needs-setup-p is true for a *.asd dir whose existing
+.envrc lacks DSMR_BUS_AGENT (whether or not it has DSMR_SLYNK_ATTACH); false for
+a fully up-to-date .envrc (both markers present), no .envrc, no *.asd, or a nil
+root. DSMR_BUS_AGENT presence is the done state."
   (with-temp-project-root (s root)
     (setf (session-elicitation-p s) nil) ; s unused by the predicate; touch it.
     ;; No *.asd yet, no .envrc.
@@ -244,18 +248,24 @@ and lives at root/.envrc (resolved through the write jail)."
 ")
     (false (lisp-project-envrc-needs-setup-p root)
            "false without a *.asd even when an incomplete .envrc exists")
-    ;; Now a real project with an incomplete .envrc -> needs setup.
+    ;; Now a real project with a fully pre-dsmr-mcp .envrc -> needs setup.
     (write-fixture-file root "foo.asd" "x")
     (true (lisp-project-envrc-needs-setup-p root)
-          "true for a *.asd dir whose .envrc lacks DSMR_SLYNK_ATTACH")
+          "true for a *.asd dir whose .envrc lacks the dsmr-mcp settings")
     ;; The create predicate must be false here (an .envrc exists).
     (false (lisp-project-without-envrc-p root)
            "create predicate is false once an .envrc exists")
-    ;; A complete .envrc (carries the marker export) is never flagged.
+    ;; A slynk-complete-but-bus-missing .envrc (predates the bus) still qualifies.
     (write-fixture-file root ".envrc" "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 ")
+    (true (lisp-project-envrc-needs-setup-p root)
+          "true when slynk is present but DSMR_BUS_AGENT is missing")
+    ;; A fully up-to-date .envrc (both markers) is never flagged.
+    (write-fixture-file root ".envrc" "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+export DSMR_BUS_AGENT=myproj
+")
     (false (lisp-project-envrc-needs-setup-p root)
-           "false once the .envrc exports DSMR_SLYNK_ATTACH")))
+           "false once the .envrc exports DSMR_BUS_AGENT")))
 
 (define-test update-appends-on-accept
   "A qualifying needs-setup root + thread-driven accept appends the dsmr-mcp
@@ -292,9 +302,37 @@ clobber)."
     (true (session-envrc-prompted-p s)
           "prompted flag set even on decline")))
 
-(define-test update-no-double-append
-  "An .envrc that already exports DSMR_SLYNK_ATTACH yields a false predicate, no
-prompt fires, and the file is left unchanged (idempotent)."
+(defun %count-occurrences (needle haystack)
+  "Return the number of non-overlapping occurrences of NEEDLE in HAYSTACK.
+Char-typed throughout; used to assert an export appears exactly once after an
+append (no duplication)."
+  (let ((needle (map 'string #'identity needle))
+        (haystack (map 'string #'identity haystack)))
+    (loop with len = (length needle)
+          for start = 0 then (+ pos len)
+          for pos = (search needle haystack :start2 start)
+          while pos
+          count t)))
+
+(define-test slynk-complete-bus-missing-needs-setup
+  "A *.asd dir whose .envrc exports DSMR_SLYNK_ATTACH but lacks DSMR_BUS_AGENT
+qualifies for the update offer; once DSMR_BUS_AGENT is present it does not."
+  (with-temp-project-root (s root)
+    (write-fixture-file root "foo.asd" "x")
+    (write-fixture-file root ".envrc" "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+")
+    (true (lisp-project-envrc-needs-setup-p root)
+          "slynk present, bus missing => needs setup")
+    (write-fixture-file root ".envrc" "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+export DSMR_BUS_AGENT=foo
+")
+    (false (lisp-project-envrc-needs-setup-p root)
+           "bus present => done")))
+
+(define-test bus-only-append-preserves-single-slynk
+  "Accepting on a slynk-complete-but-bus-missing .envrc appends a bus stanza,
+preserves the user's lines, leaves EXACTLY ONE DSMR_SLYNK_ATTACH (no slynk
+duplication), and adds DSMR_BUS_AGENT."
   (with-temp-project-root (s root)
     (write-fixture-file root "foo.asd" "x")
     (write-fixture-file root ".envrc"
@@ -302,15 +340,77 @@ prompt fires, and the file is left unchanged (idempotent)."
 export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 ")
     (setf (session-elicitation-p s) t)
+    (true (lisp-project-envrc-needs-setup-p root)
+          "qualifying slynk-complete-but-bus-missing project")
+    (true (%prompt-with-consent s "accept")
+          "accept should append the bus stanza and return true")
+    (let ((text (uiop:read-file-string (merge-pathnames ".envrc" root))))
+      (true (search "FOO=bar" text) "the user's original line is preserved")
+      (is = 1 (%count-occurrences "DSMR_SLYNK_ATTACH" text)
+          "exactly one DSMR_SLYNK_ATTACH after a bus-only append (no duplication)")
+      (true (search "DSMR_BUS_AGENT" text) "the bus identity was added")
+      (true (session-envrc-prompted-p s) "prompted flag set after the update"))))
+
+(define-test bus-present-is-noop
+  "A .envrc already carrying DSMR_BUS_AGENT is needs-setup false and a
+maybe-prompt-and-write call writes nothing (idempotent)."
+  (with-temp-project-root (s root)
+    (write-fixture-file root "foo.asd" "x")
+    (write-fixture-file root ".envrc"
+                        "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+export DSMR_BUS_AGENT=foo
+")
+    (setf (session-elicitation-p s) t)
     (false (lisp-project-envrc-needs-setup-p root)
-           "a complete .envrc does not need setup")
-    ;; No router: neither trigger state qualifies, so no round-trip is started.
+           "a bus-present .envrc does not need setup")
     (false (maybe-prompt-and-write-envrc s (make-string-output-stream))
-           "no prompt and no write for a complete .envrc")
-    (is string= "export FOO=bar
-export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+           "no prompt and no write for a bus-present .envrc")
+    (is string= "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+export DSMR_BUS_AGENT=foo
 "
         (uiop:read-file-string (merge-pathnames ".envrc" root))
-        "the complete .envrc is left unchanged")
+        "the bus-present .envrc is left unchanged")
+    (false (session-envrc-prompted-p s)
+           "prompted flag stays nil when neither trigger state qualifies")))
+
+(define-test legacy-append-includes-bus-line
+  "The legacy 'lacks slynk entirely' accept still appends the full managed block,
+which now also carries the bus line."
+  (with-temp-project-root (s root)
+    (write-fixture-file root "foo.asd" "x")
+    (write-fixture-file root ".envrc" "export FOO=bar
+")
+    (setf (session-elicitation-p s) t)
+    (true (lisp-project-envrc-needs-setup-p root)
+          "a fully pre-dsmr-mcp .envrc needs setup")
+    (true (%prompt-with-consent s "accept")
+          "accept should append the full managed block")
+    (let ((text (uiop:read-file-string (merge-pathnames ".envrc" root))))
+      (true (search "FOO=bar" text) "the user's original line is preserved")
+      (true (search "DSMR_SLYNK_ATTACH" text) "the full block carries slynk")
+      (true (search "DSMR_BUS_AGENT" text) "the full block carries the bus line"))))
+
+(define-test update-no-double-append
+  "An .envrc that already exports DSMR_BUS_AGENT yields a false predicate, no
+prompt fires, and the file is left unchanged (idempotent)."
+  (with-temp-project-root (s root)
+    (write-fixture-file root "foo.asd" "x")
+    (write-fixture-file root ".envrc"
+                        "export FOO=bar
+export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+export DSMR_BUS_AGENT=myproj
+")
+    (setf (session-elicitation-p s) t)
+    (false (lisp-project-envrc-needs-setup-p root)
+           "a fully up-to-date .envrc does not need setup")
+    ;; No router: neither trigger state qualifies, so no round-trip is started.
+    (false (maybe-prompt-and-write-envrc s (make-string-output-stream))
+           "no prompt and no write for a fully up-to-date .envrc")
+    (is string= "export FOO=bar
+export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+export DSMR_BUS_AGENT=myproj
+"
+        (uiop:read-file-string (merge-pathnames ".envrc" root))
+        "the up-to-date .envrc is left unchanged")
     (false (session-envrc-prompted-p s)
            "prompted flag stays nil when neither trigger state qualifies")))
