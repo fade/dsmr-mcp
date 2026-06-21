@@ -204,6 +204,65 @@ arm-time max. If it returns anything, handle it and loop; if it is empty, arm
 and your own message is in the baseline, so the watch fires only on genuinely new
 foreign traffic — never on you.
 
+** Self-wake is now impossible by construction
+
+The re-arm rule above is now a /safety net/ rather than the load-bearing guard:
+the bus itself prevents an agent from waking on, or receiving, its own traffic —
+regardless of arm discipline. Two properties make it so.
+
+*Publishing reports the sequence number the message was assigned.* When you
+=bus-publish=, the result now carries the exact seq the broker gave your message.
+You learn your /own/ seq reliably even when several sister agents publish at the
+very same moment from separate processes: each agent tags every message it sends
+and recognises that same tag on the record it gets back, so it can never mistake
+another agent's message for its own. The seq you get is unambiguously yours.
+
+*An agent never receives its own messages back.* On receive, an agent recognises
+the messages it sent itself and skips them. This is /receive-side/ filtering: the
+agent drops only its OWN messages from what it reads — it never skips another
+agent's message to do it, so no foreign message is ever lost. A message that
+landed below your own send is still delivered to you in order.
+
+Together these close both holes structurally. Self-echo cannot happen because an
+agent filters out its own messages on receive. And self-wake cannot happen because
+publishing tells you your own seq: a watch armed at that seq sits /at/ your own
+message, not below it, so your own publish can never push a seq above the baseline.
+Neither depends on getting the arm discipline right.
+
+The corrected re-arm rule documented just above (omit =--after=, arm last, then a
+catch-up =bus-receive=) is therefore now *belt-and-suspenders*. It is kept for
+resilience — a missed real-time nudge still degrades cleanly to catch-up on the
+next receive — but it is no longer the only thing standing between you and a
+self-wake. The loop is safe even if a step is skipped; the structure prevents the
+failure the discipline used to guard against.
+
+This change is *backward-compatible*. The seq the publish result carries is an
+additive field — nothing that read the old result breaks. An agent filters only
+its own messages on receive, so another subscriber's delivery is never affected.
+And a message sent by an agent on the new behaviour is still received correctly,
+as its original text, by a subscriber that has not yet picked it up.
+
+** Rolling out a bus-internals change
+
+This publish behaviour lives in the bus internals compiled into the prebuilt core
+image (=dsmr.core=) that each agent's MCP server boots from. A running server keeps
+serving the *old* core — and thus the old publish behaviour — until it is rebuilt
+and restarted. To pick up the new behaviour, each live agent rebuilds the core and
+restarts its MCP server:
+
+#+begin_example
+make core            # rebuild dsmr.core with the new bus internals
+# then restart the MCP server so it boots the freshly built core
+#+end_example
+
+Because the change is backward-compatible — the publish result gains a field
+additively, an agent only filters its own messages on receive, and a message from
+an agent on the new behaviour is still received correctly by an agent still on the
+old core — a *staggered* restart across agents is safe. An old-behaviour publisher
+and a new-behaviour publisher interoperate on the same bus, so the sisters need not
+restart in lockstep: each can rebuild and restart on its own schedule, and the
+mixed window in between is harmless.
+
 ** CLI surface
 
 #+begin_example
