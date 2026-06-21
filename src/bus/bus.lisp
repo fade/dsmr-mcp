@@ -17,6 +17,8 @@
 ;;;; of truth — so a dropped or missed nudge costs latency, never a message. POLL
 ;;;; is the non-blocking form: catch up and return whatever is pending right now.
 
+(require :sb-posix)
+
 (defpackage #:dsmr-mcp/src/bus/bus
   (:use #:cl)
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
@@ -24,12 +26,40 @@
                     (#:election #:dsmr-mcp/src/bus/election)
                     (#:tz #:dsmr-mcp/src/bus/zmq))
   (:export #:client #:connect-client #:publish #:disconnect-client
-           #:subscriber #:subscribe #:unsubscribe #:poll #:await))
+           #:subscriber #:subscribe #:unsubscribe #:poll #:poll-count #:await
+           #:agent-id #:encode-id))
 
 (in-package #:dsmr-mcp/src/bus/bus)
 
 (defun %now-ms ()
   (values (truncate (* 1000 (get-internal-real-time)) internal-time-units-per-second)))
+
+;;; --------------------------------------------------------------- identity
+
+(defvar *local-counter* 0
+  "Process-local counter for auto-generated subscriber names.")
+
+(defun %unique-local ()
+  "A token unique across processes (pid) and within one (counter) — gensym-style
+   for an anonymous, ephemeral subagent."
+  (format nil "g~A-~A" (sb-posix:getpid) (incf *local-counter*)))
+
+(defun agent-id (namespace &key name)
+  "Construct a bus subscriber id of the form <namespace>/<name>. NAMESPACE is the
+   project root (the shared 'generation name'); NAME, when given, is a stable
+   subagent name that resumes its cursor across restarts. When NAME is omitted an
+   auto-unique ephemeral name is generated, so multiple anonymous subagents in one
+   project each get a distinct id under the shared namespace."
+  (format nil "~A/~A" namespace (or name (%unique-local))))
+
+(defun encode-id (id)
+  "Percent-encode ID into a single filesystem-safe token for a cursor filename.
+   Injective, so two distinct ids never share a cursor."
+  (with-output-to-string (s)
+    (loop for ch across id
+          do (if (or (alphanumericp ch) (member ch '(#\. #\- #\_)))
+                 (write-char ch s)
+                 (format s "%~2,'0X" (char-code ch))))))
 
 (defun %release-fd (fd)
   (when fd (ignore-errors (election:close-lock fd))))
@@ -72,7 +102,7 @@
   "Open a subscriber named ID against the bus at PATHS. Holds a durable cursor
    (under the bus cursors dir) and a SUB socket on the broker's fan-out feed."
   (broker:ensure-bus-dirs paths)
-  (let ((cursor-path (merge-pathnames id (broker:bus-paths-cursors-dir paths))))
+  (let ((cursor-path (merge-pathnames (encode-id id) (broker:bus-paths-cursors-dir paths))))
     (%make-subscriber
      :paths paths
      :cursor (cursor:make-subscriber id (broker:bus-paths-wal paths) cursor-path)
@@ -84,6 +114,11 @@
   "Non-blocking: deliver every record past the cursor right now (catch-up) and
    advance the cursor. Returns the list of WAL:RECORD delivered (possibly empty)."
   (cursor:deliver-pending (subscriber-cursor subscriber)))
+
+(defun poll-count (subscriber)
+  "How many records are waiting for SUBSCRIBER right now, without delivering them
+   or moving the cursor."
+  (cursor:pending-count (subscriber-cursor subscriber)))
 
 (defun await (subscriber &key (timeout-ms 1000))
   "Block up to TIMEOUT-MS for at least one message, then deliver and return it.

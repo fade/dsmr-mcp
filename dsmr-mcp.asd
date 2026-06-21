@@ -109,7 +109,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/bus/archive"
                "dsmr-mcp/src/bus/zmq"
                "dsmr-mcp/src/bus/broker"
-               "dsmr-mcp/src/bus/bus")
+               "dsmr-mcp/src/bus/bus"
+               "dsmr-mcp/src/bus/agent")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"
@@ -185,7 +186,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/bus/wakeup-test"
                "dsmr-mcp/tests/bus/archive-test"
                "dsmr-mcp/tests/bus/zmq-test"
-               "dsmr-mcp/tests/bus/flow-test")
+               "dsmr-mcp/tests/bus/flow-test"
+               "dsmr-mcp/tests/bus/agent-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
