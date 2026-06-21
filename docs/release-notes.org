@@ -5,6 +5,14 @@
 
 Fixes on =main= after the v0.1.0 tag, ahead of the next release:
 
+- *Agent coordination bus.* A new single-host message bus lets several agents —
+  one per Lisp project, plus subagents — coordinate through a durable,
+  broker-mediated log. Three verbs (=bus-publish=, =bus-receive=, =bus-status=)
+  front a flock-elected broker, a write-ahead log as the message authority, and
+  per-agent durable cursors for exactly-once, resume-across-restart delivery. Each
+  project gets a stable identity via =DSMR_BUS_AGENT= (added to the per-project
+  =.envrc=), with an =ephemeral= opt-out so subagents read without consuming the
+  main agent's backlog. See [[file:coordination-bus.org][Agent coordination bus]].
 - *Every tool result renders.* A =tools/call= success that carried only
   structured fields could display as an empty result in some clients; the
   dispatcher now guarantees renderable content on every success, and

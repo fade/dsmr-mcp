@@ -1,0 +1,163 @@
+#+TITLE: dsmr-mcp — Agent Coordination Bus
+#+SUBTITLE: How sibling agents and subagents coordinate on one host
+
+The *coordination bus* lets multiple agents on the same machine pass messages to
+one another — sibling agents driving different Lisp projects, and subagents
+spawned inside one project. It is a single-host, broker-mediated, durable message
+log: an agent publishes a line, every other participant receives it exactly once,
+and a participant that restarts resumes exactly where it left off.
+
+It exists for the multi-project workflow this server already encourages. If you
+run one global MCP install across several Lisp projects (see
+[[file:configuration.org::*direnv per-project setup][direnv per-project setup]]),
+each project's agent is otherwise blind to the others. The bus is the back-channel
+that lets a project leader announce progress, hand off work, or acknowledge a
+sibling — without any shared database, network service, or manual wiring.
+
+It is *localhost only* and shares the server's trust posture: it is a
+coordination convenience among agents the operator already trusts, not a security
+boundary. See the [[file:threat-model.org][threat model]].
+
+* The three verbs
+
+The bus surface is three tools. Their full input schemas live in the
+[[file:tools.org][tool reference]]; this is the operational summary.
+
+- =bus-publish= — broadcast a message. Fire-and-forget: the line is appended
+  durably to the bus log and every other participant will receive it. Takes a
+  required =message= string.
+- =bus-receive= — receive messages this agent has not yet seen, advancing its
+  cursor so each is delivered once. With no =timeout_ms= (the default) it returns
+  immediately with whatever is pending (catch-up); set =timeout_ms= to block that
+  long waiting for the first message.
+- =bus-status= — report whether a broker is running and how many messages are
+  waiting for this agent, *without* consuming them. Use it to peek.
+
+All three accept two optional identity controls, =agent_id= and =ephemeral=,
+described under [[*Agent identity]] below.
+
+A minimal round trip: =bus-status= to see the broker is up and the backlog,
+=bus-receive= to drain it (advancing the cursor), =bus-publish= to broadcast back.
+
+* Agent identity
+
+Every participant on the bus has an identity of the form =<namespace>/<name>=.
+The *namespace* is the project root path, so two projects never collide even if
+they pick the same name. The *name* is what distinguishes a long-lived agent
+(=main=, =leader=) from a one-shot helper. A participant's durable message cursor
+is keyed on the full identity, which is why a named agent resumes its place across
+restarts and an anonymous one does not.
+
+The session resolves its identity by a fixed four-rule order — the first rule
+that applies wins:
+
+1. *=ephemeral t= (explicit opt-out).* Forces a fresh, one-shot ephemeral
+   identity for this call, ignoring rules 2 and 3. This is how a subagent that
+   inherits the project environment avoids stealing the main agent's cursor.
+2. *Explicit =agent_id=.* A non-empty =agent_id= argument names a stable
+   participant under the project namespace; it resumes its own cursor across
+   restarts.
+3. *=DSMR_BUS_AGENT= environment variable.* A non-empty value names the project's
+   stable main-agent identity. This is the normal case: the per-project =.envrc=
+   exports it (defaulting to the project directory name), so the project's primary
+   agent keeps one durable cursor across every launch. An empty value is treated
+   as absent.
+4. *Ephemeral default.* With none of the above, the session gets an auto-unique
+   ephemeral identity for the duration of the session. It does not resume a prior
+   cursor.
+
+The practical upshot: give your project's main agent a stable =DSMR_BUS_AGENT= (or
+pass =agent_id=) so it never orphans its backlog, and let subagents pass
+=ephemeral: true= so they read fresh without consuming the main agent's messages.
+
+* How it works
+
+The bus is durable and broker-mediated, so a missed real-time notification never
+loses a message — it degrades to catch-up on the next receive.
+
+- *Broker election.* The first dsmr-mcp process to acquire an exclusive =flock=
+  on the bus lock file becomes the broker; every other process is a client.
+  Because =flock= is released by the OS when a process dies, a broker crash simply
+  lets the next waiter take over — no heartbeat, no manual failover. =flock= is
+  per-machine, which is what scopes the bus to a single host.
+- *Write-ahead log (WAL) as authority.* The broker is the sole writer; it appends
+  every message to a length-and-CRC-framed log under a monotonic sequence number.
+  A successor broker replays the log on takeover and truncates any torn final
+  record left by a crash, so the sequence is always contiguous.
+- *Cursors give exactly-once delivery.* Each participant has a durable cursor file
+  recording the last sequence it acknowledged. =bus-receive= delivers every record
+  past the cursor and then advances it; =bus-status= reads the count without
+  advancing. Cursors are files, so they survive restarts — that is what "resumes
+  where it left off" means.
+- *Active wakeup.* Real-time delivery rides a ZeroMQ notification, but the wait is
+  *level-triggered*: on entry it first checks the log against the cursor, so a
+  message that landed between "went to sleep" and "started watching" is seen
+  immediately rather than dropped. The notification carries only a sequence
+  number; the log and cursor remain the source of truth.
+- *Transport.* ZeroMQ over =ipc://= filesystem sockets is the live message path —
+  a PUSH/PULL pair fans submissions in to the broker, a PUB/SUB pair fans
+  notifications out to subscribers. A dropped or slow subscriber still catches up
+  from its cursor, so a lost notification is never a lost message.
+- *Orderly archive.* On a *clean* shutdown of the last participant on the host,
+  the active log is recovered and rotated to a timestamped archive, leaving a
+  fresh empty log for the next run. A crash skips this path by construction, so a
+  crash never discards unread history.
+
+* On-disk state
+
+All bus state lives under one directory, rooted at =XDG_STATE_HOME=:
+
+#+begin_example
+$XDG_STATE_HOME/dsmr-mcp/bus/        (or ~/.local/state/dsmr-mcp/bus/ if unset)
+├── bus.wal                          # the active write-ahead log
+├── broker.lock                      # broker-election flock
+├── members                          # shared membership lock (held for process life)
+├── broker.log                       # broker stdout/stderr
+├── cursors/                         # one durable cursor file per participant
+│   └── <percent-encoded-agent-id>
+├── *.ipc                            # ZeroMQ ipc sockets (submit + pub)
+└── bus.wal.archive-<ms>             # rotated logs from clean last-member shutdowns
+#+end_example
+
+The directory is shared by every dsmr-mcp process on the host — that is precisely
+how cross-project agents find one another. To reset a single participant's
+backlog, delete its file under =cursors/=; the encoding is the percent-escaped
+identity (e.g. =/home/you/proj/main= becomes =%2Fhome%2Fyou%2Fproj%2Fmain=).
+
+* Configuration
+
+The bus reads two environment variables:
+
+- =DSMR_BUS_AGENT= — the project's stable bus identity (rule 3 above). The shipped
+  per-project =.envrc= exports it, defaulting to the project directory name. Set
+  it explicitly to pin a different name. Empty is treated as unset.
+- =XDG_STATE_HOME= — roots the bus state directory; falls back to
+  =~/.local/state= when unset.
+
+No other setup is required. The broker is elected lazily on first bus use, and the
+=.envrc= the server offers to write (see
+[[file:configuration.org::*direnv per-project setup][direnv per-project setup]])
+already carries the =DSMR_BUS_AGENT= stanza.
+
+* Operating it
+
+- *Is the bus up, and is anything waiting?* Call =bus-status=. =broker_running=
+  reflects whether a broker holds the election lock; =pending= is your backlog.
+- *Drain the backlog.* =bus-receive= with the default (non-blocking) timeout
+  returns everything past your cursor and advances it.
+- *Broker seems stuck.* Kill the broker process; the next participant contending
+  for the election lock takes over and replays the log. No state is lost — the WAL
+  is the authority and cursors are durable.
+- *Reset a participant.* Delete its cursor file under
+  =$XDG_STATE_HOME/dsmr-mcp/bus/cursors/= to make it re-receive from the start of
+  the current log.
+- *Single host only.* =flock= and =ipc://= sockets are machine-local; agents on
+  different machines each get their own independent bus. There is no cross-host
+  transport.
+
+* See also
+
+- [[file:configuration.org::*direnv per-project setup][Configuration → direnv per-project setup]] — where =DSMR_BUS_AGENT= comes from.
+- [[file:tools.org][Tool reference]] — full input schemas for =bus-publish=, =bus-receive=, =bus-status=.
+- [[file:architecture.org][Architecture]] — where the bus sits in the module map.
+- [[file:threat-model.org][Threat model]] — the localhost-only trust posture the bus inherits.
