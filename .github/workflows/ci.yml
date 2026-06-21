@@ -7,6 +7,10 @@ on:
   push:
     branches: [main]
   pull_request:
+    # Include `labeled` so adding the run-integration label fires a fresh run that
+    # the gated integration job can see — without it, the label gates a job the
+    # workflow never re-triggers to evaluate.
+    types: [opened, synchronize, reopened, labeled]
   schedule:
     - cron: '0 6 * * *'
   workflow_dispatch:
