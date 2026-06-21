@@ -174,21 +174,35 @@ installer (=~/.local/bin/dsmr-bus-watch=).
   running. Use it under a persistent monitor that delivers each line as it is
   printed (the leader end of a two-agent loop).
 
-** The re-arm-after-publish rule (load-bearing)
+** The re-arm rule (load-bearing)
 
 The watcher seeds a /baseline/ sequence number when it arms and fires only on a
-seq strictly greater than that baseline. This is what keeps an agent from waking
-on its *own* message — but only if you observe one rule:
+seq strictly greater than that baseline. With no author field in the WAL, the
+watcher cannot tell your own messages from anyone else's — so the /loop/, not the
+binary, is what keeps you from waking on your own traffic. Two rules do it:
 
 #+begin_quote
-*Always re-arm the watch AFTER you publish, never before.* Arming before you
-publish puts your own message above the baseline, and the watch fires on it. The
-no-author-field design is correct only with re-arm-after-publish.
+1. *Arm strictly last — after you publish, never before.* Arming before you
+   publish leaves your own message above the baseline, and the watch fires on it.
+2. *Re-arm with =--after= OMITTED.* With no =--after=, the baseline is the WAL's
+   current max read /at arm time/ — which, because you armed last, already
+   includes your just-published message and can never wake you. Do NOT re-arm
+   with the seq you were last /signalled/: that value sits below your own newer
+   message and re-creates the self-wake.
 #+end_quote
 
-The worker loop is therefore: =bus-receive= → act → =bus-publish= → re-arm. Pass
-=--after <SEQ>= on re-arm using the seq you were last signalled (or omit it to
-re-seed from the WAL's current end at arm time).
+The worker loop is therefore:
+
+#+begin_example
+bus-receive (drain) → act → bus-publish → bus-receive (catch-up) → arm
+#+end_example
+
+The catch-up =bus-receive= immediately before arming closes the only remaining
+gap: a message from another agent that landed during your turn, below the
+arm-time max. If it returns anything, handle it and loop; if it is empty, arm
+(=--after= omitted). Your cursor has then consumed everything through that point
+and your own message is in the baseline, so the watch fires only on genuinely new
+foreign traffic — never on you.
 
 ** CLI surface
 
