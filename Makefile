@@ -17,7 +17,7 @@ export XDG_CACHE_HOME ?= $(CURDIR)/.ci-cache
 # whenever the dependencies, the SBCL build, or the project source change.
 CORE ?= dsmr.core
 
-.PHONY: bridge test test-integration core test-warm
+.PHONY: bridge bus-watch test test-integration core test-warm
 
 ## bridge: build the standalone stdio<->TCP bridge binary.
 ##
@@ -30,6 +30,25 @@ bridge:
 	sbcl --noinform --disable-debugger \
 	     --eval '(asdf:load-asd (truename "dsmr-mcp-bridge.asd"))' \
 	     --eval '(asdf:make :dsmr-mcp-bridge)' \
+	     --eval '(quit)'
+
+## bus-watch: build the standalone coordination-bus wakeup watcher binary.
+##
+##   Produces bin/dsmr-bus-watch via ASDF program-op (save-lisp-and-die).
+##   A sister repo arms it by bare command name; the machine needs no SBCL or
+##   Python of its own. Build artefact is .gitignored; rebuild with
+##   'make bus-watch' after any change to src/bus/watch.lisp.
+##
+##   Built with --no-userinit/--no-sysinit so the saved image carries ONLY the
+##   WAL leaf + watcher (no Quicklisp/slynk) — the watcher's closure needs
+##   nothing beyond CL, so both .asd files are registered explicitly.
+bus-watch:
+	@mkdir -p bin
+	sbcl --noinform --no-sysinit --no-userinit --disable-debugger \
+	     --eval '(require :asdf)' \
+	     --eval '(asdf:load-asd (truename "dsmr-mcp.asd"))' \
+	     --eval '(asdf:load-asd (truename "dsmr-bus-watch.asd"))' \
+	     --eval '(asdf:make :dsmr-bus-watch)' \
 	     --eval '(quit)'
 
 ## test: fast in-process unit suite (the push hot-path).
