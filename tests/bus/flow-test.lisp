@@ -84,11 +84,17 @@
                (bus:publish client "a")
                (bus:publish client "b")
                (bus:publish client "c")
-               ;; subscriber arrives only now; await drains the backlog
+               ;; Sync point: publishing is async (zmq -> broker -> WAL), so wait
+               ;; until all three are durably logged before the late subscriber
+               ;; reads. Otherwise it can catch the broker mid-append and POLL/
+               ;; AWAIT returns a partial batch — the source of an intermittent
+               ;; failure under load. With all three present, one POLL drains them.
+               (loop repeat 150
+                     until (>= (wal:scan (broker:bus-paths-wal paths)) 3)
+                     do (sleep 0.02))
                (let ((sub (bus:subscribe paths "late")))
                  (unwind-protect
-                      (let ((got (bus:await sub :timeout-ms 3000)))
-                        (is equal '("a" "b" "c") (bodies got)))
+                      (is equal '("a" "b" "c") (bodies (bus:poll sub)))
                    (bus:unsubscribe sub))))
           (bus:disconnect-client client))))))
 

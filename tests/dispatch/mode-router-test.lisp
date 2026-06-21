@@ -28,7 +28,9 @@
                 #:*log-request-id*
                 #:configure-log4cl-for-server)
   (:import-from #:dsmr-mcp/src/tools/helpers
-                #:make-ht))
+                #:make-ht)
+  (:import-from #:dsmr-mcp/tests/support/env-fixture
+                #:with-clean-resolution-env))
 
 (in-package #:dsmr-mcp/tests/dispatch/mode-router-test)
 
@@ -40,6 +42,12 @@
   "With *mode* :hermetic and no pool initialized, a tools/call routes through
 dispatch-hermetic-call and returns a structured rpc-error -32000 (pool-shutting-
 down condition caught) rather than crashing the serve loop."
+  (with-clean-resolution-env
+  ;; Guarantee the precondition rather than assume it: an earlier test (or a
+  ;; reachable Slynk on the dev shell's DSMR_SLYNK_ATTACH target) can leave a pool
+  ;; initialized, which would make repl-eval route to a live worker instead of the
+  ;; pool-not-running error this test asserts.
+  (ignore-errors (shutdown-pool))
   (let* ((*mode* :hermetic)
          (capture (make-string-output-stream))
          (*error-output* capture)
@@ -55,7 +63,7 @@ down condition caught) rather than crashing the serve loop."
       ;; Should be an rpc-error envelope (not a result envelope).
       (true rpc-err)
       (is = -32000 (gethash "code" rpc-err))
-      (true (search "pool" (string-downcase (gethash "message" rpc-err)))))))
+      (true (search "pool" (string-downcase (gethash "message" rpc-err))))))))
 
 (define-test hermetic-unknown-tool-returns-not-found
   "With *mode* :hermetic, an unknown tool name is NOT a worker-routed verb, so
