@@ -82,6 +82,11 @@ it is shell syntax, not a render-template target."
              export DSMR_MODE=~A~@
              export DSMR_SLYNK_ATTACH=\"${SLYNK_HOST}:${SLYNK_PORT}\"~@
              export DSMR_LOG_LEVEL=info~2%~
+             # This project's stable bus identity. The dsmr-mcp coordination bus uses it so~@
+             # this project's main agent resumes its durable message cursor across restarts~@
+             # instead of getting a fresh ephemeral id every launch. Defaults to the project~@
+             # directory name; override by exporting DSMR_BUS_AGENT before direnv loads.~@
+             export DSMR_BUS_AGENT=\"${DSMR_BUS_AGENT:-$(basename \"$PWD\")}\"~2%~
              # Sibling projects this one may re-root into (filesystem sandbox whitelist):~@
              ~:[# export DSMR_RELATED_PROJECTS=\"$HOME/SourceCode/lisp/cl-mcp:$HOME/SourceCode/lisp/eve-quant\"~;export DSMR_RELATED_PROJECTS=\"~:*~A\"~]~%"
             ws host port mode related)))

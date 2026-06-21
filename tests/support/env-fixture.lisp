@@ -28,7 +28,7 @@
 
 (defparameter +resolution-env-vars+
   '("DSMR_MODE" "DSMR_SLYNK_ATTACH" "DSMR_TRANSPORT" "DSMR_PORT" "DSMR_BIND"
-    "DSMR_LOG_LEVEL" "DSMR_PROJECT_ROOT" "DSMR_ALLOW_REMOTE")
+    "DSMR_LOG_LEVEL" "DSMR_PROJECT_ROOT" "DSMR_ALLOW_REMOTE" "DSMR_BUS_AGENT")
   "Every DSMR_* variable the config/mode resolution path consults. A direnv dev
 shell commonly exports several of these for the live server; resolution tests must
 neutralize them to be deterministic.")

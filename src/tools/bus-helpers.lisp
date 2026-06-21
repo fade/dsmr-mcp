@@ -8,10 +8,29 @@
 ;;;; session — and tears every participant down at session end.
 ;;;;
 ;;;; Identity follows the locked model: the session's project root is the
-;;;; namespace, and the tool's optional agent_id is the name within it. A named
-;;;; agent resumes its durable cursor; the anonymous default agent (no agent_id)
-;;;; is ephemeral and lives under the :default key for the session's lifetime, so
-;;;; repeated no-argument calls reuse one identity.
+;;;; namespace, and the name within it is resolved by a four-rule order so the
+;;;; project's long-lived main agent keeps a stable identity (and resumes its
+;;;; durable cursor) across restarts, while one-shot subagents stay ephemeral.
+;;;;
+;;;; The four rules, in order:
+;;;;   1. ephemeral t      -> the session's ephemeral default (key :default, name
+;;;;                          nil). The subagent opt-out: a subagent inherits the
+;;;;                          same DSMR_BUS_AGENT env as the main agent (same
+;;;;                          process), so this is how it avoids stealing the main
+;;;;                          agent's cursor. Bypasses rules 2 and 3 entirely.
+;;;;   2. explicit agent-id -> stable <namespace>/<agent-id>, resumes its cursor.
+;;;;   3. DSMR_BUS_AGENT set -> stable <namespace>/<value>; the project's main
+;;;;                          agent identity, read from the inherited direnv env
+;;;;                          (an empty value reads as absent).
+;;;;   4. otherwise         -> the session's ephemeral default (key :default,
+;;;;                          name nil), preserved byte-for-byte from before this
+;;;;                          phase.
+;;;;
+;;;; Rules 1 and 4 both use the :default cache key with a nil name, so repeated
+;;;; ephemeral calls in one session reuse one auto-unique participant (a subagent
+;;;; publishes then receives and needs its cursor to persist within its session).
+;;;; Cross-session distinctness is automatic: each subagent is a separate session,
+;;;; hence a separate :default participant with a naturally distinct id.
 
 (defpackage #:dsmr-mcp/src/tools/bus-helpers
   (:use #:cl)
@@ -37,17 +56,39 @@ root — there is no namespace to give the agent an identity under."))
     (unless root (error 'no-project-root))
     (namestring root)))
 
-(defun session-agent (session &optional agent-id)
-  "The bus participant for SESSION under the optional AGENT-ID, connecting and
-   caching it on first use. AGENT-ID names a stable agent that resumes its cursor;
-   when omitted, the session's ephemeral default agent (key :default) is used.
-   Signals NO-PROJECT-ROOT if the session has no namespace."
+(defun %env-bus-agent ()
+  "The DSMR_BUS_AGENT value from the inherited environment, or NIL when unset or
+   empty. An empty string reads as absent, mirroring the convention the other
+   DSMR_* env reads use (see fs-set-project-root)."
+  (let ((value (uiop:getenv "DSMR_BUS_AGENT")))
+    (when (and value (plusp (length value)))
+      value)))
+
+(defun session-agent (session &optional agent-id &key ephemeral)
+  "The bus participant for SESSION, connecting and caching it on first use.
+   Signals NO-PROJECT-ROOT if the session has no namespace.
+
+   The identity name within the namespace is resolved by four rules, in order:
+     1. EPHEMERAL true -> the session's ephemeral default (key :default, name
+        nil), regardless of AGENT-ID or DSMR_BUS_AGENT. The subagent opt-out.
+     2. else AGENT-ID non-nil and non-empty -> stable name = AGENT-ID.
+     3. else DSMR_BUS_AGENT set (non-empty) -> stable name = that value.
+     4. else -> the session's ephemeral default (key :default, name nil).
+
+   Stable names (rules 2 and 3) cache under the resolved name so repeat calls
+   reuse the same participant and resume its durable cursor. The ephemeral rules
+   (1 and 4) share the :default key with a nil name, so repeated ephemeral calls
+   in one session reuse one auto-unique participant."
   (let* ((namespace (bus-namespace session))
          (table (session-bus-agents session))
-         (key (or agent-id :default)))
+         (stable-name
+           (unless ephemeral
+             (cond ((and agent-id (plusp (length agent-id))) agent-id)
+                   (t (%env-bus-agent)))))
+         (key (or stable-name :default)))
     (or (gethash key table)
         (setf (gethash key table)
-              (agent:connect-agent namespace :name agent-id)))))
+              (agent:connect-agent namespace :name stable-name)))))
 
 (defun disconnect-session-bus (session)
   "Disconnect every bus participant this session opened and forget them. Durable

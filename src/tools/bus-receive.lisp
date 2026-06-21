@@ -35,6 +35,11 @@ first message. A named agent resumes where it left off across restarts.")
                   :type :string
                   :description "Optional stable agent name to receive as (under \
 this project's namespace). Omit to use the session's anonymous default agent.")
+                 (ephemeral
+                  :type :boolean
+                  :description "Set true to force a fresh one-shot ephemeral \
+identity for this subagent, opting out of the project's stable DSMR_BUS_AGENT \
+identity so it never resumes the main agent's cursor.")
                  (timeout_ms
                   :type :integer
                   :description "Milliseconds to wait for the first message before \
@@ -47,6 +52,7 @@ returning empty (default 0 = non-blocking catch-up)."))
 
 (defmethod tool-handle ((tool bus-receive-tool) id args)
   (let ((agent-id-arg (gethash "agent_id" args))
+        (ephemeral (and (gethash "ephemeral" args) t))
         (timeout (or (gethash "timeout_ms" args) 0)))
     (unless (and (integerp timeout) (>= timeout 0))
       (return-from tool-handle
@@ -54,7 +60,7 @@ returning empty (default 0 = non-blocking catch-up)."))
                             "error_type" "invalid-argument"
                             "content" (text-content "bus-receive: timeout_ms must be a non-negative integer.")))))
     (handler-case
-        (let* ((a (session-agent (tool-session tool) agent-id-arg))
+        (let* ((a (session-agent (tool-session tool) agent-id-arg :ephemeral ephemeral))
                (messages (agent-receive a :timeout-ms timeout)))
           (result id (make-ht "messages" (coerce messages 'vector)
                               "count" (length messages)

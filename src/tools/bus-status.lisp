@@ -32,7 +32,12 @@ is running and how many messages are waiting, without consuming them.")
                 ((agent_id
                   :type :string
                   :description "Optional stable agent name to report for (under \
-this project's namespace). Omit to use the session's anonymous default agent."))
+this project's namespace). Omit to use the session's anonymous default agent.")
+                 (ephemeral
+                  :type :boolean
+                  :description "Set true to force a fresh one-shot ephemeral \
+identity for this subagent, opting out of the project's stable DSMR_BUS_AGENT \
+identity so it never resumes the main agent's cursor."))
                 :required ())))
   (:metaclass mcp-tool-class)
   (:documentation "MCP tool: report coordination-bus status for this agent."))
@@ -40,9 +45,10 @@ this project's namespace). Omit to use the session's anonymous default agent."))
 (c2mop:ensure-finalized (find-class 'bus-status-tool))
 
 (defmethod tool-handle ((tool bus-status-tool) id args)
-  (let ((agent-id-arg (gethash "agent_id" args)))
+  (let ((agent-id-arg (gethash "agent_id" args))
+        (ephemeral (and (gethash "ephemeral" args) t)))
     (handler-case
-        (let* ((a (session-agent (tool-session tool) agent-id-arg))
+        (let* ((a (session-agent (tool-session tool) agent-id-arg :ephemeral ephemeral))
                (st (agent-status a))
                (running (getf st :broker-running))
                (pending (getf st :pending))

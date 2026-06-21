@@ -19,6 +19,10 @@ Fire-and-forget; the message is appended durably to the bus log.
       "description": "Optional stable agent name to publish as (under \nthis project's namespace). Omit to use the session's anonymous default agent.",
       "type": "string"
     },
+    "ephemeral": {
+      "description": "Set true to force a fresh one-shot ephemeral \nidentity for this subagent, opting out of the project's stable DSMR_BUS_AGENT \nidentity so it never resumes the main agent's cursor.",
+      "type": "boolean"
+    },
     "message": {
       "description": "The message text to broadcast.",
       "type": "string"
@@ -45,6 +49,10 @@ first message. A named agent resumes where it left off across restarts.
       "description": "Optional stable agent name to receive as (under \nthis project's namespace). Omit to use the session's anonymous default agent.",
       "type": "string"
     },
+    "ephemeral": {
+      "description": "Set true to force a fresh one-shot ephemeral \nidentity for this subagent, opting out of the project's stable DSMR_BUS_AGENT \nidentity so it never resumes the main agent's cursor.",
+      "type": "boolean"
+    },
     "timeout_ms": {
       "description": "Milliseconds to wait for the first message before \nreturning empty (default 0 = non-blocking catch-up).",
       "type": "integer"
@@ -66,6 +74,10 @@ is running and how many messages are waiting, without consuming them.
     "agent_id": {
       "description": "Optional stable agent name to report for (under \nthis project's namespace). Omit to use the session's anonymous default agent.",
       "type": "string"
+    },
+    "ephemeral": {
+      "description": "Set true to force a fresh one-shot ephemeral \nidentity for this subagent, opting out of the project's stable DSMR_BUS_AGENT \nidentity so it never resumes the main agent's cursor.",
+      "type": "boolean"
     }
   },
   "required": [],
