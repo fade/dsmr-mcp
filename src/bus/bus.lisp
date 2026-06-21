@@ -34,6 +34,9 @@
 (in-package #:dsmr-mcp/src/bus/bus)
 
 (defun %now-ms ()
+  "Milliseconds from GET-INTERNAL-REAL-TIME. This is a monotonic-ish counter from
+   an implementation-dependent fixed point in the past, used ONLY for measuring
+   relative durations (deadlines) — never as a wall clock the operator reads."
   (values (truncate (* 1000 (get-internal-real-time)) internal-time-units-per-second)))
 
 ;;; --------------------------------------------------------------- identity
@@ -238,7 +241,13 @@
    Delivers any existing backlog first (catch-up), then waits on the live ZeroMQ
    nudge for more. The cursor — not the nudge — is the source of truth, so a
    missed nudge degrades to catch-up, never a lost message. Returns the delivered
-   records, or NIL if nothing arrived before the deadline."
+   records, or NIL if nothing arrived before the deadline.
+
+   TIMEOUT-MS is GRANULAR to the feed's own receive timeout (the FEED-TIMEOUT-MS
+   passed to SUBSCRIBE, default 100ms): the deadline is only checked between feed
+   receives, so a quiet AWAIT can overshoot TIMEOUT-MS by up to nearly one feed
+   interval. Pick a feed timeout no larger than the tightest AWAIT timeout a
+   caller needs honored. The clock is for relative durations only (see %NOW-MS)."
   (let ((deadline (+ (%now-ms) timeout-ms)))
     (loop
       (let ((delivered (cursor:deliver-pending (subscriber-cursor subscriber))))

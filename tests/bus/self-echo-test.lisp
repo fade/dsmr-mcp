@@ -164,6 +164,38 @@
           (agent:disconnect-agent a)
           (agent:disconnect-agent b))))))
 
+(define-test self-id-roundtrips-encoded-on-the-wire
+  "Pin the self-echo comparison invariant: the self-id a publisher embeds comes
+   back off the WAL ALREADY ENCODED, equal to (encode-id (agent-id self)). The
+   receive-side filter compares that stored field against (encode-id own-id), so
+   this equality is exactly what makes the filter correct. If encode-id ever
+   gained non-determinism this assertion would catch it before the agent silently
+   started receiving its own messages back (the self-wake loop this phase exists
+   to prevent)."
+  (with-bus (paths)
+    (with-running-broker (br paths)
+      (let ((a (agent:connect-agent "/proj" :name "self-id-pin" :paths paths :ensure-broker nil)))
+        (unwind-protect
+             (let ((seq (agent:agent-publish a "mine")))
+               (wait-durable paths seq)
+               (let* ((record (first (wal:read-records
+                                      (broker:bus-paths-wal paths) :after (1- seq)))))
+                 (multiple-value-bind (text cid sid)
+                     (bus:decode-envelope (wal:record-body-string record))
+                   (declare (ignore text cid))
+                   ;; The stored self-id field is the ENCODED form of A's id. The
+                   ;; receive filter compares this stored field against
+                   ;; (encode-id own-id) WITHOUT re-encoding the stored side, so
+                   ;; this single equality is exactly the comparison the filter
+                   ;; makes — and what pins it against a silent encode-id drift.
+                   (is string= (bus:encode-id (agent:agent-id a)) sid
+                       "the stored self-id equals (encode-id agent-id)")
+                   ;; encode-id is deterministic: a second encode of the same raw
+                   ;; id yields the identical token (the filter relies on this).
+                   (is string= sid (bus:encode-id (agent:agent-id a))
+                       "encode-id is deterministic for a given id"))))
+          (agent:disconnect-agent a))))))
+
 (define-test cross-agent-ordering-intact
   "A fresh subscriber C receives every message with contiguous, gap-free seqs, each
    decoded to its text."
