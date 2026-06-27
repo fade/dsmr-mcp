@@ -31,7 +31,8 @@
                 #:text-content
                 #:validate-args)
   (:import-from #:dsmr-mcp/src/state
-                #:session-project-root)
+                #:session-project-root
+                #:session-project-root-just-set-p)
   (:import-from #:dsmr-mcp/src/project-root
                 #:broad-root-p
                 #:broad-root-error)
@@ -154,6 +155,15 @@ Call fs-set-project-root with human_approved: true after manual verification." n
                    "new_root" new-ns))
       ;; D-06: set root on session ONLY — no uiop:chdir, no *default-pathname-defaults*
       (setf (session-project-root session) new-root)
+      ;; Mark that THIS dispatch newly established the session root so the
+      ;; transport's post-dispatch hook can offer the project `.envrc` on the
+      ;; same tools/call.  The handler runs mid-dispatch with no access to the
+      ;; wire, so it cannot drive the elicitation itself; the stdio loop reads
+      ;; and clears this flag after writing the response (see serve-streams).
+      ;; Set whenever the root is adopted (including a re-root) -- the
+      ;; once-per-session prompted-p guard inside maybe-prompt-and-write-envrc
+      ;; still bounds it to a single prompt for the session's lifetime.
+      (setf (session-project-root-just-set-p session) t)
       (log-event :info "fs.set-project-root"
                  "previous_root" prev-ns
                  "new_root" new-ns)
