@@ -28,6 +28,7 @@
            #:session-notify-channel-lock
            #:session-elicitation-p
            #:session-envrc-prompted-p
+           #:session-project-root-just-set-p
            #:session-elicitation-id-counter
            #:session-elicitation-lock
            #:session-pending-elicitation
@@ -124,6 +125,20 @@ prompt degrades to a silent no-op.")
     :documentation "Once-per-session guard for the launch-time .envrc prompt.
 Set T the first time the qualifying-project check runs, regardless of the
 operator's answer, so the dialog cannot re-fire on every tool call.")
+   (project-root-just-set-p
+    :accessor session-project-root-just-set-p
+    :initform nil
+    :documentation "Transient one-shot flag: T for the span between a
+fs-set-project-root call newly establishing this session's project root and the
+transport's post-dispatch .envrc check consuming it. fs-set-project-root runs
+mid-dispatch with no access to the wire, so it cannot drive the elicitation
+round-trip itself; it sets this flag instead, and the stdio loop checks it AFTER
+writing the tool response and -- if set -- clears it and runs
+maybe-prompt-and-write-envrc inline (the only safe place to read/write the
+wire). This closes the gap where the .envrc offer would otherwise wait for a
+LATER tools/call, since the pre-dispatch intercept cannot see a root that the
+very call it precedes is about to set. The once-per-session envrc-prompted-p
+guard still ensures at most one prompt even if both intercept paths would fire.")
    (elicitation-id-counter
     :accessor session-elicitation-id-counter
     :initform 0
