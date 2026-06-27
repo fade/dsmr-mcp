@@ -43,6 +43,7 @@
   (:import-from #:dsmr-mcp/src/state
                 #:make-session
                 #:session-id
+                #:session-project-root-just-set-p
                 #:*current-session-id*)
   (:import-from #:dsmr-mcp/src/protocol
                 #:process-json-line)
@@ -333,7 +334,30 @@ Divergences from cl-mcp src/run.lisp:
                       (stream-error (e)
                         (log-event :warn "stdio.write.error"
                                    "error" (princ-to-string e))
-                        (return t)))))))))
+                        (return t))))
+                  ;; Post-dispatch .envrc consent: when the line just dispatched
+                  ;; was the fs-set-project-root call that newly adopted this
+                  ;; session's root, the pre-dispatch intercept above could not
+                  ;; have offered the `.envrc` -- the root is set mid-dispatch,
+                  ;; so it was still NIL when that intercept ran.  Consume the
+                  ;; one-shot flag here, AFTER the response is on the wire, and
+                  ;; drive the elicitation in-line on this loop thread (the only
+                  ;; place it is safe to read/write the wire on stdio).  Clear
+                  ;; the flag unconditionally first so a non-qualifying root or a
+                  ;; declined prompt does not leave it armed for the next call.
+                  ;; The once-per-session prompted-p guard inside
+                  ;; maybe-prompt-and-write-envrc keeps this from double-firing
+                  ;; with the pre-dispatch path.  Runtime symbol resolution and
+                  ;; ignore-errors mirror the pre-dispatch intercept.
+                  (when (session-project-root-just-set-p session)
+                    (setf (session-project-root-just-set-p session) nil)
+                    (ignore-errors
+                     (uiop:symbol-call :dsmr-mcp/src/envrc-init
+                                       :maybe-prompt-and-write-envrc
+                                       session out
+                                       (lambda ()
+                                         (%read-line-limited
+                                          in :eof +max-json-line-bytes+))))))))))
       ;; Cleanup: close the attached Slynk connection before logging stop so
       ;; the host Slynk listener gets a clean FIN on EOF or abnormal exit.
       ;; Runtime symbol resolution avoids a compile-time dep on

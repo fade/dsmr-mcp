@@ -33,6 +33,8 @@
                 #:canonical-server-entry)
   (:import-from #:dsmr-mcp/src/envrc-template
                 #:read-envrc-template)
+  (:import-from #:dsmr-mcp/src/envrc-init
+                #:envrc-content-with-derived-port)
   (:import-from #:dsmr-mcp/tests/integration/support
                 #:sbcl-path
                 #:with-mcp-server-child-or-skip))
@@ -312,6 +314,43 @@ stdin is closed after the last line so the child reaches EOF and exits."
       (ignore-errors (uiop:terminate-process proc))
       (ignore-errors (uiop:wait-process proc)))))
 
+(defun %run-set-root-fires-scenario (root &key (response-action "accept")
+                                              second-trigger)
+  "Spawn a real server seeded at the NON-qualifying /tmp launch root, then send
+ONLY a fs-set-project-root to ROOT (a qualifying temp dir) followed immediately
+by the elicitation response -- NO separate trigger tools/call precedes the
+response.
+
+This isolates the post-dispatch path: with the launch root non-qualifying, the
+pre-dispatch (search \"tools/call\" ...) intercept cannot offer the .envrc (the
+session root is still /tmp when it runs), and there is no later tools/call to
+trip it.  The only way a prompt can appear is the set-root call arming the
+just-set flag and the loop's post-dispatch hook consuming it on the same call.
+
+When SECOND-TRIGGER is true, a trigger tools/call follows the response so the
+test can prove the once-per-session guard yields no further prompt and the
+server stays alive to answer it.  stdin is closed after the last line so the
+child reaches EOF and exits."
+  (let ((proc (%spawn-server :project-root #p"/tmp/"))
+        (root-str (namestring root)))
+    (unwind-protect
+         (let ((in  (uiop:process-info-input proc))
+               (out (uiop:process-info-output proc)))
+           (write-line (%initialize-line :elicitation t) in)
+           (write-line (%initialized-line) in)
+           (write-line (%set-root-line 2 root-str) in)
+           (when response-action
+             (write-line (%elicit-response-line :action response-action) in))
+           (when second-trigger
+             (write-line (%trigger-line 3) in))
+           (force-output in)
+           (close in)
+           (prog1 (%drain-stdout out :deadline-seconds 120)
+             (ignore-errors (uiop:wait-process proc))))
+      (ignore-errors (close (uiop:process-info-input proc)))
+      (ignore-errors (uiop:terminate-process proc))
+      (ignore-errors (uiop:wait-process proc)))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Scenarios (mirror 13-UAT.md, all assert hard)
 ;;; ---------------------------------------------------------------------------
@@ -334,8 +373,42 @@ fires without any prior re-root)."
         (let ((envrc (merge-pathnames ".envrc" root)))
           (true (probe-file envrc) ".envrc written on accept")
           (when (probe-file envrc)
-            (is string= (read-envrc-template) (uiop:read-file-string envrc)
-                ".envrc is byte-for-byte the template")))))))
+            (is string= (envrc-content-with-derived-port (read-envrc-template)
+                                                         root)
+                (uiop:read-file-string envrc)
+                ".envrc is the template with the project-derived port")))))))
+
+(define-test stdio-elicitation-set-root-call-fires-prompt
+  "Set-root-this-call: with the launch root non-qualifying (/tmp) and NO trigger
+preceding the response, the fs-set-project-root call that newly adopts a
+qualifying root fires the .envrc offer on that SAME tools/call -- exactly one
+elicitation/create (id 1) -- and on accept the .envrc is written byte-for-byte
+equal to the template.  A second trigger afterward yields NO further prompt
+(once-per-session guard) and is still answered, proving the server stays alive
+and the post-dispatch path does not double-fire with the pre-dispatch one.
+Guards the gap where the offer used to wait for a later tools/call."
+  (with-mcp-server-child-or-skip
+    (%with-temp-root (root)
+      (let* ((objs (%run-set-root-fires-scenario root :response-action "accept"
+                                                      :second-trigger t))
+             (prompts (remove-if-not #'%elicitation-create-p objs)))
+        (is = 1 (length prompts)
+            "exactly one elicitation/create on the set-root call itself")
+        (when (= 1 (length prompts))
+          (is = 1 (gethash "id" (first prompts)) "prompt id is 1"))
+        (let ((envrc (merge-pathnames ".envrc" root)))
+          (true (probe-file envrc) ".envrc written on accept")
+          (when (probe-file envrc)
+            (is string= (envrc-content-with-derived-port (read-envrc-template)
+                                                         root)
+                (uiop:read-file-string envrc)
+                ".envrc is the template with the project-derived port")))
+        ;; The post-response trigger (id 3) still received a JSON-RPC response,
+        ;; proving no double-prompt stalled the loop and the server stayed alive.
+        (true (some (lambda (o)
+                      (and (hash-table-p o) (eql 3 (gethash "id" o))))
+                    objs)
+              "the trigger after the response was answered")))))
 
 (define-test stdio-elicitation-accept-writes-envrc
   "Accept + once-per-session: exactly ONE elicitation/create (id 1) despite two
@@ -351,23 +424,28 @@ trigger produces no further prompt."
         (let ((envrc (merge-pathnames ".envrc" root)))
           (true (probe-file envrc) ".envrc written on accept")
           (when (probe-file envrc)
-            (is string= (read-envrc-template) (uiop:read-file-string envrc)
-                ".envrc is byte-for-byte the template")))))))
+            (is string= (envrc-content-with-derived-port (read-envrc-template)
+                                                         root)
+                (uiop:read-file-string envrc)
+                ".envrc is the template with the project-derived port")))))))
 
 (define-test stdio-elicitation-no-clobber
-  "A pre-existing COMPLETE .envrc (one that already exports DSMR_SLYNK_ATTACH)
-yields ZERO elicitation/create and is left unchanged: neither the create nor the
-update trigger fires."
+  "A pre-existing COMPLETE .envrc (one that already exports both
+DSMR_SLYNK_ATTACH and the DSMR_BUS_AGENT done-state marker) yields ZERO
+elicitation/create and is left unchanged: neither the create nor the update
+trigger fires."
   (with-mcp-server-child-or-skip
-  (%with-temp-root (root :envrc-content "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+    (%with-temp-root (root :envrc-content "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+export DSMR_BUS_AGENT=stub
 ")
-    (let ((objs (%run-scenario root :elicitation t :response-action nil)))
-      (is = 0 (%count-elicitation-creates objs)
-          "no prompt when a complete .envrc already exists")
-      (is string= "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+      (let ((objs (%run-scenario root :elicitation t :response-action nil)))
+        (is = 0 (%count-elicitation-creates objs)
+            "no prompt when a complete .envrc already exists")
+        (is string= "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+export DSMR_BUS_AGENT=stub
 "
-          (uiop:read-file-string (merge-pathnames ".envrc" root))
-          "pre-existing complete .envrc content unchanged")))))
+            (uiop:read-file-string (merge-pathnames ".envrc" root))
+            "pre-existing complete .envrc content unchanged")))))
 
 (define-test stdio-elicitation-update-appends-block
   "An existing .envrc that lacks the dsmr-mcp setup fires exactly ONE

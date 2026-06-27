@@ -14,6 +14,7 @@
   (:import-from #:dsmr-mcp/src/state
                 #:make-session
                 #:session-project-root
+                #:session-project-root-just-set-p
                 #:get-tool-instance)
   (:import-from #:dsmr-mcp/src/project-root
                 #:allowed-read-path
@@ -159,3 +160,51 @@ a typed reroot-permission-required error and does NOT change the root."
                                (if r "explicit" "missing")))
       ;; Root should now be the dsmr-mcp source dir
       (true (session-project-root session)))))
+
+(define-test set-root-arms-envrc-offer-flag
+  "A SUCCESSFUL fs-set-project-root arms the session's project-root-just-set-p
+flag, the handler half of the contract that lets the transport offer the
+project .envrc on this same tools/call instead of a later one.  The flag starts
+disarmed and the offer itself is driven elsewhere (the stdio loop's
+post-dispatch hook); here we verify only that a successful set-root arms it."
+  (with-temp-project-root (session root)
+    (false (session-project-root-just-set-p session)
+           "flag starts disarmed")
+    (let* ((tool     (get-tool-instance session "fs-set-project-root"))
+           (args     (let ((h (make-hash-table :test 'equal)))
+                       (setf (gethash "path" h) (namestring root))
+                       h))
+           ;; Re-rooting to the CURRENT root is whitelisted, so this succeeds
+           ;; without human_approved.
+           (response (tool-handle tool 1 args))
+           (result   (gethash "result" response)))
+      (false (gethash "isError" result) "set-root to the current root succeeds")
+      (true (session-project-root-just-set-p session)
+            "flag is armed after a successful set-root"))))
+
+(define-test rejected-set-root-leaves-offer-flag-disarmed
+  "A REFUSED fs-set-project-root (re-root to a non-whitelisted path without
+human_approved) must NOT arm the offer flag: no root was adopted, so there is
+nothing to offer for, and a later legitimate set-root must remain the one that
+arms it."
+  (with-temp-project-root (session _root)
+    (false (session-project-root-just-set-p session)
+           "flag starts disarmed")
+    (let* ((tool     (get-tool-instance session "fs-set-project-root"))
+           (target   (namestring (asdf:system-source-directory :dsmr-mcp)))
+           (args     (let ((h (make-hash-table :test 'equal)))
+                       (setf (gethash "path" h) target)
+                       h))
+           (response (let ((saved-env (uiop:getenv "DSMR_RELATED_PROJECTS")))
+                       (unwind-protect
+                            (progn
+                              (sb-posix:setenv "DSMR_RELATED_PROJECTS" "" 1)
+                              (tool-handle tool 1 args))
+                         (if saved-env
+                             (sb-posix:setenv "DSMR_RELATED_PROJECTS" saved-env 1)
+                             (sb-posix:unsetenv "DSMR_RELATED_PROJECTS")))))
+           (result   (gethash "result" response)))
+      (true (gethash "isError" result) "the re-root is refused")
+      (is string= "reroot-permission-required" (gethash "error_type" result))
+      (false (session-project-root-just-set-p session)
+             "a refused set-root leaves the offer flag disarmed"))))
