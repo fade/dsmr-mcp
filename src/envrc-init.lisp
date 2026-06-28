@@ -92,11 +92,12 @@ already exists makes the predicate false, which is the no-clobber guard."
 (defun lisp-project-envrc-needs-setup-p (project-root)
   "Return T when PROJECT-ROOT names a Lisp project (`*.asd` present) whose
 `.envrc` EXISTS but is not yet up to date with the dsmr-mcp settings. The file
-qualifies when it is missing `DSMR_SLYNK_ATTACH` (a fully pre-dsmr-mcp file) OR
-missing `DSMR_BUS_AGENT` (a slynk-complete file that predates the coordination
-bus). Keying the \"done\" state on `DSMR_BUS_AGENT` presence is sufficient
-because the template and managed block always write both exports together, so a
-file carrying the bus line necessarily has the slynk line too.
+qualifies when it is missing `DSMR_SLYNK_ATTACH` (e.g. a fully pre-dsmr-mcp file
+or an externally authored bus-identity-only file) OR missing `DSMR_BUS_AGENT`
+(e.g. a slynk file that predates the coordination bus). Completion requires BOTH
+markers -- a file carrying only one is still incomplete. The handler that acts
+on accept (%append-envrc-on-accept) uses the same both-markers definition of
+\"done\" and appends only the missing half, so trigger and handler agree.
 
 This is the update trigger gate: an `.envrc` created from the current template
 already carries both markers, so it is never re-nagged, and a hand-written one
@@ -199,6 +200,39 @@ export DSMR_BUS_AGENT=\"${DSMR_BUS_AGENT:-~A}\"
 # <<< dsmr-mcp (bus) <<<
 "
              agent))))
+
+(defun envrc-slynk-stanza (&optional project-root)
+  "Return the marker-delimited dsmr-mcp SLYNK stanza as an element-type CHARACTER
+string: the slynk-side exports (LISP_WORKSPACE, SLYNK_HOST, SLYNK_PORT,
+DSMR_MODE, DSMR_SLYNK_ATTACH, DSMR_LOG_LEVEL) wrapped in their own
+`# >>> dsmr-mcp (slynk) ... >>>` / `# <<< dsmr-mcp (slynk) <<<` markers, with NO
+DSMR_BUS_AGENT line. This is the append shape -- symmetric to ENVRC-BUS-STANZA --
+for a `.envrc` that already carries a bus identity (exports DSMR_BUS_AGENT) but
+lacks the slynk attach setup. Appending the full managed block would duplicate
+the bus identity the file already owns, so only the missing slynk exports are
+added.
+
+When PROJECT-ROOT is supplied the SLYNK_PORT default is derived from it into a
+stable per-project value in [4096, 32768) -- the same derivation the managed
+block uses -- so concurrent projects do not converge on one shared Slynk image.
+When PROJECT-ROOT is nil the legacy literal 4005 is used. Built via FORMAT then
+coerced through %wire-string so nothing on it is a simple-base-string."
+  (let* ((derived (and project-root
+                       (handler-case (derive-slynk-port project-root)
+                         (error () nil))))
+         (port    (if derived (princ-to-string derived) "4005")))
+    (%wire-string
+     (format nil
+"# >>> dsmr-mcp (slynk) (added automatically; edit or remove freely) >>>
+export LISP_WORKSPACE=\"${LISP_WORKSPACE:-$HOME/SourceCode/lisp/}\"
+export SLYNK_HOST=\"${SLYNK_HOST:-127.0.0.1}\"
+export SLYNK_PORT=\"${SLYNK_PORT:-~A}\"
+export DSMR_MODE=auto
+export DSMR_SLYNK_ATTACH=\"${SLYNK_HOST}:${SLYNK_PORT}\"
+export DSMR_LOG_LEVEL=info
+# <<< dsmr-mcp (slynk) <<<
+"
+             port))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Template port substitution
@@ -401,17 +435,24 @@ root when the operator confirmed. Returns T when something was appended, NIL
 otherwise. The write goes only through the session write jail
 (ensure-write-path) and is skipped when the operator's submitted `confirm` is
 explicitly false, when the file no longer exists (never created here -- the
-create path owns that), or when the file already exports `DSMR_BUS_AGENT`
-(re-checked here so a concurrent edit cannot double-append -- the bus marker is
-the \"done\" state because the managed block always writes slynk + bus
-together).
+create path owns that), or when the file is already complete -- it carries BOTH
+`DSMR_SLYNK_ATTACH` and `DSMR_BUS_AGENT` (re-checked here so a concurrent edit
+cannot double-append). Completion requires both markers, matching the trigger
+predicate LISP-PROJECT-ENVRC-NEEDS-SETUP-P: a file with only one marker is still
+incomplete and gets the missing half appended below. Keying \"done\" on the bus
+marker alone was the prior bug -- an externally-authored bus-only file (a
+hand-written bus identity, no slynk attach) was judged done and never updated,
+so the launch trigger re-prompted it every session and Accept could never
+resolve.
 
-The append SHAPE adapts to what is already present:
-  - file already exports `DSMR_SLYNK_ATTACH` but lacks `DSMR_BUS_AGENT` (a
-    slynk-complete file that predates the bus): append ONLY the bus stanza, so
-    the slynk exports are NOT duplicated.
-  - file lacks slynk entirely (a fully pre-dsmr-mcp file): append the full
-    managed block (which now includes the bus line).
+The append SHAPE adapts to what is already present, adding only the missing
+half so the half the file already owns is never duplicated:
+  - file exports `DSMR_SLYNK_ATTACH` but lacks `DSMR_BUS_AGENT` (a slynk file
+    that predates the bus): append ONLY the bus stanza.
+  - file exports `DSMR_BUS_AGENT` but lacks `DSMR_SLYNK_ATTACH` (an externally
+    authored bus-identity file): append ONLY the slynk stanza.
+  - file lacks both (a bare, pre-dsmr-mcp file): append the full managed block
+    (slynk exports plus the bus line).
 
 The user's existing lines are preserved: the stanza is appended after a
 blank-line separator (an extra newline is added when the file does not already
@@ -439,9 +480,13 @@ end in one, so lines never join). CONTENT is the accept response content."
            ((null existing)
             (log-event :warn "envrc.append.unreadable" "path" (namestring target))
             nil)
-           ;; Idempotency re-check: a `.envrc` that already carries the bus
-           ;; marker is fully up to date and left untouched (no double-append).
-           ((search "DSMR_BUS_AGENT" existing)
+           ;; Idempotency re-check: a `.envrc` is fully up to date only when it
+           ;; carries BOTH markers (DSMR_SLYNK_ATTACH and DSMR_BUS_AGENT). A
+           ;; file with just one is still incomplete and gets the missing half
+           ;; appended below -- keying "done" on the bus marker alone wrongly
+           ;; skipped an externally-authored bus-only file forever.
+           ((and (search "DSMR_SLYNK_ATTACH" existing)
+                 (search "DSMR_BUS_AGENT" existing))
             (log-event :info "envrc.append.already-present"
                        "path" (namestring target))
             nil)
@@ -454,11 +499,20 @@ end in one, so lines never join). CONTENT is the accept response content."
                    ;; otherwise two are needed (one to end the last line, one
                    ;; blank) so the appended marker never joins a user line.
                    (sep (if ends-nl (format nil "~%") (format nil "~%~%")))
-                   ;; Slynk already present => add only the bus stanza (no slynk
-                   ;; duplication); otherwise append the full managed block.
-                   (stanza (if (search "DSMR_SLYNK_ATTACH" existing)
-                               (envrc-bus-stanza root)
-                               (envrc-managed-block root)))
+                   ;; Append only the half the file is missing, so the half it
+                   ;; already owns is never duplicated:
+                   ;;   has slynk, lacks bus   => bus stanza
+                   ;;   has bus,   lacks slynk => slynk stanza
+                   ;;   lacks both             => full managed block
+                   (has-slynk (search "DSMR_SLYNK_ATTACH" existing))
+                   (has-bus   (search "DSMR_BUS_AGENT" existing))
+                   (stanza (cond
+                             ((and has-slynk (not has-bus))
+                              (envrc-bus-stanza root))
+                             ((and has-bus (not has-slynk))
+                              (envrc-slynk-stanza root))
+                             (t
+                              (envrc-managed-block root))))
                    (full (%wire-string
                           (concatenate 'string existing sep stanza))))
               (write-file-string-atomically target full)
@@ -504,10 +558,11 @@ session's project root is matched against two mutually exclusive trigger states,
 in order:
   - no `.envrc` at all (a qualifying Lisp project): prompt to CREATE one from
     the template; on :accept write through the write jail.
-  - an `.envrc` that exists but lacks the dsmr-mcp setup: prompt to APPEND the
-    managed block; on :accept append (the user's lines are preserved).
-A complete `.envrc` (one that already exports DSMR_SLYNK_ATTACH) matches neither
-state, so it is never re-prompted. When a branch fires, the once-per-session
+  - an `.envrc` that exists but lacks the dsmr-mcp setup (missing either marker):
+    prompt to APPEND the missing half; on :accept append (the user's lines are
+    preserved).
+A complete `.envrc` (one that already exports BOTH DSMR_SLYNK_ATTACH and
+DSMR_BUS_AGENT) matches neither state, so it is never re-prompted. When a branch fires, the once-per-session
 guard is set FIRST (inside the branch) so even a decline / cancel / timeout
 suppresses any later prompt this session; when neither state qualifies the guard
 is left untouched so a later qualifying call can still prompt.
