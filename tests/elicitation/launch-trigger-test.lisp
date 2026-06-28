@@ -236,7 +236,8 @@ and lives at root/.envrc (resolved through the write jail)."
   "lisp-project-envrc-needs-setup-p is true for a *.asd dir whose existing
 .envrc lacks DSMR_BUS_AGENT (whether or not it has DSMR_SLYNK_ATTACH); false for
 a fully up-to-date .envrc (both markers present), no .envrc, no *.asd, or a nil
-root. DSMR_BUS_AGENT presence is the done state."
+root. Completion requires BOTH markers; a file with only one is still
+incomplete."
   (with-temp-project-root (s root)
     (setf (session-elicitation-p s) nil) ; s unused by the predicate; touch it.
     ;; No *.asd yet, no .envrc.
@@ -350,6 +351,37 @@ export DSMR_SLYNK_ATTACH=127.0.0.1:4005
           "exactly one DSMR_SLYNK_ATTACH after a bus-only append (no duplication)")
       (true (search "DSMR_BUS_AGENT" text) "the bus identity was added")
       (true (session-envrc-prompted-p s) "prompted flag set after the update"))))
+
+(define-test slynk-only-append-preserves-single-bus
+  "Accepting on a bus-identity-only .envrc (exports DSMR_BUS_AGENT, lacks
+DSMR_SLYNK_ATTACH -- e.g. a hand-written bus identity) appends the slynk stanza,
+preserves the user's lines, leaves EXACTLY ONE DSMR_BUS_AGENT (no bus
+duplication), adds DSMR_SLYNK_ATTACH, and -- the regression this guards --
+reaches completion so a subsequent trigger no longer prompts. Before the fix the
+handler treated the bus marker as 'done' and wrote nothing, so the trigger
+re-prompted every session and Accept could never resolve."
+  (with-temp-project-root (s root)
+    (write-fixture-file root "foo.asd" "x")
+    (write-fixture-file root ".envrc"
+                        "export FOO=bar
+export DSMR_BUS_AGENT=myproj
+")
+    (setf (session-elicitation-p s) t)
+    (true (lisp-project-envrc-needs-setup-p root)
+          "a bus-identity-only .envrc is incomplete (lacks slynk) => needs setup")
+    (true (%prompt-with-consent s "accept")
+          "accept should append the slynk stanza and return true")
+    (let ((text (uiop:read-file-string (merge-pathnames ".envrc" root))))
+      (true (search "FOO=bar" text) "the user's original line is preserved")
+      (true (search "DSMR_SLYNK_ATTACH" text)
+            "the missing slynk attach setup was appended")
+      (is = 1 (%count-occurrences "DSMR_BUS_AGENT" text)
+          "exactly one DSMR_BUS_AGENT after a slynk-only append (no duplication)")
+      (true (session-envrc-prompted-p s) "prompted flag set after the update")
+      ;; Completion reached: the trigger and handler now agree, so a fresh
+      ;; predicate check on the rewritten file no longer asks to prompt.
+      (false (lisp-project-envrc-needs-setup-p root)
+             "the appended file is complete (both markers) => no re-prompt"))))
 
 (define-test bus-present-is-noop
   "A .envrc already carrying DSMR_BUS_AGENT is needs-setup false and a
