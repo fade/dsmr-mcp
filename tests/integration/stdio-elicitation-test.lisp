@@ -159,6 +159,15 @@ end, terminating this drain."
 (defun %count-elicitation-creates (objs)
   (count-if #'%elicitation-create-p objs))
 
+(defun %count-occurrences (needle haystack)
+  "Return the number of non-overlapping occurrences of NEEDLE in HAYSTACK.
+Used to assert an export survives an append exactly once (no duplication)."
+  (loop with len = (length needle)
+        for start = 0 then (+ pos len)
+        for pos = (search needle haystack :start2 start)
+        while pos
+        count t))
+
 (defun %result-with-id-p (obj id)
   "True when OBJ is a JSON-RPC response (result OR error) bearing ID.
 Used by the handshake reader to detect that a specific request has been
@@ -463,6 +472,30 @@ user's original lines are preserved (append, not clobber)."
               "the user's original line is preserved")
         (true (search "DSMR_SLYNK_ATTACH" text)
               "the dsmr-mcp managed block was appended"))))))
+
+(define-test stdio-elicitation-bus-only-appends-slynk
+  "A bus-identity-only .envrc (exports DSMR_BUS_AGENT, lacks DSMR_SLYNK_ATTACH --
+the hand-written-bus-identity case) fires exactly ONE elicitation/create; on
+accept the slynk stanza is APPENDED, adding DSMR_SLYNK_ATTACH, preserving the
+user's lines, and leaving EXACTLY ONE DSMR_BUS_AGENT (no duplication). This is
+the previously-unsatisfiable case: the old handler judged the bus marker 'done'
+and wrote nothing, so the trigger re-prompted every session and Accept could
+never resolve. Proven end-to-end over real stdio here."
+  (with-mcp-server-child-or-skip
+  (%with-temp-root (root :envrc-content "export FOO=bar
+export DSMR_BUS_AGENT=stub
+")
+    (let* ((objs (%run-scenario root :elicitation t :response-action "accept"))
+           (prompts (remove-if-not #'%elicitation-create-p objs)))
+      (is = 1 (length prompts)
+          "exactly one elicitation/create for the bus-only update prompt")
+      (let ((text (uiop:read-file-string (merge-pathnames ".envrc" root))))
+        (true (search "FOO=bar" text)
+              "the user's original line is preserved")
+        (true (search "DSMR_SLYNK_ATTACH" text)
+              "the missing slynk attach setup was appended")
+        (is = 1 (%count-occurrences "DSMR_BUS_AGENT" text)
+            "exactly one DSMR_BUS_AGENT after the slynk-only append"))))))
 
 (define-test stdio-elicitation-decline-writes-nothing
   "Decline: exactly one elicitation/create; no .envrc written afterward."
