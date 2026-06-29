@@ -41,6 +41,7 @@
                 #:worker-routed-tool-p)
   (:import-from #:com.inuoe.jzon)
   (:export #:handle-tools-call
+           #:%backend-call-p
            #:%ensure-rendered-result
            #:*synthesized-content-max-chars*))
 
@@ -151,3 +152,32 @@ untouched. Returns ENVELOPE."
             (%ensure-rendered-result (tool-handle instance id args) name))
         (arg-validation-error (e)
           (rpc-error id -32602 (arg-validation-message e)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Backend-call predicate (offload-by-predicate, D-07)
+;;; ---------------------------------------------------------------------------
+;;;
+;;; The stdio read loop uses this to decide which requests must run OFF the read
+;;; thread. A backend call is a tools/call whose tool name touches a live image:
+;;; the hermetic worker pool (:hermetic) or an attached Slynk eval (:attached).
+;;; Per D-07 the backend-verb set is identical in both modes -- every verb in
+;;; +worker-routed-tools+ routes to a worker in hermetic mode and to
+;;; bounded-slime-eval in attached mode -- so worker-routed-tool-p is the single
+;;; authoritative classifier for both. This is a predicate over that one set, not
+;;; a second parallel list: a slow verb newly added to +worker-routed-tools+ is
+;;; offloaded automatically, so no one can re-wedge the read loop by forgetting to
+;;; tag it. MODE is passed in (the caller reads *mode*) so the predicate stays
+;;; pure of specials and is trivially testable.
+
+(defun %backend-call-p (method name mode)
+  "True only when METHOD is \"tools/call\" AND the tool NAME touches a backend in
+MODE (:attached or :hermetic). NAME is the tool-name string; for non-tools/call
+methods it is ignored. Returns NIL for pure in-process verbs (ping, initialize,
+tools/list, notifications/*) and for dispatcher-side tools (fs-*, clhs-lookup,
+lsp-*, pool-status, ...)."
+  (and (stringp method)
+       (string= method "tools/call")
+       (case mode
+         (:attached (worker-routed-tool-p name))
+         (:hermetic (worker-routed-tool-p name))
+         (t nil))))

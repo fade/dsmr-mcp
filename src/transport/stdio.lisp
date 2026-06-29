@@ -37,6 +37,7 @@
 
 (defpackage #:dsmr-mcp/src/transport/stdio
   (:use #:cl)
+  (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:bordeaux-threads
                 #:make-lock
                 #:with-lock-held)
@@ -44,9 +45,17 @@
                 #:make-session
                 #:session-id
                 #:session-project-root-just-set-p
-                #:*current-session-id*)
+                #:*current-session-id*
+                #:*mode*)
   (:import-from #:dsmr-mcp/src/protocol
-                #:process-json-line)
+                #:process-json-line
+                #:+max-json-depth+
+                #:+max-json-string-length+)
+  (:import-from #:dsmr-mcp/src/dispatch
+                #:%backend-call-p)
+  (:import-from #:dsmr-mcp/src/transport/dispatch-pool
+                #:dispatch-pool-submit
+                #:ensure-dispatch-pool)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
   (:import-from #:sb-ext)
@@ -231,6 +240,37 @@ server-initiated message path, not a fix for a current race."
 ;;; Entry point
 ;;; ---------------------------------------------------------------------------
 
+;;; ---------------------------------------------------------------------------
+;;; Lightweight request classification (offload-by-predicate)
+;;; ---------------------------------------------------------------------------
+
+(defun %classify-request-line (line)
+  "Lightly parse LINE to extract (values METHOD ID NAME) for offload routing.
+METHOD is the JSON-RPC method string (or NIL), ID is the request id as parsed
+\(string or number, or NIL for notifications), and NAME is the tools/call tool
+name string (or NIL). Parses with the SAME jzon depth/string bounds as
+process-json-line so a hostile line cannot allocate unboundedly here (T-19-13),
+and is fully guarded: any parse failure or unexpected shape returns
+\(values nil nil nil), so the caller falls through to the inline dispatch path,
+which produces the proper -32700 / -32600 envelope. This is a cheap routing
+probe, not the authoritative parse -- the chosen path re-parses via
+process-json-line."
+  (handler-case
+      (let ((msg (jzon:parse line
+                             :max-depth +max-json-depth+
+                             :max-string-length +max-json-string-length+)))
+        (if (hash-table-p msg)
+            (let ((method (gethash "method" msg))
+                  (id     (gethash "id" msg))
+                  (params (gethash "params" msg)))
+              (values (and (stringp method) method)
+                      id
+                      (and (hash-table-p params)
+                           (let ((name (gethash "name" params)))
+                             (and (stringp name) name)))))
+            (values nil nil nil)))
+    (error () (values nil nil nil))))
+
 (defun serve-streams (in out &key (session (make-session :id "stdio")))
   "Read newline-delimited JSON-RPC requests from IN and write response lines
 to OUT.  Returns T when IN reaches EOF.
@@ -241,11 +281,30 @@ for the lifetime of the loop so every downstream call site can read it
 without receiving it as a function argument.
 
 Behaviour:
-  - Each request line is dispatched via PROCESS-JSON-LINE inside
-    %DISPATCH-WITH-STDOUT-GUARD, which captures any stray *STANDARD-OUTPUT*
-    writes so they cannot corrupt the JSON-RPC channel.
+  - Each request line is classified (offload-by-predicate, D-07). A backend
+    tools/call (a verb that touches the hermetic worker pool or an attached
+    Slynk eval, per %backend-call-p) carrying an id is submitted to the
+    dispatch pool and its response is written from the WORKER thread through
+    %write-wire-line; the read loop continues immediately without awaiting,
+    so ping and new requests stay responsive while a long backend call runs.
+    Every other line (pure verbs, notifications, dispatcher-side tools, and
+    anything that fails to classify) is dispatched INLINE on the read loop,
+    exactly as before.
+  - Inline dispatch runs PROCESS-JSON-LINE inside %DISPATCH-WITH-STDOUT-GUARD,
+    which captures any stray *STANDARD-OUTPUT* writes so they cannot corrupt
+    the JSON-RPC channel; the offloaded worker thunk uses the same guard. The
+    worker thunk also re-binds *CURRENT-SESSION-ID* to (SESSION-ID SESSION),
+    because dynamic bindings are thread-local: the pool worker does not inherit
+    the read loop's binding, and handle-tools-call requires it bound.
   - Each response is followed by FORCE-OUTPUT so a piped reader sees it
     immediately.
+  - A per-session in-flight map (request-id -> dispatch-promise) is populated
+    at submit and cleaned at fulfill, under in-flight-lock. Submit + register
+    are atomic with respect to the worker's removal, and the removal runs in an
+    unwind-protect so a worker error still cleans the entry. This is the lookup
+    table the cancel handler needs; lookup-in-flight / register-in-flight /
+    remove-in-flight are local closures over the map so the cancel branch can
+    reuse them inline on the read loop.
   - An oversized input line (> +MAX-JSON-LINE-BYTES+ chars) causes a literal
     -32600 \"Request too large\" envelope to be written; the loop then
     continues reading subsequent lines rather than aborting. The drain that
@@ -263,108 +322,171 @@ Divergences from cl-mcp src/run.lisp:
     before the stdio.stop log via runtime symbol resolution so this file
     compiles before dsmr-mcp/src/attach/dispatch is loaded."
   (let ((*current-session-id* (session-id session))
-        (write-lock (make-lock "dsmr-stdio-wire-write")))
-    (log-event :info "stdio.start" "session" (session-id session))
-    (unwind-protect
-         (loop
-           ;; Read the next line, capped at +max-json-line-bytes+.
-           (let ((line (handler-case
-                           (%read-line-limited in :eof +max-json-line-bytes+)
-                         (line-too-long (e)
-                           (log-event :warn "stdio.read.line-too-long"
-                                      "error" (princ-to-string e))
-                           ;; Drain remaining bytes up to the newline, but cap
-                           ;; the drain at +max-json-line-bytes+ too.  A hostile
-                           ;; peer that never sends a newline must not pin us
-                           ;; here indefinitely — terminate the connection if the
-                           ;; drain budget is exceeded — terminate rather than pinning indefinitely.
-                           (loop with drained = 0
-                                 for ch = (read-char in nil nil)
-                                 while ch
-                                 until (char= ch #\Newline)
-                                 do (when (> (incf drained) +max-json-line-bytes+)
-                                      (log-event :warn "stdio.read.drain-exceeded")
-                                      (return-from serve-streams t)))
-                           :too-long))))
-             (cond
-               ;; EOF — client closed the pipe; return t to the caller.
-               ((eq line :eof)
-                (return t))
+        (write-lock (make-lock "dsmr-stdio-wire-write"))
+        (in-flight (make-hash-table :test 'equal))
+        (in-flight-lock (make-lock "dsmr-stdio-in-flight")))
+    (labels ((lookup-in-flight (id)
+               "Return the dispatch-promise registered under ID, or NIL.
+Provided for the cancel handler (Plan 06), which runs inline on the read loop."
+               (with-lock-held (in-flight-lock) (gethash id in-flight)))
+             (remove-in-flight (id)
+               "Drop ID from the in-flight map. Idempotent (a missing id is a
+no-op), so it is safe in the worker's unwind-protect cleanup."
+               (with-lock-held (in-flight-lock) (remhash id in-flight)))
+             (register-in-flight (id thunk)
+               "Submit THUNK to the dispatch pool under ID and record its promise
+in the in-flight map. The in-flight-lock is held ACROSS submit + record so a
+worker that starts running immediately cannot reach remove-in-flight before the
+entry is recorded -- registration always happens-before removal. Returns the
+promise."
+               (with-lock-held (in-flight-lock)
+                 (let ((promise (dispatch-pool-submit
+                                 (ensure-dispatch-pool) thunk
+                                 :session-id (session-id session)
+                                 :request-id id
+                                 :mode *mode*)))
+                   (setf (gethash id in-flight) promise)
+                   promise))))
+      (declare (ignorable #'lookup-in-flight #'remove-in-flight
+                          #'register-in-flight))
+      (log-event :info "stdio.start" "session" (session-id session))
+      (unwind-protect
+           (loop
+             ;; Read the next line, capped at +max-json-line-bytes+.
+             (let ((line (handler-case
+                             (%read-line-limited in :eof +max-json-line-bytes+)
+                           (line-too-long (e)
+                             (log-event :warn "stdio.read.line-too-long"
+                                        "error" (princ-to-string e))
+                             ;; Drain remaining bytes up to the newline, but cap
+                             ;; the drain at +max-json-line-bytes+ too.  A hostile
+                             ;; peer that never sends a newline must not pin us
+                             ;; here indefinitely — terminate the connection if the
+                             ;; drain budget is exceeded — terminate rather than pinning indefinitely.
+                             (loop with drained = 0
+                                   for ch = (read-char in nil nil)
+                                   while ch
+                                   until (char= ch #\Newline)
+                                   do (when (> (incf drained) +max-json-line-bytes+)
+                                        (log-event :warn "stdio.read.drain-exceeded")
+                                        (return-from serve-streams t)))
+                             :too-long))))
+               (cond
+                 ;; EOF — client closed the pipe; return t to the caller.
+                 ((eq line :eof)
+                  (return t))
 
-               ;; Oversized line — emit the literal error envelope and continue.
-               ((eq line :too-long)
-                (handler-case
-                    (%write-wire-line
-                     "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"Request too large\"}}"
-                     out write-lock)
-                  (stream-error (e)
-                    (log-event :warn "stdio.write.error"
-                               "error" (princ-to-string e))
-                    (return t))))
+                 ;; Oversized line — emit the literal error envelope and continue.
+                 ((eq line :too-long)
+                  (handler-case
+                      (%write-wire-line
+                       "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"Request too large\"}}"
+                       out write-lock)
+                    (stream-error (e)
+                      (log-event :warn "stdio.write.error"
+                                 "error" (princ-to-string e))
+                      (return t))))
 
-               ;; Normal line — dispatch with stdout guard, then flush.
-               (t
-                ;; Launch-time .envrc consent: on the first qualifying
-                ;; tools/call line, complete the elicitation round-trip in-line
-                ;; (reading and answering interleaved client lines through the
-                ;; in-reader thunk) BEFORE dispatching the held tool-call line.
-                ;; The cheap (search "tools/call" ...) gate may produce false
-                ;; positives; the intercept body re-checks capability /
-                ;; once-per-session / qualifying-project, so a false positive is
-                ;; harmless. Runtime symbol resolution avoids a compile-time dep
-                ;; on dsmr-mcp/src/envrc-init.
-                (when (search "tools/call" line)
-                  (ignore-errors
-                   (uiop:symbol-call :dsmr-mcp/src/envrc-init
-                                     :maybe-prompt-and-write-envrc
-                                     session out
-                                     (lambda ()
-                                       (%read-line-limited
-                                        in :eof +max-json-line-bytes+)))))
-                (multiple-value-bind (resp captured)
-                    (%dispatch-with-stdout-guard line session)
-                  (when (plusp (length captured))
-                    (log-event :warn "stdio.transport.stdout-pollution"
-                               "bytes" (length captured)
-                               "preview" (subseq captured 0
-                                                  (min 200 (length captured)))))
-                  (when resp
-                    (handler-case
-                        (%write-wire-line resp out write-lock)
-                      (stream-error (e)
-                        (log-event :warn "stdio.write.error"
-                                   "error" (princ-to-string e))
-                        (return t))))
-                  ;; Post-dispatch .envrc consent: when the line just dispatched
-                  ;; was the fs-set-project-root call that newly adopted this
-                  ;; session's root, the pre-dispatch intercept above could not
-                  ;; have offered the `.envrc` -- the root is set mid-dispatch,
-                  ;; so it was still NIL when that intercept ran.  Consume the
-                  ;; one-shot flag here, AFTER the response is on the wire, and
-                  ;; drive the elicitation in-line on this loop thread (the only
-                  ;; place it is safe to read/write the wire on stdio).  Clear
-                  ;; the flag unconditionally first so a non-qualifying root or a
-                  ;; declined prompt does not leave it armed for the next call.
-                  ;; The once-per-session prompted-p guard inside
-                  ;; maybe-prompt-and-write-envrc keeps this from double-firing
-                  ;; with the pre-dispatch path.  Runtime symbol resolution and
-                  ;; ignore-errors mirror the pre-dispatch intercept.
-                  (when (session-project-root-just-set-p session)
-                    (setf (session-project-root-just-set-p session) nil)
+                 ;; Normal line — classify, then either offload a backend call to
+                 ;; the dispatch pool or dispatch inline.
+                 (t
+                  ;; Launch-time .envrc consent: on the first qualifying
+                  ;; tools/call line, complete the elicitation round-trip in-line
+                  ;; (reading and answering interleaved client lines through the
+                  ;; in-reader thunk) BEFORE dispatching the held tool-call line.
+                  ;; The cheap (search "tools/call" ...) gate may produce false
+                  ;; positives; the intercept body re-checks capability /
+                  ;; once-per-session / qualifying-project, so a false positive is
+                  ;; harmless. Runtime symbol resolution avoids a compile-time dep
+                  ;; on dsmr-mcp/src/envrc-init.
+                  (when (search "tools/call" line)
                     (ignore-errors
                      (uiop:symbol-call :dsmr-mcp/src/envrc-init
                                        :maybe-prompt-and-write-envrc
                                        session out
                                        (lambda ()
                                          (%read-line-limited
-                                          in :eof +max-json-line-bytes+))))))))))
-      ;; Cleanup: close the attached Slynk connection before logging stop so
-      ;; the host Slynk listener gets a clean FIN on EOF or abnormal exit.
-      ;; Runtime symbol resolution avoids a compile-time dep on
-      ;; dsmr-mcp/src/attach/dispatch (same technique as the version lookup
-      ;; in protocol.lisp %handle-initialize). ignore-errors guards against
-      ;; the attach system being absent in a stripped build.
-      (ignore-errors
-       (uiop:symbol-call :dsmr-mcp/src/attach/dispatch :detach-session session))
-      ;; Always log stdio.stop, even on abnormal exit.
-      (log-event :info "stdio.stop" "session" (session-id session)))))
+                                          in :eof +max-json-line-bytes+)))))
+                  (multiple-value-bind (method id name)
+                      (%classify-request-line line)
+                    (if (and id (%backend-call-p method name *mode*))
+                        ;; Backend tools/call with an id: run it OFF the read
+                        ;; thread on a dispatch-pool worker. The worker re-parses
+                        ;; and dispatches via process-json-line (same stdout
+                        ;; guard), writes its response through %write-wire-line
+                        ;; under write-lock, and removes its in-flight entry in an
+                        ;; unwind-protect so a worker error still cleans the map.
+                        ;; The read loop does NOT await — it returns to the next
+                        ;; read immediately. out / write-lock / session / line are
+                        ;; captured by closure; *current-session-id* is re-bound on
+                        ;; the worker thread (bindings are thread-local).
+                        (register-in-flight
+                         id
+                         (lambda ()
+                           (let ((*current-session-id* (session-id session)))
+                             (unwind-protect
+                                  (multiple-value-bind (resp captured)
+                                      (%dispatch-with-stdout-guard line session)
+                                    (when (plusp (length captured))
+                                      (log-event :warn "stdio.transport.stdout-pollution"
+                                                 "bytes" (length captured)
+                                                 "preview" (subseq captured 0
+                                                                    (min 200 (length captured)))))
+                                    (when resp
+                                      (handler-case
+                                          (%write-wire-line resp out write-lock)
+                                        (stream-error (e)
+                                          (log-event :warn "stdio.write.error"
+                                                     "error" (princ-to-string e))))))
+                               (remove-in-flight id)))))
+                        ;; Inline path (pure verbs, notifications, dispatcher-side
+                        ;; tools, and anything that did not classify): dispatch on
+                        ;; the read loop exactly as before.
+                        (multiple-value-bind (resp captured)
+                            (%dispatch-with-stdout-guard line session)
+                          (when (plusp (length captured))
+                            (log-event :warn "stdio.transport.stdout-pollution"
+                                       "bytes" (length captured)
+                                       "preview" (subseq captured 0
+                                                          (min 200 (length captured)))))
+                          (when resp
+                            (handler-case
+                                (%write-wire-line resp out write-lock)
+                              (stream-error (e)
+                                (log-event :warn "stdio.write.error"
+                                           "error" (princ-to-string e))
+                                (return t))))
+                          ;; Post-dispatch .envrc consent: when the line just
+                          ;; dispatched was the fs-set-project-root call that newly
+                          ;; adopted this session's root, the pre-dispatch intercept
+                          ;; above could not have offered the `.envrc` -- the root is
+                          ;; set mid-dispatch, so it was still NIL when that intercept
+                          ;; ran.  Consume the one-shot flag here, AFTER the response
+                          ;; is on the wire, and drive the elicitation in-line on this
+                          ;; loop thread (the only place it is safe to read/write the
+                          ;; wire on stdio).  Clear the flag unconditionally first so a
+                          ;; non-qualifying root or a declined prompt does not leave it
+                          ;; armed for the next call.  The once-per-session prompted-p
+                          ;; guard inside maybe-prompt-and-write-envrc keeps this from
+                          ;; double-firing with the pre-dispatch path.  Runtime symbol
+                          ;; resolution and ignore-errors mirror the pre-dispatch
+                          ;; intercept.
+                          (when (session-project-root-just-set-p session)
+                            (setf (session-project-root-just-set-p session) nil)
+                            (ignore-errors
+                             (uiop:symbol-call :dsmr-mcp/src/envrc-init
+                                               :maybe-prompt-and-write-envrc
+                                               session out
+                                               (lambda ()
+                                                 (%read-line-limited
+                                                  in :eof +max-json-line-bytes+))))))))))))
+        ;; Cleanup: close the attached Slynk connection before logging stop so
+        ;; the host Slynk listener gets a clean FIN on EOF or abnormal exit.
+        ;; Runtime symbol resolution avoids a compile-time dep on
+        ;; dsmr-mcp/src/attach/dispatch (same technique as the version lookup
+        ;; in protocol.lisp %handle-initialize). ignore-errors guards against
+        ;; the attach system being absent in a stripped build.
+        (ignore-errors
+         (uiop:symbol-call :dsmr-mcp/src/attach/dispatch :detach-session session))
+        ;; Always log stdio.stop, even on abnormal exit.
+        (log-event :info "stdio.stop" "session" (session-id session))))))

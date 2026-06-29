@@ -11,6 +11,7 @@
 
 (defpackage #:dsmr-mcp/tests/transport/concurrent-dispatch-test
   (:use #:cl #:parachute)
+  (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/transport/dispatch-pool
                 #:dispatch-promise
                 #:make-dispatch-promise
@@ -28,12 +29,171 @@
                 #:%clamp-pool-size)
   (:import-from #:dsmr-mcp/src/hermetic/pool
                 #:*max-pool-size*)
+  ;; End-to-end CONC-01 offload test: drives serve-streams over real OS pipes
+  ;; with a mock backend verb that blocks on a condition variable.
+  (:import-from #:dsmr-mcp/src/transport/stdio
+                #:serve-streams)
+  (:import-from #:dsmr-mcp/src/state
+                #:make-session)
+  (:import-from #:dsmr-mcp/src/hermetic/dispatch
+                #:+worker-routed-tools+)
+  (:import-from #:dsmr-mcp/src/tools/base
+                #:mcp-tool
+                #:mcp-tool-class
+                #:tool-handle
+                #:*tool-classes*)
+  ;; result shadows parachute:result (the mock handler builds a tool result
+  ;; envelope; this package does not use parachute's result symbol).
+  (:shadowing-import-from #:dsmr-mcp/src/tools/helpers
+                #:result)
+  (:import-from #:dsmr-mcp/src/tools/helpers
+                #:make-ht)
+  (:import-from #:dsmr-mcp/tests/support/scoped-tools
+                #:unregister-tool)
   (:import-from #:bordeaux-threads
                 #:make-thread #:join-thread
                 #:make-lock #:with-lock-held
                 #:make-condition-variable #:condition-wait #:condition-notify))
 
 (in-package #:dsmr-mcp/tests/transport/concurrent-dispatch-test)
+
+;;; ===========================================================================
+;;; End-to-end CONC-01: the read loop offloads backend calls and stays
+;;; responsive. Driven over real OS pipes (a synchronous string-stream cannot
+;;; model a blocking handler) with a mock backend verb that parks on a condition
+;;; variable until the test releases it.
+;;;
+;;; sb-posix must be loaded before the pipe-driver form below is READ, since it
+;;; names sb-posix:pipe; keep this require as its own earlier top-level form.
+;;; ===========================================================================
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-posix))
+
+;; Fixtures + pipe driver for the two end-to-end tests below. Wrapped in a
+;; top-level PROGN so its subforms are still processed as top-level definitions
+;; (the defclass is compiled before the defmethod that specialises on it).
+(progn
+  ;; Rendezvous between the test thread and the mock handler running on a
+  ;; dispatch worker. *mock-entered* counts handler invocations that reached the
+  ;; park point; *mock-released* gates their return. One lock + cv guards both
+  ;; (each waiter re-checks its own predicate).
+  (defvar *mock-lock* (make-lock "concurrent-dispatch-mock"))
+  (defvar *mock-cv* (make-condition-variable :name "concurrent-dispatch-mock"))
+  (defvar *mock-entered* 0)
+  (defvar *mock-released* nil)
+
+  (defclass blocking-backend-tool (mcp-tool)
+    ((dsmr-mcp/src/tools/base::name
+      :allocation :class :initform "mock-blocking-backend")
+     (dsmr-mcp/src/tools/base::description
+      :allocation :class :initform "Mock backend verb that blocks until released.")
+     (dsmr-mcp/src/tools/base::input-schema
+      :allocation :class :initform '(:object :properties () :required ())))
+    (:metaclass mcp-tool-class))
+  (c2mop:ensure-finalized (find-class 'blocking-backend-tool))
+  ;; The defclass auto-registers in the global registry at finalization; scrub
+  ;; it so tools/list and the docs parity renderer never see the fixture. The
+  ;; pipe driver re-installs it (and the matching backend-verb tag) only for the
+  ;; duration of a single test, then restores both.
+  (unregister-tool "mock-blocking-backend")
+
+  (defmethod tool-handle ((tool blocking-backend-tool) id args)
+    (declare (ignore args))
+    ;; Signal entry, then park until the test releases us.
+    (with-lock-held (*mock-lock*)
+      (incf *mock-entered*)
+      (sb-thread:condition-broadcast *mock-cv*))
+    (with-lock-held (*mock-lock*)
+      (loop until *mock-released*
+            do (condition-wait *mock-cv* *mock-lock*)))
+    (result id (make-ht "ok" t)))
+
+  (defun %wait-until (predicate timeout)
+    "Block until PREDICATE returns true or TIMEOUT seconds elapse, waking on the
+mock cv. Returns PREDICATE's final value — NIL means the deadline won, which a
+caller asserts on rather than hanging forever."
+    (with-lock-held (*mock-lock*)
+      (let ((deadline (+ (get-internal-real-time)
+                         (round (* timeout internal-time-units-per-second)))))
+        (loop until (funcall predicate)
+              do (let ((remaining (/ (- deadline (get-internal-real-time))
+                                     internal-time-units-per-second)))
+                   (when (<= remaining 0) (return))
+                   (condition-wait *mock-cv* *mock-lock* :timeout remaining)))
+        (funcall predicate))))
+
+  (defun %release-mock ()
+    (with-lock-held (*mock-lock*)
+      (setf *mock-released* t)
+      (sb-thread:condition-broadcast *mock-cv*)))
+
+  (defun %rpc-init-line (id)
+    (format nil "{\"jsonrpc\":\"2.0\",\"id\":~A,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}" id))
+  (defun %rpc-call-line (id name)
+    (format nil "{\"jsonrpc\":\"2.0\",\"id\":~A,\"method\":\"tools/call\",\"params\":{\"name\":\"~A\",\"arguments\":{}}}" id name))
+  (defun %rpc-ping-line (id)
+    (format nil "{\"jsonrpc\":\"2.0\",\"id\":~A,\"method\":\"ping\"}" id))
+
+  (defun call-with-mock-backend-server (body)
+    "Drive serve-streams over real OS pipes with a scoped 'mock-blocking-backend'
+backend verb bound to BLOCKING-BACKEND-TOOL, then call BODY with two closures:
+SEND (write one JSON-RPC line to the server) and RECV (read + parse one response
+line, time-bounded so a wedged loop fails the test instead of hanging).
+
+A fresh handshake (initialize + initialized) runs first and its response is
+drained, so BODY sees a clean output channel. Teardown (always) releases the
+mock, restores the global backend-verb list and tool registry, closes the
+server's input to drive it to EOF, joins the serve thread, and closes the pipe
+streams — so a failing assertion never leaks a blocked handler or a live thread."
+    (setf *mock-entered* 0 *mock-released* nil)
+    (let ((saved-verbs (symbol-value '+worker-routed-tools+))
+          (serve-thread nil))
+      (multiple-value-bind (in-read in-write) (sb-posix:pipe)
+        (multiple-value-bind (out-read out-write) (sb-posix:pipe)
+          (let ((server-in  (sb-sys:make-fd-stream in-read :input t
+                                                   :external-format :utf-8 :buffering :none))
+                (client-out (sb-sys:make-fd-stream in-write :output t
+                                                   :external-format :utf-8 :buffering :none))
+                (server-out (sb-sys:make-fd-stream out-write :output t
+                                                   :external-format :utf-8 :buffering :none))
+                (client-in  (sb-sys:make-fd-stream out-read :input t
+                                                   :external-format :utf-8 :buffering :none)))
+            (unwind-protect
+                 (progn
+                   ;; Install the scoped backend verb + mock class GLOBALLY: the
+                   ;; serve loop and the dispatch-pool workers run on their own
+                   ;; threads and read the global values, not a dynamic
+                   ;; rebinding.
+                   (setf (symbol-value '+worker-routed-tools+)
+                         (cons "mock-blocking-backend" saved-verbs))
+                   (setf (gethash "mock-blocking-backend" *tool-classes*)
+                         (find-class 'blocking-backend-tool))
+                   (setf serve-thread
+                         (make-thread
+                          (lambda ()
+                            (serve-streams server-in server-out
+                                           :session (make-session :id "concurrent-dispatch")))))
+                   (flet ((send (line)
+                            (write-line line client-out)
+                            (finish-output client-out))
+                          (recv ()
+                            (sb-ext:with-timeout 10 (jzon:parse (read-line client-in)))))
+                     (send (%rpc-init-line 0))
+                     (send "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")
+                     (recv)             ; drain the initialize response
+                     (funcall body #'send #'recv)))
+              ;; Teardown — order matters: release first so parked workers can
+              ;; finish, then EOF the input so the loop returns, then join.
+              (%release-mock)
+              (setf (symbol-value '+worker-routed-tools+) saved-verbs)
+              (remhash "mock-blocking-backend" *tool-classes*)
+              (ignore-errors (close client-out))
+              (when serve-thread
+                (ignore-errors (sb-ext:with-timeout 5 (join-thread serve-thread))))
+              (ignore-errors (close server-in))
+              (ignore-errors (close server-out))
+              (ignore-errors (close client-in)))))))))
 
 (define-test promise-fulfilled-from-worker-is-observed
   (let ((promise (make-dispatch-promise)))
@@ -190,3 +350,43 @@
             ;; The cancelled thunk never ran.
             (is = 0 counter)))
       (dispatch-pool-shutdown pool))))
+
+(define-test ping-stays-responsive-while-backend-call-blocks
+  ;; CONC-01: a backend tools/call is offloaded to a worker and parks; a ping
+  ;; sent AFTER it must get its response back while the backend call is still
+  ;; held — proof the read loop is not serialized behind the backend call.
+  (call-with-mock-backend-server
+   (lambda (send recv)
+     (funcall send (%rpc-call-line 1 "mock-blocking-backend"))
+     ;; The offload actually reached a worker (not still on the read loop).
+     (true (%wait-until (lambda () (>= *mock-entered* 1)) 10))
+     (funcall send (%rpc-ping-line 2))
+     (let ((resp (funcall recv)))
+       ;; Ordering, not sleep-and-hope: the ping response is observed while the
+       ;; backend tool is STILL held (not yet released).
+       (false *mock-released*)
+       (is = 2 (gethash "id" resp))
+       (true (nth-value 1 (gethash "result" resp))))
+     ;; Release; the backend call now completes and returns its own response.
+     (%release-mock)
+     (let ((resp (funcall recv)))
+       (is = 1 (gethash "id" resp))))))
+
+(define-test concurrent-backend-calls-do-not-serialize
+  ;; CONC-01: two backend tools/calls submitted back-to-back must BOTH be
+  ;; executing on worker threads at once before either is released — proof they
+  ;; do not serialize on the read loop.
+  (call-with-mock-backend-server
+   (lambda (send recv)
+     (funcall send (%rpc-call-line 1 "mock-blocking-backend"))
+     (funcall send (%rpc-call-line 2 "mock-blocking-backend"))
+     ;; Both handlers enter concurrently while neither has been released.
+     (true (%wait-until (lambda () (>= *mock-entered* 2)) 10))
+     (is >= *mock-entered* 2)
+     (false *mock-released*)
+     ;; Release both and drain the two responses (ids 1 and 2, any order).
+     (%release-mock)
+     (let ((ids (sort (list (gethash "id" (funcall recv))
+                            (gethash "id" (funcall recv)))
+                      #'<)))
+       (is equal '(1 2) ids)))))
