@@ -117,7 +117,7 @@ jobs:
         run: |
           set -euo pipefail
           git clone --filter=blob:none https://github.com/fade/slynk-client.git vendor/slynk-client
-          git -C vendor/slynk-client checkout 32691172ee0a5619f084145c0304464f5c4b67c3
+          git -C vendor/slynk-client checkout 67b65da7210b4f9a6e373077373528a4c7bed4b5
 
       - name: Prime dependencies (cold — download dist deps + compile)
         # `make test` uses asdf:load-system, which resolves only systems already
@@ -224,7 +224,7 @@ jobs:
         run: |
           set -euo pipefail
           git clone --filter=blob:none https://github.com/fade/slynk-client.git vendor/slynk-client
-          git -C vendor/slynk-client checkout 32691172ee0a5619f084145c0304464f5c4b67c3
+          git -C vendor/slynk-client checkout 67b65da7210b4f9a6e373077373528a4c7bed4b5
 
       - name: Prime dependencies (download dist deps + compile)
         # Export the same project-local XDG_CACHE_HOME the Makefile uses so the
