@@ -228,6 +228,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
 ;; umbrella so the inner-loop suite stays quick. Each leaf here spawns a real
 ;; dsmr-mcp server subprocess (~10-12s/scenario) and skips cleanly when the
 ;; environment cannot spawn one. Run explicitly: (asdf:test-system "dsmr-mcp/tests/integration").
+
 (asdf:defsystem "dsmr-mcp/tests/integration"
   :class :package-inferred-system
   :description "Slow cross-process integration tests for dsmr-mcp."
@@ -240,6 +241,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/integration/transport/bridge-test"
                "dsmr-mcp/tests/integration/attach/wire-cross-process-test"
                "dsmr-mcp/tests/integration/attach/run-tests-cross-process-test"
+               "dsmr-mcp/tests/integration/attach/error-context-guard-test"
                "dsmr-mcp/tests/integration/attach/cancel-test"
                "dsmr-mcp/tests/integration/hermetic/cancel-test"
                "dsmr-mcp/tests/integration/hermetic/worker-spawn-test"

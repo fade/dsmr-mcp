@@ -264,17 +264,6 @@ value directly on the session object."
 ;;; transport.  Each must instead return a structured error_context over the
 ;;; rex — never a NETWORK_ERROR, never a debugger entry.
 
-(defun %attach-error-context (conn session-id code)
-  "Dispatch CODE through %dispatch-attach on a fresh test session.
-Returns (values ERROR-CONTEXT-HT ERROR-TYPE RESULT-HT)."
-  (multiple-value-bind (session tool)
-      (%make-attach-session session-id conn)
-    (declare (ignore session))
-    (let ((res (%dispatch-attach tool (make-ht "code" code))))
-      (values (gethash "error_context" res)
-              (gethash "error_type" res)
-              res))))
-
 (define-test unknown-package-returns-error-context
   "A typo'd evaluation package yields a structured error, not a debugger entry.
 The package lookup runs inside the injected form's guarded region."
@@ -291,46 +280,6 @@ The package lookup runs inside the injected form's guarded region."
         (false (equal "NETWORK_ERROR" (gethash "error_type" res)))
         (true ec)
         (true (search "NO-SUCH-PACKAGE-XYZZY" (gethash "message" ec)))))))
-
-(define-test reader-error-returns-error-context
-  "Unreadable code text yields a structured error, not a debugger entry.
-The READ of the code string runs inside the injected form's guarded region."
-  (with-temporary-slynk-listener (conn)
-    (multiple-value-bind (ec error-type)
-        (%attach-error-context conn "guard-reader-error" "#<unreadable>")
-      (false (equal "NETWORK_ERROR" error-type))
-      (true ec)
-      (true (gethash "condition_type" ec)))))
-
-(define-test non-error-serious-condition-returns-error-context
-  "A serious-but-not-error condition (sb-ext:timeout is not an ERROR subtype)
-is caught by the widened handler with full restarts context."
-  (with-temporary-slynk-listener (conn)
-    (multiple-value-bind (ec error-type)
-        (%attach-error-context conn "guard-serious-non-error"
-                               "(error (make-condition 'sb-ext:timeout))")
-      (false (equal "NETWORK_ERROR" error-type))
-      (true ec)
-      (true (search "TIMEOUT" (gethash "condition_type" ec)))
-      ;; Full-context branch: restarts captured with the stack live.
-      (let ((restarts (gethash "restarts" ec)))
-        (true (vectorp restarts))
-        (true (plusp (length restarts)))))))
-
-(define-test storage-condition-returns-minimal-error-context
-  "A storage-condition takes the minimal type+message branch — no restarts,
-no frames — because consing heavily inside a heap-exhaustion handler can
-itself fail and fall through to the debugger."
-  (with-temporary-slynk-listener (conn)
-    (multiple-value-bind (ec error-type)
-        (%attach-error-context conn "guard-storage-condition"
-                               "(error (make-condition 'storage-condition))")
-      (false (equal "NETWORK_ERROR" error-type))
-      (true ec)
-      (true (search "STORAGE-CONDITION" (gethash "condition_type" ec)))
-      (let ((restarts (gethash "restarts" ec)))
-        (true (or (null restarts)
-                  (and (vectorp restarts) (zerop (length restarts)))))))))
 
 (define-test drop-connection-closes-socket-and-dispatcher-exits
   "drop-connection best-effort-closes the abandoned connection's socket, so
@@ -359,15 +308,3 @@ print any late protocol event arriving on the dead connection."
                      do (sleep 0.05))
                (false (thread-alive-p dispatcher)))))
       (ignore-errors (slynk:stop-server port)))))
-
-(define-test break-returns-error-context-without-debugger
-  "BREAK bypasses handlers and *debugger-hook* by definition; the
-SB-EXT:*INVOKE-DEBUGGER-HOOK* backstop converts it to a minimal error
-context instead of parking the rex worker in the debugger."
-  (with-temporary-slynk-listener (conn)
-    (multiple-value-bind (ec error-type)
-        (%attach-error-context conn "guard-break"
-                               "(break \"guard-break-test\")")
-      (false (equal "NETWORK_ERROR" error-type))
-      (true ec)
-      (true (search "guard-break-test" (gethash "message" ec))))))
