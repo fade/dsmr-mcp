@@ -55,7 +55,25 @@
                 #:%backend-call-p)
   (:import-from #:dsmr-mcp/src/transport/dispatch-pool
                 #:dispatch-pool-submit
-                #:ensure-dispatch-pool)
+                #:dispatch-pool-shutdown
+                #:ensure-dispatch-pool
+                #:await-promise
+                #:dispatch-promise-lock
+                #:dispatch-promise-cancelled
+                #:dispatch-promise-mode
+                #:dispatch-promise-thread
+                #:dispatch-promise-session-id)
+  (:import-from #:dsmr-mcp/src/hermetic/pool
+                #:kill-session-worker)
+  (:import-from #:dsmr-mcp/src/attach/cancel
+                #:cancel-attached-eval
+                #:*cancel-grace-seconds*)
+  (:import-from #:dsmr-mcp/src/orphan
+                #:orphan-count)
+  (:import-from #:dsmr-mcp/src/notify
+                #:%build-notification-json)
+  (:import-from #:dsmr-mcp/src/tools/helpers
+                #:make-ht)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
   (:import-from #:sb-ext)
@@ -271,6 +289,42 @@ process-json-line."
             (values nil nil nil)))
     (error () (values nil nil nil))))
 
+(defun %cancel-params (line)
+  "Parse a notifications/cancelled LINE and return (values REQUEST-ID REASON).
+REQUEST-ID is the params.requestId (a string or number) used ONLY as an
+exact-match hash key into the in-flight map -- never interpolated into code
+\(ASVS V5, T-19-02). REASON is the optional reason string or NIL. Parses with
+the SAME jzon depth/string bounds as process-json-line so a hostile line cannot
+allocate unboundedly here, and is fully guarded: any parse failure or
+unexpected shape returns (values nil nil)."
+  (handler-case
+      (let ((msg (jzon:parse line
+                             :max-depth +max-json-depth+
+                             :max-string-length +max-json-string-length+)))
+        (if (hash-table-p msg)
+            (let ((params (gethash "params" msg)))
+              (if (hash-table-p params)
+                  (values (gethash "requestId" params)
+                          (let ((r (gethash "reason" params)))
+                            (and (stringp r) r)))
+                  (values nil nil)))
+            (values nil nil)))
+    (error () (values nil nil))))
+
+(defun %cancel-message (outcome)
+  "Human-readable message for a cancel-result OUTCOME, so the agent's mental
+model of the image state stays accurate (D-03)."
+  (cond
+    ((string= outcome "aborted_clean")
+     "The in-flight call was cooperatively aborted; the image is clean.")
+    ((string= outcome "orphaned")
+     "The in-flight call did not abort within the grace window; its thread is tracked as an orphan and the image may still be running it.")
+    ((string= outcome "killed")
+     "The hermetic worker running the call was killed and respawned; the call was dropped and the session remains usable.")
+    ((string= outcome "dropped_queued")
+     "The call was cancelled before it started running; it produced no result.")
+    (t "The call was cancelled.")))
+
 (defun serve-streams (in out &key (session (make-session :id "stdio")))
   "Read newline-delimited JSON-RPC requests from IN and write response lines
 to OUT.  Returns T when IN reaches EOF.
@@ -346,9 +400,125 @@ promise."
                                  :request-id id
                                  :mode *mode*)))
                    (setf (gethash id in-flight) promise)
-                   promise))))
+                   promise)))
+             (emit-cancel-result (request-id outcome)
+               "Write a server-initiated cancel-result notification to THIS
+session's own wire via %write-wire-line (D-03). NOT emit: a stdio session
+carries a null notify-channel where emit is a silent no-op (Pitfall 5). Carries
+request_id, outcome, orphan_count, and a human-readable message."
+               (let* ((params (make-ht "request_id"   request-id
+                                       "outcome"       outcome
+                                       "orphan_count"  (orphan-count)
+                                       "message"       (%cancel-message outcome)))
+                      (json (%build-notification-json
+                             "notifications/dsmr-mcp/cancel-result" params)))
+                 (handler-case
+                     (%write-wire-line json out write-lock)
+                   (stream-error (e)
+                     (log-event :warn "stdio.write.error"
+                                "error" (princ-to-string e))))
+                 (log-event :info "stdio.cancel.result"
+                            "request_id" (princ-to-string request-id)
+                            "outcome" outcome)))
+             (handle-cancelled-notification (line)
+               "Handle a notifications/cancelled inline on the read loop (D-07).
+Looks up the requestId in THIS session's in-flight map (T-19-02: a session can
+cancel only its own calls; the key is an exact-match hash lookup, never
+interpolated). An unknown or absent requestId is a logged no-op. A found promise
+is marked cancelled, then cancelled per backend mode: a still-queued call is
+dropped via the pool worker's lazy-skip (no queue scan); a running hermetic call
+is hard-killed and respawned; a running attached call is cooperatively aborted.
+Always emits a cancel-result and returns nil -- a notification gets no JSON-RPC
+response and the session stays usable, never throwing on a bad id."
+               (multiple-value-bind (request-id reason) (%cancel-params line)
+                 (declare (ignore reason))
+                 (if (not (or (stringp request-id) (numberp request-id)))
+                     (progn (log-event :warn "stdio.cancel.bad-request-id") nil)
+                     (let ((promise (lookup-in-flight request-id)))
+                       (if (null promise)
+                           (progn
+                             (log-event :info "stdio.cancel.unknown"
+                                        "request_id" (princ-to-string request-id))
+                             nil)
+                           (let (thread mode)
+                             ;; Snapshot mode + running-thread atomically with the
+                             ;; cancel mark so the worker either lazy-skips a still
+                             ;; queued thunk or is seen already running -- never a
+                             ;; torn read.
+                             (with-lock-held ((dispatch-promise-lock promise))
+                               (setf (dispatch-promise-cancelled promise) t)
+                               (setf thread (dispatch-promise-thread promise)
+                                     mode   (dispatch-promise-mode promise)))
+                             (let ((outcome
+                                     (cond
+                                       ((null thread)
+                                        ;; Queued: the pool worker lazy-skips a
+                                        ;; cancelled thunk before running it, so it
+                                        ;; never runs and emits no response (D-04).
+                                        ;; The worker thunk's unwind cleanup never
+                                        ;; runs for a skipped task, so drop the map
+                                        ;; entry here.
+                                        (remove-in-flight request-id)
+                                        "dropped_queued")
+                                       ((eq mode :hermetic)
+                                        ;; Running hermetic: hard-kill + respawn
+                                        ;; frees the disposable worker; the blocked
+                                        ;; dispatch worker unblocks and cleans its
+                                        ;; own in-flight entry (D-01).
+                                        (kill-session-worker (session-id session))
+                                        "killed")
+                                       ((eq mode :attached)
+                                        ;; Running attached: cooperative two-phase
+                                        ;; abort (clean) or tracked orphan (no-take).
+                                        (ecase (cancel-attached-eval promise)
+                                          (:aborted-clean "aborted_clean")
+                                          (:orphaned      "orphaned")))
+                                       (t
+                                        (log-event :warn "stdio.cancel.unknown-mode"
+                                                   "mode" (princ-to-string mode))
+                                        "dropped_queued"))))
+                               (emit-cancel-result request-id outcome)
+                               nil)))))))
+             (drain-in-flight-on-eof ()
+               "On EOF with in-flight calls, drain them within the grace window
+instead of hanging (Critical Item 4 / T-19-16). With nothing in flight this is a
+no-op and EOF returns immediately, unchanged. Otherwise mark every in-flight
+promise cancelled, fire the per-mode cancel for the running ones (hermetic
+hard-kill is non-blocking; attached drives the cooperative abort), await the
+promises bounded by *cancel-grace-seconds*, then shut the dispatch pool down so
+its workers join and the unwind path (detach-session + stdio.stop) runs."
+               (let ((promises (with-lock-held (in-flight-lock)
+                                 (loop for p being the hash-values of in-flight
+                                       collect p))))
+                 (when promises
+                   (log-event :info "stdio.eof.drain" "in_flight" (length promises))
+                   (dolist (p promises)
+                     (let (thread mode)
+                       (with-lock-held ((dispatch-promise-lock p))
+                         (setf (dispatch-promise-cancelled p) t)
+                         (setf thread (dispatch-promise-thread p)
+                               mode   (dispatch-promise-mode p)))
+                       (when thread
+                         (ignore-errors
+                          (case mode
+                            (:hermetic (kill-session-worker
+                                        (dispatch-promise-session-id p)))
+                            (:attached (cancel-attached-eval p)))))))
+                   (let ((deadline (+ (get-internal-real-time)
+                                      (round (* *cancel-grace-seconds*
+                                                internal-time-units-per-second)))))
+                     (dolist (p promises)
+                       (let ((remaining (/ (- deadline (get-internal-real-time))
+                                           internal-time-units-per-second)))
+                         (when (plusp remaining)
+                           (ignore-errors (await-promise p :timeout remaining))))))
+                   (ignore-errors
+                    (dispatch-pool-shutdown (ensure-dispatch-pool)))))))
       (declare (ignorable #'lookup-in-flight #'remove-in-flight
-                          #'register-in-flight))
+                          #'register-in-flight
+                          #'emit-cancel-result
+                          #'handle-cancelled-notification
+                          #'drain-in-flight-on-eof))
       (log-event :info "stdio.start" "session" (session-id session))
       (unwind-protect
            (loop
@@ -372,8 +542,10 @@ promise."
                                         (return-from serve-streams t)))
                              :too-long))))
                (cond
-                 ;; EOF — client closed the pipe; return t to the caller.
+                 ;; EOF — client closed the pipe. Drain any in-flight calls
+                 ;; within the grace window (no-op when none), then return t.
                  ((eq line :eof)
+                  (drain-in-flight-on-eof)
                   (return t))
 
                  ;; Oversized line — emit the literal error envelope and continue.
@@ -409,7 +581,15 @@ promise."
                                           in :eof +max-json-line-bytes+)))))
                   (multiple-value-bind (method id name)
                       (%classify-request-line line)
-                    (if (and id (%backend-call-p method name *mode*))
+                    (cond
+                      ;; notifications/cancelled (a method, no id): handle inline
+                      ;; on the read loop (D-07) -- look up this session's
+                      ;; in-flight map and cancel per backend mode. Never
+                      ;; offloaded; never throws on an unknown/absent requestId.
+                      ((and (null id) (stringp method)
+                            (string= method "notifications/cancelled"))
+                       (handle-cancelled-notification line))
+                      ((and id (%backend-call-p method name *mode*))
                         ;; Backend tools/call with an id: run it OFF the read
                         ;; thread on a dispatch-pool worker. The worker re-parses
                         ;; and dispatches via process-json-line (same stdout
@@ -438,48 +618,49 @@ promise."
                                         (stream-error (e)
                                           (log-event :warn "stdio.write.error"
                                                      "error" (princ-to-string e))))))
-                               (remove-in-flight id)))))
-                        ;; Inline path (pure verbs, notifications, dispatcher-side
-                        ;; tools, and anything that did not classify): dispatch on
-                        ;; the read loop exactly as before.
-                        (multiple-value-bind (resp captured)
-                            (%dispatch-with-stdout-guard line session)
-                          (when (plusp (length captured))
-                            (log-event :warn "stdio.transport.stdout-pollution"
-                                       "bytes" (length captured)
-                                       "preview" (subseq captured 0
-                                                          (min 200 (length captured)))))
-                          (when resp
-                            (handler-case
-                                (%write-wire-line resp out write-lock)
-                              (stream-error (e)
-                                (log-event :warn "stdio.write.error"
-                                           "error" (princ-to-string e))
-                                (return t))))
-                          ;; Post-dispatch .envrc consent: when the line just
-                          ;; dispatched was the fs-set-project-root call that newly
-                          ;; adopted this session's root, the pre-dispatch intercept
-                          ;; above could not have offered the `.envrc` -- the root is
-                          ;; set mid-dispatch, so it was still NIL when that intercept
-                          ;; ran.  Consume the one-shot flag here, AFTER the response
-                          ;; is on the wire, and drive the elicitation in-line on this
-                          ;; loop thread (the only place it is safe to read/write the
-                          ;; wire on stdio).  Clear the flag unconditionally first so a
-                          ;; non-qualifying root or a declined prompt does not leave it
-                          ;; armed for the next call.  The once-per-session prompted-p
-                          ;; guard inside maybe-prompt-and-write-envrc keeps this from
-                          ;; double-firing with the pre-dispatch path.  Runtime symbol
-                          ;; resolution and ignore-errors mirror the pre-dispatch
-                          ;; intercept.
-                          (when (session-project-root-just-set-p session)
-                            (setf (session-project-root-just-set-p session) nil)
-                            (ignore-errors
-                             (uiop:symbol-call :dsmr-mcp/src/envrc-init
-                                               :maybe-prompt-and-write-envrc
-                                               session out
-                                               (lambda ()
-                                                 (%read-line-limited
-                                                  in :eof +max-json-line-bytes+))))))))))))
+                               (remove-in-flight id))))))
+                      ;; Inline path (pure verbs, notifications this loop does not
+                      ;; special-case, dispatcher-side tools, and anything that
+                      ;; did not classify): dispatch on the read loop as before.
+                      (t
+                       (multiple-value-bind (resp captured)
+                           (%dispatch-with-stdout-guard line session)
+                         (when (plusp (length captured))
+                           (log-event :warn "stdio.transport.stdout-pollution"
+                                      "bytes" (length captured)
+                                      "preview" (subseq captured 0
+                                                         (min 200 (length captured)))))
+                         (when resp
+                           (handler-case
+                               (%write-wire-line resp out write-lock)
+                             (stream-error (e)
+                               (log-event :warn "stdio.write.error"
+                                          "error" (princ-to-string e))
+                               (return t))))
+                         ;; Post-dispatch .envrc consent: when the line just
+                         ;; dispatched was the fs-set-project-root call that newly
+                         ;; adopted this session's root, the pre-dispatch intercept
+                         ;; above could not have offered the `.envrc` -- the root is
+                         ;; set mid-dispatch, so it was still NIL when that intercept
+                         ;; ran.  Consume the one-shot flag here, AFTER the response
+                         ;; is on the wire, and drive the elicitation in-line on this
+                         ;; loop thread (the only place it is safe to read/write the
+                         ;; wire on stdio).  Clear the flag unconditionally first so a
+                         ;; non-qualifying root or a declined prompt does not leave it
+                         ;; armed for the next call.  The once-per-session prompted-p
+                         ;; guard inside maybe-prompt-and-write-envrc keeps this from
+                         ;; double-firing with the pre-dispatch path.  Runtime symbol
+                         ;; resolution and ignore-errors mirror the pre-dispatch
+                         ;; intercept.
+                         (when (session-project-root-just-set-p session)
+                           (setf (session-project-root-just-set-p session) nil)
+                           (ignore-errors
+                            (uiop:symbol-call :dsmr-mcp/src/envrc-init
+                                              :maybe-prompt-and-write-envrc
+                                              session out
+                                              (lambda ()
+                                                (%read-line-limited
+                                                 in :eof +max-json-line-bytes+)))))))))))))
         ;; Cleanup: close the attached Slynk connection before logging stop so
         ;; the host Slynk listener gets a clean FIN on EOF or abnormal exit.
         ;; Runtime symbol resolution avoids a compile-time dep on
