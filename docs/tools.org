@@ -1022,6 +1022,38 @@ narrows the hermetic kill to one session-id.
 }
 #+end_src
 
+* reset-peer
+
+Direct a local reset at a NAMED peer agent in this project's bus 
+namespace (rung 2 of the recovery ladder). Publishes a restart command onto the 
+coordination bus addressed to the target peer; the peer's background listener 
+runs a local reset of its own backends on receipt. Bidirectional within the 
+namespace — a leader can reset a worker and a worker can reset the leader, as 
+long as both share this project's namespace. Delivery rides the durable bus log, 
+so it reaches a peer whose own read loop is wedged. Fire-and-forget: it returns 
+the assigned bus seq immediately and never waits for the peer to acknowledge. 
+Use bus-status to list the peers in this namespace. Optional scope narrows the 
+reset the peer performs ("attached", "hermetic", or a session-id).
+
+#+begin_src json
+{
+  "properties": {
+    "scope": {
+      "description": "Optional reset scope passed to the peer: \n\"attached\", \"hermetic\", or a session-id. Omit to reset all of the peer's \nlocal backends.",
+      "type": "string"
+    },
+    "target": {
+      "description": "The peer agent NAME within this project's bus \nnamespace to restart (as shown by bus-status). Required.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "target"
+  ],
+  "type": "object"
+}
+#+end_src
+
 * run-tests
 
 Run tests for an ASDF system and return structured results with 
