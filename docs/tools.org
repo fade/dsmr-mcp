@@ -992,6 +992,36 @@ Requires :slynk-attach / DSMR_SLYNK_ATTACH to be configured.
 }
 #+end_src
 
+* reset-local
+
+Reset the local backends in place (rung 1 of the recovery ladder). 
+Drops the attached Slynk connection, kills the hermetic workers bound to this 
+server, clears the circuit breaker, and clears the orphan registry — a 
+synchronous, non-blocking recovery that never waits for a wedged backend to 
+acknowledge. In-image state (loaded systems, REPL definitions) bound to killed 
+workers is lost; a fresh worker spawns on the next call and the attached 
+connection reopens on demand. Optional scope narrows the reset: "attached" 
+drops only the attached connection, "hermetic" kills workers and clears the 
+breaker, and a session-id narrows the kill to one worker. Optional target 
+narrows the hermetic kill to one session-id.
+
+#+begin_src json
+{
+  "properties": {
+    "scope": {
+      "description": "Optional reset scope: \"all\" (the default), \n\"attached\", \"hermetic\", or a session-id to narrow the worker kill to one worker.",
+      "type": "string"
+    },
+    "target": {
+      "description": "Optional session-id; narrows the hermetic worker \nkill to that one worker.",
+      "type": "string"
+    }
+  },
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
 * run-tests
 
 Run tests for an ASDF system and return structured results with 
