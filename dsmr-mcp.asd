@@ -211,7 +211,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/tools/bus-identity-test"
                "dsmr-mcp/tests/tools/reset-local-test"
                "dsmr-mcp/tests/tools/reset-peer-test"
-               "dsmr-mcp/tests/tools/restart-process-test")
+               "dsmr-mcp/tests/tools/restart-process-test"
+               "dsmr-mcp/tests/bus-listener-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
