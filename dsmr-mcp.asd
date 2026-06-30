@@ -81,6 +81,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/tools/inspect-condition"
                "dsmr-mcp/src/tools/pool-status"
                "dsmr-mcp/src/tools/pool-kill-worker"
+               "dsmr-mcp/src/reset"
                "dsmr-mcp/src/notify"
                "dsmr-mcp/src/transport/tcp"
                "dsmr-mcp/src/transport/http"
@@ -204,7 +205,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/bus/flow-test"
                "dsmr-mcp/tests/bus/agent-test"
                "dsmr-mcp/tests/bus/self-echo-test"
-               "dsmr-mcp/tests/tools/bus-identity-test")
+               "dsmr-mcp/tests/tools/bus-identity-test"
+               "dsmr-mcp/tests/tools/reset-local-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
