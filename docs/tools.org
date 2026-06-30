@@ -1054,6 +1054,31 @@ reset the peer performs ("attached", "hermetic", or a session-id).
 }
 #+end_src
 
+* restart-process
+
+Restart the whole dsmr-mcp server process (rung 3, the TERMINAL 
+rung of the recovery ladder). The process exits with a sentinel code and the 
+supervising launcher relaunches it, re-establishing the session. ALL in-image 
+state is lost — loaded systems, REPL definitions, the attached Slynk 
+connection, and every hermetic worker. Use this only when an in-place reset 
+(reset-local) is insufficient; for a lighter recovery prefer reset-local. The 
+exit is unconditional and never waits on a backend, so it works even when a 
+backend is wedged. There is no confirmation prompt: invoking this verb is the 
+explicit intent.
+
+#+begin_src json
+{
+  "properties": {
+    "scope": {
+      "description": "Optional restart scope. Omit to restart this \nserver process. Reserved for directing a re-exec at a named worker on a future \nworker path.",
+      "type": "string"
+    }
+  },
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
 * run-tests
 
 Run tests for an ASDF system and return structured results with 
