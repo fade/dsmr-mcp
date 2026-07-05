@@ -158,7 +158,10 @@ compare equal to user inputs written without the '#:' prefix."
 (defun %definition-candidates (form form-type)
   "Return candidate strings that identify FORM with FORM-TYPE.
 Handles the common cases: defmethod (specializers + qualifiers), defstruct
-with option lists, and (setf name) form names."
+with option lists, (setf name) form names, and compound name specs such as
+the (\"c-name\" lisp-name) shape used by sb-alien:define-alien-routine and
+sibling def-forms — for those, every symbol in the name spec becomes a
+candidate so the Lisp-side name is matchable."
   (let ((name (second form)))
     (cond
       ((string= form-type "defmethod")
@@ -176,6 +179,17 @@ with option lists, and (setf name) form names."
             (string= (symbol-name (car name)) "SETF"))
        (list (%normalize-string (second name))
              (format nil "(setf ~A)" (%normalize-string (second name)))))
+      ;; General compound name spec, e.g. ("sendmsg" %scm-sendmsg) from
+      ;; sb-alien:define-alien-routine / define-alien-variable. Pull out every
+      ;; symbol (ignoring C-name strings and other atoms) so the Lisp-side name
+      ;; can match.
+      ((consp name)
+       (let ((syms nil))
+         (labels ((walk (x)
+                    (cond ((and x (symbolp x)) (push x syms))
+                          ((consp x) (walk (car x)) (walk (cdr x))))))
+           (walk name))
+         (mapcar #'%normalize-string (nreverse syms))))
       (t (list (%normalize-string name))))))
 
 ;;;; -------------------------------------------------------------------------
