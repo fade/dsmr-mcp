@@ -1,0 +1,78 @@
+#+TITLE: dsmr-mcp — TODO
+#+STARTUP: overview
+
+Backlog of confirmed limitations and follow-ups. Each entry carries a concrete
+reproduction, impact, and a suggested fix so the work is actionable without
+rediscovering the problem.
+
+* Structure-aware editing tools
+** TODO Structure-aware editors cannot target a free-standing comment block
+   =lisp-edit-form= and =lisp-patch-form= operate on *named top-level forms*. A
+   =;;;= banner / section comment that sits *between* top-level forms — not
+   reachable as text inside any =(defun …)= / =(defmethod …)= body — has no
+   handle. There is no verb to replace or patch such a comment block.
+
+   Reproduction: =seven/src/transport-socket.lisp= has a multi-line =;;;=
+   section comment ("SCM_RIGHTS fd passing — sideband over an AF_LOCAL
+   endpoint") between the =close= method and the first alien-routine
+   definition. A doc-accuracy pass needed to rewrite it. =lisp-patch-form=
+   scopes *within* a matched form and =lisp-edit-form= matches a *whole* form,
+   so neither can address a comment that is not inside a form.
+
+   Impact: the only fix was a plain text edit — which the DSMR workflow forbids
+   for =.lisp= files, defeating the point of the structure-aware tools. Every
+   comment-accuracy pass over banner/section comments hits this.
+
+   Suggested fix:
+   - Let =lisp-patch-form= / =lisp-edit-form= scope to the *leading comment*
+     attached to a named form (edit the comment without touching the form), and
+   - add a comment-region verb (anchor by first/last line or a unique
+     substring) for banner comments that belong to no single form.
+
+** DONE lisp-edit-form cannot match a form whose name is a compound spec (e.g. define-alien-routine)
+   Fixed: =%definition-candidates= (=src/lisp-edit-form-core.lisp=) now walks a
+   compound name spec and emits a candidate for every symbol it contains, so the
+   Lisp-side name in a =(c-name lisp-name)= spec is matchable. General rule, not a
+   =define-alien-routine= special case, so =define-alien-variable= and kin work too.
+   Regression tests in =tests/lisp-edit-form-test.lisp= (tool-level repro +
+   =%definition-candidates= unit case). Description below kept for the record.
+
+   The name-extraction logic assumes =(defX name …)= with =name= a bare symbol
+   at position 1, so a form whose name lives inside a spec list is unreachable.
+   =sb-alien:define-alien-routine= names the Lisp function as the *second
+   element of a =(c-name lisp-name)= list*:
+
+   #+begin_src lisp
+   (sb-alien:define-alien-routine ("sendmsg" %scm-sendmsg) sb-alien:long
+     (fd sb-alien:int) (msg sb-alien:system-area-pointer) (flags sb-alien:int))
+   #+end_src
+
+   Reproduction (against =seven/src/transport-socket.lisp=):
+
+   #+begin_example
+   lisp-edit-form
+     form_type = "define-alien-routine"
+     form_name = "%scm-sendmsg"
+     operation = replace  (dry_run true)
+   => "Form define-alien-routine %scm-sendmsg not found in …/transport-socket.lisp"
+   #+end_example
+
+   The form is present and loads fine; it is simply not matchable.
+
+   Impact: such forms — and their leading comments/docstrings — cannot be
+   edited structurally, forcing a fall-back to the generic text editor. Compounds
+   with the comment-block issue above when a banner comment precedes a
+   =define-alien-routine=.
+
+   Suggested fix: extend the matcher so that when the element after =form_type=
+   is a *list*, the name is resolved from the spec rather than skipping the
+   form. For =define-alien-routine= the Lisp name is =(second name-spec)=. The
+   same =(external internal)= shape appears in =define-alien-variable= and other
+   =sb-alien= def-forms, so prefer a general "if the name position is a list,
+   search it for the symbol matching =form_name=" rule over special-casing one
+   macro.
+
+   Note: both limitations were hit during ordinary doc/comment maintenance on a
+   loaded, compiling system — not exotic input. Until fixed, the workaround is a
+   plain-text edit followed by =lisp-check-parens= + =load-system= to prove
+   structure was not disturbed.
