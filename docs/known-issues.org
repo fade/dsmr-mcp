@@ -1,0 +1,96 @@
+#+TITLE: dsmr-mcp — Known Issues
+#+SUBTITLE: Tool limitations logged for a future fix
+
+Durable backlog of confirmed limitations in the structure-aware editing tools.
+Each entry has a concrete reproduction, the impact, and a suggested fix so the
+work is actionable without rediscovering the problem. Mirrored in the repo-root
+=TODO.org= — keep the two in sync when either changes.
+
+* Structure-aware editors cannot target a free-standing comment block
+
+** Symptom
+=lisp-edit-form= and =lisp-patch-form= operate on *named top-level forms*. A
+=;;;= banner / section comment that sits *between* top-level forms — i.e. not
+reachable as text inside any =(defun …)= / =(defmethod …)= body — has no handle.
+There is no verb to replace or patch such a comment block.
+
+** Reproduction
+In =seven/src/transport-socket.lisp= there is a multi-line =;;;= section
+comment ("SCM_RIGHTS fd passing — sideband over an AF_LOCAL endpoint") between
+the =close= method and the first alien-routine definition. A doc-accuracy pass
+needed to rewrite that comment to match a changed design. Neither
+=lisp-patch-form= (scopes *within* a matched form) nor =lisp-edit-form= (matches
+a *whole* form) can address a comment that is not inside a form.
+
+** Impact
+The only way to fix the comment was to fall back to a plain text editor — which
+the DSMR workflow explicitly forbids for =.lisp= files, because the whole point
+of the structure-aware tools is to keep edits off the generic text path. Every
+comment-accuracy pass over banner/section comments hits this.
+
+** Suggested fix
+Add a way to target a free-standing comment region — options, roughly in order
+of effort:
+- Allow =lisp-patch-form= / =lisp-edit-form= to scope to the *leading comment*
+  attached to a named form (edit the comment without touching the form), and
+- add a comment-region verb (anchor by first/last line or by a unique substring)
+  for banner comments that belong to no single form.
+
+* RESOLVED — lisp-edit-form cannot match a form whose name is a compound spec (e.g. define-alien-routine)
+
+** Resolution
+Fixed in =%definition-candidates= (=src/lisp-edit-form-core.lisp=): when a form's
+name is a list, the matcher now walks the spec and emits a candidate for each
+symbol it contains, so the Lisp-side name in a =(c-name lisp-name)= spec matches.
+Implemented as the general "name position is a list → search it for the symbol"
+rule, so =define-alien-variable= and other =sb-alien= def-forms are covered too.
+Regression coverage in =tests/lisp-edit-form-test.lisp=. Detail below retained for
+the record.
+
+** Symptom
+=lisp-edit-form= / =lisp-patch-form= fail to find a top-level form when the
+form's *name* is not a bare symbol at position 1 but a compound spec. Concretely,
+=sb-alien:define-alien-routine= names the Lisp function as the *second element of
+a =(c-name lisp-name)= list*:
+
+#+begin_src lisp
+(sb-alien:define-alien-routine ("sendmsg" %scm-sendmsg) sb-alien:long
+  (fd sb-alien:int) (msg sb-alien:system-area-pointer) (flags sb-alien:int))
+#+end_src
+
+** Reproduction
+Against =seven/src/transport-socket.lisp=:
+
+#+begin_example
+lisp-edit-form
+  file_path = src/transport-socket.lisp
+  form_type = "define-alien-routine"
+  form_name = "%scm-sendmsg"
+  operation = replace  (dry_run true)
+=> "Form define-alien-routine %scm-sendmsg not found in …/transport-socket.lisp"
+#+end_example
+
+The form is present and loads fine; the name-extraction logic evidently assumes
+=(defX name …)= with =name= a symbol at position 1, so a form whose name lives
+inside a spec list is unreachable.
+
+** Impact
+Such forms — and their leading comments/docstrings — cannot be edited
+structurally, again forcing a fall-back to the generic text editor. This
+compounds with the comment-block issue above: when a banner comment precedes a
+=define-alien-routine=, neither the comment nor the form is addressable.
+
+** Suggested fix
+Extend the form-name matcher: when the element after =form_type= is a *list*,
+resolve the name from the spec rather than skipping the form. For
+=define-alien-routine= the Lisp name is =(second name-spec)=. The same shape
+appears in =define-alien-variable= and other =sb-alien= def-forms and in any
+macro that takes a =(external internal)= name spec, so a general "if the name
+position is a list, search it for the symbol that matches =form_name=" rule is
+preferable to special-casing one macro.
+
+* Notes
+Both limitations were hit during ordinary doc/comment maintenance on a loaded,
+compiling system — not exotic input. Until fixed, the workaround is a plain-text
+edit of the comment/form followed by =lisp-check-parens= + =load-system= to
+prove structure was not disturbed.

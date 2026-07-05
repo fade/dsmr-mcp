@@ -157,3 +157,66 @@ rather than crashing (D-16 no-root guard)."
          (res     (gethash "result" resp)))
     (true (gethash "isError" res))
     (is string= "project-root-not-set" (gethash "error_type" res))))
+
+;;;; -------------------------------------------------------------------------
+;;;; Test: compound name specs (e.g. sb-alien:define-alien-routine) are matchable
+;;;; -------------------------------------------------------------------------
+
+(define-test compound-name-spec-is-matchable
+  "A top-level form whose name is a compound spec list — such as the
+(\"c-name\" lisp-name) shape used by sb-alien:define-alien-routine — is located
+by its Lisp-side symbol name, not stringified as the whole list. A dry-run
+replace targeting the Lisp name locates the form and previews correctly."
+  (with-temp-project-root (session root)
+    (let* ((source ";; Alien bindings.
+(sb-alien:define-alien-routine (\"sendmsg\" %scm-sendmsg) sb-alien:long
+  (fd sb-alien:int)
+  (msg sb-alien:system-area-pointer)
+  (flags sb-alien:int))
+
+(defun neighbor (x)
+  (1+ x))
+")
+           (pn (write-fixture-file root "alien.lisp" source))
+           (new-content (format nil
+                                "(sb-alien:define-alien-routine (\"sendmsg\" %scm-sendmsg) sb-alien:long~%  (fd sb-alien:int)~%  (msg sb-alien:system-area-pointer)~%  (flags sb-alien:unsigned-int))"))
+           ;; This call must NOT signal \"Form ... not found\" — the compound
+           ;; name spec has to resolve to the Lisp-side symbol %scm-sendmsg.
+           (result (edit-form (namestring root) (namestring pn)
+                              "define-alien-routine" "%scm-sendmsg"
+                              "replace" new-content
+                              :dry-run t)))
+      ;; The form was located and a real replacement would change the file.
+      (true (gethash "would_change" result))
+      ;; The preview carries the new content.
+      (true (search "sb-alien:unsigned-int" (gethash "preview" result)))
+      ;; The old element type is gone from the replaced form's preview.
+      (false (search "(flags sb-alien:int)" (gethash "preview" result)))
+      ;; The surrounding form is untouched in the preview.
+      (true (search "defun neighbor" (gethash "preview" result))))))
+
+;;;; -------------------------------------------------------------------------
+;;;; Test: %definition-candidates pulls symbols out of a compound name spec
+;;;; -------------------------------------------------------------------------
+
+(define-test definition-candidates-extracts-symbols-from-name-spec
+  "%definition-candidates yields a candidate per symbol in a compound name
+spec (ignoring C-name strings), while the defstruct-with-options and
+(setf name) clauses keep taking precedence."
+  ;; Compound spec: the Lisp-side symbol is a candidate; the C-name string is not.
+  (is equal '("%scm-sendmsg")
+      (dsmr-mcp/src/lisp-edit-form-core::%definition-candidates
+       '(sb-alien:define-alien-routine ("sendmsg" %scm-sendmsg) sb-alien:long)
+       "define-alien-routine"))
+  ;; (setf name) still resolves through its dedicated clause.
+  (is equal '("foo" "(setf foo)")
+      (dsmr-mcp/src/lisp-edit-form-core::%definition-candidates
+       '(defun (setf foo) (v x)) "defun"))
+  ;; defstruct-with-options still uses just the struct name.
+  (is equal '("point")
+      (dsmr-mcp/src/lisp-edit-form-core::%definition-candidates
+       '(defstruct (point (:conc-name pt-)) x y) "defstruct"))
+  ;; A bare-symbol name is unchanged.
+  (is equal '("frobnicate")
+      (dsmr-mcp/src/lisp-edit-form-core::%definition-candidates
+       '(defun frobnicate (a b)) "defun")))
