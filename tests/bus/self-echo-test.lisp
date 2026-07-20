@@ -197,23 +197,23 @@
           (agent:disconnect-agent a))))))
 
 (define-test cross-agent-ordering-intact
-  "A fresh subscriber C receives every message with contiguous, gap-free seqs, each
-   decoded to its text."
+  "A third subscriber C receives every message with contiguous, gap-free seqs,
+   each decoded to its text. C joins before the traffic, since a participant is
+   owed what arrives after it joins and not what came before."
   (with-bus (paths)
     (with-running-broker (br paths)
       (let ((a (agent:connect-agent "/proj" :name "agent-a" :paths paths :ensure-broker nil))
-            (b (agent:connect-agent "/proj" :name "agent-b" :paths paths :ensure-broker nil)))
+            (b (agent:connect-agent "/proj" :name "agent-b" :paths paths :ensure-broker nil))
+            (c (agent:connect-agent "/proj" :name "agent-c" :paths paths :ensure-broker nil)))
         (unwind-protect
              (progn
                (let ((sa (agent:agent-publish a "a1"))) (wait-durable paths sa))
                (let ((sb (agent:agent-publish b "b1"))) (wait-durable paths sb))
                (is = 2 (wal:scan (broker:bus-paths-wal paths))
                    "two contiguous gap-free seqs were assigned")
-               (let ((c (agent:connect-agent "/proj" :name "agent-c" :paths paths :ensure-broker nil)))
-                 (unwind-protect
-                      (let ((got (agent:agent-receive c :timeout-ms 3000)))
-                        (is equal '("a1" "b1") got
-                            "C receives both messages, in order, decoded to their text"))
-                   (agent:disconnect-agent c))))
+               (let ((got (agent:agent-receive c :timeout-ms 3000)))
+                 (is equal '("a1" "b1") got
+                     "C receives both messages, in order, decoded to their text")))
           (agent:disconnect-agent a)
-          (agent:disconnect-agent b))))))
+          (agent:disconnect-agent b)
+          (agent:disconnect-agent c))))))
