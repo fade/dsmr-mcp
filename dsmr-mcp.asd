@@ -81,6 +81,10 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/tools/inspect-condition"
                "dsmr-mcp/src/tools/pool-status"
                "dsmr-mcp/src/tools/pool-kill-worker"
+               "dsmr-mcp/src/reset"
+               "dsmr-mcp/src/tools/reset-local"
+               "dsmr-mcp/src/tools/reset-peer"
+               "dsmr-mcp/src/tools/restart-process"
                "dsmr-mcp/src/notify"
                "dsmr-mcp/src/transport/tcp"
                "dsmr-mcp/src/transport/http"
@@ -119,7 +123,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/tools/bus-helpers"
                "dsmr-mcp/src/tools/bus-publish"
                "dsmr-mcp/src/tools/bus-receive"
-               "dsmr-mcp/src/tools/bus-status")
+               "dsmr-mcp/src/tools/bus-status"
+               "dsmr-mcp/src/bus-listener")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
 (asdf:defsystem "dsmr-mcp/tests"
@@ -208,7 +213,11 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/bus/agent-test"
                "dsmr-mcp/tests/bus/self-echo-test"
                "dsmr-mcp/tests/tools/bus-identity-test"
-               "dsmr-mcp/tests/tools/bus-receive-test")
+               "dsmr-mcp/tests/tools/bus-receive-test"
+               "dsmr-mcp/tests/tools/reset-local-test"
+               "dsmr-mcp/tests/tools/reset-peer-test"
+               "dsmr-mcp/tests/tools/restart-process-test"
+               "dsmr-mcp/tests/bus-listener-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
@@ -253,7 +262,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/integration/hermetic/circuit-breaker-test"
                "dsmr-mcp/tests/integration/hermetic/pool-affinity-test"
                "dsmr-mcp/tests/integration/bus/failover-test"
-               "dsmr-mcp/tests/integration/bus/watch-integration-test")
+               "dsmr-mcp/tests/integration/bus/watch-integration-test"
+               "dsmr-mcp/tests/integration/scripts/launcher-supervise-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
