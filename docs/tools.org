@@ -992,6 +992,93 @@ Requires :slynk-attach / DSMR_SLYNK_ATTACH to be configured.
 }
 #+end_src
 
+* reset-local
+
+Reset the local backends in place (rung 1 of the recovery ladder). 
+Drops the attached Slynk connection, kills the hermetic workers bound to this 
+server, clears the circuit breaker, and clears the orphan registry — a 
+synchronous, non-blocking recovery that never waits for a wedged backend to 
+acknowledge. In-image state (loaded systems, REPL definitions) bound to killed 
+workers is lost; a fresh worker spawns on the next call and the attached 
+connection reopens on demand. Optional scope narrows the reset: "attached" 
+drops only the attached connection, "hermetic" kills workers and clears the 
+breaker, and a session-id narrows the kill to one worker. Optional target 
+narrows the hermetic kill to one session-id.
+
+#+begin_src json
+{
+  "properties": {
+    "scope": {
+      "description": "Optional reset scope: \"all\" (the default), \n\"attached\", \"hermetic\", or a session-id to narrow the worker kill to one worker.",
+      "type": "string"
+    },
+    "target": {
+      "description": "Optional session-id; narrows the hermetic worker \nkill to that one worker.",
+      "type": "string"
+    }
+  },
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
+* reset-peer
+
+Direct a local reset at a NAMED peer agent in this project's bus 
+namespace (rung 2 of the recovery ladder). Publishes a restart command onto the 
+coordination bus addressed to the target peer; the peer's background listener 
+runs a local reset of its own backends on receipt. Bidirectional within the 
+namespace — a leader can reset a worker and a worker can reset the leader, as 
+long as both share this project's namespace. Delivery rides the durable bus log, 
+so it reaches a peer whose own read loop is wedged. Fire-and-forget: it returns 
+the assigned bus seq immediately and never waits for the peer to acknowledge. 
+Use bus-status to list the peers in this namespace. Optional scope narrows the 
+reset the peer performs ("attached", "hermetic", or a session-id).
+
+#+begin_src json
+{
+  "properties": {
+    "scope": {
+      "description": "Optional reset scope passed to the peer: \n\"attached\", \"hermetic\", or a session-id. Omit to reset all of the peer's \nlocal backends.",
+      "type": "string"
+    },
+    "target": {
+      "description": "The peer agent NAME within this project's bus \nnamespace to restart (as shown by bus-status). Required.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "target"
+  ],
+  "type": "object"
+}
+#+end_src
+
+* restart-process
+
+Restart the whole dsmr-mcp server process (rung 3, the TERMINAL 
+rung of the recovery ladder). The process exits with a sentinel code and the 
+supervising launcher relaunches it, re-establishing the session. ALL in-image 
+state is lost — loaded systems, REPL definitions, the attached Slynk 
+connection, and every hermetic worker. Use this only when an in-place reset 
+(reset-local) is insufficient; for a lighter recovery prefer reset-local. The 
+exit is unconditional and never waits on a backend, so it works even when a 
+backend is wedged. There is no confirmation prompt: invoking this verb is the 
+explicit intent.
+
+#+begin_src json
+{
+  "properties": {
+    "scope": {
+      "description": "Optional restart scope. Omit to restart this \nserver process. Reserved for directing a re-exec at a named worker on a future \nworker path.",
+      "type": "string"
+    }
+  },
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
 * run-tests
 
 Run tests for an ASDF system and return structured results with 

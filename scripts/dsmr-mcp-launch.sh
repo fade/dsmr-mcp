@@ -70,27 +70,47 @@ trigger_rebuild() {
   disown 2>/dev/null || true
 }
 
-exec_core() {
-  exec "$SBCL" --core "$CORE" --noinform --disable-debugger --no-userinit \
-       --eval '(dsmr-mcp:run :transport :stdio)'
+# Exit code the server uses to ask the launcher for a relaunch (rung 3 of the
+# recovery ladder). 75 = EX_TEMPFAIL (sysexits.h), unused by SBCL for anything
+# else, so it cannot collide with an ordinary error exit. Override for testing.
+RESTART_EXIT_CODE="${DSMR_RESTART_EXIT_CODE:-75}"
+
+# Launch the server as a SUBPROCESS (no `exec`) so the shell survives to inspect
+# the exit status and decide whether to relaunch. Freshness is re-checked on
+# every call, so a core rebuilt while the previous instance ran is picked up on
+# the next relaunch.
+run_server() {
+  if core_is_fresh; then
+    log "core fresh; booting from image"
+    "$SBCL" --core "$CORE" --noinform --disable-debugger --no-userinit \
+         --eval '(dsmr-mcp:run :transport :stdio)'
+  else
+    log "core stale/absent; source-loading now, regenerating in background"
+    trigger_rebuild
+    # Fallback: compile from source with stdout kept clean (matches the
+    # installer's hardened launcher — *debug-io*/*trace-output* carry the
+    # SLYNK loader banner).
+    "$SBCL" --noinform --disable-debugger --no-userinit \
+         --eval '(require :asdf)' \
+         --eval '(let ((s (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file s) (let ((*standard-output* *error-output*)) (load s))))' \
+         --eval '(push (or (let ((w (uiop:getenv "LISP_WORKSPACE"))) (when (and w (not (uiop:string-prefix-p "~" w))) w)) (namestring (merge-pathnames #P"SourceCode/lisp/" (user-homedir-pathname)))) asdf:*central-registry*)' \
+         --eval '(let ((*standard-output* *error-output*) (*trace-output* *error-output*) (*debug-io* (make-two-way-stream *standard-input* *error-output*))) (asdf:load-system :dsmr-mcp))' \
+         --eval '(dsmr-mcp:run :transport :stdio)'
+  fi
 }
 
-# Fallback: compile from source with stdout kept clean (matches the installer's
-# hardened launcher — *debug-io*/*trace-output* carry the SLYNK loader banner).
-exec_source_load() {
-  exec "$SBCL" --noinform --disable-debugger --no-userinit \
-       --eval '(require :asdf)' \
-       --eval '(let ((s (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file s) (let ((*standard-output* *error-output*)) (load s))))' \
-       --eval '(push (or (let ((w (uiop:getenv "LISP_WORKSPACE"))) (when (and w (not (uiop:string-prefix-p "~" w))) w)) (namestring (merge-pathnames #P"SourceCode/lisp/" (user-homedir-pathname)))) asdf:*central-registry*)' \
-       --eval '(let ((*standard-output* *error-output*) (*trace-output* *error-output*) (*debug-io* (make-two-way-stream *standard-input* *error-output*))) (asdf:load-system :dsmr-mcp))' \
-       --eval '(dsmr-mcp:run :transport :stdio)'
-}
-
-if core_is_fresh; then
-  log "core fresh; booting from image"
-  exec_core
-else
-  log "core stale/absent; source-loading now, regenerating in background"
-  trigger_rebuild
-  exec_source_load
-fi
+# Supervise loop: relaunch the server ONLY when it exits with the restart
+# sentinel; any other exit code is a real shutdown and exits the launcher with
+# that same code. Dropping `exec` above is what makes this loop reachable — an
+# exec'd shell is replaced and could never relaunch.
+while true; do
+  run_server
+  status=$?
+  if [ "$status" -eq "$RESTART_EXIT_CODE" ]; then
+    log "restart requested (rc=$status); relaunching"
+    continue
+  else
+    log "server exited with rc=$status; exiting launcher"
+    exit "$status"
+  fi
+done
