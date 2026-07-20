@@ -38,9 +38,12 @@ Fire-and-forget; the message is appended durably to the bus log.
 * bus-receive
 
 Receive messages from the coordination bus that this agent has 
-not yet seen, advancing its cursor so each is delivered once. Returns immediately 
-with whatever is pending (catch-up); set timeout_ms to wait that long for the 
-first message. A named agent resumes where it left off across restarts.
+not yet seen, advancing its cursor so each is delivered once. Delivery is 
+bounded: the oldest pending messages come back a page at a time and 
+remaining_pending says how many are still waiting, so a long backlog is walked 
+forward across calls rather than arriving all at once. Returns immediately by 
+default; set timeout_ms to wait that long for the first message. A named agent 
+resumes where it left off across restarts.
 
 #+begin_src json
 {
@@ -51,6 +54,14 @@ first message. A named agent resumes where it left off across restarts.
     },
     "ephemeral": {
       "description": "Set true to force a fresh one-shot ephemeral \nidentity for this subagent, opting out of the project's stable DSMR_BUS_AGENT \nidentity so it never resumes the main agent's cursor.",
+      "type": "boolean"
+    },
+    "limit": {
+      "description": "Maximum number of messages to deliver in this \ncall (default 20). Delivery is oldest-first and paginated: the cursor advances \nonly over what was delivered, so the remainder is not lost and is picked up by \nthe next call.",
+      "type": "integer"
+    },
+    "skip_to_head": {
+      "description": "Set true to DISCARD every pending message by \nadvancing the cursor straight to the current head of the bus. The discarded \nmessages are never delivered to this agent; the abandoned field reports how \nmany were given up. No messages are received in the same call.",
       "type": "boolean"
     },
     "timeout_ms": {

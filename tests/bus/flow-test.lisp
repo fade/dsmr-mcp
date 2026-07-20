@@ -4,7 +4,7 @@
 ;;;; End-to-end flow test for the bus, in one process: a broker runs in a thread,
 ;;;; a client publishes over ZeroMQ, the broker appends to the log and fans out a
 ;;;; nudge, and a subscriber receives the message through its cursor. Also checks
-;;;; catch-up (a subscriber that arrives late still gets the backlog) and that a
+;;;; catch-up (a subscriber that was not reading still gets what it missed) and that a
 ;;;; clean last-member-out shutdown archives the log. The multi-process SIGKILL
 ;;;; failover lives in the slow integration suite.
 
@@ -74,28 +74,32 @@
           (bus:disconnect-client client)
           (bus:unsubscribe sub))))))
 
-(define-test late-subscriber-catches-up
-  "Messages published before a subscriber polls are still delivered, in order."
+(define-test subscriber-catches-up-on-what-arrived-while-it-was-idle
+  "Messages published while a subscriber was not reading are still delivered, in
+   order, whenever it next polls — delivery rides the durable cursor, not the
+   live nudge. The subscriber joins first, because what precedes a join is
+   history and a participant that has never read has no claim on it."
   (with-bus (paths)
     (with-running-broker (br paths)
       (let ((client (bus:connect-client paths)))
         (unwind-protect
-             (progn
-               (bus:publish client "a")
-               (bus:publish client "b")
-               (bus:publish client "c")
-               ;; Sync point: publishing is async (zmq -> broker -> WAL), so wait
-               ;; until all three are durably logged before the late subscriber
-               ;; reads. Otherwise it can catch the broker mid-append and POLL/
-               ;; AWAIT returns a partial batch — the source of an intermittent
-               ;; failure under load. With all three present, one POLL drains them.
-               (loop repeat 150
-                     until (>= (wal:scan (broker:bus-paths-wal paths)) 3)
-                     do (sleep 0.02))
-               (let ((sub (bus:subscribe paths "late")))
-                 (unwind-protect
-                      (is equal '("a" "b" "c") (bodies (bus:poll sub)))
-                   (bus:unsubscribe sub))))
+             (let ((sub (bus:subscribe paths "late")))
+               (unwind-protect
+                    (progn
+                      (bus:publish client "a")
+                      (bus:publish client "b")
+                      (bus:publish client "c")
+                      ;; Sync point: publishing is async (zmq -> broker -> WAL), so
+                      ;; wait until all three are durably logged before reading.
+                      ;; Otherwise the poll can catch the broker mid-append and
+                      ;; return a partial batch — the source of an intermittent
+                      ;; failure under load. With all three present, one POLL
+                      ;; drains them.
+                      (loop repeat 150
+                            until (>= (wal:scan (broker:bus-paths-wal paths)) 3)
+                            do (sleep 0.02))
+                      (is equal '("a" "b" "c") (bodies (bus:poll sub))))
+                 (bus:unsubscribe sub)))
           (bus:disconnect-client client))))))
 
 (define-test cursor-persists-across-resubscribe
