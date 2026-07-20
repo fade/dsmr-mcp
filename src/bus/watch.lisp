@@ -11,23 +11,42 @@
 ;;;; mode) or STREAMING a line while it runs (streaming mode under a persistent
 ;;;; monitor).
 ;;;;
-;;;; It reuses the canonical read-only WAL reader (`wal:scan`) as the single
-;;;; source of truth for the on-disk format — it never parses frames itself — and
-;;;; depends on nothing else from the bus, so the compiled binary stays small and
-;;;; carries no ZeroMQ transport code.
+;;;; It reuses the canonical read-only WAL reader as the single source of truth
+;;;; for the on-disk format — it never parses frames itself — and reads the wire
+;;;; envelope through the shared envelope leaf. It depends on nothing else from
+;;;; the bus, so the compiled binary stays small and carries no ZeroMQ transport
+;;;; code: a sister repo needs no libzmq to arm a watcher.
 ;;;;
-;;;; Self-wake is avoided without any on-disk change: the watcher seeds a BASELINE
-;;;; sequence number at arm time and fires only on a strictly greater seq. The
-;;;; agent re-arms the watcher AFTER it publishes, so its own just-sent message is
-;;;; already in the baseline and never wakes it. Because the baseline is read at
-;;;; arm time and the check is level-triggered, a message that lands between
-;;;; "scan" and "first poll" is not lost.
+;;;; WHO the watch runs for decides both of the things that make it correct.
+;;;;
+;;;; Self-wake is avoided by identity, not by ordering. Every published body
+;;;; already carries its publisher's encoded self-id, so with an identity
+;;;; resolved the watcher fires only on records that id did NOT publish — the
+;;;; same encoded-against-encoded comparison the receive path makes. A message
+;;;; with no self-id is a legacy un-enveloped one and counts as foreign, so a
+;;;; staggered rollout drops nothing.
+;;;;
+;;;; The BASELINE it arms at comes from that same identity's durable cursor: the
+;;;; position the agent has actually consumed to. A message that landed while
+;;;; the agent was between a drain and this arm is above that cursor, so the
+;;;; level-triggered check fires it on the first poll rather than burying it
+;;;; under a head baseline where nothing could ever reach it. The cursor is read
+;;;; and never written — the MCP session that consumes the bus owns that file.
+;;;;
+;;;; With no identity resolvable the watcher degrades to the log head with no
+;;;; filter, fires on anything new, and says so on stderr. That is the whole of
+;;;; the pre-identity behavior, kept working and made visible.
 
 (defpackage #:dsmr-bus-watch/src/bus/watch
   (:use #:cl)
   (:local-nicknames (#:envelope #:dsmr-mcp/src/bus/envelope)
                     (#:cursor #:dsmr-mcp/src/bus/cursor))
-  (:import-from #:dsmr-mcp/src/bus/wal #:scan #:now-ms)
+  (:import-from #:dsmr-mcp/src/bus/wal
+                #:scan
+                #:now-ms
+                #:read-records
+                #:record-seq
+                #:record-body-string)
   (:export #:main
            #:watch-until-foreign
            #:watch-stream
@@ -96,46 +115,112 @@
    log. Read-only — never clips a write still in flight."
   (values (scan wal-path)))
 
-(defun watch-until-foreign (wal-path baseline
-                            &key (poll-ms 1000) (recycle-seconds 600))
-  "Block until the WAL at WAL-PATH holds a record with seq strictly greater than
-   BASELINE, then return that highest seq. Return NIL if the recycle window
-   elapses with no such record (an idle self-recycle, so a silently-dead watch
-   re-arms). Level-triggered: a qualifying record already present returns on the
-   first poll. Tolerates a missing/empty WAL (baseline treated as already seen)."
-  (let ((deadline (+ (now-ms) (round (* recycle-seconds 1000))))
-        (sleep-s (/ poll-ms 1000.0)))
-    (loop
+(defun %foreign-record-p (record own-encoded)
+  "True when RECORD was not published by the agent whose encoded id is
+   OWN-ENCODED.
+
+   The comparison is encoded-against-encoded, on the encoded self-id the shared
+   envelope leaf pulls out of the body — the same comparison the receive path
+   makes. One implementation of the format on both sides is the whole point of
+   that leaf: a second encoder here would desync the first time either
+   alphabet changed, and it would desync silently.
+
+   Two cases deliberately count as foreign. A NIL OWN-ENCODED means no identity
+   resolved, so there is no self to recognize and everything fires, exactly as
+   it did before the watcher had an identity. A record with no self-id at all is
+   a legacy un-enveloped message from an old-core publisher; treating it as this
+   agent's own would drop real traffic on the floor through a staggered
+   rollout."
+  (or (null own-encoded)
+      (multiple-value-bind (text correlation-id self-id)
+          (envelope:decode-envelope (record-body-string record))
+        (declare (ignore text correlation-id))
+        (not (and self-id (string= self-id own-encoded))))))
+
+(defun %highest-foreign-seq (wal-path baseline own-encoded)
+  "The highest seq above BASELINE belonging to a record this agent did not
+   publish, or NIL when there is no such record.
+
+   Without an identity this is just the log head when it exceeds BASELINE, and
+   the log is never re-read past its tail. With one, the records above BASELINE
+   are read and filtered, so a burst made up entirely of this agent's own
+   publishes leaves the watch waiting instead of waking it up to find nothing
+   addressed to it."
+  (if (null own-encoded)
       (let ((last (%last-seq wal-path)))
-        (when (> last baseline)
-          (return last)))
+        (and (> last baseline) last))
+      (let ((highest nil))
+        (dolist (record (read-records wal-path :after baseline) highest)
+          (when (%foreign-record-p record own-encoded)
+            (setf highest (record-seq record)))))))
+
+(defun watch-until-foreign (wal-path baseline
+                            &key (poll-ms 1000) (recycle-seconds 600) self-id)
+  "Block until the WAL at WAL-PATH holds a FOREIGN record with seq strictly
+   greater than BASELINE, then return that highest foreign seq. Return NIL if
+   the recycle window elapses with no such record (an idle self-recycle, so a
+   silently-dead watch re-arms). Level-triggered: a qualifying record already
+   present returns on the first poll. Tolerates a missing/empty WAL (baseline
+   treated as already seen).
+
+   SELF-ID is the full <namespace>/<name> id this watch runs for. Records
+   carrying that id are this agent's own and never fire it, which is what makes
+   arming independent of publish ordering. With SELF-ID NIL nothing is filtered
+   and every new seq fires, the behavior from before the watcher had an
+   identity."
+  (let ((deadline (+ (now-ms) (round (* recycle-seconds 1000))))
+        (sleep-s (/ poll-ms 1000.0))
+        (own (and self-id (envelope:encode-id self-id))))
+    (loop
+      (let ((fired (%highest-foreign-seq wal-path baseline own)))
+        (when fired
+          (return fired)))
       (when (>= (now-ms) deadline)
         (return nil))
       (sleep sleep-s))))
 
-(defun poll-new (wal-path cursor &optional emit)
-  "One streaming step: for each seq in (CURSOR, last-committed] call EMIT (when
-   supplied) with that seq, and return the new cursor (the highest committed
-   seq). WAL seqs are contiguous, so this emits exactly one signal per new
-   message. Pure and side-effect-free apart from EMIT — the unit tests drive it
-   directly with a collecting callback."
-  (let ((last (%last-seq wal-path)))
+(defun poll-new (wal-path cursor &optional emit self-id)
+  "One streaming step: call EMIT (when supplied) once per FOREIGN record with
+   seq in (CURSOR, last-committed], and return the new cursor.
+
+   The returned cursor is the highest committed seq regardless of who published
+   what, so records skipped as this agent's own are still stepped over and never
+   examined twice. With SELF-ID NIL nothing is filtered and every new seq is
+   emitted; WAL seqs are contiguous, so that path needs no read at all. Pure and
+   side-effect-free apart from EMIT — the unit tests drive it directly with a
+   collecting callback.
+
+   SELF-ID is positional rather than a keyword only because EMIT already is:
+   mixing the two lambda-list kinds is legal but draws a style warning, and the
+   positional EMIT is the older contract."
+  (let ((own (and self-id (envelope:encode-id self-id)))
+        (last (%last-seq wal-path)))
     (when (and emit (> last cursor))
-      (loop for s from (1+ cursor) to last do (funcall emit s)))
+      (if (null own)
+          (loop for s from (1+ cursor) to last do (funcall emit s))
+          (dolist (record (read-records wal-path :after cursor))
+            (when (and (<= (record-seq record) last)
+                       (%foreign-record-p record own))
+              (funcall emit (record-seq record))))))
     (max last cursor)))
 
 (defun watch-stream (wal-path baseline
-                     &key (poll-ms 1000) (recycle-seconds 600)
+                     &key (poll-ms 1000) (recycle-seconds 600) self-id
                           (emit (lambda (s) (%signal-seq s))))
-  "Stream every new seq beyond BASELINE by calling EMIT once per new message,
-   looping until the recycle window elapses with no further activity, then
-   return the final cursor. Used by the persistent-monitor mode; EMIT defaults
-   to printing the bus:<SEQ> signal line."
+  "Stream every new FOREIGN seq beyond BASELINE by calling EMIT once per such
+   message, looping until the recycle window elapses with no further activity,
+   then return the final cursor. Used by the persistent-monitor mode; EMIT
+   defaults to printing the bus:<SEQ> signal line.
+
+   SELF-ID has the same meaning it has for the exit-on-event loop: this agent's
+   own publishes advance the cursor but emit nothing. The idle window resets on
+   any activity, this agent's own included — the log moved, so the watch is
+   demonstrably alive and has no reason to recycle."
   (let ((cursor baseline)
         (deadline (+ (now-ms) (round (* recycle-seconds 1000))))
         (sleep-s (/ poll-ms 1000.0)))
     (loop
-      (let ((advanced (poll-new wal-path cursor emit)))
+      (let ((advanced (poll-new wal-path cursor emit self-id)))
         (when (> advanced cursor)
           (setf cursor advanced
                 ;; activity resets the idle window
@@ -405,11 +490,13 @@ prints `recycle:` then exits 0. Streaming prints `bus:<SEQ>` per new foreign seq
           (if (opt-stream-p opts)
               (progn
                 (watch-stream wal-path baseline
-                              :poll-ms poll-ms :recycle-seconds recycle-seconds)
+                              :poll-ms poll-ms :recycle-seconds recycle-seconds
+                              :self-id self-id)
                 (%signal-recycle))
               (let ((fired (watch-until-foreign wal-path baseline
                                                 :poll-ms poll-ms
-                                                :recycle-seconds recycle-seconds)))
+                                                :recycle-seconds recycle-seconds
+                                                :self-id self-id)))
                 (if fired (%signal-seq fired) (%signal-recycle))))
           (uiop:quit 0)))
     (error (e)
