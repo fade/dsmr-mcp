@@ -203,14 +203,31 @@
                               (declare (ignore seq ts pstart pend))))
       (values last-seq good-bytes records total))))
 
-(defun read-records (path &key (after 0))
+(defun read-records (path &key (after 0) limit)
   "READ-ONLY: return a list of RECORD structs for every good record with
-   seq > AFTER, in order. Stops at the torn tail; never truncates."
+   seq > AFTER, in order. Stops at the torn tail; never truncates.
+
+   LIMIT, when a positive integer, caps how many records are COLLECTED — the
+   oldest LIMIT records past AFTER, so successive calls with an advancing AFTER
+   page forward through the log. When NIL (the default) every matching record is
+   returned, byte-identical to an uncapped read.
+
+   The file is still walked front-to-back in full even under a LIMIT. That walk
+   is the WAL's self-correctness check: each record's CRC is verified and the seq
+   column is asserted contiguous, so a torn or corrupt record beyond the
+   requested page is detected on the very read that skipped it rather than
+   surviving until some later call happens to reach that far. What LIMIT removes
+   is the per-record payload copy for records past the page, which is where the
+   memory cost of a large backlog lives. Bounding the walk itself is not on the
+   table here; the cost of reading a large WAL is a compaction question."
   (let ((bytes (read-file-bytes path))
+        (kept 0)
         (out '()))
     (walk-records bytes
                   (lambda (seq ts pstart pend)
-                    (when (> seq after)
+                    (when (and (> seq after)
+                               (or (null limit) (< kept limit)))
+                      (incf kept)
                       (push (%make-record seq ts
                                           (subseq bytes (+ pstart +fixed-payload+) pend))
                             out))))
