@@ -17,7 +17,10 @@ export XDG_CACHE_HOME ?= $(CURDIR)/.ci-cache
 # whenever the dependencies, the SBCL build, or the project source change.
 CORE ?= dsmr.core
 
-.PHONY: bridge bus-watch test test-integration core test-warm
+.PHONY: bridge bus-watch install-bus-watch test test-integration core test-warm
+
+PREFIX ?= $(HOME)/.local
+BINDIR ?= $(PREFIX)/bin
 
 ## bridge: build the standalone stdio<->TCP bridge binary.
 ##
@@ -50,6 +53,22 @@ bus-watch:
 	     --eval '(asdf:load-asd (truename "dsmr-bus-watch.asd"))' \
 	     --eval '(asdf:make :dsmr-bus-watch)' \
 	     --eval '(quit)'
+
+## install-bus-watch: publish the built watcher onto PATH.
+##
+##   Agents invoke 'dsmr-bus-watch' by name, so the copy under $(BINDIR) — not
+##   bin/ — is the one every session actually runs. Skipping this step leaves
+##   the operator docs describing flags the deployed binary rejects, and a
+##   watcher that exits on them is deaf to the bus rather than noisy about it.
+##   Install atomically: agents arm watchers continuously, and cp over a running
+##   binary's inode can hand a session a half-written image.
+install-bus-watch: bus-watch
+	@mkdir -p "$(BINDIR)"
+	@cp bin/dsmr-bus-watch "$(BINDIR)/.dsmr-bus-watch.tmp"
+	@chmod 755 "$(BINDIR)/.dsmr-bus-watch.tmp"
+	@mv -f "$(BINDIR)/.dsmr-bus-watch.tmp" "$(BINDIR)/dsmr-bus-watch"
+	@echo "installed $(BINDIR)/dsmr-bus-watch"
+	@echo "running watchers keep the previous image until each is re-armed"
 
 ## test: fast in-process unit suite (the push hot-path).
 ##
