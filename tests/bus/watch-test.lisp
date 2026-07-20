@@ -23,7 +23,21 @@
   (:import-from #:dsmr-bus-watch/src/bus/watch
                 #:watch-until-foreign
                 #:poll-new
-                #:default-wal-path))
+                #:default-wal-path
+                ;; internal: the argument parser and its record are exercised
+                ;; directly, since the flags they carry are only observable
+                ;; through main otherwise
+                #:%parse-args
+                #:opt-wal
+                #:opt-after
+                #:opt-agent
+                #:opt-namespace
+                #:opt-agent-id
+                #:opt-cursors-dir
+                #:opt-stream-p
+                #:opt-poll-ms
+                #:opt-recycle-seconds
+                #:opt-help-p))
 
 (in-package #:dsmr-mcp/tests/bus/watch-test)
 
@@ -89,3 +103,69 @@
           (setf cursor (poll-new w cursor #'collect))
           (is = 2 cursor)
           (is equal '(1 2) (nreverse seen)))))))
+
+(defun call-capturing-stderr (thunk)
+  "Run THUNK with *error-output* redirected, and return (values result text).
+   The watcher's degradations are only observable as stderr diagnostics, so the
+   text is as much part of the contract as the value."
+  (let* ((stream (make-string-output-stream))
+         (result (let ((*error-output* stream)) (funcall thunk))))
+    (values result (get-output-stream-string stream))))
+
+(defmacro capturing-stderr (&body body)
+  `(call-capturing-stderr (lambda () ,@body)))
+
+(define-test unknown-flag-warns-and-parsing-continues
+  ;; A mistyped flag must not deafen the agent: it is named on stderr, skipped,
+  ;; and the flags around it still take effect.
+  (multiple-value-bind (opts err)
+      (capturing-stderr (%parse-args (list "--bogus" "--poll-ms" "250")))
+    (is = 250 (opt-poll-ms opts))
+    (is = 600 (opt-recycle-seconds opts))
+    (false (opt-wal opts))
+    (false (opt-after opts))
+    (true (search "--bogus" err))))
+
+(define-test unparseable-value-keeps-that-flags-default
+  ;; A value that will not parse costs its own flag only, never the whole run.
+  (multiple-value-bind (opts err)
+      (capturing-stderr (%parse-args (list "--poll-ms" "banana"
+                                           "--recycle-seconds" "30")))
+    (is = 1000 (opt-poll-ms opts))
+    (is = 30 (opt-recycle-seconds opts))
+    (true (search "--poll-ms" err))))
+
+(define-test dangling-value-flag-warns-and-resolves-nothing
+  ;; A value-taking flag at the very end of argv has nothing to consume.
+  (multiple-value-bind (opts err)
+      (capturing-stderr (%parse-args (list "--agent")))
+    (false (opt-agent opts))
+    (true (search "--agent" err))))
+
+(define-test identity-flags-parse
+  (let ((opts (%parse-args (list "--agent" "runciter"
+                                 "--namespace" "/p"
+                                 "--agent-id" "/p/runciter"
+                                 "--cursors-dir" "/tmp/cursors/"))))
+    (is equal "runciter" (opt-agent opts))
+    (is equal "/p" (opt-namespace opts))
+    (is equal "/p/runciter" (opt-agent-id opts))
+    (is equal "/tmp/cursors/" (opt-cursors-dir opts))))
+
+(define-test previously-supported-flags-parse-unchanged
+  ;; Every combination the arm wrapper passes today, plus the operator-facing
+  ;; overrides, must land on the same values they did before the flags grew.
+  (let ((opts (%parse-args (list "--wal" "/tmp/x.wal" "--after" "7" "--stream"))))
+    (is equal "/tmp/x.wal" (opt-wal opts))
+    (is = 7 (opt-after opts))
+    (true (opt-stream-p opts)))
+  (dolist (cadence '(("500" "60") ("1000" "120") ("1000" "300") ("1000" "600")))
+    (destructuring-bind (poll recycle) cadence
+      (let ((opts (%parse-args (list "--poll-ms" poll "--recycle-seconds" recycle))))
+        (is = (parse-integer poll) (opt-poll-ms opts))
+        (is = (parse-integer recycle) (opt-recycle-seconds opts))
+        (false (opt-stream-p opts))
+        (false (opt-wal opts))
+        (false (opt-after opts)))))
+  (true (opt-help-p (%parse-args (list "--help"))))
+  (true (opt-help-p (%parse-args (list "-h")))))

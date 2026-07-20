@@ -36,6 +36,13 @@
 
 ;;; -------------------------------------------------------------- default path
 
+(defun %warn (control &rest args)
+  "Write a diagnostic to *error-output*, tagged with the binary's name.
+   Diagnostics never touch *standard-output*, which carries signal lines only —
+   a stray line there would be read by the arm wrapper as a wake signal."
+  (format *error-output* "dsmr-bus-watch: ~?~%" control args)
+  (force-output *error-output*))
+
 (defun default-wal-path ()
   "The default bus WAL path: $XDG_STATE_HOME/dsmr-mcp/bus/bus.wal (falling back
    to ~/.local/state/dsmr-mcp/bus/bus.wal). Inlined from the broker's
@@ -124,77 +131,146 @@
 
 Watch the coordination-bus WAL and signal a new foreign message so a dormant
 sister agent can be re-armed/woken. Signal lines go to STDOUT; everything else
-to STDERR. Re-arm AFTER you publish so your own message stays below the baseline.
+to STDERR.
 
 Options:
   --wal PATH           WAL file to watch (default: $XDG_STATE_HOME/dsmr-mcp/bus/bus.wal)
-  --after SEQ          baseline seq; fire on the first seq > SEQ
-                       (default: the WAL's current max seq, read at arm time;
-                        0 = fire on any record)
-  --stream             stream one line per new seq and keep running
+  --agent NAME         bus agent name to watch for (default: $DSMR_BUS_AGENT).
+                       With a name resolved, the watcher arms from that agent's
+                       durable cursor and ignores that agent's own publishes.
+  --namespace PATH     bus namespace for the agent name. Pass the SAME project
+                       root the MCP session uses: the cursor file is keyed on
+                       the full <namespace>/<name> id, so a namespace that
+                       differs by even a trailing component watches the wrong
+                       cursor. Defaults to the working directory, with a warning.
+  --agent-id FULL-ID   complete <namespace>/<name> id, for a caller that already
+                       knows it. Takes precedence over --agent and --namespace.
+  --cursors-dir PATH   cursor directory to read
+                       (default: $XDG_STATE_HOME/dsmr-mcp/bus/cursors/)
+  --after SEQ          baseline seq; fire on the first foreign seq > SEQ.
+                       Overrides the cursor-derived baseline.
+                       (default: the resolved agent's cursor, or the WAL's
+                        current max seq when no agent resolves; 0 = fire on any
+                        record)
+  --stream             stream one line per new foreign seq and keep running
                        (for a persistent monitor); default is exit-on-event
   --poll-ms N          poll interval in milliseconds (default 1000)
   --recycle-seconds N  idle self-recycle window in seconds (default 600)
   -h, --help           print this help and exit
 
+An unknown flag, or a flag with an unparseable value, is reported on STDERR and
+then ignored — the watcher keeps running on defaults rather than leaving the
+agent deaf to the bus.
+
 Exit-on-event prints one `bus:<SEQ>` line then exits 0; on idle recycle it
-prints `recycle:` then exits 0. Streaming prints `bus:<SEQ>` per new seq.
+prints `recycle:` then exits 0. Streaming prints `bus:<SEQ>` per new foreign seq.
 ")
 
 (defun %usage (&optional (stream *error-output*))
   (write-string +usage+ stream)
   (force-output stream))
 
+(defstruct (options (:conc-name opt-))
+  "One parsed command line. A named record rather than a positional tuple: the
+   watcher now takes ten settings, and a ten-element VALUES list is a defect
+   waiting for the day someone inserts a value in the middle of it."
+  (wal nil)
+  (after nil)
+  (agent nil)
+  (namespace nil)
+  (agent-id nil)
+  (cursors-dir nil)
+  (stream-p nil)
+  (poll-ms 1000)
+  (recycle-seconds 600)
+  (help-p nil))
+
 (defun %parse-nonneg (string flag)
-  "Parse STRING as a non-negative integer for FLAG, or signal a usage error."
+  "STRING as a non-negative integer for FLAG, or NIL with a warning when it is
+   not one. Returning NIL rather than signalling is what lets a mistyped value
+   fall back to that one flag's default instead of taking the whole watcher
+   down."
   (multiple-value-bind (n end)
       (ignore-errors (parse-integer string :junk-allowed nil))
-    (unless (and n (= end (length string)) (>= n 0))
-      (error "~A expects a non-negative integer, got ~S" flag string))
-    n))
+    (if (and n (= end (length string)) (>= n 0))
+        n
+        (progn
+          (%warn "~A expects a non-negative integer, got ~S; keeping the default"
+                 flag string)
+          nil))))
 
 (defun %parse-args (args)
-  "Parse ARGS into (values wal after stream-p poll-ms recycle-seconds help-p).
-   WAL is NIL when unspecified (caller substitutes the default); AFTER is NIL
-   when unspecified (caller seeds from the WAL). Signals on malformed input."
-  (let ((wal nil) (after nil) (stream-p nil)
-        (poll-ms 1000) (recycle-seconds 600) (help-p nil))
-    (loop with rest = args
-          while rest
-          for arg = (pop rest)
-          do (cond
-               ((or (string= arg "-h") (string= arg "--help"))
-                (setf help-p t))
-               ((string= arg "--stream")
-                (setf stream-p t))
-               ((string= arg "--wal")
-                (unless rest (error "--wal requires a PATH argument"))
-                (setf wal (pop rest)))
-               ((string= arg "--after")
-                (unless rest (error "--after requires a SEQ argument"))
-                (setf after (%parse-nonneg (pop rest) "--after")))
-               ((string= arg "--poll-ms")
-                (unless rest (error "--poll-ms requires an N argument"))
-                (setf poll-ms (%parse-nonneg (pop rest) "--poll-ms")))
-               ((string= arg "--recycle-seconds")
-                (unless rest (error "--recycle-seconds requires an N argument"))
-                (setf recycle-seconds (%parse-nonneg (pop rest) "--recycle-seconds")))
-               (t (error "unknown argument: ~S" arg))))
-    (values wal after stream-p poll-ms recycle-seconds help-p)))
+  "Parse ARGS into an OPTIONS record. Absent flags keep their defaults; WAL,
+   AFTER and the identity fields stay NIL so the caller can substitute the WAL
+   default, the arm-time baseline, and the environment fallback respectively.
+
+   Parsing never signals on bad input. An unrecognized argument, a value that
+   will not parse, or a value-taking flag left dangling at the end of the
+   argument list is reported on *error-output* and then ignored, and parsing
+   continues with what remains. This is a wake primitive, and it favors
+   availability over strictness: an agent that mistypes a flag should get a
+   watcher on default cadence, not silence. Refusing to start would leave the
+   agent deaf to the bus with an empty stdout and nothing to say why."
+  (let ((opts (make-options))
+        (rest args))
+    (labels ((next-value (flag)
+               (if rest
+                   (pop rest)
+                   (progn
+                     (%warn "~A requires a value but none followed; ignoring it"
+                            flag)
+                     nil)))
+             (next-nonneg (flag current)
+               (let ((raw (next-value flag)))
+                 (or (and raw (%parse-nonneg raw flag)) current))))
+      (loop while rest
+            for arg = (pop rest)
+            do (cond
+                 ((or (string= arg "-h") (string= arg "--help"))
+                  (setf (opt-help-p opts) t))
+                 ((string= arg "--stream")
+                  (setf (opt-stream-p opts) t))
+                 ((string= arg "--wal")
+                  (setf (opt-wal opts) (or (next-value "--wal") (opt-wal opts))))
+                 ((string= arg "--agent")
+                  (setf (opt-agent opts)
+                        (or (next-value "--agent") (opt-agent opts))))
+                 ((string= arg "--namespace")
+                  (setf (opt-namespace opts)
+                        (or (next-value "--namespace") (opt-namespace opts))))
+                 ((string= arg "--agent-id")
+                  (setf (opt-agent-id opts)
+                        (or (next-value "--agent-id") (opt-agent-id opts))))
+                 ((string= arg "--cursors-dir")
+                  (setf (opt-cursors-dir opts)
+                        (or (next-value "--cursors-dir") (opt-cursors-dir opts))))
+                 ((string= arg "--after")
+                  (setf (opt-after opts) (next-nonneg "--after" (opt-after opts))))
+                 ((string= arg "--poll-ms")
+                  (setf (opt-poll-ms opts)
+                        (next-nonneg "--poll-ms" (opt-poll-ms opts))))
+                 ((string= arg "--recycle-seconds")
+                  (setf (opt-recycle-seconds opts)
+                        (next-nonneg "--recycle-seconds" (opt-recycle-seconds opts))))
+                 (t (%warn "unknown argument ~S ignored; continuing on defaults"
+                           arg)))))
+    opts))
 
 (defun main ()
   "Entry point. Parse argv, seed a baseline, and watch. Signal lines go to
    *standard-output*; usage, diagnostics, and errors go to *error-output*.
-   Exit 0 on a fired/recycled watch, 64 on a usage error."
+   Exit 0 on a fired/recycled watch, 64 on an unrecoverable failure. A bad flag
+   is not one: it degrades to defaults and still arms."
   (handler-case
-      (multiple-value-bind (wal after stream-p poll-ms recycle-seconds help-p)
-          (%parse-args (uiop:command-line-arguments))
-        (when help-p
+      (let ((opts (%parse-args (uiop:command-line-arguments))))
+        (when (opt-help-p opts)
           (%usage)
           (uiop:quit 0))
-        (let* ((wal-path (if wal (pathname wal) (default-wal-path)))
-               (baseline (or after (%last-seq wal-path))))
-          (if stream-p
+        (let* ((wal-path (if (opt-wal opts) (pathname (opt-wal opts)) (default-wal-path)))
+               (baseline (or (opt-after opts) (%last-seq wal-path)))
+               (poll-ms (opt-poll-ms opts))
+               (recycle-seconds (opt-recycle-seconds opts)))
+          (if (opt-stream-p opts)
               (progn
                 (watch-stream wal-path baseline
                               :poll-ms poll-ms :recycle-seconds recycle-seconds)
