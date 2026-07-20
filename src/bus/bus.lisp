@@ -27,6 +27,8 @@
                     (#:envelope #:dsmr-mcp/src/bus/envelope)
                     (#:wal #:dsmr-mcp/src/bus/wal)
                     (#:tz #:dsmr-mcp/src/bus/zmq))
+  (:import-from #:dsmr-mcp/src/bus/cursor
+                #:+default-batch-size+)
   (:import-from #:dsmr-mcp/src/bus/envelope
                 #:encode-id
                 #:agent-id
@@ -36,6 +38,7 @@
                 #:+envelope-delimiter+)
   (:export #:client #:connect-client #:publish #:disconnect-client
            #:subscriber #:subscribe #:unsubscribe #:poll #:poll-count #:await
+           #:skip-to-head #:+default-batch-size+
            #:agent-id #:encode-id
            #:decode-envelope #:delivered-body-string))
 
@@ -151,32 +154,48 @@
 
 (defun subscribe (paths id &key (join t) (feed-timeout-ms 100))
   "Open a subscriber named ID against the bus at PATHS. Holds a durable cursor
-   (under the bus cursors dir) and a SUB socket on the broker's fan-out feed."
+   (under the bus cursors dir) and a SUB socket on the broker's fan-out feed.
+
+   A cursor that does not exist yet is seeded at the current log head before this
+   returns, so a participant joining for the first time starts from now rather
+   than replaying everything the bus has ever carried. Seeding happens here
+   rather than lazily on the first read because a caller may connect long before
+   it reads — the background restart listener joins at server startup and then
+   polls on its own cadence — and an unseeded cursor would spend that whole gap
+   looking like a participant owed the entire log."
   (broker:ensure-bus-dirs paths)
   (let ((cursor-path (merge-pathnames (encode-id id) (broker:bus-paths-cursors-dir paths))))
     (%make-subscriber
      :paths paths
-     :cursor (cursor:make-subscriber id (broker:bus-paths-wal paths) cursor-path)
+     :cursor (cursor:ensure-seeded
+              (cursor:make-subscriber id (broker:bus-paths-wal paths) cursor-path))
      :feed (tz:make-feed (broker:bus-paths-pub-endpoint paths)
                          :timeout-ms feed-timeout-ms)
      :members-fd (when join (broker:join-members paths)))))
 
-(defun poll (subscriber)
-  "Non-blocking: deliver every record past the cursor right now (catch-up) and
-   advance the cursor. Returns the list of WAL:RECORD delivered (possibly empty)."
-  (cursor:deliver-pending (subscriber-cursor subscriber)))
+(defun poll (subscriber &key (limit cursor:+default-batch-size+))
+  "Non-blocking: deliver a bounded batch of the records past the cursor right now
+   (catch-up) and advance the cursor over exactly what it delivered. Returns the
+   list of WAL:RECORD delivered (possibly empty). LIMIT NIL asks for the whole
+   backlog. What remains after a bounded call is POLL-COUNT's question to answer,
+   not a second value returned from here."
+  (cursor:deliver-pending (subscriber-cursor subscriber) :limit limit))
 
 (defun poll-count (subscriber)
   "How many records are waiting for SUBSCRIBER right now, without delivering them
    or moving the cursor."
   (cursor:pending-count (subscriber-cursor subscriber)))
 
-(defun await (subscriber &key (timeout-ms 1000))
+(defun await (subscriber &key (timeout-ms 1000) (limit cursor:+default-batch-size+))
   "Block up to TIMEOUT-MS for at least one message, then deliver and return it.
    Delivers any existing backlog first (catch-up), then waits on the live ZeroMQ
    nudge for more. The cursor — not the nudge — is the source of truth, so a
    missed nudge degrades to catch-up, never a lost message. Returns the delivered
    records, or NIL if nothing arrived before the deadline.
+
+   Each delivery is bounded by LIMIT, so a caller waiting on a bus it has been
+   away from gets one batch and can come back for the rest; LIMIT NIL asks for
+   the whole backlog at once.
 
    TIMEOUT-MS is GRANULAR to the feed's own receive timeout (the FEED-TIMEOUT-MS
    passed to SUBSCRIBE, default 100ms): the deadline is only checked between feed
@@ -185,12 +204,21 @@
    caller needs honored. The clock is for relative durations only (see %NOW-MS)."
   (let ((deadline (+ (%now-ms) timeout-ms)))
     (loop
-      (let ((delivered (cursor:deliver-pending (subscriber-cursor subscriber))))
+      (let ((delivered (cursor:deliver-pending (subscriber-cursor subscriber)
+                                               :limit limit)))
         (when delivered (return delivered)))
       (when (>= (%now-ms) deadline) (return nil))
       ;; wait for a live nudge over zmq (bounded by the feed's receive timeout);
       ;; its content is irrelevant — the next loop turn reads the log.
       (tz:recv-message (subscriber-feed subscriber)))))
+
+(defun skip-to-head (subscriber)
+  "Abandon SUBSCRIBER's backlog outright and return how many records were given
+   up. Offered here so a caller can make that choice without reaching past the
+   facade into the cursor itself. Nothing on the delivery path calls it — giving
+   up unread messages is always a decision someone makes on purpose, and the
+   count is what makes it visible afterwards."
+  (cursor:skip-to-head (subscriber-cursor subscriber)))
 
 (defun unsubscribe (subscriber)
   "Close the subscriber's feed and release its membership lock. The durable cursor

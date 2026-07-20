@@ -82,10 +82,16 @@
           (agent:disconnect-agent b))))))
 
 (define-test named-agent-resumes-after-reconnect
-  "A named agent that disconnects and reconnects resumes after its last message."
+  "A named agent that disconnects and reconnects resumes after its last message.
+   It joins before the traffic starts, because a participant's claim on the bus
+   begins when it first joins — what arrives while it is away is its backlog, and
+   that is what must survive the reconnect."
   (with-bus (paths)
     (with-running-broker (br paths)
-      (let ((pub (agent:connect-agent "/proj" :name "pub" :paths paths :ensure-broker nil)))
+      (let ((pub (agent:connect-agent "/proj" :name "pub" :paths paths :ensure-broker nil))
+            (joiner (agent:connect-agent "/proj" :name "resumer" :paths paths
+                                                 :ensure-broker nil)))
+        (agent:disconnect-agent joiner)
         (unwind-protect
              (progn
                (agent:agent-publish pub "first")
@@ -151,3 +157,77 @@
                       "the ephemeral name is not the bare namespace")
                (is eq nil (getf (agent:agent-status a) :stable)))
           (agent:disconnect-agent a))))))
+
+;;; joining, backlog, and abandonment -------------------------------------------
+
+(define-test new-agent-does-not-replay-the-log-it-arrived-after
+  "An agent joining a bus that already carries traffic receives nothing on its
+   first read. It has never read, so it has no claim on what came before it —
+   without this its first receive is the whole log."
+  (with-bus (paths)
+    (with-running-broker (br paths)
+      (let ((pub (agent:connect-agent "/proj" :name "pub" :paths paths :ensure-broker nil)))
+        (unwind-protect
+             (progn
+               (dotimes (i 5) (agent:agent-publish pub (format nil "old-~D" i)))
+               (let ((newcomer (agent:connect-agent "/proj" :name "newcomer"
+                                                            :paths paths :ensure-broker nil)))
+                 (unwind-protect
+                      (progn
+                        (is = 0 (length (agent:agent-receive newcomer)))
+                        (is = 0 (getf (agent:agent-status newcomer) :pending))
+                        ;; but it does get what arrives after it joined
+                        (agent:agent-publish pub "after-joining")
+                        (is equal '("after-joining")
+                            (agent:agent-receive newcomer :timeout-ms 3000)))
+                   (agent:disconnect-agent newcomer))))
+          (agent:disconnect-agent pub))))))
+
+(define-test returning-agent-gets-its-backlog-a-batch-at-a-time
+  "A returning agent's backlog is intact but handed over in bounded batches, so
+   joining seeded it without clobbering the position it had earned."
+  (with-bus (paths)
+    (with-running-broker (br paths)
+      (let ((pub (agent:connect-agent "/proj" :name "pub" :paths paths :ensure-broker nil))
+            (joiner (agent:connect-agent "/proj" :name "returner" :paths paths
+                                                 :ensure-broker nil)))
+        (agent:disconnect-agent joiner)
+        (unwind-protect
+             (progn
+               (dotimes (i 9) (agent:agent-publish pub (format nil "m-~D" i)))
+               (let ((s (agent:connect-agent "/proj" :name "returner"
+                                                     :paths paths :ensure-broker nil)))
+                 (unwind-protect
+                      (let ((first-batch (agent:agent-receive s :timeout-ms 3000 :limit 4)))
+                        (is = 4 (length first-batch))
+                        (is equal '("m-0" "m-1" "m-2" "m-3") first-batch)
+                        (is = 5 (getf (agent:agent-status s) :pending))
+                        (is equal '("m-4" "m-5" "m-6" "m-7" "m-8")
+                            (agent:agent-receive s :timeout-ms 3000))
+                        (is = 0 (getf (agent:agent-status s) :pending)))
+                   (agent:disconnect-agent s))))
+          (agent:disconnect-agent pub))))))
+
+(define-test skipping-ahead-reports-the-backlog-it-gave-up
+  "An agent can abandon its backlog deliberately, and is told how much it gave
+   up — the discard is never silent."
+  (with-bus (paths)
+    (with-running-broker (br paths)
+      (let ((pub (agent:connect-agent "/proj" :name "pub" :paths paths :ensure-broker nil))
+            (joiner (agent:connect-agent "/proj" :name "skipper" :paths paths
+                                                 :ensure-broker nil)))
+        (agent:disconnect-agent joiner)
+        (unwind-protect
+             (progn
+               (dotimes (i 6) (agent:agent-publish pub (format nil "stale-~D" i)))
+               (let ((s (agent:connect-agent "/proj" :name "skipper"
+                                                     :paths paths :ensure-broker nil)))
+                 (unwind-protect
+                      (progn
+                        (loop repeat 50 until (= 6 (getf (agent:agent-status s) :pending))
+                              do (sleep 0.05))
+                        (is = 6 (agent:agent-skip-to-head s))
+                        (is = 0 (getf (agent:agent-status s) :pending))
+                        (is = 0 (length (agent:agent-receive s))))
+                   (agent:disconnect-agent s))))
+          (agent:disconnect-agent pub))))))

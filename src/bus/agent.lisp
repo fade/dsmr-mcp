@@ -23,7 +23,8 @@
   (:export #:agent #:agent-id #:agent-name #:agent-namespace #:agent-stable-p
            #:agent-paths
            #:connect-agent #:disconnect-agent
-           #:agent-publish #:agent-receive #:agent-status))
+           #:agent-publish #:agent-receive #:agent-status
+           #:agent-skip-to-head))
 
 (in-package #:dsmr-mcp/src/bus/agent)
 
@@ -83,7 +84,7 @@
   (bus:publish (agent-client agent) message
                :self-id (agent-id agent)))
 
-(defun agent-receive (agent &key (timeout-ms 0))
+(defun agent-receive (agent &key (timeout-ms 0) (limit bus:+default-batch-size+))
   "Receive messages addressed to the whole bus that this agent has not yet seen,
    advancing its cursor. With TIMEOUT-MS 0 this is a non-blocking catch-up; with a
    positive timeout it waits up to that long for the first message. Returns a list
@@ -91,10 +92,17 @@
    advances over EVERY pending record (including this agent's own), but records
    carrying this agent's own self-id are filtered out of the RETURNED set — the
    receive-side self-echo filter. A foreign record interleaved below this agent's
-   own seq was delivered in order and IS returned: no message is skipped."
+   own seq was delivered in order and IS returned: no message is skipped.
+
+   LIMIT bounds how many records are DELIVERED, not how many come back. A batch
+   made up entirely of this agent's own publishes therefore returns nothing while
+   still advancing the cursor past them — correct, not starvation: those records
+   are genuinely consumed, and the next call reads the ones after them. LIMIT NIL
+   asks for the whole backlog in one delivery."
   (let ((records (if (plusp timeout-ms)
-                     (bus:await (agent-subscriber agent) :timeout-ms timeout-ms)
-                     (bus:poll (agent-subscriber agent))))
+                     (bus:await (agent-subscriber agent)
+                                :timeout-ms timeout-ms :limit limit)
+                     (bus:poll (agent-subscriber agent) :limit limit)))
         (own (bus:encode-id (agent-id agent)))
         (out '()))
     (dolist (record records (nreverse out))
@@ -105,6 +113,13 @@
         ;; drop only records carrying this agent's own encoded self-id.
         (unless (and sid (string= sid own))
           (push text out))))))
+
+(defun agent-skip-to-head (agent)
+  "Give up whatever this agent has not yet read and return how many records that
+   was. For a participant returning to a backlog it judges too stale to be worth
+   the reading — a deliberate choice, reported so the size of what was dropped is
+   on the record."
+  (bus:skip-to-head (agent-subscriber agent)))
 
 (defun agent-status (agent)
   "A snapshot of this agent's view of the bus: its own identity (full id, the name
