@@ -91,6 +91,36 @@
     (let ((recs (read-records w :after 3)))
       (is equal '(4 5) (mapcar #'record-seq recs)))))
 
+(define-test read-records-limit-returns-oldest-page
+  "READ-RECORDS with :limit returns the OLDEST limit records past the cursor —
+   pagination walks forward from the backlog's head, it does not skip to the
+   newest and drop history."
+  (with-wal (w)
+    (write-good-wal w 40)
+    (let ((recs (read-records w :after 0 :limit 5)))
+      (is = 5 (length recs))
+      (is equal '(1 2 3 4 5) (mapcar #'record-seq recs)))
+    ;; an omitted or NIL limit is the uncapped read it has always been
+    (is = 40 (length (read-records w :after 0)))
+    (is = 40 (length (read-records w :after 0 :limit nil)))))
+
+(define-test read-records-limit-preserves-torn-tail-detection
+  "A bounded read stops COLLECTING early but the integrity walk still runs to the
+   torn boundary, so SCAN on the same file reports the full good-record count.
+   Bounding the page must not blind the WAL to corruption past it."
+  (with-wal (w)
+    (write-good-wal w 12)
+    (let ((rec (encode-record 13 "x")))
+      (setf (aref rec (+ 8 16)) (logxor (aref rec (+ 8 16)) 1)) ; flip a body bit
+      (append-raw w rec))
+    (let ((recs (read-records w :after 0 :limit 4)))
+      (is = 4 (length recs))
+      (is equal '(1 2 3 4) (mapcar #'record-seq recs)))
+    (multiple-value-bind (last-seq good-bytes records) (scan w)
+      (declare (ignore good-bytes))
+      (is = 12 last-seq)
+      (is = 12 records "the unbounded scan still sees every good record"))))
+
 ;;; torn-tail recovery ---------------------------------------------------------
 
 (define-test torn-partial-header-truncated

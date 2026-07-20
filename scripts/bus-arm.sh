@@ -7,9 +7,12 @@
 #     one. This is a one-shot priming arm, not a persistent watcher: the
 #     watcher runs in exit-on-event mode (no --stream), so it exits the moment
 #     the first foreign message lands or after one recycle window, and its
-#     output is discarded (the session cannot observe it anyway). What keeps a
-#     watcher armed thereafter is the in-turn re-arm path below, driven from
-#     within the agent's turns — the bootstrap only gets the loop started.
+#     signal line is discarded (the session cannot observe it anyway). Its
+#     DIAGNOSTICS are not: they go to a log beside the arm state, because a
+#     watcher that armed against the wrong cursor says so on stderr and the
+#     bootstrap path is the one place nobody is listening. What keeps a watcher
+#     armed thereafter is the in-turn re-arm path below, driven from within the
+#     agent's turns — the bootstrap only gets the loop started.
 #   * from within an agent turn after a publish+catch-up receive (re-arm mode,
 #     --rearm) — runs the watcher with stdout kept so the turn observes the
 #     wake signal, then records whether it fired or idled, and re-arms again
@@ -28,6 +31,7 @@ set -eu
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dsmr-mcp/bus"
 STATE_FILE="$STATE_DIR/watch-arm.state"
+ARM_LOG="$STATE_DIR/watch-arm.log"
 
 # Consecutive idle-recycle count (0 when the state file is absent/unreadable).
 IDLE=0
@@ -74,17 +78,52 @@ if [ "${1:-}" = "--rearm" ]; then
     MODE="rearm"
 fi
 
+# Identity, passed explicitly rather than left to be inferred.
+#
+# A watcher reads the cursor named by the full <namespace>/<name> id, and the
+# namespace is the project root the MCP session uses. Left unstated, the watcher
+# falls back to the working directory — which is the checkout only when the
+# caller happened to be standing in it, and names some other agent's cursor (or
+# none) when it did not. The hook exports the project directory; use it.
+#
+# The trailing separator is not cosmetic. The session builds its namespace from a
+# DIRECTORY pathname, which always ends in one, and the id is matched by encoded
+# bytes. A root passed without it names a different cursor that will never exist.
+PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$PWD}"
+case "$PROJECT_ROOT" in
+    */) : ;;
+    *)  PROJECT_ROOT="$PROJECT_ROOT/" ;;
+esac
+
+# Build the identity arguments as positional parameters — the project root may
+# contain spaces, and "$@" is the only way /bin/sh carries that intact. Read
+# AFTER the mode select above, which is what consumed $1.
+#
+# Neither argument is required. A caller that sets only DSMR_BUS_AGENT still
+# works, and so does one that sets nothing: the watcher degrades to firing on
+# everything and says so. That is what makes this a no-migration change for every
+# sister repo.
+set -- --namespace "$PROJECT_ROOT"
+if [ -n "${DSMR_BUS_AGENT:-}" ]; then
+    set -- "$@" --agent "$DSMR_BUS_AGENT"
+fi
+
+mkdir -p "$STATE_DIR"
+
 if [ "$MODE" = "bootstrap" ]; then
-    # Detach all fds so the SessionStart hook does not hang; arm and exit.
-    nohup dsmr-bus-watch --poll-ms "$POLL_MS" --recycle-seconds "$RECYCLE_S" \
-        </dev/null >/dev/null 2>&1 &
+    # Detach stdin and stdout so the SessionStart hook does not hang — a
+    # background process holding the session's stdio open blocks startup. Stderr
+    # goes to the arm log rather than /dev/null: this path cannot report to a
+    # session that has not begun, so the log is the only place a wrong namespace
+    # or an unreadable cursor can be found afterward.
+    nohup dsmr-bus-watch --poll-ms "$POLL_MS" --recycle-seconds "$RECYCLE_S" "$@" \
+        </dev/null >/dev/null 2>>"$ARM_LOG" &
     exit 0
 fi
 
 # Re-arm: keep stdout so the turn observes the watcher's first signal line, and
 # update the idle counter — reset to 0 on a fire (bus:), increment on idle
 # (recycle:).
-mkdir -p "$STATE_DIR"
 
 # The arm script is the operator's only feedback channel for "is the watcher
 # even installed?", so a missing binary must be a distinguishable, visible
@@ -104,7 +143,7 @@ fi
 # pipeline exit status (head masks the watcher's, and pipefail is not portable
 # in /bin/sh); the SIGNAL shape below is what distinguishes fire/idle/failure.
 WATCH_ERR=$(mktemp "${TMPDIR:-/tmp}/bus-arm-err.XXXXXX")
-SIGNAL=$(dsmr-bus-watch --poll-ms "$POLL_MS" --recycle-seconds "$RECYCLE_S" \
+SIGNAL=$(dsmr-bus-watch --poll-ms "$POLL_MS" --recycle-seconds "$RECYCLE_S" "$@" \
     </dev/null 2>"$WATCH_ERR" | head -n 1)
 case "$SIGNAL" in
     bus:*)

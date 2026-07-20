@@ -10,8 +10,10 @@
 ;;;;
 ;;;; This lives in its own .asd (rather than alongside dsmr-mcp.asd) so its
 ;;;; primary system name matches the file and its lean dependency closure stays
-;;;; minimal: it depends ONLY on the bus WAL leaf (which is ZeroMQ-free) plus its
-;;;; own entrypoint — never on broker/zmq/the MCP server — so the binary is small.
+;;;; minimal: it depends on three ZeroMQ-free bus leaves — the WAL, the message
+;;;; envelope, and the delivery cursor — plus its own entrypoint. Never the
+;;;; broker, never ZeroMQ, never the MCP server. A sister repo needs no libzmq to
+;;;; arm a watcher, and the binary stays small.
 ;;;;
 ;;;; Build-operation note: the string form "program-op" is the CL Cookbook
 ;;;; recommended style for ASDF >= 3.1; if it fails with "operation not found"
@@ -24,6 +26,8 @@
   :license "AGPL-3.0-or-later"
   :version "0.1.0"
   :depends-on ("dsmr-mcp/src/bus/wal"
+               "dsmr-mcp/src/bus/envelope"
+               "dsmr-mcp/src/bus/cursor"
                "dsmr-bus-watch/src/bus/watch")
   :build-operation "program-op"
   :build-pathname "bin/dsmr-bus-watch"
