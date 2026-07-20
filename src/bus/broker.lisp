@@ -30,7 +30,7 @@
   (:export #:bus-paths #:make-bus-paths #:default-state-root
            #:bus-paths-root #:bus-paths-wal #:bus-paths-lock #:bus-paths-members
            #:bus-paths-cursors-dir #:bus-paths-submit-endpoint #:bus-paths-pub-endpoint
-           #:ensure-bus-dirs
+           #:ensure-bus-dirs #:reap-orphaned-cursors
            #:broker #:broker-seq
            #:start-broker #:broker-step #:serve-broker #:stop-broker
            #:join-members
@@ -81,6 +81,82 @@
     (election:lock-shared fd)
     fd))
 
+(defun %ephemeral-name-p (name)
+  "True iff NAME is an auto-generated ephemeral agent name — g<digits>-<digits>,
+   the shape the envelope leaf builds for an id given no stable name. The match
+   is exact rather than a prefix: a stable name that merely starts with a g, or
+   carries a dash in some other position, must not answer true."
+  (let ((len (length name)))
+    (and (> len 3)
+         (char= (char name 0) #\g)
+         (let ((dash (position #\- name :start 1)))
+           (and dash
+                (> dash 1)
+                (< (1+ dash) len)
+                (every #'digit-char-p (subseq name 1 dash))
+                (every #'digit-char-p (subseq name (1+ dash))))))))
+
+(defun %ephemeral-cursor-name-p (filename)
+  "True iff FILENAME is the cursor file of an ephemeral agent. A cursor is named
+   by percent-encoding the whole <namespace>/<name> id, and the encoding's safe
+   alphabet covers letters, digits and the dash — so the name survives verbatim
+   after the encoded separator, and matching the encoded tail is exact.
+
+   No decoder is involved on purpose: the encoding has no inverse here, and
+   writing one would add edge cases to answer a question the tail already
+   answers."
+  (let* ((separator "%2F")
+         (pos (search separator filename :from-end t)))
+    (%ephemeral-name-p (if pos
+                           (subseq filename (+ pos (length separator)))
+                           filename))))
+
+(defun reap-orphaned-cursors (paths &key (max-age-days 7))
+  "Delete long-dead ephemeral cursors under PATHS' cursor directory and return
+   how many were removed. One cursor is written per subagent session, so the
+   directory otherwise grows for the life of the bus.
+
+   A file is removed only when BOTH its name has the ephemeral shape AND it has
+   not been written in MAX-AGE-DAYS. Both conditions are required and neither
+   may be dropped. Age alone would take a stable identity's cursor whenever that
+   identity stayed dormant a while, discarding a real backlog it was entitled to
+   walk forward. Shape alone would never terminate, since it would take a live
+   subagent's cursor the moment a broker happened to restart.
+
+   A mistake in the conservative direction is cheap: a wrongly-reaped ephemeral
+   simply starts again at the log head, which is where a participant that has
+   never read starts anyway. A mistake in the other direction destroys delivery
+   state a consumer is still using, which is why the count is reported rather
+   than the removal being silent.
+
+   Nothing here may abort a broker coming up: a file that cannot be examined or
+   removed is named on stderr and skipped, and a directory that cannot be
+   scanned at all yields a count of zero."
+  (let ((reaped 0))
+    (handler-case
+        (let ((cutoff (- (get-universal-time)
+                         (* max-age-days 24 60 60))))
+          (dolist (file (uiop:directory-files (bus-paths-cursors-dir paths)))
+            (handler-case
+                (when (and (%ephemeral-cursor-name-p (file-namestring file))
+                           (let ((written (file-write-date file)))
+                             (and written (< written cutoff))))
+                  (delete-file file)
+                  (incf reaped))
+              (error (e)
+                (format *error-output*
+                        "dsmr-mcp bus: skipping cursor ~A during reap: ~A~%"
+                        file e)))))
+      (error (e)
+        (format *error-output*
+                "dsmr-mcp bus: could not scan the cursor directory to reap: ~A~%"
+                e)))
+    (when (plusp reaped)
+      (format *error-output*
+              "dsmr-mcp bus: reaped ~D orphaned ephemeral cursor~:P older than ~D day~:P~%"
+              reaped max-age-days))
+    reaped))
+
 ;;; --------------------------------------------------------------- broker
 
 (defstruct (broker (:constructor %make-broker))
@@ -91,8 +167,13 @@
    true, wait until it dies and take over; if BLOCK is false and the role is
    taken, return NIL. On winning: recover the log (truncating any torn tail) to
    learn the next seq, optionally JOIN membership, and bind the intake and
-   publisher sockets. Returns a BROKER."
+   publisher sockets. Returns a BROKER.
+
+   Also reaps long-dead ephemeral cursors, once per broker process. The broker
+   already owns the cursor directory's lifecycle, and this is the one place
+   that runs rarely enough for the sweep to cost nothing."
   (ensure-bus-dirs paths)
+  (reap-orphaned-cursors paths)
   (let ((lock-fd (election:open-lock (bus-paths-lock paths))))
     (cond
       ((election:try-lock-exclusive lock-fd))      ; won immediately
