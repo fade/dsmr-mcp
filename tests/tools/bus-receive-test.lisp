@@ -1,0 +1,262 @@
+;;;; tests/tools/bus-receive-test.lisp
+;;;; SPDX-License-Identifier: AGPL-3.0-or-later
+;;;;
+;;;; The bus-receive tool boundary: bounded delivery, the limit guard, and the
+;;;; explicit abandonment of a backlog.
+;;;;
+;;;; The bus core owns the mutation — this verb only translates arguments into a
+;;;; call and formats the reply — so these tests assert on what a caller of the
+;;;; verb can actually observe: how many messages came back, how many the reply
+;;;; says are still waiting, whether a bad limit was refused before it reached
+;;;; the core, and what a deliberate skip reports having given up.
+;;;;
+;;;; A participant now joins at the current head of the log, so every test
+;;;; connects its receiving agent BEFORE the traffic it expects to see. The
+;;;; backlog is published by a second, separate agent: the receive path filters
+;;;; out an agent's own messages, so a self-published backlog would come back
+;;;; empty while still consuming the cursor.
+;;;;
+;;;; Each test isolates XDG_STATE_HOME to a temp directory and runs an in-process
+;;;; broker there, so nothing here touches the developer's host-wide bus.
+
+;; Package evolution guard: drop a prior incarnation so a reload picks up the
+;; current import/export set rather than stale symbols.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (let ((pkg (find-package '#:dsmr-mcp/tests/tools/bus-receive-test)))
+    (when pkg
+      (sb-ext:without-package-locks (delete-package pkg)))))
+
+(defpackage #:dsmr-mcp/tests/tools/bus-receive-test
+  (:use #:cl #:parachute)
+  (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
+                    (#:agent #:dsmr-mcp/src/bus/agent))
+  (:import-from #:dsmr-mcp/src/bus/bus
+                #:+default-batch-size+)
+  (:import-from #:dsmr-mcp/src/tools/base
+                #:tool-handle)
+  (:import-from #:dsmr-mcp/src/tools/bus-helpers
+                #:session-agent
+                #:disconnect-session-bus)
+  (:import-from #:dsmr-mcp/src/tools/bus-receive
+                #:bus-receive-tool)
+  (:import-from #:dsmr-mcp/src/state
+                #:make-session)
+  (:import-from #:dsmr-mcp/tests/support/env-fixture
+                #:with-clean-resolution-env))
+
+(in-package #:dsmr-mcp/tests/tools/bus-receive-test)
+
+;;; ---------------------------------------------------------------------------
+;;; Fixture: an isolated host bus on a temp XDG_STATE_HOME, served in-process.
+;;; ---------------------------------------------------------------------------
+
+(defun %make-temp-directory ()
+  "Create a uniquely named temp directory under /tmp and return its pathname.
+   The random state is seeded per call: SBCL's default state is identical in
+   every fresh image, so an unseeded name repeats across runs and an absence
+   assertion can pass on a leftover directory."
+  (let ((*random-state* (make-random-state t)))
+    (loop
+      (let* ((rand-part (format nil "dsmr-bus-recv-~8,'0X" (random #xFFFFFFFF)))
+             (dir-pn    (uiop:ensure-directory-pathname
+                         (merge-pathnames rand-part #p"/tmp/"))))
+        (unless (probe-file dir-pn)
+          (ensure-directories-exist dir-pn)
+          (return dir-pn))))))
+
+(defmacro with-isolated-bus (() &body body)
+  "Run BODY with XDG_STATE_HOME pointed at a fresh temp directory and an
+   in-process broker serving the default bus paths derived from it, so the tool
+   connects to a private bus and never touches the host-wide one."
+  (let ((dir (gensym "DIR")) (saved (gensym "SAVED"))
+        (paths (gensym "PATHS")) (br (gensym "BR"))
+        (stop (gensym "STOP")) (thread (gensym "THREAD")))
+    `(let* ((,dir (%make-temp-directory))
+            (,saved (uiop:getenv "XDG_STATE_HOME")))
+       (unwind-protect
+            (progn
+              (setf (uiop:getenv "XDG_STATE_HOME") (namestring ,dir))
+              (let* ((,paths (broker:make-bus-paths))
+                     (,stop nil))
+                (broker:ensure-bus-dirs ,paths)
+                (let* ((,br (broker:start-broker ,paths :block nil))
+                       (,thread (sb-thread:make-thread
+                                 (lambda ()
+                                   (broker:serve-broker ,br (lambda () ,stop)))
+                                 :name "bus-receive-test-broker")))
+                  (unwind-protect (progn ,@body)
+                    (setf ,stop t)
+                    (ignore-errors (sb-thread:join-thread ,thread))
+                    (ignore-errors (broker:stop-broker ,br))))))
+         (setf (uiop:getenv "XDG_STATE_HOME") (or ,saved ""))
+         (ignore-errors (uiop:delete-directory-tree
+                         ,dir :validate t :if-does-not-exist :ignore))))))
+
+(defmacro with-rooted-session ((session-var) &body body)
+  "Bind SESSION-VAR to a fresh session rooted at a temp project directory, with
+   DSMR_BUS_AGENT and the other resolution vars neutralized, and disconnect
+   every participant the session opened on the way out."
+  (let ((root (gensym "ROOT")))
+    `(with-clean-resolution-env
+       (let* ((,root (%make-temp-directory))
+              (,session-var (make-session :id "bus-receive" :project-root ,root)))
+         (unwind-protect (progn ,@body)
+           (ignore-errors (disconnect-session-bus ,session-var))
+           (ignore-errors (uiop:delete-directory-tree
+                           ,root :validate t :if-does-not-exist :ignore)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Driving the verb
+;;; ---------------------------------------------------------------------------
+
+(defun %args (&rest kvs)
+  "An MCP arguments hash-table from alternating string-key/value pairs."
+  (let ((ht (make-hash-table :test 'equal)))
+    (loop for (k v) on kvs by #'cddr do (setf (gethash k ht) v))
+    ht))
+
+(defun %call (session &rest kvs)
+  "Invoke bus-receive for SESSION with the given arguments and return the result
+   payload (the tool's own hash-table, unwrapped from the JSON-RPC envelope)."
+  (let ((tool (make-instance 'bus-receive-tool :session session)))
+    (gethash "result" (tool-handle tool 1 (apply #'%args kvs)))))
+
+(defun %field (payload key)
+  (gethash key payload))
+
+(defun %messages (payload)
+  "The delivered messages as a list, in delivery order."
+  (coerce (gethash "messages" payload) 'list))
+
+(defun %error-type (payload)
+  (and (gethash "isError" payload) (gethash "error_type" payload)))
+
+(defmacro with-bus-session ((session-var) &body body)
+  "The common shape of every test here: an isolated bus, a rooted session, and
+   the session's receiving participant already connected — so it is positioned
+   at the head before any traffic is published."
+  `(with-isolated-bus ()
+     (with-rooted-session (,session-var)
+       ;; Connect first: a participant that has never read starts at the current
+       ;; head, so anything published before this call is not addressed to it.
+       (session-agent ,session-var)
+       ,@body)))
+
+(defmacro with-publisher ((var session) &body body)
+  "Bind VAR to a separate publishing participant in SESSION's namespace,
+   disconnecting it on exit. Separate because the receive path filters an
+   agent's own messages out of what it returns."
+  `(let ((,var (agent:connect-agent
+                (namestring (dsmr-mcp/src/state:session-project-root ,session))
+                :name "backlog-publisher")))
+     (unwind-protect (progn ,@body)
+       (ignore-errors (agent:disconnect-agent ,var)))))
+
+(defun %publish-backlog (publisher n)
+  "Publish N numbered messages and return them as a list in publication order."
+  (loop for i from 1 to n
+        for text = (format nil "m~D" i)
+        do (agent:agent-publish publisher text)
+        collect text))
+
+;;; ---------------------------------------------------------------------------
+;;; Bounded delivery
+;;; ---------------------------------------------------------------------------
+
+(define-test default-limit-bounds-a-large-backlog
+  "A backlog larger than the default batch comes back one page at a time, and
+the reply says how much is still waiting. Without the remaining count a caller
+cannot tell a page from the whole queue."
+  (with-bus-session (session)
+    (with-publisher (pub session)
+      (%publish-backlog pub 50))
+    (let ((payload (%call session)))
+      (is = +default-batch-size+ (%field payload "count")
+          "a default receive delivers exactly one batch")
+      (is = 30 (%field payload "remaining_pending")
+          "and reports the 30 records it did not deliver")
+      (is string= "m1" (first (%messages payload))
+          "delivery is oldest-first")
+      (is string= "m20" (car (last (%messages payload)))
+          "and stops at the batch boundary"))))
+
+(define-test explicit-limit-overrides-the-default
+  "An explicit limit is honoured in place of the default batch size."
+  (with-bus-session (session)
+    (with-publisher (pub session)
+      (%publish-backlog pub 50))
+    (let ((payload (%call session "limit" 5)))
+      (is = 5 (%field payload "count") "exactly the requested page size")
+      (is = 45 (%field payload "remaining_pending") "the rest is still pending")
+      (is equal '("m1" "m2" "m3" "m4" "m5") (%messages payload)))))
+
+(define-test successive-calls-walk-the-backlog-without-gap-or-repeat
+  "Three default-limit calls over a 50-record backlog concatenate to the whole
+backlog exactly once each, in order. Pagination that dropped or repeated a
+record would be worse than the unbounded delivery it replaced."
+  (with-bus-session (session)
+    (with-publisher (pub session)
+      (let ((published (%publish-backlog pub 50))
+            (seen '()))
+        (dotimes (_ 3)
+          (setf seen (append seen (%messages (%call session)))))
+        (is equal published seen
+            "every record delivered once, in publication order")
+        (is = 0 (%field (%call session) "remaining_pending")
+            "and nothing is left pending afterwards")))))
+
+;;; ---------------------------------------------------------------------------
+;;; The limit guard
+;;; ---------------------------------------------------------------------------
+
+(define-test non-positive-and-non-integer-limits-are-refused
+  "A zero, negative or non-integer limit is refused at the tool boundary and the
+cursor does not move. Left to the core a zero would degrade to the default batch
+and a string would error deep inside the log reader — both worse than telling
+the caller what was wrong with the value it sent."
+  (with-bus-session (session)
+    (with-publisher (pub session)
+      (%publish-backlog pub 25))
+    (dolist (bad '(0 -1 "five"))
+      (let ((payload (%call session "limit" bad)))
+        (is string= "invalid-argument" (%error-type payload)
+            (format nil "limit ~S is refused" bad))
+        (false (gethash "messages" payload)
+               (format nil "limit ~S delivers nothing" bad))))
+    ;; The cursor is where it was: the next valid call still starts at m1.
+    (let ((payload (%call session)))
+      (is string= "m1" (first (%messages payload))
+          "a refused call left the cursor unmoved"))))
+
+(define-test timeout-validation-is-unchanged
+  "The pre-existing timeout_ms guard still refuses a negative value in the same
+shape the new limit guard mirrors."
+  (with-bus-session (session)
+    (is string= "invalid-argument" (%error-type (%call session "timeout_ms" -1)))
+    (is string= "invalid-argument"
+        (%error-type (%call session "timeout_ms" "soon")))))
+
+;;; ---------------------------------------------------------------------------
+;;; Explicit abandonment
+;;; ---------------------------------------------------------------------------
+
+(define-test skip-to-head-abandons-the-backlog-and-says-how-much
+  "skip_to_head gives up the whole backlog and reports the count. The count is
+the point: a silent discard is the amnesia that made restarting look like a
+cure."
+  (with-bus-session (session)
+    (with-publisher (pub session)
+      (%publish-backlog pub 25))
+    (let ((payload (%call session "skip_to_head" t)))
+      (is = 25 (%field payload "abandoned") "reports what it gave up")
+      (is = 0 (%field payload "count") "and delivers nothing in the same call"))
+    (let ((payload (%call session)))
+      (is = 0 (%field payload "count") "the backlog is gone")
+      (is = 0 (%field payload "remaining_pending") "and nothing is pending"))))
+
+(define-test skip-to-head-on-a-current-cursor-abandons-nothing
+  "With nothing pending there is nothing to give up, and the count says so
+rather than reporting a discard that did not happen."
+  (with-bus-session (session)
+    (let ((payload (%call session "skip_to_head" t)))
+      (is = 0 (%field payload "abandoned")))))
