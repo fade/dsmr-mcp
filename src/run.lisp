@@ -37,6 +37,8 @@
                 #:initialize-pool #:shutdown-pool #:release-session)
   (:import-from #:usocket)
   (:import-from #:sb-ext)
+  (:import-from #:dsmr-mcp/src/bus-listener
+                #:start-bus-listener #:stop-bus-listener)
   ;; process-json-line is re-exported from here so src/main.lisp's
   ;; existing :import-from dsmr-mcp/src/run #:process-json-line
   ;; continues to resolve. The canonical definition lives in
@@ -321,6 +323,31 @@ It shares %RESOLVE-PROJECT-ROOT, %READ-CONF-INTO-DEFAULTS, %OR-FROM-ENV, and
 ;;; Entry point
 ;;; ---------------------------------------------------------------------------
 
+(defun %env-bus-agent ()
+  "The DSMR_BUS_AGENT value, or NIL when unset or empty — this server's own
+addressable bus name. Mirrors the bus-helpers resolution: an empty string reads
+as absent, the same convention the other DSMR_* env reads use."
+  (let ((value (uiop:getenv "DSMR_BUS_AGENT")))
+    (when (and value (plusp (length value)))
+      value)))
+
+(defun %maybe-start-bus-listener (resolved-root session)
+  "Start the background bus listener when this server is addressable on the bus.
+
+The listener needs two things to be a restart target: a non-nil project root
+(its namespace) and a non-empty DSMR_BUS_AGENT (the name a peer addresses). An
+unnamed server cannot be the target of a restart command, so the listener is not
+started for one. The start is best-effort — a bus failure at startup must never
+prevent the server from serving — and stop-bus-listener is registered as an exit
+hook so the listener is released on a process exit. The listener survives a
+rung-1 reset: reset-local-backends never references the listener thread or its
+agent, so a local reset leaves the cross-session command path intact."
+  (let ((own-name (%env-bus-agent)))
+    (when (and resolved-root own-name)
+      (ignore-errors
+       (start-bus-listener (namestring resolved-root) own-name :session session)
+       (pushnew 'stop-bus-listener sb-ext:*exit-hooks*)))))
+
 (defun run (&key (transport nil transport-supplied-p)
                  (slynk-attach nil slynk-attach-supplied-p)
                  (mode nil mode-supplied-p)
@@ -468,12 +495,17 @@ The dsmr-mcp:run nickname (re-exported by src/main.lisp) resolves to this functi
             ;; only for in-image callers (tests); the real server exits.
             (multiple-value-bind (wire-out wire-in restore-streams)
                 (isolate-stdio-wire)
-              (unwind-protect
-                   (serve-streams wire-in wire-out
-                                  :session (make-session :id "stdio"
-                                                         :slynk-attach resolved-slynk-attach
-                                                         :project-root resolved-root))
-                (funcall restore-streams))))
+              (let ((session (make-session :id "stdio"
+                                           :slynk-attach resolved-slynk-attach
+                                           :project-root resolved-root)))
+                ;; Start the cross-session restart listener (when addressable)
+                ;; before serving, and stop it on unwind. It runs on its own
+                ;; thread, independent of the read loop below.
+                (%maybe-start-bus-listener resolved-root session)
+                (unwind-protect
+                     (serve-streams wire-in wire-out :session session)
+                  (stop-bus-listener)
+                  (funcall restore-streams)))))
            (:tcp
             (%check-remote-bind resolved-bind)
             (log-event :info "run.start" "transport" :tcp "mode" *mode*)
