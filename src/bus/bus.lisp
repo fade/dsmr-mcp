@@ -24,8 +24,16 @@
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:cursor #:dsmr-mcp/src/bus/cursor)
                     (#:election #:dsmr-mcp/src/bus/election)
+                    (#:envelope #:dsmr-mcp/src/bus/envelope)
                     (#:wal #:dsmr-mcp/src/bus/wal)
                     (#:tz #:dsmr-mcp/src/bus/zmq))
+  (:import-from #:dsmr-mcp/src/bus/envelope
+                #:encode-id
+                #:agent-id
+                #:wrap-envelope
+                #:decode-envelope
+                #:delivered-body-string
+                #:+envelope-delimiter+)
   (:export #:client #:connect-client #:publish #:disconnect-client
            #:subscriber #:subscribe #:unsubscribe #:poll #:poll-count #:await
            #:agent-id #:encode-id
@@ -39,68 +47,31 @@
    relative durations (deadlines) — never as a wall clock the operator reads."
   (values (truncate (* 1000 (get-internal-real-time)) internal-time-units-per-second)))
 
-;;; --------------------------------------------------------------- identity
-
-(defvar *local-counter* 0
-  "Process-local counter for auto-generated subscriber names.")
-
-(defun %unique-local ()
-  "A token unique across processes (pid) and within one (counter) — gensym-style
-   for an anonymous, ephemeral subagent."
-  (format nil "g~A-~A" (sb-posix:getpid) (incf *local-counter*)))
-
-(defun agent-id (namespace &key name)
-  "Construct a bus subscriber id of the form <namespace>/<name>. NAMESPACE is the
-   project root (the shared 'generation name'); NAME, when given, is a stable
-   subagent name that resumes its cursor across restarts. When NAME is omitted an
-   auto-unique ephemeral name is generated, so multiple anonymous subagents in one
-   project each get a distinct id under the shared namespace."
-  (format nil "~A/~A" namespace (or name (%unique-local))))
-
-(defun encode-id (id)
-  "Percent-encode ID into a single filesystem-safe token for a cursor filename.
-   Injective, so two distinct ids never share a cursor."
-  (with-output-to-string (s)
-    (loop for ch across id
-          do (if (or (alphanumericp ch) (member ch '(#\. #\- #\_)))
-                 (write-char ch s)
-                 (format s "%~2,'0X" (char-code ch))))))
-
 (defun %release-fd (fd)
   (when fd (ignore-errors (election:close-lock fd))))
 
 ;;; ------------------------------------------------------ message envelope
 ;;;
-;;; Two distinct needs ride one body envelope, with NO change to the WAL frame or
-;;; the broker (which appends the submission verbatim):
+;;; Id construction, id encoding, and the body envelope itself live in the
+;;; dsmr-mcp/src/bus/envelope leaf and are imported here, then re-exported so
+;;; BUS:ENCODE-ID and friends stay the names callers already use. They are
+;;; separate because the standalone watcher binary has to decode the same wire
+;;; format to tell a peer's message from its own, and that binary links no
+;;; ZeroMQ — which this file does. One implementation, two consumers.
 ;;;
-;;;   - SELF-WAKE: the publisher learns the broker-assigned seq of its OWN message
-;;;     by tagging it with a globally-unique correlation-id, then matching that id
-;;;     on the durable record it reads back. Matching by message IDENTITY (not WAL
-;;;     position) is what makes this race-free under concurrent cross-process
-;;;     publishing — a foreign agent's record simply fails the id match.
-;;;
-;;;   - SELF-ECHO suppression: the envelope also carries the publisher's stable
-;;;     self-id, so the publisher's OWN receive can filter its own messages out of
-;;;     the returned set (the agent layer does this) — without ever touching a
-;;;     cursor.
-;;;
-;;; Wire format of the body string:  correlation-id <DELIM> encoded-self-id <DELIM> payload
-;;; DELIM is a single char outside both the correlation-id alphabet and ENCODE-ID's
-;;; output, so neither field can ever contain it; the payload follows the SECOND
-;;; delimiter raw and may itself contain DELIM harmlessly (decoding splits on the
-;;; first two only).
-
-(defconstant +envelope-delimiter+ #\|
-  "The envelope field separator. Outside the correlation-id alphabet (lowercase
-   hex/alphanumerics) and outside ENCODE-ID's output (percent-encoding over
-   alphanumerics + . - _), so it can appear only in the payload — never in either
-   id field.")
+;;; What stays here is the correlation-id: it is minted per publish, matched on
+;;; read-back to learn this message's assigned seq, and never parsed by anyone
+;;; but the publisher, so it belongs with the publishing code rather than with
+;;; the shared format.
 
 (defvar *correlation-random* (make-random-state t)
   "A per-process random source, seeded from system entropy at load, for the random
    nonce in a correlation-id. Distinct fresh images thus draw distinct nonces even
    when pid + counter happen to align.")
+
+(defvar *correlation-counter* 0
+  "Process-local counter contributing the monotonic component of a
+   correlation-id.")
 
 (defun %new-correlation-id ()
   "A token unique across processes (pid), within one process (a monotonic counter),
@@ -109,44 +80,8 @@
    and two publishes anywhere on the host never collide."
   (format nil "c~(~x~)x~(~x~)x~(~x~)"
           (sb-posix:getpid)
-          (incf *local-counter*)
+          (incf *correlation-counter*)
           (random (expt 2 48) *correlation-random*)))
-
-(defun %wrap-envelope (correlation-id self-id payload)
-  "Build the wire body: CORRELATION-ID + DELIM + (ENCODE-ID SELF-ID) + DELIM +
-   PAYLOAD. A NIL SELF-ID embeds an empty encoded field; the wrap always emits two
-   delimiters so the format is uniform and decoding is unambiguous."
-  (format nil "~A~C~A~C~A"
-          correlation-id
-          +envelope-delimiter+
-          (if self-id (encode-id self-id) "")
-          +envelope-delimiter+
-          payload))
-
-(defun decode-envelope (body-string)
-  "Split a wire body into THREE values: the original user TEXT (everything past the
-   second delimiter), the CORRELATION-ID, and the ENCODED SELF-ID (compared
-   encoded-vs-encoded against (ENCODE-ID id), so it is returned in its encoded
-   form). The payload may itself contain the delimiter — only the first two
-   delimiter positions are used. A body WITHOUT two delimiters is a legacy,
-   un-enveloped message from an old-core publisher: it is returned verbatim as the
-   text with NIL ids, so the decoder is backward-compatible during a staggered
-   rollout."
-  (let ((d1 (position +envelope-delimiter+ body-string)))
-    (if d1
-        (let ((d2 (position +envelope-delimiter+ body-string :start (1+ d1))))
-          (if d2
-              (values (subseq body-string (1+ d2))
-                      (subseq body-string 0 d1)
-                      (let ((encoded (subseq body-string (1+ d1) d2)))
-                        (if (zerop (length encoded)) nil encoded)))
-              (values body-string nil nil)))
-        (values body-string nil nil))))
-
-(defun delivered-body-string (record)
-  "The original user text of RECORD — its body decoded through the envelope. A
-   single call for body-only readers that do not need the ids."
-  (values (decode-envelope (wal:record-body-string record))))
 
 ;;; --------------------------------------------------------------- client
 
@@ -197,7 +132,7 @@
          (paths (client-paths client))
          (floor (or after (wal:scan (broker:bus-paths-wal paths)))))
     (tz:send-message (client-submitter client)
-                     (%wrap-envelope correlation-id self-id payload))
+                     (wrap-envelope correlation-id self-id payload))
     (%await-own-seq paths correlation-id floor)))
 
 (defun disconnect-client (client)
