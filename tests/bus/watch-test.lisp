@@ -26,6 +26,7 @@
                 #:wrap-envelope)
   (:import-from #:dsmr-bus-watch/src/bus/watch
                 #:watch-until-foreign
+                #:watch-stream
                 #:poll-new
                 #:default-wal-path
                 #:default-cursors-dir
@@ -162,6 +163,13 @@
                        :if-exists :supersede
                        :if-does-not-exist :create)
     (prin1 seq out))
+  seq)
+
+(defun append-from (path seq self-id &optional (text "x"))
+  "Append record SEQ to PATH as published by SELF-ID. A NIL SELF-ID writes the
+   raw text with no envelope at all — a legacy message from an old-core
+   publisher."
+  (append-record path seq (if self-id (wrap-envelope "c1" self-id text) text))
   seq)
 
 (define-test unknown-flag-warns-and-parsing-continues
@@ -332,3 +340,73 @@
                (self-id (%resolve-self-id opts)))
           (write-cursor dir self-id 4)
           (is = 2 (%resolve-baseline opts self-id w dir)))))))
+
+(define-test our-own-publishes-never-fire-the-watch
+  ;; The reason arming no longer depends on publishing first.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me")))
+      (append-from w 1 me)
+      (append-from w 2 me)
+      (false (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 0.05
+                                      :self-id me)))))
+
+(define-test foreign-record-among-our-own-fires-with-its-own-seq
+  ;; The fired seq is the foreign record's, not the log head's — the head here
+  ;; belongs to this agent and is nothing to wake anyone for.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them")))
+      (append-from w 1 me)
+      (append-from w 2 them)
+      (append-from w 3 me)
+      (is = 2 (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 5
+                                       :self-id me)))))
+
+(define-test legacy-unenveloped-record-fires
+  ;; A body with no envelope carries no author. Reading that as "ours" would
+  ;; drop real traffic every time a publisher lagged a core rebuild.
+  (with-wal (w)
+    (append-from w 1 nil "a plain body from an old-core publisher")
+    (is = 1 (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 5
+                                     :self-id (agent-id "/p" :name "me")))))
+
+(define-test without-an-identity-every-record-fires
+  ;; No self to recognize means no filter, byte for byte the old behavior.
+  (with-wal (w)
+    (append-from w 1 (agent-id "/p" :name "me"))
+    (is = 1 (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 5))))
+
+(define-test streaming-skips-our-own-and-still-steps-over-them
+  ;; One signal per foreign seq, and the cursor clears the skipped records so
+  ;; the next poll does not re-examine them.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them"))
+          (seen '()))
+      (flet ((collect (s) (push s seen)))
+        (append-from w 1 me)
+        (append-from w 2 them)
+        (let ((cursor (poll-new w 0 #'collect me)))
+          (is = 2 cursor)
+          (is equal '(2) (reverse seen))
+          (setf seen '())
+          (append-from w 3 me)
+          (append-from w 4 them)
+          (setf cursor (poll-new w cursor #'collect me))
+          (is = 4 cursor)
+          (is equal '(4) (reverse seen)))))))
+
+(define-test watch-stream-emits-only-foreign-seqs
+  ;; The whole streaming loop, not just one step of it.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them"))
+          (seen '()))
+      (append-from w 1 me)
+      (append-from w 2 them)
+      (append-from w 3 me)
+      (let ((final (watch-stream w 0 :poll-ms 5 :recycle-seconds 0.05
+                                     :self-id me
+                                     :emit (lambda (s) (push s seen)))))
+        (is = 3 final)
+        (is equal '(2) (reverse seen))))))
