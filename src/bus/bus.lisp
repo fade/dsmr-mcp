@@ -35,12 +35,16 @@
                 #:wrap-envelope
                 #:decode-envelope
                 #:delivered-body-string
+                #:foreign-self-id-p
+                #:foreign-record-p
                 #:+envelope-delimiter+)
   (:export #:client #:connect-client #:publish #:disconnect-client
-           #:subscriber #:subscribe #:unsubscribe #:poll #:poll-count #:await
+           #:subscriber #:subscribe #:unsubscribe #:poll #:poll-count
+           #:poll-count-foreign #:await
            #:skip-to-head #:+default-batch-size+
            #:agent-id #:encode-id
-           #:decode-envelope #:delivered-body-string))
+           #:decode-envelope #:delivered-body-string
+           #:foreign-self-id-p #:foreign-record-p))
 
 (in-package #:dsmr-mcp/src/bus/bus)
 
@@ -185,6 +189,26 @@
   "How many records are waiting for SUBSCRIBER right now, without delivering them
    or moving the cursor."
   (cursor:pending-count (subscriber-cursor subscriber)))
+
+(defun poll-count-foreign (subscriber own-encoded)
+  "How many records past SUBSCRIBER's cursor DELIVERY would actually hand back for
+   the agent whose encoded self-id is OWN-ENCODED — foreign records only, under the
+   exact FOREIGN-RECORD-P predicate the receive path filters by. This is the count
+   an agent should read as `pending`: POLL-COUNT is the raw count above the cursor
+   and includes the agent's OWN un-consumed publishes, which delivery drops, so it
+   over-reports for a subscriber that also publishes. Read-only — reads the records
+   above the cursor and never moves it.
+
+   Sharing FOREIGN-RECORD-P with AGENT-RECEIVE is the whole point: the count and
+   the delivery filter turn on one predicate, so a reported `pending` can never
+   promise a message that a receive would then quietly drop as this agent's own."
+  (let ((cur (subscriber-cursor subscriber))
+        (foreign 0))
+    (dolist (record (wal:read-records (cursor:subscriber-wal cur)
+                                      :after (cursor:cursor-value cur))
+                    foreign)
+      (when (foreign-record-p record own-encoded)
+        (incf foreign)))))
 
 (defun await (subscriber &key (timeout-ms 1000) (limit cursor:+default-batch-size+))
   "Block up to TIMEOUT-MS for at least one message, then deliver and return it.
