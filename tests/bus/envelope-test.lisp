@@ -101,3 +101,23 @@
         (b (envelope:agent-id "/p")))
     (false (string= a b) "two ephemeral ids in one namespace differ")
     (is = 0 (search "/p/" a) "an ephemeral id is still scoped to its namespace")))
+
+(define-test foreign-self-id-p-recognizes-own-foreign-and-legacy
+  "The shared delivery predicate, the single comparison the receive filter, the
+   pending count, and the watcher all turn on. An agent's OWN encoded id is not
+   foreign (delivery drops it); any other id is foreign (delivery returns it); a
+   record with NO self-id is a legacy un-enveloped message and counts as foreign
+   so a staggered rollout never drops it; and with no identity resolved (a NIL
+   own-encoded) everything is foreign, the pre-identity default."
+  (let ((mine (envelope:encode-id "/p/me"))
+        (theirs (envelope:encode-id "/p/them")))
+    (false (envelope:foreign-self-id-p mine mine)
+           "an agent's own record is not foreign to it")
+    (true (envelope:foreign-self-id-p theirs mine)
+          "another agent's record is foreign")
+    (true (envelope:foreign-self-id-p nil mine)
+          "a legacy record with no self-id counts as foreign")
+    (true (envelope:foreign-self-id-p mine nil)
+          "with no identity resolved, everything is foreign")
+    (true (envelope:foreign-self-id-p nil nil)
+          "no identity and no self-id is still foreign")))
