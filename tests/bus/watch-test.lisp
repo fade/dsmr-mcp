@@ -30,6 +30,7 @@
                 #:poll-new
                 #:default-wal-path
                 #:default-cursors-dir
+                #:default-watch-dir
                 ;; internal: argument parsing, identity resolution and baseline
                 ;; arming are only observable through main otherwise, and each
                 ;; carries behavior worth pinning on its own
@@ -46,7 +47,18 @@
                 #:opt-stream-p
                 #:opt-poll-ms
                 #:opt-recycle-seconds
-                #:opt-help-p))
+                #:opt-check-p
+                #:opt-live-window-seconds
+                #:opt-help-p)
+  ;; The heartbeat helpers moved to a shared leaf so the watcher (writer) and the
+  ;; MCP core (reader) share one implementation of the beat filename and format.
+  ;; The pure liveness decision and its file-backed classifier both carry behavior
+  ;; a caller depends on but cannot observe through main alone.
+  (:import-from #:dsmr-mcp/src/bus/heartbeat
+                #:beat-path
+                #:write-beat
+                #:beat-status
+                #:beat-liveness))
 
 (in-package #:dsmr-mcp/tests/bus/watch-test)
 
@@ -410,3 +422,57 @@
                                      :emit (lambda (s) (push s seen)))))
         (is = 3 final)
         (is equal '(2) (reverse seen))))))
+
+;;; heartbeat -----------------------------------------------------------------
+
+(defmacro with-watch-dir ((var) &body body)
+  "Bind VAR to a fresh empty heartbeat directory and remove it afterwards. The
+   random suffix is seeded per call for the same reason WITH-CURSORS-DIR seeds
+   its own: SBCL's default random state repeats across fresh images, so an
+   unseeded name would collide between runs and a `dead`/absent assertion would
+   flake on a leftover file."
+  `(let ((,var (ensure-directories-exist
+                (merge-pathnames
+                 (format nil "dsmr-bus-watch-beats-~D-~D/"
+                         (sb-posix:getpid)
+                         (random 100000000 (make-random-state t)))
+                 (uiop:temporary-directory)))))
+     (unwind-protect (progn ,@body)
+       (ignore-errors (uiop:delete-directory-tree ,var :validate t)))))
+
+(define-test beat-liveness-is-dead-for-a-missing-file
+  ;; No heartbeat at all is the `not running` case: an agent whose watch never
+  ;; started, or one whose watch unwound cleanly and removed its beat.
+  (with-watch-dir (dir)
+    (let ((path (merge-pathnames "absent.beat" dir)))
+      (is eq :dead (beat-liveness path 100)))))
+
+(define-test beat-liveness-is-live-for-a-just-written-beat
+  ;; A beat written this instant is well inside any sane window; a real live
+  ;; watch rewrites it every poll, so its beat is never older than a poll.
+  (with-watch-dir (dir)
+    (let ((path (beat-path (agent-id "/p" :name "me") dir)))
+      (write-beat path :mode :stream :baseline 3 :poll-ms 250)
+      (multiple-value-bind (status age pid) (beat-liveness path 100)
+        (is eq :live status)
+        (true (integerp age))
+        (is = (sb-posix:getpid) pid)))))
+
+(define-test beat-status-threshold-is-inclusive-of-the-window
+  ;; The pure age->status decision, tested straight across the boundary so the
+  ;; threshold is pinned without any clock games: at-or-within is live, past is
+  ;; stale.
+  (is eq :live  (beat-status 0 5))
+  (is eq :live  (beat-status 4 5))
+  (is eq :live  (beat-status 5 5))
+  (is eq :stale (beat-status 6 5))
+  (is eq :stale (beat-status 100 5)))
+
+(define-test beat-path-is-stable-for-a-given-identity
+  ;; Write and check must name the same file byte for byte, so the path a self-id
+  ;; maps to cannot depend on anything but the id and the directory.
+  (with-watch-dir (dir)
+    (let ((id (agent-id "/p" :name "runciter")))
+      (is equal
+          (namestring (beat-path id dir))
+          (namestring (beat-path id dir))))))

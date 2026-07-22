@@ -21,6 +21,8 @@
            #:wrap-envelope
            #:decode-envelope
            #:delivered-body-string
+           #:foreign-self-id-p
+           #:foreign-record-p
            #:+envelope-delimiter+))
 
 (in-package #:dsmr-mcp/src/bus/envelope)
@@ -115,3 +117,30 @@
   "The original user text of RECORD — its body decoded through the envelope. A
    single call for body-only readers that do not need the ids."
   (values (decode-envelope (wal:record-body-string record))))
+
+(defun foreign-self-id-p (encoded-self-id own-encoded)
+  "True when a record whose decoded ENCODED-SELF-ID is ENCODED-SELF-ID is FOREIGN
+   to the agent whose encoded id is OWN-ENCODED — i.e. that agent did not publish
+   it, so delivery would return it. This is the one comparison the whole delivery
+   filter turns on, factored to a single place so the receive path, the pending
+   count, and the watcher cannot drift apart the first time either alphabet
+   changes.
+
+   Two cases deliberately count as foreign. A NIL OWN-ENCODED means no identity
+   resolved, so there is no self to recognize and everything counts (exactly the
+   pre-identity watcher behavior). A NIL ENCODED-SELF-ID is a legacy un-enveloped
+   message from an old-core publisher; treating it as this agent's own would drop
+   real traffic on the floor through a staggered rollout."
+  (or (null own-encoded)
+      (not (and encoded-self-id (string= encoded-self-id own-encoded)))))
+
+(defun foreign-record-p (record own-encoded)
+  "True when RECORD was not published by the agent whose encoded id is
+   OWN-ENCODED — i.e. RECORD is deliverable to that agent. Decodes RECORD's body
+   through the shared envelope and defers the verdict to FOREIGN-SELF-ID-P, so the
+   comparison is encoded-against-encoded on the self-id this leaf pulls out of the
+   body — the same comparison every consumer of this leaf makes."
+  (multiple-value-bind (text correlation-id self-id)
+      (decode-envelope (wal:record-body-string record))
+    (declare (ignore text correlation-id))
+    (foreign-self-id-p self-id own-encoded)))

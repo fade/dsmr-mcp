@@ -42,6 +42,15 @@ identity so it never resumes the main agent's cursor."))
   (:metaclass mcp-tool-class)
   (:documentation "MCP tool: report coordination-bus status for this agent."))
 
+(defun %watcher-line (status age)
+  "One human-readable clause about this agent's wakeup watcher, appended to the
+   status text so an agent sees at a glance whether its own ears are on. STATUS is
+   \"live\"/\"stale\"/\"dead\" and AGE is whole seconds or NIL."
+  (cond
+    ((equal status "live")  (format nil "Watcher: live (age ~Ds)." age))
+    ((equal status "stale") (format nil "Watcher: stale (age ~Ds) — may have stopped listening." age))
+    (t "Watcher: DEAD — nothing listening.")))
+
 (c2mop:ensure-finalized (find-class 'bus-status-tool))
 
 (defmethod tool-handle ((tool bus-status-tool) id args)
@@ -52,18 +61,25 @@ identity so it never resumes the main agent's cursor."))
                (st (agent-status a))
                (running (getf st :broker-running))
                (pending (getf st :pending))
-               (aid (getf st :id)))
+               (aid (getf st :id))
+               (watcher-status (getf st :watcher-status))
+               (watcher-age (getf st :watcher-age-seconds))
+               (live-watcher (getf st :live-watcher)))
           (result id (make-ht "broker_running" (and running t)
                               "pending" pending
                               "agent_id" aid
                               "agent_name" (getf st :name)
                               "namespace" (getf st :namespace)
                               "stable" (and (getf st :stable) t)
+                              "live_watcher" (and live-watcher t)
+                              "watcher_status" watcher-status
+                              "watcher_age_seconds" (or watcher-age 'null)
                               "content" (text-content
-                                         (format nil "You are ~A. Bus ~A: ~D message(s) pending."
+                                         (format nil "You are ~A. Bus ~A: ~D message(s) pending. ~A"
                                                  (identity-summary a)
                                                  (if running "up" "down (no broker)")
-                                                 pending)))))
+                                                 pending
+                                                 (%watcher-line watcher-status watcher-age))))))
       (no-project-root ()
         (result id (make-ht "isError" t
                             "error_type" "project-root-not-set"

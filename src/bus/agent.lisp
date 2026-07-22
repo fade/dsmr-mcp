@@ -19,6 +19,7 @@
   (:use #:cl)
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:bus #:dsmr-mcp/src/bus/bus)
+                    (#:heartbeat #:dsmr-mcp/src/bus/heartbeat)
                     (#:wal #:dsmr-mcp/src/bus/wal))
   (:export #:agent #:agent-id #:agent-name #:agent-namespace #:agent-stable-p
            #:agent-paths
@@ -110,8 +111,10 @@
           (bus:decode-envelope (wal:record-body-string record))
         (declare (ignore cid))
         ;; Keep a legacy un-enveloped message (sid NIL) and any FOREIGN message;
-        ;; drop only records carrying this agent's own encoded self-id.
-        (unless (and sid (string= sid own))
+        ;; drop only records carrying this agent's own encoded self-id. The verdict
+        ;; goes through the shared FOREIGN-SELF-ID-P so this filter and the pending
+        ;; count can never disagree about what delivery returns.
+        (when (bus:foreign-self-id-p sid own)
           (push text out))))))
 
 (defun agent-skip-to-head (agent)
@@ -123,14 +126,34 @@
 
 (defun agent-status (agent)
   "A snapshot of this agent's view of the bus: its own identity (full id, the name
-   within the namespace, the namespace, and whether the identity is stable), plus
-   whether a broker is live and how many messages are waiting for it right now."
-  (list :id (agent-id agent)
-        :name (agent-name agent)
-        :namespace (agent-namespace agent)
-        :stable (agent-stable-p agent)
-        :broker-running (broker:broker-running-p (agent-paths agent))
-        :pending (bus:poll-count (agent-subscriber agent))))
+   within the namespace, the namespace, and whether the identity is stable),
+   whether a broker is live, how many messages are waiting for it right now, and
+   whether a wakeup watcher is currently listening on its behalf.
+
+   PENDING is the self-aware count: only the FOREIGN records delivery would
+   actually return, never this agent's own un-consumed publishes (which receive
+   filters out). It shares one predicate with AGENT-RECEIVE, so the number here
+   and the batch a receive hands back cannot disagree.
+
+   The watcher fields come from the heartbeat a running watch refreshes under this
+   agent's identity: LIVE-WATCHER is true only when that beat is fresh, and
+   WATCHER-STATUS / WATCHER-AGE-SECONDS carry the detail (a dead or absent watch
+   reports \"dead\" with a NIL age). The freshness window is the shared default, so
+   this read and the watcher's own --check-live agree on what `live` means."
+  (let ((own (bus:encode-id (agent-id agent))))
+    (multiple-value-bind (wstatus wage)
+        (heartbeat:beat-liveness
+         (heartbeat:beat-path (agent-id agent) (heartbeat:default-watch-dir))
+         heartbeat:+default-live-window-seconds+)
+      (list :id (agent-id agent)
+            :name (agent-name agent)
+            :namespace (agent-namespace agent)
+            :stable (agent-stable-p agent)
+            :broker-running (broker:broker-running-p (agent-paths agent))
+            :pending (bus:poll-count-foreign (agent-subscriber agent) own)
+            :live-watcher (eq wstatus :live)
+            :watcher-status (string-downcase (symbol-name wstatus))
+            :watcher-age-seconds wage))))
 
 (defun disconnect-agent (agent)
   "Release the agent's client and subscriber. The durable cursor is left in place
