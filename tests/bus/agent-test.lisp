@@ -16,7 +16,9 @@
   (:use #:cl #:parachute)
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:bus #:dsmr-mcp/src/bus/bus)
-                    (#:agent #:dsmr-mcp/src/bus/agent)))
+                    (#:agent #:dsmr-mcp/src/bus/agent)
+                    (#:heartbeat #:dsmr-mcp/src/bus/heartbeat)
+                    (#:wal #:dsmr-mcp/src/bus/wal)))
 
 (in-package #:dsmr-mcp/tests/bus/agent-test)
 
@@ -231,3 +233,115 @@
                         (is = 0 (length (agent:agent-receive s))))
                    (agent:disconnect-agent s))))
           (agent:disconnect-agent pub))))))
+
+;;; pending count matches delivery ---------------------------------------------
+
+(define-test pending-count-counts-only-what-a-receive-would-return
+  "The self-aware pending count matches delivery exactly. An agent that both
+   publishes and consumes has its OWN un-consumed publishes ABOVE its cursor, but
+   receive filters those out — so a pending count that included them would promise
+   messages a receive then silently drops. The reported count is the FOREIGN
+   records only (== what receive returns); the raw count still includes this
+   agent's own. This is the regression guard for the status/receive mismatch."
+  (with-bus (paths)
+    (with-running-broker (br paths)
+      (let ((me (agent:connect-agent "/proj" :name "me" :paths paths :ensure-broker nil))
+            (them (agent:connect-agent "/proj" :name "them" :paths paths :ensure-broker nil)))
+        (unwind-protect
+             (progn
+               ;; K = 2 of my own publishes, M = 3 foreign, interleaved above my
+               ;; cursor (which seeded at the empty-log head when I connected).
+               (agent:agent-publish me "mine-0")
+               (agent:agent-publish them "foreign-0")
+               (agent:agent-publish me "mine-1")
+               (agent:agent-publish them "foreign-1")
+               (agent:agent-publish them "foreign-2")
+               (loop repeat 200
+                     until (= 5 (wal:scan (broker:bus-paths-wal paths)))
+                     do (sleep 0.02))
+               ;; Reported pending == M: only the deliverable foreign records.
+               (is = 3 (getf (agent:agent-status me) :pending)
+                   "pending counts the 3 foreign records, not my own 2")
+               ;; Raw count is K+M: the unfiltered position delta.
+               (is = 5 (bus:poll-count (agent::agent-subscriber me))
+                   "the raw count still includes my own un-consumed publishes")
+               ;; And a receive returns EXACTLY those M foreign, in order — the
+               ;; count promised what delivery delivers.
+               (is equal '("foreign-0" "foreign-1" "foreign-2")
+                   (agent:agent-receive me :timeout-ms 3000))
+               (is = 0 (getf (agent:agent-status me) :pending)
+                   "after draining, nothing foreign remains"))
+          (agent:disconnect-agent me)
+          (agent:disconnect-agent them))))))
+
+(define-test legacy-unenveloped-record-is-pending-and-delivered
+  "A record with no self-id — a legacy body from an old-core publisher — counts as
+   foreign in BOTH the pending count and the receive, so a staggered rollout never
+   drops or under-reports real traffic."
+  (with-bus (paths)
+    (with-running-broker (br paths)
+      (let ((me (agent:connect-agent "/proj" :name "me" :paths paths :ensure-broker nil)))
+        (unwind-protect
+             (progn
+               ;; Append a raw, un-enveloped record directly, as an old core would.
+               (wal:append-record (broker:bus-paths-wal paths) 1 "a plain old body")
+               (is = 1 (getf (agent:agent-status me) :pending)
+                   "the un-enveloped record is counted as deliverable")
+               (is equal '("a plain old body")
+                   (agent:agent-receive me :timeout-ms 1000)
+                   "and it is actually delivered"))
+          (agent:disconnect-agent me))))))
+
+;;; watcher liveness surfaced through status -----------------------------------
+
+(defun call-with-xdg-state (dir thunk)
+  "Run THUNK with XDG_STATE_HOME set to DIR so the shared heartbeat's default
+   watch directory resolves under a temp root, then restore the inherited value."
+  (let ((previous (uiop:getenv "XDG_STATE_HOME")))
+    (unwind-protect
+         (progn (sb-posix:setenv "XDG_STATE_HOME" (namestring dir) 1)
+                (funcall thunk))
+      (if previous
+          (sb-posix:setenv "XDG_STATE_HOME" previous 1)
+          (ignore-errors (sb-posix:unsetenv "XDG_STATE_HOME"))))))
+
+(define-test status-reports-watcher-liveness
+  "agent-status surfaces whether a wakeup watcher is listening for THIS agent, read
+   from the shared heartbeat under the agent's own identity. A fresh beat reads
+   live; its absence reads dead. The temp XDG root's random suffix is seeded per
+   call so a leftover from a prior fresh image never turns a `dead` assertion into
+   a flake."
+  (with-bus (paths)
+    (with-running-broker (br paths)
+      (let ((state-root (ensure-directories-exist
+                         (merge-pathnames
+                          (format nil "dsmr-agent-status-watch-~D-~D/"
+                                  (sb-posix:getpid)
+                                  (random 100000000 (make-random-state t)))
+                          (uiop:temporary-directory)))))
+        (unwind-protect
+             (call-with-xdg-state state-root
+               (lambda ()
+                 (let ((me (agent:connect-agent "/proj" :name "watched"
+                                                       :paths paths :ensure-broker nil)))
+                   (unwind-protect
+                        (progn
+                          ;; No beat yet: the watch is not running.
+                          (let ((st (agent:agent-status me)))
+                            (is eq nil (getf st :live-watcher))
+                            (is string= "dead" (getf st :watcher-status))
+                            (is eq nil (getf st :watcher-age-seconds)))
+                          ;; A running watch refreshes a beat under this identity.
+                          (let ((beat (heartbeat:beat-path
+                                       (agent:agent-id me) (heartbeat:default-watch-dir))))
+                            (heartbeat:write-beat beat :mode :event :baseline 0 :poll-ms 250)
+                            (let ((st (agent:agent-status me)))
+                              (is eq t (getf st :live-watcher))
+                              (is string= "live" (getf st :watcher-status))
+                              (true (integerp (getf st :watcher-age-seconds))))
+                            ;; Removed on clean exit: back to dead.
+                            (heartbeat:remove-beat beat)
+                            (is eq nil (getf (agent:agent-status me) :live-watcher)
+                                "an absent beat reads as no watcher")))
+                     (agent:disconnect-agent me)))))
+          (ignore-errors (uiop:delete-directory-tree state-root :validate t)))))))

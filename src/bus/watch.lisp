@@ -40,13 +40,20 @@
 (defpackage #:dsmr-bus-watch/src/bus/watch
   (:use #:cl)
   (:local-nicknames (#:envelope #:dsmr-mcp/src/bus/envelope)
-                    (#:cursor #:dsmr-mcp/src/bus/cursor))
+                    (#:cursor #:dsmr-mcp/src/bus/cursor)
+                    (#:heartbeat #:dsmr-mcp/src/bus/heartbeat))
   (:import-from #:dsmr-mcp/src/bus/wal
                 #:scan
                 #:now-ms
                 #:read-records
                 #:record-seq
                 #:record-body-string)
+  ;; The heartbeat lives in a shared leaf so the name a running watch writes and
+  ;; the name a --check-live probe (or the MCP core) reads stay identical byte
+  ;; for byte; DEFAULT-WATCH-DIR is imported and re-exported so this package's
+  ;; public surface is unchanged.
+  (:import-from #:dsmr-mcp/src/bus/heartbeat
+                #:default-watch-dir)
   (:export #:main
            #:watch-until-foreign
            #:watch-stream
@@ -96,23 +103,6 @@
                     (merge-pathnames ".local/state/" (user-homedir-pathname))))))
     (merge-pathnames "cursors/" root)))
 
-(defun default-watch-dir ()
-  "The default watcher-heartbeat directory: $XDG_STATE_HOME/dsmr-mcp/bus/watch/
-   (falling back to ~/.local/state/dsmr-mcp/bus/watch/).
-
-   Inlined for the same reason DEFAULT-WAL-PATH and DEFAULT-CURSORS-DIR inline
-   the state-root derivation: reaching for the module that owns the state root
-   would pull the ZeroMQ transport into a binary sister repos must be able to run
-   without libzmq installed. A third copy of the derivation is a real cost, and
-   it is the smaller one."
-  (let* ((xdg (uiop:getenv "XDG_STATE_HOME"))
-         (root (merge-pathnames
-                "dsmr-mcp/bus/"
-                (if (and xdg (plusp (length xdg)))
-                    (uiop:ensure-directory-pathname xdg)
-                    (merge-pathnames ".local/state/" (user-homedir-pathname))))))
-    (merge-pathnames "watch/" root)))
-
 ;;; ---------------------------------------------------------------- signalling
 
 (defun %signal-seq (seq)
@@ -128,81 +118,13 @@
 
 ;;; ----------------------------------------------------------------- heartbeat
 ;;;
-;;; A watch that has gone silently deaf looks, from outside, exactly like one
-;;; still doing its job: exit-on-event exits 0 after it fires, byte for byte the
-;;; same exit as a watch that never fired at all, so a dead watch and a live one
-;;; are indistinguishable from their exit alone. The heartbeat closes that gap.
-;;; While the watch runs it rewrites a small file once per poll; that file's
-;;; MTIME is the liveness signal — a live watch keeps it within one poll of now,
-;;; a dead one lets it age without bound. On any clean exit (fire, recycle, or
-;;; error) the file is removed, so an absent beat reads as "not running" rather
-;;; than "stale". The contents are diagnostics only; nothing keys off them, and
-;;; a beat that cannot be written is dropped rather than allowed to take the
-;;; watch down.
-
-(defun %beat-path (self-id watch-dir)
-  "The heartbeat file for SELF-ID under WATCH-DIR. Keyed on the SAME encoded id
-   the cursor path uses, so the name a running watch writes and the name a
-   --check-live probe reads are identical byte for byte."
-  (merge-pathnames (concatenate 'string (envelope:encode-id self-id) ".beat")
-                   (uiop:ensure-directory-pathname watch-dir)))
-
-(defun %write-beat (path &key mode baseline poll-ms)
-  "Refresh the heartbeat at PATH: rewrite it with a single readable diagnostic
-   plist and let its MTIME advance. Called at the top of every poll, so a live
-   watch keeps the file within one poll interval of now.
-
-   Wrapped in IGNORE-ERRORS deliberately: a beat-write failure — a full disk, a
-   vanished directory — must never take the watcher down, and must never leak a
-   line onto *standard-output*, where it would be read as a wake signal. A
-   dropped beat costs one poll of liveness resolution; an unhandled error would
-   cost the watch."
-  (ignore-errors
-   (ensure-directories-exist path)
-   (with-open-file (out path :direction :output
-                             :if-exists :supersede
-                             :if-does-not-exist :create)
-     (prin1 (list :pid (sb-posix:getpid)
-                  :mode mode
-                  :baseline baseline
-                  :poll-ms poll-ms)
-            out)))
-  (values))
-
-(defun %remove-beat (path)
-  "Remove the heartbeat at PATH if present. Called on every clean exit so an
-   absent beat reads as `not running` rather than `stale`. Best-effort: a
-   failure to unlink is never worth signalling over."
-  (ignore-errors (when (probe-file path) (delete-file path))))
-
-(defun %beat-status (age-seconds window-seconds)
-  "The liveness verdict for a beat AGE-SECONDS old measured against
-   WINDOW-SECONDS: :LIVE when at or within the window, :STALE when past it.
-   Factored out of %BEAT-LIVENESS so the threshold is unit-testable directly,
-   without arranging a file of a controlled age."
-  (if (<= age-seconds window-seconds) :live :stale))
-
-(defun %beat-liveness (path window-seconds)
-  "Read the heartbeat at PATH and classify it. Returns (VALUES STATUS AGE PID):
-
-     :DEAD  — no file, or nothing readable there (AGE and PID both NIL)
-     :LIVE  — the beat is at most WINDOW-SECONDS old
-     :STALE — the beat is older than that
-
-   Age is (now - file-write-date) in whole seconds, matching FILE-WRITE-DATE's
-   one-second resolution: a live watch refreshes every poll so its beat is about
-   a second old at most, a dead one grows without bound, and the window separates
-   the two with room to spare. PID is read best-effort from the file's plist for
-   the diagnostic line; a beat present but unreadable as a plist still counts by
-   its age, just without a pid to name."
-  (let ((mtime (ignore-errors (file-write-date path))))
-    (if (null mtime)
-        (values :dead nil nil)
-        (let ((age (- (get-universal-time) mtime))
-              (pid (ignore-errors
-                    (with-open-file (in path :if-does-not-exist nil)
-                      (getf (and in (read in nil nil)) :pid)))))
-          (values (%beat-status age window-seconds) age pid)))))
+;;; The heartbeat — how a running watch advertises that it is still listening,
+;;; and how a probe reads that advertisement back — lives in the shared
+;;; dsmr-mcp/src/bus/heartbeat leaf (reached here through the HEARTBEAT nickname).
+;;; The watcher WRITES the beat and the MCP core READS it, so both sides share one
+;;; implementation of the filename and format rather than each carrying a copy
+;;; that could drift. The write/refresh/remove calls are wired into MAIN's poll
+;;; thunk and unwind; the liveness read is what %CHECK-LIVE reports.
 
 ;;; ----------------------------------------------------------------- the loops
 
@@ -210,28 +132,6 @@
   "The highest committed seq in WAL-PATH, or 0 for a missing/empty/torn-only
    log. Read-only — never clips a write still in flight."
   (values (scan wal-path)))
-
-(defun %foreign-record-p (record own-encoded)
-  "True when RECORD was not published by the agent whose encoded id is
-   OWN-ENCODED.
-
-   The comparison is encoded-against-encoded, on the encoded self-id the shared
-   envelope leaf pulls out of the body — the same comparison the receive path
-   makes. One implementation of the format on both sides is the whole point of
-   that leaf: a second encoder here would desync the first time either
-   alphabet changed, and it would desync silently.
-
-   Two cases deliberately count as foreign. A NIL OWN-ENCODED means no identity
-   resolved, so there is no self to recognize and everything fires, exactly as
-   it did before the watcher had an identity. A record with no self-id at all is
-   a legacy un-enveloped message from an old-core publisher; treating it as this
-   agent's own would drop real traffic on the floor through a staggered
-   rollout."
-  (or (null own-encoded)
-      (multiple-value-bind (text correlation-id self-id)
-          (envelope:decode-envelope (record-body-string record))
-        (declare (ignore text correlation-id))
-        (not (and self-id (string= self-id own-encoded))))))
 
 (defun %highest-foreign-seq (wal-path baseline own-encoded)
   "The highest seq above BASELINE belonging to a record this agent did not
@@ -247,7 +147,7 @@
         (and (> last baseline) last))
       (let ((highest nil))
         (dolist (record (read-records wal-path :after baseline) highest)
-          (when (%foreign-record-p record own-encoded)
+          (when (envelope:foreign-record-p record own-encoded)
             (setf highest (record-seq record)))))))
 
 (defun watch-until-foreign (wal-path baseline
@@ -304,7 +204,7 @@
           (loop for s from (1+ cursor) to last do (funcall emit s))
           (dolist (record (read-records wal-path :after cursor))
             (when (and (<= (record-seq record) last)
-                       (%foreign-record-p record own))
+                       (envelope:foreign-record-p record own))
               (funcall emit (record-seq record))))))
     (max last cursor)))
 
@@ -625,7 +525,7 @@ watch which stopped listening otherwise exits identically to one that never fire
         (force-output *standard-output*)
         (uiop:quit 2))
       (multiple-value-bind (status age pid)
-          (%beat-liveness beat-path window-seconds)
+          (heartbeat:beat-liveness beat-path window-seconds)
         (ecase status
           (:live  (format *standard-output* "live pid=~A age_s=~A~%"
                           (or pid "?") age))
@@ -662,7 +562,7 @@ watch which stopped listening otherwise exits identically to one that never fire
                                 (default-cursors-dir)))
                (watch-dir (default-watch-dir))
                (self-id (%resolve-self-id opts))
-               (beat-path (and self-id (%beat-path self-id watch-dir))))
+               (beat-path (and self-id (heartbeat:beat-path self-id watch-dir))))
           (when (opt-check-p opts)
             (%check-live self-id beat-path (opt-live-window-seconds opts)))
           (let* ((baseline (%resolve-baseline opts self-id wal-path cursors-dir))
@@ -671,8 +571,8 @@ watch which stopped listening otherwise exits identically to one that never fire
                  (mode (if (opt-stream-p opts) :stream :event)))
             (flet ((beat ()
                      (when beat-path
-                       (%write-beat beat-path :mode mode :baseline baseline
-                                              :poll-ms poll-ms))))
+                       (heartbeat:write-beat beat-path :mode mode :baseline baseline
+                                                       :poll-ms poll-ms))))
               (unwind-protect
                    (if (opt-stream-p opts)
                        (progn
@@ -686,7 +586,7 @@ watch which stopped listening otherwise exits identically to one that never fire
                                                          :self-id self-id
                                                          :on-poll #'beat)))
                          (if fired (%signal-seq fired) (%signal-recycle))))
-                (when beat-path (%remove-beat beat-path))))
+                (when beat-path (heartbeat:remove-beat beat-path))))
             (uiop:quit 0))))
     (error (e)
       (format *error-output* "dsmr-bus-watch: ~A~%" e)
