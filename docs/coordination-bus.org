@@ -165,16 +165,32 @@ and turns a new message into one of the two events a harness can wake a dormant
 agent on. Build it with =make bus-watch= and install it on =PATH= via the
 installer (=~/.local/bin/dsmr-bus-watch=).
 
-** Two modes
+** Two modes, and which one to stand on
 
-- *Exit-on-event* (default) — polls until a new message arrives, prints one
-  =bus:<SEQ>= line, and *exits 0*. Arm it in a background shell whose exit
-  re-invokes the agent: the agent wakes, drains the bus, acts, and re-arms.
 - *Streaming* (=--stream=) — prints =bus:<SEQ>= once per new message and keeps
-  running. Use it under a persistent monitor that delivers each line as it is
-  printed (the leader end of a two-agent loop).
+  running. This is the STANDING listener: run it under a persistent *Monitor*
+  (the Claude Code harness primitive that turns each printed line into a live
+  notification), armed once at bring-up, and every message wakes the agent with
+  no per-turn re-arm. See the =bus-watch= skill for the exact Monitor command.
+- *Exit-on-event* (default) — polls until a new message arrives, prints one
+  =bus:<SEQ>= line, and *exits 0*. Now used only for the SessionStart bootstrap
+  prime (below): a one-shot that ensures a watcher and heartbeat exist before
+  turn one.
 
-** The re-arm rule (load-bearing)
+*Do not* run the standing watch as a =run_in_background= shell task. The harness
+notifies on process *exit*, and a streaming watch — or a =while true= around the
+one-shot — never exits, so its signal is never delivered and the agent goes
+silently deaf. That mismatch is the right watcher on the wrong harness primitive.
+The Monitor tool, which fires per printed line, is the connector that actually
+wakes you.
+
+** The re-arm rule (historical — the persistent Monitor removes it)
+
+With the standing listener now a persistent Monitor armed once at bring-up, there
+is no per-turn re-arm at all, so the discipline below is no longer something an
+agent performs. It is kept here because it explains *why* self-wake cannot happen
+(the next section), which is still load-bearing. Read it as background, not as a
+step to follow.
 
 The watcher seeds a /baseline/ sequence number when it arms and fires only on a
 seq strictly greater than that baseline. With no author field in the WAL, the
@@ -289,12 +305,14 @@ With no new message, the watch exits cleanly after =--recycle-seconds= with a
 a harness restart heals itself: the next arm starts a fresh watch. Treat
 =recycle:= as "still alive, nothing new — re-arm".
 
-** Two-agent shape (no operator nudge)
+** Standing shape (no operator nudge)
 
-Run the leader with a persistent streaming monitor on =dsmr-bus-watch --stream=;
-run the worker with an exit-on-event =dsmr-bus-watch= in a background shell that
-re-invokes it on exit. Each side receives, acts, publishes, and re-arms — the
-loop self-drives with no operator in the middle.
+Both ends — the leader and every sister — run the SAME standing listener: one
+=dsmr-bus-watch --stream= under a persistent *Monitor*, armed once at bring-up.
+Each streamed message wakes the agent, which receives, acts, and publishes, then
+returns to work; the Monitor keeps listening, so there is no re-arm step. The loop
+self-drives with no operator in the middle. See the =bus-watch= skill for the
+Monitor command and the drain-on-wake loop.
 
 ** Auto-arm on bringup
 
@@ -336,33 +354,26 @@ any one of these and the session can stall on bringup. The installer ships this 
 a small launch script (=~/.local/lib/dsmr-mcp/bus-arm.sh=) that the hook calls, so
 the safe form lives in one place.
 
-*** Adaptive cadence
+*** Cadence
 
-The launch script tunes the watch to the moment by tracking *consecutive idle
-recycles* in a small state file and adjusting two independent knobs:
+The prime uses a fixed cadence (=--poll-ms 250=, =--recycle-seconds 120=): poll
+fast so a message arriving in the window before the agent arms its Monitor is seen
+promptly, recycle modestly so a quiet prime self-exits rather than lingering
+beside the standing watch. Responsiveness comes from =--poll-ms=, never from
+=--recycle-seconds=.
 
-- =--poll-ms= — *per-message reaction latency*: how soon a delivered message wakes
-  the agent. Lower is snappier.
-- =--recycle-seconds= — the *idle self-heal heartbeat*: how long a quiet watch runs
-  before it recycles itself to recover from a silently-killed watch (see
-  /Idle self-recycle/ above). This is recovery latency only — it does *not* affect
-  how fast a real message wakes the agent.
-
-Keeping the two separate matters: responsiveness comes from =--poll-ms=, never from
-=--recycle-seconds=. The script tightens the cadence while an interaction is hot
-and relaxes it as the agent sits idle — fast and short when traffic is recent, slow
-and long when nothing has arrived for a while. The shipped bands run from HOT
-(=--poll-ms 500=, =--recycle-seconds 60=) when a fire just happened, down to IDLE
-(=--poll-ms 1000=, =--recycle-seconds 600=) after several idle recycles. These
-values live in the launch script and are tunable in place — no rebuild needed to
-adjust them.
+The earlier adaptive-cadence bands and their idle-counter state file are gone.
+They existed to tune a background exit-on-event watch that woke the agent only on
+process exit — the persistent Monitor removes that problem, so the launch script
+is now just the one-shot prime, with no cadence state to track.
 
 *** What the hook does, and what it leaves to the loop
 
-The hook only fires the *first* arm — the bootstrap. Every subsequent re-arm
-follows the existing re-arm rule documented above (arm last, =--after= omitted,
-catch-up receive), driven from within the agent's turns. The hook is purely how the
-loop gets started before turn one; it does not change the loop's mechanics.
+The hook only fires the *first* watcher — the one-shot bootstrap prime. The
+standing listener is the persistent Monitor the agent arms at bring-up (see the
+=bus-watch= skill); the hook does not arm it, and there is no per-turn re-arm to
+drive. The hook is purely how a watcher and heartbeat exist before turn one; it
+does not change the standing loop's mechanics.
 
 Identity and the WAL location come from the environment that is already in place —
 no new configuration. The arm inherits the project's =DSMR_BUS_AGENT= (so the
