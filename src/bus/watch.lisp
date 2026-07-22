@@ -52,7 +52,8 @@
            #:watch-stream
            #:poll-new
            #:default-wal-path
-           #:default-cursors-dir))
+           #:default-cursors-dir
+           #:default-watch-dir))
 
 (in-package #:dsmr-bus-watch/src/bus/watch)
 
@@ -95,6 +96,23 @@
                     (merge-pathnames ".local/state/" (user-homedir-pathname))))))
     (merge-pathnames "cursors/" root)))
 
+(defun default-watch-dir ()
+  "The default watcher-heartbeat directory: $XDG_STATE_HOME/dsmr-mcp/bus/watch/
+   (falling back to ~/.local/state/dsmr-mcp/bus/watch/).
+
+   Inlined for the same reason DEFAULT-WAL-PATH and DEFAULT-CURSORS-DIR inline
+   the state-root derivation: reaching for the module that owns the state root
+   would pull the ZeroMQ transport into a binary sister repos must be able to run
+   without libzmq installed. A third copy of the derivation is a real cost, and
+   it is the smaller one."
+  (let* ((xdg (uiop:getenv "XDG_STATE_HOME"))
+         (root (merge-pathnames
+                "dsmr-mcp/bus/"
+                (if (and xdg (plusp (length xdg)))
+                    (uiop:ensure-directory-pathname xdg)
+                    (merge-pathnames ".local/state/" (user-homedir-pathname))))))
+    (merge-pathnames "watch/" root)))
+
 ;;; ---------------------------------------------------------------- signalling
 
 (defun %signal-seq (seq)
@@ -107,6 +125,84 @@
   "Emit the idle self-recycle signal on *standard-output* and flush."
   (format *standard-output* "recycle:~%")
   (force-output *standard-output*))
+
+;;; ----------------------------------------------------------------- heartbeat
+;;;
+;;; A watch that has gone silently deaf looks, from outside, exactly like one
+;;; still doing its job: exit-on-event exits 0 after it fires, byte for byte the
+;;; same exit as a watch that never fired at all, so a dead watch and a live one
+;;; are indistinguishable from their exit alone. The heartbeat closes that gap.
+;;; While the watch runs it rewrites a small file once per poll; that file's
+;;; MTIME is the liveness signal — a live watch keeps it within one poll of now,
+;;; a dead one lets it age without bound. On any clean exit (fire, recycle, or
+;;; error) the file is removed, so an absent beat reads as "not running" rather
+;;; than "stale". The contents are diagnostics only; nothing keys off them, and
+;;; a beat that cannot be written is dropped rather than allowed to take the
+;;; watch down.
+
+(defun %beat-path (self-id watch-dir)
+  "The heartbeat file for SELF-ID under WATCH-DIR. Keyed on the SAME encoded id
+   the cursor path uses, so the name a running watch writes and the name a
+   --check-live probe reads are identical byte for byte."
+  (merge-pathnames (concatenate 'string (envelope:encode-id self-id) ".beat")
+                   (uiop:ensure-directory-pathname watch-dir)))
+
+(defun %write-beat (path &key mode baseline poll-ms)
+  "Refresh the heartbeat at PATH: rewrite it with a single readable diagnostic
+   plist and let its MTIME advance. Called at the top of every poll, so a live
+   watch keeps the file within one poll interval of now.
+
+   Wrapped in IGNORE-ERRORS deliberately: a beat-write failure — a full disk, a
+   vanished directory — must never take the watcher down, and must never leak a
+   line onto *standard-output*, where it would be read as a wake signal. A
+   dropped beat costs one poll of liveness resolution; an unhandled error would
+   cost the watch."
+  (ignore-errors
+   (ensure-directories-exist path)
+   (with-open-file (out path :direction :output
+                             :if-exists :supersede
+                             :if-does-not-exist :create)
+     (prin1 (list :pid (sb-posix:getpid)
+                  :mode mode
+                  :baseline baseline
+                  :poll-ms poll-ms)
+            out)))
+  (values))
+
+(defun %remove-beat (path)
+  "Remove the heartbeat at PATH if present. Called on every clean exit so an
+   absent beat reads as `not running` rather than `stale`. Best-effort: a
+   failure to unlink is never worth signalling over."
+  (ignore-errors (when (probe-file path) (delete-file path))))
+
+(defun %beat-status (age-seconds window-seconds)
+  "The liveness verdict for a beat AGE-SECONDS old measured against
+   WINDOW-SECONDS: :LIVE when at or within the window, :STALE when past it.
+   Factored out of %BEAT-LIVENESS so the threshold is unit-testable directly,
+   without arranging a file of a controlled age."
+  (if (<= age-seconds window-seconds) :live :stale))
+
+(defun %beat-liveness (path window-seconds)
+  "Read the heartbeat at PATH and classify it. Returns (VALUES STATUS AGE PID):
+
+     :DEAD  — no file, or nothing readable there (AGE and PID both NIL)
+     :LIVE  — the beat is at most WINDOW-SECONDS old
+     :STALE — the beat is older than that
+
+   Age is (now - file-write-date) in whole seconds, matching FILE-WRITE-DATE's
+   one-second resolution: a live watch refreshes every poll so its beat is about
+   a second old at most, a dead one grows without bound, and the window separates
+   the two with room to spare. PID is read best-effort from the file's plist for
+   the diagnostic line; a beat present but unreadable as a plist still counts by
+   its age, just without a pid to name."
+  (let ((mtime (ignore-errors (file-write-date path))))
+    (if (null mtime)
+        (values :dead nil nil)
+        (let ((age (- (get-universal-time) mtime))
+              (pid (ignore-errors
+                    (with-open-file (in path :if-does-not-exist nil)
+                      (getf (and in (read in nil nil)) :pid)))))
+          (values (%beat-status age window-seconds) age pid)))))
 
 ;;; ----------------------------------------------------------------- the loops
 
@@ -155,7 +251,8 @@
             (setf highest (record-seq record)))))))
 
 (defun watch-until-foreign (wal-path baseline
-                            &key (poll-ms 1000) (recycle-seconds 600) self-id)
+                            &key (poll-ms 1000) (recycle-seconds 600) self-id
+                                 on-poll)
   "Block until the WAL at WAL-PATH holds a FOREIGN record with seq strictly
    greater than BASELINE, then return that highest foreign seq. Return NIL if
    the recycle window elapses with no such record (an idle self-recycle, so a
@@ -167,11 +264,18 @@
    carrying that id are this agent's own and never fire it, which is what makes
    arming independent of publish ordering. With SELF-ID NIL nothing is filtered
    and every new seq fires, the behavior from before the watcher had an
-   identity."
+   identity.
+
+   ON-POLL, when supplied, is a nullary thunk called at the top of every poll,
+   before the fired check — so a freshly-armed watch runs it once immediately,
+   with no race window, and again every poll thereafter. It is where the
+   heartbeat refresh lives; keeping it out of the pure fired-check body leaves
+   the loop's own logic side-effect-free and the unit tests untouched."
   (let ((deadline (+ (now-ms) (round (* recycle-seconds 1000))))
         (sleep-s (/ poll-ms 1000.0))
         (own (and self-id (envelope:encode-id self-id))))
     (loop
+      (when on-poll (funcall on-poll))
       (let ((fired (%highest-foreign-seq wal-path baseline own)))
         (when fired
           (return fired)))
@@ -206,7 +310,8 @@
 
 (defun watch-stream (wal-path baseline
                      &key (poll-ms 1000) (recycle-seconds 600) self-id
-                          (emit (lambda (s) (%signal-seq s))))
+                          (emit (lambda (s) (%signal-seq s)))
+                          on-poll)
   "Stream every new FOREIGN seq beyond BASELINE by calling EMIT once per such
    message, looping until the recycle window elapses with no further activity,
    then return the final cursor. Used by the persistent-monitor mode; EMIT
@@ -215,11 +320,18 @@
    SELF-ID has the same meaning it has for the exit-on-event loop: this agent's
    own publishes advance the cursor but emit nothing. The idle window resets on
    any activity, this agent's own included — the log moved, so the watch is
-   demonstrably alive and has no reason to recycle."
+   demonstrably alive and has no reason to recycle.
+
+   ON-POLL, when supplied, is a nullary thunk called at the top of every poll,
+   before the advance check, on the same contract watch-until-foreign gives it:
+   fired once at arm with no race window, then every poll. It carries the
+   heartbeat refresh, kept out of the pure poll-new step so the streaming unit
+   tests see no new behavior."
   (let ((cursor baseline)
         (deadline (+ (now-ms) (round (* recycle-seconds 1000))))
         (sleep-s (/ poll-ms 1000.0)))
     (loop
+      (when on-poll (funcall on-poll))
       (let ((advanced (poll-new wal-path cursor emit self-id)))
         (when (> advanced cursor)
           (setf cursor advanced
@@ -261,6 +373,15 @@ Options:
                        (for a persistent monitor); default is exit-on-event
   --poll-ms N          poll interval in milliseconds (default 1000)
   --recycle-seconds N  idle self-recycle window in seconds (default 600)
+  --check-live         do not watch; report the running watch's heartbeat for
+                       the resolved identity and exit. Prints one line to STDOUT
+                       (`live pid=<pid> age_s=<n>`, `stale pid=<pid> age_s=<n>`,
+                       `dead`, or `unknown` when no identity resolves) and exits
+                       0 live / 1 stale-or-dead / 2 unknown.
+  --live-window-seconds N
+                       how fresh a heartbeat must be to count as live under
+                       --check-live (default 5). A live watch refreshes every
+                       poll, so this need only exceed --poll-ms with some slack.
   -h, --help           print this help and exit
 
 An unknown flag, or a flag with an unparseable value, is reported on STDERR and
@@ -269,6 +390,11 @@ agent deaf to the bus.
 
 Exit-on-event prints one `bus:<SEQ>` line then exits 0; on idle recycle it
 prints `recycle:` then exits 0. Streaming prints `bus:<SEQ>` per new foreign seq.
+
+While a watch runs it refreshes a heartbeat file every poll and removes it on
+clean exit; a dead watch leaves no fresh beat. --check-live reads that beat so a
+dead watch is distinguishable from a live one — the gap this closes is that a
+watch which stopped listening otherwise exits identically to one that never fired.
 ")
 
 (defun %usage (&optional (stream *error-output*))
@@ -277,8 +403,8 @@ prints `recycle:` then exits 0. Streaming prints `bus:<SEQ>` per new foreign seq
 
 (defstruct (options (:conc-name opt-))
   "One parsed command line. A named record rather than a positional tuple: the
-   watcher now takes ten settings, and a ten-element VALUES list is a defect
-   waiting for the day someone inserts a value in the middle of it."
+   watcher now takes a dozen settings, and a twelve-element VALUES list is a
+   defect waiting for the day someone inserts a value in the middle of it."
   (wal nil)
   (after nil)
   (agent nil)
@@ -288,6 +414,8 @@ prints `recycle:` then exits 0. Streaming prints `bus:<SEQ>` per new foreign seq
   (stream-p nil)
   (poll-ms 1000)
   (recycle-seconds 600)
+  (check-p nil)
+  (live-window-seconds 5)
   (help-p nil))
 
 (defun %parse-nonneg (string flag)
@@ -335,6 +463,8 @@ prints `recycle:` then exits 0. Streaming prints `bus:<SEQ>` per new foreign seq
                   (setf (opt-help-p opts) t))
                  ((string= arg "--stream")
                   (setf (opt-stream-p opts) t))
+                 ((string= arg "--check-live")
+                  (setf (opt-check-p opts) t))
                  ((string= arg "--wal")
                   (setf (opt-wal opts) (or (next-value "--wal") (opt-wal opts))))
                  ((string= arg "--agent")
@@ -357,6 +487,10 @@ prints `recycle:` then exits 0. Streaming prints `bus:<SEQ>` per new foreign seq
                  ((string= arg "--recycle-seconds")
                   (setf (opt-recycle-seconds opts)
                         (next-nonneg "--recycle-seconds" (opt-recycle-seconds opts))))
+                 ((string= arg "--live-window-seconds")
+                  (setf (opt-live-window-seconds opts)
+                        (next-nonneg "--live-window-seconds"
+                                     (opt-live-window-seconds opts))))
                  (t (%warn "unknown argument ~S ignored; continuing on defaults"
                            arg)))))
     opts))
@@ -468,12 +602,55 @@ prints `recycle:` then exits 0. Streaming prints `bus:<SEQ>` per new foreign seq
                   filter on this agent's own publishes."))
         (%last-seq wal-path))))
 
+(defun %check-live (self-id beat-path window-seconds)
+  "Report the liveness of the watch for SELF-ID from its heartbeat, then exit.
+   Never watches — this is the cheap probe an agent runs to answer `is my watch
+   still listening?`.
+
+   A resolved identity is what makes liveness observable at all: the beat file
+   is keyed on it, exactly as the cursor is. With none there is no stable key to
+   probe, so this prints `unknown` and exits 2 — honest that liveness needs the
+   same resolved identity a healthy watch already runs under, not a softer
+   answer that would read as `fine`.
+
+   Otherwise it prints exactly one status line to *standard-output* — the only
+   thing an agent parses — and exits 0 for a live beat, 1 for a stale or absent
+   one. Any human-facing detail goes to *error-output*, never stdout."
+  (if (null self-id)
+      (progn
+        (%warn "--check-live needs a resolved identity (pass --agent or ~
+                --agent-id, or set DSMR_BUS_AGENT); cannot locate a heartbeat ~
+                without one.")
+        (format *standard-output* "unknown~%")
+        (force-output *standard-output*)
+        (uiop:quit 2))
+      (multiple-value-bind (status age pid)
+          (%beat-liveness beat-path window-seconds)
+        (ecase status
+          (:live  (format *standard-output* "live pid=~A age_s=~A~%"
+                          (or pid "?") age))
+          (:stale (format *standard-output* "stale pid=~A age_s=~A~%"
+                          (or pid "?") age))
+          (:dead  (format *standard-output* "dead~%")))
+        (force-output *standard-output*)
+        (uiop:quit (if (eq status :live) 0 1)))))
+
 (defun main ()
   "Entry point. Parse argv, resolve who this watch is for, arm a baseline, and
-   watch. Signal lines go to *standard-output*; usage, diagnostics, and errors
-   go to *error-output*. Exit 0 on a fired/recycled watch, 64 on an
-   unrecoverable failure — a bad flag is not one, and neither is an
-   unresolvable identity."
+   watch — or, under --check-live, report the running watch's heartbeat and exit
+   without watching. Signal lines go to *standard-output*; usage, diagnostics,
+   and errors go to *error-output*. Exit 0 on a fired/recycled watch or a live
+   heartbeat, 1 on a stale/absent heartbeat, 2 on a liveness probe with no
+   resolvable identity, 64 on an unrecoverable failure — a bad flag is not one,
+   and neither is an unresolvable identity for a watch.
+
+   The heartbeat is written under the watch's own identity: while the watch runs
+   it refreshes a beat file every poll, and an UNWIND-PROTECT removes that file
+   on fire, recycle, AND error, so an absent beat means `not running` and a
+   stale one means `died without unwinding`. With no identity resolved there is
+   no stable key to write a beat under, so the watch runs without one — liveness
+   observability is the one thing that requires the identity the healthy fleet
+   already uses, and --check-live says so rather than pretending otherwise."
   (handler-case
       (let ((opts (%parse-args (uiop:command-line-arguments))))
         (when (opt-help-p opts)
@@ -483,22 +660,34 @@ prints `recycle:` then exits 0. Streaming prints `bus:<SEQ>` per new foreign seq
                (cursors-dir (if (opt-cursors-dir opts)
                                 (uiop:ensure-directory-pathname (opt-cursors-dir opts))
                                 (default-cursors-dir)))
+               (watch-dir (default-watch-dir))
                (self-id (%resolve-self-id opts))
-               (baseline (%resolve-baseline opts self-id wal-path cursors-dir))
-               (poll-ms (opt-poll-ms opts))
-               (recycle-seconds (opt-recycle-seconds opts)))
-          (if (opt-stream-p opts)
-              (progn
-                (watch-stream wal-path baseline
-                              :poll-ms poll-ms :recycle-seconds recycle-seconds
-                              :self-id self-id)
-                (%signal-recycle))
-              (let ((fired (watch-until-foreign wal-path baseline
-                                                :poll-ms poll-ms
-                                                :recycle-seconds recycle-seconds
-                                                :self-id self-id)))
-                (if fired (%signal-seq fired) (%signal-recycle))))
-          (uiop:quit 0)))
+               (beat-path (and self-id (%beat-path self-id watch-dir))))
+          (when (opt-check-p opts)
+            (%check-live self-id beat-path (opt-live-window-seconds opts)))
+          (let* ((baseline (%resolve-baseline opts self-id wal-path cursors-dir))
+                 (poll-ms (opt-poll-ms opts))
+                 (recycle-seconds (opt-recycle-seconds opts))
+                 (mode (if (opt-stream-p opts) :stream :event)))
+            (flet ((beat ()
+                     (when beat-path
+                       (%write-beat beat-path :mode mode :baseline baseline
+                                              :poll-ms poll-ms))))
+              (unwind-protect
+                   (if (opt-stream-p opts)
+                       (progn
+                         (watch-stream wal-path baseline
+                                       :poll-ms poll-ms :recycle-seconds recycle-seconds
+                                       :self-id self-id :on-poll #'beat)
+                         (%signal-recycle))
+                       (let ((fired (watch-until-foreign wal-path baseline
+                                                         :poll-ms poll-ms
+                                                         :recycle-seconds recycle-seconds
+                                                         :self-id self-id
+                                                         :on-poll #'beat)))
+                         (if fired (%signal-seq fired) (%signal-recycle))))
+                (when beat-path (%remove-beat beat-path))))
+            (uiop:quit 0))))
     (error (e)
       (format *error-output* "dsmr-bus-watch: ~A~%" e)
       (%usage)
