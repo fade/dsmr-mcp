@@ -1,108 +1,53 @@
 #!/bin/sh
-# bus-arm.sh — thin launch wrapper for the dsmr-mcp bus wakeup watcher.
+# bus-arm.sh — SessionStart bootstrap prime for the dsmr-mcp bus watcher.
 #
-# Called two ways:
-#   * at session start by the Claude Code SessionStart hook (bootstrap mode,
-#     the default) — fires the FIRST watch so the loop is primed before turn
-#     one. This is a one-shot priming arm, not a persistent watcher: the
-#     watcher runs in exit-on-event mode (no --stream), so it exits the moment
-#     the first foreign message lands or after one recycle window, and its
-#     signal line is discarded (the session cannot observe it anyway). Its
-#     DIAGNOSTICS are not: they go to a log beside the arm state, because a
-#     watcher that armed against the wrong cursor says so on stderr and the
-#     bootstrap path is the one place nobody is listening. What keeps a watcher
-#     armed thereafter is the in-turn re-arm path below, driven from within the
-#     agent's turns — the bootstrap only gets the loop started.
-#   * from within an agent turn after a publish+catch-up receive (re-arm mode,
-#     --rearm) — runs the watcher with stdout kept so the turn observes the
-#     wake signal, then records whether it fired or idled, and re-arms again
-#     on the next turn.
+# Called by the Claude Code SessionStart hook to prime a one-shot watcher before
+# turn one, so a watcher and its heartbeat exist the moment a session comes up.
+# It runs the watcher in exit-on-event mode, detached from the session's stdio,
+# and discards its signal: a detached process cannot wake the session, and it is
+# not meant to. The STANDING listener is a persistent Monitor the agent arms at
+# bring-up (see the bus-watch skill) — each streamed message becomes a live
+# notification there. This bootstrap only makes sure something is watching, and a
+# heartbeat is present for --check-live, from t=0 until the agent arms the Monitor.
 #
-# Adaptive cadence: the watcher polls fast and recycles quickly while the bus
-# is hot, relaxing toward slow polling and long recycles after consecutive
-# idle recycles, so it recovers promptly when busy and costs little when quiet.
-# The bands below are tunable here without rebuilding the Lisp binary.
+# Detaching every file descriptor (</dev/null >/dev/null 2>>log &) is mandatory,
+# not cosmetic: a SessionStart hook that keeps the session's stdio open hangs
+# Claude Code at startup.
 #
-# Bootstrap mode detaches every file descriptor (</dev/null >/dev/null 2>&1 &):
-# a background process that keeps the session's stdio open hangs Claude Code at
-# startup, so the detach is mandatory, not cosmetic.
+# There is deliberately no re-arm mode and no adaptive-cadence machinery here.
+# The per-turn re-arm dance and the idle-counter cadence bands were compensations
+# for running the STANDING watch as a background task that woke the agent only on
+# process exit. The persistent Monitor removes that whole class of problem — it
+# wakes per streamed line — so this script is now just the one-shot prime it was
+# always meant to be.
 
 set -eu
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dsmr-mcp/bus"
-STATE_FILE="$STATE_DIR/watch-arm.state"
 ARM_LOG="$STATE_DIR/watch-arm.log"
 
-# Consecutive idle-recycle count (0 when the state file is absent/unreadable).
-IDLE=0
-if [ -f "$STATE_FILE" ]; then
-    IDLE=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
-fi
-# Guard against a non-integer state file (empty, multi-line, or non-digit), then
-# normalize to base-10. The guard rejects anything with a non-digit; the
-# arithmetic re-evaluation with the 10# radix prefix forces base-10 so a value
-# with leading zeros (e.g. 08) is never misread as octal by the integer tests
-# below — which under set -e would abort the whole arm ("value too great for
-# base 8") and leave no watcher primed.
-case "$IDLE" in
-    ''|*[!0-9]*) IDLE=0 ;;
-esac
-IDLE=$((10#$IDLE))
+# Fixed cadence for the prime. Poll fast so a message arriving in the window
+# before the agent arms its Monitor is seen promptly; a modest recycle so a quiet
+# prime self-exits rather than lingering beside the standing watch. Reaction
+# latency is governed by --poll-ms, never by --recycle-seconds.
+POLL_MS=250
+RECYCLE_S=120
 
-# Adaptive cadence bands (idle count -> poll-ms / recycle-seconds):
-#   0    HOT     500ms / 60s   — just fired or fresh; match a live interaction.
-#   1-2  WARM   1000ms / 120s
-#   3-5  COOLING 1000ms / 300s
-#   6+   IDLE   1000ms / 600s  — the 600s intentionally MIRRORS the watcher
-#                                binary's own default recovery latency, but is
-#                                passed explicitly below so the two stay in step
-#                                even if the binary default later changes (the
-#                                script never relies on the binary's default).
-if [ "$IDLE" -eq 0 ]; then
-    POLL_MS=500
-    RECYCLE_S=60
-elif [ "$IDLE" -le 2 ]; then
-    POLL_MS=1000
-    RECYCLE_S=120
-elif [ "$IDLE" -le 5 ]; then
-    POLL_MS=1000
-    RECYCLE_S=300
-else
-    POLL_MS=1000
-    RECYCLE_S=600
-fi
-
-# Mode select: --rearm picks re-arm; anything else (incl. no arg) is bootstrap.
-MODE="bootstrap"
-if [ "${1:-}" = "--rearm" ]; then
-    MODE="rearm"
-fi
-
-# Identity, passed explicitly rather than left to be inferred.
-#
-# A watcher reads the cursor named by the full <namespace>/<name> id, and the
-# namespace is the project root the MCP session uses. Left unstated, the watcher
-# falls back to the working directory — which is the checkout only when the
-# caller happened to be standing in it, and names some other agent's cursor (or
-# none) when it did not. The hook exports the project directory; use it.
-#
-# The trailing separator is not cosmetic. The session builds its namespace from a
-# DIRECTORY pathname, which always ends in one, and the id is matched by encoded
-# bytes. A root passed without it names a different cursor that will never exist.
+# Identity, passed explicitly rather than inferred. The watcher reads the cursor
+# named by the full <namespace>/<name> id; the namespace is the project root the
+# MCP session uses, which the hook exports as CLAUDE_PROJECT_DIR. The trailing
+# separator is load-bearing: the id is matched by encoded bytes, so a root without
+# it names a cursor that never exists.
 PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$PWD}"
 case "$PROJECT_ROOT" in
     */) : ;;
     *)  PROJECT_ROOT="$PROJECT_ROOT/" ;;
 esac
 
-# Build the identity arguments as positional parameters — the project root may
-# contain spaces, and "$@" is the only way /bin/sh carries that intact. Read
-# AFTER the mode select above, which is what consumed $1.
-#
-# Neither argument is required. A caller that sets only DSMR_BUS_AGENT still
-# works, and so does one that sets nothing: the watcher degrades to firing on
-# everything and says so. That is what makes this a no-migration change for every
-# sister repo.
+# Build identity args as positional parameters so a root containing spaces
+# survives intact. Neither flag is required: with only DSMR_BUS_AGENT set, or with
+# nothing, the watcher degrades to firing on everything and says so on stderr — a
+# no-migration default for every sister repo.
 set -- --namespace "$PROJECT_ROOT"
 if [ -n "${DSMR_BUS_AGENT:-}" ]; then
     set -- "$@" --agent "$DSMR_BUS_AGENT"
@@ -110,57 +55,10 @@ fi
 
 mkdir -p "$STATE_DIR"
 
-if [ "$MODE" = "bootstrap" ]; then
-    # Detach stdin and stdout so the SessionStart hook does not hang — a
-    # background process holding the session's stdio open blocks startup. Stderr
-    # goes to the arm log rather than /dev/null: this path cannot report to a
-    # session that has not begun, so the log is the only place a wrong namespace
-    # or an unreadable cursor can be found afterward.
-    nohup dsmr-bus-watch --poll-ms "$POLL_MS" --recycle-seconds "$RECYCLE_S" "$@" \
-        </dev/null >/dev/null 2>>"$ARM_LOG" &
-    exit 0
-fi
-
-# Re-arm: keep stdout so the turn observes the watcher's first signal line, and
-# update the idle counter — reset to 0 on a fire (bus:), increment on idle
-# (recycle:).
-
-# The arm script is the operator's only feedback channel for "is the watcher
-# even installed?", so a missing binary must be a distinguishable, visible
-# signal rather than a silently-swallowed empty line repeated turn after turn.
-if ! command -v dsmr-bus-watch >/dev/null 2>&1; then
-    echo "bus-arm: dsmr-bus-watch not found on PATH (run the installer or 'make bus-watch')" >&2
-    printf 'error:watcher-missing\n'
-    exit 0
-fi
-
-# Capture the watcher's diagnostics rather than discarding them, so a crash or
-# a non-zero exit is not muted. head -n 1 takes the single signal line that
-# exit-on-event mode emits: this re-arm path depends on the watcher running
-# WITHOUT --stream (one line, then exit). A future --stream caller would emit
-# many lines and head would close the pipe (SIGPIPE) — a latent coupling, so
-# any later --stream change must revisit this pipeline. We do not rely on the
-# pipeline exit status (head masks the watcher's, and pipefail is not portable
-# in /bin/sh); the SIGNAL shape below is what distinguishes fire/idle/failure.
-WATCH_ERR=$(mktemp "${TMPDIR:-/tmp}/bus-arm-err.XXXXXX")
-SIGNAL=$(dsmr-bus-watch --poll-ms "$POLL_MS" --recycle-seconds "$RECYCLE_S" "$@" \
-    </dev/null 2>"$WATCH_ERR" | head -n 1)
-case "$SIGNAL" in
-    bus:*)
-        echo 0 >"$STATE_FILE"
-        printf '%s\n' "$SIGNAL"
-        ;;
-    recycle:*)
-        echo $((IDLE + 1)) >"$STATE_FILE"
-        printf '%s\n' "$SIGNAL"
-        ;;
-    *)
-        # Empty or unrecognized signal: the watcher failed before emitting a
-        # signal line. Surface its stderr and a distinguishable marker so the
-        # turn can tell "watcher failed" from "watcher idled" — do NOT touch the
-        # idle counter (a crash is not an idle recycle).
-        [ -s "$WATCH_ERR" ] && cat "$WATCH_ERR" >&2
-        printf 'error:watcher-failed\n'
-        ;;
-esac
-rm -f "$WATCH_ERR"
+# Detach stdin/stdout so the SessionStart hook does not hang; stderr goes to the
+# arm log rather than /dev/null, because this path cannot report to a session that
+# has not begun and the log is the only place a wrong namespace or an unreadable
+# cursor can be found afterward.
+nohup dsmr-bus-watch --poll-ms "$POLL_MS" --recycle-seconds "$RECYCLE_S" "$@" \
+    </dev/null >/dev/null 2>>"$ARM_LOG" &
+exit 0
