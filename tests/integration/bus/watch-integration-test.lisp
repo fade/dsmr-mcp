@@ -459,3 +459,39 @@
               (is = 0 code)
               (true (search "bus:" out))
               (true (search "no agent identity resolved" err))))))))
+
+(define-test streaming-signals-on-stdout-and-recycles-to-stderr
+  "Streaming mode keeps STDOUT clean for the persistent monitor: it prints only
+   `bus:<SEQ>` there, and routes its idle self-recycle notice to STDERR. The
+   exit-on-event mode still prints `recycle:` on stdout (a separate documented
+   contract); this guards that streaming does not, so a monitor reading each
+   stdout line never mistakes a recycle for a wake."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (progn
+          ;; (a) idle WAL: streaming self-recycles by exiting 0, and its recycle
+          ;; notice lands on STDERR, never STDOUT.
+          (with-wal (w)
+            (seed-wal w 3)
+            (multiple-value-bind (out err code)
+                (run-watcher bin "--stream"
+                             "--wal" (namestring w)
+                             "--after" "3"
+                             "--poll-ms" "50"
+                             "--recycle-seconds" "1")
+              (is = 0 code)
+              (false (search "recycle:" out))
+              (true (search "recycle:" err))))
+          ;; (b) growing WAL: each new foreign seq is signalled on STDOUT.
+          (with-wal (w)
+            (ignore-errors (delete-file w))
+            (multiple-value-bind (out err code)
+                (run-watcher-on-growing-wal bin w
+                                            "--stream"
+                                            "--wal" (namestring w)
+                                            "--poll-ms" "50"
+                                            "--recycle-seconds" "2")
+              (declare (ignore err))
+              (is = 0 code)
+              (true (search "bus:" out))))))))

@@ -269,8 +269,11 @@ Options:
                        (default: the resolved agent's cursor, or the WAL's
                         current max seq when no agent resolves; 0 = fire on any
                         record)
-  --stream             stream one line per new foreign seq and keep running
-                       (for a persistent monitor); default is exit-on-event
+  --stream             stream one `bus:<SEQ>` line per new foreign seq on STDOUT
+                       (for a persistent monitor); on an idle window it
+                       self-recycles by exiting 0 so a supervisor re-arms it
+                       fresh. Recycle/lifecycle notes go to STDERR, never STDOUT.
+                       Default is exit-on-event.
   --poll-ms N          poll interval in milliseconds (default 1000)
   --recycle-seconds N  idle self-recycle window in seconds (default 600)
   --check-live         do not watch; report the running watch's heartbeat for
@@ -289,7 +292,9 @@ then ignored — the watcher keeps running on defaults rather than leaving the
 agent deaf to the bus.
 
 Exit-on-event prints one `bus:<SEQ>` line then exits 0; on idle recycle it
-prints `recycle:` then exits 0. Streaming prints `bus:<SEQ>` per new foreign seq.
+prints `recycle:` then exits 0. Streaming prints `bus:<SEQ>` per new foreign seq
+on stdout and self-recycles by exiting 0 on an idle window, so its supervising
+monitor re-arms it fresh; its recycle/lifecycle diagnostics go only to STDERR.
 
 While a watch runs it refreshes a heartbeat file every poll and removes it on
 clean exit; a dead watch leaves no fresh beat. --check-live reads that beat so a
@@ -579,7 +584,7 @@ watch which stopped listening otherwise exits identically to one that never fire
                          (watch-stream wal-path baseline
                                        :poll-ms poll-ms :recycle-seconds recycle-seconds
                                        :self-id self-id :on-poll #'beat)
-                         (%signal-recycle))
+                         (%warn "recycle: idle window elapsed; exiting for supervised re-arm"))
                        (let ((fired (watch-until-foreign wal-path baseline
                                                          :poll-ms poll-ms
                                                          :recycle-seconds recycle-seconds
