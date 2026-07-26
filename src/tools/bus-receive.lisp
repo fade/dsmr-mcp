@@ -16,7 +16,8 @@
   (:import-from #:dsmr-mcp/src/bus/bus
                 #:+default-batch-size+)
   (:import-from #:dsmr-mcp/src/bus/agent
-                #:agent-receive #:agent-id #:agent-name #:agent-namespace
+                #:agent-receive-detailed #:agent-id #:agent-name #:agent-namespace
+                #:delivery-author #:delivery-author-id #:delivery-text
                 #:agent-stable-p #:agent-skip-to-head #:agent-status))
 
 (in-package #:dsmr-mcp/src/tools/bus-receive)
@@ -32,7 +33,10 @@ bounded: the oldest pending messages come back a page at a time and \
 remaining_pending says how many are still waiting, so a long backlog is walked \
 forward across calls rather than arriving all at once. Returns immediately by \
 default; set timeout_ms to wait that long for the first message. A named agent \
-resumes where it left off across restarts.")
+resumes where it left off across restarts. Every message comes back with the \
+agent that published it in its own author field, and the rendered text labels \
+each message with that author: a body opening with a name is ADDRESSING that \
+agent, not signing as it.")
    (dsmr-mcp/src/tools/base::input-schema
     :allocation :class
     :initform `(:object
@@ -80,20 +84,47 @@ many were given up. No messages are received in the same call."))
         "namespace" (agent-namespace a)
         "stable" (agent-stable-p a)))
 
-(defun %receive-content (a messages remaining)
-  "The human-readable text for a receive reply: who the caller is, what it got,
-   and — when the batch stopped short of the backlog — that more is still
-   waiting. A caller told only what it received cannot tell a page from the whole
-   queue, and an agent that believes it is caught up when it is not is the
+(defun %message-fields (d)
+  "One delivered message as the object a client reads: the body, the author
+   rendered for display, and the author's full bus id. The author is a field of
+   its own so a consumer never has to recover it by parsing prose, and never has
+   to guess it from a body that opens with somebody's name. AUTHOR-ID is JSON null
+   when the record carried no id that would decode."
+  (make-ht "author" (delivery-author d)
+           "author_id" (or (delivery-author-id d) 'null)
+           "text" (delivery-text d)))
+
+(defun %message-block (index total d)
+  "One delivered message rendered as a header line naming its author followed by
+   the body verbatim.
+
+   The header is bracketed, counted and labelled so it cannot be read as part of
+   the body. That is the whole point of the shape: bodies here conventionally open
+   with the name of the agent being ADDRESSED, which reads as a byline, and agents
+   have repeatedly credited a message to the wrong sender on the strength of it.
+   An author label that looked like ordinary prose would not fix anything."
+  (format nil "[~D/~D] author: ~A~%~A"
+          index total (delivery-author d) (delivery-text d)))
+
+(defun %receive-content (a deliveries remaining)
+  "The human-readable text for a receive reply: who the caller is, who wrote each
+   message it got, and, when the batch stopped short of the backlog, that more is
+   still waiting. A caller told only what it received cannot tell a page from the
+   whole queue, and an agent that believes it is caught up when it is not is the
    starvation this reports away."
   (let ((tail (if (plusp remaining)
-                  (format nil "~%~D more message(s) still pending — call \
+                  (format nil "~%~%~D more message(s) still pending. Call \
 bus-receive again to continue."
                           remaining)
                   "")))
-    (if messages
-        (format nil "You are ~A.~%~D message(s):~%~{- ~A~^~%~}~A"
-                (identity-summary a) (length messages) messages tail)
+    (if deliveries
+        (format nil "You are ~A.~%~D message(s):~%~%~{~A~^~%~%~}~A"
+                (identity-summary a) (length deliveries)
+                (let ((total (length deliveries))
+                      (index 0))
+                  (mapcar (lambda (d) (%message-block (incf index) total d))
+                          deliveries))
+                tail)
         (format nil "You are ~A. No new messages.~A"
                 (identity-summary a) tail))))
 
@@ -139,9 +170,9 @@ bus-receive again to continue."
 message(s) by skipping to the head of the bus; they will not be delivered."
                                            (identity-summary a) abandoned))
                                   (%identity-fields a))))
-              (let* ((messages (agent-receive a :timeout-ms timeout
-                                                :limit (or limit
-                                                           +default-batch-size+)))
+              (let* ((deliveries (agent-receive-detailed
+                                  a :timeout-ms timeout
+                                    :limit (or limit +default-batch-size+)))
                      ;; Read what remains after the delivery rather than
                      ;; threading a second value down through every cursor, bus
                      ;; and agent caller: only this boundary wants the figure,
@@ -149,11 +180,13 @@ message(s) by skipping to the head of the bus; they will not be delivered."
                      ;; records.
                      (remaining (getf (agent-status a) :pending)))
                 (result id (apply #'make-ht
-                                  "messages" (coerce messages 'vector)
-                                  "count" (length messages)
+                                  "messages" (map 'vector #'%message-fields
+                                                  deliveries)
+                                  "count" (length deliveries)
                                   "remaining_pending" remaining
                                   "content" (text-content
-                                             (%receive-content a messages remaining))
+                                             (%receive-content a deliveries
+                                                               remaining))
                                   (%identity-fields a))))))
       (no-project-root ()
         (result id (make-ht "isError" t

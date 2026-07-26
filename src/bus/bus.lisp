@@ -31,6 +31,9 @@
                 #:+default-batch-size+)
   (:import-from #:dsmr-mcp/src/bus/envelope
                 #:encode-id
+                #:decode-id
+                #:split-agent-id
+                #:author-display
                 #:agent-id
                 #:wrap-envelope
                 #:decode-envelope
@@ -42,7 +45,8 @@
            #:subscriber #:subscribe #:unsubscribe #:poll #:poll-count
            #:poll-count-foreign #:await
            #:skip-to-head #:+default-batch-size+
-           #:agent-id #:encode-id
+           #:agent-id #:encode-id #:decode-id
+           #:split-agent-id #:author-display
            #:decode-envelope #:delivered-body-string
            #:foreign-self-id-p #:foreign-record-p))
 
