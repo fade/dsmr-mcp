@@ -29,7 +29,9 @@
 (defpackage #:dsmr-mcp/tests/tools/bus-receive-test
   (:use #:cl #:parachute)
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
-                    (#:agent #:dsmr-mcp/src/bus/agent))
+                    (#:agent #:dsmr-mcp/src/bus/agent)
+                    (#:zmq #:dsmr-mcp/src/bus/zmq)
+                    (#:wal #:dsmr-mcp/src/bus/wal))
   (:import-from #:dsmr-mcp/src/bus/bus
                 #:+default-batch-size+)
   (:import-from #:dsmr-mcp/src/tools/base
@@ -125,8 +127,21 @@
   (gethash key payload))
 
 (defun %messages (payload)
-  "The delivered messages as a list, in delivery order."
+  "The delivered messages as a list of message objects, in delivery order. Each
+   is a hash-table carrying the body and the agent that published it."
   (coerce (gethash "messages" payload) 'list))
+
+(defun %texts (payload)
+  "Just the bodies of the delivered messages, in delivery order."
+  (mapcar (lambda (m) (gethash "text" m)) (%messages payload)))
+
+(defun %authors (payload)
+  "The rendered author of each delivered message, in delivery order."
+  (mapcar (lambda (m) (gethash "author" m)) (%messages payload)))
+
+(defun %content-text (payload)
+  "The human-readable text the verb rendered for the caller."
+  (gethash "text" (aref (gethash "content" payload) 0)))
 
 (defun %error-type (payload)
   (and (gethash "isError" payload) (gethash "error_type" payload)))
@@ -152,12 +167,46 @@
      (unwind-protect (progn ,@body)
        (ignore-errors (agent:disconnect-agent ,var)))))
 
+(defmacro with-named-publisher ((var namespace name) &body body)
+  "Bind VAR to a publishing participant called NAME under NAMESPACE, and
+   disconnect it on exit. NAMESPACE is given explicitly so a test can publish
+   from a project other than the reader's own."
+  `(let ((,var (agent:connect-agent ,namespace :name ,name)))
+     (unwind-protect (progn ,@body)
+       (ignore-errors (agent:disconnect-agent ,var)))))
+
 (defun %publish-backlog (publisher n)
   "Publish N numbered messages and return them as a list in publication order."
   (loop for i from 1 to n
         for text = (format nil "m~D" i)
         do (agent:agent-publish publisher text)
         collect text))
+
+(defun %own-namespace (session)
+  "The bus namespace the session's own participant lives under."
+  (namestring (dsmr-mcp/src/state:session-project-root session)))
+
+(defun %publish-raw (body)
+  "Submit BODY to the broker's intake exactly as given, with no envelope wrapped
+   around it, and return once the broker has made it durable. This is what a
+   message from an older publisher looks like on the wire, and submitting
+   straight to the intake is the only way to produce one now that publishing
+   always wraps.
+
+   The socket is held open until the record appears in the log: a PUSH closed the
+   instant after a send can discard a message that has not yet reached the
+   intake, and a test waiting on a record nobody ever wrote fails for a reason
+   that has nothing to do with what it is testing."
+  (let* ((paths (broker:make-bus-paths))
+         (submitter (zmq:make-submitter (broker:bus-paths-submit-endpoint paths))))
+    (unwind-protect
+         (progn
+           (zmq:send-message submitter body)
+           (loop repeat 100
+                 until (find body (wal:read-records (broker:bus-paths-wal paths))
+                             :key #'wal:record-body-string :test #'string=)
+                 do (sleep 0.05)))
+      (zmq:close-endpoint submitter))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Bounded delivery
@@ -175,9 +224,9 @@ cannot tell a page from the whole queue."
           "a default receive delivers exactly one batch")
       (is = 30 (%field payload "remaining_pending")
           "and reports the 30 records it did not deliver")
-      (is string= "m1" (first (%messages payload))
+      (is string= "m1" (first (%texts payload))
           "delivery is oldest-first")
-      (is string= "m20" (car (last (%messages payload)))
+      (is string= "m20" (car (last (%texts payload)))
           "and stops at the batch boundary"))))
 
 (define-test explicit-limit-overrides-the-default
@@ -188,7 +237,7 @@ cannot tell a page from the whole queue."
     (let ((payload (%call session "limit" 5)))
       (is = 5 (%field payload "count") "exactly the requested page size")
       (is = 45 (%field payload "remaining_pending") "the rest is still pending")
-      (is equal '("m1" "m2" "m3" "m4" "m5") (%messages payload)))))
+      (is equal '("m1" "m2" "m3" "m4" "m5") (%texts payload)))))
 
 (define-test successive-calls-walk-the-backlog-without-gap-or-repeat
   "Three default-limit calls over a 50-record backlog concatenate to the whole
@@ -199,7 +248,7 @@ record would be worse than the unbounded delivery it replaced."
       (let ((published (%publish-backlog pub 50))
             (seen '()))
         (dotimes (_ 3)
-          (setf seen (append seen (%messages (%call session)))))
+          (setf seen (append seen (%texts (%call session)))))
         (is equal published seen
             "every record delivered once, in publication order")
         (is = 0 (%field (%call session) "remaining_pending")
@@ -225,7 +274,7 @@ the caller what was wrong with the value it sent."
                (format nil "limit ~S delivers nothing" bad))))
     ;; The cursor is where it was: the next valid call still starts at m1.
     (let ((payload (%call session)))
-      (is string= "m1" (first (%messages payload))
+      (is string= "m1" (first (%texts payload))
           "a refused call left the cursor unmoved"))))
 
 (define-test timeout-validation-is-unchanged
@@ -260,3 +309,77 @@ rather than reporting a discard that did not happen."
   (with-bus-session (session)
     (let ((payload (%call session "skip_to_head" t)))
       (is = 0 (%field payload "abandoned")))))
+
+(define-test same-namespace-author-is-the-bare-name
+  "A message from an agent in the reader's own project is credited to it by bare
+name, both in a field of its own and in the rendered text. The bare name is what
+agents in one project already call each other; the encoded id would be a wall of
+percent escapes nobody reads."
+  (with-bus-session (session)
+    (with-named-publisher (pub (%own-namespace session) "sister")
+      (agent:agent-publish pub "the log read is bounded now"))
+    (let ((payload (%call session)))
+      (is = 1 (%field payload "count"))
+      (is equal '("sister") (%authors payload)
+          "the author is carried as its own field")
+      (is equal '("the log read is bounded now") (%texts payload)
+          "and the body is untouched")
+      (true (search "author: sister" (%content-text payload))
+            "the rendered text names the author too"))))
+
+(define-test foreign-namespace-author-is-qualified-by-its-project
+  "A message from another project is credited to name@namespace, not to the bare
+name. Two projects can both run an agent called valis, and a bare name would put
+back the ambiguity the author field exists to remove."
+  (with-bus-session (session)
+    (with-named-publisher (pub "/tmp/some-other-project/" "valis")
+      (agent:agent-publish pub "status?"))
+    (let ((author (first (%authors (%call session)))))
+      (is string= "valis@/tmp/some-other-project" author
+          "a foreign sender is qualified by the project it publishes from")
+      (false (string= "valis" author)
+             "and is never shown as a bare name that could collide"))))
+
+(define-test unresolvable-author-reads-as-unknown-and-the-message-still-arrives
+  "A record with no envelope at all and one whose id will not decode are both
+credited to \"unknown\" and are both still delivered. Refusing to deliver a
+message because its author cannot be established would lose real traffic through
+a staggered rollout; guessing at the author would be worse."
+  (with-bus-session (session)
+    (%publish-raw "a message from an older publisher")
+    (%publish-raw "c1|%ZZ|a message with a mangled id")
+    (let ((texts '())
+          (authors '()))
+      ;; Both records are durable by the time %publish-raw returns, but a bounded
+      ;; delivery need not hand back both in one call, so drain until it has.
+      (loop repeat 10
+            while (< (length texts) 2)
+            do (let ((payload (%call session "timeout_ms" 1000)))
+                 (setf texts (append texts (%texts payload)))
+                 (setf authors (append authors (%authors payload)))))
+      (is equal '("a message from an older publisher"
+                  "a message with a mangled id")
+          texts
+          "both records are delivered, bodies intact")
+      (is equal '("unknown" "unknown") authors
+          "and each is honestly reported as having no establishable author"))))
+
+(define-test a-body-opening-with-a-name-does-not-become-the-author
+  "A body that opens with the name of the agent being ADDRESSED is still credited
+to the agent that actually sent it. This is the regression the author field
+exists to prevent: the convention of leading a message with the recipient's name
+reads as a byline, and agents have credited messages to the wrong sender on the
+strength of it, warnings notwithstanding."
+  (with-bus-session (session)
+    (with-named-publisher (pub (%own-namespace session) "sister")
+      (agent:agent-publish pub "valis: check the bounded log read"))
+    (let ((payload (%call session)))
+      (is equal '("sister") (%authors payload)
+          "the author is the sender, not the name the body opens with")
+      (is equal '("valis: check the bounded log read") (%texts payload)
+          "and the body is delivered verbatim")
+      (let ((content (%content-text payload)))
+        (true (search "author: sister" content)
+              "the rendered text credits the sender")
+        (false (search "author: valis" content)
+               "and never credits the addressee")))))

@@ -17,6 +17,9 @@
   (:use #:cl)
   (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal))
   (:export #:encode-id
+           #:decode-id
+           #:split-agent-id
+           #:author-display
            #:agent-id
            #:wrap-envelope
            #:decode-envelope
@@ -53,6 +56,45 @@
           do (if (or (alphanumericp ch) (member ch '(#\. #\- #\_)))
                  (write-char ch s)
                  (format s "%~2,'0X" (char-code ch))))))
+
+(defun decode-id (encoded)
+  "Invert ENCODE-ID: turn a percent-encoded id token back into the plain
+   <namespace>/<name> string it was built from. Returns NIL for a NIL token and
+   for one that is not well-formed percent-encoding, so a reader can say the
+   author is unknown rather than present a mangled id as if it were a name. A
+   half-decoded id is worse than no id at all."
+  (when encoded
+    (handler-case
+        (with-output-to-string (s)
+          (let ((i 0)
+                (n (length encoded)))
+            (loop while (< i n)
+                  do (let ((ch (char encoded i)))
+                       (cond ((char= ch #\%)
+                              (when (> (+ i 3) n)
+                                (return-from decode-id nil))
+                              (write-char (code-char
+                                           (parse-integer encoded
+                                                          :start (1+ i)
+                                                          :end (+ i 3)
+                                                          :radix 16))
+                                          s)
+                              (incf i 3))
+                             (t
+                              (write-char ch s)
+                              (incf i)))))))
+      (error () nil))))
+
+(defun split-agent-id (id)
+  "Split a bus id into its namespace and the name within that namespace: two
+   values, everything before the LAST separator and everything after it. An id
+   with no separator has no namespace and comes back whole as the name. The last
+   separator is the split point because the namespace is a project root path and
+   carries separators of its own, while a name never does."
+  (let ((sep (position #\/ id :from-end t)))
+    (if sep
+        (values (subseq id 0 sep) (subseq id (1+ sep)))
+        (values nil id))))
 
 ;;; ------------------------------------------------------ message envelope
 ;;;
@@ -117,6 +159,29 @@
   "The original user text of RECORD — its body decoded through the envelope. A
    single call for body-only readers that do not need the ids."
   (values (decode-envelope (wal:record-body-string record))))
+
+(defun author-display (encoded-self-id own-namespace)
+  "Render the agent that published a record as a short string a reader can trust.
+   ENCODED-SELF-ID is the third value DECODE-ENVELOPE returns; OWN-NAMESPACE is
+   the reading agent's namespace.
+
+   A sender in the reader's own namespace renders as its bare name, which is how
+   agents in one project already refer to each other. A sender from any other
+   namespace renders as name@namespace: a bare name that collides across projects
+   would restore exactly the ambiguity an author field exists to remove, and the
+   raw encoded id is a wall of percent escapes nobody reads.
+
+   A record with no self-id (an un-enveloped message from an older publisher) or
+   one whose id will not decode renders as \"unknown\". Delivery of a message must
+   never depend on being able to name its author."
+  (let ((id (decode-id encoded-self-id)))
+    (if (null id)
+        "unknown"
+        (multiple-value-bind (namespace name) (split-agent-id id)
+          (cond ((null namespace) id)
+                ((and own-namespace (string= namespace own-namespace)) name)
+                (t (format nil "~A@~A" name
+                           (string-right-trim "/" namespace))))))))
 
 (defun foreign-self-id-p (encoded-self-id own-encoded)
   "True when a record whose decoded ENCODED-SELF-ID is ENCODED-SELF-ID is FOREIGN
