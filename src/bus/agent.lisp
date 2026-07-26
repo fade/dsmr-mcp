@@ -24,13 +24,28 @@
   (:export #:agent #:agent-id #:agent-name #:agent-namespace #:agent-stable-p
            #:agent-paths
            #:connect-agent #:disconnect-agent
-           #:agent-publish #:agent-receive #:agent-status
+           #:agent-publish #:agent-receive #:agent-receive-detailed
+           #:delivery #:delivery-author #:delivery-author-id #:delivery-text
+           #:agent-status
            #:agent-skip-to-head))
 
 (in-package #:dsmr-mcp/src/bus/agent)
 
 (defstruct (agent (:constructor %make-agent))
   id namespace stable paths client subscriber)
+
+(defstruct (delivery (:constructor %make-delivery))
+  "One message handed to a reader, with the agent that published it attached.
+   AUTHOR is the publisher rendered for display and is always a string, \"unknown\"
+   when the record carries no usable id. AUTHOR-ID is the publisher's full bus id,
+   or NIL when it could not be established. TEXT is the message body exactly as
+   published.
+
+   The author travels WITH the body rather than beside it because the two were
+   coming apart at the presentation layer: a body that opens with the addressee's
+   name reads as a byline, and readers have attributed messages to the wrong agent
+   on the strength of it."
+  author author-id text)
 
 (defun connect-agent (namespace &key name paths (ensure-broker t) (feed-timeout-ms 100))
   "Join the bus as one participant. NAMESPACE is the project root; NAME, if given,
@@ -85,6 +100,40 @@
   (bus:publish (agent-client agent) message
                :self-id (agent-id agent)))
 
+(defun agent-receive-detailed (agent &key (timeout-ms 0)
+                                         (limit bus:+default-batch-size+))
+  "Receive as AGENT-RECEIVE does, but return a DELIVERY per message instead of a
+   bare string: the text, the publishing agent's id, and a rendering of that
+   publisher fit to show a reader. Delivery semantics, the cursor, the self-echo
+   filter and LIMIT are exactly AGENT-RECEIVE's, which is defined in terms of this
+   function.
+
+   The author comes off the same envelope field the self-echo filter already
+   reads, so a message and the name attached to it cannot come apart. Resolving
+   the rendering here rather than at the tool boundary is deliberate: this is the
+   layer that knows the reader's own namespace, and that is what decides whether a
+   sender is shown by bare name or qualified by the project it publishes from."
+  (let ((records (if (plusp timeout-ms)
+                     (bus:await (agent-subscriber agent)
+                                :timeout-ms timeout-ms :limit limit)
+                     (bus:poll (agent-subscriber agent) :limit limit)))
+        (own (bus:encode-id (agent-id agent)))
+        (namespace (agent-namespace agent))
+        (out '()))
+    (dolist (record records (nreverse out))
+      (multiple-value-bind (text cid sid)
+          (bus:decode-envelope (wal:record-body-string record))
+        (declare (ignore cid))
+        ;; Keep a legacy un-enveloped message (sid NIL) and any FOREIGN message;
+        ;; drop only records carrying this agent's own encoded self-id. The verdict
+        ;; goes through the shared FOREIGN-SELF-ID-P so this filter and the pending
+        ;; count can never disagree about what delivery returns.
+        (when (bus:foreign-self-id-p sid own)
+          (push (%make-delivery :author (bus:author-display sid namespace)
+                                :author-id (bus:decode-id sid)
+                                :text text)
+                out))))))
+
 (defun agent-receive (agent &key (timeout-ms 0) (limit bus:+default-batch-size+))
   "Receive messages addressed to the whole bus that this agent has not yet seen,
    advancing its cursor. With TIMEOUT-MS 0 this is a non-blocking catch-up; with a
@@ -99,23 +148,15 @@
    made up entirely of this agent's own publishes therefore returns nothing while
    still advancing the cursor past them — correct, not starvation: those records
    are genuinely consumed, and the next call reads the ones after them. LIMIT NIL
-   asks for the whole backlog in one delivery."
-  (let ((records (if (plusp timeout-ms)
-                     (bus:await (agent-subscriber agent)
-                                :timeout-ms timeout-ms :limit limit)
-                     (bus:poll (agent-subscriber agent) :limit limit)))
-        (own (bus:encode-id (agent-id agent)))
-        (out '()))
-    (dolist (record records (nreverse out))
-      (multiple-value-bind (text cid sid)
-          (bus:decode-envelope (wal:record-body-string record))
-        (declare (ignore cid))
-        ;; Keep a legacy un-enveloped message (sid NIL) and any FOREIGN message;
-        ;; drop only records carrying this agent's own encoded self-id. The verdict
-        ;; goes through the shared FOREIGN-SELF-ID-P so this filter and the pending
-        ;; count can never disagree about what delivery returns.
-        (when (bus:foreign-self-id-p sid own)
-          (push text out))))))
+   asks for the whole backlog in one delivery.
+
+   This is the text-only view of AGENT-RECEIVE-DETAILED, kept for callers with no
+   use for the author. A caller that PRESENTS a message to a reader should use the
+   detailed form instead: bodies conventionally open with the addressee's name,
+   which reads as a byline, so a body shown without its author invites
+   misattribution."
+  (mapcar #'delivery-text
+          (agent-receive-detailed agent :timeout-ms timeout-ms :limit limit)))
 
 (defun agent-skip-to-head (agent)
   "Give up whatever this agent has not yet read and return how many records that

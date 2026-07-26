@@ -121,3 +121,50 @@
           "with no identity resolved, everything is foreign")
     (true (envelope:foreign-self-id-p nil nil)
           "no identity and no self-id is still foreign")))
+
+(define-test author-display-is-bare-at-home-and-qualified-abroad
+  "How a publisher is shown to a reader: bare name inside the reader's own
+   namespace, name@namespace outside it, and \"unknown\" whenever the id cannot
+   be established. A bare name for a foreign sender would collide across projects
+   running same-named agents, which is the ambiguity this rendering exists to
+   remove."
+  (let* ((home "/home/fade/proj/")
+         (mine (envelope:encode-id (envelope:agent-id home :name "sister")))
+         (theirs (envelope:encode-id
+                  (envelope:agent-id "/home/fade/other/" :name "sister"))))
+    (is string= "sister" (envelope:author-display mine home)
+        "a sender in the reader's own project is shown by bare name")
+    (is string= "sister@/home/fade/other"
+        (envelope:author-display theirs home)
+        "a sender elsewhere is qualified by the project it publishes from")
+    (is string= "unknown" (envelope:author-display nil home)
+        "a record with no self-id has no establishable author")
+    (is string= "unknown" (envelope:author-display "%ZZ" home)
+        "and neither has one whose id will not decode")))
+
+(define-test split-agent-id-cuts-at-the-last-separator
+  "A bus id splits into the project namespace and the name within it at the LAST
+   separator: the namespace is a path and carries separators of its own, while a
+   name never does. An id with no separator at all is all name."
+  (multiple-value-bind (namespace name)
+      (envelope:split-agent-id "/home/fade/proj//sister")
+    (is string= "/home/fade/proj/" namespace)
+    (is string= "sister" name))
+  (multiple-value-bind (namespace name) (envelope:split-agent-id "solo")
+    (false namespace "no separator means no namespace")
+    (is string= "solo" name)))
+
+(define-test decode-id-inverts-encode-id-and-refuses-a-mangled-token
+  "An encoded id round-trips exactly, because the name a reader is shown is taken
+   out of it. A token that is not well-formed percent-encoding decodes to NIL
+   rather than to a half-decoded string: presenting a mangled id as if it were a
+   name is worse than admitting the author is unknown."
+  (dolist (id (list "/home/fade/proj/worker"
+                    "/p/n"
+                    (format nil "a~Cb" envelope:+envelope-delimiter+)
+                    "plain"))
+    (is string= id (envelope:decode-id (envelope:encode-id id))
+        (format nil "~S round-trips" id)))
+  (false (envelope:decode-id nil) "no token decodes to no id")
+  (false (envelope:decode-id "%ZZ") "a non-hex escape is refused")
+  (false (envelope:decode-id "abc%2") "a truncated escape is refused"))
