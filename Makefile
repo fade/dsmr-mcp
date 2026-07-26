@@ -103,9 +103,24 @@ test-integration:
 ##   load and the system+test compile. The core is GC-safe (SBCL refuses a
 ##   cross-build --core) and large — it is .gitignored, never committed.
 ##   Rebuild after any dependency, SBCL-build, or project-source change.
+##
+##   Builds to a temporary path and renames into place, because a running server
+##   has the core file mmap'd: writing the new image over it would fault every
+##   live server. The rename swaps in a new inode and leaves running processes
+##   holding the old one until they exit. The previous image is kept as
+##   $(CORE).prev, both as a rollback and so core size and dependency drift can
+##   be diffed across builds.
 core:
-	DSMR_CORE_OUTPUT=$(CORE) $(SBCL) --noinform --disable-debugger \
+	@rm -f "$(CORE).tmp" "$(CORE).tmp.manifest"
+	DSMR_CORE_OUTPUT=$(CORE).tmp $(SBCL) --noinform --disable-debugger \
 	     --load scripts/build-core.lisp
+	@test -s "$(CORE).tmp" || { echo "core build produced no image; $(CORE) left untouched" >&2; exit 1; }
+	@if [ -e "$(CORE)" ]; then mv -f "$(CORE)" "$(CORE).prev"; fi
+	@if [ -e "$(CORE).manifest" ]; then mv -f "$(CORE).manifest" "$(CORE).manifest.prev"; fi
+	@mv -f "$(CORE).tmp.manifest" "$(CORE).manifest"
+	@mv -f "$(CORE).tmp" "$(CORE)"
+	@echo "installed $(CORE) (previous image kept as $(CORE).prev)"
+	@echo "running servers keep the previous core until each restarts"
 
 ## test-warm: run the fast suite against the prebuilt core ($(CORE)).
 ##

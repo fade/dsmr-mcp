@@ -50,6 +50,12 @@ dsmr.core
 dsmr.core.manifest
 .dsmr-core-rebuild.log
 .dsmr-core-rebuild.lock
+# The build stages through .tmp and keeps the superseded image as .prev; neither
+# matches *.core, so both are named here.
+dsmr.core.tmp
+dsmr.core.tmp.manifest
+dsmr.core.prev
+dsmr.core.manifest.prev
 
 # Per-developer direnv config (points at a local LISP_WORKSPACE / Slynk port).
 # dsmr-mcp can write one from its template via the launch-time consent prompt;

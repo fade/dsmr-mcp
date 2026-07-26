@@ -218,3 +218,51 @@ rediscovering the problem.
    a wake line shows the same addressee-as-byline ambiguity that #53 removed from
    receive. It ships in the server system, so fixing it costs a core rebuild.
 
+* Build and deployment
+** DONE rebuilding the core could fault every running server at once
+   CLOSED: 2026-07-26
+
+   A running server has the core file mapped for its whole life. =make core= wrote
+   the new image directly over that path, so a routine rebuild while any server was
+   up could fault all of them together. Nothing in the build enforced this. The only
+   thing standing between the target and a downed fleet was the operator remembering
+   to move the old image aside by hand first, which is a procedure, not a guarantee,
+   and it had to be recalled correctly every single time.
+
+   The build now writes to a staging path and renames the finished image into place.
+   The rename installs a new file and leaves running servers holding the one they
+   already mapped until each exits on its own schedule. A build that produces no
+   image leaves the installed one untouched rather than replacing it with a
+   fragment. The install path =install-bus-watch= uses was already correct; this
+   brings the core target into line with it.
+
+   The superseded image is kept rather than discarded, for two reasons. It is the
+   rollback. It is also the only way a question about image size or dependency drift
+   can be answered later: a roughly 20 MB swing between builds was unanswerable
+   precisely because the previous image had been overwritten and no process still
+   held it open.
+
+   Verified against a live fleet rather than reasoned about: the rebuild landed at a
+   fresh inode, all nine running servers kept their existing mappings and stayed
+   asleep rather than faulting, no staging files were left behind, and the resulting
+   image boots and serves its full verb set. Shipped in #54.
+
+** TODO core image size varies by about 20 MB across builds with no input change
+   Four builds of identical source with identical dependency manifests produced
+   206.1 MB, 185.4 MB, 194.3 MB and 205.9 MB, swinging in both directions. The
+   manifests were compared across the pairs and are the same, so this is not
+   dependency drift, and it is not compression: the save call is unchanged, the
+   string never appears in the build inputs anywhere in history, and the magnitude
+   is wrong for it anyway, since a compressed image would land nearer a quarter of
+   raw size rather than ninety percent of it.
+
+   This is bounded rather than explained. The evidence says the variation is not
+   symptomatic of anything, which is a different and much weaker claim than knowing
+   what causes it. No mechanism has been identified.
+
+   Impact is low but not nil: image size is one of the few cheap signals that a
+   build went wrong, and a signal that moves 20 MB on its own cannot be read that
+   way. Retaining each build's manifest and byte size alongside the previous image,
+   which the staging change above now does as a side effect, is what makes the next
+   occurrence diffable instead of unanswerable.
+
