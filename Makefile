@@ -17,7 +17,7 @@ export XDG_CACHE_HOME ?= $(CURDIR)/.ci-cache
 # whenever the dependencies, the SBCL build, or the project source change.
 CORE ?= dsmr.core
 
-.PHONY: bridge bus-watch install-bus-watch test test-integration core test-warm
+.PHONY: bridge bus-watch install-bus-watch test test-integration core core-verify test-warm
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -110,17 +110,54 @@ test-integration:
 ##   holding the old one until they exit. The previous image is kept as
 ##   $(CORE).prev, both as a rollback and so core size and dependency drift can
 ##   be diffed across builds.
+##
+##   Every step that can fail happens while the working core is still installed,
+##   so a build that produces a truncated or partially-loaded image is rejected
+##   rather than installed. File size alone cannot establish that, and it was
+##   all the previous check rested on.
+##
+##   $(CORE).prev is a hard link to the outgoing image rather than a rename of
+##   it, so $(CORE) names a valid image at every instant: the final rename
+##   replaces one complete file with another and there is no window where the
+##   path is missing. Rollback is `mv $(CORE).prev $(CORE)`.
 core:
 	@rm -f "$(CORE).tmp" "$(CORE).tmp.manifest"
 	DSMR_CORE_OUTPUT=$(CORE).tmp $(SBCL) --noinform --disable-debugger \
 	     --load scripts/build-core.lisp
 	@test -s "$(CORE).tmp" || { echo "core build produced no image; $(CORE) left untouched" >&2; exit 1; }
-	@if [ -e "$(CORE)" ]; then mv -f "$(CORE)" "$(CORE).prev"; fi
-	@if [ -e "$(CORE).manifest" ]; then mv -f "$(CORE).manifest" "$(CORE).manifest.prev"; fi
-	@mv -f "$(CORE).tmp.manifest" "$(CORE).manifest"
+	@test -s "$(CORE).tmp.manifest" || { echo "core build produced no manifest; $(CORE) left untouched" >&2; exit 1; }
+	@$(MAKE) --no-print-directory core-verify CORE_IMAGE="$(CORE).tmp"
+	@rm -f "$(CORE).prev" "$(CORE).manifest.prev"
+	@if [ -e "$(CORE)" ]; then ln "$(CORE)" "$(CORE).prev" 2>/dev/null || cp -p "$(CORE)" "$(CORE).prev"; fi
+	@if [ -e "$(CORE).manifest" ]; then ln "$(CORE).manifest" "$(CORE).manifest.prev" 2>/dev/null || cp -p "$(CORE).manifest" "$(CORE).manifest.prev"; fi
 	@mv -f "$(CORE).tmp" "$(CORE)"
+	@mv -f "$(CORE).tmp.manifest" "$(CORE).manifest"
 	@echo "installed $(CORE) (previous image kept as $(CORE).prev)"
 	@echo "running servers keep the previous core until each restarts"
+
+## core-verify: boot a core image and assert it is a complete, working build.
+##
+##   Run by `make core` against the staged image before it is installed, so the
+##   build refuses to replace a working core with a broken one. Also useful on
+##   its own to check the installed image (`make core-verify`) or any other
+##   (`make core-verify CORE_IMAGE=some.core`) without rebuilding anything.
+##
+##   Two kinds of broken image fail here by two different routes, and only one
+##   of them reaches the script. An image damaged badly enough not to boot kills
+##   SBCL as it maps the file, so the check that rejects it is the exit status,
+##   not anything scripts/verify-core.lisp does. An image that boots but loaded
+##   only part of the system is the case the script itself catches.
+##
+##   A truncated image therefore reports "Bus error" here, which is alarming to
+##   read in a build log given that faulting live servers is the thing this
+##   whole arrangement exists to prevent. It is the opposite: the fault is this
+##   throwaway check process touching a bad file it never installed, and the
+##   servers still hold the working image.
+CORE_IMAGE ?= $(CORE)
+core-verify:
+	@test -s "$(CORE_IMAGE)" || { echo "no core image at $(CORE_IMAGE)" >&2; exit 1; }
+	@$(SBCL) --core "$(CORE_IMAGE)" --noinform --disable-debugger --non-interactive \
+	     --load scripts/verify-core.lisp
 
 ## test-warm: run the fast suite against the prebuilt core ($(CORE)).
 ##
