@@ -76,3 +76,145 @@ rediscovering the problem.
    loaded, compiling system — not exotic input. Until fixed, the workaround is a
    plain-text edit followed by =lisp-check-parens= + =load-system= to prove
    structure was not disturbed.
+* Parallel agent execution vs. ASDF system resolution
+** TODO Worktree isolation does not isolate ASDF: a hotloading agent can resolve a worktree it does not own
+   Running several editing agents concurrently against one repo is unsafe — they
+   share one git working tree and one attached image, so branches collide and
+   every cold verify is contaminated by another agent's in-flight edits. The
+   standard remedy is to give each agent its own git worktree. For Common Lisp
+   that remedy is incomplete, and the gap is quiet rather than loud.
+
+   A worktree isolates the *filesystem*. ASDF's system namespace is *global* and
+   keyed by system **name**, not by path. N worktrees of this repo are N
+   directories each containing a =dsmr-mcp.asd= that all claim the name
+   =dsmr-mcp=. Which one a given image loads is decided by source-registry
+   search order, not by which worktree the agent was assigned. An agent can
+   therefore compile, load, and test code it does not own, and report green — the
+   same "a green certifies nothing" failure that worktrees were introduced to
+   prevent, now harder to spot because the filesystem looks correctly isolated.
+
+   Reproduction (the hazard is already in-tree, in two spots):
+
+   #+begin_src lisp
+   ;; src/hermetic/worker-client.lisp — inherited config is consulted FIRST,
+   ;; and the explicit source is a :tree scan rather than a pinned directory.
+   (asdf:initialize-source-registry
+     '(:source-registry :inherit-configuration (:tree #p"...")))
+
+   ;; src/bus/broker.lisp — the correct shape: explicit directory wins,
+   ;; inherited config only fills in the remainder.
+   (asdf:initialize-source-registry
+     '(:source-registry (:directory #p"...") :inherit-configuration))
+   #+end_src
+
+   =src/lsp/client.lisp= repeats the worker-client form. With sibling worktrees
+   under a scanned root, the =:tree= variant sweeps up every one of them, and the
+   leading =:inherit-configuration= means anything resolvable from the global
+   configuration outranks the source directory the worker was explicitly handed.
+
+   Impact: blocks safe parallel agent execution, which is the actual goal. Today
+   the only defensible posture is to serialize editing agents on a shared repo,
+   which costs real throughput on every multi-plan piece of work. It also means
+   the existing hermetic worker is less hermetic than its name claims — a
+   pre-existing correctness question independent of parallelism. A related
+   failure has already been observed with tree scans picking the wrong version of
+   a dependency that ships many copies.
+
+   Suggested fix:
+   - Normalize every registry initialization to the broker's shape: the owned
+     directory as an explicit =(:directory ...)= entry FIRST, =:inherit-configuration=
+     last, and never =(:tree ...)= over a root that can contain sibling checkouts.
+   - Give each parallel agent a source registry naming exactly the worktree it
+     owns, so system-name resolution cannot reach a sibling regardless of what
+     else is registered.
+   - Keep worktrees out of any directory covered by an inherited tree scan
+     (notably a local-projects tree), or they self-register and re-open the hole.
+   - Give each agent its own fasl cache (=XDG_CACHE_HOME=); shared caches have
+     already produced a flavor-mismatch crash here.
+   - Then verify the property directly rather than assuming it: two agents, two
+     worktrees, a deliberate divergence between them, and an assertion that each
+     loads its own definition. Until that test exists, parallel Lisp execution
+     should stay off.
+
+* IPC Bus faults in practice (Burn Down)
+** TODO the bus polling is too noisy, and an agents own bus emissions trip their own watches
+   Update: the "own emissions" half is fixed. The wakeup watcher already filters a
+   record carrying the agent's own encoded self-id, and =bus-status='s pending
+   count now applies that same filter — it previously counted an agent's own
+   un-consumed publishes, so status reported mail =bus-receive= would never hand
+   back, read as loss. Count and delivery now share one foreign-record predicate
+   (=envelope:foreign-record-p=) so they cannot drift apart again. Tracked in #48
+   (fixed). The remaining half — poll cadence being too noisy — is unaddressed.
+
+   Update 2026-07-26: the *volume* half of "too noisy" is fixed and measured. Both
+   readers used to re-read and re-verify the whole log on every look; they now read
+   only what was appended. Measured on a live 10-server / 10-watcher fleet: a server
+   went from ~70% of a core and ~25 MB/s to 0.38-0.44% and ~2.7 KB/s, sustained
+   across five hours of uptime; a watcher from ~43% and ~27 MB/s to 0.0-0.2% and
+   ~1 KB/s. Shipped in #52.
+
+   What is actually left under this heading is *cadence*, not volume, and it is now
+   specific: the fleet does not agree on a poll interval. Four watchers run
+   =--poll-ms 250= and five sit on the 1s default, so wake latency differs by 4x
+   depending on which agent you are waiting for. Separately, arming a watcher still
+   costs about one full WAL scan (7.7 MB measured against a 7 MB log; 15 MB for a
+   fresh identity), paid again on every recycle and growing with the log — the fix
+   bounded the poll, not the arm. Both belong to the wake-latency and rotation work.
+
+** TODO agents fall into a trap where they send the wrong flags to re-arm the wakeup, resulting in:
+
+  #+BEGIN_EXAMPLE
+  [the captured output for this item was lost: a paste landed a tool
+   invocation here instead of its result, and the file it pointed at
+   (a scratch task log under /tmp) has since been reaped. Described
+   from the known failure mode rather than reconstructed, because
+   inventing plausible error text here would be worse than the gap.]
+
+  Shape of the failure: dsmr-bus-watch treats an unrecognised flag as a
+  hard exit. The wrapper loop restarts it, it exits again on the same
+  bad flag, and nothing surfaces on the wake channel. The agent holds a
+  watch it believes is armed while no process is listening, so a
+  by-name dispatch never arrives and the silence is indistinguishable
+  from an idle bus.
+  #+END_EXAMPLE
+
+  which effectively silences that agent until it is manually recovered by the operator, and becomes an attractor causing the problem to reoccur with increasing frequency. the only 'repair' seems to be dropping the context entirely by restarting the agent; /clear often doesn't heal the problem. /bus-watch is only a half fix for the operator to 'get us out of this hole', which only works reliably if context is purged, which is bad for lots of obvious reasons.
+
+  Update: the deaf state is now *observable*, though not yet *prevented*. A watch
+  writes a heartbeat while it runs; =dsmr-bus-watch --check-live= and
+  =bus-status='s new =live_watcher= / =watcher_status= / =watcher_age_seconds=
+  fields let an agent or a park routine detect that its own ears are off before
+  the operator notices the latency. Tracked in #46 — observability shipped. The
+  actual fix for this item — enforce the correct re-arm, or make persistent mode
+  the default so wrong flags cannot silently deafen an agent — is the open
+  residual of #46.
+
+** DONE a delivered message showed no sender, so the name it was addressed to read as its byline
+   CLOSED: 2026-07-26
+
+   Messages were handed to a reader as their body alone. Bodies open with the name of
+   the agent being *addressed*, so the first word read as a signature and readers
+   credited messages to the wrong agent. It happened three times across the fleet in
+   one day, twice to readers that were holding written warnings about it, and once by
+   an agent that had just decoded the trap correctly for someone else and then laid it
+   again in its own message.
+
+   That last part is why this was worth fixing in code rather than in documentation:
+   when a hazard keeps firing on people who know about it, the missing field is the
+   defect and the care is not the remedy. The cost was real — four agents each spent a
+   full measurement refuting a claim its supposed author never made.
+
+   Receive now carries the publisher beside the body, as a field and as a labelled
+   header. Same-project senders show a bare name; senders from another project are
+   qualified by it, since two projects can each run an agent of the same name. A record
+   that will not decode reads as "unknown" and is still delivered — naming the author
+   must never become a condition of delivery. Shipped in #53.
+
+   ⚠ Merged is not deployed: sessions keep the old render until the core is rebuilt
+   and the servers restart.
+
+** TODO the watcher's own output still renders bodies without an author
+   =src/bus-listener.lisp= has the same author-less render on a different surface, so
+   a wake line shows the same addressee-as-byline ambiguity that #53 removed from
+   receive. It ships in the server system, so fixing it costs a core rebuild.
+
