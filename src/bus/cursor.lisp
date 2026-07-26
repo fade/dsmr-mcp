@@ -28,9 +28,12 @@
 ;;;; history; without seeding, an absent cursor reads as 0 and the first delivery
 ;;;; would be the whole log.
 ;;;;
-;;;; Delivery reads through WAL:READ-RECORDS, which is read-only and stops at a
+;;;; Delivery reads through WAL:READ-FORWARD, which is read-only and stops at a
 ;;;; torn tail — a subscriber therefore never sees a half-written record and never
-;;;; truncates the log (only a successor broker repairs it).
+;;;; truncates the log (only a successor broker repairs it). READ-FORWARD reads
+;;;; only the bytes appended since the previous delivery, which is what keeps a
+;;;; subscriber polling a quiet bus from paying for the whole history several
+;;;; times a second for the life of the process.
 
 (defpackage #:dsmr-mcp/src/bus/cursor
   (:use #:cl)
@@ -48,10 +51,18 @@
 
 (defstruct (subscriber (:constructor make-subscriber (id wal cursor-path)))
   "A bus consumer: its stable ID, the WAL path it reads, and the path of its
-   durable cursor file."
+   durable cursor file.
+
+   READER is process-local scratch rather than state: the byte position the last
+   delivery read up to, so the next one covers only what was appended since. It
+   is deliberately not durable and not part of the cursor's contract. A fresh
+   process starts with a fresh reader, reads the log once in full, and is
+   incremental from then on. The durable cursor file remains the only thing that
+   decides what this subscriber is owed."
   (id "" :type string)
   (wal "" :type (or string pathname))
-  (cursor-path "" :type (or string pathname)))
+  (cursor-path "" :type (or string pathname))
+  (reader (wal:make-reader) :type wal:reader))
 
 (defun cursor-value (subscriber)
   "The last sequence number SUBSCRIBER has acknowledged (0 if it has never
@@ -127,18 +138,34 @@
    not threaded back through here: PENDING-COUNT already answers that question
    for whoever needs it, and returning it as a second value would oblige every
    intermediate caller between here and the tool surface to propagate a value
-   none of them reads."
+   none of them reads.
+
+   The read is incremental. This is the busiest call in an otherwise idle
+   process, since AWAIT sits on it for the life of the server, and re-reading the
+   whole log on every turn made an attached but silent agent cost a sizeable
+   fraction of a core, scaling with the length of the history rather than with
+   the traffic. The subscriber's reader carries the byte position the previous
+   delivery stopped at, so a quiet turn touches only what was appended since."
   (let* ((bound (cond ((null limit) nil)
                       ((and (integerp limit) (plusp limit)) limit)
                       (t +default-batch-size+)))
          (cursor (cursor-value subscriber))
-         (records (wal:read-records (subscriber-wal subscriber)
-                                    :after cursor
-                                    :limit bound)))
-    (when records
-      (setf (cursor-value subscriber)
-            (wal:record-seq (car (last records)))))
-    records))
+         (reader (subscriber-reader subscriber)))
+    ;; The durable cursor decides what is owed; the reader only remembers where
+    ;; the bytes ran out last time. A reader that has read PAST the cursor means
+    ;; the cursor moved backwards under it, because another process rewrote the
+    ;; file, and the records between the two are owed again, so its position is
+    ;; thrown away. A reader BEHIND the cursor needs no such thing: it keeps
+    ;; reading forward and steps over whatever the cursor already covers.
+    (when (> (wal:reader-last-seq reader) cursor)
+      (wal:reset-reader reader))
+    (let ((records (wal:read-forward (subscriber-wal subscriber) reader
+                                     :after cursor
+                                     :limit bound)))
+      (when records
+        (setf (cursor-value subscriber)
+              (wal:record-seq (car (last records)))))
+      records)))
 
 (defun skip-to-head (subscriber)
   "Abandon SUBSCRIBER's whole backlog: advance its cursor straight to the log
