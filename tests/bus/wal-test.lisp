@@ -21,6 +21,7 @@
                 #:append-record
                 #:scan
                 #:read-records
+                #:make-reader #:read-forward #:reader-offset
                 #:recover
                 #:record-seq #:record-body-string
                 #:recovery-last-seq #:recovery-records #:recovery-truncated-from))
@@ -56,6 +57,13 @@
     (write-sequence bytes out)))
 
 (defun last-seq (path) (recovery-last-seq (recover path)))
+
+(defun empty-wal (path)
+  "Reset PATH to a zero-length file, exactly what archival does to the active log
+   when the last member leaves, and the event a live reader has to survive."
+  (close (open path :element-type '(unsigned-byte 8) :direction :output
+                    :if-exists :supersede :if-does-not-exist :create))
+  path)
 
 ;;; CRC ------------------------------------------------------------------------
 
@@ -195,3 +203,114 @@
       (false (recovery-truncated-from r)))
     (is equal (loop for s from 1 to 12 collect s)
         (mapcar #'record-seq (read-records w)))))
+
+;;; incremental tail reads -----------------------------------------------------
+;;;
+;;; A polling subscriber reads through READ-FORWARD, which remembers a byte
+;;; position and covers only what was appended since. The saving is real but the
+;;; failure it invites is silent: a reader that trusts a position it should not
+;;; skips records and reports nothing wrong. These tests pin the equivalence with
+;;; the full read, and each of the three ways a remembered position goes bad.
+
+(define-test incremental-read-matches-full-read
+  "Paged reads through one reader return exactly what an unbounded READ-RECORDS
+   returns: same seqs, same bodies, same order. If the two ever disagree the
+   cheap path is not an optimisation, it is a second implementation."
+  (with-wal (w)
+    (loop for s from 1 to 40 do (append-record w s (format nil "body-~D" s)))
+    (let ((r (make-reader))
+          (paged '()))
+      (loop for page = (read-forward w r :limit 7)
+            while page do (setf paged (append paged page)))
+      (let ((full (read-records w)))
+        (is equal (mapcar #'record-seq full) (mapcar #'record-seq paged))
+        (is equal (mapcar #'record-body-string full)
+            (mapcar #'record-body-string paged))))))
+
+(define-test drained-reader-sits-at-the-end-of-the-log
+  "Having read everything, the reader's position IS the end of the file, so the
+   next read of a quiet log covers no record bytes at all. That is the whole
+   point of the exercise, and it must not cost the record appended next."
+  (with-wal (w)
+    (write-good-wal w 20)
+    (let ((r (make-reader)))
+      (is = 20 (length (read-forward w r :limit nil)))
+      (is = (length (file-bytes w)) (reader-offset r))
+      (is eq nil (read-forward w r) "a quiet log delivers nothing")
+      (is = (length (file-bytes w)) (reader-offset r) "and moves nothing")
+      (append-record w 21 "x")
+      (is equal '(21) (mapcar #'record-seq (read-forward w r))))))
+
+(define-test bounded-read-strands-nothing-it-declined-to-return
+  "A LIMIT stops the reader at the last record it handed over, never past it, so
+   the records it declined are the very next ones the following read returns. A
+   position that ran ahead of the batch would drop them with no error anywhere."
+  (with-wal (w)
+    (write-good-wal w 25)
+    (let ((r (make-reader))
+          (seen '()))
+      (loop repeat 3
+            do (setf seen (append seen (read-forward w r :limit 4))))
+      (is equal '(1 2 3 4 5 6 7 8 9 10 11 12) (mapcar #'record-seq seen))
+      (is equal (loop for s from 13 to 25 collect s)
+          (mapcar #'record-seq (read-forward w r :limit nil))))))
+
+(define-test emptied-log-sends-the-reader-back-to-the-head
+  "Archival empties the active log under a live reader. Its remembered position
+   now describes a file that no longer exists, and the replacement has to be read
+   from the head. Trusting the position here is how a subscriber goes deaf at
+   exactly the moment the next cohort comes up."
+  (with-wal (w)
+    (write-good-wal w 12 "old")
+    (let ((r (make-reader)))
+      (is = 12 (length (read-forward w r :limit nil)))
+      (empty-wal w)
+      (loop for s from 1 to 6 do (append-record w s "new"))
+      (multiple-value-bind (recs restarted) (read-forward w r :limit nil)
+        (true restarted "the reader reports that it restarted")
+        (is equal '(1 2 3 4 5 6) (mapcar #'record-seq recs))
+        (is equal '("new")
+            (remove-duplicates (mapcar #'record-body-string recs) :test #'string=)
+            "and the records are the new log's, not the old one's")))))
+
+(define-test replacement-log-of-the-same-shape-is-not-mistaken-for-the-old-one
+  "The rotation that hides. The replacement log carries records of the SAME size
+   and starts numbering again from 1, so at the reader's remembered offset there
+   sits a perfectly valid record bearing exactly the seq the reader is expecting;
+   and the file has grown past that offset again, so its length gives nothing
+   away either. Catching the substitution takes recognising the individual record
+   by its CRC and its timestamp, not merely establishing that it is well formed.
+   Get this wrong and the whole head of the new log is skipped, silently, with
+   every integrity check still passing."
+  (with-wal (w)
+    (write-good-wal w 50 "aaaaaaaaaaaaaaaaaaaa")
+    (let* ((r (make-reader))
+           (stale (progn (read-forward w r :limit nil) (reader-offset r))))
+      (empty-wal w)
+      (loop for s from 1 to 90 do (append-record w s "bbbbbbbbbbbbbbbbbbbb"))
+      (true (> (length (file-bytes w)) stale)
+            "the replacement must grow past the stale offset for this to bite")
+      (multiple-value-bind (recs restarted) (read-forward w r :limit nil)
+        (true restarted "the reader reports that it restarted")
+        (is = 90 (length recs) "the new log's head is not skipped")
+        (is = 1 (record-seq (first recs)))
+        (is equal (mapcar #'record-seq (read-records w))
+            (mapcar #'record-seq recs))))))
+
+(define-test torn-tail-stops-the-read-and-is-picked-up-once-it-completes
+  "A partial trailing record stops the read and is never handed over. The reader
+   does not step past it either, so when the writer finishes the record a later
+   read returns it in its proper place. The file is not touched: repairing a torn
+   tail belongs to a successor broker, never to a reader."
+  (with-wal (w)
+    (write-good-wal w 5)
+    (let ((r (make-reader))
+          (full (encode-record 6 "x")))
+      (is equal '(1 2 3 4 5) (mapcar #'record-seq (read-forward w r :limit nil)))
+      (append-raw w (subseq full 0 (+ 8 4)))         ; header plus four payload bytes
+      (let ((torn-size (length (file-bytes w))))
+        (is eq nil (read-forward w r) "the torn record is not delivered")
+        (is = torn-size (length (file-bytes w)) "and the log is left alone"))
+      (append-raw w (subseq full (+ 8 4)))           ; the writer finishes it
+      (is equal '(6) (mapcar #'record-seq (read-forward w r)))
+      (is equal '(1 2 3 4 5 6) (mapcar #'record-seq (read-records w))))))
