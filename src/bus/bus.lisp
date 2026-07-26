@@ -110,12 +110,19 @@
    publisher's OWN record, identified by message identity, never by WAL position.
    A concurrent foreign agent's record fails the id match and is left for normal
    delivery. Bounded by a deadline: returns NIL if the id has not appeared in time.
-   AFTER is not advanced between turns — re-scanning from the same floor is fine
-   because the id match, not the position, selects the record. Touches no cursor."
+   AFTER is not advanced between turns — the floor stays where the publish began,
+   because the id match, not the position, selects the record. Touches no cursor.
+
+   The rescan is incremental: one reader is held across the whole wait, so each
+   record is examined on the turn it lands and not again. Re-reading the log from
+   the floor on every turn instead made one publish pay for the entire history
+   several hundred times over on a busy bus, for a wait that is normally decided
+   in the first few turns."
   (let ((deadline (+ (%now-ms) timeout-ms))
-        (wal-path (broker:bus-paths-wal paths)))
+        (wal-path (broker:bus-paths-wal paths))
+        (reader (wal:make-reader)))
     (loop
-      (dolist (record (wal:read-records wal-path :after after))
+      (dolist (record (wal:read-forward wal-path reader :after after))
         (multiple-value-bind (text cid sid) (decode-envelope (wal:record-body-string record))
           (declare (ignore text sid))
           (when (and cid (string= cid correlation-id))

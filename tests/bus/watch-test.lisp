@@ -19,7 +19,10 @@
   (:use #:cl #:parachute)
   (:import-from #:dsmr-mcp/src/bus/wal
                 #:scan
-                #:append-record)
+                #:append-record
+                ;; the incremental-read machinery the poll path now rides on
+                #:make-reader
+                #:reader-offset)
   (:import-from #:dsmr-mcp/src/bus/envelope
                 #:agent-id
                 #:encode-id
@@ -35,6 +38,11 @@
                 ;; arming are only observable through main otherwise, and each
                 ;; carries behavior worth pinning on its own
                 #:%parse-args
+                ;; internal: the bounded poll step both loops now share. Its
+                ;; restart verdict is the whole of the rotation defence and is
+                ;; not observable through the loops' return values.
+                #:%poll-forward
+                #:%highest-foreign-seq
                 #:%resolve-self-id
                 #:%resolve-baseline
                 #:%cursor-path
@@ -476,3 +484,195 @@
       (is equal
           (namestring (beat-path id dir))
           (namestring (beat-path id dir))))))
+
+(defun write-generation (path n &key (ts-base 1000) (body "xxxxxxxx"))
+  "Empty PATH and write a fresh log of N contiguous records with deterministic
+   timestamps. TS-BASE is what distinguishes one generation of the log from the
+   next: two generations written with the same bodies put records of identical
+   length carrying identical seqs at identical byte offsets, so the timestamp —
+   and the CRC that covers it — is the only thing telling them apart. That is
+   exactly the distinction a reader resuming from a remembered offset has to be
+   able to make, so the fixture is built to remove every easier cue."
+  (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                            :if-exists :supersede :if-does-not-exist :create)
+    (declare (ignore out)))
+  (loop for s from 1 to n do (append-record path s body :ts (+ ts-base s)))
+  path)
+
+(defun run-poll-script (wal me &key reader)
+  "Drive one fixed publish-and-poll script over WAL and return (values emitted
+   cursors). With READER the polls are incremental; without one each poll builds
+   its own throwaway reader and reads the whole log, which is what the watcher
+   did before it carried a position. From out here the two must be
+   indistinguishable, which is the point of driving them through one script."
+  (let ((seen '())
+        (cursors '())
+        (cursor 0)
+        (them (agent-id "/p" :name "them")))
+    (labels ((collect (s) (push s seen))
+             (advance (c)
+               (let ((next (if reader
+                               (poll-new wal c #'collect me reader)
+                               (poll-new wal c #'collect me))))
+                 (push next cursors)
+                 next)))
+      (append-from wal 1 me)
+      (append-from wal 2 them)
+      (append-from wal 3 them)
+      (setf cursor (advance cursor))
+      (append-from wal 4 me)
+      (setf cursor (advance cursor))
+      (setf cursor (advance cursor))       ; a quiet poll: nothing was published
+      (append-from wal 5 them)
+      (append-from wal 6 them)
+      (advance cursor)
+      (values (nreverse seen) (nreverse cursors)))))
+
+(define-test incremental-polling-says-what-a-full-read-would-say
+  ;; Differential: the same publish-and-poll script run twice, once reading only
+  ;; what was appended since the last look and once reading the whole log every
+  ;; time. Reading less must not mean seeing less — not the seqs emitted, and not
+  ;; the cursor handed back at each step.
+  (let (incremental-seen incremental-cursors full-seen full-cursors)
+    (with-wal (w)
+      (multiple-value-setq (incremental-seen incremental-cursors)
+        (run-poll-script w (agent-id "/p" :name "me") :reader (make-reader))))
+    (with-wal (w)
+      (multiple-value-setq (full-seen full-cursors)
+        (run-poll-script w (agent-id "/p" :name "me"))))
+    (is equal '(2 3 5 6) full-seen)
+    (is equal '(3 4 4 6) full-cursors)
+    (is equal full-seen incremental-seen)
+    (is equal full-cursors incremental-cursors)))
+
+(define-test a-log-replaced-under-the-watch-is-reread-from-its-new-head
+  ;; The trap a remembered byte offset walks into. A rotation empties the log and
+  ;; the next broker numbers from 1 again, so a record of the same shape carrying
+  ;; the very same seq lands at the very same offset, and the file can be longer
+  ;; than before so its length gives nothing away either. A reader that asked only
+  ;; "is there a good record where I stopped?" would pass that check, resume in
+  ;; the middle of a log it has never read, and never mention anything below it —
+  ;; a watch gone silently deaf while every integrity check it makes still passes.
+  ;;
+  ;; Both generations here are written with identical bodies and identical seqs,
+  ;; so the timestamps, and the CRC covering them, are the only evidence the log
+  ;; changed. Emitting all eight is what says that evidence was actually used;
+  ;; emitting 6, 7 and 8 is precisely the failure being ruled out.
+  (with-wal (w)
+    (let ((reader (make-reader))
+          (seen '()))
+      (write-generation w 5 :ts-base 1000)
+      (is = 5 (poll-new w 0 (lambda (s) (push s seen)) nil reader))
+      (is equal '(1 2 3 4 5) (reverse seen))
+      (setf seen '())
+      (write-generation w 8 :ts-base 9000)
+      (multiple-value-bind (cursor restarted)
+          (poll-new w 5 (lambda (s) (push s seen)) nil reader)
+        (true restarted "a replaced log must be reported as a restart, not read as growth")
+        (is = 8 cursor)
+        (is equal '(1 2 3 4 5 6 7 8) (reverse seen))))))
+
+(define-test a-shorter-log-drags-the-cursor-back-instead-of-going-deaf
+  ;; The other half of the same problem, and the one a cursor that only ever
+  ;; climbs gets wrong. When the replacement log is SHORTER than the seq the watch
+  ;; was holding, keeping the larger of the two leaves the watch parked above
+  ;; every seq the new log will ever produce: it polls forever, reports itself
+  ;; healthy, and can never fire again. The cursor has to come back down with the
+  ;; log, because the two numbers count different logs.
+  (with-wal (w)
+    (let ((reader (make-reader))
+          (seen '()))
+      (write-generation w 6 :ts-base 1000)
+      (is = 6 (poll-new w 0 (lambda (s) (push s seen)) nil reader))
+      (setf seen '())
+      (write-generation w 2 :ts-base 5000)
+      (multiple-value-bind (cursor restarted)
+          (poll-new w 6 (lambda (s) (push s seen)) nil reader)
+        (true restarted "a truncated log must be reported as a restart")
+        (is = 2 cursor)
+        (is equal '(1 2) (reverse seen))))))
+
+(define-test a-message-that-landed-before-the-arm-fires-on-the-first-poll
+  ;; The window between an agent draining the bus and its watch coming back up.
+  ;; A message that lands in there is already on disk before anything is
+  ;; watching, so a watch waiting for the log to MOVE would never see it. Arming
+  ;; a reader must not quietly turn the check edge-triggered.
+  ;;
+  ;; A recycle window of zero puts the deadline in the past, so the loop gets
+  ;; exactly one poll before it gives up. Firing inside that budget is what pins
+  ;; the property; a watch that needed a second poll would return NIL here.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them")))
+      (append-from w 1 me)
+      (append-from w 2 them)
+      (is = 2 (watch-until-foreign w 1 :poll-ms 5 :recycle-seconds 0
+                                       :self-id me)))))
+
+(define-test streaming-arm-emits-a-message-that-landed-before-it
+  ;; The same arm-time property for the streaming mode, which is the one the
+  ;; fleet actually arms. Its first poll reads the whole log precisely so that
+  ;; what is already sitting above the baseline is emitted rather than skipped
+  ;; past on the way to establishing where the log ends.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them"))
+          (seen '()))
+      (append-from w 1 me)
+      (append-from w 2 them)
+      (let ((final (watch-stream w 1 :poll-ms 5 :recycle-seconds 0
+                                     :self-id me
+                                     :emit (lambda (s) (push s seen)))))
+        (is = 2 final)
+        (is equal '(2) (reverse seen))))))
+
+(define-test a-held-reader-still-finds-a-foreign-record-after-quiet-polls
+  ;; A reader hands each record over exactly once, so the exit-on-event filter
+  ;; sees any given record on one poll only. That is sound here — a poll that
+  ;; found nothing foreign has already established there was nothing foreign
+  ;; among the records it consumed — but it is sound for a reason rather than by
+  ;; construction, so it is worth holding a reader across several barren polls and
+  ;; checking the message that eventually arrives is still found.
+  (with-wal (w)
+    (let* ((me (agent-id "/p" :name "me"))
+           (them (agent-id "/p" :name "them"))
+           (own (encode-id me))
+           (reader (make-reader)))
+      (append-from w 1 me)
+      (false (%highest-foreign-seq w 0 own reader))
+      (false (%highest-foreign-seq w 0 own reader))   ; nothing published since
+      (append-from w 2 me)
+      (false (%highest-foreign-seq w 0 own reader))
+      (append-from w 3 them)
+      (is = 3 (%highest-foreign-seq w 0 own reader)))))
+
+(define-test a-quiet-poll-does-not-reread-the-whole-log
+  ;; The defect all of the above exists to make safe to fix. Every poll used to
+  ;; read the entire history, so an idle watcher's cost tracked how much traffic
+  ;; the bus had EVER carried rather than how much it was carrying now. At the
+  ;; quarter-second cadence the fleet arms, across every repo at once, that was
+  ;; tens of megabytes a second per watcher and a real fraction of the machine
+  ;; spent on logs nobody was reading.
+  ;;
+  ;; Nothing about which seqs come out can catch a regression here, so this
+  ;; measures instead. Allocation is the proxy: a whole-log read has to
+  ;; materialise the log, so eight quiet polls consing less than ONE file's worth
+  ;; is only possible if the reads are bounded. The real ratio is far wider than
+  ;; the bound asserted; the bound is loose on purpose so the test measures the
+  ;; defect and not the allocator.
+  (with-wal (w)
+    (let ((reader (make-reader))
+          (body (make-string 1024 :initial-element #\z)))
+      (loop for s from 1 to 400 do (append-record w s body))
+      (let ((size (with-open-file (in w :element-type '(unsigned-byte 8))
+                    (file-length in))))
+        (poll-new w 0 nil nil reader)            ; arm: this one does read it all
+        (is = size (reader-offset reader)
+            "the arming read must leave the reader at the end of the log")
+        (let ((before (sb-ext:get-bytes-consed)))
+          (dotimes (i 8) (poll-new w 400 nil nil reader))
+          (let ((consed (- (sb-ext:get-bytes-consed) before)))
+            (true (< consed size)
+                  "8 quiet polls consed ~:D bytes against a ~:D byte log; ~
+                   re-reading the log every poll would cost at least ~:D"
+                  consed size (* 8 size))))))))

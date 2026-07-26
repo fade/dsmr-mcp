@@ -41,11 +41,11 @@
   (:use #:cl)
   (:local-nicknames (#:envelope #:dsmr-mcp/src/bus/envelope)
                     (#:cursor #:dsmr-mcp/src/bus/cursor)
-                    (#:heartbeat #:dsmr-mcp/src/bus/heartbeat))
+                    (#:heartbeat #:dsmr-mcp/src/bus/heartbeat)
+                    (#:wal #:dsmr-mcp/src/bus/wal))
   (:import-from #:dsmr-mcp/src/bus/wal
                 #:scan
                 #:now-ms
-                #:read-records
                 #:record-seq
                 #:record-body-string)
   ;; The heartbeat lives in a shared leaf so the name a running watch writes and
@@ -130,25 +130,80 @@
 
 (defun %last-seq (wal-path)
   "The highest committed seq in WAL-PATH, or 0 for a missing/empty/torn-only
-   log. Read-only — never clips a write still in flight."
+   log. Read-only — never clips a write still in flight.
+
+   This is the whole-log question and it costs the whole log to answer, which is
+   the right price ONCE, at arm time, where the watcher needs a head to arm
+   against and holds no position yet. It is deliberately not on the poll path:
+   the loops below ask the same question several times a second for the life of
+   the process, and they ask it of %POLL-FORWARD, which answers from the bytes
+   appended since the previous look."
   (values (scan wal-path)))
 
-(defun %highest-foreign-seq (wal-path baseline own-encoded)
-  "The highest seq above BASELINE belonging to a record this agent did not
-   publish, or NIL when there is no such record.
+(defun %poll-forward (wal-path reader after)
+  "One bounded look at WAL-PATH on behalf of READER. Returns (values records
+   last-seq restarted-p): the good records with seq > AFTER that READER has not
+   already accounted for, oldest first; the log's highest committed seq; and
+   whether the read fell back to the head of the file.
 
-   Without an identity this is just the log head when it exceeds BASELINE, and
-   the log is never re-read past its tail. With one, the records above BASELINE
-   are read and filtered, so a burst made up entirely of this agent's own
-   publishes leaves the watch waiting instead of waking it up to find nothing
-   addressed to it."
-  (if (null own-encoded)
-      (let ((last (%last-seq wal-path)))
-        (and (> last baseline) last))
-      (let ((highest nil))
-        (dolist (record (read-records wal-path :after baseline) highest)
-          (when (envelope:foreign-record-p record own-encoded)
-            (setf highest (record-seq record)))))))
+   READER carries the byte offset the previous look stopped at, so a quiet poll
+   costs the 24-byte prefix that re-identifies the record behind that offset plus
+   whatever has been appended since — not the whole history. Every guarantee the
+   whole-log read makes still holds, because this is the whole-log read's own
+   machinery: each record is CRC-verified on the read that first hands it over,
+   the seq column is asserted contiguous across the incremental join, and a torn
+   tail stops the read cleanly and is picked up once the record completes.
+
+   A failed re-identification means the log on disk is no longer the log READER
+   was reading. Rotation empties the active log and the next broker numbers from
+   1 again, so a seq carried over from the old log names nothing here and would
+   filter out every record in the new one — a watch that looks healthy and hears
+   nothing. The recovery is therefore to re-read this log from its head with no
+   floor at all, and to say so through RESTARTED-P so the caller drops the
+   position it was holding. The retry cannot itself restart: READER's offset is
+   zero going into it."
+  (multiple-value-bind (records restarted)
+      (wal:read-forward wal-path reader :after after)
+    (if restarted
+        (progn
+          (wal:reset-reader reader)
+          (let ((from-head (wal:read-forward wal-path reader :after 0)))
+            (values from-head (wal:reader-last-seq reader) t)))
+        (values records (wal:reader-last-seq reader) nil))))
+
+(defun %highest-foreign-seq (wal-path baseline own-encoded
+                             &optional (reader (wal:make-reader)))
+  "The highest seq above BASELINE belonging to a record this agent did not
+   publish, or NIL when there is no such record. Returns (values seq last-seq
+   restarted-p).
+
+   Without an identity this is just the log head when it exceeds BASELINE. With
+   one, the records above BASELINE are read and filtered, so a burst made up
+   entirely of this agent's own publishes leaves the watch waiting instead of
+   waking it up to find nothing addressed to it.
+
+   READER is the caller's position in the log. A caller that supplies one and
+   keeps it across polls pays for the tail; the default is a throwaway reader,
+   which reads the whole log exactly as this did before it took a position — the
+   behavior every one-shot caller and every existing test sees. Handing back a
+   record only once is sound for this question because a poll that found no
+   foreign record has already established there was none among the records it
+   consumed.
+
+   After a restart the log has been rotated or truncated and BASELINE belongs to
+   a numbering that no longer applies, so the floor for this look is the head of
+   the new log rather than a seq from the old one."
+  (multiple-value-bind (records last restarted)
+      (%poll-forward wal-path reader baseline)
+    (let ((floor (if restarted 0 baseline)))
+      (values (if (null own-encoded)
+                  (and (> last floor) last)
+                  (let ((highest nil))
+                    (dolist (record records highest)
+                      (when (envelope:foreign-record-p record own-encoded)
+                        (setf highest (record-seq record))))))
+              last
+              restarted))))
 
 (defun watch-until-foreign (wal-path baseline
                             &key (poll-ms 1000) (recycle-seconds 600) self-id
@@ -170,43 +225,70 @@
    before the fired check — so a freshly-armed watch runs it once immediately,
    with no race window, and again every poll thereafter. It is where the
    heartbeat refresh lives; keeping it out of the pure fired-check body leaves
-   the loop's own logic side-effect-free and the unit tests untouched."
+   the loop's own logic side-effect-free and the unit tests untouched.
+
+   One reader is held for the life of the watch. The first poll still reads the
+   whole log — that is what establishes where the log currently ends, and it is
+   also what makes the arm level-triggered — and every poll after it reads only
+   what has been appended since. An idle watch therefore costs a fixed handful of
+   bytes per poll instead of the entire history, which at a quarter-second cadence
+   is the difference between a background process and a busy core."
   (let ((deadline (+ (now-ms) (round (* recycle-seconds 1000))))
         (sleep-s (/ poll-ms 1000.0))
-        (own (and self-id (envelope:encode-id self-id))))
+        (own (and self-id (envelope:encode-id self-id)))
+        (reader (wal:make-reader))
+        (floor baseline))
     (loop
       (when on-poll (funcall on-poll))
-      (let ((fired (%highest-foreign-seq wal-path baseline own)))
+      (multiple-value-bind (fired last restarted)
+          (%highest-foreign-seq wal-path floor own reader)
+        (declare (ignore last))
+        (when restarted
+          (setf floor 0)
+          (%warn "wal rotated or truncated under the watch; re-armed at the head of the new log"))
         (when fired
           (return fired)))
       (when (>= (now-ms) deadline)
         (return nil))
       (sleep sleep-s))))
 
-(defun poll-new (wal-path cursor &optional emit self-id)
+(defun poll-new (wal-path cursor &optional emit self-id
+                                           (reader (wal:make-reader)))
   "One streaming step: call EMIT (when supplied) once per FOREIGN record with
-   seq in (CURSOR, last-committed], and return the new cursor.
+   seq in (CURSOR, last-committed], and return (values new-cursor restarted-p).
 
    The returned cursor is the highest committed seq regardless of who published
    what, so records skipped as this agent's own are still stepped over and never
    examined twice. With SELF-ID NIL nothing is filtered and every new seq is
-   emitted; WAL seqs are contiguous, so that path needs no read at all. Pure and
-   side-effect-free apart from EMIT — the unit tests drive it directly with a
-   collecting callback.
+   emitted. Pure and side-effect-free apart from EMIT — the unit tests drive it
+   directly with a collecting callback.
 
-   SELF-ID is positional rather than a keyword only because EMIT already is:
-   mixing the two lambda-list kinds is legal but draws a style warning, and the
-   positional EMIT is the older contract."
-  (let ((own (and self-id (envelope:encode-id self-id)))
-        (last (%last-seq wal-path)))
-    (when (and emit (> last cursor))
-      (if (null own)
-          (loop for s from (1+ cursor) to last do (funcall emit s))
-          (dolist (record (read-records wal-path :after cursor))
-            (when (and (<= (record-seq record) last)
-                       (envelope:foreign-record-p record own))
-              (funcall emit (record-seq record))))))
-    (max last cursor)))
+   READER is the caller's position in the log; supplying one and keeping it
+   across calls is what makes a quiet poll cost the tail rather than the whole
+   history. The default is a throwaway reader, which reads the whole log, which
+   is what every one-shot caller wants and what this did before it took a
+   position.
+
+   The records and the head seq now come out of ONE read rather than a scan
+   followed by a separate replay. That closes a small race as a side effect: a
+   record appended between those two reads used to be visible to the replay but
+   above the cursor the scan had just fixed, and had to be filtered back out to
+   avoid returning a cursor that skipped it. One read cannot disagree with
+   itself.
+
+   RESTARTED-P is true when the log was rotated or truncated under the reader.
+   The cursor returned in that case is the new log's head, not the old cursor
+   carried forward, because the two number different logs and keeping the larger
+   would leave this watch permanently above every record the new log can produce."
+  (let ((own (and self-id (envelope:encode-id self-id))))
+    (multiple-value-bind (records last restarted)
+        (%poll-forward wal-path reader cursor)
+      (when emit
+        (dolist (record records)
+          (when (or (null own) (envelope:foreign-record-p record own))
+            (funcall emit (record-seq record)))))
+      (values (if restarted last (max last cursor))
+              restarted))))
 
 (defun watch-stream (wal-path baseline
                      &key (poll-ms 1000) (recycle-seconds 600) self-id
@@ -226,14 +308,27 @@
    before the advance check, on the same contract watch-until-foreign gives it:
    fired once at arm with no race window, then every poll. It carries the
    heartbeat refresh, kept out of the pure poll-new step so the streaming unit
-   tests see no new behavior."
+   tests see no new behavior.
+
+   One reader is held for the life of the stream, so a quiet poll reads the bytes
+   appended since the last one rather than the whole log. This is the loop that
+   made idle watchers expensive: it is the mode the fleet arms, at a
+   quarter-second cadence, in every repo at once.
+
+   A rotation counts as activity and resets the idle window. The log demonstrably
+   moved, and the cursor moving DOWN to the new log's head is exactly the case a
+   plain advance test would read as no activity at all."
   (let ((cursor baseline)
         (deadline (+ (now-ms) (round (* recycle-seconds 1000))))
-        (sleep-s (/ poll-ms 1000.0)))
+        (sleep-s (/ poll-ms 1000.0))
+        (reader (wal:make-reader)))
     (loop
       (when on-poll (funcall on-poll))
-      (let ((advanced (poll-new wal-path cursor emit self-id)))
-        (when (> advanced cursor)
+      (multiple-value-bind (advanced restarted)
+          (poll-new wal-path cursor emit self-id reader)
+        (when restarted
+          (%warn "wal rotated or truncated under the watch; streaming from the head of the new log"))
+        (when (or restarted (> advanced cursor))
           (setf cursor advanced
                 ;; activity resets the idle window
                 deadline (+ (now-ms) (round (* recycle-seconds 1000))))))
