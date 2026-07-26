@@ -199,3 +199,49 @@
                        (lambda (p) (eql 0 (search stem (file-namestring p))))
                        (uiop:directory-files dir))))
       (is = 0 (length leftovers) "no transient cursor file remains"))))
+
+;;; incremental delivery -------------------------------------------------------
+;;;
+;;; Delivery reads only the bytes appended since the previous call. The durable
+;;; cursor still decides what is owed; what these pin is that the cheaper read
+;;; hands back the same records the whole-log read did, including across the
+;;; events that invalidate a remembered byte position.
+
+(defun empty-wal (path)
+  "Reset PATH to a zero-length file, what archival does to the active log when
+   the last member leaves."
+  (close (open path :element-type '(unsigned-byte 8) :direction :output
+                    :if-exists :supersede :if-does-not-exist :create))
+  path)
+
+(define-test many-quiet-polls-do-not-cost-the-next-message
+  "The shape of an idle subscriber's life: poll, poll, poll, then a message. The
+   quiet polls deliver nothing and move nothing, and the record that finally
+   arrives is delivered once, in order, exactly as a single poll would have."
+  (with-sub (s)
+    (publish s 6)
+    (is equal '(1 2 3 4 5 6) (mapcar #'wal:record-seq (cursor:deliver-pending s)))
+    (dotimes (i 50)
+      (is eq nil (cursor:deliver-pending s)))
+    (is = 6 (cursor:cursor-value s))
+    (publish s 2)
+    (is equal '(7 8) (mapcar #'wal:record-seq (cursor:deliver-pending s)))
+    (is = 8 (cursor:cursor-value s))
+    (is eq nil (cursor:deliver-pending s) "and delivery is still idempotent")))
+
+(define-test delivery-survives-the-log-being-rotated-underneath-it
+  "Archival empties the log under a live subscriber and the next cohort starts
+   numbering again. Delivery must fall back to reading the replacement from its
+   head and hand back everything the cursor does not already cover. A subscriber
+   that kept trusting a stale byte position would report itself healthy and
+   deliver nothing ever again."
+  (with-sub (s)
+    (publish s 8)
+    (is = 3 (length (cursor:deliver-pending s :limit 3)))    ; cursor -> 3
+    (empty-wal (cursor:subscriber-wal s))
+    (loop for i from 1 to 9
+          do (wal:append-record (cursor:subscriber-wal s) i "post-rotation"))
+    (is equal '(4 5 6 7 8 9)
+        (mapcar #'wal:record-seq (cursor:deliver-pending s :limit nil))
+        "everything above the cursor in the new log is delivered")
+    (is = 9 (cursor:cursor-value s))))
