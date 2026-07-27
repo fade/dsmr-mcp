@@ -18,6 +18,7 @@
                     (#:bus #:dsmr-mcp/src/bus/bus)
                     (#:agent #:dsmr-mcp/src/bus/agent)
                     (#:heartbeat #:dsmr-mcp/src/bus/heartbeat)
+                    (#:selector #:dsmr-mcp/src/bus/selector)
                     (#:wal #:dsmr-mcp/src/bus/wal)))
 
 (in-package #:dsmr-mcp/tests/bus/agent-test)
@@ -345,3 +346,45 @@
                                 "an absent beat reads as no watcher")))
                      (agent:disconnect-agent me)))))
           (ignore-errors (uiop:delete-directory-tree state-root :validate t)))))))
+
+(define-test connect-agent-records-the-bus-it-joined
+  "A participant knows which bus it is on, and the handle is where every surface
+   downstream reads it from rather than assuming there is only one bus. With no
+   :bus the paths are exactly the ones this has always derived; with a name they
+   sit under that name's own root, with a write-ahead log of their own. The temp
+   XDG root's suffix is seeded per call so a leftover tree from an earlier image
+   cannot turn an assertion about a fresh root into a flake."
+  (let ((state-root (ensure-directories-exist
+                     (merge-pathnames
+                      (format nil "dsmr-agent-named-bus-~D-~D/"
+                              (sb-posix:getpid)
+                              (random 100000000 (make-random-state t)))
+                      (uiop:temporary-directory)))))
+    (unwind-protect
+         (call-with-xdg-state state-root
+           (lambda ()
+             (let ((here (agent:connect-agent "/proj" :name "here"
+                                                      :ensure-broker nil))
+                   (there (agent:connect-agent "/proj" :name "there" :bus "alpha"
+                                                       :ensure-broker nil)))
+               (unwind-protect
+                    (progn
+                      (is eq nil (agent:agent-bus here)
+                          "no :bus means the host's unnamed bus")
+                      (is string= "alpha" (agent:agent-bus there))
+                      (is string= (namestring (selector:bus-root nil))
+                          (namestring (broker:bus-paths-root
+                                       (agent:agent-paths here)))
+                          "the unnamed participant keeps today's root")
+                      (is string= (namestring (selector:bus-root "alpha"))
+                          (namestring (broker:bus-paths-root
+                                       (agent:agent-paths there)))
+                          "the named participant sits under its own root")
+                      (false (equal (broker:bus-paths-wal
+                                     (agent:agent-paths here))
+                                    (broker:bus-paths-wal
+                                     (agent:agent-paths there)))
+                             "the two buses keep separate write-ahead logs"))
+                 (agent:disconnect-agent here)
+                 (agent:disconnect-agent there)))))
+      (ignore-errors (uiop:delete-directory-tree state-root :validate t)))))
