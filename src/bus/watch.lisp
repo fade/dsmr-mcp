@@ -42,7 +42,8 @@
   (:local-nicknames (#:envelope #:dsmr-mcp/src/bus/envelope)
                     (#:cursor #:dsmr-mcp/src/bus/cursor)
                     (#:heartbeat #:dsmr-mcp/src/bus/heartbeat)
-                    (#:wal #:dsmr-mcp/src/bus/wal))
+                    (#:wal #:dsmr-mcp/src/bus/wal)
+                    (#:selector #:dsmr-mcp/src/bus/selector))
   (:import-from #:dsmr-mcp/src/bus/wal
                 #:scan
                 #:now-ms
@@ -73,35 +74,23 @@
   (format *error-output* "dsmr-bus-watch: ~?~%" control args)
   (force-output *error-output*))
 
-(defun default-wal-path ()
-  "The default bus WAL path: $XDG_STATE_HOME/dsmr-mcp/bus/bus.wal (falling back
-   to ~/.local/state/dsmr-mcp/bus/bus.wal). The state-root derivation is inlined
-   rather than reached through the module that owns it, so this binary carries
-   no ZeroMQ transport — a sister repo needs no libzmq to arm a watcher."
-  (let* ((xdg (uiop:getenv "XDG_STATE_HOME"))
-         (root (merge-pathnames
-                "dsmr-mcp/bus/"
-                (if (and xdg (plusp (length xdg)))
-                    (uiop:ensure-directory-pathname xdg)
-                    (merge-pathnames ".local/state/" (user-homedir-pathname))))))
-    (merge-pathnames "bus.wal" root)))
+(defun default-wal-path (&optional bus)
+  "The bus write-ahead log: bus.wal under the state root for BUS, or under the
+   unnamed root when BUS is nil.
 
-(defun default-cursors-dir ()
-  "The default bus cursor directory: $XDG_STATE_HOME/dsmr-mcp/bus/cursors/
-   (falling back to ~/.local/state/dsmr-mcp/bus/cursors/).
+   The root comes from the shared selector leaf, which imports nothing beyond cl
+   and uiop. That is what keeps this binary free of the ZeroMQ transport, so a
+   sister repo needs no libzmq to arm a watcher."
+  (merge-pathnames "bus.wal" (selector:bus-root bus)))
 
-   The derivation is inlined here for the same reason DEFAULT-WAL-PATH inlines
-   it: reaching for the module that owns the state root would pull the ZeroMQ
-   transport into a binary that sister repos must be able to run without libzmq
-   installed. Two copies of a path derivation is a real cost, and it is the
-   smaller one."
-  (let* ((xdg (uiop:getenv "XDG_STATE_HOME"))
-         (root (merge-pathnames
-                "dsmr-mcp/bus/"
-                (if (and xdg (plusp (length xdg)))
-                    (uiop:ensure-directory-pathname xdg)
-                    (merge-pathnames ".local/state/" (user-homedir-pathname))))))
-    (merge-pathnames "cursors/" root)))
+(defun default-cursors-dir (&optional bus)
+  "The bus cursor directory: cursors/ under the state root for BUS, or under the
+   unnamed root when BUS is nil.
+
+   The root comes from the shared selector leaf, which imports nothing beyond cl
+   and uiop. That is what keeps this binary free of the ZeroMQ transport, so a
+   sister repo needs no libzmq to arm a watcher."
+  (merge-pathnames "cursors/" (selector:bus-root bus)))
 
 ;;; ---------------------------------------------------------------- signalling
 

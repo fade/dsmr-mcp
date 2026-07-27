@@ -28,6 +28,7 @@
   :depends-on ("dsmr-mcp/src/bus/wal"
                "dsmr-mcp/src/bus/envelope"
                "dsmr-mcp/src/bus/cursor"
+               "dsmr-mcp/src/bus/selector"
                "dsmr-mcp/src/bus/heartbeat"
                "dsmr-bus-watch/src/bus/watch")
   :build-operation "program-op"

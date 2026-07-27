@@ -28,7 +28,8 @@
 
 (defpackage #:dsmr-mcp/src/bus/heartbeat
   (:use #:cl)
-  (:local-nicknames (#:envelope #:dsmr-mcp/src/bus/envelope))
+  (:local-nicknames (#:envelope #:dsmr-mcp/src/bus/envelope)
+                    (#:selector #:dsmr-mcp/src/bus/selector))
   (:export #:default-watch-dir
            #:beat-path
            #:write-beat
@@ -46,22 +47,14 @@
    --check-live default and the MCP core's own liveness read both take it from
    here, so the writer's cadence and every reader's window can never drift apart.")
 
-(defun default-watch-dir ()
-  "The default watcher-heartbeat directory: $XDG_STATE_HOME/dsmr-mcp/bus/watch/
-   (falling back to ~/.local/state/dsmr-mcp/bus/watch/).
+(defun default-watch-dir (&optional bus)
+  "The watcher-heartbeat directory: watch/ under the state root for BUS, or
+   under the unnamed root when BUS is nil.
 
-   The state-root derivation is inlined here rather than reached through the
-   module that owns it, for the same reason the WAL and cursor path derivations
-   are inlined in the watcher: reaching for that module would pull the ZeroMQ
-   transport into a binary sister repos must be able to run without libzmq
-   installed. A copy of the derivation is a real cost, and it is the smaller one."
-  (let* ((xdg (uiop:getenv "XDG_STATE_HOME"))
-         (root (merge-pathnames
-                "dsmr-mcp/bus/"
-                (if (and xdg (plusp (length xdg)))
-                    (uiop:ensure-directory-pathname xdg)
-                    (merge-pathnames ".local/state/" (user-homedir-pathname))))))
-    (merge-pathnames "watch/" root)))
+   The root comes from the shared selector leaf, which imports nothing beyond cl
+   and uiop. That is what keeps the watcher binary free of the ZeroMQ transport,
+   so a sister repo needs no libzmq to arm a watch."
+  (merge-pathnames "watch/" (selector:bus-root bus)))
 
 (defun beat-path (self-id watch-dir)
   "The heartbeat file for SELF-ID under WATCH-DIR. Keyed on the SAME encoded id
