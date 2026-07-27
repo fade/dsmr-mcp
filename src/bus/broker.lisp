@@ -26,7 +26,8 @@
   (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal)
                     (#:election #:dsmr-mcp/src/bus/election)
                     (#:archive #:dsmr-mcp/src/bus/archive)
-                    (#:tz #:dsmr-mcp/src/bus/zmq))
+                    (#:tz #:dsmr-mcp/src/bus/zmq)
+                    (#:selector #:dsmr-mcp/src/bus/selector))
   (:export #:bus-paths #:make-bus-paths #:default-state-root
            #:bus-paths-root #:bus-paths-wal #:bus-paths-lock #:bus-paths-members
            #:bus-paths-cursors-dir #:bus-paths-submit-endpoint #:bus-paths-pub-endpoint
@@ -40,14 +41,19 @@
 
 ;;; --------------------------------------------------------------- paths
 
-(defun default-state-root ()
-  "The default bus state directory: $XDG_STATE_HOME/dsmr-mcp/bus/ (falling back
-   to ~/.local/state/dsmr-mcp/bus/). Survives a reboot."
-  (let ((xdg (uiop:getenv "XDG_STATE_HOME")))
-    (merge-pathnames "dsmr-mcp/bus/"
-                     (if (and xdg (plusp (length xdg)))
-                         (uiop:ensure-directory-pathname xdg)
-                         (merge-pathnames ".local/state/" (user-homedir-pathname))))))
+(defun default-state-root (&optional bus)
+  "The bus state directory, ordinarily ~/.local/state/dsmr-mcp/bus/. Survives a
+   reboot. The selector leaf documents how it is derived and is the only place
+   that derives it.
+
+   A non-nil BUS names a private bus root under that directory, isolated from
+   every other bus on the host. The derivation itself lives in the shared
+   selector leaf, which is the only place in the tree that does this arithmetic;
+   this function stays because every caller of it already spells it this way.
+
+   Signals SELECTOR:INVALID-BUS-NAME for a name that is malformed, reserved, or
+   long enough that the derived socket path would not fit."
+  (selector:bus-root bus))
 
 (defstruct (bus-paths (:constructor %make-bus-paths))
   root wal lock members cursors-dir submit-endpoint pub-endpoint)
