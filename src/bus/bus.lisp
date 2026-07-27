@@ -40,6 +40,9 @@
                 #:delivered-body-string
                 #:foreign-self-id-p
                 #:foreign-record-p
+                #:record-addressee
+                #:deliverable-p
+                #:deliverable-record-p
                 #:+envelope-delimiter+)
   (:export #:client #:connect-client #:publish #:disconnect-client
            #:subscriber #:subscribe #:unsubscribe #:poll #:poll-count
@@ -48,7 +51,8 @@
            #:agent-id #:encode-id #:decode-id
            #:split-agent-id #:author-display
            #:decode-envelope #:delivered-body-string
-           #:foreign-self-id-p #:foreign-record-p))
+           #:foreign-self-id-p #:foreign-record-p
+           #:record-addressee #:deliverable-p #:deliverable-record-p))
 
 (in-package #:dsmr-mcp/src/bus/bus)
 
@@ -134,7 +138,7 @@
       (when (>= (%now-ms) deadline) (return nil))
       (sleep (/ poll-ms 1000.0)))))
 
-(defun publish (client payload &key after self-id)
+(defun publish (client payload &key after self-id to)
   "Submit PAYLOAD (string) to the broker, wrapped in a correlation-id + self-id
    envelope. Delivery is still fire-and-forget — a ZeroMQ PUSH the broker appends
    verbatim and fans out — but the call ALSO reports the EXACT broker-assigned seq
@@ -145,12 +149,20 @@
    pre-send floor for the read-back scan (the caller's last-seen seq); it defaults
    to the WAL's current highest seq. SELF-ID is the publisher's stable bus id,
    embedded so the publisher's own receive can filter the message out. Reads the
-   WAL read-only and touches NO cursor."
+   WAL read-only and touches NO cursor.
+
+   TO, when given, is the bus id of the one participant the message is for. It
+   rides in the same envelope field as SELF-ID and changes nothing else: the
+   record is appended to the fleet's own log exactly as a broadcast is, and every
+   member's cursor still advances over it. Only who is SHOWN the message changes.
+   That also means an addressed message is not a private one. It sits on a log
+   every member of the fleet can read, and the transport has no security surface
+   to make it otherwise."
   (let* ((correlation-id (%new-correlation-id))
          (paths (client-paths client))
          (floor (or after (wal:scan (broker:bus-paths-wal paths)))))
     (tz:send-message (client-submitter client)
-                     (wrap-envelope correlation-id self-id payload))
+                     (wrap-envelope correlation-id self-id payload :to to))
     (%await-own-seq paths correlation-id floor)))
 
 (defun disconnect-client (client)
@@ -202,24 +214,27 @@
   (cursor:pending-count (subscriber-cursor subscriber)))
 
 (defun poll-count-foreign (subscriber own-encoded)
-  "How many records past SUBSCRIBER's cursor DELIVERY would actually hand back for
-   the agent whose encoded self-id is OWN-ENCODED — foreign records only, under the
-   exact FOREIGN-RECORD-P predicate the receive path filters by. This is the count
-   an agent should read as `pending`: POLL-COUNT is the raw count above the cursor
-   and includes the agent's OWN un-consumed publishes, which delivery drops, so it
-   over-reports for a subscriber that also publishes. Read-only — reads the records
-   above the cursor and never moves it.
+  "How many records past SUBSCRIBER's cursor DELIVERY would actually hand back
+   for the agent whose encoded self-id is OWN-ENCODED. That is records this agent
+   did not publish and that name either nobody or this agent, under the exact
+   DELIVERABLE-RECORD-P predicate the receive path filters by.
 
-   Sharing FOREIGN-RECORD-P with AGENT-RECEIVE is the whole point: the count and
-   the delivery filter turn on one predicate, so a reported `pending` can never
-   promise a message that a receive would then quietly drop as this agent's own."
+   This is the count an agent should read as `pending`. POLL-COUNT is the raw
+   count above the cursor: it includes the agent's OWN un-consumed publishes and
+   any mail addressed to somebody else, both of which delivery drops, so it
+   over-reports for any subscriber on a bus carrying either. Read-only, and the
+   cursor never moves.
+
+   Sharing one predicate with AGENT-RECEIVE is the whole point: the count and the
+   delivery filter reach the same verdict, so a reported `pending` can never
+   promise a message a receive would then quietly withhold."
   (let ((cur (subscriber-cursor subscriber))
-        (foreign 0))
+        (deliverable 0))
     (dolist (record (wal:read-records (cursor:subscriber-wal cur)
                                       :after (cursor:cursor-value cur))
-                    foreign)
-      (when (foreign-record-p record own-encoded)
-        (incf foreign)))))
+                    deliverable)
+      (when (deliverable-record-p record own-encoded)
+        (incf deliverable)))))
 
 (defun await (subscriber &key (timeout-ms 1000) (limit cursor:+default-batch-size+))
   "Block up to TIMEOUT-MS for at least one message, then deliver and return it.
