@@ -47,7 +47,8 @@
   (:import-from #:dsmr-mcp/src/state
                 #:session-project-root
                 #:session-bus-agents)
-  (:export #:bus-namespace #:session-bus #:session-agent #:disconnect-session-bus
+  (:export #:bus-namespace #:session-bus #:bus-label
+           #:session-agent #:forget-session-agent #:disconnect-session-bus
            #:identity-summary #:no-project-root))
 
 (in-package #:dsmr-mcp/src/tools/bus-helpers)
@@ -105,6 +106,35 @@ root — there is no namespace to give the agent an identity under."))
     (when resolved
       (selector:validate-bus-name resolved))))
 
+(defun bus-label (bus)
+  "BUS rendered for a person to read: its name, or \"default\" for the host's
+   unnamed bus.
+
+   \"default\" rather than a blank or an omitted field, and matching what the
+   standalone watcher prints, so one word means one bus wherever it appears. A
+   surface that simply left the field out when no bus was named could not be
+   told apart from an older surface that never carried the field at all, which
+   is the ambiguity a named bus exists to remove."
+  (or bus "default"))
+
+(defun %stable-name (agent-id ephemeral)
+  "The stable participant name these arguments resolve to, or NIL for the
+   session's ephemeral default. Rules 1 to 4 of the identity order, with the
+   bus deliberately left out: the bus is the other dimension of the key."
+  (unless ephemeral
+    (cond ((and agent-id (plusp (length agent-id))) agent-id)
+          (t (%env-bus-agent)))))
+
+(defun %participant-key (resolved-bus stable-name)
+  "The key one participant is cached under: the bus it is connected on and the
+   name it carries there, each falling back to :DEFAULT.
+
+   Both dimensions are built here and nowhere else, so a caller that resolves a
+   participant and a caller that forgets one cannot construct the key
+   differently. A disagreement about the bus dimension is what hands one fleet's
+   traffic to another fleet's reader while every surface reports success."
+  (cons (or resolved-bus :default) (or stable-name :default)))
+
 (defun session-agent (session &optional agent-id &key ephemeral bus)
   "The bus participant for SESSION on the resolved bus, connecting and caching it
    on first use. Signals NO-PROJECT-ROOT if the session has no namespace.
@@ -131,15 +161,28 @@ root — there is no namespace to give the agent an identity under."))
   (let* ((namespace (bus-namespace session))
          (table (session-bus-agents session))
          (resolved-bus (session-bus bus))
-         (stable-name
-           (unless ephemeral
-             (cond ((and agent-id (plusp (length agent-id))) agent-id)
-                   (t (%env-bus-agent)))))
-         (key (cons (or resolved-bus :default) (or stable-name :default))))
+         (stable-name (%stable-name agent-id ephemeral))
+         (key (%participant-key resolved-bus stable-name)))
     (or (gethash key table)
         (setf (gethash key table)
               (agent:connect-agent namespace :name stable-name
                                              :bus resolved-bus)))))
+
+(defun forget-session-agent (session &optional agent-id &key ephemeral bus)
+  "Drop from SESSION's cache the participant SESSION-AGENT would resolve for
+   these same arguments, and answer whether one was there to drop. The
+   participant itself is not disconnected: this only forgets it.
+
+   For a caller that has just departed a bus. A departed participant's client
+   and subscriber are already released, so leaving it in the cache would hand
+   the next bus call in that session a handle with no connection behind it,
+   which fails in a way that looks nothing like its cause. Forgetting it means
+   the next call reconnects, which is what returning to a bus should do.
+
+   Takes the same arguments SESSION-AGENT takes and builds the key through the
+   same function, so the entry removed is always the entry that was added."
+  (remhash (%participant-key (session-bus bus) (%stable-name agent-id ephemeral))
+           (session-bus-agents session)))
 
 (defun identity-summary (a)
   "A labeled \"who am I\" phrase for the bus participant A: its name, whether the

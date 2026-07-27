@@ -127,6 +127,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/tools/bus-publish"
                "dsmr-mcp/src/tools/bus-receive"
                "dsmr-mcp/src/tools/bus-status"
+               "dsmr-mcp/src/tools/bus-roster"
+               "dsmr-mcp/src/tools/bus-leave"
                "dsmr-mcp/src/bus-listener")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
@@ -220,6 +222,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/bus/self-echo-test"
                "dsmr-mcp/tests/tools/bus-identity-test"
                "dsmr-mcp/tests/tools/bus-receive-test"
+               "dsmr-mcp/tests/tools/bus-roster-test"
                "dsmr-mcp/tests/tools/reset-local-test"
                "dsmr-mcp/tests/tools/reset-peer-test"
                "dsmr-mcp/tests/tools/restart-process-test"
