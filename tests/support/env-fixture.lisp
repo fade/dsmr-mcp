@@ -28,10 +28,16 @@
 
 (defparameter +resolution-env-vars+
   '("DSMR_MODE" "DSMR_SLYNK_ATTACH" "DSMR_TRANSPORT" "DSMR_PORT" "DSMR_BIND"
-    "DSMR_LOG_LEVEL" "DSMR_PROJECT_ROOT" "DSMR_ALLOW_REMOTE" "DSMR_BUS_AGENT")
+    "DSMR_LOG_LEVEL" "DSMR_PROJECT_ROOT" "DSMR_ALLOW_REMOTE" "DSMR_BUS_AGENT"
+    "DSMR_BUS_SELECTOR")
   "Every DSMR_* variable the config/mode resolution path consults. A direnv dev
 shell commonly exports several of these for the live server; resolution tests must
-neutralize them to be deterministic.")
+neutralize them to be deterministic.
+
+DSMR_BUS_SELECTOR earns its place for the same reason DSMR_BUS_AGENT does: a
+developer whose shell puts the session on a named bus would otherwise see every
+bus-resolution assertion answer with that name, and the suite would fail in a
+real shell while passing in CI's empty environment.")
 
 (defmacro with-clean-resolution-env (&body body)
   "Evaluate BODY with every variable in +RESOLUTION-ENV-VARS+ cleared, restoring

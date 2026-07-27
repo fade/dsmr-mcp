@@ -26,19 +26,28 @@
 ;;;;                          name nil), preserved byte-for-byte from before this
 ;;;;                          phase.
 ;;;;
-;;;; Rules 1 and 4 both use the :default cache key with a nil name, so repeated
+;;;; Rules 1 and 4 both use the :default name key with a nil name, so repeated
 ;;;; ephemeral calls in one session reuse one auto-unique participant (a subagent
 ;;;; publishes then receives and needs its cursor to persist within its session).
 ;;;; Cross-session distinctness is automatic: each subagent is a separate session,
 ;;;; hence a separate :default participant with a naturally distinct id.
+;;;;
+;;;; The bus a session speaks on is a second and independent dimension, and the
+;;;; four name rules above are unchanged by it. It resolves by the same shape,
+;;;; minus the ephemeral opt-out which has no meaning for a bus: an explicit
+;;;; argument, then DSMR_BUS_SELECTOR, then the host's unnamed bus. A cached
+;;;; participant is keyed on both, so an agent joined to two buses under one
+;;;; stable name gets one participant per bus rather than a single shared
+;;;; connection that would hand one fleet's traffic to another fleet's reader.
 
 (defpackage #:dsmr-mcp/src/tools/bus-helpers
   (:use #:cl)
-  (:local-nicknames (#:agent #:dsmr-mcp/src/bus/agent))
+  (:local-nicknames (#:agent #:dsmr-mcp/src/bus/agent)
+                    (#:selector #:dsmr-mcp/src/bus/selector))
   (:import-from #:dsmr-mcp/src/state
                 #:session-project-root
                 #:session-bus-agents)
-  (:export #:bus-namespace #:session-agent #:disconnect-session-bus
+  (:export #:bus-namespace #:session-bus #:session-agent #:disconnect-session-bus
            #:identity-summary #:no-project-root))
 
 (in-package #:dsmr-mcp/src/tools/bus-helpers)
@@ -64,31 +73,73 @@ root — there is no namespace to give the agent an identity under."))
     (when (and value (plusp (length value)))
       value)))
 
-(defun session-agent (session &optional agent-id &key ephemeral)
-  "The bus participant for SESSION, connecting and caching it on first use.
-   Signals NO-PROJECT-ROOT if the session has no namespace.
+(defun %env-bus-selector ()
+  "The DSMR_BUS_SELECTOR value from the inherited environment, or NIL when unset
+   or empty. An empty string reads as absent, exactly as %ENV-BUS-AGENT treats an
+   empty name.
+
+   This is the same variable the .envrc stanza declares and the same one the
+   standalone watcher reads, deliberately: one carrier for the bus means a session
+   and the watcher armed for it cannot drift onto different buses while both
+   report success."
+  (let ((value (uiop:getenv "DSMR_BUS_SELECTOR")))
+    (when (and value (plusp (length value)))
+      value)))
+
+(defun session-bus (&optional bus)
+  "The bus this session speaks on: a validated name string, or NIL for the
+   host's unnamed bus.
+
+   Resolution mirrors the four-rule identity order above on purpose, minus the
+   ephemeral opt-out, which has no meaning for a bus: an explicit non-empty BUS
+   argument wins, then DSMR_BUS_SELECTOR from the environment, then the
+   documented default. One mental model covers both a participant's name and the
+   bus it carries that name on, rather than two orders a reader has to keep
+   apart.
+
+   Signals SELECTOR:INVALID-BUS-NAME for a name that cannot become a bus root.
+   A bad selector is never quietly downgraded to the default bus: that would put
+   a fleet's traffic on the shared bus while every surface reported success."
+  (let ((resolved (or (and (stringp bus) (plusp (length bus)) bus)
+                      (%env-bus-selector))))
+    (when resolved
+      (selector:validate-bus-name resolved))))
+
+(defun session-agent (session &optional agent-id &key ephemeral bus)
+  "The bus participant for SESSION on the resolved bus, connecting and caching it
+   on first use. Signals NO-PROJECT-ROOT if the session has no namespace.
 
    The identity name within the namespace is resolved by four rules, in order:
-     1. EPHEMERAL true -> the session's ephemeral default (key :default, name
-        nil), regardless of AGENT-ID or DSMR_BUS_AGENT. The subagent opt-out.
+     1. EPHEMERAL true -> the session's ephemeral default (name nil), regardless
+        of AGENT-ID or DSMR_BUS_AGENT. The subagent opt-out.
      2. else AGENT-ID non-nil and non-empty -> stable name = AGENT-ID.
      3. else DSMR_BUS_AGENT set (non-empty) -> stable name = that value.
-     4. else -> the session's ephemeral default (key :default, name nil).
+     4. else -> the session's ephemeral default (name nil).
 
-   Stable names (rules 2 and 3) cache under the resolved name so repeat calls
-   reuse the same participant and resume its durable cursor. The ephemeral rules
-   (1 and 4) share the :default key with a nil name, so repeated ephemeral calls
-   in one session reuse one auto-unique participant."
+   The bus is a second, independent dimension, resolved by SESSION-BUS: explicit
+   BUS argument, then DSMR_BUS_SELECTOR, then the host's unnamed bus. The cache
+   key carries both, so one session can hold a participant on each of several
+   buses under one stable name, each with its own connection, membership and
+   cursor. Two calls differing only in the bus therefore return two distinct
+   participants, and never one shared connection that would leak one fleet's
+   traffic into another fleet's reader.
+
+   Stable names (rules 2 and 3) cache under the resolved name so repeat calls on
+   one bus reuse the same participant and resume its durable cursor. The
+   ephemeral rules (1 and 4) share the :default name key, so repeated ephemeral
+   calls in one session and on one bus reuse one auto-unique participant."
   (let* ((namespace (bus-namespace session))
          (table (session-bus-agents session))
+         (resolved-bus (session-bus bus))
          (stable-name
            (unless ephemeral
              (cond ((and agent-id (plusp (length agent-id))) agent-id)
                    (t (%env-bus-agent)))))
-         (key (or stable-name :default)))
+         (key (cons (or resolved-bus :default) (or stable-name :default))))
     (or (gethash key table)
         (setf (gethash key table)
-              (agent:connect-agent namespace :name stable-name)))))
+              (agent:connect-agent namespace :name stable-name
+                                             :bus resolved-bus)))))
 
 (defun identity-summary (a)
   "A labeled \"who am I\" phrase for the bus participant A: its name, whether the

@@ -11,18 +11,27 @@
 ;;;; Identity follows the locked model: <project-namespace>/<name>. A given name
 ;;;; resumes its cursor across restarts; an omitted name yields an auto-unique,
 ;;;; ephemeral id, so several anonymous subagents in one project each receive every
-;;;; message independently while sharing the namespace. The bus itself is a single
-;;;; host-wide instance, so agents in different projects coexist on it under
-;;;; different namespaces. Messages are broadcast; coordination is by convention.
+;;;; message independently while sharing the namespace.
+;;;;
+;;;; A bus is a named, isolated state root. An unset name means the shared
+;;;; host-wide bus, which is where everything lands unless something says
+;;;; otherwise. Namespaces separate projects within one bus; the bus name
+;;;; separates one fleet's traffic from another's, down to a private write-ahead
+;;;; log and a private pair of sockets. One process may hold participants on
+;;;; several buses at once, each with its own connection, membership and cursor,
+;;;; which is how an agent reports into a neighbouring fleet without carrying that
+;;;; fleet's traffic everywhere else. Messages are broadcast; coordination is by
+;;;; convention.
 
 (defpackage #:dsmr-mcp/src/bus/agent
   (:use #:cl)
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:bus #:dsmr-mcp/src/bus/bus)
                     (#:heartbeat #:dsmr-mcp/src/bus/heartbeat)
+                    (#:selector #:dsmr-mcp/src/bus/selector)
                     (#:wal #:dsmr-mcp/src/bus/wal))
   (:export #:agent #:agent-id #:agent-name #:agent-namespace #:agent-stable-p
-           #:agent-paths
+           #:agent-paths #:agent-bus
            #:connect-agent #:disconnect-agent
            #:agent-publish #:agent-receive #:agent-receive-detailed
            #:delivery #:delivery-author #:delivery-author-id #:delivery-text
@@ -32,7 +41,7 @@
 (in-package #:dsmr-mcp/src/bus/agent)
 
 (defstruct (agent (:constructor %make-agent))
-  id namespace stable paths client subscriber)
+  id namespace stable bus paths client subscriber)
 
 (defstruct (delivery (:constructor %make-delivery))
   "One message handed to a reader, with the agent that published it attached.
@@ -47,13 +56,25 @@
    on the strength of it."
   author author-id text)
 
-(defun connect-agent (namespace &key name paths (ensure-broker t) (feed-timeout-ms 100))
-  "Join the bus as one participant. NAMESPACE is the project root; NAME, if given,
+(defun connect-agent (namespace &key name bus paths (ensure-broker t)
+                                     (feed-timeout-ms 100))
+  "Join a bus as one participant. NAMESPACE is the project root; NAME, if given,
    is a stable subagent name (resumes its cursor) and otherwise an ephemeral
-   auto-unique name is used. PATHS defaults to the host-wide bus. Unless
-   ENSURE-BROKER is nil, a detached broker is spawned if none is running. Returns
-   an AGENT handle."
-  (let ((paths (or paths (broker:make-bus-paths))))
+   auto-unique name is used.
+
+   BUS names which bus to join. NIL, the default, is the host's unnamed bus, so a
+   caller that says nothing lands exactly where it always has. A name selects an
+   isolated state root of its own: its own write-ahead log, broker, membership
+   lock, cursors and sockets. The name is recorded on the handle, so every
+   surface downstream can say which bus a participant is speaking on rather than
+   assuming there is only one. Signals SELECTOR:INVALID-BUS-NAME for a name that
+   cannot be turned into a usable root, and connects nothing when it does.
+
+   PATHS overrides the derivation outright and is how a test points a participant
+   at a bus root of its own choosing; supplying it makes BUS purely descriptive.
+   Unless ENSURE-BROKER is nil, a detached broker is spawned if none is running
+   on the resolved bus. Returns an AGENT handle."
+  (let ((paths (or paths (broker:make-bus-paths (selector:bus-root bus)))))
     (broker:ensure-bus-dirs paths)
     (when ensure-broker (broker:ensure-broker paths))
     (let ((id (bus:agent-id namespace :name name)))
@@ -61,6 +82,7 @@
        :id id
        :namespace namespace
        :stable (and name t)
+       :bus bus
        :paths paths
        :client (bus:connect-client paths)
        :subscriber (bus:subscribe paths id :feed-timeout-ms feed-timeout-ms)))))
