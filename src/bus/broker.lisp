@@ -27,10 +27,13 @@
                     (#:election #:dsmr-mcp/src/bus/election)
                     (#:archive #:dsmr-mcp/src/bus/archive)
                     (#:tz #:dsmr-mcp/src/bus/zmq)
-                    (#:selector #:dsmr-mcp/src/bus/selector))
+                    (#:selector #:dsmr-mcp/src/bus/selector)
+                    (#:roster #:dsmr-mcp/src/bus/roster))
   (:export #:bus-paths #:make-bus-paths #:default-state-root
            #:bus-paths-root #:bus-paths-wal #:bus-paths-lock #:bus-paths-members
-           #:bus-paths-cursors-dir #:bus-paths-submit-endpoint #:bus-paths-pub-endpoint
+           #:bus-paths-cursors-dir
+           #:bus-paths-roster-dir #:bus-paths-roster-state
+           #:bus-paths-submit-endpoint #:bus-paths-pub-endpoint
            #:ensure-bus-dirs #:reap-orphaned-cursors
            #:broker #:broker-seq
            #:start-broker #:broker-step #:serve-broker #:stop-broker
@@ -56,13 +59,21 @@
   (selector:bus-root bus))
 
 (defstruct (bus-paths (:constructor %make-bus-paths))
-  root wal lock members cursors-dir submit-endpoint pub-endpoint)
+  root wal lock members cursors-dir roster-dir roster-state
+  submit-endpoint pub-endpoint)
 
 (defun %ipc (root name)
   (format nil "ipc://~A~A" (namestring root) name))
 
 (defun make-bus-paths (&optional (root (default-state-root)))
-  "Derive every on-disk and socket path for a bus rooted at ROOT."
+  "Derive every on-disk and socket path for a bus rooted at ROOT.
+
+   ROSTER-DIR and ROSTER-STATE are the busmaster's record of who is enrolled on
+   this bus, who leads it, and whether enrollment is open. They are metadata the
+   broker holds, never a membership check: nothing on the serving path consults
+   them. Note that ROSTER-DIR is a wholly different thing from MEMBERS one
+   directory up, which is the shared lock every live process holds and which dies
+   with the processes holding it."
   (let ((root (uiop:ensure-directory-pathname root)))
     (%make-bus-paths
      :root root
@@ -70,13 +81,22 @@
      :lock (merge-pathnames "broker.lock" root)
      :members (merge-pathnames "members" root)
      :cursors-dir (merge-pathnames "cursors/" root)
+     :roster-dir (merge-pathnames "roster/" root)
+     :roster-state (merge-pathnames "roster.state" root)
      :submit-endpoint (%ipc root "submit.ipc")
      :pub-endpoint (%ipc root "pub.ipc"))))
 
 (defun ensure-bus-dirs (paths)
-  "Create the bus root and cursors directory if absent."
+  "Create the bus root, the cursors directory and the roster directory if absent.
+
+   The roster directory is created eagerly so every bus root that exists at all
+   has one to list. The roster STATE file is deliberately not created here: an
+   absent state file reads as open enrollment with no declared leader, which is
+   the right answer for a bus nobody has closed, and writing one would only make
+   a default look like a decision."
   (ensure-directories-exist (bus-paths-root paths))
   (ensure-directories-exist (bus-paths-cursors-dir paths))
+  (ensure-directories-exist (bus-paths-roster-dir paths))
   paths)
 
 (defun join-members (paths)
