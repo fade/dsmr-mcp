@@ -335,7 +335,16 @@ sister agent can be re-armed/woken. Signal lines go to STDOUT; everything else
 to STDERR.
 
 Options:
-  --wal PATH           WAL file to watch (default: $XDG_STATE_HOME/dsmr-mcp/bus/bus.wal)
+  --bus NAME           bus to arm on (default: $DSMR_BUS_SELECTOR, and the
+                       shared host-wide bus when that is unset). The value is
+                       the fleet tag, normally exported by the repo's .envrc;
+                       the flag is here so a generated arm line an operator
+                       reads shows which bus it arms on. A name the bus cannot
+                       honour is refused outright rather than downgraded to the
+                       shared bus, since a watcher on the wrong bus reports
+                       healthy and never fires.
+  --wal PATH           WAL file to watch (default: bus.wal under the resolved
+                       bus's state root)
   --agent NAME         bus agent name to watch for (default: $DSMR_BUS_AGENT).
                        With a name resolved, the watcher arms from that agent's
                        durable cursor and ignores that agent's own publishes.
@@ -346,8 +355,8 @@ Options:
                        cursor. Defaults to the working directory, with a warning.
   --agent-id FULL-ID   complete <namespace>/<name> id, for a caller that already
                        knows it. Takes precedence over --agent and --namespace.
-  --cursors-dir PATH   cursor directory to read
-                       (default: $XDG_STATE_HOME/dsmr-mcp/bus/cursors/)
+  --cursors-dir PATH   cursor directory to read (default: cursors/ under the
+                       resolved bus's state root)
   --after SEQ          baseline seq; fire on the first foreign seq > SEQ.
                        Overrides the cursor-derived baseline.
                        (default: the resolved agent's cursor, or the WAL's
@@ -362,9 +371,13 @@ Options:
   --recycle-seconds N  idle self-recycle window in seconds (default 600)
   --check-live         do not watch; report the running watch's heartbeat for
                        the resolved identity and exit. Prints one line to STDOUT
-                       (`live pid=<pid> age_s=<n>`, `stale pid=<pid> age_s=<n>`,
-                       `dead`, or `unknown` when no identity resolves) and exits
-                       0 live / 1 stale-or-dead / 2 unknown.
+                       (`live pid=<pid> age_s=<n> bus=<name>`,
+                       `stale pid=<pid> age_s=<n> bus=<name>`, `dead bus=<name>`,
+                       or `unknown` when no identity resolves) and exits
+                       0 live / 1 stale-or-dead / 2 unknown. The bus field names
+                       the resolved bus on every answer, printing `default` for
+                       the shared host-wide one, so a watcher that is live on
+                       the wrong bus is readable rather than invisible.
   --live-window-seconds N
                        how fresh a heartbeat must be to count as live under
                        --check-live (default 5). A live watch refreshes every
@@ -393,11 +406,16 @@ watch which stopped listening otherwise exits identically to one that never fire
 (defstruct (options (:conc-name opt-))
   "One parsed command line. A named record rather than a positional tuple: the
    watcher now takes a dozen settings, and a twelve-element VALUES list is a
-   defect waiting for the day someone inserts a value in the middle of it."
+   defect waiting for the day someone inserts a value in the middle of it.
+
+   BUS is the bus this watch arms on. NIL means the host-wide default bus, which
+   is the only bus that existed before buses had names and is still what an
+   operator gets by passing nothing."
   (wal nil)
   (after nil)
   (agent nil)
   (namespace nil)
+  (bus nil)
   (agent-id nil)
   (cursors-dir nil)
   (stream-p nil)
@@ -462,6 +480,9 @@ watch which stopped listening otherwise exits identically to one that never fire
                  ((string= arg "--namespace")
                   (setf (opt-namespace opts)
                         (or (next-value "--namespace") (opt-namespace opts))))
+                 ((string= arg "--bus")
+                  (setf (opt-bus opts)
+                        (or (next-value "--bus") (opt-bus opts))))
                  ((string= arg "--agent-id")
                   (setf (opt-agent-id opts)
                         (or (next-value "--agent-id") (opt-agent-id opts))))
@@ -490,6 +511,37 @@ watch which stopped listening otherwise exits identically to one that never fire
   (let ((value (uiop:getenv "DSMR_BUS_AGENT")))
     (when (and value (plusp (length value)))
       value)))
+
+(defun %env-bus-selector ()
+  "The DSMR_BUS_SELECTOR value, or NIL when unset or empty. An empty string
+   reads as absent, matching the convention every other DSMR_* environment read
+   uses."
+  (let ((value (uiop:getenv "DSMR_BUS_SELECTOR")))
+    (when (and value (plusp (length value)))
+      value)))
+
+(defun %resolve-bus (opts)
+  "The bus this watch arms on: --bus if it carries a value, else
+   DSMR_BUS_SELECTOR, else NIL for the host-wide default bus.
+
+   That is the same explicit-then-environment precedence %RESOLVE-SELF-ID uses
+   for the agent name, extended rather than forked. It reads the SAME variable
+   the .envrc stanza declares and the MCP session resolves its own bus by, so a
+   watcher and the session it serves cannot land on different buses while both
+   report themselves healthy.
+
+   The name is validated here, at the point the operator's value is read, and an
+   unusable one is signalled rather than dropped. This is the one place in this
+   binary where refusing to start is right: a mistyped cadence flag costs its own
+   default, but a bus name that quietly degrades to the default bus leaves a
+   watcher armed on a bus nobody is talking on, reporting live and never firing.
+   Arming somewhere else is indistinguishable from arming correctly until a
+   message goes unanswered."
+  (let* ((flagged (opt-bus opts))
+         (name (or (and flagged (plusp (length flagged)) flagged)
+                   (%env-bus-selector))))
+    (when name
+      (selector:validate-bus-name name))))
 
 (defun %resolve-self-id (opts)
   "The full <namespace>/<name> bus id this watcher watches on behalf of, or NIL
@@ -591,20 +643,47 @@ watch which stopped listening otherwise exits identically to one that never fire
                   filter on this agent's own publishes."))
         (%last-seq wal-path))))
 
-(defun %check-live (self-id beat-path window-seconds)
-  "Report the liveness of the watch for SELF-ID from its heartbeat, then exit.
-   Never watches — this is the cheap probe an agent runs to answer `is my watch
-   still listening?`.
+(defun %liveness-line (status age pid bus)
+  "The one status line --check-live prints for STATUS, as a string with no
+   trailing newline. Pure: it prints nothing and exits nothing, so the answer
+   can be read directly rather than inferred from a process.
+
+   Every answer names the bus it is answering for, the default bus included, and
+   NIL renders as the literal `default`. A field present only for a named bus
+   could not tell a watcher on the default bus apart from a binary too old to
+   know that buses have names, which is the same silence between `armed` and
+   `armed somewhere else` that the field exists to break. `default` is
+   unambiguous as a literal because the bus refuses it as a name, so the word
+   can only ever mean the unnamed bus.
+
+   The `unknown` answer deliberately has no case here. It is printed when no
+   identity resolves, and a bus name printed beside an unresolved identity would
+   read as a probe that found something."
+  (let ((label (or bus "default")))
+    (ecase status
+      (:live  (format nil "live pid=~A age_s=~A bus=~A" (or pid "?") age label))
+      (:stale (format nil "stale pid=~A age_s=~A bus=~A" (or pid "?") age label))
+      (:dead  (format nil "dead bus=~A" label)))))
+
+(defun %check-live (self-id beat-path window-seconds &optional bus)
+  "Report the liveness of the watch for SELF-ID on BUS from its heartbeat, then
+   exit. Never watches: this is the cheap probe an agent runs to answer `is my
+   watch still listening?`.
 
    A resolved identity is what makes liveness observable at all: the beat file
    is keyed on it, exactly as the cursor is. With none there is no stable key to
    probe, so this prints `unknown` and exits 2 — honest that liveness needs the
    same resolved identity a healthy watch already runs under, not a softer
-   answer that would read as `fine`.
+   answer that would read as `fine`. That line carries no bus field; see
+   %LIVENESS-LINE for why.
 
    Otherwise it prints exactly one status line to *standard-output* — the only
    thing an agent parses — and exits 0 for a live beat, 1 for a stale or absent
-   one. Any human-facing detail goes to *error-output*, never stdout."
+   one. Any human-facing detail goes to *error-output*, never stdout.
+
+   BEAT-PATH is derived from BUS, so an agent joined to several buses runs one
+   probe per bus and each answers about its own watch. The bus on the line is
+   what makes those answers tellable apart."
   (if (null self-id)
       (progn
         (%warn "--check-live needs a resolved identity (pass --agent or ~
@@ -615,12 +694,7 @@ watch which stopped listening otherwise exits identically to one that never fire
         (uiop:quit 2))
       (multiple-value-bind (status age pid)
           (heartbeat:beat-liveness beat-path window-seconds)
-        (ecase status
-          (:live  (format *standard-output* "live pid=~A age_s=~A~%"
-                          (or pid "?") age))
-          (:stale (format *standard-output* "stale pid=~A age_s=~A~%"
-                          (or pid "?") age))
-          (:dead  (format *standard-output* "dead~%")))
+        (format *standard-output* "~A~%" (%liveness-line status age pid bus))
         (force-output *standard-output*)
         (uiop:quit (if (eq status :live) 0 1)))))
 
@@ -630,8 +704,14 @@ watch which stopped listening otherwise exits identically to one that never fire
    without watching. Signal lines go to *standard-output*; usage, diagnostics,
    and errors go to *error-output*. Exit 0 on a fired/recycled watch or a live
    heartbeat, 1 on a stale/absent heartbeat, 2 on a liveness probe with no
-   resolvable identity, 64 on an unrecoverable failure — a bad flag is not one,
-   and neither is an unresolvable identity for a watch.
+   resolvable identity, 64 on an unrecoverable failure. A bad flag is not one,
+   and neither is an unresolvable identity for a watch; an unusable bus name is,
+   because the alternative is a watch armed on a bus nobody is talking on.
+
+   Which bus this watch arms on is resolved first, and every default path below
+   hangs off it: the write-ahead log it reads, the cursor it arms from, and the
+   heartbeat it advertises itself with. An explicit --wal or --cursors-dir still
+   wins, so the overrides an operator already uses keep working.
 
    The heartbeat is written under the watch's own identity: while the watch runs
    it refreshes a beat file every poll, and an UNWIND-PROTECT removes that file
@@ -645,15 +725,18 @@ watch which stopped listening otherwise exits identically to one that never fire
         (when (opt-help-p opts)
           (%usage)
           (uiop:quit 0))
-        (let* ((wal-path (if (opt-wal opts) (pathname (opt-wal opts)) (default-wal-path)))
+        (let* ((bus (%resolve-bus opts))
+               (wal-path (if (opt-wal opts)
+                             (pathname (opt-wal opts))
+                             (default-wal-path bus)))
                (cursors-dir (if (opt-cursors-dir opts)
                                 (uiop:ensure-directory-pathname (opt-cursors-dir opts))
-                                (default-cursors-dir)))
-               (watch-dir (default-watch-dir))
+                                (default-cursors-dir bus)))
+               (watch-dir (default-watch-dir bus))
                (self-id (%resolve-self-id opts))
                (beat-path (and self-id (heartbeat:beat-path self-id watch-dir))))
           (when (opt-check-p opts)
-            (%check-live self-id beat-path (opt-live-window-seconds opts)))
+            (%check-live self-id beat-path (opt-live-window-seconds opts) bus))
           (let* ((baseline (%resolve-baseline opts self-id wal-path cursors-dir))
                  (poll-ms (opt-poll-ms opts))
                  (recycle-seconds (opt-recycle-seconds opts))
