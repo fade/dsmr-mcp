@@ -35,6 +35,8 @@
            #:agent-paths #:agent-bus
            #:connect-agent #:disconnect-agent #:quiesce-and-leave
            #:agent-publish #:agent-receive #:agent-receive-detailed
+           #:*direct-addressing-enabled* #:direct-addressing-enabled-p
+           #:direct-addressing-disabled #:direct-addressing-disabled-addressee
            #:delivery #:delivery-author #:delivery-author-id #:delivery-text
            #:agent-status
            #:agent-skip-to-head))
@@ -109,8 +111,52 @@
    anonymous/ephemeral participant whose cursor does not persist."
   (and (agent-stable agent) t))
 
-(defun agent-publish (agent message)
-  "Broadcast MESSAGE (string) onto the bus and return the EXACT broker-assigned seq
+(defvar *direct-addressing-enabled* nil
+  "Whether this process may publish a message naming one recipient.
+
+   NIL by default, and deliberately inert. The capability exists because the
+   busmaster holds every participant's identity, and once it does, naming one of
+   them is the obvious thing to want. It is off because the arrangement actually
+   in use is hub and spoke: a leader talks to each worker and each worker talks
+   to the leader. The standing site rule that keeps it that way is not revised by
+   this code, and its reasoning still holds: several workers converging on one
+   point is usually one claim echoing rather than corroboration.
+
+   Bind this to true for one process, or set DSMR_BUS_DIRECT_ADDRESSING to 1,
+   true or yes for one repository, to turn the capability on.")
+
+(defun direct-addressing-enabled-p ()
+  "True when this process may publish a message naming one recipient.
+
+   *DIRECT-ADDRESSING-ENABLED* wins when it is true; otherwise the environment is
+   consulted, so an operator can turn the capability on for one repository from
+   its .envrc without touching any code. The environment is read on every call
+   rather than cached at load, so a value set after the image came up still
+   counts."
+  (or (and *direct-addressing-enabled* t)
+      (and (member (uiop:getenv "DSMR_BUS_DIRECT_ADDRESSING")
+                   '("1" "true" "yes") :test #'string=)
+           t)))
+
+(define-condition direct-addressing-disabled (error)
+  ((addressee :initarg :addressee :initform nil
+              :reader direct-addressing-disabled-addressee))
+  (:report (lambda (condition stream)
+             (format stream
+                     "dsmr-mcp bus: direct addressing is off, so nothing was ~
+                      published to ~S. Set DSMR_BUS_DIRECT_ADDRESSING to 1 in ~
+                      the repository that needs it, or bind ~
+                      *DIRECT-ADDRESSING-ENABLED*."
+                     (direct-addressing-disabled-addressee condition))))
+  (:documentation
+   "Signalled when a publish names a recipient while direct addressing is off.
+
+    Nothing is sent. Refusing is the whole point: broadcasting the message
+    instead would put something its sender believed was private in front of the
+    entire fleet, and the sender would have no way to tell it had happened."))
+
+(defun agent-publish (agent message &key to)
+  "Put MESSAGE (string) on the bus and return the EXACT broker-assigned seq
    of this message (an integer, or NIL when it could not be matched within the
    bound). The message embeds this agent's stable self-id so the agent's OWN
    receive filters it back out — the agent never gets its own message returned to
@@ -119,9 +165,23 @@
    foreign publisher's record. PUBLISH defaults the read-back scan floor to the
    WAL's current highest seq; that floor only BOUNDS the rescan window — its cost
    scales with how much bus traffic accrues above the floor while waiting for the
-   id to appear, not with correctness."
+   id to appear, not with correctness.
+
+   TO names one participant by its full bus id, and only that participant is
+   handed the message. The record still goes to the fleet's own log and every
+   member's cursor still advances over it; what changes is who is shown it. An
+   addressed message is therefore filtered, not private.
+
+   Naming a recipient while direct addressing is off signals
+   DIRECT-ADDRESSING-DISABLED and publishes nothing. It does not fall back to a
+   broadcast, because a message its sender believed had one reader arriving in
+   front of the whole fleet is a worse outcome than a refusal the sender can
+   read."
+  (when (and to (not (direct-addressing-enabled-p)))
+    (error 'direct-addressing-disabled :addressee to))
   (bus:publish (agent-client agent) message
-               :self-id (agent-id agent)))
+               :self-id (agent-id agent)
+               :to to))
 
 (defun agent-receive-detailed (agent &key (timeout-ms 0)
                                          (limit bus:+default-batch-size+))
@@ -144,14 +204,19 @@
         (namespace (agent-namespace agent))
         (out '()))
     (dolist (record records (nreverse out))
-      (multiple-value-bind (text cid sid)
+      (multiple-value-bind (text cid sid addressee)
           (bus:decode-envelope (wal:record-body-string record))
         (declare (ignore cid))
-        ;; Keep a legacy un-enveloped message (sid NIL) and any FOREIGN message;
-        ;; drop only records carrying this agent's own encoded self-id. The verdict
-        ;; goes through the shared FOREIGN-SELF-ID-P so this filter and the pending
-        ;; count can never disagree about what delivery returns.
-        (when (bus:foreign-self-id-p sid own)
+        ;; Two halves to one verdict. Drop records carrying this agent's own
+        ;; encoded self-id, so a publisher never gets its own message back; and
+        ;; drop records naming somebody else, so addressed mail reaches only the
+        ;; participant it names. Everything else is kept, a legacy un-enveloped
+        ;; message (sid NIL) included. The cursor has already advanced over all
+        ;; of them either way: filtering here decides what is shown, never where
+        ;; the cursor sits, because a reader that stopped at other people's mail
+        ;; would pin the log. The verdict goes through the shared DELIVERABLE-P
+        ;; so this filter and the pending count cannot disagree.
+        (when (bus:deliverable-p sid addressee own)
           (push (%make-delivery :author (bus:author-display sid namespace)
                                 :author-id (bus:decode-id sid)
                                 :text text)
@@ -194,10 +259,11 @@
    whether a broker is live, how many messages are waiting for it right now, and
    whether a wakeup watcher is currently listening on its behalf.
 
-   PENDING is the self-aware count: only the FOREIGN records delivery would
-   actually return, never this agent's own un-consumed publishes (which receive
-   filters out). It shares one predicate with AGENT-RECEIVE, so the number here
-   and the batch a receive hands back cannot disagree.
+   PENDING is the self-aware count: only the records delivery would actually
+   return, never this agent's own un-consumed publishes and never mail addressed
+   to somebody else, both of which receive filters out. It shares one predicate
+   with AGENT-RECEIVE, so the number here and the batch a receive hands back
+   cannot disagree.
 
    The watcher fields come from the heartbeat a running watch refreshes under this
    agent's identity: LIVE-WATCHER is true only when that beat is fresh, and

@@ -26,7 +26,11 @@
            #:delivered-body-string
            #:foreign-self-id-p
            #:foreign-record-p
-           #:+envelope-delimiter+))
+           #:record-addressee
+           #:deliverable-p
+           #:deliverable-record-p
+           #:+envelope-delimiter+
+           #:+routing-separator+))
 
 (in-package #:dsmr-mcp/src/bus/envelope)
 
@@ -124,36 +128,123 @@
    alphanumerics + . - _), so it can appear only in the payload — never in either
    id field.")
 
-(defun wrap-envelope (correlation-id self-id payload)
-  "Build the wire body: CORRELATION-ID + DELIM + (ENCODE-ID SELF-ID) + DELIM +
-   PAYLOAD. A NIL SELF-ID embeds an empty encoded field; the wrap always emits two
-   delimiters so the format is uniform and decoding is unambiguous."
+(defconstant +routing-separator+ #\>
+  "Separates the publisher's encoded self-id from an encoded addressee INSIDE the
+   envelope's second field, which is why that field is a routing field rather
+   than a self-id field.
+
+   Chosen for two properties, both of which the format depends on. It is outside
+   ENCODE-ID's output alphabet (percent-encoding over alphanumerics + . - _), so
+   neither half of the field can ever contain it and the split is unambiguous by
+   construction. And it is not the envelope delimiter, so carrying an addressee
+   leaves the delimiter count at two and changes nothing about how the payload is
+   found.
+
+   Nesting the addressee here rather than adding a third delimiter-bounded field
+   is deliberate and is the only decidable choice. A payload may itself contain
+   the delimiter, so a record published before addressing existed can already
+   present three delimiters; a reader that counted them would take part of the
+   message body as an addressee and silently truncate the rest.")
+
+(defun %routing-field (self-id to)
+  "Build the envelope's routing field: the encoded SELF-ID on its own for a
+   broadcast, or the encoded self-id, the routing separator, and the encoded
+   addressee TO for an addressed record. A NIL SELF-ID contributes an empty
+   first half, so a publisher with no identity can still address a message."
+  (let ((self (if self-id (encode-id self-id) "")))
+    (if to
+        (format nil "~A~C~A" self +routing-separator+ (encode-id to))
+        self)))
+
+(defun wrap-envelope (correlation-id self-id payload &key to)
+  "Build the wire body: CORRELATION-ID + DELIM + routing field + DELIM + PAYLOAD.
+   The routing field is (ENCODE-ID SELF-ID); a NIL SELF-ID embeds an empty one.
+   The wrap always emits two delimiters so the format is uniform and decoding is
+   unambiguous.
+
+   TO, when given, is the bus id of the one participant this message is for. It
+   is encoded and appended to the routing field after +ROUTING-SEPARATOR+, so an
+   addressed record is CID + DELIM + ENCODED-SELF + SEP + ENCODED-TO + DELIM +
+   PAYLOAD. With TO NIL the string produced is byte for byte the one this
+   function has always produced.
+
+   The reason the addressee rides inside the routing field, and the reason the
+   delimiter count does not change, is that decoding has to stay decidable
+   against records already on the log. Reading is a three-rung ladder:
+
+     zero delimiters, or one, is a legacy un-enveloped body from a publisher
+     running an older core, returned verbatim as the text;
+
+     two delimiters with a plain routing field is a broadcast, decoded exactly as
+     it always was;
+
+     two delimiters with a routing field carrying the separator is an addressed
+     record, and only then is an addressee read.
+
+   The degradation is in the safe direction. A reader that has not been upgraded
+   compares the whole routing field against its own encoded id, finds no match,
+   judges the record foreign and delivers it. It over-delivers rather than
+   mis-parsing, and no message text is ever altered. The one cost is that such a
+   reader also fails to recognise its own addressed publish and takes delivery of
+   its own message, which can only happen once someone has deliberately turned
+   addressing on."
   (format nil "~A~C~A~C~A"
           correlation-id
           +envelope-delimiter+
-          (if self-id (encode-id self-id) "")
+          (%routing-field self-id to)
           +envelope-delimiter+
           payload))
 
+(defun %nonempty (string)
+  "STRING, or NIL when it is empty. An absent envelope field is written as an
+   empty one, and a caller wants to see the absence rather than a blank string."
+  (if (zerop (length string)) nil string))
+
+(defun %split-routing-field (routing)
+  "Split the envelope's routing field into TWO values: the encoded self-id and
+   the encoded addressee, each NIL when absent.
+
+   A field with no separator is a broadcast and is all self-id. A field with one
+   is an addressed record. The separator cannot occur in either half, because
+   both halves are ENCODE-ID output, so the first occurrence is the split point
+   and there is nothing left to disambiguate."
+  (let ((sep (position +routing-separator+ routing)))
+    (if sep
+        (values (%nonempty (subseq routing 0 sep))
+                (%nonempty (subseq routing (1+ sep))))
+        (values (%nonempty routing) nil))))
+
 (defun decode-envelope (body-string)
-  "Split a wire body into THREE values: the original user TEXT (everything past the
-   second delimiter), the CORRELATION-ID, and the ENCODED SELF-ID (compared
-   encoded-vs-encoded against (ENCODE-ID id), so it is returned in its encoded
-   form). The payload may itself contain the delimiter — only the first two
-   delimiter positions are used. A body WITHOUT two delimiters is a legacy,
-   un-enveloped message from an old-core publisher: it is returned verbatim as the
-   text with NIL ids, so the decoder is backward-compatible during a staggered
-   rollout."
+  "Split a wire body into FOUR values: the original user TEXT (everything past
+   the second delimiter), the CORRELATION-ID, the ENCODED SELF-ID, and the
+   ENCODED ADDRESSEE. Both ids come back in their encoded form, because every
+   comparison against them is made encoded against encoded.
+
+   The first three values are exactly what this function has always returned,
+   for every body that decodes today. The payload may itself contain the
+   delimiter, so only the first two delimiter positions are ever used. A body
+   WITHOUT two delimiters is a legacy, un-enveloped message from an old-core
+   publisher: it is returned verbatim as the text with NIL ids, so the decoder
+   is backward-compatible during a staggered rollout.
+
+   The fourth value is NIL for every broadcast and every legacy record, and is
+   the addressee only when the routing field carries +ROUTING-SEPARATOR+. It is
+   read out of the second field rather than a third one precisely so that a
+   legacy payload containing the delimiter cannot be mistaken for routing
+   information. Adding a value is safe for callers that destructure the first
+   three: a MULTIPLE-VALUE-BIND drops the extra silently."
   (let ((d1 (position +envelope-delimiter+ body-string)))
     (if d1
         (let ((d2 (position +envelope-delimiter+ body-string :start (1+ d1))))
           (if d2
-              (values (subseq body-string (1+ d2))
-                      (subseq body-string 0 d1)
-                      (let ((encoded (subseq body-string (1+ d1) d2)))
-                        (if (zerop (length encoded)) nil encoded)))
-              (values body-string nil nil)))
-        (values body-string nil nil))))
+              (multiple-value-bind (self-id addressee)
+                  (%split-routing-field (subseq body-string (1+ d1) d2))
+                (values (subseq body-string (1+ d2))
+                        (subseq body-string 0 d1)
+                        self-id
+                        addressee))
+              (values body-string nil nil nil)))
+        (values body-string nil nil nil))))
 
 (defun delivered-body-string (record)
   "The original user text of RECORD — its body decoded through the envelope. A
@@ -209,3 +300,55 @@
       (decode-envelope (wal:record-body-string record))
     (declare (ignore text correlation-id))
     (foreign-self-id-p self-id own-encoded)))
+
+(defun record-addressee (record)
+  "The ENCODED addressee RECORD names, or NIL when it names nobody. A broadcast
+   and a legacy un-enveloped record both answer NIL, which is what makes an
+   un-addressed record deliverable to everyone."
+  (multiple-value-bind (text correlation-id self-id addressee)
+      (decode-envelope (wal:record-body-string record))
+    (declare (ignore text correlation-id self-id))
+    addressee))
+
+(defun deliverable-p (encoded-self-id encoded-addressee own-encoded)
+  "True when a record whose routing field decoded to ENCODED-SELF-ID and
+   ENCODED-ADDRESSEE should be handed to the agent whose encoded id is
+   OWN-ENCODED. This is the whole delivery verdict in one place, so the receive
+   path and the pending count cannot drift apart the first time either half of
+   it changes, exactly as FOREIGN-SELF-ID-P already is for the first half.
+
+   Two things must both hold. The record must be foreign, which is
+   FOREIGN-SELF-ID-P unchanged: an agent is never handed back its own publish.
+   And the record must be for this agent, which means it names nobody or names
+   this agent.
+
+   With no identity resolved (a NIL OWN-ENCODED) everything is deliverable,
+   addressed mail included. There is no self to recognise and nothing to compare
+   an addressee against, so the only safe reading is the pre-identity one: show
+   the reader everything rather than silently withhold a message.
+
+   This decides what a reader is SHOWN, never where its cursor sits. A cursor
+   advances over every record regardless of who it names. A recipient that
+   stopped at other people's mail would pin the log, which is the retirement
+   problem multiplied."
+  (and (foreign-self-id-p encoded-self-id own-encoded)
+       (or (null own-encoded)
+           (null encoded-addressee)
+           (string= encoded-addressee own-encoded))
+       t))
+
+(defun deliverable-record-p (record own-encoded)
+  "True when RECORD should be handed to the agent whose encoded id is
+   OWN-ENCODED. Decodes RECORD's body through the shared envelope and defers the
+   verdict to DELIVERABLE-P, which is the same shape FOREIGN-RECORD-P takes over
+   FOREIGN-SELF-ID-P: one decode, one comparison, one place to change.
+
+   This is the predicate the delivery path and the pending count both use.
+   FOREIGN-RECORD-P is deliberately left alone and still means only what it has
+   always meant, because the standalone watcher binary reads it and is deployed
+   on a schedule of its own; a shift in its meaning would reach the fleet at a
+   different time from the core that publishes for it."
+  (multiple-value-bind (text correlation-id self-id addressee)
+      (decode-envelope (wal:record-body-string record))
+    (declare (ignore text correlation-id))
+    (deliverable-p self-id addressee own-encoded)))
