@@ -132,8 +132,8 @@ a named bus takes its restart commands from that bus and not from the shared
 one: a command published where the server is not a member reaches nobody, which
 is the point of running a fleet on a bus of its own.
 
-The listener connects an EPHEMERAL agent in NAMESPACE — no stable name, so it
-never resumes (or steals) the main agent's durable cursor — and polls every
+The listener connects an EPHEMERAL agent in NAMESPACE, with no stable name, so
+it never resumes (or steals) the main agent's durable cursor. It polls every
 POLL-MS for restart commands. Each message is validated against NAMESPACE and
 OWN-NAME, not against the ephemeral agent's own id, then dispatched: rung 1 runs
 a local reset of SESSION's backends, rung 3 exits the process through the shared
