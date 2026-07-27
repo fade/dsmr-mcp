@@ -439,19 +439,25 @@ trigger produces no further prompt."
                 ".envrc is the template with the project-derived port")))))))
 
 (define-test stdio-elicitation-no-clobber
-  "A pre-existing COMPLETE .envrc (one that already exports both
-DSMR_SLYNK_ATTACH and the DSMR_BUS_AGENT done-state marker) yields ZERO
+  "A pre-existing COMPLETE .envrc (one that declares every marker variable:
+DSMR_SLYNK_ATTACH, DSMR_BUS_AGENT and DSMR_BUS_SELECTOR) yields ZERO
 elicitation/create and is left unchanged: neither the create nor the update
-trigger fires."
+trigger fires.
+
+The fixture gained the fleet selector when the selector joined the marker set.
+The contract proven here is the one it always was, over real stdio: a file that
+carries everything is never re-offered the settings and is never rewritten."
   (with-mcp-server-child-or-skip
     (%with-temp-root (root :envrc-content "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 export DSMR_BUS_AGENT=stub
+export DSMR_BUS_SELECTOR=\"\"
 ")
       (let ((objs (%run-scenario root :elicitation t :response-action nil)))
         (is = 0 (%count-elicitation-creates objs)
             "no prompt when a complete .envrc already exists")
         (is string= "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 export DSMR_BUS_AGENT=stub
+export DSMR_BUS_SELECTOR=\"\"
 "
             (uiop:read-file-string (merge-pathnames ".envrc" root))
             "pre-existing complete .envrc content unchanged")))))
@@ -471,7 +477,9 @@ user's original lines are preserved (append, not clobber)."
         (true (search "FOO=bar" text)
               "the user's original line is preserved")
         (true (search "DSMR_SLYNK_ATTACH" text)
-              "the dsmr-mcp managed block was appended"))))))
+              "the dsmr-mcp managed block was appended")
+        (is = 1 (%count-occurrences "export DSMR_BUS_SELECTOR=" text)
+            "the appended block carries the fleet selector exactly once"))))))
 
 (define-test stdio-elicitation-bus-only-appends-slynk
   "A bus-identity-only .envrc (exports DSMR_BUS_AGENT, lacks DSMR_SLYNK_ATTACH --
@@ -495,7 +503,9 @@ export DSMR_BUS_AGENT=stub
         (true (search "DSMR_SLYNK_ATTACH" text)
               "the missing slynk attach setup was appended")
         (is = 1 (%count-occurrences "DSMR_BUS_AGENT" text)
-            "exactly one DSMR_BUS_AGENT after the slynk-only append"))))))
+            "exactly one DSMR_BUS_AGENT after the slynk-only append")
+        (is = 1 (%count-occurrences "export DSMR_BUS_SELECTOR=" text)
+            "the fleet selector is added exactly once"))))))
 
 (define-test stdio-elicitation-decline-writes-nothing
   "Decline: exactly one elicitation/create; no .envrc written afterward."

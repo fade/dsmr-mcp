@@ -21,5 +21,15 @@ export DSMR_LOG_LEVEL=info
 # directory name; override by exporting DSMR_BUS_AGENT before direnv loads.
 export DSMR_BUS_AGENT="${DSMR_BUS_AGENT:-$(basename "$PWD")}"
 
+# The fleet this project's agent belongs to. An empty value means the shared
+# host-wide bus, so a repository that gains this line has not moved anywhere:
+# distributing the stanza across every repository puts nobody on somebody
+# else's bus. Set it to the fleet tag the leader named to put this project's
+# agent on that fleet's private bus, or override by exporting
+# DSMR_BUS_SELECTOR before direnv loads. The MCP session and any watcher armed
+# from this directory read the same variable, so one value here keeps both on
+# one bus rather than letting them drift apart while both report success.
+export DSMR_BUS_SELECTOR="${DSMR_BUS_SELECTOR:-}"
+
 # Sibling projects this one may re-root into (filesystem sandbox whitelist):
 # export DSMR_RELATED_PROJECTS="$HOME/SourceCode/lisp/cl-mcp:$HOME/SourceCode/lisp/eve-quant"

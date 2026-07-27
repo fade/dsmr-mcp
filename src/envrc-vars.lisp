@@ -336,6 +336,20 @@ image grabbed it first, so the derived value is what keeps them apart."
 # instead of getting a fresh ephemeral id every launch. Defaults to the project
 # directory name; override by exporting DSMR_BUS_AGENT before direnv loads."
     :default #'project-basename
+    :setup-marker-p t)
+   (%make-managed-variable
+    :name "DSMR_BUS_SELECTOR"
+    :comment "# The fleet this project's agent belongs to. An empty value means the shared
+# host-wide bus, so a repository that gains this line has not moved anywhere:
+# distributing the stanza across every repository puts nobody on somebody
+# else's bus. Set it to the fleet tag the leader named to put this project's
+# agent on that fleet's private bus, or override by exporting
+# DSMR_BUS_SELECTOR before direnv loads. The MCP session and any watcher armed
+# from this directory read the same variable, so one value here keeps both on
+# one bus rather than letting them drift apart while both report success."
+    :default (lambda (project-root)
+               (declare (ignore project-root))
+               "")
     :setup-marker-p t))
   "Every variable dsmr-mcp declares in a project `.envrc`, in the order the
 managed block writes them. This is the single place a new variable is added: the
