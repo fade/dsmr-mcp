@@ -298,6 +298,7 @@ export DSMR_MODE=auto
 export DSMR_SLYNK_ATTACH=\"${SLYNK_HOST}:${SLYNK_PORT}\"
 export DSMR_LOG_LEVEL=info
 export DSMR_BUS_AGENT=\"${DSMR_BUS_AGENT:-agent}\"
+export DSMR_BUS_SELECTOR=\"${DSMR_BUS_SELECTOR:-}\"
 # <<< dsmr-mcp <<<
 "
       (managed-block)
@@ -337,7 +338,7 @@ Slynk image or one bus name."
   "The undeclared set skips what is already declared and keeps table order, so a
 caller folding over it writes the block's own sequence."
   (is equal '("LISP_WORKSPACE" "SLYNK_PORT" "DSMR_MODE" "DSMR_SLYNK_ATTACH"
-              "DSMR_LOG_LEVEL" "DSMR_BUS_AGENT")
+              "DSMR_LOG_LEVEL" "DSMR_BUS_AGENT" "DSMR_BUS_SELECTOR")
       (mapcar #'variable-name
               (undeclared-variables "export SLYNK_HOST=1.2.3.4
 "))
@@ -345,8 +346,14 @@ caller folding over it writes the block's own sequence."
 
 (define-test setup-complete-p-keys-on-the-marker-variables
   "The settled question is answered by the marker variables alone. A file
-carrying both is settled even without the supporting lines, which is what stops
-an operator's deliberate deletion turning into a prompt every session."
+carrying all of them is settled even without the supporting lines, which is what
+stops an operator's deliberate deletion turning into a prompt every session.
+
+The fleet selector joined the marker set, which is what makes every repository
+already carrying the older stanza incomplete again and therefore reachable by
+the offer. That is deliberate and it is how the selector reaches the fleet: the
+declaration it gains defaults to empty, which is the shared host-wide bus, so
+nobody is moved by receiving it."
   (false (setup-complete-p +bare-envrc+)
          "a file with neither marker is not settled")
   (false (setup-complete-p "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
@@ -354,10 +361,20 @@ an operator's deliberate deletion turning into a prompt every session."
          "a file with only the slynk marker is not settled")
   (false (setup-complete-p +bus-only-envrc+)
          "a file with only the bus marker is not settled")
-  (true (setup-complete-p "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+  (false (setup-complete-p "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 export DSMR_BUS_AGENT=myproj
 ")
-        "a file carrying both markers is settled"))
+         "the stanza as it stood before the selector existed is not settled")
+  (true (setup-complete-p "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+export DSMR_BUS_AGENT=myproj
+export DSMR_BUS_SELECTOR=\"\"
+")
+        "a file carrying every marker is settled")
+  (true (setup-complete-p "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+export DSMR_BUS_AGENT=myproj
+export DSMR_BUS_SELECTOR=fulcrum
+")
+        "a selector naming a fleet is settled exactly as an empty one is"))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The fold the append path uses
@@ -386,16 +403,18 @@ rather than needing its own check."
       (is string= complete text "a complete file must not be touched"))))
 
 (define-test the-fold-adds-only-what-is-missing
-  "A file carrying the older slynk region gains the bus identity and nothing
-else: the six declarations it already has are not written a second time."
+  "A file carrying the older slynk region gains the two declarations it lacks
+and nothing else: the six it already has are not written a second time."
   (multiple-value-bind (text changed)
       (ensure-managed-declarations +slynk-only-envrc+)
-    (true changed "a slynk-only file must gain the bus identity")
+    (true changed "a slynk-only file must gain the missing declarations")
     (is = 1 (%count-lines-mentioning "DSMR_SLYNK_ATTACH" text)
         "the slynk attach line is not duplicated")
     (is = 1 (%count-lines-mentioning "DSMR_BUS_AGENT" text)
         "the bus identity is added exactly once")
-    (is = (1+ (length (%lines +slynk-only-envrc+))) (length (%lines text))
-        "exactly one line was added")
+    (is = 1 (%count-lines-mentioning "DSMR_BUS_SELECTOR" text)
+        "the fleet selector is added exactly once")
+    (is = (+ 2 (length (%lines +slynk-only-envrc+))) (length (%lines text))
+        "exactly the two missing declarations were added")
     (true (setup-complete-p text)
           "the file reaches the settled state, so no re-prompt follows")))
