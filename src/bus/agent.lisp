@@ -28,11 +28,12 @@
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:bus #:dsmr-mcp/src/bus/bus)
                     (#:heartbeat #:dsmr-mcp/src/bus/heartbeat)
+                    (#:roster #:dsmr-mcp/src/bus/roster)
                     (#:selector #:dsmr-mcp/src/bus/selector)
                     (#:wal #:dsmr-mcp/src/bus/wal))
   (:export #:agent #:agent-id #:agent-name #:agent-namespace #:agent-stable-p
            #:agent-paths #:agent-bus
-           #:connect-agent #:disconnect-agent
+           #:connect-agent #:disconnect-agent #:quiesce-and-leave
            #:agent-publish #:agent-receive #:agent-receive-detailed
            #:delivery #:delivery-author #:delivery-author-id #:delivery-text
            #:agent-status
@@ -228,3 +229,80 @@
     (bus:unsubscribe (agent-subscriber agent))
     (setf (agent-subscriber agent) nil))
   (values))
+
+(defun %record-departure (agent)
+  "Put AGENT's departure on its bus's roster and return the universal time now on
+   record for it, or NIL when nothing could be written.
+
+   An existing departure is left exactly as it stands. That time is what the
+   busmaster ages a held cursor against, so a repeated leave must not push it
+   forward: doing so would turn holding a cursor into keeping it forever.
+
+   A failure is named on stderr and swallowed. The caller is on its way out and
+   has nowhere to handle it."
+  (let ((roster-dir (broker:bus-paths-roster-dir (agent-paths agent)))
+        (id (agent-id agent)))
+    (handler-case
+        (let ((existing (roster:entry id roster-dir)))
+          (if (and (eq (roster:entry-status existing) :departed)
+                   (integerp (roster:entry-departed-at existing)))
+              (roster:entry-departed-at existing)
+              (roster:entry-departed-at (roster:disenroll id roster-dir))))
+      (error (e)
+        (format *error-output*
+                "dsmr-mcp bus: could not record ~A leaving: ~A~%" id e)
+        nil))))
+
+(defun quiesce-and-leave (agent &key (max-batches 100)
+                                     (limit bus:+default-batch-size+))
+  "Leave the bus cleanly: read whatever is still waiting for AGENT, put its
+   departure on this bus's roster, and release its connection.
+
+   Returns (VALUES DRAINED DEPARTED-AT BOUND-REACHED). DRAINED is how many
+   messages came back on the way out. DEPARTED-AT is the universal time now on
+   record, or NIL when the roster could not be written. BOUND-REACHED is true
+   when the drain stopped on MAX-BATCHES with records still arriving, so a
+   firehose cannot hold a departing agent indefinitely; the records left behind
+   are not lost, they are simply not read by an agent that is leaving.
+
+   The roster entry written here is what transfers custody of this agent's
+   cursor, and that is the design rather than a workaround. A cursor is normally
+   written by exactly one process, the session consuming the bus through it,
+   which is why the watcher binary refuses to touch one: writing it from outside
+   would move a live session's delivery position behind its back. On a clean
+   leave that session is gone, and the per-bus busmaster, which already owns the
+   lifecycle of the cursor directory, takes the file over. It advances the cursor
+   with fleet traffic so a departed participant can never pin the log, and
+   retires it once the departure is old enough. The entry written here is what
+   makes that handover explicit and datable; an agent that vanishes without one
+   gets none of it.
+
+   Leaving twice is safe. The second call finds the departure already recorded,
+   leaves the original time in place, and reports nothing drained.
+
+   A roster write that fails is reported and not signalled, and the disconnect
+   happens either way. An agent that cannot leave is a worse outcome than one
+   whose departure went unrecorded.
+
+   Membership is not upgraded, probed or otherwise touched. This agent holds two
+   shared locks on the bus's membership file, one for its client and one for its
+   subscriber, so it could never win an upgrade against itself, and a won upgrade
+   has no release anywhere in this tree and would block every later join.
+   Leaving therefore does not make the clean-exit archive reachable and does not
+   pretend to."
+  (let ((drained 0)
+        (bound-reached t)
+        (departed-at nil))
+    (unwind-protect
+         (progn
+           (if (agent-subscriber agent)
+               (dotimes (batch max-batches)
+                 (declare (ignore batch))
+                 (let ((records (agent-receive agent :timeout-ms 0 :limit limit)))
+                   (cond (records (incf drained (length records)))
+                         (t (setf bound-reached nil)
+                            (return)))))
+               (setf bound-reached nil))
+           (setf departed-at (%record-departure agent)))
+      (disconnect-agent agent))
+    (values drained departed-at bound-reached)))

@@ -31,9 +31,11 @@
 (defpackage #:dsmr-mcp/tests/bus/roster-test
   (:use #:cl #:parachute)
   (:local-nicknames (#:roster #:dsmr-mcp/src/bus/roster)
+                    (#:agent #:dsmr-mcp/src/bus/agent)
                     (#:envelope #:dsmr-mcp/src/bus/envelope)
                     (#:broker #:dsmr-mcp/src/bus/broker)
-                    (#:selector #:dsmr-mcp/src/bus/selector)))
+                    (#:selector #:dsmr-mcp/src/bus/selector)
+                    (#:wal #:dsmr-mcp/src/bus/wal)))
 
 (in-package #:dsmr-mcp/tests/bus/roster-test)
 
@@ -336,3 +338,133 @@
     (false (probe-file (broker:bus-paths-roster-state paths)))
     (true (roster:enrollment-open-p (broker:bus-paths-roster-state paths)))
     (false (roster:leader (broker:bus-paths-roster-state paths)))))
+
+;;; ---------------------------------------------------------- clean departure
+
+(defun feed-log (paths &rest bodies)
+  "Append BODIES to the bus log exactly as the busmaster would, and return the
+   new head sequence.
+
+   Writing the log directly rather than publishing through a broker is
+   deliberate: what is under test here is what a departing agent reads and what
+   it records, and delivery reads the log, so a ZeroMQ round trip would add a
+   thread and a timeout without adding an assertion."
+  (let ((path (broker:bus-paths-wal paths))
+        (seq (wal:scan (broker:bus-paths-wal paths))))
+    (dolist (body bodies seq)
+      (wal:append-record path (incf seq) body))))
+
+(defun departure-record (paths id)
+  (roster:entry id (broker:bus-paths-roster-dir paths)))
+
+(defmacro with-quiet-stderr (&body body)
+  "Run BODY with stderr discarded. Used only by the case that provokes a reported
+   failure, so the suite does not print a warning that is the expected result."
+  `(let ((*error-output* (make-broadcast-stream)))
+     ,@body))
+
+(define-test leaving-drains-what-is-waiting-and-records-when
+  "A departing agent reads out what it still had, and its departure lands on the
+   roster of the bus it was speaking on, stamped with when it left."
+  (with-bus-root (paths)
+    (let* ((before (get-universal-time))
+           (leaver (agent:connect-agent +namespace+ :name "departing"
+                                        :paths paths :ensure-broker nil))
+           (id (agent:agent-id leaver)))
+      (false (nth-value 1 (departure-record paths id)))
+      (feed-log paths "one" "two" "three")
+      (multiple-value-bind (drained departed-at bound)
+          (agent:quiesce-and-leave leaver)
+        (is = 3 drained)
+        (false bound)
+        (true (integerp departed-at))
+        (true (>= departed-at before))
+        (multiple-value-bind (record present) (departure-record paths id)
+          (true present)
+          (is eq :departed (roster:entry-status record))
+          (is = departed-at (roster:entry-departed-at record)))))))
+
+(define-test leaving-records-a-departure-for-an-agent-that-never-enrolled
+  "Enrollment is advisory, so a participant nobody listed still leaves on the
+   record. Without an entry there is nothing for its cursor to be aged against."
+  (with-bus-root (paths)
+    (let* ((leaver (agent:connect-agent +namespace+ :name "unlisted"
+                                        :paths paths :ensure-broker nil))
+           (id (agent:agent-id leaver)))
+      (is = 0 (length (roster:members (broker:bus-paths-roster-dir paths))))
+      (multiple-value-bind (drained departed-at) (agent:quiesce-and-leave leaver)
+        (is = 0 drained)
+        (true (integerp departed-at)))
+      (is = 1 (length (roster:departed-members
+                       (broker:bus-paths-roster-dir paths)))))))
+
+(define-test leaving-releases-both-of-the-agents-connections
+  "Leaving disconnects afterwards, releasing the client and the subscriber the
+   same way a plain disconnect does."
+  (with-bus-root (paths)
+    (let ((leaver (agent:connect-agent +namespace+ :name "releasing"
+                                       :paths paths :ensure-broker nil)))
+      (true (dsmr-mcp/src/bus/agent::agent-client leaver))
+      (true (dsmr-mcp/src/bus/agent::agent-subscriber leaver))
+      (agent:quiesce-and-leave leaver)
+      (false (dsmr-mcp/src/bus/agent::agent-client leaver))
+      (false (dsmr-mcp/src/bus/agent::agent-subscriber leaver)))))
+
+(define-test leaving-twice-keeps-the-first-departure-time
+  "The second leave reports nothing drained and does not restamp the record. The
+   stamp is what a held cursor is aged against, so moving it forward on every
+   repeat would make the cursor outlive every threshold."
+  (with-bus-root (paths)
+    (let* ((leaver (agent:connect-agent +namespace+ :name "twice"
+                                        :paths paths :ensure-broker nil))
+           (id (agent:agent-id leaver))
+           (dir (broker:bus-paths-roster-dir paths)))
+      (feed-log paths "one")
+      (is = 1 (agent:quiesce-and-leave leaver))
+      ;; Backdate the record so a second leave rewriting the stamp would be
+      ;; visible. GET-UNIVERSAL-TIME has one-second resolution, so two calls in
+      ;; the same second would agree whether or not the stamp was rewritten.
+      (let* ((record (roster:entry id dir))
+             (backdated (- (roster:entry-departed-at record) (* 30 24 60 60)))
+             (amended (copy-list record)))
+        (setf (getf amended :departed-at) backdated)
+        (plant (roster:roster-entry-path id dir)
+               (with-standard-io-syntax (prin1-to-string amended)))
+        (multiple-value-bind (drained departed-at) (agent:quiesce-and-leave leaver)
+          (is = 0 drained)
+          (is = backdated departed-at))
+        (is = backdated (roster:entry-departed-at (roster:entry id dir)))))))
+
+(define-test leaving-stops-on-its-batch-bound-and-says-so
+  "A departing agent is bounded rather than held by whatever is still arriving,
+   and it reports having stopped short instead of implying it drained the lot."
+  (with-bus-root (paths)
+    (let ((leaver (agent:connect-agent +namespace+ :name "bounded"
+                                       :paths paths :ensure-broker nil)))
+      (feed-log paths "one" "two" "three" "four" "five")
+      (multiple-value-bind (drained departed-at bound)
+          (agent:quiesce-and-leave leaver :max-batches 2 :limit 1)
+        (is = 2 drained)
+        (true bound)
+        (true (integerp departed-at))))))
+
+(define-test leaving-survives-a-roster-it-cannot-write
+  "A roster write that fails is reported, not signalled, and the agent still
+   leaves. Being unable to depart is worse than departing unrecorded."
+  (with-bus-root (paths)
+    (let ((leaver (agent:connect-agent +namespace+ :name "obstructed"
+                                       :paths paths :ensure-broker nil))
+          (dir (broker:bus-paths-roster-dir paths)))
+      (feed-log paths "one")
+      ;; Put a plain file where the roster directory belongs, so no entry under
+      ;; it can be created.
+      (ignore-errors (uiop:delete-directory-tree dir :validate t))
+      (plant (make-pathname :name "roster" :type nil
+                            :defaults (broker:bus-paths-root paths))
+             "not a directory")
+      (with-quiet-stderr
+        (multiple-value-bind (drained departed-at) (agent:quiesce-and-leave leaver)
+          (is = 1 drained)
+          (false departed-at)))
+      (false (dsmr-mcp/src/bus/agent::agent-client leaver))
+      (false (dsmr-mcp/src/bus/agent::agent-subscriber leaver)))))
