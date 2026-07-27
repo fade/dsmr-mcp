@@ -6,6 +6,40 @@
 # diverge from the schema the server actually advertises and fail the parity
 # test. Regenerate instead of editing.
 
+* bus-leave
+
+Leave a coordination bus cleanly. This agent reads out whatever 
+is still waiting for it, records its departure on the bus's roster with the time 
+it left, and disconnects. 
+From that moment the bus's busmaster holds this agent's cursor and keeps it at 
+the head of the log, so nothing the agent never read can pin the log, and the 
+cursor is retired once the departure is old enough rather than living forever. 
+Returning later resumes at the current head: no backlog arrives for the period 
+away, which is what having left means. 
+It can only depart the identity this session resolves, never another agent's. 
+Use bus-roster to disenroll somebody else.
+
+#+begin_src json
+{
+  "properties": {
+    "agent_id": {
+      "description": "Optional stable agent name to leave as (under \nthis project's namespace). Omit to use the session's usual identity.",
+      "type": "string"
+    },
+    "bus": {
+      "description": "Optional named bus to leave. Omit to leave the \nbus this session already speaks on.",
+      "type": "string"
+    },
+    "ephemeral": {
+      "description": "Set true to depart the session's one-shot \nephemeral identity rather than the project's stable DSMR_BUS_AGENT one.",
+      "type": "boolean"
+    }
+  },
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
 * bus-publish
 
 Broadcast a message onto the coordination bus. All subscribed 
@@ -73,6 +107,46 @@ agent, not signing as it.
     }
   },
   "required": [],
+  "type": "object"
+}
+#+end_src
+
+* bus-roster
+
+Read and change the roster of a coordination bus: list who is on 
+it, enroll and disenroll participants while the fleet is running, close or 
+reopen enrollment, and record which agent leads the bus. 
+The roster is operator-managed and ADVISORY: the bus enforces nothing from it. 
+An agent that is not on the roster, or that was refused a place on it, can still 
+connect, publish and receive exactly as any other participant. Closing 
+enrollment stops the leader from listing new participants; it stops nobody from 
+using the bus. This is a gate, not an access control list. 
+Isolation between fleets comes from each bus having its own state root and the 
+filesystem permissions on that root, not from a membership check, because the 
+transport has no security surface that could back one. A declared leader plus a 
+closeable gate is the answer to two fleets sharing a machine: each names its own 
+bus and records its own leader. There is no cryptographic or capability guard 
+here, and adding one would only dress a convention up as a control.
+
+#+begin_src json
+{
+  "properties": {
+    "action": {
+      "description": "What to do: list (every entry, plus whether \nenrollment is open and who leads), enroll (add an agent), disenroll (mark an \nagent departed and stamp when), close-enrollment (shut the gate), \nopen-enrollment (reopen it), or declare-leader (record who leads this bus).",
+      "type": "string"
+    },
+    "agent": {
+      "description": "The agent to act on: either a full \nNAMESPACE/NAME bus id, or the bare name within this session's own project \nnamespace, which is qualified for you. Required by enroll, disenroll and \ndeclare-leader; ignored by the others.",
+      "type": "string"
+    },
+    "bus": {
+      "description": "Optional named bus to act on. Omit to use the \nbus this session already speaks on.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "action"
+  ],
   "type": "object"
 }
 #+end_src
