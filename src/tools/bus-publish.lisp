@@ -16,10 +16,12 @@
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht #:result #:text-content)
   (:import-from #:dsmr-mcp/src/tools/bus-helpers
-                #:session-agent #:identity-summary #:no-project-root)
+                #:session-agent #:bus-label #:identity-summary #:no-project-root)
   (:import-from #:dsmr-mcp/src/bus/agent
                 #:agent-publish #:agent-id #:agent-name #:agent-namespace
-                #:agent-stable-p #:direct-addressing-disabled))
+                #:agent-bus #:agent-stable-p #:direct-addressing-disabled)
+  (:import-from #:dsmr-mcp/src/bus/selector
+                #:invalid-bus-name))
 
 (in-package #:dsmr-mcp/src/tools/bus-publish)
 
@@ -58,7 +60,14 @@ this project's namespace). Omit to use the session's anonymous default agent.")
                   :type :boolean
                   :description "Set true to force a fresh one-shot ephemeral \
 identity for this subagent, opting out of the project's stable DSMR_BUS_AGENT \
-identity so it never resumes the main agent's cursor."))
+identity so it never resumes the main agent's cursor.")
+                 (bus
+                  :type :string
+                  :description "Optional named bus to publish on. Omit to use \
+this session's bus, which is DSMR_BUS_SELECTOR from the repository's .envrc \
+when that is set and the shared host-wide bus otherwise. A name that cannot \
+become a bus is refused; nothing is ever published to the shared bus in place \
+of a bus that was named."))
                 :required ("message"))))
   (:metaclass mcp-tool-class)
   (:documentation "MCP tool: publish a message to the coordination bus."))
@@ -88,6 +97,7 @@ identity so it never resumes the main agent's cursor."))
   (let ((message (gethash "message" args))
         (agent-id-arg (gethash "agent_id" args))
         (to-arg (gethash "to" args))
+        (bus-arg (gethash "bus" args))
         (ephemeral (and (gethash "ephemeral" args) t)))
     (unless (and message (stringp message))
       (return-from tool-handle
@@ -101,11 +111,22 @@ identity so it never resumes the main agent's cursor."))
         (%invalid-argument id "bus-publish: to must be a non-empty string, \
 either a full NAMESPACE/NAME bus id or a bare name in this project's \
 namespace.")))
+    ;; A named bus is checked in the same breath and for the same reason. An
+    ;; empty string is refused rather than read as "no bus named": resolved, it
+    ;; would fall through to whatever bus the session already speaks on, which
+    ;; puts a fleet's message in front of the wrong fleet while the call reports
+    ;; success.
+    (unless (or (null bus-arg) (and (stringp bus-arg) (plusp (length bus-arg))))
+      (return-from tool-handle
+        (%invalid-argument id "bus-publish: bus must be a non-empty string \
+naming a bus. Omit it to publish on this session's own bus.")))
     (handler-case
-        (let* ((a (session-agent (tool-session tool) agent-id-arg :ephemeral ephemeral))
+        (let* ((a (session-agent (tool-session tool) agent-id-arg
+                                 :ephemeral ephemeral :bus bus-arg))
                (recipient (and to-arg (%qualify to-arg (agent-namespace a))))
                (seq (agent-publish a message :to recipient)))
           (result id (make-ht "published" t
+                              "bus" (bus-label (agent-bus a))
                               "agent_id" (agent-id a)
                               "agent_name" (agent-name a)
                               "namespace" (agent-namespace a)
@@ -113,9 +134,10 @@ namespace.")))
                               "to" (or recipient 'null)
                               "seq" (or seq 'null)
                               "content" (text-content
-                                         (format nil "Published ~D char(s) to ~
-~:[the bus~;~:*~A~] as ~A~@[ (seq ~D)~]."
+                                         (format nil "Published ~D char(s) ~
+~@[to ~A ~]on bus ~A as ~A~@[ (seq ~D)~]."
                                                  (length message) recipient
+                                                 (bus-label (agent-bus a))
                                                  (identity-summary a) seq)))))
       ;; The refusal is surfaced with a stable error_type of its own so a caller
       ;; can branch on the taxonomy rather than on the prose, and the condition's
@@ -124,6 +146,11 @@ namespace.")))
         (result id (make-ht "isError" t
                             "error_type" "direct-addressing-disabled"
                             "content" (text-content (format nil "bus-publish: ~A" e)))))
+      ;; A bus name that cannot become a bus root is refused here rather than
+      ;; downgraded. Falling back to the session's own bus would put the message
+      ;; on a bus the caller did not name while the reply said it succeeded.
+      (invalid-bus-name (e)
+        (%invalid-argument id (format nil "bus-publish: ~A" e)))
       (no-project-root ()
         (result id (make-ht "isError" t
                             "error_type" "project-root-not-set"

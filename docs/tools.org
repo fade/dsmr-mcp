@@ -55,6 +55,10 @@ the bus log either way.
       "description": "Optional stable agent name to publish as (under \nthis project's namespace). Omit to use the session's anonymous default agent.",
       "type": "string"
     },
+    "bus": {
+      "description": "Optional named bus to publish on. Omit to use \nthis session's bus, which is DSMR_BUS_SELECTOR from the repository's .envrc \nwhen that is set and the shared host-wide bus otherwise. A name that cannot \nbecome a bus is refused; nothing is ever published to the shared bus in place \nof a bus that was named.",
+      "type": "string"
+    },
     "ephemeral": {
       "description": "Set true to force a fresh one-shot ephemeral \nidentity for this subagent, opting out of the project's stable DSMR_BUS_AGENT \nidentity so it never resumes the main agent's cursor.",
       "type": "boolean"
@@ -93,6 +97,10 @@ agent, not signing as it.
   "properties": {
     "agent_id": {
       "description": "Optional stable agent name to receive as (under \nthis project's namespace). Omit to use the session's anonymous default agent.",
+      "type": "string"
+    },
+    "bus": {
+      "description": "Optional named bus to receive from. Omit to use \nthis session's bus, which is DSMR_BUS_SELECTOR from the repository's .envrc \nwhen that is set and the shared host-wide bus otherwise. A name that cannot \nbecome a bus is refused; nothing is ever read from the shared bus in place of a \nbus that was named.",
       "type": "string"
     },
     "ephemeral": {
@@ -167,6 +175,10 @@ is running and how many messages are waiting, without consuming them.
   "properties": {
     "agent_id": {
       "description": "Optional stable agent name to report for (under \nthis project's namespace). Omit to use the session's anonymous default agent.",
+      "type": "string"
+    },
+    "bus": {
+      "description": "Optional named bus to report on. Omit to use \nthis session's bus, which is DSMR_BUS_SELECTOR from the repository's .envrc \nwhen that is set and the shared host-wide bus otherwise. A name that cannot \nbecome a bus is refused; the shared bus is never reported on in place of a bus \nthat was named.",
       "type": "string"
     },
     "ephemeral": {
