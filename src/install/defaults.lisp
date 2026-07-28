@@ -56,8 +56,11 @@ Integers (e.g. a Slynk port) are accepted and printed without decoration."
 supplied values substituted into the `${VAR:-DEFAULT}` defaults. PURE — no IO.
 
 Shape matches the shipped templates/dsmr-mcp.envrc.template: same exports, same
-comments, same `direnv allow` instruction. A nil argument keeps the shipped
-default (127.0.0.1 / 4005 / $HOME/SourceCode/lisp/ / auto). RELATED-PROJECTS,
+comments, same `direnv allow` instruction. That is no longer a claim kept by
+convention: a parity test asserts this function's output with the shipped
+defaults is byte-equal to that file, so the two cannot drift apart unnoticed.
+A nil argument keeps the shipped default (127.0.0.1 / 4005 /
+$HOME/SourceCode/lisp/ / auto). RELATED-PROJECTS,
 when supplied as a non-empty string, becomes an active export; otherwise the
 example line stays commented out. The output never contains a `{{` substring —
 it is shell syntax, not a render-template target."
@@ -87,6 +90,15 @@ it is shell syntax, not a render-template target."
              # instead of getting a fresh ephemeral id every launch. Defaults to the project~@
              # directory name; override by exporting DSMR_BUS_AGENT before direnv loads.~@
              export DSMR_BUS_AGENT=\"${DSMR_BUS_AGENT:-$(basename \"$PWD\")}\"~2%~
+             # The fleet this project's agent belongs to. An empty value means the shared~@
+             # host-wide bus, so a repository that gains this line has not moved anywhere:~@
+             # distributing the stanza across every repository puts nobody on somebody~@
+             # else's bus. Set it to the fleet tag the leader named to put this project's~@
+             # agent on that fleet's private bus, or override by exporting~@
+             # DSMR_BUS_SELECTOR before direnv loads. The MCP session and any watcher armed~@
+             # from this directory read the same variable, so one value here keeps both on~@
+             # one bus rather than letting them drift apart while both report success.~@
+             export DSMR_BUS_SELECTOR=\"${DSMR_BUS_SELECTOR:-}\"~2%~
              # Sibling projects this one may re-root into (filesystem sandbox whitelist):~@
              ~:[# export DSMR_RELATED_PROJECTS=\"$HOME/SourceCode/lisp/cl-mcp:$HOME/SourceCode/lisp/eve-quant\"~;export DSMR_RELATED_PROJECTS=\"~:*~A\"~]~%"
             ws host port mode related)))

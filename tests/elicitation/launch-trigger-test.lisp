@@ -144,16 +144,21 @@ no-op (prompted flag set) and does not write again."
 ;;; ---------------------------------------------------------------------------
 
 (define-test no-prompt-when-envrc-exists
-  "A root whose .envrc is already complete (exports both DSMR_SLYNK_ATTACH and
-DSMR_BUS_AGENT) yields a false create predicate AND a false update predicate:
-neither trigger fires, no round-trip starts, and the original content is
-preserved (no clobber)."
+  "A root whose .envrc is already complete (it declares every marker variable:
+DSMR_SLYNK_ATTACH, DSMR_BUS_AGENT and DSMR_BUS_SELECTOR) yields a false create
+predicate AND a false update predicate: neither trigger fires, no round-trip
+starts, and the original content is preserved (no clobber).
+
+The fixture gained the selector declaration when the selector joined the marker
+set. The contract asserted here is the one it always was: a file that carries
+everything is left alone and is never offered the settings again."
   (with-temp-project-root (s root)
     (write-fixture-file root "foo.asd" "x")
     (write-fixture-file root ".envrc"
                         "ORIGINAL
 export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 export DSMR_BUS_AGENT=myproj
+export DSMR_BUS_SELECTOR=\"\"
 ")
     (setf (session-elicitation-p s) t)
     (false (lisp-project-without-envrc-p root)
@@ -166,6 +171,7 @@ export DSMR_BUS_AGENT=myproj
     (is string= "ORIGINAL
 export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 export DSMR_BUS_AGENT=myproj
+export DSMR_BUS_SELECTOR=\"\"
 "
         (uiop:read-file-string (merge-pathnames ".envrc" root))
         "existing .envrc content must be preserved")))
@@ -234,10 +240,9 @@ and lives at root/.envrc (resolved through the write jail)."
 
 (define-test needs-setup-predicate
   "lisp-project-envrc-needs-setup-p is true for a *.asd dir whose existing
-.envrc lacks DSMR_BUS_AGENT (whether or not it has DSMR_SLYNK_ATTACH); false for
-a fully up-to-date .envrc (both markers present), no .envrc, no *.asd, or a nil
-root. Completion requires BOTH markers; a file with only one is still
-incomplete."
+.envrc leaves any marker variable undeclared; false for a fully up-to-date
+.envrc, no .envrc, no *.asd, or a nil root. Completion requires EVERY marker;
+a file carrying only some of them is still incomplete."
   (with-temp-project-root (s root)
     (setf (session-elicitation-p s) nil) ; s unused by the predicate; touch it.
     ;; No *.asd yet, no .envrc.
@@ -261,12 +266,21 @@ incomplete."
 ")
     (true (lisp-project-envrc-needs-setup-p root)
           "true when slynk is present but DSMR_BUS_AGENT is missing")
-    ;; A fully up-to-date .envrc (both markers) is never flagged.
+    ;; The stanza every repository in the fleet already carries: slynk and bus
+    ;; identity, no fleet selector. It used to be the settled shape; it is now
+    ;; incomplete, which is what carries the selector out to every repository.
     (write-fixture-file root ".envrc" "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 export DSMR_BUS_AGENT=myproj
 ")
+    (true (lisp-project-envrc-needs-setup-p root)
+          "true when the fleet selector is the only marker missing")
+    ;; A fully up-to-date .envrc (every marker) is never flagged.
+    (write-fixture-file root ".envrc" "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+export DSMR_BUS_AGENT=myproj
+export DSMR_BUS_SELECTOR=\"\"
+")
     (false (lisp-project-envrc-needs-setup-p root)
-           "false once the .envrc exports DSMR_BUS_AGENT")))
+           "false once the .envrc declares every marker variable")))
 
 (define-test update-appends-on-accept
   "A qualifying needs-setup root + thread-driven accept appends the dsmr-mcp
@@ -286,6 +300,8 @@ clobber)."
             "the user's original line is preserved")
       (true (search "DSMR_SLYNK_ATTACH" text)
             "the dsmr-mcp managed block was appended")
+      (true (search "DSMR_BUS_SELECTOR" text)
+            "the appended block carries the fleet selector")
       (true (session-envrc-prompted-p s) "prompted flag set after the update"))))
 
 (define-test update-decline-writes-nothing
@@ -317,7 +333,7 @@ append (no duplication)."
 
 (define-test slynk-complete-bus-missing-needs-setup
   "A *.asd dir whose .envrc exports DSMR_SLYNK_ATTACH but lacks DSMR_BUS_AGENT
-qualifies for the update offer; once DSMR_BUS_AGENT is present it does not."
+qualifies for the update offer; once every marker is present it does not."
   (with-temp-project-root (s root)
     (write-fixture-file root "foo.asd" "x")
     (write-fixture-file root ".envrc" "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
@@ -326,9 +342,10 @@ qualifies for the update offer; once DSMR_BUS_AGENT is present it does not."
           "slynk present, bus missing => needs setup")
     (write-fixture-file root ".envrc" "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 export DSMR_BUS_AGENT=foo
+export DSMR_BUS_SELECTOR=\"\"
 ")
     (false (lisp-project-envrc-needs-setup-p root)
-           "bus present => done")))
+           "every marker present => done")))
 
 (define-test bus-only-append-preserves-single-slynk
   "Accepting on a slynk-complete-but-bus-missing .envrc appends a bus stanza,
@@ -350,6 +367,11 @@ export DSMR_SLYNK_ATTACH=127.0.0.1:4005
       (is = 1 (%count-occurrences "DSMR_SLYNK_ATTACH" text)
           "exactly one DSMR_SLYNK_ATTACH after a bus-only append (no duplication)")
       (true (search "DSMR_BUS_AGENT" text) "the bus identity was added")
+      (is = 1 (%count-occurrences "export DSMR_BUS_SELECTOR=" text)
+          "exactly one DSMR_BUS_SELECTOR after the append (no duplication)")
+      (true (search "export DSMR_BUS_SELECTOR=\"${DSMR_BUS_SELECTOR:-}\"" text)
+            "the selector arrives with an empty default, so the repository is
+still on the shared host-wide bus")
       (true (session-envrc-prompted-p s) "prompted flag set after the update"))))
 
 (define-test slynk-only-append-preserves-single-bus
@@ -377,6 +399,8 @@ export DSMR_BUS_AGENT=myproj
             "the missing slynk attach setup was appended")
       (is = 1 (%count-occurrences "DSMR_BUS_AGENT" text)
           "exactly one DSMR_BUS_AGENT after a slynk-only append (no duplication)")
+      (is = 1 (%count-occurrences "export DSMR_BUS_SELECTOR=" text)
+          "exactly one DSMR_BUS_SELECTOR after the append (no duplication)")
       (true (session-envrc-prompted-p s) "prompted flag set after the update")
       ;; Completion reached: the trigger and handler now agree, so a fresh
       ;; predicate check on the rewritten file no longer asks to prompt.
@@ -384,24 +408,31 @@ export DSMR_BUS_AGENT=myproj
              "the appended file is complete (both markers) => no re-prompt"))))
 
 (define-test bus-present-is-noop
-  "A .envrc already carrying DSMR_BUS_AGENT is needs-setup false and a
-maybe-prompt-and-write call writes nothing (idempotent)."
+  "A .envrc carrying every marker variable is needs-setup false and a
+maybe-prompt-and-write call writes nothing (idempotent).
+
+The fixture gained DSMR_BUS_SELECTOR when the selector joined the marker set.
+Keeping this case rather than retiring it is the point: the no-op contract is
+the one the append path must never lose, and a fixture that stopped being
+complete would stop testing it."
   (with-temp-project-root (s root)
     (write-fixture-file root "foo.asd" "x")
     (write-fixture-file root ".envrc"
                         "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 export DSMR_BUS_AGENT=foo
+export DSMR_BUS_SELECTOR=\"\"
 ")
     (setf (session-elicitation-p s) t)
     (false (lisp-project-envrc-needs-setup-p root)
-           "a bus-present .envrc does not need setup")
+           "a fully-declared .envrc does not need setup")
     (false (maybe-prompt-and-write-envrc s (make-string-output-stream))
-           "no prompt and no write for a bus-present .envrc")
+           "no prompt and no write for a fully-declared .envrc")
     (is string= "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 export DSMR_BUS_AGENT=foo
+export DSMR_BUS_SELECTOR=\"\"
 "
         (uiop:read-file-string (merge-pathnames ".envrc" root))
-        "the bus-present .envrc is left unchanged")
+        "the fully-declared .envrc is left unchanged")
     (false (session-envrc-prompted-p s)
            "prompted flag stays nil when neither trigger state qualifies")))
 
@@ -420,17 +451,24 @@ which now also carries the bus line."
     (let ((text (uiop:read-file-string (merge-pathnames ".envrc" root))))
       (true (search "FOO=bar" text) "the user's original line is preserved")
       (true (search "DSMR_SLYNK_ATTACH" text) "the full block carries slynk")
-      (true (search "DSMR_BUS_AGENT" text) "the full block carries the bus line"))))
+      (true (search "DSMR_BUS_AGENT" text) "the full block carries the bus line")
+      (is = 1 (%count-occurrences "export DSMR_BUS_SELECTOR=" text)
+          "the full block carries the fleet selector exactly once"))))
 
 (define-test update-no-double-append
-  "An .envrc that already exports DSMR_BUS_AGENT yields a false predicate, no
-prompt fires, and the file is left unchanged (idempotent)."
+  "An .envrc that already declares every marker variable yields a false
+predicate, no prompt fires, and the file is left unchanged (idempotent).
+
+The fixture gained DSMR_BUS_SELECTOR when the selector joined the marker set;
+the contract is unchanged and is the reason the fixture was updated rather than
+the assertion flipped."
   (with-temp-project-root (s root)
     (write-fixture-file root "foo.asd" "x")
     (write-fixture-file root ".envrc"
                         "export FOO=bar
 export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 export DSMR_BUS_AGENT=myproj
+export DSMR_BUS_SELECTOR=\"\"
 ")
     (setf (session-elicitation-p s) t)
     (false (lisp-project-envrc-needs-setup-p root)
@@ -441,8 +479,81 @@ export DSMR_BUS_AGENT=myproj
     (is string= "export FOO=bar
 export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 export DSMR_BUS_AGENT=myproj
+export DSMR_BUS_SELECTOR=\"\"
 "
         (uiop:read-file-string (merge-pathnames ".envrc" root))
         "the up-to-date .envrc is left unchanged")
     (false (session-envrc-prompted-p s)
            "prompted flag stays nil when neither trigger state qualifies")))
+
+(defun %lines (text)
+  "Return TEXT's lines without their newlines, used to count how many lines an
+append added."
+  (uiop:split-string text :separator (list #\Newline)))
+
+(defparameter +stanza-without-selector+
+  "export FOO=bar
+
+# >>> dsmr-mcp (added automatically; edit or remove freely) >>>
+export LISP_WORKSPACE=\"${LISP_WORKSPACE:-$HOME/SourceCode/lisp/}\"
+export SLYNK_HOST=\"${SLYNK_HOST:-127.0.0.1}\"
+export SLYNK_PORT=\"${SLYNK_PORT:-4005}\"
+export DSMR_MODE=auto
+export DSMR_SLYNK_ATTACH=\"${SLYNK_HOST}:${SLYNK_PORT}\"
+export DSMR_LOG_LEVEL=info
+export DSMR_BUS_AGENT=\"${DSMR_BUS_AGENT:-myproj}\"
+# <<< dsmr-mcp <<<
+"
+  "The stanza every repository in the fleet is carrying right now: the managed
+region as it stood before the fleet selector existed, under one line of the
+operator's own. This is the shape the append has to get exactly right, because
+it is the shape that actually exists on disk in every repository.")
+
+(define-test old-stanza-gains-only-the-selector
+  "An .envrc carrying the full stanza as it stood before the fleet selector
+existed gains EXACTLY ONE line, that line declares the selector, every
+pre-existing line survives byte for byte and in order, and every managed
+variable still appears exactly once.
+
+This is the regression the old shape-selection cond would have failed: with the
+two historical markers both present and a third variable absent, it fell through
+to the branch that re-appends the whole block, duplicating the exports the file
+already carried. The byte-exact expectation below is the evidence that it does
+not, and the settled check at the end is the evidence that one accept ends the
+prompting rather than starting a loop."
+  (with-temp-project-root (s root)
+    (write-fixture-file root "foo.asd" "x")
+    (write-fixture-file root ".envrc" +stanza-without-selector+)
+    (setf (session-elicitation-p s) t)
+    (true (lisp-project-envrc-needs-setup-p root)
+          "the pre-selector stanza is incomplete, so the offer is made")
+    (true (%prompt-with-consent s "accept")
+          "accept should append the selector and return true")
+    (let ((text (uiop:read-file-string (merge-pathnames ".envrc" root))))
+      (is = (1+ (length (%lines +stanza-without-selector+)))
+          (length (%lines text))
+          "exactly one line was added")
+      (is string= "export FOO=bar
+
+# >>> dsmr-mcp (added automatically; edit or remove freely) >>>
+export LISP_WORKSPACE=\"${LISP_WORKSPACE:-$HOME/SourceCode/lisp/}\"
+export SLYNK_HOST=\"${SLYNK_HOST:-127.0.0.1}\"
+export SLYNK_PORT=\"${SLYNK_PORT:-4005}\"
+export DSMR_MODE=auto
+export DSMR_SLYNK_ATTACH=\"${SLYNK_HOST}:${SLYNK_PORT}\"
+export DSMR_LOG_LEVEL=info
+export DSMR_BUS_AGENT=\"${DSMR_BUS_AGENT:-myproj}\"
+export DSMR_BUS_SELECTOR=\"${DSMR_BUS_SELECTOR:-}\"
+# <<< dsmr-mcp <<<
+"
+          text
+          "the operator's line, the markers, and every existing declaration
+survive byte for byte, with the selector joining the region already there")
+      (dolist (name '("LISP_WORKSPACE" "SLYNK_HOST" "SLYNK_PORT" "DSMR_MODE"
+                      "DSMR_SLYNK_ATTACH" "DSMR_LOG_LEVEL" "DSMR_BUS_AGENT"))
+        (is = 1 (%count-occurrences (format nil "export ~A=" name) text)
+            (format nil "~A must still be declared exactly once" name)))
+      (is = 1 (%count-occurrences "export DSMR_BUS_SELECTOR=" text)
+          "the selector must be declared exactly once")
+      (false (lisp-project-envrc-needs-setup-p root)
+             "the appended file is settled, so no re-prompt follows"))))

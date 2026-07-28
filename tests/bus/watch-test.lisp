@@ -44,9 +44,15 @@
                 #:%poll-forward
                 #:%highest-foreign-seq
                 #:%resolve-self-id
+                #:%resolve-bus
                 #:%resolve-baseline
                 #:%cursor-path
+                ;; internal: the line --check-live prints. Extracted from the
+                ;; probe so the answer can be read as a value instead of being
+                ;; inferred from a process that exits as it speaks.
+                #:%liveness-line
                 #:opt-wal
+                #:opt-bus
                 #:opt-after
                 #:opt-agent
                 #:opt-namespace
@@ -62,6 +68,10 @@
   ;; MCP core (reader) share one implementation of the beat filename and format.
   ;; The pure liveness decision and its file-backed classifier both carry behavior
   ;; a caller depends on but cannot observe through main alone.
+  ;; The bus a watch arms on is derived and validated by the shared selector
+  ;; leaf; the refusal is what stops a bad name arming on the shared bus.
+  (:import-from #:dsmr-mcp/src/bus/selector
+                #:invalid-bus-name)
   (:import-from #:dsmr-mcp/src/bus/heartbeat
                 #:beat-path
                 #:write-beat
@@ -161,6 +171,23 @@
 (defmacro with-env-agent ((value) &body body)
   `(call-with-env-agent ,value (lambda () ,@body)))
 
+(defun call-with-env-selector (value thunk)
+  "Run THUNK with DSMR_BUS_SELECTOR set to VALUE (a NIL VALUE unsets it), then
+   put the inherited value back. Same reason as the agent-name fixture: a
+   developer running these in a direnv shell already exports a selector, and an
+   unbound test would resolve their fleet's bus instead of the fixture's."
+  (let ((previous (uiop:getenv "DSMR_BUS_SELECTOR")))
+    (flet ((apply-env (v)
+             (if v
+                 (sb-posix:setenv "DSMR_BUS_SELECTOR" v 1)
+                 (ignore-errors (sb-posix:unsetenv "DSMR_BUS_SELECTOR")))))
+      (unwind-protect
+           (progn (apply-env value) (funcall thunk))
+        (apply-env previous)))))
+
+(defmacro with-env-selector ((value) &body body)
+  `(call-with-env-selector ,value (lambda () ,@body)))
+
 (defmacro with-cursors-dir ((var) &body body)
   "Bind VAR to a fresh empty cursor directory and remove it afterwards. The
    random suffix is seeded per call: SBCL's default random state repeats across
@@ -190,6 +217,14 @@
    raw text with no envelope at all — a legacy message from an old-core
    publisher."
   (append-record path seq (if self-id (wrap-envelope "c1" self-id text) text))
+  seq)
+
+(defun append-addressed (path seq self-id to &optional (text "x"))
+  "Append record SEQ to PATH as published by SELF-ID and addressed to TO, using
+   the shared envelope leaf rather than a hand-built body. Building the wire
+   string here would let this file and the publisher disagree about the format
+   the watcher is supposed to be reading."
+  (append-record path seq (wrap-envelope "c1" self-id text :to to))
   seq)
 
 (define-test unknown-flag-warns-and-parsing-continues
@@ -246,6 +281,58 @@
         (false (opt-after opts)))))
   (true (opt-help-p (%parse-args (list "--help"))))
   (true (opt-help-p (%parse-args (list "-h")))))
+
+(define-test bus-flag-parses
+  ;; The flag exists so a generated arm line an operator reads says which bus it
+  ;; arms on. Absent, the record carries nothing and the default bus is meant.
+  (is equal "valis" (opt-bus (%parse-args (list "--bus" "valis"))))
+  (false (opt-bus (%parse-args '())))
+  ;; It sits beside the other identity flags and does not disturb them.
+  (let ((opts (%parse-args (list "--bus" "valis"
+                                 "--agent" "runciter"
+                                 "--namespace" "/p"))))
+    (is equal "valis" (opt-bus opts))
+    (is equal "runciter" (opt-agent opts))
+    (is equal "/p" (opt-namespace opts))))
+
+(define-test dangling-bus-flag-warns-and-resolves-nothing
+  ;; A dangling --bus degrades exactly as every other value-taking flag does:
+  ;; named on stderr, then ignored, leaving the watcher on the default bus
+  ;; rather than refusing to start.
+  (with-env-selector (nil)
+    (multiple-value-bind (opts err)
+        (capturing-stderr (%parse-args (list "--bus")))
+      (false (opt-bus opts))
+      (true (search "--bus" err))
+      (false (%resolve-bus opts)))))
+
+(define-test bus-resolves-from-flag-then-environment
+  ;; The same order the agent name resolves by, reading the same variable the
+  ;; .envrc stanza declares and the MCP session resolves its bus from, so the
+  ;; watcher and the session it serves cannot land on different buses.
+  (with-env-selector (nil)
+    (is equal "valis" (%resolve-bus (%parse-args (list "--bus" "valis"))))
+    (false (%resolve-bus (%parse-args '()))))
+  (with-env-selector ("fromenv")
+    (is equal "fromenv" (%resolve-bus (%parse-args '())))
+    (is equal "valis" (%resolve-bus (%parse-args (list "--bus" "valis")))))
+  ;; An empty environment value reads as absent, not as a bus called "".
+  (with-env-selector ("")
+    (false (%resolve-bus (%parse-args '())))))
+
+(define-test an-unusable-bus-name-is-refused-not-downgraded
+  ;; The one refusal in a binary that otherwise favours availability. Falling
+  ;; back to the shared bus here would arm a watch nobody is publishing to,
+  ;; which reports healthy and never fires.
+  (with-env-selector (nil)
+    (fail (%resolve-bus (%parse-args (list "--bus" "nope-not-a/name")))
+          'invalid-bus-name)
+    (fail (%resolve-bus (%parse-args (list "--bus" "cursors")))
+          'invalid-bus-name))
+  (with-env-selector ("nope-not-a/name")
+    (fail (%resolve-bus (%parse-args '())) 'invalid-bus-name)
+    ;; And an explicit good name still wins over a bad environment value.
+    (is equal "valis" (%resolve-bus (%parse-args (list "--bus" "valis"))))))
 
 (define-test identity-name-resolves-from-flag-then-environment
   ;; The same order the MCP session uses: explicit name, then DSMR_BUS_AGENT,
@@ -396,6 +483,77 @@
     (append-from w 1 (agent-id "/p" :name "me"))
     (is = 1 (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 5))))
 
+(define-test a-broadcast-still-fires-the-watch
+  ;; The default case, pinned explicitly now that the filter asks a second
+  ;; question: a record naming nobody is for everybody, and narrowing the filter
+  ;; must not have narrowed it to nothing.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them")))
+      (append-from w 1 them)
+      (is = 1 (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 5
+                                       :self-id me)))))
+
+(define-test mail-addressed-to-us-fires-the-watch
+  ;; The point of the whole feature at this end: a message that names this
+  ;; watcher's identity must wake it, exactly as a broadcast does.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them")))
+      (append-addressed w 1 them me)
+      (is = 1 (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 5
+                                       :self-id me)))))
+
+(define-test mail-for-somebody-else-does-not-fire-the-watch
+  ;; The reason the filter narrowed. Waking this agent for a message it will
+  ;; never be shown burns a context window and returns nothing, so the watch
+  ;; must sit through it and recycle on its own idle window instead.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them"))
+          (someone-else (agent-id "/p" :name "someone-else")))
+      (append-addressed w 1 them someone-else)
+      (false (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 0.05
+                                      :self-id me)
+             "other people's mail leaves the watch running to its recycle"))))
+
+(define-test a-broadcast-fires-past-mail-for-somebody-else
+  ;; Skipping someone else's mail must not skip what follows it, and the fired
+  ;; seq is the broadcast's own rather than the head of the log.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them"))
+          (someone-else (agent-id "/p" :name "someone-else")))
+      (append-addressed w 1 them someone-else)
+      (append-from w 2 them)
+      (append-addressed w 3 them someone-else)
+      (is = 2 (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 5
+                                       :self-id me)))))
+
+(define-test without-an-identity-mail-for-somebody-else-still-fires
+  ;; The no-identity branch is unchanged. With nothing resolved there is no self
+  ;; to recognise and no addressee to compare, so everything counts, which is
+  ;; the pre-identity behaviour and still the only safe reading: a watcher that
+  ;; cannot tell whose mail it is must not decide it is not ours.
+  (with-wal (w)
+    (let ((them (agent-id "/p" :name "them"))
+          (someone-else (agent-id "/p" :name "someone-else")))
+      (append-addressed w 1 them someone-else)
+      (is = 1 (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 5)))))
+
+(define-test mail-addressed-to-us-before-the-arm-fires-on-the-first-poll
+  ;; Level-triggered arming, over the narrowed filter. A message that landed
+  ;; between the agent's last drain and this arm sits above the cursor, and it
+  ;; must still be found on the first look rather than waiting for the next
+  ;; record to come along.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them")))
+      (append-from w 1 me)
+      (append-addressed w 2 them me)
+      (is = 2 (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 5
+                                       :self-id me)))))
+
 (define-test streaming-skips-our-own-and-still-steps-over-them
   ;; One signal per foreign seq, and the cursor clears the skipped records so
   ;; the next poll does not re-examine them.
@@ -415,6 +573,33 @@
           (setf cursor (poll-new w cursor #'collect me))
           (is = 4 cursor)
           (is equal '(4) (reverse seen)))))))
+
+(define-test streaming-skips-mail-for-somebody-else-and-still-steps-over-it
+  ;; The streaming step must ask the same question delivery asks. Emitting for
+  ;; a third party's mail wakes a sister to read a bus that then shows it
+  ;; nothing, and streaming is the mode a fleet actually arms. The cursor must
+  ;; clear the withheld record all the same, or a quiet stretch of other
+  ;; people's mail pins the log at the first one.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them"))
+          (someone-else (agent-id "/p" :name "someone-else"))
+          (seen '()))
+      (flet ((collect (s) (push s seen)))
+        (append-addressed w 1 them someone-else)
+        (append-from w 2 them)
+        (let ((cursor (poll-new w 0 #'collect me)))
+          (is = 2 cursor "the cursor clears the mail we were not shown")
+          (is equal '(2) (reverse seen)
+              "only the record we would be handed is emitted"))
+        (setf seen '())
+        ;; A step in which every record belongs to somebody else emits nothing
+        ;; and still advances, which is what keeps the log from pinning.
+        (append-addressed w 3 them someone-else)
+        (append-addressed w 4 them someone-else)
+        (let ((cursor (poll-new w 2 #'collect me)))
+          (is = 4 cursor "a step holding nothing for us still advances")
+          (is equal '() (reverse seen) "and emits nothing"))))))
 
 (define-test watch-stream-emits-only-foreign-seqs
   ;; The whole streaming loop, not just one step of it.
@@ -484,6 +669,54 @@
       (is equal
           (namestring (beat-path id dir))
           (namestring (beat-path id dir))))))
+
+(define-test every-liveness-answer-names-its-bus
+  ;; D-05. The field is on every answer, the default bus included: a field that
+  ;; appeared only for a named bus could not tell a watcher on the default bus
+  ;; apart from a binary too old to know buses have names.
+  (is equal "live pid=42 age_s=1 bus=valis" (%liveness-line :live 1 42 "valis"))
+  (is equal "live pid=42 age_s=1 bus=default" (%liveness-line :live 1 42 nil))
+  (is equal "stale pid=42 age_s=99 bus=valis" (%liveness-line :stale 99 42 "valis"))
+  (is equal "stale pid=42 age_s=99 bus=default" (%liveness-line :stale 99 42 nil))
+  (is equal "dead bus=valis" (%liveness-line :dead nil nil "valis"))
+  (is equal "dead bus=default" (%liveness-line :dead nil nil nil))
+  ;; An absent pid still renders as it always did; the bus field is appended,
+  ;; never substituted for anything an agent already parses.
+  (is equal "live pid=? age_s=1 bus=default" (%liveness-line :live 1 nil nil))
+  ;; No line carries a newline: the probe owns the printing.
+  (false (find #\Newline (%liveness-line :live 1 42 "valis"))))
+
+(define-test the-unresolved-identity-answer-has-no-bus-to-name
+  ;; The `unknown` line is deliberately not this function's business. No bus is
+  ;; worth naming beside an identity that did not resolve: it would read as a
+  ;; probe that found something. The probe prints that line itself, unchanged.
+  (fail (%liveness-line :unknown nil nil "valis")))
+
+(define-test a-named-bus-keeps-its-own-watcher-paths
+  ;; D-19. One --check-live per joined bus only means something if the beat
+  ;; files differ, and they differ because every path the watcher derives hangs
+  ;; off the bus root. Two watchers for one identity on two buses can then not
+  ;; overwrite each other's beat, or read each other's cursor.
+  (let ((id (agent-id "/p" :name "runciter")))
+    (isnt equal
+          (beat-path id (default-watch-dir))
+          (beat-path id (default-watch-dir "valis")))
+    (isnt equal
+          (beat-path id (default-watch-dir "valis"))
+          (beat-path id (default-watch-dir "fulcrum")))
+    (isnt equal (default-wal-path) (default-wal-path "valis"))
+    (isnt equal (default-cursors-dir) (default-cursors-dir "valis"))
+    ;; The named paths are the unnamed root plus one segment; the unnamed ones
+    ;; carry no segment at all.
+    (true (search "/valis/" (namestring (default-watch-dir "valis"))))
+    (false (search "/valis/" (namestring (default-watch-dir))))
+    ;; And nothing changes for a watcher with no bus: an absent name and an
+    ;; explicit NIL both land on the paths the binary has always used.
+    (is equal (namestring (default-wal-path)) (namestring (default-wal-path nil)))
+    (is equal (namestring (default-cursors-dir))
+        (namestring (default-cursors-dir nil)))
+    (is equal (namestring (beat-path id (default-watch-dir)))
+        (namestring (beat-path id (default-watch-dir nil))))))
 
 (defun write-generation (path n &key (ts-base 1000) (body "xxxxxxxx"))
   "Empty PATH and write a fresh log of N contiguous records with deterministic

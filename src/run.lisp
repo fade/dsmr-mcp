@@ -39,6 +39,8 @@
   (:import-from #:sb-ext)
   (:import-from #:dsmr-mcp/src/bus-listener
                 #:start-bus-listener #:stop-bus-listener)
+  (:import-from #:dsmr-mcp/src/tools/bus-helpers
+                #:session-bus)
   ;; process-json-line is re-exported from here so src/main.lisp's
   ;; existing :import-from dsmr-mcp/src/run #:process-json-line
   ;; continues to resolve. The canonical definition lives in
@@ -337,15 +339,23 @@ as absent, the same convention the other DSMR_* env reads use."
 The listener needs two things to be a restart target: a non-nil project root
 (its namespace) and a non-empty DSMR_BUS_AGENT (the name a peer addresses). An
 unnamed server cannot be the target of a restart command, so the listener is not
-started for one. The start is best-effort — a bus failure at startup must never
-prevent the server from serving — and stop-bus-listener is registered as an exit
-hook so the listener is released on a process exit. The listener survives a
-rung-1 reset: reset-local-backends never references the listener thread or its
-agent, so a local reset leaves the cross-session command path intact."
+started for one. It listens on the bus this session resolved, so a server and its
+own tools are members of the same bus and a restart command cannot arrive from
+one the server never joined.
+
+The start is best-effort: a bus failure at startup must never prevent the
+server from serving, and that covers an unusable DSMR_BUS_SELECTOR as much as an
+unreachable broker, so the bus is resolved inside the guard. Nothing silently
+falls back to the shared bus: the listener simply does not start, and the server
+serves. stop-bus-listener is registered as an exit hook so the listener is
+released on a process exit. The listener survives a rung-1 reset:
+reset-local-backends never references the listener thread or its agent, so a
+local reset leaves the cross-session command path intact."
   (let ((own-name (%env-bus-agent)))
     (when (and resolved-root own-name)
       (ignore-errors
-       (start-bus-listener (namestring resolved-root) own-name :session session)
+       (start-bus-listener (namestring resolved-root) own-name
+                           :session session :bus (session-bus))
        (pushnew 'stop-bus-listener sb-ext:*exit-hooks*)))))
 
 (defun run (&key (transport nil transport-supplied-p)

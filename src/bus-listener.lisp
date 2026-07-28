@@ -12,7 +12,9 @@
 ;;;;
 ;;;; The listener connects an EPHEMERAL receiving agent (no stable name) so it
 ;;;; never steals the main agent's durable cursor, and polls the bus on a short
-;;;; timeout. Each message is parsed and validated by the pure core
+;;;; timeout. It listens on the bus its session resolved rather than
+;;;; unconditionally on the host's unnamed one, so a server belonging to a fleet
+;;;; takes commands from that fleet's bus and from nowhere else. Each message is parsed and validated by the pure core
 ;;;; %handle-restart-message: it acts only on a command whose namespace equals
 ;;;; this server's own namespace (the cross-namespace block) AND whose target
 ;;;; equals this server's own bus name. Validation is keyed on the resolved
@@ -120,16 +122,23 @@ survive every message."
 A plain global the stopping thread mutates — not a per-thread dynamic binding —
 so stop-bus-listener in one thread is seen by the listener in another.")
 
-(defun start-bus-listener (namespace own-name &key (poll-ms 2000) session)
+(defun start-bus-listener (namespace own-name &key (poll-ms 2000) session bus)
   "Spawn the background bus listener and return its thread.
 
 NAMESPACE is this server's project-root namespace and OWN-NAME its addressable
-bus name (the resolved DSMR_BUS_AGENT). The listener connects an EPHEMERAL agent
-in NAMESPACE — no stable name, so it never resumes (or steals) the main agent's
-durable cursor — and polls every POLL-MS for restart commands. Each message is
-validated against NAMESPACE and OWN-NAME, not against the ephemeral agent's own
-id, then dispatched: rung 1 runs a local reset of SESSION's backends, rung 3
-exits the process through the shared restart sentinel.
+bus name (the resolved DSMR_BUS_AGENT). BUS names which bus to listen on, NIL
+meaning the host's unnamed one. The listener is per bus, so a server running on
+a named bus takes its restart commands from that bus and not from the shared
+one: a command published where the server is not a member reaches nobody, which
+is the point of running a fleet on a bus of its own.
+
+The listener connects an EPHEMERAL agent in NAMESPACE, with no stable name, so
+it never resumes (or steals) the main agent's durable cursor. It polls every
+POLL-MS for restart commands. Each message is validated against NAMESPACE and
+OWN-NAME, not against the ephemeral agent's own id, then dispatched: rung 1 runs
+a local reset of SESSION's backends, rung 3 exits the process through the shared
+restart sentinel. The cross-namespace refusal is unchanged and still applies
+within a bus.
 
 SESSION, when supplied, is the live transport session whose attached connection
 the reset can drop; absent it the reset still kills hermetic workers and clears
@@ -137,13 +146,14 @@ the breaker and orphan registries. The dispatch runs in the loop body, never
 under a lock (the exit primitive runs exit hooks that take *pool-lock*). The loop
 body is wrapped so no single message kills the thread."
   (setf *listener-stop* nil)
-  (let ((agent (connect-agent namespace)))
+  (let ((agent (connect-agent namespace :bus bus)))
     (setf *listener-agent* agent)
     (setf *listener-thread*
           (bt:make-thread
            (lambda ()
              (log-event :info "bus-listener.start"
-                        "namespace" namespace "name" own-name)
+                        "namespace" namespace "name" own-name
+                        "bus" (or bus "default"))
              (unwind-protect
                   (loop until *listener-stop* do
                     (handler-case

@@ -18,6 +18,7 @@
                     (#:bus #:dsmr-mcp/src/bus/bus)
                     (#:agent #:dsmr-mcp/src/bus/agent)
                     (#:heartbeat #:dsmr-mcp/src/bus/heartbeat)
+                    (#:selector #:dsmr-mcp/src/bus/selector)
                     (#:wal #:dsmr-mcp/src/bus/wal)))
 
 (in-package #:dsmr-mcp/tests/bus/agent-test)
@@ -292,6 +293,147 @@
                    "and it is actually delivered"))
           (agent:disconnect-agent me))))))
 
+(defun call-with-direct-addressing (enabled thunk)
+  "Run THUNK with direct addressing definitively on or off, whatever the ambient
+   shell says. The capability reads a special variable and an environment
+   variable, so a test that set only the first would still answer differently in
+   a developer's direnv shell from in an empty CI environment. The inherited
+   value is put back afterwards."
+  (let ((previous (uiop:getenv "DSMR_BUS_DIRECT_ADDRESSING"))
+        (agent:*direct-addressing-enabled* enabled))
+    (unwind-protect
+         (progn (ignore-errors (sb-posix:unsetenv "DSMR_BUS_DIRECT_ADDRESSING"))
+                (funcall thunk))
+      (if previous
+          (sb-posix:setenv "DSMR_BUS_DIRECT_ADDRESSING" previous 1)
+          (ignore-errors (sb-posix:unsetenv "DSMR_BUS_DIRECT_ADDRESSING"))))))
+
+(define-test addressing-hands-a-message-to-the-participant-it-names
+  "A message that names a recipient reaches that recipient and nobody else, with
+   the author that sent it attached. The capability is switched on explicitly
+   here: it is off in every shipped configuration and no assertion in this suite
+   leans on the default behaving otherwise."
+  (with-bus (paths)
+    (with-running-broker (br paths)
+      (let ((sender (agent:connect-agent "/proj" :name "sender"
+                                                 :paths paths :ensure-broker nil))
+            (named (agent:connect-agent "/proj" :name "named"
+                                                :paths paths :ensure-broker nil))
+            (bystander (agent:connect-agent "/proj" :name "bystander"
+                                                    :paths paths :ensure-broker nil)))
+        (unwind-protect
+             (call-with-direct-addressing t
+               (lambda ()
+                 (agent:agent-publish sender "for you alone"
+                                      :to (agent:agent-id named))
+                 (let ((mail (agent:agent-receive-detailed named :timeout-ms 3000)))
+                   (is = 1 (length mail))
+                   (is string= "for you alone" (agent:delivery-text (first mail)))
+                   (is string= "sender" (agent:delivery-author (first mail))
+                       "the recipient can see who addressed it"))
+                 (is = 0 (length (agent:agent-receive bystander :timeout-ms 1000))
+                     "a participant the message does not name is shown nothing")
+                 (is = 0 (length (agent:agent-receive sender :timeout-ms 500))
+                     "and the sender does not take delivery of its own message")))
+          (agent:disconnect-agent sender)
+          (agent:disconnect-agent named)
+          (agent:disconnect-agent bystander))))))
+
+(define-test a-bystander-cursor-advances-past-mail-for-somebody-else
+  "The invariant addressing must never break. A participant that is not the
+   recipient is shown nothing, and its cursor still moves past the record:
+   after the receive nothing at all remains above it, and the next broadcast
+   arrives normally. A reader that stopped at other people's mail would pin the
+   write-ahead log, once per participant."
+  (with-bus (paths)
+    (with-running-broker (br paths)
+      (let ((sender (agent:connect-agent "/proj" :name "sender"
+                                                 :paths paths :ensure-broker nil))
+            (named (agent:connect-agent "/proj" :name "named"
+                                                :paths paths :ensure-broker nil))
+            (bystander (agent:connect-agent "/proj" :name "bystander"
+                                                    :paths paths :ensure-broker nil)))
+        (unwind-protect
+             (call-with-direct-addressing t
+               (lambda ()
+                 (agent:agent-publish sender "not for you"
+                                      :to (agent:agent-id named))
+                 (loop repeat 200
+                       until (= 1 (wal:scan (broker:bus-paths-wal paths)))
+                       do (sleep 0.02))
+                 (is = 0 (length (agent:agent-receive bystander :timeout-ms 1000))
+                     "nothing is handed to a participant the message does not name")
+                 (is = 0 (bus:poll-count (agent::agent-subscriber bystander))
+                     "and the raw count is zero: the cursor moved past the record")
+                 (agent:agent-publish sender "everyone")
+                 (is equal '("everyone")
+                     (agent:agent-receive bystander :timeout-ms 3000)
+                     "so a later broadcast is delivered normally")))
+          (agent:disconnect-agent sender)
+          (agent:disconnect-agent named)
+          (agent:disconnect-agent bystander))))))
+
+(define-test pending-count-leaves-out-mail-addressed-to-somebody-else
+  "The count a status reports and the batch a receive hands back stay one
+   verdict once addressing exists. Mail for another participant is in neither,
+   while the raw position delta still counts it, which is what shows the record
+   was passed over rather than held back."
+  (with-bus (paths)
+    (with-running-broker (br paths)
+      (let ((sender (agent:connect-agent "/proj" :name "sender"
+                                                 :paths paths :ensure-broker nil))
+            (named (agent:connect-agent "/proj" :name "named"
+                                                :paths paths :ensure-broker nil))
+            (bystander (agent:connect-agent "/proj" :name "bystander"
+                                                    :paths paths :ensure-broker nil)))
+        (unwind-protect
+             (call-with-direct-addressing t
+               (lambda ()
+                 (agent:agent-publish sender "for the named one"
+                                      :to (agent:agent-id named))
+                 (agent:agent-publish sender "for everyone")
+                 (loop repeat 200
+                       until (= 2 (wal:scan (broker:bus-paths-wal paths)))
+                       do (sleep 0.02))
+                 (is = 1 (getf (agent:agent-status bystander) :pending)
+                     "only the broadcast is promised to the bystander")
+                 (is = 2 (bus:poll-count (agent::agent-subscriber bystander))
+                     "though both records sit above its cursor")
+                 (is equal '("for everyone")
+                     (agent:agent-receive bystander :timeout-ms 3000)
+                     "and the batch is exactly what the count promised")
+                 (is = 0 (getf (agent:agent-status bystander) :pending))))
+          (agent:disconnect-agent sender)
+          (agent:disconnect-agent named)
+          (agent:disconnect-agent bystander))))))
+
+(define-test an-addressed-publish-is-refused-while-the-capability-is-off
+  "In the configuration everything ships in, naming a recipient is refused and
+   nothing reaches the log. The refusal is the point: quietly broadcasting
+   instead would put a message its sender believed had one reader in front of
+   the whole fleet, with nothing to tell the sender it had happened. A publish
+   that names nobody is untouched by the switch."
+  (with-bus (paths)
+    (with-running-broker (br paths)
+      (let ((sender (agent:connect-agent "/proj" :name "sender"
+                                                 :paths paths :ensure-broker nil))
+            (other (agent:connect-agent "/proj" :name "other"
+                                                :paths paths :ensure-broker nil)))
+        (unwind-protect
+             (call-with-direct-addressing nil
+               (lambda ()
+                 (fail (agent:agent-publish sender "psst"
+                                            :to (agent:agent-id other))
+                       agent:direct-addressing-disabled)
+                 (is = 0 (wal:scan (broker:bus-paths-wal paths))
+                     "the refused message never reached the log")
+                 (agent:agent-publish sender "everyone")
+                 (is equal '("everyone")
+                     (agent:agent-receive other :timeout-ms 3000)
+                     "a publish that names nobody is unaffected by the switch")))
+          (agent:disconnect-agent sender)
+          (agent:disconnect-agent other))))))
+
 ;;; watcher liveness surfaced through status -----------------------------------
 
 (defun call-with-xdg-state (dir thunk)
@@ -345,3 +487,98 @@
                                 "an absent beat reads as no watcher")))
                      (agent:disconnect-agent me)))))
           (ignore-errors (uiop:delete-directory-tree state-root :validate t)))))))
+
+(define-test status-reads-the-watcher-beat-from-the-bus-the-agent-joined
+  "A watch armed on a named bus writes its beat under that bus's watch directory,
+   so that is where the status read has to look. Reading the host's unnamed watch
+   directory instead reports a demonstrably live watch as dead, and does it while
+   the pending count and broker state beside it stay correct, which reads as a
+   broken watch rather than a misread path.
+
+   The second half is the half that matters: a beat under the SHARED watch
+   directory, keyed on this same agent's id, must not make a participant on a
+   named bus look watched. Without it the assertion passes on code that ignores
+   the bus entirely. The temp XDG root's suffix is seeded per call so a leftover
+   tree from an earlier image cannot turn a `dead` assertion into a flake."
+  (let ((state-root (ensure-directories-exist
+                     (merge-pathnames
+                      (format nil "dsmr-agent-bus-watch-~D-~D/"
+                              (sb-posix:getpid)
+                              (random 100000000 (make-random-state t)))
+                      (uiop:temporary-directory)))))
+    (unwind-protect
+         (call-with-xdg-state state-root
+           (lambda ()
+             (let ((me (agent:connect-agent "/proj" :name "watched" :bus "alpha"
+                                                    :ensure-broker nil)))
+               (unwind-protect
+                    (let ((named (heartbeat:beat-path
+                                  (agent:agent-id me)
+                                  (heartbeat:default-watch-dir "alpha")))
+                          (shared (heartbeat:beat-path
+                                   (agent:agent-id me)
+                                   (heartbeat:default-watch-dir))))
+                      (isnt equal (namestring named) (namestring shared)
+                            "the two buses keep separate watch directories")
+                      ;; A beat on the unnamed bus says nothing about this agent.
+                      (heartbeat:write-beat shared :mode :event :baseline 0
+                                                   :poll-ms 250)
+                      (let ((st (agent:agent-status me)))
+                        (is eq nil (getf st :live-watcher)
+                            "a beat on the shared bus is not this agent's watch")
+                        (is string= "dead" (getf st :watcher-status)))
+                      ;; The beat its own watch writes is the one that counts.
+                      (heartbeat:write-beat named :mode :event :baseline 0
+                                                  :poll-ms 250)
+                      (let ((st (agent:agent-status me)))
+                        (is eq t (getf st :live-watcher)
+                            "the beat under the joined bus reports live")
+                        (is string= "live" (getf st :watcher-status))
+                        (true (integerp (getf st :watcher-age-seconds))))
+                      (heartbeat:remove-beat named)
+                      (is eq nil (getf (agent:agent-status me) :live-watcher)
+                          "removing the joined bus's beat reads as no watcher"))
+                 (agent:disconnect-agent me)))))
+      (ignore-errors (uiop:delete-directory-tree state-root :validate t)))))
+
+(define-test connect-agent-records-the-bus-it-joined
+  "A participant knows which bus it is on, and the handle is where every surface
+   downstream reads it from rather than assuming there is only one bus. With no
+   :bus the paths are exactly the ones this has always derived; with a name they
+   sit under that name's own root, with a write-ahead log of their own. The temp
+   XDG root's suffix is seeded per call so a leftover tree from an earlier image
+   cannot turn an assertion about a fresh root into a flake."
+  (let ((state-root (ensure-directories-exist
+                     (merge-pathnames
+                      (format nil "dsmr-agent-named-bus-~D-~D/"
+                              (sb-posix:getpid)
+                              (random 100000000 (make-random-state t)))
+                      (uiop:temporary-directory)))))
+    (unwind-protect
+         (call-with-xdg-state state-root
+           (lambda ()
+             (let ((here (agent:connect-agent "/proj" :name "here"
+                                                      :ensure-broker nil))
+                   (there (agent:connect-agent "/proj" :name "there" :bus "alpha"
+                                                       :ensure-broker nil)))
+               (unwind-protect
+                    (progn
+                      (is eq nil (agent:agent-bus here)
+                          "no :bus means the host's unnamed bus")
+                      (is string= "alpha" (agent:agent-bus there))
+                      (is string= (namestring (selector:bus-root nil))
+                          (namestring (broker:bus-paths-root
+                                       (agent:agent-paths here)))
+                          "the unnamed participant keeps today's root")
+                      (is string= (namestring (selector:bus-root "alpha"))
+                          (namestring (broker:bus-paths-root
+                                       (agent:agent-paths there)))
+                          "the named participant sits under its own root")
+                      (false (equal (broker:bus-paths-wal
+                                     (agent:agent-paths here))
+                                    (broker:bus-paths-wal
+                                     (agent:agent-paths there)))
+                             "the two buses keep separate write-ahead logs"))
+                 (agent:disconnect-agent here)
+                 (agent:disconnect-agent there)))))
+      (ignore-errors (uiop:delete-directory-tree state-root :validate t)))))
