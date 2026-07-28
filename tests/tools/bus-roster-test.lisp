@@ -175,6 +175,16 @@
    way the bus builds it."
   (format nil "~A/~A" (%own-namespace session) name))
 
+(defun %hand-typed (session name)
+  "The full bus id for NAME as an operator writes it: one separator at the join.
+
+   A leader listing a sister that lives in another repository cannot pass a bare
+   name, because a bare name is qualified with the calling session's own project
+   and would reach the wrong one. So it types the full id, and it types one
+   separator. The bus builds every id with two, because the namespace is a
+   project root in its directory form and already ends in one."
+  (concatenate 'string (%own-namespace session) name))
+
 (defmacro with-participant ((var namespace &rest connect-args) &body body)
   "Bind VAR to a participant connected under NAMESPACE and disconnect it on the
    way out."
@@ -278,6 +288,46 @@ an unlisted agent is exactly the one nobody is watching."
         (true (integerp (%field payload "departed_at")))
         (is string= "departed" (gethash "status" (%field payload "member")))))))
 
+(define-test an-agent-listed-by-hand-departs-when-it-leaves-under-its-own-id
+  "The case measured live, driven through the verbs. A leader lists a sister by
+   typing its full id, which carries one separator at the join. That sister later
+   leaves, and leaving can only ever depart the identity its own session
+   resolves, which carries two.
+
+   One agent, one line on the roster, and it is departed. Treated as two, the
+   typed line would be stranded as enrolled with nothing able to reach it, and
+   the listing would show one sister in both states at once."
+  (with-isolated-bus ()
+    (with-rooted-session (session)
+      (%roster session "action" "enroll" "agent" (%hand-typed session "sister"))
+      (let ((payload (%leave session "agent_id" "sister")))
+        (is eq t (%field payload "left")))
+      (let ((listing (%roster session "action" "list")))
+        (is = 1 (%field listing "count")
+            "the typed listing and the agent's own departure are one entry")
+        (let ((entry (%member-named listing (%qualified session "sister"))))
+          (true entry "listed under the id the agent resolves for itself")
+          (is string= "departed" (gethash "status" entry))
+          (true (integerp (gethash "departed_at" entry))))))))
+
+(define-test disenrolling-by-hand-departs-the-entry-the-agent-was-listed-under
+  "The same collision the other way about: the sister was listed under the id its
+   session resolves, and an operator departs it by typing one separator. Still
+   one entry, and it is the one that was there."
+  (with-isolated-bus ()
+    (with-rooted-session (session)
+      (%roster session "action" "enroll" "agent" "sister")
+      (let ((payload (%roster session "action" "disenroll"
+                              "agent" (%hand-typed session "sister"))))
+        (true (integerp (%field payload "departed_at")))
+        (is string= "departed" (gethash "status" (%field payload "member"))))
+      (let ((listing (%roster session "action" "list")))
+        (is = 1 (%field listing "count") "no second entry was written")
+        (is string= "departed"
+            (gethash "status"
+                     (%member-named listing (%qualified session "sister")))
+            "and the entry that was listed is the one that departed")))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; The gate
 ;;; ---------------------------------------------------------------------------
@@ -356,6 +406,22 @@ declared leader gains no ability an ordinary member lacks."
         (is = 1 (%field listing "count") "and no entry was added or removed")
         (is string= "enrolled" (gethash "status" entry)
             "the declared leader's status is untouched")))))
+
+(define-test a-leader-declared-by-hand-and-again-by-name-is-one-leader
+  "Declaring the same agent by typed id and by bare name records one leader,
+   spelled the way its entry is spelled. Two spellings would leave a listing
+   naming a leader that matches none of the entries printed under it."
+  (with-isolated-bus ()
+    (with-rooted-session (session)
+      (%roster session "action" "enroll" "agent" "valis")
+      (%roster session "action" "declare-leader"
+               "agent" (%hand-typed session "valis"))
+      (%roster session "action" "declare-leader" "agent" "valis")
+      (let ((listing (%roster session "action" "list")))
+        (is string= (%qualified session "valis") (%field listing "leader"))
+        (is = 1 (%field listing "count") "and no entry was added")
+        (true (%member-named listing (%field listing "leader"))
+              "the declared leader matches a listed entry")))))
 
 (define-test two-buses-keep-separate-leaders-and-separate-gates
   "Each bus carries its own roster, its own gate and its own leader, which is the
