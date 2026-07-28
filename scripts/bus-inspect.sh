@@ -4,10 +4,10 @@
 # scripts/bus-inspect.sh - read the on-disk state of a coordination bus.
 #
 # Every question this answers can be answered by hand, and answering them by hand
-# is how the roster's duplicate-id defect was created: an agent id has to be
-# composed from a namespace that already ends in a separator, so the correct form
-# carries a doubled slash and looks like a typo. This composes it for you and
-# decodes the percent-encoded filenames rather than asking you to read them.
+# is how the roster's duplicate-id defect was created: a namespace already ends in
+# a separator, so composing an id by hand tended to leave two. One separator is
+# the correct form. This composes it for you and decodes the percent-encoded
+# filenames rather than asking you to read them.
 #
 # Read-only. It never writes, publishes, enrolls or deletes.
 set -u
@@ -85,8 +85,8 @@ inspect() {
       status="$(grep -aoE ':ENROLLED|:DEPARTED' "$f" | head -1)"
       printf '  %-9s %s\n' "${status:-:UNKNOWN}" "$id"
       case "$id" in
-        *//*) : ;;
-        *) echo "           ^ SINGLE separator: hand-entered, cannot match this agent's own id" ;;
+        *//*) echo "           ^ DOUBLED separator: predates the id fix, cannot match this agent's own id" ;;
+        *) : ;;
       esac
     done
     [ "$n" -eq 0 ] && echo "  (empty)"
