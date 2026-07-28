@@ -24,7 +24,8 @@
 ;;;; the ZeroMQ transport in here would break the watcher, which deliberately
 ;;;; links no libzmq.
 
-(require :sb-posix)
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-posix))
 
 (defpackage #:dsmr-mcp/src/bus/heartbeat
   (:use #:cl)

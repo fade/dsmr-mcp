@@ -258,14 +258,24 @@
 
 (defun poll-new (wal-path cursor &optional emit self-id
                                            (reader (wal:make-reader)))
-  "One streaming step: call EMIT (when supplied) once per FOREIGN record with
-   seq in (CURSOR, last-committed], and return (values new-cursor restarted-p).
+  "One streaming step: call EMIT (when supplied) once per record with seq in
+   (CURSOR, last-committed] that this agent would actually be handed, and return
+   (values new-cursor restarted-p).
+
+   The filter asks the SAME question delivery asks, which is two questions
+   rather than one: the record must not be this agent's own publish, and it must
+   not be mail naming somebody else. Streaming is the mode a fleet actually
+   arms, so a watch that emitted for another agent's mail woke a sister to read
+   a bus that then showed it nothing, and a spurious wake costs a whole context
+   window.
 
    The returned cursor is the highest committed seq regardless of who published
-   what, so records skipped as this agent's own are still stepped over and never
-   examined twice. With SELF-ID NIL nothing is filtered and every new seq is
-   emitted. Pure and side-effect-free apart from EMIT — the unit tests drive it
-   directly with a collecting callback.
+   what, so a record withheld under either condition is still stepped over and
+   never examined twice. Withholding an emit must never hold the cursor back, or
+   the log pins at the first record this agent is not shown. With SELF-ID NIL
+   nothing is filtered and every new seq is emitted. Pure and side-effect-free
+   apart from EMIT, so the unit tests drive it directly with a collecting
+   callback.
 
    READER is the caller's position in the log; supplying one and keeping it
    across calls is what makes a quiet poll cost the tail rather than the whole
@@ -289,7 +299,7 @@
         (%poll-forward wal-path reader cursor)
       (when emit
         (dolist (record records)
-          (when (or (null own) (envelope:foreign-record-p record own))
+          (when (or (null own) (envelope:deliverable-record-p record own))
             (funcall emit (record-seq record)))))
       (values (if restarted last (max last cursor))
               restarted))))

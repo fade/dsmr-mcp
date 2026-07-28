@@ -223,8 +223,8 @@
                 out))))))
 
 (defun agent-receive (agent &key (timeout-ms 0) (limit bus:+default-batch-size+))
-  "Receive messages addressed to the whole bus that this agent has not yet seen,
-   advancing its cursor. With TIMEOUT-MS 0 this is a non-blocking catch-up; with a
+  "Receive messages addressed to the whole bus, or to this agent by name, that it
+   has not yet seen, advancing its cursor. With TIMEOUT-MS 0 this is a non-blocking catch-up; with a
    positive timeout it waits up to that long for the first message. Returns a list
    of message strings (most recent last), empty if none. The delivery cursor
    advances over EVERY pending record (including this agent's own), but records

@@ -574,6 +574,33 @@
           (is = 4 cursor)
           (is equal '(4) (reverse seen)))))))
 
+(define-test streaming-skips-mail-for-somebody-else-and-still-steps-over-it
+  ;; The streaming step must ask the same question delivery asks. Emitting for
+  ;; a third party's mail wakes a sister to read a bus that then shows it
+  ;; nothing, and streaming is the mode a fleet actually arms. The cursor must
+  ;; clear the withheld record all the same, or a quiet stretch of other
+  ;; people's mail pins the log at the first one.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them"))
+          (someone-else (agent-id "/p" :name "someone-else"))
+          (seen '()))
+      (flet ((collect (s) (push s seen)))
+        (append-addressed w 1 them someone-else)
+        (append-from w 2 them)
+        (let ((cursor (poll-new w 0 #'collect me)))
+          (is = 2 cursor "the cursor clears the mail we were not shown")
+          (is equal '(2) (reverse seen)
+              "only the record we would be handed is emitted"))
+        (setf seen '())
+        ;; A step in which every record belongs to somebody else emits nothing
+        ;; and still advances, which is what keeps the log from pinning.
+        (append-addressed w 3 them someone-else)
+        (append-addressed w 4 them someone-else)
+        (let ((cursor (poll-new w 2 #'collect me)))
+          (is = 4 cursor "a step holding nothing for us still advances")
+          (is equal '() (reverse seen) "and emits nothing"))))))
+
 (define-test watch-stream-emits-only-foreign-seqs
   ;; The whole streaming loop, not just one step of it.
   (with-wal (w)
