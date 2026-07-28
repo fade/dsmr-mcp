@@ -274,11 +274,18 @@
    agent's identity: LIVE-WATCHER is true only when that beat is fresh, and
    WATCHER-STATUS / WATCHER-AGE-SECONDS carry the detail (a dead or absent watch
    reports \"dead\" with a NIL age). The freshness window is the shared default, so
-   this read and the watcher's own --check-live agree on what `live` means."
+   this read and the watcher's own --check-live agree on what `live` means.
+
+   The beat is read under the bus this agent joined, which is where a watch armed
+   with the same --bus writes it. Reading the host's unnamed watch directory
+   instead reports every watch on a named bus as dead, while the pending count and
+   broker state beside it stay correct, so the disagreement looks like a broken
+   watch rather than a misread path."
   (let ((own (bus:encode-id (agent-id agent))))
     (multiple-value-bind (wstatus wage)
         (heartbeat:beat-liveness
-         (heartbeat:beat-path (agent-id agent) (heartbeat:default-watch-dir))
+         (heartbeat:beat-path (agent-id agent)
+                              (heartbeat:default-watch-dir (agent-bus agent)))
          heartbeat:+default-live-window-seconds+)
       (list :id (agent-id agent)
             :name (agent-name agent)

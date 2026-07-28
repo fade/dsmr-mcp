@@ -488,6 +488,59 @@
                      (agent:disconnect-agent me)))))
           (ignore-errors (uiop:delete-directory-tree state-root :validate t)))))))
 
+(define-test status-reads-the-watcher-beat-from-the-bus-the-agent-joined
+  "A watch armed on a named bus writes its beat under that bus's watch directory,
+   so that is where the status read has to look. Reading the host's unnamed watch
+   directory instead reports a demonstrably live watch as dead, and does it while
+   the pending count and broker state beside it stay correct, which reads as a
+   broken watch rather than a misread path.
+
+   The second half is the half that matters: a beat under the SHARED watch
+   directory, keyed on this same agent's id, must not make a participant on a
+   named bus look watched. Without it the assertion passes on code that ignores
+   the bus entirely. The temp XDG root's suffix is seeded per call so a leftover
+   tree from an earlier image cannot turn a `dead` assertion into a flake."
+  (let ((state-root (ensure-directories-exist
+                     (merge-pathnames
+                      (format nil "dsmr-agent-bus-watch-~D-~D/"
+                              (sb-posix:getpid)
+                              (random 100000000 (make-random-state t)))
+                      (uiop:temporary-directory)))))
+    (unwind-protect
+         (call-with-xdg-state state-root
+           (lambda ()
+             (let ((me (agent:connect-agent "/proj" :name "watched" :bus "alpha"
+                                                    :ensure-broker nil)))
+               (unwind-protect
+                    (let ((named (heartbeat:beat-path
+                                  (agent:agent-id me)
+                                  (heartbeat:default-watch-dir "alpha")))
+                          (shared (heartbeat:beat-path
+                                   (agent:agent-id me)
+                                   (heartbeat:default-watch-dir))))
+                      (isnt equal (namestring named) (namestring shared)
+                            "the two buses keep separate watch directories")
+                      ;; A beat on the unnamed bus says nothing about this agent.
+                      (heartbeat:write-beat shared :mode :event :baseline 0
+                                                   :poll-ms 250)
+                      (let ((st (agent:agent-status me)))
+                        (is eq nil (getf st :live-watcher)
+                            "a beat on the shared bus is not this agent's watch")
+                        (is string= "dead" (getf st :watcher-status)))
+                      ;; The beat its own watch writes is the one that counts.
+                      (heartbeat:write-beat named :mode :event :baseline 0
+                                                  :poll-ms 250)
+                      (let ((st (agent:agent-status me)))
+                        (is eq t (getf st :live-watcher)
+                            "the beat under the joined bus reports live")
+                        (is string= "live" (getf st :watcher-status))
+                        (true (integerp (getf st :watcher-age-seconds))))
+                      (heartbeat:remove-beat named)
+                      (is eq nil (getf (agent:agent-status me) :live-watcher)
+                          "removing the joined bus's beat reads as no watcher"))
+                 (agent:disconnect-agent me)))))
+      (ignore-errors (uiop:delete-directory-tree state-root :validate t)))))
+
 (define-test connect-agent-records-the-bus-it-joined
   "A participant knows which bus it is on, and the handle is where every surface
    downstream reads it from rather than assuming there is only one bus. With no
