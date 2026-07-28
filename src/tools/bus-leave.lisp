@@ -109,6 +109,18 @@ against, so an operator should disenroll you with bus-roster.")))
         (ephemeral (and (gethash "ephemeral" args) t))
         (bus-arg (gethash "bus" args))
         (session (tool-session tool)))
+    ;; An empty bus is refused rather than read as "no bus named": resolved, it
+    ;; would fall through to whatever bus the session already speaks on, and an
+    ;; agent that asked to leave one fleet would depart another while the reply
+    ;; reported success on the bus it actually left.
+    (unless (or (null bus-arg) (and (stringp bus-arg) (plusp (length bus-arg))))
+      (return-from tool-handle
+        (result id (make-ht "isError" t
+                            "error_type" "invalid-argument"
+                            "content"
+                            (text-content
+                             "bus-leave: bus must be a non-empty string naming \
+a bus. Omit it to leave this session's own bus.")))))
     (handler-case
         (let ((a (session-agent session agent-id-arg
                                :ephemeral ephemeral :bus bus-arg)))
