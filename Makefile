@@ -78,6 +78,9 @@ install-bus-watch: bus-watch
 
 ## check-skills: report where the deployed skills differ from this tree.
 ##
+##   A skill is a directory, so only files inside one are deployable; anything
+##   at the top of skills/ is documentation about the collection and stays here.
+##
 ##   A skill tracked here but never deployed is worse than one that was never
 ##   tracked: it reads as version-controlled while the thing an agent actually
 ##   loads is something else. That is how the scaffold-project copy rotted 19
@@ -85,7 +88,7 @@ install-bus-watch: bus-watch
 ##   and never edits, so it is safe to run against a live fleet.
 check-skills:
 	@status=0; \
-	for f in $$(cd skills && find . -type f ! -path '*__pycache__*' | sed 's|^\./||'); do \
+	for f in $$(cd skills && find . -mindepth 2 -type f ! -path '*__pycache__*' | sed 's|^\./||'); do \
 	  if [ ! -f "$(SKILLDIR)/$$f" ]; then \
 	    echo "  NOT DEPLOYED  $$f"; status=1; \
 	  elif ! cmp -s "skills/$$f" "$(SKILLDIR)/$$f"; then \
@@ -109,7 +112,7 @@ check-skills:
 ##   it. Run check-skills first and port the other way before deploying.
 ##   Deployment is per-file so an agent's unrelated skills are left alone.
 install-skills:
-	@for f in $$(cd skills && find . -type f ! -path '*__pycache__*' | sed 's|^\./||'); do \
+	@for f in $$(cd skills && find . -mindepth 2 -type f ! -path '*__pycache__*' | sed 's|^\./||'); do \
 	  mkdir -p "$(SKILLDIR)/$$(dirname $$f)"; \
 	  cp -p "skills/$$f" "$(SKILLDIR)/$$f"; \
 	  echo "  deployed $$f"; \
