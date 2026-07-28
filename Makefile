@@ -17,10 +17,16 @@ export XDG_CACHE_HOME ?= $(CURDIR)/.ci-cache
 # whenever the dependencies, the SBCL build, or the project source change.
 CORE ?= dsmr.core
 
-.PHONY: bridge bus-watch install-bus-watch test test-integration core core-verify test-warm
+.PHONY: bridge bus-watch install-bus-watch test test-integration core core-verify test-warm \
+        install-skills check-skills
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
+
+# Where the harness skills are deployed for the agent that reads them. Claude is
+# the first target and deliberately not the only one; a second agent gets its own
+# directory rather than this one being generalized in place.
+SKILLDIR ?= $(HOME)/.claude/skills
 
 ## bridge: build the standalone stdio<->TCP bridge binary.
 ##
@@ -69,6 +75,46 @@ install-bus-watch: bus-watch
 	@mv -f "$(BINDIR)/.dsmr-bus-watch.tmp" "$(BINDIR)/dsmr-bus-watch"
 	@echo "installed $(BINDIR)/dsmr-bus-watch"
 	@echo "running watchers keep the previous image until each is re-armed"
+
+## check-skills: report where the deployed skills differ from this tree.
+##
+##   A skill tracked here but never deployed is worse than one that was never
+##   tracked: it reads as version-controlled while the thing an agent actually
+##   loads is something else. That is how the scaffold-project copy rotted 19
+##   lines behind without anyone noticing. This reports drift in both directions
+##   and never edits, so it is safe to run against a live fleet.
+check-skills:
+	@status=0; \
+	for f in $$(cd skills && find . -type f ! -path '*__pycache__*' | sed 's|^\./||'); do \
+	  if [ ! -f "$(SKILLDIR)/$$f" ]; then \
+	    echo "  NOT DEPLOYED  $$f"; status=1; \
+	  elif ! cmp -s "skills/$$f" "$(SKILLDIR)/$$f"; then \
+	    echo "  DIFFERS       $$f"; status=1; \
+	  fi; \
+	done; \
+	for f in $$(cd "$(SKILLDIR)" 2>/dev/null && find . -type f ! -path '*__pycache__*' | sed 's|^\./||'); do \
+	  case "$$f" in gsd-*|*/gsd-*) continue;; esac; \
+	  if [ -d "skills/$$(dirname $$f)" ] && [ ! -f "skills/$$f" ]; then \
+	    echo "  DEPLOYED ONLY $$f"; status=1; \
+	  fi; \
+	done; \
+	if [ $$status -eq 0 ]; then echo "skills in sync with $(SKILLDIR)"; \
+	else echo "run 'make install-skills' to deploy this tree, or port the other way first"; fi; \
+	exit $$status
+
+## install-skills: deploy this tree's harness skills to the agent that reads them.
+##
+##   ⛔ The migration direction is global -> repo. If a deployed skill has been
+##   edited in place, that edit is the newer one and this target would destroy
+##   it. Run check-skills first and port the other way before deploying.
+##   Deployment is per-file so an agent's unrelated skills are left alone.
+install-skills:
+	@for f in $$(cd skills && find . -type f ! -path '*__pycache__*' | sed 's|^\./||'); do \
+	  mkdir -p "$(SKILLDIR)/$$(dirname $$f)"; \
+	  cp -p "skills/$$f" "$(SKILLDIR)/$$f"; \
+	  echo "  deployed $$f"; \
+	done
+	@echo "installed into $(SKILLDIR)"
 
 ## test: fast in-process unit suite (the push hot-path).
 ##
