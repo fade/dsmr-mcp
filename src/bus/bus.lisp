@@ -17,7 +17,8 @@
 ;;;; of truth — so a dropped or missed nudge costs latency, never a message. POLL
 ;;;; is the non-blocking form: catch up and return whatever is pending right now.
 
-(require :sb-posix)
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-posix))
 
 (defpackage #:dsmr-mcp/src/bus/bus
   (:use #:cl)

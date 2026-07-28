@@ -11,7 +11,8 @@
 ;;;; encoded id byte-for-byte cannot be allowed to carry two encoders — a single
 ;;;; alphabet change on either side would silently desync them.
 
-(require :sb-posix)
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-posix))
 
 (defpackage #:dsmr-mcp/src/bus/envelope
   (:use #:cl)
