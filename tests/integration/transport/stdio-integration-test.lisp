@@ -93,6 +93,59 @@ whole life, so the only thing that reaches stdout is the JSON-RPC traffic."
                "\"capabilities\":{},\"clientInfo\":{\"name\":\"inttest\","
                "\"version\":\"0\"}}}"))
 
+(defparameter *child-response-deadline* 60
+  "Seconds to wait for a spawned server child to answer on its stdout.
+Long enough to cover a cold child on a loaded runner, and finite because a child
+that never answers has to be reported as a broken server. Left unbounded it
+instead stalls the suite until a job limit kills it, which reports nothing.")
+
+(defparameter *child-exit-deadline* 60
+  "Seconds to wait for a spawned server child to exit once its stdin is closed,
+and to wait for its stderr to reach EOF afterwards.")
+
+(defun %read-line-with-deadline (stream seconds what)
+  "Read one line from STREAM, giving up after SECONDS.
+Returns two values: the line, or NIL when none arrived, and a detail string
+describing the wait. The detail is always a string and always names WHAT was
+expected, so an assertion on the line reports which message never came instead
+of just an unexplained NIL."
+  (handler-case
+      (sb-ext:with-timeout seconds
+        (let ((line (read-line stream nil nil)))
+          (values line
+                  (if line
+                      (format nil "received ~A" what)
+                      (format nil "child stdout reached EOF before sending ~A"
+                              what)))))
+    (sb-ext:timeout ()
+      (values nil
+              (format nil "timed out after ~D s waiting for ~A" seconds what)))))
+
+(defun %wait-process-with-deadline (proc seconds)
+  "Wait for PROC to exit, giving up after SECONDS.
+Returns the child's exit code, or :TIMEOUT when it was still running at the
+deadline and had to be killed."
+  (handler-case
+      (sb-ext:with-timeout seconds (uiop:wait-process proc))
+    (sb-ext:timeout ()
+      (ignore-errors (uiop:terminate-process proc :urgent t))
+      (ignore-errors (uiop:wait-process proc))
+      :timeout)))
+
+(defun %drain-with-deadline (stream seconds)
+  "Read STREAM to EOF, giving up after SECONDS, and return everything read.
+Partial output is still returned on expiry, because a truncated stderr is a far
+better diagnostic than a suite that never finishes."
+  (let ((collected (make-string-output-stream)))
+    (handler-case
+        (sb-ext:with-timeout seconds
+          (loop for line = (read-line stream nil nil)
+                while line
+                do (write-line line collected)))
+      (sb-ext:timeout () nil)
+      (error () nil))
+    (get-output-stream-string collected)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Tests
 ;;; ---------------------------------------------------------------------------
@@ -109,29 +162,38 @@ a structurally correct JSON-RPC response containing protocolVersion."
              (write-line (%init-line) child-in)
              (force-output child-in)
 
-             ;; Read one response line from child stdout.
-             (let* ((response (read-line child-out nil nil))
-                    (parsed   (and response (jzon:parse response))))
-               ;; Assert protocolVersion is present in the result.
-               (true response)
-               (true parsed)
-               (is equal "2.0" (gethash "jsonrpc" parsed))
-               (is = 1 (gethash "id" parsed))
-               (let ((ver (gethash* parsed "result" "protocolVersion")))
-                 (true (stringp ver))
-                 (true (> (length ver) 0))))
+             ;; Read one response line from child stdout, on a deadline.
+             (multiple-value-bind (response detail)
+                 (%read-line-with-deadline
+                  child-out *child-response-deadline*
+                  "the initialize response on child stdout")
+               (let ((parsed (and response
+                                  (ignore-errors (jzon:parse response)))))
+                 ;; Assert protocolVersion is present in the result.
+                 (true response "~A" detail)
+                 (true parsed "~A" detail)
+                 (when parsed
+                   (is equal "2.0" (gethash "jsonrpc" parsed))
+                   (is = 1 (gethash "id" parsed))
+                   (let ((ver (gethash* parsed "result" "protocolVersion")))
+                     (true (stringp ver))
+                     (true (and (stringp ver) (> (length ver) 0)))))))
 
              ;; Close input to trigger EOF; child should exit.
              (close child-in)
-             (uiop:wait-process proc))
+             (true (not (eq :timeout
+                            (%wait-process-with-deadline
+                             proc *child-exit-deadline*)))
+                   "the child exited within ~D s of its stdin closing"
+                   *child-exit-deadline*))
 
         ;; Ensure the process is reaped even if assertions fail.
         (ignore-errors
-          (close (uiop:process-info-input proc)))
+         (close (uiop:process-info-input proc)))
         (ignore-errors
-          (uiop:terminate-process proc))
+         (uiop:terminate-process proc))
         (ignore-errors
-          (uiop:wait-process proc))))))
+         (uiop:wait-process proc))))))
 
 (define-test stdio-start-appears-in-child-stderr
   "Child stderr contains a stdio.start log event, proving the transport
@@ -144,21 +206,29 @@ logged its start."
              ;; Send and receive one initialize exchange so the server starts.
              (write-line (%init-line) child-in)
              (force-output child-in)
-             ;; Read the response (ignore content — just drain so the child
-             ;; has had a chance to write its log lines).
-             (read-line child-out nil nil)
+             ;; Drain the response so the child has had a chance to write its
+             ;; log lines. Content is not asserted here, but arrival is: a child
+             ;; that never answers must fail this test rather than stall it.
+             (multiple-value-bind (response detail)
+                 (%read-line-with-deadline
+                  child-out *child-response-deadline*
+                  "the initialize response on child stdout")
+               (true response "~A" detail))
              ;; Close to trigger EOF, wait for child to exit.
              (close child-in)
-             (uiop:wait-process proc)
+             (true (not (eq :timeout
+                            (%wait-process-with-deadline
+                             proc *child-exit-deadline*)))
+                   "the child exited within ~D s of its stdin closing"
+                   *child-exit-deadline*)
              ;; Drain stderr into a string (the stream is now at EOF
              ;; because the child has exited and closed its end).
-             (let* ((err-stream (uiop:process-info-error-output proc))
-                    (stderr     (with-output-to-string (s)
-                                  (loop for line = (read-line err-stream nil nil)
-                                        while line
-                                        do (write-line line s)))))
+             (let ((stderr (%drain-with-deadline
+                            (uiop:process-info-error-output proc)
+                            *child-exit-deadline*)))
                (true (stringp stderr))
-               (true (search "stdio.start" stderr))))
+               (true (search "stdio.start" stderr)
+                     "child stderr carried a stdio.start event")))
 
         ;; Ensure process cleanup.
         (ignore-errors (close (uiop:process-info-input proc)))
