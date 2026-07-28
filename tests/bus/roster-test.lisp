@@ -87,6 +87,19 @@
 (defun probe-id (name)
   (envelope:agent-id +namespace+ :name name))
 
+(defun constructed-id (name)
+  "The id the constructor builds for NAME, which is what a session resolves for
+   itself. The namespace goes in as a project root in its directory form, exactly
+   as a live session supplies it, so the join carries the two separators every
+   real id carries."
+  (envelope:agent-id (concatenate 'string +namespace+ "/") :name name))
+
+(defun hand-typed-id (name)
+  "The id for NAME as an operator writes it: one separator at the join. Nothing
+   generates this spelling. It only ever arrives as typed input, and it has to
+   name the same agent as the constructed one."
+  (concatenate 'string +namespace+ "/" name))
+
 (defun entry-files (roster-dir)
   (remove-if-not (lambda (f) (equal (pathname-type f) "member"))
                  (uiop:directory-files roster-dir)))
@@ -211,6 +224,65 @@
         (is = 1 (length departed))
         (is equal gone (roster:entry-id (first departed)))))))
 
+(define-test enrolling-by-hand-then-departing-as-the-agent-leaves-one-entry
+  "The case measured live. An operator lists a sister in another repository by
+   typing its full id, which carries one separator at the join; that sister later
+   leaves under the id its own session resolves, which carries two. One agent,
+   one entry, and it is departed.
+
+   Split in two, the typed entry could never be departed by anything: leaving
+   only ever departs the identity the session resolves for itself, so the roster
+   would show one agent as enrolled and departed at once, forever."
+  (with-roster (roster-dir state-path)
+    (let ((typed (hand-typed-id "parachute"))
+          (built (constructed-id "parachute")))
+      (roster:enroll typed roster-dir state-path)
+      (roster:disenroll built roster-dir)
+      (is = 1 (length (entry-files roster-dir))
+          "the two spellings wrote one entry, not two")
+      (let ((record (roster:entry typed roster-dir)))
+        (is eq :departed (roster:entry-status record))
+        (is equal built (roster:entry-id record)
+            "and it records the constructed spelling, which is what the \
+busmaster derives the held cursor's filename from")))))
+
+(define-test enrolling-as-the-agent-then-departing-by-hand-leaves-one-entry
+  "The same collision the other way about: the agent was listed under the id its
+   session resolves, and an operator departs it by typing one. Still one entry,
+   still departed, and the recorded id is still the constructed one, because the
+   cursor was created under that spelling and a typed departure must not point
+   the busmaster at a file that does not exist."
+  (with-roster (roster-dir state-path)
+    (let ((typed (hand-typed-id "fulcrum"))
+          (built (constructed-id "fulcrum")))
+      (roster:enroll built roster-dir state-path)
+      (roster:disenroll typed roster-dir)
+      (is = 1 (length (entry-files roster-dir)))
+      (let ((record (roster:entry built roster-dir)))
+        (is eq :departed (roster:entry-status record))
+        (is equal built (roster:entry-id record))
+        (true (integerp (roster:entry-departed-at record))))
+      (is = 1 (length (roster:departed-members roster-dir))
+          "and the listing agrees there is one agent, gone"))))
+
+(define-test either-spelling-of-one-id-finds-the-same-entry
+  "A lookup answers for the agent, not for the spelling it was asked with. A
+   lookup that missed would be worse than a duplicate write: the caller is told
+   the agent is absent, and goes on to create the second entry itself."
+  (with-roster (roster-dir state-path)
+    (let ((typed (hand-typed-id "hekate"))
+          (built (constructed-id "hekate")))
+      (roster:enroll built roster-dir state-path)
+      (multiple-value-bind (record present) (roster:entry typed roster-dir)
+        (true present "the typed spelling finds it")
+        (is eq :enrolled (roster:entry-status record)))
+      (multiple-value-bind (record present) (roster:entry built roster-dir)
+        (true present "and so does the constructed one")
+        (is eq :enrolled (roster:entry-status record)))
+      (is equal (roster:roster-entry-path typed roster-dir)
+          (roster:roster-entry-path built roster-dir)
+          "both spellings name one file"))))
+
 ;;; ----------------------------------------------------------- the gate
 
 (define-test enrollment-is-open-on-a-bus-nobody-has-closed
@@ -279,6 +351,21 @@
       (is = 2 (length (roster:members roster-dir)))
       (is = 0 (length (roster:departed-members roster-dir))))))
 
+(define-test a-redeclared-leader-settles-on-the-constructed-spelling
+  "Declaring the same agent again under the other spelling records one leader,
+   spelled the way the roster spells that agent's entry. A leader printed in a
+   spelling no entry uses leaves a reader unable to match the two up."
+  (with-roster (roster-dir state-path)
+    (let ((typed (hand-typed-id "valis"))
+          (built (constructed-id "valis")))
+      (roster:declare-leader typed state-path)
+      (roster:declare-leader built state-path)
+      (is equal built (roster:leader state-path)
+          "the constructed spelling stands once it has been seen")
+      (roster:declare-leader typed state-path)
+      (is equal built (roster:leader state-path)
+          "and a later typed declaration does not undo it"))))
+
 ;;; ------------------------------------------------------------ write safety
 
 (define-test writes-leave-no-scratch-files-behind
@@ -298,6 +385,33 @@
       (multiple-value-bind (record present) (roster:entry id roster-dir)
         (true present)
         (is eq :enrolled (roster:entry-status record))))))
+
+(define-test durable-files-hold-plain-strings
+  "Every string that lands in an entry or in the bus state file is written as a
+   plain string.
+
+   An id arrives as the namestring of a pathname, which this implementation hands
+   back as a base string whenever every character is ASCII. Printed readably that
+   is an array literal, so without the coercion the roster fills with
+   #A((47) BASE-CHAR . \"...\") where a name belongs. It reads back, which is why
+   it went unnoticed; the same literal on a wire has repeatedly killed the image
+   at the far end, and state a person cannot read at a glance is worth stopping
+   at the write."
+  (with-roster (roster-dir state-path)
+    (let ((id (constructed-id "plainly")))
+      (roster:enroll id roster-dir state-path)
+      (roster:declare-leader id state-path)
+      (let ((entry-text (uiop:read-file-string
+                         (roster:roster-entry-path id roster-dir)))
+            (state-text (uiop:read-file-string state-path)))
+        (false (search "#A(" entry-text)
+               "no array literal in the entry file")
+        (false (search "BASE-CHAR" entry-text))
+        (true (search id entry-text)
+              "and the id is there to read as itself")
+        (false (search "#A(" state-text)
+               "nor in the bus state file")
+        (false (search "BASE-CHAR" state-text))))))
 
 (define-test roster-paths-are-derived-from-the-bus-root
   "The busmaster owns the layout: both roster paths hang off the bus root it was

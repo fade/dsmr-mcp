@@ -79,13 +79,41 @@
    even in the window before the rename."
   "tmp")
 
+(defun %canonical-key (id)
+  "ID reduced to the spelling that identifies the agent, so two ways of writing
+   one identity address one entry.
+
+   A bus id is a namespace joined to a name, and the namespace is a project root
+   in its directory form, which already ends in a separator. Every id the
+   constructor builds therefore carries two separators at the join. An operator
+   listing a sister that lives in another repository has to type the full id by
+   hand, and types one. Both mean the same agent. Without this they land on two
+   files, and the one the operator made can never be departed afterwards, because
+   leaving only ever departs the identity a session resolves for itself: the
+   roster then shows a single agent as enrolled and departed at once.
+
+   The name is the segment after the last separator and the namespace is
+   everything before it, spelled with its trailing separator restored. Idempotent,
+   so an id that already carries the constructed join comes back unchanged. An id
+   with no separator at all is not a qualified id and is returned as it came."
+  (if (and (stringp id) (find #\/ id))
+      (let* ((cut (position #\/ id :from-end t))
+             (name (subseq id (1+ cut)))
+             (namespace (string-right-trim "/" (subseq id 0 cut))))
+        (concatenate 'string namespace "//" name))
+      id))
+
 (defun roster-entry-path (id roster-dir)
   "Where the roster entry for agent ID lives under ROSTER-DIR.
 
    Keyed on the SAME encoded id that this agent's cursor and heartbeat files use,
-   so the three names for one identity are derived once and cannot drift."
+   so the three names for one identity are derived once and cannot drift.
+
+   The id is reduced to its identity key first, which is what makes a hand-typed
+   id and a constructed one address one file instead of two."
   (merge-pathnames (concatenate 'string
-                                (envelope:encode-id id) "." (%entry-file-type))
+                                (envelope:encode-id (%canonical-key id))
+                                "." (%entry-file-type))
                    (uiop:ensure-directory-pathname roster-dir)))
 
 (defun %temp-path (target)
@@ -143,8 +171,24 @@
             (values nil t)))
       (values nil nil)))
 
+(defun %plain-text (value)
+  "VALUE with every string inside it held as a full CHARACTER string.
+
+   An id reaches the roster as the namestring of a pathname, and this
+   implementation hands back a base string whenever every character is ASCII.
+   Printed readably, a base string is an array literal, so the entry files and
+   the bus state file fill up with #A(...) forms where plain strings belong. They
+   read back, so nothing breaks here, and that is exactly why it is worth
+   stopping at the write: the same literal on a wire has repeatedly killed the
+   image at the far end, and durable state a person can read at a glance is worth
+   more than the microsecond the coercion costs."
+  (typecase value
+    (string (map '(simple-array character (*)) #'identity value))
+    (cons (cons (%plain-text (car value)) (%plain-text (cdr value))))
+    (t value)))
+
 (defun %write-plist (path plist)
-  "Write PLIST to PATH atomically and return it.
+  "Write PLIST to PATH atomically and return what landed.
 
    The replacement must be atomic. A roster file is read by processes other than
    the one writing it, so writing in place would truncate first and expose a
@@ -152,21 +196,26 @@
    the SAME directory and renaming it over the target makes the swap one
    filesystem operation: a reader sees either value, never neither. The scratch
    file is removed if anything goes wrong, so a failed write leaves the previous
-   entry intact and no litter behind."
+   entry intact and no litter behind.
+
+   Strings are flattened to a single element type on the way out, and the
+   flattened plist is what comes back, so a caller reading the return value and a
+   caller reading the file are looking at the same thing."
   (ensure-directories-exist path)
-  (let ((temp (%temp-path path)))
+  (let ((plain (%plain-text plist))
+        (temp (%temp-path path)))
     (unwind-protect
          (progn
            (with-open-file (out temp :direction :output
                                      :if-exists :supersede
                                      :if-does-not-exist :create)
              (with-standard-io-syntax
-               (prin1 plist out))
+               (prin1 plain out))
              (finish-output out))
            (rename-file temp path)
            (setf temp nil))
-      (when temp (ignore-errors (delete-file temp)))))
-  plist)
+      (when temp (ignore-errors (delete-file temp))))
+    plain))
 
 ;;; ------------------------------------------------------------- entry access
 
@@ -259,15 +308,42 @@
   (getf (%bus-state state-path) :leader))
 
 (defun declare-leader (id state-path)
-  "Record ID as the leader of the bus whose state lives at STATE-PATH.
+  "Record ID as the leader of the bus whose state lives at STATE-PATH, and return
+   the spelling that was recorded.
 
    Recording, not granting. Leadership belongs to whoever assembled the bus, and
    this writes that fact down so any participant can read it back. It changes no
-   entry's status and confers no ability that a member lacks."
-  (%update-bus-state state-path :leader id)
-  id)
+   entry's status and confers no ability that a member lacks.
+
+   Declaring the same agent again under the other separator spelling keeps the
+   constructed one rather than replacing it, so the leader a listing prints
+   matches the entry sitting beside it in that listing."
+  (let ((recorded (%preferred-spelling id (leader state-path))))
+    (%update-bus-state state-path :leader recorded)
+    recorded))
 
 ;;; --------------------------------------------------------- enrol and depart
+
+(defun %preferred-spelling (id recorded)
+  "Which spelling of one identity gets written down: ID, or the RECORDED one when
+   that is the spelling the id constructor produces.
+
+   The recorded id is not decoration. The busmaster derives a departed agent's
+   cursor filename from this field, and that cursor was created under the
+   constructed spelling. A call that names the same agent with a hand-typed
+   single separator must therefore not overwrite it: the entry would still be
+   found by every later call, and the cursor behind it would silently stop being
+   advanced, which is the one failure that turns a departed agent into the thing
+   pinning the log.
+
+   Only a recorded id that names the same agent can win, so an entry that was
+   planted by hand and holds something unrelated is replaced rather than
+   believed."
+  (if (and (stringp recorded)
+           (string= (%canonical-key recorded) (%canonical-key id))
+           (search "//" recorded))
+      recorded
+      id))
 
 (defun enroll (id roster-dir state-path &key role)
   "Enroll ID on the bus whose roster is ROSTER-DIR and whose state is STATE-PATH.
@@ -280,19 +356,23 @@
    Enrolling an id that has departed clears its departure stamp and returns it to
    enrolled, so an agent that left can come back. ROLE defaults to whatever the
    existing entry carried and to :MEMBER for a new one, so re-enrolling a leader
-   does not quietly demote it."
+   does not quietly demote it.
+
+   An id typed with one separator at the join and the same id as the constructor
+   builds it are one agent here, and land on one entry."
   (if (enrollment-open-p state-path)
       (let* ((now (get-universal-time))
              (existing (entry id roster-dir))
+             (recorded (%preferred-spelling id (getf existing :id)))
              (returning (not (eq (entry-status existing) :enrolled)))
-             (plist (list :id id
+             (plist (list :id recorded
                           :status :enrolled
                           :enrolled-at (if returning
                                            now
                                            (or (getf existing :enrolled-at) now))
                           :departed-at nil
                           :role (or role (getf existing :role) :member))))
-        (values (%write-plist (roster-entry-path id roster-dir) plist) nil))
+        (values (%write-plist (roster-entry-path recorded roster-dir) plist) nil))
       (values nil :enrollment-closed)))
 
 (defun disenroll (id roster-dir)
@@ -301,11 +381,17 @@
    Works whether or not the gate is open, and whether or not ID was ever
    enrolled: an id with no entry gets a departed one rather than an error, so a
    self-service departure is always recorded. A departure with no record would
-   leave the agent's cursor with nothing to age against."
+   leave the agent's cursor with nothing to age against.
+
+   An id typed with one separator at the join departs the entry an id built by
+   the constructor enrolled, and the other way about. Anything else lets an agent
+   sit on the roster as enrolled and departed at the same time, with the enrolled
+   half beyond the reach of every later call."
   (let* ((existing (entry id roster-dir))
-         (plist (list :id id
+         (recorded (%preferred-spelling id (getf existing :id)))
+         (plist (list :id recorded
                       :status :departed
                       :enrolled-at (getf existing :enrolled-at)
                       :departed-at (get-universal-time)
                       :role (or (getf existing :role) :member))))
-    (%write-plist (roster-entry-path id roster-dir) plist)))
+    (%write-plist (roster-entry-path recorded roster-dir) plist)))
