@@ -1,27 +1,143 @@
-#+TITLE: dsmr-mcp — Architecture
+#+TITLE: dsmr-mcp Architecture
 #+OPTIONS: toc:2 num:nil
 
-This document describes how a request travels through dsmr-mcp, the two
-execution paths it can take, and the major subsystems that make up the
-server. It is the structural overview; for the things adjacent to it see
-[[file:modes-and-transports.org]] (how modes and transports are selected and
-configured), [[file:threat-model.org]] (the trust posture and the controls the
-server actually enforces), [[file:tools.org][Tool reference]] (the verb surface), and
-[[file:index.org]] (documentation index).
+This document records the decisions and invariants a maintainer needs in order to
+change this code correctly: what the seams are, what they promise, and what the
+system deliberately does not do. The code is the record of /how/. This is the
+record of /what/ and /why/.
 
-dsmr-mcp is an attached-image-first MCP server for Common Lisp: it exposes
-the verbs an AI agent needs to write and debug Lisp *inside a running
-development image*, where definitions, packages, threads, and application
-state already exist. A forked-worker pool is available as a fallback for
-crash isolation and parallel work. The whole system is a package-inferred
-ASDF system — one source file maps to one package — so the file names in
-this document are also the package names.
+For the things adjacent to it see [[file:modes-and-transports.org]] (how modes and
+transports are selected and configured), [[file:threat-model.org]] (the trust posture
+and the controls the server actually enforces), [[file:coordination-bus.org]] and
+[[file:bus-segmentation.org]] (operating the bus and putting a fleet on one of its
+own), [[file:tools.org][Tool reference]] (the verb surface), and [[file:index.org]] (documentation index).
+
+* What this repository is
+
+dsmr-mcp is a Model Context Protocol server that gives an AI agent a set of verbs
+over a Common Lisp development image. Lisp development is image based: a
+developer accumulates definitions, packages, threads, CLOS instances and
+application state over a session, and that accumulated world is most of what
+makes the language productive. Conventional AI coding tools discard it, operating
+on files and a freshly spawned process. This server takes the opposite stance,
+which is its central thesis: the agent should work inside the image the developer
+already has running, where a redefined function takes effect immediately, a live
+object can be inspected, and a restart can be invoked. Everything else here is
+either in service of that (the wire discipline, the object registry, the
+cancellation path) or a fallback for when there is no such image to attach to
+(the forked worker pool).
+
+The whole system is a package inferred ASDF system, one source file to one
+package, so the file names in this document are also the package names.
+
+* Why this is a repository of its own
+
+A maintainer can read the whole source, understand exactly how it works, and
+still not know whether a proposed change belongs here. This section is the answer
+to that question. Four properties are only enforceable at the repository
+boundary, and each one decays the moment this code is folded into something that
+consumes it.
+
+** The consumers are clients this project does not control
+
+This is a protocol server, not a library with one caller. It negotiates an MCP
+protocol version with whatever connects (=+supported-protocol-versions+= in
+=src/protocol.lisp=), serves three transports, and advertises every verb as JSON
+schema through =tools/list=. The installer has a =:claude-code= arm and a
+=:print= arm whose entire purpose is to emit a config fragment for a client this
+repository has never heard of, and adding a client is documented as adding
+another arm (=src/install.lisp=).
+
+The consequence for review: the schema surface is a contract with programs we do
+not ship. Renaming a field or tightening a required argument is a breaking change
+even when every call site in this tree is updated, and the parity test between
+the live registry and [[file:tools.org][Tool reference]] exists because that contract has to be
+visible to a person, not only to a client.
+
+Some of the shape here is imposed from outside and is not ours to relitigate. The
+JSON-RPC error codes are the MCP specification's, and the =-32002= "server not
+initialized" response is the MCP and TypeScript SDK convention that real clients
+expect. Where that convention and a cleaner design disagree, the convention wins,
+because the client on the other end implements the convention.
+
+** The target image belongs to someone else
+
+This is the constraint that generates every rule here that looks arbitrary from
+the inside. In attached mode the server injects code into a Lisp image it did not
+start, cannot restart, and whose implementation it may not assume. Three
+disciplines follow, and all three are invisible unless you know why:
+
+- *Injected forms are portable ANSI.* No implementation specific symbols, no MOP,
+  no library calls. The attached object registry and the cancellation form both
+  say so at the top of the file, and the wrapping form reaches for the ANSI
+  =*debugger-hook*= even where an implementation specific hook would be tidier.
+- *Injected literals are restricted to what the Slynk reader round trips.* A
+  string that happens to be a base string prints as an array literal under
+  =*print-readably*=, overruns the length prefix, and drops the connection.
+  =src/wire-strings.lisp= normalises at two boundaries for this reason. The
+  outbound one is what actually protects the connection, since the form builders
+  introduce strings the inbound pass never saw.
+- *The developer's image is never force killed.* The hard kill backstop in the
+  worker pool is hermetic only. A cancellation that does not take within its
+  grace window leaves the thread running and the connection open, and records the
+  stranded thread rather than reclaiming it.
+
+Folded into a consuming project, these read as gratuitous restrictions, and they
+erode the first time somebody reaches for an implementation specific symbol that
+works on their machine. Held at a boundary where the target image is by
+definition a stranger's, they are obviously right.
+
+** The process is ours, and that is what makes the protocol channel safe
+
+On the stdio transport the JSON-RPC channel /is/ the process's stdout. A single
+stray line from any library on any thread corrupts it. The server therefore
+claims the standard streams for the whole process, re-pointing the global values
+of six standard stream specials so that output goes to stderr and input reads as
+end of file, on threads spawned long after startup included. All logging is
+routed to stderr by construction.
+
+That is a whole process property. It is enforceable because the process exists to
+be this server and nothing else. A library embedded in a host application cannot
+make it, and a host application that made it would be surprising to its own
+users.
+
+** The build expresses boundaries the source does not
+
+The coordination bus is single host on purpose. Its election and its crash
+detection both come from one primitive, an advisory file lock that the operating
+system releases even on =SIGKILL=, and both of its sockets are =ipc://=. Those
+are machine local facts, not a transport that could be swapped.
+
+The watcher makes the point sharper. It ships as its own system in its own
+=dsmr-bus-watch.asd=, building to a standalone binary, and it depends on five
+leaf systems and its own entry point: never the broker, never the ZeroMQ
+transport, never the MCP server. The purpose is that a repository which only
+needs to watch a bus does not have to install libzmq. Nothing at build time
+enforces that on the machine where the binary is produced, because that machine
+has libzmq and the build succeeds either way. The failure appears later, on
+somebody else's machine, as a binary that will not start. So the closure is
+asserted directly by walking the ASDF dependency graph in a test
+(=tests/bus/watch-leaf-isolation-test.lisp=), and the state root derivation lives
+in its own leaf that imports nothing beyond =cl= and =uiop= specifically so that
+one added package nickname cannot quietly pull the transport in.
+
+*Adding a dependency to a bus leaf is a design change, not housekeeping.* That is
+the single most useful thing to take from this section.
+
+** What this repository is not
+
+It is not a build system, a package manager, or a CI harness. It does not contain
+the projects it serves; the filesystem sandbox exists precisely because those
+live elsewhere and it must reach into them under a policy. It has no cross host
+transport, and adding one would not be a transport swap but a different design,
+since the WAL as authority model exists in order to avoid consensus and
+replication entirely.
 
 * Request lifecycle
 
-A single MCP request crosses several layers before it reaches the code that
-does the work. The shape is the same regardless of which transport carries
-it and which execution path serves it.
+A single MCP request crosses several layers before it reaches the code that does
+the work. The shape is the same regardless of which transport carries it and
+which execution path serves it.
 
 #+begin_example
   MCP client
@@ -29,20 +145,21 @@ it and which execution path serves it.
      v
   transport            src/transport/{stdio,tcp,http}.lisp
      |  reads one JSON-RPC line, binds *current-session-id*
+     |  (stdio: backend calls are handed to the dispatch pool)
      v
   protocol             src/protocol.lisp  (process-json-line)
      |  handshake / tools/list / tools/call / prompts
      v
   dispatcher           src/dispatch.lisp  (handle-tools-call)
-     |  resolve tool in *tool-classes*, validate args vs schema
+     |  mode branch first, then resolve tool in *tool-classes*
      |
-     +-- *mode* = :hermetic ------------> dispatch-hermetic-call
+     +-- *mode* = :hermetic AND worker-routed tool --> dispatch-hermetic-call
      |                                    src/hermetic/dispatch.lisp
      |                                       |
      |                                       v
      |                                    forked SBCL worker (own process)
      |
-     +-- *mode* = :attached -----------> tool-handle on the per-session
+     +-- everything else ---------------> tool-handle on the per-session
                                           tool instance
                                             |  with-attach-dispatch
                                             v
@@ -50,257 +167,659 @@ it and which execution path serves it.
                                           src/attach/dispatch.lisp
                                             |  slynk-client
                                             v
-                                          operator's own running Slynk image
+                                          developer's own running Slynk image
 #+end_example
 
-The transport reads exactly one JSON-RPC message per line, binds the
-session identity special =*current-session-id*=, and hands the line to
-=process-json-line= in =src/protocol.lisp=. The protocol layer handles the
-MCP handshake (=initialize=, version negotiation), =tools/list=, =prompts=,
-and routes a =tools/call= to =handle-tools-call= in =src/dispatch.lisp=.
+The transport reads exactly one JSON-RPC message per line under a size cap, binds
+the session identity special =*current-session-id*=, and hands the line to
+=process-json-line= in =src/protocol.lisp=. The protocol layer handles the MCP
+handshake, refuses tool and prompt traffic before initialization with =-32002=,
+and routes a =tools/call= to =handle-tools-call=.
 
-The dispatcher is the mode router. It first asserts that the transport has
-bound a non-empty session id (a regression boundary that catches a caller
-who drives the protocol layer without establishing session identity). It
-then branches on the dynamic special =*mode*=: in =:hermetic= mode it
-returns straight into =dispatch-hermetic-call=; otherwise it resolves the
-tool class by name from the registry, fetches the per-session tool
-instance, validates the arguments against the tool's class-allocated
-schema (a missing required field becomes JSON-RPC =-32602=; an unknown
-tool name becomes =-32601=), and calls the tool's =tool-handle= method.
+Two points where the picture is easy to get wrong:
 
-On the way out, the dispatcher guarantees that every =tools/call= success
-carries renderable =content=: a tool that returns only structured fields gets
-a synthesized, size-bounded text block rendering those fields (and a warning
-is logged naming the tool), so no client ever displays an empty result for a
-call that succeeded. JSON-RPC errors and results that already carry content
-pass through untouched.
+- *The mode branch comes first, and it is not a blanket route.* Hermetic dispatch
+  requires both that =*mode*= is =:hermetic= /and/ that the verb is one the worker
+  actually serves. Dispatcher side verbs (the filesystem verbs, documentation
+  lookup, the LSP verbs, pool status) run locally in hermetic mode exactly as they
+  do in attached mode. A change that assumes "hermetic means everything goes to a
+  worker" will be wrong.
+- *The stdio read loop is no longer the only thread that dispatches.* Backend
+  calls are classified and submitted to a bounded dispatch pool
+  (=src/transport/dispatch-pool.lisp=), which re-binds the session identity on the
+  worker thread. The invariant that keeps that safe is that the dispatch pool's
+  size is derived from, and clamped to, the hermetic pool ceiling: dispatch
+  threads must never outnumber the child processes they can be waiting on, or the
+  two layers deadlock against each other.
+
+On the way out, the dispatcher guarantees that every =tools/call= success carries
+renderable =content=: a tool that returns only structured fields gets a
+synthesized, size bounded text block rendering those fields, and a warning is
+logged naming the tool, so no client ever displays an empty result for a call that
+succeeded. JSON-RPC errors and results that already carry content pass through
+untouched.
 
 * The two execution paths
 
-Every image-resident verb — evaluate, load a system, run tests, describe a
-symbol, inspect a live object — has to run *somewhere with a live Lisp
-image*. dsmr-mcp offers two such places, and the mode router chooses
-between them.
+Every image resident verb (evaluate, load a system, run tests, describe a symbol,
+inspect a live object) has to run /somewhere with a live Lisp image/. dsmr-mcp
+offers two such places, and the mode router chooses between them.
 
 ** Attached (default)
 
-In attached mode the eval runs inside the operator's *own* long-running
-Lisp image, reached over a Slynk listener the operator started themselves.
-This is the project's central thesis: the agent works where the world
-already exists rather than in a worker that must rebuild it from scratch.
+In attached mode the eval runs inside the developer's /own/ long running Lisp
+image, reached over a Slynk listener the developer started themselves. This is
+the project's central thesis: the agent works where the world already exists
+rather than in a worker that must rebuild it from scratch.
 
-The path is in =src/attach/=. =repl-eval-tool= (src/attach/dispatch.lisp)
-caches, per session, a single Slynk connection, a call-serialisation lock,
-and a connection-incarnation epoch counter — all per-instance slots, no
-global tables. =%dispatch-attach= builds a wrapping form (src/attach/wrap-form.lisp),
-sends it through =bounded-slime-eval= (src/attach/connection.lisp) over
-=slynk-client=, and turns the six-element result tuple from the remote image
-into a structured response: printed value, captured stdout/stderr, and rich
-error context (condition type, restarts, backtrace frames).
+The path is in =src/attach/=. The eval tool caches, per session, a single Slynk
+connection, a call serialisation lock, and a connection incarnation epoch counter,
+all as per instance slots rather than global tables. Dispatch builds a wrapping
+form, sends it through =bounded-slime-eval= over =slynk-client=, and turns the six
+element result tuple from the remote image into a structured response: printed
+value, captured stdout and stderr, and rich error context.
 
-Three properties matter for callers:
+Four properties matter for callers:
 
-- *Fail-closed, self-healing.* A lost listener surfaces a structured
-  =isError= (NETWORK_ERROR class), drops the cached connection, and bumps
-  the epoch so any previously-minted object handles read as stale. The
-  next call reopens the connection on demand and prefixes its output with
-  a reconnect note. There is no server restart and no silent fall-through
-  to hermetic.
-- *Concurrency policy.* Under the default =:serialised= policy a
-  process-wide lock is held around every eval so concurrent sessions take
-  turns inside the one live image; a queued notification is emitted before
-  a session blocks. =:parallel= drops the lock for read-mostly agents.
-- *Wire-serialization discipline.* Outbound injected forms must be
-  ANSI/portable (the attached image is the user's, of unknown
-  implementation) and free of literals the Slynk reader cannot round-trip;
-  strings are normalised at the parse boundary (src/wire-strings.lisp) so
-  an unprintable literal never kills the connection.
+- *Fail closed, self healing.* A lost listener surfaces a structured =isError=,
+  drops the cached connection, and bumps the epoch so any previously minted object
+  handles read as stale. The next call reopens the connection on demand and
+  prefixes its output with a reconnect note, deliberately suppressing the object
+  handle on that call since the image behind it is a different incarnation. There
+  is no server restart and no silent fall through to hermetic. Note that the
+  typed =NETWORK_ERROR= payload is produced by the individual tool wrappers; the
+  eval verb's own lost-listener envelope is an untyped =isError=.
+- *Two locks, not one.* Under the default =:serialised= policy a process wide lock
+  is held around every eval so concurrent sessions take turns inside the one live
+  image, and a queued notification carrying the caller's position is emitted
+  before a session blocks. The =:parallel= policy drops /that/ lock for read
+  mostly agents. It does not make a single session concurrent with itself: a per
+  session lock still serialises connection acquisition and eval within one
+  session, because one Slynk connection cannot serve two calls at once.
+- *Wire serialization discipline.* Outbound injected forms must be portable ANSI
+  and free of literals the Slynk reader cannot round trip. Strings are normalised
+  both inbound at the JSON-RPC parse boundary and outbound in the attached eval
+  funnel, and the outbound pass is the one that matters, because the form builders
+  introduce strings the inbound pass never saw.
+- *Cancellation is cooperative and bounded.* An in flight eval is asked to abort
+  through an interrupt followed by a restart invocation, in that order and with a
+  deliberate pause between them, because a restart invoked before the interrupt
+  has landed is a no op. If the abort does not take within its grace window the
+  thread is recorded in a bounded orphan registry and the connection is left open.
+  The developer's image is never force killed and never has a thread destroyed out
+  from under it.
 
-** Hermetic (fallback / parallel isolation)
+Port resolution deserves its own note. A per project Slynk port is derived from a
+stable hash of the project's absolute path, which is what stopped two projects
+from silently sharing one listener. The hash is deliberately not =sxhash=, since
+the derived value is written into a project's =.envrc= and must survive an
+implementation upgrade unchanged, and the range stays below the ephemeral port
+window. Derivation makes collisions rare rather than impossible; the residue is
+closed at runtime by a probe.
 
-In hermetic mode each session is served by a dedicated forked SBCL child
-process, so a crash takes down only that worker and never the operator's
-image. This is the path for when the live image is unavailable, or when an
-agent deliberately wants isolation from host state. The code is in
-=src/hermetic/=: the dispatcher-side pool and worker client, plus the
-worker program itself under =src/hermetic/worker/=.
+** Hermetic (fallback and parallel isolation)
 
-A worker is a bare SBCL child (=--noinform --non-interactive
---no-userinit=) that loads the worker system, emits a one-line JSON
-handshake on stdout (its TCP port and pid), and then serves RPCs on that
-port. The dispatcher reads the handshake, connects, and authenticates with
-a shared secret. The wire between dispatcher and worker is *newline-delimited
-JSON-RPC* with a 16 MB line cap — not a length-prefixed envelope.
+In hermetic mode each session is served by a dedicated forked SBCL child process,
+so a crash takes down only that worker and never the developer's image. This is
+the path for when the live image is unavailable, or when an agent deliberately
+wants isolation from host state. The code is in =src/hermetic/=: the dispatcher
+side pool and worker client, plus the worker program itself under
+=src/hermetic/worker/=.
+
+A worker is a bare SBCL child that loads the worker system, emits a one line JSON
+handshake on stdout, and then serves RPCs on the port it announces. The dispatcher
+reads the handshake, connects, and authenticates with a per worker random shared
+secret that gates every method except authentication itself. The wire between
+dispatcher and worker is /newline delimited JSON-RPC/ with a 16 MB line cap
+enforced identically on both sides, not a length prefixed envelope.
 
 ** The mode router and :auto
 
-=*mode*= is resolved once at startup by =resolve-mode= in =src/run.lisp=,
-with precedence keyword arg > =DSMR_MODE= env > =.dsmr-mcp.conf= > the
-built-in default =:attached=. The third value, =:auto=, is the only place
-the two paths meet: it probes the configured Slynk listener with a 3-second
-TCP connect and resolves to =:attached= if reachable, =:hermetic= (with a
-one-time startup warning on stderr) if not. The probe runs only after the
-log appender is installed so the warning never lands on the JSON-RPC
-channel. Explicit =:attached= never falls back — a dead listener fails
-closed. See [[file:modes-and-transports.org]] for the full resolution rules.
+=*mode*= is resolved at startup with precedence keyword arg > =DSMR_MODE= env >
+=.dsmr-mcp.conf= > the built in default =:attached=. Explicit =:attached= never
+falls back: a dead listener fails closed at call time rather than quietly moving
+the agent into a different world.
+
+=:auto= is the only place the two paths meet. It resolves a Slynk target,
+preferring the handshake file a development boot writes over any configured
+address, classifies the port, and falls back to =:hermetic= with a startup warning
+on stderr when nothing usable is there. The probe runs only after the log appender
+is installed, so the warning never lands on the JSON-RPC channel.
+
+Two decisions inside that probe are worth knowing. First, connecting successfully
+proves almost nothing, because a Slynk client connects to /any/ listener on the
+port; distinguishing your image from a different project's requires a bounded eval
+against the image, which is why the probe evaluates as well as connects. Second,
+the identity check *fails open*: any error during probing is treated as "this is
+ours", because dropping a developer into hermetic mode over a transient probe
+failure is far worse than attaching to an image that turns out to be unexpected,
+which merely warns.
+
+See [[file:modes-and-transports.org]] for the full resolution rules.
+
+A separate startup gate covers remote binding: the TCP and HTTP transports refuse
+a bind address that is not loopback unless an explicit override environment
+variable is set. It is checked before any listener socket is created, and it does
+not apply to stdio, which has no socket to bind.
 
 * The tool registry
 
-Verbs are not registered by a macro or a central list — they are CLOS
-classes that register themselves. The machinery lives in
-=src/tools/base.lisp=.
+Verbs are not registered by a macro or a central list. They are CLOS classes that
+register themselves.
 
-- =mcp-tool= is the abstract base class. Each concrete verb subclasses it
-  and carries its MCP metadata — name, description, and input schema — in
-  =:allocation :class= slots, so every instance of a verb shares one
-  canonical name and schema literal at no per-instance cost.
-- =mcp-tool-class= is the metaclass. Because a concrete tool class inherits
-  this metaclass, closer-mop fires a =finalize-inheritance :after= method at
-  class-definition time that auto-registers the class into the registry
-  keyed by its name string. Re-evaluating a tool's =defclass= re-runs
-  finalization and refreshes the entry, so the registry is hot-reload
-  friendly. The abstract base class is skipped by a name guard.
-- =*tool-classes*= is the registry: a hash table from name string to tool
-  class. It is a =defvar= deliberately — a =defparameter= would re-bind a
-  fresh empty table whenever ASDF transitively reloads =base.lisp= for a
-  downstream leaf, silently dropping every registration. =defvar=
-  initialises once and survives the reload.
+- =mcp-tool= is the abstract base class. Each concrete verb subclasses it and
+  carries its MCP metadata (name, description, input schema) in =:allocation
+  :class= slots, so every instance of a verb shares one canonical name and schema
+  literal at no per instance cost. Those slots must be filled with =:initform= and
+  never =:default-initargs=, because the registry reads them off the class
+  prototype and default initargs are not applied to a prototype. Every verb file
+  repeats this warning for a reason.
+- =mcp-tool-class= is the metaclass. Because a concrete tool class inherits it,
+  closer-mop fires a =finalize-inheritance :after= method at class definition time
+  that auto-registers the class into the registry keyed by its name string. The
+  abstract base is skipped by a name guard. Registration is last writer wins with
+  no collision detection, deliberately, which is what makes re-evaluating a verb's
+  =defclass= refresh the entry rather than error. Registration is only eager
+  because each verb file explicitly finalizes its class after the =defclass=;
+  without that it would defer to first instantiation.
+- =*tool-classes*= is the registry, a hash table from name string to tool class.
+  It is a =defvar= deliberately. A =defparameter= would re-bind a fresh empty
+  table whenever ASDF transitively reloads the base file for a downstream leaf,
+  silently dropping every registration.
 
-The dispatcher reads from this same table, and =tools/list= renders it (the
-documentation in [[file:tools.org][Tool reference]] is generated from the live registry, with a
-parity test enforcing that the docs match what ships). Each verb is its own
-file under =src/tools/<verb>.lisp=.
+The dispatcher reads from this same table and =tools/list= renders it. [[file:tools.org][Tool
+reference]] is generated from the live registry and a parity test asserts byte
+exact agreement, with tool names sorted and schema keys canonicalised so the
+output is deterministic. Note that the generator lives inside that test file
+rather than in a script or a Makefile target, so regenerating the reference means
+loading the test package and calling it.
 
 * Hermetic worker pool and circuit breaker
 
-The hermetic pool (=src/hermetic/pool.lisp=) manages worker processes with
-*strict exclusive session affinity*: one session is bound to exactly one
-worker, never shared. The pool keeps a small set of warm standby workers
-ready (=DSMR_WORKER_POOL_WARMUP=, default 1) and spawns on demand up to a
-ceiling (=DSMR_MAX_POOL_SIZE=, default 16); exceeding the ceiling signals a
-typed capacity error. At hermetic startup =initialize-pool= pre-warms the
-worker system's FASL cache once in the parent so concurrent child spawns
-never race to compile the same files, starts a background health monitor,
-and registers a shutdown hook.
+The hermetic pool manages worker processes with /strict exclusive session
+affinity/: one session is bound to exactly one worker, never shared. The pool
+keeps a small set of warm standby workers ready (=DSMR_WORKER_POOL_WARMUP=,
+default 1) and spawns on demand up to a ceiling (=DSMR_MAX_POOL_SIZE=, default
+16); exceeding the ceiling signals a typed capacity error rather than queueing.
+At hermetic startup the pool pre-warms the worker system's FASL cache once in the
+parent so concurrent child spawns never race to compile the same files, starts a
+background health monitor, and registers a shutdown hook.
 
 When a worker dies the health monitor detects it and asynchronously spawns a
-replacement bound to the same session. The session receives exactly *one*
-crash notification — the next call after a crash succeeds against the fresh
-worker, prefixed once with a notice that in-image state was lost.
+replacement bound to the same session. The session receives exactly /one/ crash
+notification; "exactly one" is enforced by a test and clear performed under the
+worker's stream lock, which is what closes the race between the monitor arming
+the notice and the next call consuming it.
 
 Two safety mechanisms guard against runaway sessions:
 
-- *Circuit breaker.* If one session's worker crashes three times within a
-  five-minute window the breaker trips: further calls for that session fail
-  fast for a 60-second cooldown rather than spawning yet another doomed
-  replacement. The breaker self-clears when the cooldown expires;
-  =release-session= and =pool-kill-worker :reset= clear it immediately.
-  This protects the host from a crash loop consuming process slots without
-  bound. (This is a dsmr-mcp addition over its cl-mcp lineage.)
-- *Per-request timeout with a hard-kill backstop.* Every worker call carries
-  a soft eval budget (=*default-eval-timeout*=, default 120 s) enforced
-  inside the worker, which returns a structured TIMEOUT payload on overrun.
-  As a backstop, if the worker does not respond within the soft budget plus
-  a kill grace (=DSMR_WORKER_KILL_GRACE_SECONDS=, default 5 s) — for example
-  a runaway FFI call the soft timeout cannot interrupt — the parent SIGKILLs
-  the worker via its process object (avoiding the PID-reuse hazard of
-  killing by raw pid), routes it through the normal crash-recovery path, and
-  surfaces a structured crash error. This control is *hermetic-only*; the
-  attached image is the operator's own and is never force-killed.
+- *Circuit breaker.* If one session's worker crashes three times within a five
+  minute window the breaker trips: further calls for that session fail fast for a
+  60 second cooldown rather than spawning yet another doomed replacement. This
+  protects the host from a crash loop consuming process slots without bound.
+  Releasing the session, or killing its worker with a reset, clears the breaker
+  immediately. "Self clears" is behavioural rather than literal: the record is
+  never removed on expiry, the gate simply stops matching once the cooldown has
+  passed. Note also that there are two places a trip can be recorded, the health
+  monitor and the lazy crash accounting on the next assignment, so a change to the
+  trip rule has to touch both.
+- *Per request timeout with a hard kill backstop.* Every worker call carries a
+  soft eval budget (120 s by default, overridable by environment) enforced inside
+  the worker, which returns a structured TIMEOUT payload on overrun. As a
+  backstop, if the worker does not respond within the soft budget plus a kill
+  grace (=DSMR_WORKER_KILL_GRACE_SECONDS=, default 5 s), for example a runaway
+  foreign call the soft timeout cannot interrupt, the parent kills the worker via
+  its process object rather than by raw pid, which avoids the pid reuse hazard,
+  routes it through the normal crash recovery path, and surfaces a structured
+  crash error. This control is *hermetic only*; the attached image is the
+  developer's own and is never force killed.
 
-The =pool-status= verb exposes the pool's health — running flag, worker
-counts, and a per-worker summary — but deliberately omits each worker's
-Slynk/swank port so the health view cannot be used to bypass MCP policy.
+The =pool-status= verb exposes the pool's health but deliberately omits each
+worker's Slynk port, so the health view cannot be used to reach a worker directly
+and bypass MCP policy. The port is present in the handshake the dispatcher reads
+and is dropped on the way out.
 
 * Filesystem sandbox
 
-The one control the server enforces against the agent is the filesystem
-sandbox (=src/project-root.lisp=, =src/fs.lisp=). The project root is a
-*per-session* slot, never a process global and never a =chdir=, so
-concurrent sessions can each be rooted at a different project without
-racing. Reads are allowed under the session root *and* under any registered
-ASDF source directory (so an agent can read sibling and dependency source);
-writes are jailed to the session root only. Symlink resolution runs before
-the containment check, broad roots like =/= or =/home/= are refused, and
-re-rooting outside a configured whitelist requires explicit human approval
-an agent cannot grant itself.
+The one control the server enforces against the agent is the filesystem sandbox
+(=src/project-root.lisp=, =src/fs.lisp=). The project root is a /per session/
+slot, never a process global and never a =chdir=, so concurrent sessions can each
+be rooted at a different project without racing. Reads are allowed under the
+session root /and/ under any registered ASDF source directory, so an agent can
+read sibling and dependency source; writes are jailed to the session root only,
+with the ASDF directories explicitly excluded.
 
-This is a guardrail against accidental reach, not containment against an
-adversary — an agent with eval can touch the filesystem directly. The full
-trust posture, and why this is the only enforced agent-facing boundary, is
-in [[file:threat-model.org]].
+Symlink resolution runs before the containment check, and it resolves the deepest
+existing ancestor when the leaf does not exist yet, which closes the obvious
+escape through a path that has not been created. A deny list of a dozen broad
+roots is refused outright, checked both as written and as resolved; it is wider
+than it looks and includes =/tmp/= as well as =/= and =/home/=.
+
+Re-rooting deserves a precise statement, because it is easy to overclaim.
+Re-rooting outside the whitelist named by =DSMR_RELATED_PROJECTS= requires an
+explicit approval flag in the request, and when that variable is unset every
+re-root to a new path requires it. The guarantee is that *the server never
+supplies, defaults, derives, or infers that flag on the agent's behalf*, and that
+the override is logged before the mutation. It is an audit trail and a
+deliberate speed bump, not a capability boundary: nothing prevents an agent from
+setting the flag itself on a retry.
+
+That is the honest shape of the whole sandbox. It is a guardrail against
+accidental reach, not containment against an adversary, since an agent with eval
+can touch the filesystem directly. The full trust posture is in [[file:threat-model.org]].
 
 * The alive-lsp bridge
 
-Syntax intelligence (completions, hover, diagnostics, code actions) is
-delegated to alive-lsp rather than re-implemented. The bridge in =src/lsp/=
-follows an *attach-else-spawn* policy: it talks to an alive-lsp already
-listening on the configured port, or spawns one from a configured source
-checkout (=DSMR_ALIVE_LSP_DIR=). When neither is available the LSP verbs
-*degrade* rather than hard-fail — diagnostics, for instance, fall back to an
-in-process Eclector parse check that still catches paren and reader-level
-errors. The agent always gets *some* answer.
+Syntax intelligence (completions, hover, diagnostics, code actions) is delegated
+to alive-lsp rather than re-implemented. The bridge in =src/lsp/= follows an
+/attach else spawn/ policy: it talks to an alive-lsp already listening on the
+configured port, or spawns one from a source checkout named by
+=DSMR_ALIVE_LSP_DIR=. When that variable is unset, spawning is disabled entirely
+rather than guessed at.
+
+The degradation policy is narrower than it is often described, and the difference
+matters when adding a verb here. *Only diagnostics degrades.* With no LSP
+reachable, diagnostics falls back to an in process Eclector parse check that still
+catches paren and reader level errors, so the agent gets a real answer.
+Completions, hover and code actions return a structured unavailability envelope
+instead. A new LSP backed verb has to choose which of those two shapes it is, and
+there is no default.
+
+* The coordination bus
+
+Under =src/bus/=, fronted by the =bus-*= verbs in =src/tools/=. It is a single
+host, durable, broadcast message bus that lets several development sessions on one
+machine coordinate. This is the largest subsystem here and the one with the most
+invariants that are cheap to break by accident. [[file:coordination-bus.org]] covers
+operating it and [[file:bus-segmentation.org]] covers putting a fleet on a bus of its
+own; what follows is what constrains a change to the code.
+
+** The log is the authority and the broker is its only writer
+
+The write ahead log is append only, its sequence number is the global message
+index, and a successor broker recovers by replaying it. There is no consensus and
+no replication. Two things follow, and both are enforced rather than assumed.
+
+Records are self describing and CRC checked, so a broker killed mid write leaves a
+torn tail that recovery detects instead of handing a corrupt record to its
+successor. And because exactly one process writes, the sequence column must read
+1, 2, 3 with no hole and no repeat; replay asserts that as it goes. A gap can only
+mean two brokers wrote concurrently, so the log is the detector of its own
+correctness, and that assertion is the thing that would catch an election bug.
+
+*Clients push over an =ipc://= socket to the broker's intake, and there is
+deliberately no filesystem fallback submit path.* Nothing outside the broker
+appends to the log; in the whole of =src/= the append call has exactly one caller,
+the broker's serve step. A fallback that let a client write directly when the
+broker was slow to come up would look like robustness and would destroy the sole
+writer property that everything else rests on.
+
+Reading and repairing are kept strictly apart for the same reason. Scanning and
+forward reads are read only and stop at a torn tail without touching the file;
+only a successor broker's recovery step truncates. That separation is what makes
+concurrent read while write safe.
+
+The ZeroMQ fan out is a notification, not a channel. The nudge's content is
+ignored entirely and the next loop turn reads the log through the cursor, so a
+dropped or missed nudge costs latency and never a message. Treating the nudge as
+the message would reintroduce exactly the lossiness the durable layer exists to
+absorb.
+
+** The broker is elected by an advisory lock, lazily, and any participant can take over
+
+Election is =flock(2)=. The lock is tied to an open file description, so the
+operating system releases it when the holder dies, =SIGKILL= included. That gives
+election and crash detection from one primitive, with no heartbeat to tune and
+none of the stale socket address-in-use trouble a bind based election would meet.
+The first process to take the exclusive non blocking lock is the broker; everyone
+else takes a blocking exclusive lock, and when the broker dies exactly one waiter
+wakes and takes over.
+
+Election is *lazy*: joining a bus spawns a detached broker only if none currently
+holds the lock. The check is racy on purpose, since the spawned process elects for
+itself and a loser simply exits cleanly rather than double serving. Membership is
+a separate /shared/ lock held for a process's whole life; a process shutting down
+cleanly tries to upgrade it to exclusive, and success means it is the last one out.
+That upgrade is the only hook the log rotation hangs on, which is precisely why a
+crash can never archive: the rotation call is absent from every non clean exit
+path, so there is no "was this a crash?" test to get wrong.
+
+** Identity is a namespace joined to a name, with exactly one separator
+
+A participant's id is =<namespace>/<name>=, where the namespace is the project
+root. Exactly one separator lands at the join whether or not the namespace arrives
+in directory form, because a project root usually carries a trailing separator and
+a hand written namespace usually does not, and an id whose shape depends on which
+one the caller happened to hold is an id that spells one agent two ways.
+
+That matters far more than it looks, because *the cursor file, the heartbeat file
+and the roster entry are all named by percent encoding the full id* with one
+shared encoder. A second spelling is a second set of files for one identity, and
+the roster carries an explicit canonicalisation step so that a hand typed id and a
+constructed one land on one entry rather than leaving an agent enrolled and
+departed at the same time.
+
+The same property makes a wrong namespace *self confirming*. Everything keyed on
+the id will agree with itself at the wrong path: a watch armed under the wrong
+namespace reads a cursor that is not its own, writes a heartbeat nobody reads,
+reports healthy, and never fires. The watcher warns loudly when it has to infer a
+namespace from the working directory for exactly this reason. There is no check
+that can catch it after the fact, because every derived path is internally
+consistent.
+
+A supplied name is /stable/ and resumes its durable cursor across restarts. An
+omitted name yields an auto unique ephemeral id, so several anonymous participants
+in one project each receive every message independently while sharing the
+namespace.
+
+** Cursors are durable, per participant, and only delivery advances them
+
+Each subscriber owns a small durable file holding the sequence number it has
+acknowledged. The cursor is what makes a missed real time nudge degrade to catch
+up rather than to a lost message.
+
+Delivery is the /sole/ cursor advancing step, and it is bounded and paginating: it
+advances to the last record it actually handed over, which under a bound is short
+of the log head, so the next call resumes there and a backlog is walked forward
+across calls rather than dumped or dropped. Abandoning backlog requires an
+explicit skip, which reports how much it abandoned, and nothing on the delivery
+path calls it. A discard that reports nothing is how a coordination bus quietly
+develops amnesia and how restarting comes to look like it heals things.
+
+A participant with no cursor file is seeded at the current head when it subscribes,
+not lazily on first read. Having never read, it has no claim on history; without
+seeding, an absent cursor reads as zero and the first delivery is the entire log.
+
+Cursor writes are atomic rename over, because other processes read the file and a
+truncate in place would expose a transiently empty cursor that reads back as zero,
+which is indistinguishable from a participant that has never read anything.
+
+*A cursor is written by exactly one process*, the session consuming the bus
+through it. This is why the watcher reads cursors and never writes one: writing
+from outside would move a live session's delivery position behind its back.
+Custody transfers only on a recorded clean leave, after which the broker advances
+that cursor with fleet traffic so a departed participant can never become the
+thing pinning the log against rotation, and retires it once the departure is old
+enough. An agent that vanishes without recording a departure gets none of that.
+
+Two separate sweeps exist and must not be merged into one parameterised sweep.
+One reaps ephemeral cursors by name shape /and/ age together, where dropping
+either condition breaks it in a different direction. The other retires cursors
+whose owner recorded leaving, keyed only on the recorded departure time. In
+particular a held cursor's own modification time is useless as a key, since
+advancing it with traffic keeps it seconds old forever.
+
+** A named bus is one directory segment, and everything derives from it
+
+One function turns an optional bus name into the directory every other bus path
+hangs off. With no name it is the shared host wide state root, reproducing exactly
+the paths the bus has always used. With a name it is that same root plus one
+directory segment, and from that segment everything else follows: the log, the
+broker lock, the membership lock, the cursors directory, the roster, the watch
+heartbeats, and both sockets.
+
+Isolation between two buses is a different directory and nothing more exotic than
+that. Every path in the tree comes through this one function, and it imports
+nothing beyond =cl= and =uiop= so that the standalone watcher can reach it without
+acquiring the ZeroMQ transport. Three copies of this derivation used to exist in
+the broker, the watcher and the heartbeat, each to preserve that property; one
+leaf preserves it without the copies, and adding an import to that leaf undoes the
+work.
+
+** Name validation refuses rather than repairs
+
+A bus name is checked against a bounded length, a restricted alphabet, and a short
+reserved list compared case insensitively. The reserved list is not decoration:
+a named root is created /inside/ the shared bus root, beside entries the unnamed
+bus already writes there, so a name like "cursors" or "members" would land on top
+of live bus state instead of isolating from it, and a name carrying a separator
+would leave the bus directory entirely.
+
+The derived socket path is then measured against the path limit the kernel
+enforces on a unix domain socket, the usable 107 bytes of the 108 byte field.
+ZeroMQ strips the scheme before binding, so what is measured is the plain
+filesystem path.
+
+*Nothing is ever shortened, hashed, or downgraded to fit.* A truncated socket path
+still binds, still works, and quietly resolves to a different bus than the one
+asked for, which is indistinguishable from success at runtime. Refusal is
+signalled at derivation time before anything is created, so a caller that sees it
+knows no directory, socket or lock was left behind.
+
+The watcher applies the same rule at its command line: an unusable bus name is
+refused outright rather than dropped to the shared bus, and it is the one failure
+the binary exits nonzero for, with exit code 64. A mistyped cadence flag costs its
+own default and nothing more, but a bus name that quietly degrades leaves a watch
+armed where nobody is talking, reporting live and never firing.
+
+** The roster is advisory
+
+The roster records who is enrolled on a bus, who has left and when, who leads it,
+and whether enrollment is open. *Nothing on the serving path consults it.* An
+unenrolled agent connects, publishes and receives exactly as an enrolled one does;
+the enrollment gate stops the roster from growing and stops nothing else.
+
+This is a decision, not an omission. An =ipc://= socket is guarded by directory
+permissions and nothing else, so the transport has no security surface a
+membership check could rest on. A bus enforced roster would buy no isolation while
+turning a typo in a name into a silent non join. *What isolates one fleet from
+another is the separate state root and the filesystem permissions on it, never
+this file.* Leadership is recorded on the same terms: a declared leader and a
+closeable enrollment gate are enough for two fleets sharing a host not to
+overwrite each other's intent, and joining a bus never confers leadership, because
+nothing in the transport could back a guard that made it mean more.
+
+What the roster is genuinely for is dating a departure. That stamp is the only
+thing that lets the broker take custody of a departed participant's cursor and
+retire it later, which is why leaving writes an entry even for an id that was
+never enrolled, and why a repeated leave leaves the original timestamp alone
+rather than pushing it forward.
+
+Addressing has the same shape and the same honesty. A message naming one recipient
+is *filtered, not private*: the record goes to the fleet's log exactly as a
+broadcast does and every member's cursor still advances over it, so only who is
+shown it changes. Direct addressing is off by default, and a publish that names a
+recipient while it is off refuses rather than silently broadcasting, because a
+message its sender believed had one reader arriving in front of everyone is worse
+than an error the sender can read.
+
+A related invariant on the receive side: the cursor advances over /every/ pending
+record, including the agent's own publishes and mail addressed to somebody else,
+and the filtering decides only what is shown. A reader that stopped its cursor at
+other people's mail would pin the log. The pending count and the receive filter
+share one predicate specifically so that a reported count can never promise a
+message a receive would then withhold.
+
+** Single host, by decision
+
+Both socket pairs are =ipc://= and the election is a local file lock. Neither is a
+transport that could be pointed at another machine. This is not an unfinished
+edge: the design takes election, crash detection and durability from primitives
+that exist only within one kernel, and the log as authority model exists precisely
+so that recovery is a replay rather than a consensus protocol. Spanning hosts
+would replace that model, not extend it.
+
+** The watcher is a separate binary that carries no ZeroMQ
+
+A session only runs when something invokes it; between turns it is dormant, and a
+message can sit unread. The watcher closes that gap by turning "a new message
+arrived" into an event a supervising harness can act on, either by exiting or by
+streaming a line.
+
+It builds from its own system definition to a standalone binary and depends on
+five leaf systems and its own entry point: the log, the message envelope, the
+cursor, the state root selector and the heartbeat. Never the broker, never the
+ZeroMQ transport, never the MCP server. The reason is deployment: a repository
+that only needs to watch a bus does not have to install libzmq. Since the build
+machine has libzmq and would succeed either way, the closure is asserted by a test
+that walks the ASDF dependency graph, and a package nickname added to any of those
+leaves is enough to break it.
+
+Two correctness properties come from /who/ the watch runs for. Self wake is
+avoided by identity rather than by ordering: every published body carries its
+publisher's encoded id, so the watcher fires only on records that id did not
+publish, using the same comparison the receive path makes. And the baseline it
+arms at is that identity's durable cursor, not the log head, so a message that
+landed between a drain and the arm is above the cursor and fires on the first
+poll instead of being buried where nothing could reach it. With no identity
+resolvable the watcher degrades to the log head with no filter and says so.
+
+** The streaming watcher exits 0 on its idle window on purpose
+
+This one looks like a bug until you know why, so it is worth stating plainly.
+
+An exit on event watch that fires exits 0, and a watch that never fired exits 0
+too, so from the exit status alone a watch that has gone silently deaf is
+indistinguishable from a healthy one. The streaming watcher therefore
+*self recycles*: after an idle window with no activity it returns and the process
+exits 0 with a diagnostic on stderr, so its supervisor re-arms it fresh. That
+re-arm is the self heal. Removing the idle exit to make the watcher "keep
+running" removes the only thing that recovers a watch which stopped listening.
+
+Any activity resets the idle window, including this agent's own publishes, since
+the log demonstrably moved. A log rotation counts as activity too, and has to,
+because rotation moves the cursor /down/ to the head of a new log, which a plain
+advance test would read as no activity at all.
+
+The heartbeat closes what remains. While a watch runs it rewrites a small file
+every poll, and an unwind protected cleanup removes it on fire, on recycle and on
+error, so an absent beat reads as "not running" and a stale one as "died without
+unwinding". The file's modification time is the signal; its contents are
+diagnostics only, and a beat that cannot be written is dropped rather than allowed
+to take the watch down. Writer and reader share one leaf, so the filename and the
+freshness window cannot drift apart between the binary that writes the beat and
+the server that reads it.
+
+Two conventions round it out. Standard output is the signal channel and carries
+nothing else, so every diagnostic goes to stderr; a stray line on stdout would be
+read as a wake. And the exit codes are meaningful: 0 for a fired or recycled watch
+or a live heartbeat, 1 for a stale or absent heartbeat, 2 for a liveness probe with
+no resolvable identity, and 64 for an unusable bus name.
+
+* Recovery
+
+A wedged server cannot be recovered through its own MCP read loop, because that
+loop is the wedged thing. The recovery path is therefore built in rungs, each one
+reaching further than the last, and the rungs above the first do not depend on the
+read loop being alive.
+
+The first rung is entirely in process: drop the attached connection, kill hermetic
+workers across bound sessions, clear the circuit breaker, clear the orphan
+registry. Every primitive it calls touches in process state or tears down without
+waiting, so no wedged backend can stall recovery. Its verb deliberately has no
+confirmation gate, because a recovery tool must not depend on a client round trip
+that may itself be wedged. It also encodes a lock ordering rule that is easy to
+reintroduce as a deadlock: snapshot the bound session ids under the pool lock,
+release it, /then/ kill, because killing re-acquires it.
+
+The second rung reaches a peer over the durable bus. A background listener thread,
+started at server boot, is what makes that work while the peer's read loop is
+blocked. It connects as an /ephemeral/ participant so it never steals the main
+agent's durable cursor, and it listens on the bus its own session resolved rather
+than the shared host wide one, so a fleet member takes instruction only from its
+own fleet. Validation is keyed on the resolved agent name plus the project
+namespace and acts only on an exact match of both. Dispatch runs outside every
+lock, and a single bad message can never kill the listener.
+
+The third rung is terminal: the process exits with a sentinel status that the
+launch wrapper, and only that status, treats as a request to relaunch. The exit
+primitive is shared with the bus listener rather than duplicated, and must be
+called outside any lock, since the exit hooks take the pool lock on their way out.
+
+The property a maintainer must preserve across all three: *restoring the process
+is not the same as restoring the session*. A relaunched process has no
+initialized MCP session until the client re-initializes, so every verb answers
+"not initialized" in the interval. The rungs are ordered so that the cheapest one
+that could work is tried first for exactly this reason.
 
 * Structured logging
 
-All logging goes through =log-event= in =src/log.lisp=, backed by log4cl. A
-single appender writes one structured JSON object per line to *stderr* —
-never stdout, because stdout is the JSON-RPC channel and a stray log line
-there would corrupt the protocol. The threshold is set from =DSMR_LOG_LEVEL=
-at startup. On the stdio transport the protection is process-wide: before
-serving, the server claims the stdio streams for the wire and re-points the
-global standard-stream specials for every thread — output specials to
-stderr, input specials to an always-EOF stream — so no library code on any
-thread, including threads spawned later (Slynk dispatchers, pool workers),
-can touch the JSON-RPC channel.
+All logging goes through =log-event= in =src/log.lisp=, backed by log4cl. A single
+appender writes one structured JSON object per line to *stderr*, never stdout,
+because stdout is the JSON-RPC channel and a stray log line there would corrupt
+the protocol. The threshold is set from =DSMR_LOG_LEVEL= at startup, and an
+unrecognised value leaves the level alone rather than failing the boot.
+
+On the stdio transport the protection is process wide and stronger than routing
+the logger. Before serving, the server claims the stdio streams for the wire and
+re-points six standard stream specials, setting both the global value and the
+current thread's binding: output specials to stderr, input specials to an always
+end of file stream. No library code on any thread, including threads spawned later
+by the dispatch pool or a Slynk dispatcher, can reach the JSON-RPC channel.
+=*error-output*= is deliberately left alone, since it is the destination.
 
 * Module map
 
-A guide to the main areas under =src/=.
+A guide to the main areas under =src/=. This is a map, not an inventory; consult
+the tree for the current file list.
 
-- =src/main.lisp= — public API and root package; owns the =dsmr-mcp= /
-  =dsmr= nicknames and re-exports =run=, =process-json-line=,
-  =make-session=.
-- =src/run.lisp= — boot, config-precedence resolution, mode and transport
-  routing, the loopback safety gate, the =:auto= Slynk probe.
-- =src/protocol.lisp= — MCP/JSON-RPC: handshake, version negotiation,
-  =tools/list=, =tools/call=, =prompts=.
-- =src/dispatch.lisp= — per-session tool dispatch and the attached/hermetic
-  mode branch.
-- =src/state.lisp= — session objects and the mutable specials (=*mode*=,
-  =*current-session-id*=); the project's single home for global state.
-- =src/tools/base.lisp= — the CLOS tool-registry protocol (metaclass, base
-  class, =*tool-classes*=); =src/tools/<verb>.lisp= — one file per verb.
-- =src/transport/{stdio,tcp,http}.lisp= — the three transports; plus the
-  standalone stdio↔TCP bridge (=scripts/stdio-tcp-bridge.lisp=,
-  =dsmr-mcp-bridge.asd=).
-- =src/attach/{connection,dispatch,registry,wrap-form}.lisp= — the attached
-  execution path into the operator's Slynk image.
-- =src/hermetic/{pool,worker-client,dispatch}.lisp= and
-  =src/hermetic/worker/*= — the forked-worker pool and the worker program.
-- =src/project-root.lisp=, =src/fs.lisp= — the filesystem sandbox.
-- =src/lsp/{client,document,bridge}.lisp= — the alive-lsp bridge.
-- Code intelligence and structural editing — =src/code-core.lisp=,
+- =src/main.lisp= is the public API and root package, owning the =dsmr-mcp= and
+  =dsmr= nicknames.
+- =src/run.lisp= is boot: config precedence resolution, mode and transport
+  routing, the remote bind gate, and the =:auto= Slynk target resolution.
+- =src/protocol.lisp= is MCP and JSON-RPC: handshake, version negotiation, the
+  pre initialization gate, =tools/list=, =tools/call=, prompts.
+- =src/dispatch.lisp= is per session tool dispatch, the attached and hermetic mode
+  branch, and the classifier that decides which calls the stdio read loop hands
+  off.
+- =src/state.lisp= holds session objects and the mutable specials; it is the
+  project's single home for global state.
+- =src/tools/base.lisp= is the CLOS tool registry protocol (metaclass, base class,
+  the registry table); =src/tools/<verb>.lisp= is one file per verb.
+- =src/transport/= holds the three transports plus =dispatch-pool.lisp=, the
+  bounded thread pool and promise type that lets backend calls run off the read
+  thread. The standalone stdio to TCP bridge lives in =scripts/= with its own
+  system definition.
+- =src/attach/= is the attached execution path: the connection and its epoch, the
+  dispatcher, the injected object registry, the wrapping form builder, cooperative
+  cancellation, and the Slynk port and identity probe.
+- =src/slynk-port.lisp= derives a stable per project Slynk port from the project's
+  absolute path; =src/orphan.lisp= is the bounded registry of eval threads a
+  cancellation could not reclaim.
+- =src/hermetic/= is the forked worker pool, the worker client, and under
+  =worker/= the worker program itself.
+- =src/project-root.lisp= and =src/fs.lisp= are the filesystem sandbox.
+- =src/lsp/= is the alive-lsp bridge.
+- Code intelligence and structural editing: =src/code-core.lisp=,
   =src/clgrep.lisp=, =src/clhs.lisp=, =src/system-loader-core.lisp=,
-  =src/test-runner-engine.lisp= (the dependency-free test engine, loaded
-  into the attached image on demand and version-gated by a content
-  fingerprint), =src/test-runner-core.lisp= (its server-side facade and
-  the injected-form builders), and the Eclector-based editors
-  (=src/cst.lisp=, =src/lisp-edit-form*.lisp=, =src/lisp-patch-form.lisp=,
+  =src/test-runner-engine.lisp= (the dependency free test engine, loaded into the
+  attached image on demand and version gated by a content fingerprint),
+  =src/test-runner-core.lisp= (its server side facade and the injected form
+  builders), and the Eclector based editors (=src/cst.lisp=,
+  =src/lisp-edit-form*.lisp=, =src/lisp-patch-form.lisp=, =src/lisp-read-file.lisp=,
   =src/parinfer.lisp=, =src/validate.lisp=).
-- =src/project-scaffold*.lisp= — project skeleton generation.
-- =src/install.lisp=, =src/install/= — the install/configure helper behind
-  =scripts/install.lisp= (client-config wiring, cl-mcp migration).
-- =src/elicitation.lisp=, =src/envrc-init.lisp=, =src/envrc-template.lisp= —
-  the consent-gated per-project =.envrc= offer and its template.
-- =src/bus/= — the single-host [[file:coordination-bus.org][agent coordination bus]]: =broker.lisp= and
-  =election.lisp= (flock-elected broker), =wal.lisp= (the write-ahead log that is
-  the message authority), =cursor.lisp= (durable per-agent exactly-once cursors),
-  =wakeup.lisp= and =zmq.lisp= (the level-triggered ZeroMQ notification path),
-  =archive.lisp= (orderly last-member log rotation), =agent.lisp= and =bus.lisp=
-  (the participant facade). The =bus-*= verbs in =src/tools/= front it.
-- =src/package-context.lisp= — lenient package-context synthesis for the
-  structural file-reading verbs.
-- =src/log.lisp= (structured logging), =src/notify.lisp= (notification
-  channels), =src/wire-strings.lisp= (wire-string normalisation).
+- =src/project-scaffold*.lisp= is project skeleton generation.
+- =src/install.lisp= and =src/install/= are the install and configure helper
+  behind =scripts/install.lisp=, including the client config wiring and the
+  extension point for clients other than the one with a dedicated arm.
+- =src/elicitation.lisp=, =src/envrc-init.lisp=, =src/envrc-vars.lisp= and
+  =src/envrc-template.lisp= are the consent gated per project =.envrc= offer: the
+  consent and IO gate, the pure text accessors over =.envrc= content, and template
+  resolution. The template is copied verbatim and relies on shell default
+  expansion, so the operator's own environment always wins and there is no per
+  project rendering step.
+- =src/reset.lisp= and the reset and restart verbs are the recovery rungs;
+  =src/bus-listener.lisp= is the background thread that receives them from a peer.
+- =src/bus/= is the [[file:coordination-bus.org][coordination bus]]: =selector.lisp= (the one place a bus name
+  becomes a state root), =wal.lisp= (the append only log that is the message
+  authority), =election.lisp= (broker election and membership on advisory locks),
+  =broker.lisp= (the sole writer and the cursor custodian), =cursor.lisp= (durable
+  per participant delivery cursors), =envelope.lisp= (identity construction, id
+  encoding, and the wire envelope, shared with the watcher), =zmq.lisp= and
+  =wakeup.lisp= (the live notification path), =heartbeat.lisp= (watch liveness,
+  shared between the binary that writes it and the server that reads it),
+  =roster.lisp= (the advisory record of membership and leadership),
+  =archive.lisp= (last member out log rotation), =bus.lisp= and =agent.lisp= (the
+  client, subscriber and participant facades), and =watch.lisp= (the standalone
+  watcher, built from =dsmr-bus-watch.asd= and reachable from none of the ZeroMQ
+  carrying modules above). The =bus-*= verbs in =src/tools/= front it.
+- =src/package-context.lisp= is lenient package context synthesis for the
+  structural file reading verbs: it creates ephemeral stub packages for unknown
+  package prefixes and binds the package context declared by a file's own
+  =in-package=, so reading a file never requires the dispatcher image to have
+  loaded that file's system.
+- =src/log.lisp= is structured logging; =src/notify.lisp= is the notification
+  channel protocol, with distinct specialisations for stdio, TCP and SSE, and it
+  must never import from the state module, which loads earlier and installs its
+  default channel by runtime lookup; =src/wire-strings.lisp= is wire string
+  normalisation.
