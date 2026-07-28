@@ -50,6 +50,14 @@ third-party skill would fork an artifact whose own installer will later overwrit
 - **The `gsd-*` planning system** (67 skills) is the `get-shit-done-cc` package, installed and
   upgraded by its own tooling and tracked by its own file manifest. Local adjustments to it
   belong in that package's patch directory, not here.
-- **`graphify`** is a separate installed tool with its own CLI and version marker. The skill
-  ships with the tool.
+- **`graphify`** is ours, and that is exactly why it is not here. We carry a substantial
+  Common Lisp patch set on a fork at `SourceCode/python/graphify` (`origin` is the fork,
+  `upstream` is tracked with its push URL disabled, and the fork's version is deliberately set
+  above upstream's so a package upgrade cannot quietly revert it). The tool ships its own
+  skill from that tree, so a second copy here would be a fork of a fork, and the older one.
+  Changes to it belong in that repository.
 - **Skills shipped with the agent itself** are the vendor's to maintain.
+
+The distinction that matters is not who wrote a thing but where its single copy lives. A tool
+we have patched heavily still maintains its own skill; duplicating it here would create the
+divergence this directory exists to end.
