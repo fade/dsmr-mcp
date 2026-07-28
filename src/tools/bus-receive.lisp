@@ -12,12 +12,14 @@
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht #:result #:text-content)
   (:import-from #:dsmr-mcp/src/tools/bus-helpers
-                #:session-agent #:identity-summary #:no-project-root)
+                #:session-agent #:bus-label #:identity-summary #:no-project-root)
   (:import-from #:dsmr-mcp/src/bus/bus
                 #:+default-batch-size+)
+  (:import-from #:dsmr-mcp/src/bus/selector
+                #:invalid-bus-name)
   (:import-from #:dsmr-mcp/src/bus/agent
                 #:agent-receive-detailed #:agent-id #:agent-name #:agent-namespace
-                #:delivery-author #:delivery-author-id #:delivery-text
+                #:agent-bus #:delivery-author #:delivery-author-id #:delivery-text
                 #:agent-stable-p #:agent-skip-to-head #:agent-status))
 
 (in-package #:dsmr-mcp/src/tools/bus-receive)
@@ -67,7 +69,14 @@ the next call."
                   :description "Set true to DISCARD every pending message by \
 advancing the cursor straight to the current head of the bus. The discarded \
 messages are never delivered to this agent; the abandoned field reports how \
-many were given up. No messages are received in the same call."))
+many were given up. No messages are received in the same call.")
+                 (bus
+                  :type :string
+                  :description "Optional named bus to receive from. Omit to use \
+this session's bus, which is DSMR_BUS_SELECTOR from the repository's .envrc \
+when that is set and the shared host-wide bus otherwise. A name that cannot \
+become a bus is refused; nothing is ever read from the shared bus in place of a \
+bus that was named."))
                 :required ())))
   (:metaclass mcp-tool-class)
   (:documentation "MCP tool: receive pending coordination-bus messages."))
@@ -78,10 +87,15 @@ many were given up. No messages are received in the same call."))
   "The identity key/value pairs every bus-receive result carries, as a flat list
    ready to splice into make-ht. Both the receive and the abandon reply report
    who the caller resolved to, so an agent never has to infer its own identity
-   from the traffic it happens to see."
+   from the traffic it happens to see.
+
+   The bus is part of that answer. An agent joined to two buses under one name
+   is two participants with two cursors, and a reply that named only the agent
+   would leave a reader unable to tell which of the two it had just drained."
   (list "agent_id" (agent-id a)
         "agent_name" (agent-name a)
         "namespace" (agent-namespace a)
+        "bus" (bus-label (agent-bus a))
         "stable" (agent-stable-p a)))
 
 (defun %message-fields (d)
@@ -139,6 +153,7 @@ bus-receive again to continue."
         (ephemeral (and (gethash "ephemeral" args) t))
         (timeout (or (gethash "timeout_ms" args) 0))
         (limit (gethash "limit" args))
+        (bus-arg (gethash "bus" args))
         (skip-to-head (and (gethash "skip_to_head" args) t)))
     (unless (and (integerp timeout) (>= timeout 0))
       (return-from tool-handle
@@ -152,9 +167,18 @@ bus-receive again to continue."
       (return-from tool-handle
         (%invalid-argument
          id "bus-receive: limit must be a positive integer.")))
+    ;; An empty bus is refused rather than read as "no bus named": resolved, it
+    ;; would fall through to whatever bus the session already speaks on, and a
+    ;; caller that asked for one fleet's traffic would be handed another's while
+    ;; the reply reported success.
+    (unless (or (null bus-arg) (and (stringp bus-arg) (plusp (length bus-arg))))
+      (return-from tool-handle
+        (%invalid-argument
+         id "bus-receive: bus must be a non-empty string naming a bus. Omit it \
+to receive from this session's own bus.")))
     (handler-case
         (let ((a (session-agent (tool-session tool) agent-id-arg
-                                :ephemeral ephemeral)))
+                                :ephemeral ephemeral :bus bus-arg)))
           (if skip-to-head
               ;; Abandonment and receipt are distinct intents. Doing both in one
               ;; call would make the abandoned count ambiguous — a caller could
@@ -188,6 +212,11 @@ message(s) by skipping to the head of the bus; they will not be delivered."
                                              (%receive-content a deliveries
                                                                remaining))
                                   (%identity-fields a))))))
+      ;; A bus name that cannot become a bus root is refused rather than
+      ;; downgraded, so a caller is never quietly handed the shared bus's
+      ;; backlog in place of the one it named.
+      (invalid-bus-name (e)
+        (%invalid-argument id (format nil "bus-receive: ~A" e)))
       (no-project-root ()
         (result id (make-ht "isError" t
                             "error_type" "project-root-not-set"

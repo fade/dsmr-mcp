@@ -31,6 +31,7 @@
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:agent #:dsmr-mcp/src/bus/agent)
                     (#:zmq #:dsmr-mcp/src/bus/zmq)
+                    (#:selector #:dsmr-mcp/src/bus/selector)
                     (#:wal #:dsmr-mcp/src/bus/wal))
   (:import-from #:dsmr-mcp/src/bus/bus
                 #:+default-batch-size+)
@@ -66,30 +67,52 @@
           (ensure-directories-exist dir-pn)
           (return dir-pn))))))
 
-(defmacro with-isolated-bus (() &body body)
+(defun %serve-bus-in-process (paths)
+  "Elect a broker on PATHS and serve it on a background thread. Returns a thunk
+   that stops it and joins the thread, so a caller holding several of these can
+   shut them down in whatever order it needs."
+  (broker:ensure-bus-dirs paths)
+  (let* ((br (broker:start-broker paths :block nil))
+         (stop nil)
+         (thread (sb-thread:make-thread
+                  (lambda () (broker:serve-broker br (lambda () stop)))
+                  :name "bus-receive-test-broker")))
+    (lambda ()
+      (setf stop t)
+      (ignore-errors (sb-thread:join-thread thread))
+      (ignore-errors (broker:stop-broker br)))))
+
+(defmacro with-isolated-bus ((&rest bus-names) &body body)
   "Run BODY with XDG_STATE_HOME pointed at a fresh temp directory and an
-   in-process broker serving the default bus paths derived from it, so the tool
-   connects to a private bus and never touches the host-wide one."
+   in-process broker serving the unnamed bus derived from it, so the tool
+   connects to a private bus and never touches the host-wide one.
+
+   Each name in BUS-NAMES additionally gets its own served bus under that same
+   temp root, which is how one test can read from two buses at once. With no
+   names this is exactly the single-bus fixture it has always been. Brokers stop
+   in the reverse of the order they started, then XDG_STATE_HOME is restored and
+   the temp tree removed."
   (let ((dir (gensym "DIR")) (saved (gensym "SAVED"))
-        (paths (gensym "PATHS")) (br (gensym "BR"))
-        (stop (gensym "STOP")) (thread (gensym "THREAD")))
+        (stoppers (gensym "STOPPERS")) (stopper (gensym "STOPPER")))
     `(let* ((,dir (%make-temp-directory))
             (,saved (uiop:getenv "XDG_STATE_HOME")))
        (unwind-protect
             (progn
               (setf (uiop:getenv "XDG_STATE_HOME") (namestring ,dir))
-              (let* ((,paths (broker:make-bus-paths))
-                     (,stop nil))
-                (broker:ensure-bus-dirs ,paths)
-                (let* ((,br (broker:start-broker ,paths :block nil))
-                       (,thread (sb-thread:make-thread
-                                 (lambda ()
-                                   (broker:serve-broker ,br (lambda () ,stop)))
-                                 :name "bus-receive-test-broker")))
-                  (unwind-protect (progn ,@body)
-                    (setf ,stop t)
-                    (ignore-errors (sb-thread:join-thread ,thread))
-                    (ignore-errors (broker:stop-broker ,br))))))
+              (let ((,stoppers '()))
+                (unwind-protect
+                     (progn
+                       (push (%serve-bus-in-process (broker:make-bus-paths))
+                             ,stoppers)
+                       ,@(mapcar
+                          (lambda (name)
+                            `(push (%serve-bus-in-process
+                                    (broker:make-bus-paths
+                                     (selector:bus-root ,name)))
+                                   ,stoppers))
+                          bus-names)
+                       ,@body)
+                  (dolist (,stopper ,stoppers) (funcall ,stopper)))))
          (setf (uiop:getenv "XDG_STATE_HOME") (or ,saved ""))
          (ignore-errors (uiop:delete-directory-tree
                          ,dir :validate t :if-does-not-exist :ignore))))))
@@ -172,6 +195,15 @@
    disconnect it on exit. NAMESPACE is given explicitly so a test can publish
    from a project other than the reader's own."
   `(let ((,var (agent:connect-agent ,namespace :name ,name)))
+     (unwind-protect (progn ,@body)
+       (ignore-errors (agent:disconnect-agent ,var)))))
+
+(defmacro with-publisher-on-bus ((var namespace name bus) &body body)
+  "Bind VAR to a publishing participant called NAME under NAMESPACE and
+   connected on the named BUS, and disconnect it on exit. The bus is explicit
+   because the point of these cases is that a message put on one bus is not
+   readable from another."
+  `(let ((,var (agent:connect-agent ,namespace :name ,name :bus ,bus)))
      (unwind-protect (progn ,@body)
        (ignore-errors (agent:disconnect-agent ,var)))))
 
@@ -383,3 +415,95 @@ strength of it, warnings notwithstanding."
               "the rendered text credits the sender")
         (false (search "author: valis" content)
                "and never credits the addressee")))))
+
+(define-test omitting-the-bus-reports-the-session-bus
+  "A call that names no bus behaves as it always has and reports the bus it
+actually read, which for a session with no selector set is the unnamed one,
+labelled \"default\". The label is what lets an agent joined to two buses tell
+its own traffic apart; a reply that simply omitted the field could not be told
+from an older reply that never carried it. Both reply shapes carry it, the
+receive and the deliberate abandonment."
+  (with-bus-session (session)
+    (with-publisher (pub session)
+      (%publish-backlog pub 3))
+    (let ((payload (%call session "limit" 1)))
+      (is string= "default" (%field payload "bus")
+          "a receive names the bus it read")
+      (is equal '("m1") (%texts payload)
+          "and delivers exactly what it always did"))
+    (let ((payload (%call session "skip_to_head" t)))
+      (is string= "default" (%field payload "bus")
+          "an abandonment names it too")
+      (is = 2 (%field payload "abandoned")
+          "and still reports what it gave up"))))
+
+(define-test a-named-bus-and-the-session-bus-stay-apart
+  "Naming a bus reads that bus. One session receives on its own bus and on a
+named one in turn, and each call comes back with only the traffic put on the bus
+it named. Without this the bus argument would be decorative: an agent leading one
+fleet and reporting to another would read one queue and believe it was the
+other's."
+  (with-isolated-bus ("alpha")
+    (with-rooted-session (session)
+      ;; Both participants connect before any traffic: a participant that has
+      ;; never read starts at the head of its own bus, so anything published
+      ;; first is not addressed to it.
+      (session-agent session)
+      (session-agent session nil :bus "alpha")
+      (with-publisher (pub session)
+        (agent:agent-publish pub "on the session bus"))
+      (with-publisher-on-bus (apub (%own-namespace session) "alpha-sister" "alpha")
+        (agent:agent-publish apub "on alpha"))
+      (let ((here (%call session)))
+        (is string= "default" (%field here "bus"))
+        (is equal '("on the session bus") (%texts here)
+            "the session's own bus delivers only its own traffic"))
+      (let ((there (%call session "bus" "alpha")))
+        (is string= "alpha" (%field there "bus")
+            "the reply names the bus that was asked for")
+        (is equal '("on alpha") (%texts there)
+            "and delivers only what was published there")))))
+
+(define-test a-bus-that-is-not-a-non-empty-string-is-refused
+  "A bus argument that is not a usable string is refused at the boundary. An
+empty string is refused with the rest rather than read as \"no bus named\":
+resolved, it would fall through to whatever bus the session already speaks on,
+and a caller that asked for one fleet's traffic would be handed another's while
+the reply reported success."
+  (with-bus-session (session)
+    (with-publisher (pub session)
+      (%publish-backlog pub 3))
+    (dolist (bad (list 7 t ""))
+      (let ((payload (%call session "bus" bad)))
+        (is string= "invalid-argument" (%error-type payload)
+            (format nil "bus ~S is refused" bad))
+        (false (gethash "messages" payload)
+               (format nil "bus ~S delivers nothing" bad))
+        (false (gethash "bus" payload)
+               (format nil "and bus ~S reports no bus, having read none" bad))))
+    (let ((payload (%call session)))
+      (is string= "m1" (first (%texts payload))
+          "a refused call left the session's cursor unmoved"))))
+
+(define-test an-unusable-bus-name-is-refused-rather-than-defaulted
+  "A name that cannot become a bus root comes back as invalid-argument carrying
+the reason, and the call reads nothing. The failure being closed here is the
+quiet one: a bad name downgraded to the session's own bus would hand back a
+result that looked like success while the caller sat on the wrong bus. The
+reserved name \"default\" is in the set because the watcher already prints
+bus=default for the unnamed one, so a bus actually called that would be
+unreadable in its output."
+  (with-bus-session (session)
+    (with-publisher (pub session)
+      (agent:agent-publish pub "on the session bus"))
+    (dolist (bad '("has/slash" "spaces here" "default"))
+      (let ((payload (%call session "bus" bad)))
+        (is string= "invalid-argument" (%error-type payload)
+            (format nil "bus ~S is refused" bad))
+        (true (search "bus-receive" (%content-text payload))
+              (format nil "the refusal for ~S names the tool" bad))
+        (false (gethash "messages" payload)
+               (format nil "and bus ~S read nothing from any bus" bad))))
+    (let ((payload (%call session)))
+      (is equal '("on the session bus") (%texts payload)
+          "the session's own traffic was never consumed by a refused call"))))
