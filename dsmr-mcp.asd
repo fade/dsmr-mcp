@@ -275,6 +275,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/integration/hermetic/circuit-breaker-test"
                "dsmr-mcp/tests/integration/hermetic/pool-affinity-test"
                "dsmr-mcp/tests/integration/bus/failover-test"
+               "dsmr-mcp/tests/integration/bus/segmentation-test"
                "dsmr-mcp/tests/integration/bus/watch-integration-test"
                "dsmr-mcp/tests/integration/scripts/launcher-supervise-test")
   :perform (test-op (o c)

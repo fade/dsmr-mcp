@@ -1,0 +1,342 @@
+#+TITLE: dsmr-mcp - Bus segmentation
+#+OPTIONS: toc:2 num:nil
+
+This document answers a single question: when several unrelated projects each
+have live agents on one workstation, how should the coordination bus keep them
+out of each other's traffic?
+
+It states where things stand today (measured, not estimated), the two candidate
+designs and why one was chosen over the other, the failure mode that should
+drive the acceptance criteria, the surface as it was actually built, and the
+adoption path. For how the bus works at all, read [[file:coordination-bus.org][Agent coordination bus]] first;
+this document assumes it.
+
+Measurements below were taken on 2026-07-27 unless stated otherwise. Numbers in
+this document are stamped because a figure without its expiry condition outlives
+the thing it described.
+
+* The situation is present tense
+
+The bus is one host-wide instance. There is a single write-ahead log, a single
+broker lock, a single membership file, and a single pair of sockets for the
+whole workstation.
+
+The namespace that already exists scopes *identity*, not *delivery*. A cursor is
+keyed on =<project-root>/<name>=, so an agent never re-reads a message it has
+already consumed, and it never receives its own publishes back. But every
+message from every project still lands in the one log, and every reader still
+walks past it.
+
+That is no longer hypothetical. Counting distinct project roots in the live
+cursor population:
+
+| Project root                     | Cursors |
+|----------------------------------+---------|
+| a constellation of eight repos   |     173 |
+| dsmr-mcp                         |      15 |
+| an unrelated TLS project         |       4 |
+| a vendored test library checkout |       2 |
+| ephemeral subagents under /tmp   |      16 |
+
+Four real projects share one 7.27 MB log. Two of them have no reason ever to see
+the constellation's traffic, and currently see all of it.
+
+* The unit of isolation is a fleet, not a project
+
+The obvious move is to derive the bus from the project root, so each project
+gets its own. That is wrong, and it is worth being explicit about why, because
+it looks correct until it breaks the thing the bus is for.
+
+The eight-repo constellation is eight *separate project roots* whose agents must
+reach each other. That cross-repo delivery is the bus's main job. Deriving the
+bus from the working directory would sever it, giving eight isolated buses with
+one agent each and no way to coordinate.
+
+So the boundary is a *fleet*: a named group of cooperating agents that may span
+any number of repositories. A fleet is declared, not inferred. One project can
+belong to a fleet with seven others, or sit alone.
+
+* Two candidate designs
+
+** Rejected: filter delivery on a shared log
+
+Keep one log, and have each reader skip records whose namespace does not match
+its own.
+
+This is cheap to build and it is not isolation. Foreign traffic still reaches
+disk, still occupies the log, and still has to be read and discarded by every
+reader. The log stays a single contention point that grows at the sum of every
+project's rate, and the cost of one noisy fleet is paid by every quiet one.
+
+It also fails the property that actually matters operationally: a fleet cannot
+be reasoned about, archived, or retired independently, because its history is
+interleaved with everyone else's in one file.
+
+One distinction has to be drawn here, because the bus as built does filter
+delivery in one place and that looks at first like the design just rejected. A
+message may name a single recipient, and every other reader filters it out. The
+difference is volume. Separating fleets was about not carrying another fleet's
+traffic at all: foreign records reaching your disk, growing your log, and being
+read and discarded by you at your expense. Within one fleet every member already
+carries every message, because that is what a fleet is. Filtering there changes
+only who reads a record, never what reaches disk, so the argument above has
+nothing to say about it.
+
+** Chosen: a selector that resolves to a separate state root
+
+A named selector resolves to a state root. Unset means today's host-wide bus,
+byte for byte. Set means a private root with its own log, broker lock,
+membership file, cursor directory, and socket pair.
+
+Most of the plumbing for this already existed: the path derivation takes a root
+and derives every path under it, and brokers already elect per root. What was
+missing was that nothing in the tree ever passed a non-default root.
+
+Three properties make this the better trade:
+
+- *Real isolation.* A foreign fleet's traffic never touches your disk, never
+  enters your log, and cannot be read by you at all.
+- *Opt-in.* An unset selector is the current behaviour exactly, so nothing
+  multiplies until someone chooses it, and there is no migration step.
+- *Independent lifecycle.* Each fleet's log can rotate, archive, and be reasoned
+  about on its own.
+
+The selector is a human-friendly name and is bounds-checked. The path it derives
+is that name verbatim, so the state directory stays legible to anyone reading it
+by hand. A Unix domain socket path is limited to roughly 108 bytes, and the
+answer to that is to bound the name and refuse one that will not fit, rather
+than contorting the path into something opaque.
+
+Selection precedence mirrors the existing identity resolution rather than
+introducing a second mental model for one concept.
+
+* The failure mode that should drive acceptance
+
+=dsmr-bus-watch= is a separately built and separately deployed binary. It
+derives the bus state root *itself*, with its own copy of the derivation, and
+deliberately does not depend on the broker module, because that dependency would
+pull ZeroMQ into the watcher binary.
+
+So there are two independent derivations of the same path. A selector has to
+reach both.
+
+If the watcher does not learn the selector, it arms on the wrong bus and *never
+fires*. It does not error. It reports healthy. An agent in that state is deaf
+while believing itself armed, and the condition is discovered only when somebody
+notices that a message was never answered.
+
+The liveness probe cannot currently distinguish this, because it answers only
+whether a watcher is alive, and a watcher on the wrong bus is perfectly alive.
+
+*Therefore, as an acceptance criterion rather than a nicety: the liveness probe
+and the status verb must both report which bus they are attached to, not merely
+whether they are attached.* That single change makes the entire class visible at
+a glance, and it is cheap next to the cost of not having it.
+
+A second consequence to state deliberately rather than discover: the restart
+listener becomes bus-scoped. A leader on one bus can no longer reach a project
+on another, by construction. Isolation is the feature, so this is intended, but
+it is a real reduction in reach and should be a decision rather than a surprise.
+
+An operator-facing global restart therefore *cannot ride the bus*. It has to
+enumerate the bus roots on disk and act out of band, writing its state to files
+per root. It is a filesystem operation, not a bus message.
+
+* The surface as built
+
+This section describes what exists rather than what was proposed. The acceptance
+criterion above is met: every liveness answer names the bus it answers for.
+
+** A name resolves to a state root
+
+A bus name is one literal directory segment. The unnamed bus is the path the bus
+has always used, and a bus called =valis= is that same path plus a =valis/=
+segment. Everything else derives from there and nowhere else: the log, the
+broker lock, the membership file, the cursor directory, the roster, and the pair
+of sockets. One function performs that derivation, and the broker, the watcher
+binary and the liveness beat all reach it, so the two copies the previous
+section warned about are now one.
+
+A name is bounded at 32 characters, restricted to letters, digits, hyphen,
+underscore and dot, and refused if it collides with something the state
+directory already means, =cursors= and =members= among them. The socket path the
+name would derive is measured against the kernel's limit at that moment, and a
+name that will not fit is refused outright. Nothing is ever shortened to make it
+fit, because a truncated socket path is a silently different bus, which is the
+whole class of failure this work exists to close.
+
+** How the selector is set, and how it is inherited
+
+One variable, =DSMR_BUS_SELECTOR=, declared in a repository's =.envrc= beside the
+agent name. Every process started in that repository inherits it, so an MCP
+session and a watcher armed from the same shell cannot land on different buses
+while both report themselves healthy. An empty value means the unnamed bus,
+which is what an untagged repository keeps getting.
+
+Precedence mirrors the identity resolution that already existed rather than
+introducing a second model for one idea: an explicit argument wins, then the
+environment variable, then the unnamed bus. Each bus verb takes an optional bus
+argument for a one-off, and each reports back which bus it acted on, printing
+=default= for the unnamed one. A name that cannot become a bus is refused, and
+nothing is ever published to, read from, or reported on the shared bus in place
+of a bus that was named. Silently landing on the wrong bus is the failure worth
+paying to avoid, so the refusal is loud and total.
+
+** What a watcher reports
+
+The watcher takes =--bus=, defaulting to the same variable the =.envrc= declares
+and the session resolves through. It validates the name where the operator's
+value is read and refuses to start on an unusable one: a mistyped cadence flag
+costs its own default, but a bus name that quietly degraded to the default would
+leave a watch armed where nobody is talking, reporting live and never firing.
+
+The liveness probe names the bus on every answer, the unnamed bus included,
+where it prints =default=. A field that appeared only for a named bus could not
+tell a watcher on the default bus from a binary too old to know that buses have
+names, which is the same silence the field exists to break. =default= can only
+ever mean the unnamed bus, because the bus refuses it as a name.
+
+One watch is armed per bus an agent is on. An agent may be on more than one: it
+holds a connection, a membership and a cursor on each, which is how an agent
+reports into a neighbouring fleet without carrying that fleet's traffic
+everywhere else. That is opt-in by definition, and the cost of the traffic it
+does carry was chosen.
+
+** What the roster holds, and what it does not
+
+Each bus has a roster held by its own broker under its own root: who is
+enrolled, who leads the bus, whether enrollment is open, and, for anyone who has
+left, the time they left. It is a different thing from the membership file one
+directory up, which is the lock live processes hold and which dies with them.
+
+The roster is operator-managed and *advisory*. Nothing on the serving path
+consults it. An agent absent from the roster, or refused a place on it, still
+connects, still publishes and still receives exactly as any other participant.
+Closing enrollment stops a leader listing new participants and stops nothing
+else: it is a gate, not an access control list.
+
+That is deliberate. Isolation between fleets comes from the separate state root
+and the filesystem permissions on it, never from a membership check, because the
+transport has no security surface that could back one. A declared leader plus a
+closeable gate is the whole answer to two fleets sharing a machine: each names
+its own bus and records its own leader. Adding a cryptographic guard here would
+dress a convention up as a control.
+
+** What leaving does
+
+An agent that leaves cleanly reads out whatever is still waiting for it, records
+its departure on the roster with the time, and disconnects. That entry transfers
+custody of its cursor to the bus's broker, which from then on keeps the cursor
+at the head of the log and retires it once the departure is old enough.
+
+Two things follow, and both are the point. A departed participant can never pin
+the log with records it will never read, so the pathology of one stale cursor
+holding weeks of log against retention cannot arise for an agent that left
+properly. And holding a cursor never quietly becomes keeping it forever, because
+what ages it out is the recorded departure time and not the file's own
+modification time: a held cursor is written continuously, so its modification
+time is always within seconds of now.
+
+Returning later resumes at the current head. No backlog arrives for the time
+away, which is what having left means rather than a loss of mail. Leaving twice
+is safe and does not push the departure time forward. Leaving does *not* rotate
+the log: rotation still needs every member gone and then the broker stopped, and
+a departing agent cannot reach that trigger on its own.
+
+** What addressing promises, and what it does not
+
+A message may name one recipient, and delivery hands it to that recipient alone.
+The record itself is ordinary: it sits in the fleet's one log like any other,
+and every reader's cursor still advances past it. A reader that stalled on mail
+addressed to somebody else would become exactly the log pin that holding cursors
+exists to prevent, so the filter is at delivery and never at the cursor.
+
+This is a delivery convenience, not a privacy boundary. The record is on the
+fleet's disk and readable by anyone who can read the fleet's state root. Claiming
+otherwise would be the same mistake as a bus-enforced roster.
+
+The path is built and off by default. The traffic pattern actually in use is
+leader to member and member to leader, which needs no addressing at all, and the
+capability exists because a bus that knows its participants' identities can
+address them, not because the pattern in use asked for it.
+
+* Two recent findings that bear on sequencing
+
+** The cursor reaper is not broken
+
+The reaper had appeared not to run: cursor files accumulated for weeks while the
+reaping code inspected as correct.
+
+On 2026-07-27 a deliberately restarted broker logged that it reaped 185 orphaned
+ephemeral cursors older than seven days, taking the directory from 394 files to
+209. The reap runs at broker startup. A broker that has been up for six days
+never reaches that path again, which is a sufficient explanation for unbounded
+growth without any defect in the reaper itself.
+
+Bound, since closed: one observation of a reap at startup did not prove there
+was no separate periodic path that was independently broken. Reading the call
+site settled it. The reap has exactly one call site, inside broker startup, and
+no timer and no second thread anywhere reaches it, so startup-only is now
+established rather than inferred.
+
+** Small buses make log rotation reachable
+
+Rotation is currently gated on the last member leaving cleanly, which was
+confirmed by measurement: while a fleet is up, the exclusive upgrade of the
+membership lock is refused, so the trigger is never reached. A constellation
+that never disperses never rotates.
+
+This cuts both ways for segmentation, and the second direction is easy to miss.
+Segmentation multiplies the number of logs and cursor directories, so an
+unreachable rotation trigger becomes a problem in more places. But a small fleet
+that genuinely parks at the end of a working session *does* reach last-member-out
+and rotates cleanly. Segmentation therefore partially repairs the trigger rather
+than only multiplying the problem.
+
+* Adoption path
+
+1. *Extract the path derivation into a shared leaf* imported by name, so the two
+   copies become one. There is no case for a hard dependency between the broker
+   and the watcher, so the shared piece has to be a leaf that both can import
+   without dragging in the transport.
+2. *Teach the selector to both derivations*, and surface the resolved bus
+   identity in the liveness probe and the status verb, per the acceptance
+   criterion above.
+3. *Move the whole fleet onto named buses at bring-up*, and let the unnamed bus
+   become the untagged legacy path. This inverts what this document previously
+   recommended, which was to move the unrelated projects first and leave the
+   constellation where it was on the grounds that it had nothing to migrate.
+
+   The reason for the inversion is a fact about timing, not a change of taste.
+   The fleet is down and its log is drained: the constellation's 173 cursors
+   have nothing pending behind them, so starting fresh on named roots loses
+   nothing whatever today. Once the agents are up and carrying unread messages,
+   the same move costs undelivered mail, and it costs it silently, because a
+   cursor left on the old root cannot say what it was still owed. There is one
+   window in which this migration is free, and it is open now.
+
+   Cursors therefore start clean on the new roots and nothing is copied across.
+   That is safe only under the same precondition, a drained log and a fleet that
+   is down. If the fleet is already up when this is read, work the cost out
+   again rather than inheriting this answer.
+
+Steps 1 and 2 change no behaviour for anyone who does not set a selector, so
+nothing multiplies until somebody names a bus.
+
+* How the sequencing was settled
+
+The earlier plan put the log lifecycle work first, on the reasoning that
+segmentation multiplies logs and cursor directories, so it is better to multiply
+machinery that already rotates and reaps correctly than machinery that does not.
+
+That reasoning never applied to steps 1 and 2, which multiply nothing. Two
+things then overtook it for step 3. The reaper turned out not to be broken. And
+a clean departure, which this work had to build in any case, hands a departed
+agent's cursor to its bus's broker and keeps it at the head of the log, which
+removes the pathology the lifecycle work was most needed for. Segmentation
+repairs part of the lifecycle rather than only multiplying it.
+
+The deciding argument was the window. The migration is free exactly while the
+fleet is down and the log is drained, and it stops being free the moment the
+agents come back up. Sequencing behind the lifecycle work would have spent that
+window to buy an ordering that was no longer needed.
