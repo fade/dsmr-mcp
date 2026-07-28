@@ -260,6 +260,139 @@ leader to member and member to leader, which needs no addressing at all, and the
 capability exists because a bus that knows its participants' identities can
 address them, not because the pattern in use asked for it.
 
+* Using a named bus
+
+Everything above describes the design. This section is the operating procedure:
+what to type, what to expect back, and which of the answers are lying to you.
+
+** Put a fleet on a bus of its own
+
+The bus name is one variable in each participating repository's =.envrc=, beside
+the agent name:
+
+#+begin_src sh
+export DSMR_BUS_AGENT="${DSMR_BUS_AGENT:-my-repo}"
+export DSMR_BUS_SELECTOR="${DSMR_BUS_SELECTOR:-valis}"
+#+end_src
+
+⚠ A =.envrc= that has been edited does not take effect until it is allowed
+again. Run =direnv allow .= in the repository afterwards. Until you do, the
+variable is absent, every process falls back to the shared bus, and nothing
+reports an error, because falling back is a legitimate configuration.
+
+⚠ Prefer a literal default to =$(basename "$PWD")=. The =:-= fallback only
+applies when the variable is unset, so a shell that already exported another
+repository's identity passes it straight through and the agent comes up under a
+name that is already taken, quietly eating that agent's mail.
+
+** Find out which bus you are actually on
+
+Two sides resolve the bus independently, and they can disagree. Ask each.
+
+The session, through any bus verb, which reports the bus it acted on:
+
+#+begin_src
+bus-status
+  => You are "my-repo" ... Bus valis is up: 0 message(s) pending.
+#+end_src
+
+The watcher, through its liveness probe:
+
+#+begin_src sh
+dsmr-bus-watch --check-live --bus valis \
+  --agent "$DSMR_BUS_AGENT" --namespace "$(pwd -P)/"
+#+end_src
+
+⚠ If those two name different buses you are *split*: the session talks on one
+bus and the watch listens on another, and both report themselves healthy. This
+is what an unallowed =.envrc= produces, and what a server that started before the
+variable existed keeps producing until it is restarted or the client reconnects.
+Fix the environment on both sides. Passing =--bus= to the watcher alone papers
+over it and leaves every verb that forgets the argument on the wrong bus.
+
+** Arm a watch, and prove it is the right one
+
+Arm the loop rather than the bare watcher, one per bus:
+
+#+begin_src sh
+while true; do
+  dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
+    --bus valis --agent "$DSMR_BUS_AGENT" --namespace "$(pwd -P)/"
+done | grep --line-buffered -E "^(bus|error):"
+#+end_src
+
+=--stream= exits 0 on its idle window on purpose: that is the self-heal that
+re-arms a watch which has gone silently deaf. The loop turns that exit into a
+re-arm. A bare =dsmr-bus-watch --stream= goes deaf at the first idle mark while
+still believing it is armed.
+
+⛔ =--namespace= takes the absolute project root with its trailing separator, not
+the repository's name. Paste =pwd -P=. The cursor and the heartbeat are both keyed
+on =<namespace>/<name>=, which produces the trap below.
+
+⚠ *A wrong namespace confirms itself.* A watch armed under the wrong namespace
+writes its heartbeat there, and a probe passing the same wrong namespace reads
+that heartbeat back and answers =live=. The check agrees with the mistake. So
+prove it with a control that must fail:
+
+#+begin_src sh
+dsmr-bus-watch --check-live --bus valis \
+  --agent "$DSMR_BUS_AGENT" --namespace /nonexistent/
+  => dead bus=valis          # required. `live` here means you are reading
+                             # your own misfiled heartbeat.
+#+end_src
+
+** Reading the liveness answer
+
+Every answer names its bus, on every outcome, so a watcher that is live on the
+wrong bus is readable rather than invisible.
+
+| Answer                            | Exit | Means                                          |
+|-----------------------------------+------+------------------------------------------------|
+| =live pid=N age_s=n bus=valis=    |    0 | Listening, on the bus you asked for            |
+| =live ... bus=<other>=            |    0 | *Deaf.* Live on a bus nobody is talking on     |
+| =live ... bus=default=            |    0 | On the shared host-wide bus                    |
+| =dead bus=valis=                  |    1 | Nothing listening. Re-arm                      |
+| =stale pid=N ...=                 |    1 | A watch existed and stopped refreshing         |
+| no =bus== field at all            |    - | Binary predates named buses. Reinstall it      |
+| refusal message                   |   64 | The name was rejected. Nothing was armed       |
+
+=default= is unambiguous: it can only ever mean the shared bus, because the bus
+refuses =default= as a name.
+
+** Names the bus will refuse
+
+A name is one directory segment: at most 32 characters of letters, digits,
+hyphen, underscore and dot. Reserved names the state directory already uses, such
+as =cursors=, =members= and =default=, are refused, as is any name whose derived
+socket path would exceed the kernel's limit.
+
+Refusal is always outright, and exits 64. Nothing is shortened to fit and nothing
+falls back to the shared bus, because a truncated or downgraded name is a
+silently different bus, which is the entire failure class this exists to close.
+
+#+begin_src sh
+dsmr-bus-watch --check-live --bus cursors ...
+  => refusing the bus name "cursors". That name is reserved ...  # exit 64
+#+end_src
+
+** Inspecting a bus on disk
+
+=scripts/bus-inspect.sh= reads a bus's state without composing paths by hand:
+=--list= for the buses that exist, a bare =[BUS]= for one bus's state, and
+=--id PATH NAME= to compose an agent id.
+
+** What isolation does and does not give you
+
+Separate buses give separate state roots, so traffic does not cross and one
+fleet's broker dying does not touch another's. Isolation comes from that
+separation and the filesystem permissions on it.
+
+It does *not* come from the roster. The roster is advisory: nothing on the
+serving path consults it, an agent absent from it still publishes and receives
+normally, and closing enrollment only stops a leader listing new participants.
+Being on the roster is not evidence of being connected, and =--check-live= is.
+
 * Two recent findings that bear on sequencing
 
 ** The cursor reaper is not broken

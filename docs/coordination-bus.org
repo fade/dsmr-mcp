@@ -18,9 +18,9 @@ It is *localhost only* and shares the server's trust posture: it is a
 coordination convenience among agents the operator already trusts, not a security
 boundary. See the [[file:threat-model.org][threat model]].
 
-* The three verbs
+* The verbs
 
-The bus surface is three tools. Their full input schemas live in the
+The bus surface is five tools. Their full input schemas live in the
 [[file:tools.org][tool reference]]; this is the operational summary.
 
 - =bus-publish= — broadcast a message. Fire-and-forget: the line is appended
@@ -32,12 +32,29 @@ The bus surface is three tools. Their full input schemas live in the
   long waiting for the first message.
 - =bus-status= — report whether a broker is running and how many messages are
   waiting for this agent, *without* consuming them. Use it to peek.
+- =bus-roster= - read and change who is enrolled on a bus, who leads it, and
+  whether enrollment is open. Operator-managed and *advisory*: nothing on the
+  serving path consults it, and an agent absent from it publishes and receives
+  exactly as any other participant. A gate, not an access control list.
+- =bus-leave= - leave a bus cleanly. The agent drains what is waiting, records
+  its departure with the time, and disconnects; the busmaster then holds its
+  cursor at the head so nothing unread pins the log. Returning later resumes at
+  the current head rather than delivering the backlog for the time away.
 
-All three accept two optional identity controls, =agent_id= and =ephemeral=,
-described under [[*Agent identity]] below.
+All five accept the optional identity controls =agent_id= and =ephemeral=,
+described under [[*Agent identity]] below, and an optional =bus= naming which bus
+to act on for a one-off. Each reports back the bus it acted on, printing
+=default= for the shared host-wide one. A name that cannot become a bus is
+refused outright: nothing is ever published to, read from, or reported on the
+shared bus in place of a bus that was named.
 
 A minimal round trip: =bus-status= to see the broker is up and the backlog,
 =bus-receive= to drain it (advancing the cursor), =bus-publish= to broadcast back.
+
+⚠ By default all of this happens on *one shared host-wide bus*, so unrelated
+projects see each other's traffic. A fleet that wants its own log, broker and
+roster names a bus. See [[file:bus-segmentation.org][Bus segmentation]], whose
+=Using a named bus= section is the operating procedure.
 
 * Agent identity
 
@@ -105,7 +122,8 @@ loses a message — it degrades to catch-up on the next receive.
 
 * On-disk state
 
-All bus state lives under one directory, rooted at =XDG_STATE_HOME=:
+All state for one bus lives under one directory, rooted at =XDG_STATE_HOME=. The
+layout below is the *unnamed* bus, which is what an untagged repository uses:
 
 #+begin_example
 $XDG_STATE_HOME/dsmr-mcp/bus/        (or ~/.local/state/dsmr-mcp/bus/ if unset)
@@ -119,18 +137,40 @@ $XDG_STATE_HOME/dsmr-mcp/bus/        (or ~/.local/state/dsmr-mcp/bus/ if unset)
 └── bus.wal.archive-<ms>             # rotated logs from clean last-member shutdowns
 #+end_example
 
-The directory is shared by every dsmr-mcp process on the host — that is precisely
-how cross-project agents find one another. To reset a single participant's
-backlog, delete its file under =cursors/=; the encoding is the percent-escaped
-identity (e.g. =/home/you/proj/main= becomes =%2Fhome%2Fyou%2Fproj%2Fmain=).
+The directory is shared by every dsmr-mcp process on the host that has not named a
+bus, which is precisely how cross-project agents find one another. To reset a
+single participant's backlog, delete its file under =cursors/=; the encoding is
+the percent-escaped identity (e.g. =/home/you/proj/main= becomes
+=%2Fhome%2Fyou%2Fproj%2Fmain=).
+
+A *named* bus is that same path plus one directory segment for the name, and
+every item above derives from there and nowhere else:
+
+#+begin_example
+$XDG_STATE_HOME/dsmr-mcp/bus/valis/  # the bus named `valis`
+├── bus.wal                          # its own log, broker lock, members,
+├── broker.lock                      #   cursors and sockets, all separate
+├── members                          #   from the unnamed bus and from every
+├── cursors/                         #   other named bus
+├── roster                           # who is enrolled, who leads (advisory)
+└── *.ipc
+#+end_example
+
+Two fleets on one machine therefore share nothing: separate logs, separate
+brokers, separate cursors. Isolation comes from that separation and the
+filesystem permissions on it, never from a membership check.
 
 * Configuration
 
-The bus reads two environment variables:
+The bus reads three environment variables:
 
 - =DSMR_BUS_AGENT= — the project's stable bus identity (rule 3 above). The shipped
   per-project =.envrc= exports it, defaulting to the project directory name. Set
   it explicitly to pin a different name. Empty is treated as unset.
+- =DSMR_BUS_SELECTOR= - which bus this repository joins, declared in the same
+  =.envrc= beside the agent name. Unset or empty means the shared host-wide bus.
+  Precedence mirrors identity resolution: an explicit argument wins, then this
+  variable, then the unnamed bus.
 - =XDG_STATE_HOME= — roots the bus state directory; falls back to
   =~/.local/state= when unset.
 
@@ -138,6 +178,13 @@ No other setup is required. The broker is elected lazily on first bus use, and t
 =.envrc= the server offers to write (see
 [[file:configuration.org::*direnv per-project setup][direnv per-project setup]])
 already carries the =DSMR_BUS_AGENT= stanza.
+
+⚠ An edited =.envrc= does not take effect until =direnv allow .= runs, and a
+server already running keeps the environment it started with. Either one leaves
+the session on the shared bus while a watcher armed with an explicit =--bus=
+listens on the named one. Both sides report healthy. See
+[[file:bus-segmentation.org::*Find out which bus you are actually on][Find out
+which bus you are actually on]].
 
 * Operating it
 
@@ -154,6 +201,16 @@ already carries the =DSMR_BUS_AGENT= stanza.
 - *Single host only.* =flock= and =ipc://= sockets are machine-local; agents on
   different machines each get their own independent bus. There is no cross-host
   transport.
+- *Nobody is hearing me, but everything reports healthy.* You are on the wrong
+  bus. Ask each side separately which bus it resolved: a bus verb reports the bus
+  it acted on, and =dsmr-bus-watch --check-live= names the bus in every answer.
+  If they disagree, fix the environment rather than passing =--bus= to one side.
+- *A watch reports live but never fires.* Either it is live on the wrong bus,
+  which the =bus== field now shows, or it was armed under the wrong
+  =--namespace=, which is self-confirming and needs a deliberately wrong control
+  probe to detect. Both are covered in
+  [[file:bus-segmentation.org::*Arm a watch, and prove it is the right one][Arm a
+  watch, and prove it is the right one]].
 
 * Auto-watch (waking a dormant agent)
 
@@ -383,7 +440,8 @@ and uses the default WAL under =$XDG_STATE_HOME/dsmr-mcp/bus/=.
 
 * See also
 
-- [[file:configuration.org::*direnv per-project setup][Configuration → direnv per-project setup]] — where =DSMR_BUS_AGENT= comes from.
-- [[file:tools.org][Tool reference]] — full input schemas for =bus-publish=, =bus-receive=, =bus-status=.
+- [[file:bus-segmentation.org][Bus segmentation]] - giving a fleet a bus of its own, and the operating procedure under =Using a named bus=.
+- [[file:configuration.org::*direnv per-project setup][Configuration → direnv per-project setup]] - where =DSMR_BUS_AGENT= and =DSMR_BUS_SELECTOR= come from.
+- [[file:tools.org][Tool reference]] - full input schemas for =bus-publish=, =bus-receive=, =bus-status=, =bus-roster= and =bus-leave=.
 - [[file:architecture.org][Architecture]] — where the bus sits in the module map.
 - [[file:threat-model.org][Threat model]] — the localhost-only trust posture the bus inherits.
