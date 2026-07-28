@@ -427,6 +427,43 @@ the reply reported success on the named one."
       (is string= "invalid-argument"
           (%error-type (%roster session "action" "list" "bus" "not a bus name"))))))
 
+(define-test a-bus-that-is-not-a-non-empty-string-is-refused-by-the-roster-verb
+  "A bus argument that is not a usable string is refused at the boundary, the
+empty string with the rest. Read as \"no bus named\" it would fall through to the
+session's own bus, so an enroll meant for one fleet would land on another's
+roster while the reply reported success. Every action is checked, because a
+refusal that held for listing and not for enrolling would be the dangerous half
+missing."
+  (with-isolated-bus ()
+    (with-rooted-session (session)
+      (dolist (bad (list "" 7 t))
+        (let ((payload (%roster session "action" "enroll" "agent" "sister"
+                                "bus" bad)))
+          (is string= "invalid-argument" (%error-type payload)
+              (format nil "enroll with bus ~S is refused" bad))
+          (true (search "bus-roster" (%content-text payload))
+                (format nil "the refusal for ~S names the tool" bad)))
+        (is string= "invalid-argument"
+            (%error-type (%roster session "action" "list" "bus" bad))
+            (format nil "list with bus ~S is refused" bad))
+        (is string= "invalid-argument"
+            (%error-type (%roster session "action" "declare-leader"
+                                  "agent" "sister" "bus" bad))
+            (format nil "declare-leader with bus ~S is refused" bad))
+        (is string= "invalid-argument"
+            (%error-type (%roster session "action" "close-enrollment"
+                                  "bus" bad))
+            (format nil "close-enrollment with bus ~S is refused" bad)))
+      ;; Nothing durable was touched: no enrolment recorded, no leader named,
+      ;; and the gate still open.
+      (let ((listing (%roster session "action" "list")))
+        (is = 0 (%field listing "count")
+            "no refused enroll reached the session's own roster")
+        (is eq 'null (%field listing "leader")
+            "and no refused declare-leader named one")
+        (is eq t (%field listing "enrollment_open")
+            "and no refused close-enrollment shut the gate")))))
+
 (define-test the-roster-verb-needs-a-project-root
   "With no project root there is no namespace to act under, and the verb says so
 in the shape every bus verb uses rather than failing somewhere deeper."
@@ -555,3 +592,31 @@ success."
     (with-rooted-session (session)
       (is string= "invalid-argument"
           (%error-type (%leave session "bus" "not a bus name"))))))
+
+(define-test a-bus-that-is-not-a-non-empty-string-is-refused-by-the-leave-verb
+  "The leave verb refuses the same set the other bus verbs do. An empty bus read
+as \"no bus named\" would depart the session's own bus while the reply named it as
+a success, which is the one departure the caller did not ask for."
+  (with-isolated-bus ()
+    (with-rooted-session (session)
+      (let ((here (session-agent session "sister")))
+        (dolist (bad (list "" 7 t))
+          (let ((payload (%leave session "agent_id" "sister" "bus" bad)))
+            (is string= "invalid-argument" (%error-type payload)
+                (format nil "leaving with bus ~S is refused" bad))
+            (false (%field payload "left")
+                   (format nil "and bus ~S left nothing" bad))
+            (true (search "bus-leave" (%content-text payload))
+                  (format nil "the refusal for ~S names the tool" bad))))
+        ;; No departure was stamped and the participant is untouched: still the
+        ;; cached one, still connected, still delivering.
+        (false (%member-named (%roster session "action" "list")
+                              (%qualified session "sister"))
+               "no refused leave stamped a departure on the roster")
+        (is eq here (session-agent session "sister")
+            "and the participant was never forgotten")
+        (with-participant (pub (%own-namespace session) :name "publisher")
+          (agent:agent-publish pub "still here"))
+        (is equal '("still here")
+            (agent:agent-receive here :timeout-ms 5000)
+            "so it still receives")))))

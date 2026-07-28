@@ -299,7 +299,7 @@ own leader, not because anything here is enforced.~%~%~A"
   (let ((action (%canonical-action (gethash "action" args)))
         (agent-arg (gethash "agent" args))
         (bus-arg (gethash "bus" args)))
-    ;; Both guards run before anything reaches the roster, so a refused call
+    ;; Every guard runs before anything reaches the roster, so a refused call
     ;; leaves the bus's durable metadata exactly as it found it.
     (unless action
       (return-from tool-handle
@@ -313,6 +313,15 @@ own leader, not because anything here is enforced.~%~%~A"
          id (format nil "bus-roster: the ~A action needs an agent argument, ~
 either a full NAMESPACE/NAME bus id or a bare name in this project's namespace."
                     action))))
+    ;; An empty bus is refused rather than read as "no bus named": resolved, it
+    ;; would fall through to whatever bus the session already speaks on, and a
+    ;; caller that asked to change one fleet's roster would change another's
+    ;; while the reply reported success on the bus it actually used.
+    (unless (or (null bus-arg) (and (stringp bus-arg) (plusp (length bus-arg))))
+      (return-from tool-handle
+        (%invalid-argument
+         id "bus-roster: bus must be a non-empty string naming a bus. Omit it \
+to act on this session's own bus.")))
     (handler-case
         (let* ((a (session-agent (tool-session tool) nil :bus bus-arg))
                (paths (agent:agent-paths a))
