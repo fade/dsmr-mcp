@@ -285,6 +285,69 @@ applies when the variable is unset, so a shell that already exported another
 repository's identity passes it straight through and the agent comes up under a
 name that is already taken, quietly eating that agent's mail.
 
+** Bringing a fleet up on a bus that already exists
+
+The common case after the first day: the bus has been running for weeks, it holds
+history and cursors, and you are starting agents against it again. The thing to
+know before anything else:
+
+⛔ *A running bus is not an assembled fleet, and starting the agents does not
+assemble one.* These are three separate facts, and each can be true without the
+others:
+
+1. the bus exists and its broker is serving;
+2. the agents are running and can reach it;
+3. a roster records who is in the fleet and who leads it.
+
+Starting an agent in each repository gets you 1 and 2. It does not get you 3.
+Neither =/leader= nor =/worker= enrolls anybody: they rebuild an agent's own
+context and arm its watch. Enrollment is =/fleet='s job and only =/fleet='s. A
+fleet brought up without it works, publishes and receives perfectly well, and has
+no record of who is in it.
+
+*The order that works:*
+
+1. *Assign the tag* in each participating repository's =.envrc=, then
+   =direnv allow .= in each. Do this before starting any agent, because a process
+   inherits the environment it was started with.
+2. *Start the agents*, one per repository.
+3. *Run =/fleet=* from the leader's terminal to declare the leader, enroll each
+   sister, and close enrollment. This is the step that is easy to skip, because
+   everything already appears to work without it.
+4. *Each sister arms its watch* and proves it with a wrong-namespace control.
+
+*Check what you are joining before you assemble.* On a bus with history, ask what
+is already there:
+
+#+begin_src sh
+scripts/bus-inspect.sh --list          # which buses exist
+scripts/bus-inspect.sh <bus>           # broker, roster, cursors for one
+#+end_src
+
+⚠ *An empty roster and a bus that never had one print the same line*: no entries,
+enrollment open, leader none. On disk they differ, because a roster that has ever
+been written carries an =updated-at= stamp and a synthesized empty one does not.
+If the distinction matters, read the stamp rather than the summary. A roster file
+that was deleted outright is indistinguishable from one that never existed.
+
+*What returning agents do with the history.* Cursors are durable and survive
+everything above, so an agent that has been away resumes at its own cursor and
+may wake to a backlog rather than to silence. An agent that left through
+=bus-leave= is different: the busmaster held its cursor at the head, so it returns
+to the current head and is delivered nothing from the period it was away. Neither
+is a fault, but they look very different on the first wake, so know which one you
+are watching.
+
+*Confirming the bring-up.* Two questions, and they are not the same question:
+
+- *Who is in the fleet?* The roster answers, and it is a record of intent.
+- *Who can actually hear?* Only =--check-live= answers, per agent, per bus.
+
+⛔ Never read enrollment as reachability. An enrolled agent whose watch is dead is
+silent, and an unenrolled agent receives everything normally. A bring-up is
+finished when every sister answers =live= on the bus you meant, not when the
+roster looks complete.
+
 ** Find out which bus you are actually on
 
 Two sides resolve the bus independently, and they can disagree. Ask each.
