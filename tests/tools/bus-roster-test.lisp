@@ -172,18 +172,19 @@
 
 (defun %qualified (session name)
   "The full bus id a bare NAME resolves to under SESSION's namespace, built the
-   way the bus builds it."
-  (format nil "~A/~A" (%own-namespace session) name))
+   way the bus builds it: the project root with its trailing separator serving as
+   the single separator at the join."
+  (concatenate 'string (%own-namespace session) name))
 
-(defun %hand-typed (session name)
-  "The full bus id for NAME as an operator writes it: one separator at the join.
+(defun %doubled (session name)
+  "The full bus id for NAME with two separators at the join.
 
    A leader listing a sister that lives in another repository cannot pass a bare
    name, because a bare name is qualified with the calling session's own project
-   and would reach the wrong one. So it types the full id, and it types one
-   separator. The bus builds every id with two, because the namespace is a
-   project root in its directory form and already ends in one."
-  (concatenate 'string (%own-namespace session) name))
+   and would reach the wrong one. So it types the full id, and typing a project
+   root that already ends in a separator produces this. Nothing builds it any
+   more, and the state written before the join was normalized is full of it."
+  (concatenate 'string (%own-namespace session) "/" name))
 
 (defmacro with-participant ((var namespace &rest connect-args) &body body)
   "Bind VAR to a participant connected under NAMESPACE and disconnect it on the
@@ -256,15 +257,21 @@ may both run an agent called valis."
 (define-test enrolling-a-full-id-uses-it-as-given
   "An argument that already carries a namespace separator is taken as a full bus
 id, so a leader can list an agent from a repo other than the one it is sitting
-in."
+in. A doubled separator at the join names that same agent, and the entry is
+written under the single-separator spelling: that is what every id the bus builds
+carries, and what the busmaster derives the agent's held cursor filename from."
   (with-isolated-bus ()
     (with-rooted-session (session)
       (let ((payload (%roster session "action" "enroll"
-                                      "agent" "/tmp/other-project//fulcrum")))
-        (is string= "/tmp/other-project//fulcrum" (%field payload "agent_id"))
+                                      "agent" "/tmp/other-project/fulcrum")))
+        (is string= "/tmp/other-project/fulcrum" (%field payload "agent_id"))
         (true (%member-named (%roster session "action" "list")
-                             "/tmp/other-project//fulcrum")
-              "and it is listed under that id")))))
+                             "/tmp/other-project/fulcrum")
+              "and it is listed under that id"))
+      (%roster session "action" "enroll" "agent" "/tmp/other-project//mercer")
+      (true (%member-named (%roster session "action" "list")
+                           "/tmp/other-project/mercer")
+            "a doubled separator is listed under the single-separator spelling"))))
 
 (define-test disenrolling-marks-departed-and-stamps-the-time
   "Disenroll records that the agent left and when. The stamp is what the
@@ -299,7 +306,7 @@ an unlisted agent is exactly the one nobody is watching."
    the listing would show one sister in both states at once."
   (with-isolated-bus ()
     (with-rooted-session (session)
-      (%roster session "action" "enroll" "agent" (%hand-typed session "sister"))
+      (%roster session "action" "enroll" "agent" (%doubled session "sister"))
       (let ((payload (%leave session "agent_id" "sister")))
         (is eq t (%field payload "left")))
       (let ((listing (%roster session "action" "list")))
@@ -318,7 +325,7 @@ an unlisted agent is exactly the one nobody is watching."
     (with-rooted-session (session)
       (%roster session "action" "enroll" "agent" "sister")
       (let ((payload (%roster session "action" "disenroll"
-                              "agent" (%hand-typed session "sister"))))
+                              "agent" (%doubled session "sister"))))
         (true (integerp (%field payload "departed_at")))
         (is string= "departed" (gethash "status" (%field payload "member"))))
       (let ((listing (%roster session "action" "list")))
@@ -415,7 +422,7 @@ declared leader gains no ability an ordinary member lacks."
     (with-rooted-session (session)
       (%roster session "action" "enroll" "agent" "valis")
       (%roster session "action" "declare-leader"
-               "agent" (%hand-typed session "valis"))
+               "agent" (%doubled session "valis"))
       (%roster session "action" "declare-leader" "agent" "valis")
       (let ((listing (%roster session "action" "list")))
         (is string= (%qualified session "valis") (%field listing "leader"))

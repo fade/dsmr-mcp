@@ -145,9 +145,9 @@
 
 (defun %stable-id (session name)
   "The id session-agent resolves for a stable NAME under SESSION's namespace,
-   built exactly as the bus does: <namespace>/<name> (the namespace namestring
-   already ends in a slash, so the join yields a double slash)."
-  (format nil "~A/~A" (%root-namespace session) name))
+   built exactly as the bus does: <namespace>/<name> with a single separator at
+   the join, which the namespace namestring's trailing slash already supplies."
+  (concatenate 'string (%root-namespace session) name))
 
 (defmacro with-agent ((var agent-form) &body body)
   "Bind VAR to the agent from AGENT-FORM, disconnecting it on exit."

@@ -83,24 +83,25 @@
   "ID reduced to the spelling that identifies the agent, so two ways of writing
    one identity address one entry.
 
-   A bus id is a namespace joined to a name, and the namespace is a project root
-   in its directory form, which already ends in a separator. Every id the
-   constructor builds therefore carries two separators at the join. An operator
+   A bus id is a namespace joined to a name by a single separator. An operator
    listing a sister that lives in another repository has to type the full id by
-   hand, and types one. Both mean the same agent. Without this they land on two
+   hand, and ids built before the join was normalized carry two separators,
+   because the namespace is a project root in its directory form and already ends
+   in one. All of them mean the same agent. Without this they land on separate
    files, and the one the operator made can never be departed afterwards, because
    leaving only ever departs the identity a session resolves for itself: the
    roster then shows a single agent as enrolled and departed at once.
 
-   The name is the segment after the last separator and the namespace is
-   everything before it, spelled with its trailing separator restored. Idempotent,
-   so an id that already carries the constructed join comes back unchanged. An id
-   with no separator at all is not a qualified id and is returned as it came."
+   The name is the segment after the last separator, and the namespace is
+   everything before it with any trailing separators dropped; the two are rejoined
+   by exactly one. Idempotent, so an id already spelled this way comes back
+   unchanged. An id with no separator at all is not a qualified id and is returned
+   as it came."
   (if (and (stringp id) (find #\/ id))
       (let* ((cut (position #\/ id :from-end t))
              (name (subseq id (1+ cut)))
              (namespace (string-right-trim "/" (subseq id 0 cut))))
-        (concatenate 'string namespace "//" name))
+        (concatenate 'string namespace "/" name))
       id))
 
 (defun roster-entry-path (id roster-dir)
@@ -315,35 +316,14 @@
    this writes that fact down so any participant can read it back. It changes no
    entry's status and confers no ability that a member lacks.
 
-   Declaring the same agent again under the other separator spelling keeps the
-   constructed one rather than replacing it, so the leader a listing prints
+   What lands is the identity spelling, so declaring the same agent again under
+   another separator spelling records one leader, and the leader a listing prints
    matches the entry sitting beside it in that listing."
-  (let ((recorded (%preferred-spelling id (leader state-path))))
+  (let ((recorded (%canonical-key id)))
     (%update-bus-state state-path :leader recorded)
     recorded))
 
 ;;; --------------------------------------------------------- enrol and depart
-
-(defun %preferred-spelling (id recorded)
-  "Which spelling of one identity gets written down: ID, or the RECORDED one when
-   that is the spelling the id constructor produces.
-
-   The recorded id is not decoration. The busmaster derives a departed agent's
-   cursor filename from this field, and that cursor was created under the
-   constructed spelling. A call that names the same agent with a hand-typed
-   single separator must therefore not overwrite it: the entry would still be
-   found by every later call, and the cursor behind it would silently stop being
-   advanced, which is the one failure that turns a departed agent into the thing
-   pinning the log.
-
-   Only a recorded id that names the same agent can win, so an entry that was
-   planted by hand and holds something unrelated is replaced rather than
-   believed."
-  (if (and (stringp recorded)
-           (string= (%canonical-key recorded) (%canonical-key id))
-           (search "//" recorded))
-      recorded
-      id))
 
 (defun enroll (id roster-dir state-path &key role)
   "Enroll ID on the bus whose roster is ROSTER-DIR and whose state is STATE-PATH.
@@ -358,12 +338,17 @@
    existing entry carried and to :MEMBER for a new one, so re-enrolling a leader
    does not quietly demote it.
 
-   An id typed with one separator at the join and the same id as the constructor
-   builds it are one agent here, and land on one entry."
+   Every spelling of one id is one agent here, and they land on one entry. What
+   is written down is the identity spelling, because the busmaster derives a
+   departed agent's cursor filename from this field and that cursor is named by
+   the id the agent's own session resolves. A field holding some other spelling
+   points the busmaster at a file that does not exist, and a missing cursor path
+   is skipped in silence: the departed agent's position then stops advancing and
+   quietly becomes the thing pinning the log."
   (if (enrollment-open-p state-path)
       (let* ((now (get-universal-time))
              (existing (entry id roster-dir))
-             (recorded (%preferred-spelling id (getf existing :id)))
+             (recorded (%canonical-key id))
              (returning (not (eq (entry-status existing) :enrolled)))
              (plist (list :id recorded
                           :status :enrolled
@@ -383,12 +368,11 @@
    self-service departure is always recorded. A departure with no record would
    leave the agent's cursor with nothing to age against.
 
-   An id typed with one separator at the join departs the entry an id built by
-   the constructor enrolled, and the other way about. Anything else lets an agent
-   sit on the roster as enrolled and departed at the same time, with the enrolled
-   half beyond the reach of every later call."
+   Any spelling of an id departs the entry any other spelling of it enrolled.
+   Anything else lets an agent sit on the roster as enrolled and departed at the
+   same time, with the enrolled half beyond the reach of every later call."
   (let* ((existing (entry id roster-dir))
-         (recorded (%preferred-spelling id (getf existing :id)))
+         (recorded (%canonical-key id))
          (plist (list :id recorded
                       :status :departed
                       :enrolled-at (getf existing :enrolled-at)
