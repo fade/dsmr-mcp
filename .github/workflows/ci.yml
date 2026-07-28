@@ -29,6 +29,9 @@ jobs:
     name: Fast unit suite
     if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # A wedged job has to fail while someone is still watching it. With no bound
+    # the ceiling is GitHub's 6-hour default, which a hang burns in silence.
+    timeout-minutes: 30
     env:
       # ASDF finds the project at the checkout root; dependencies resolve from
       # the Quicklisp dist (every dep is in the dist — no local checkouts needed).
@@ -151,6 +154,10 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'run-integration')
     runs-on: ubuntu-latest
+    # The suite takes about 13 minutes on a development machine. This bounds a
+    # wedged run well clear of that, so a hang is reported as a failure in the
+    # hour it happens instead of quietly consuming a whole job budget.
+    timeout-minutes: 60
     env:
       CL_SOURCE_REGISTRY: '${{ github.workspace }}//:'
     steps:
