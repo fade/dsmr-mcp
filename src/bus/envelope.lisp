@@ -50,8 +50,23 @@
    project root (the shared 'generation name'); NAME, when given, is a stable
    subagent name that resumes its cursor across restarts. When NAME is omitted an
    auto-unique ephemeral name is generated, so multiple anonymous subagents in one
-   project each get a distinct id under the shared namespace."
-  (format nil "~A/~A" namespace (or name (%unique-local))))
+   project each get a distinct id under the shared namespace.
+
+   Exactly one separator lands at the join, whether or not NAMESPACE arrives in
+   directory form. A project root usually carries a trailing separator and a
+   namespace written by hand usually does not, and an id whose shape depends on
+   which of the two the caller happened to hold is an id that spells one agent two
+   ways. The cursor, the heartbeat and the roster entry are all named from this
+   string, so a second spelling is a second set of files for one identity.
+
+   A namespace that is empty, or is nothing but separators, leaves the name
+   standing on its own rather than growing a leading separator no project root
+   put there."
+  (let ((base (string-right-trim "/" (or namespace "")))
+        (leaf (or name (%unique-local))))
+    (if (string= base "")
+        leaf
+        (concatenate 'string base "/" leaf))))
 
 (defun encode-id (id)
   "Percent-encode ID into a single filesystem-safe token for a cursor filename.
@@ -265,15 +280,21 @@
 
    A record with no self-id (an un-enveloped message from an older publisher) or
    one whose id will not decode renders as \"unknown\". Delivery of a message must
-   never depend on being able to name its author."
+   never depend on being able to name its author.
+
+   A trailing separator takes no part in deciding whether the sender is at home.
+   OWN-NAMESPACE reaches this function as a project root in its directory form,
+   while the namespace taken back out of an id has had that separator consumed by
+   the join, so comparing the two raw would call every local sender foreign."
   (let ((id (decode-id encoded-self-id)))
     (if (null id)
         "unknown"
         (multiple-value-bind (namespace name) (split-agent-id id)
-          (cond ((null namespace) id)
-                ((and own-namespace (string= namespace own-namespace)) name)
-                (t (format nil "~A@~A" name
-                           (string-right-trim "/" namespace))))))))
+          (let ((bare (and namespace (string-right-trim "/" namespace)))
+                (home (and own-namespace (string-right-trim "/" own-namespace))))
+            (cond ((null namespace) id)
+                  ((and home (string= bare home)) name)
+                  (t (format nil "~A@~A" name bare))))))))
 
 (defun foreign-self-id-p (encoded-self-id own-encoded)
   "True when a record whose decoded ENCODED-SELF-ID is ENCODED-SELF-ID is FOREIGN

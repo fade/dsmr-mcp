@@ -95,9 +95,14 @@
    namespace prefix. For a stable agent this is the name supplied via agent_id or
    DSMR_BUS_AGENT; for an ephemeral one it is the auto-unique token. This is how an
    agent reads its own handle without parsing the composite id by eye (the
-   namespace and a same-named project would otherwise be ambiguous)."
+   namespace and a same-named project would otherwise be ambiguous).
+
+   The prefix is rebuilt with exactly one separator, the way the id itself was
+   joined. A project root reaches this in directory form and already ends in one,
+   so pasting another on would match no id and hand the caller back the whole
+   composite where a bare name belongs."
   (let* ((ns (agent-namespace agent))
-         (prefix (and ns (concatenate 'string ns "/")))
+         (prefix (and ns (concatenate 'string (string-right-trim "/" ns) "/")))
          (id (agent-id agent)))
     (if (and prefix
              (<= (length prefix) (length id))

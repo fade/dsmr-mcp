@@ -90,15 +90,17 @@
 (defun constructed-id (name)
   "The id the constructor builds for NAME, which is what a session resolves for
    itself. The namespace goes in as a project root in its directory form, exactly
-   as a live session supplies it, so the join carries the two separators every
+   as a live session supplies it, so the join carries the single separator every
    real id carries."
   (envelope:agent-id (concatenate 'string +namespace+ "/") :name name))
 
-(defun hand-typed-id (name)
-  "The id for NAME as an operator writes it: one separator at the join. Nothing
-   generates this spelling. It only ever arrives as typed input, and it has to
-   name the same agent as the constructed one."
-  (concatenate 'string +namespace+ "/" name))
+(defun doubled-id (name)
+  "The id for NAME with two separators at the join. Nothing builds this spelling
+   any more, but it is written down all over the state that predates the
+   normalized join, and an operator typing a namespace that already ends in a
+   separator produces it by hand. It has to name the same agent as the
+   constructed one."
+  (concatenate 'string +namespace+ "//" name))
 
 (defun entry-files (roster-dir)
   (remove-if-not (lambda (f) (equal (pathname-type f) "member"))
@@ -226,15 +228,15 @@
 
 (define-test enrolling-by-hand-then-departing-as-the-agent-leaves-one-entry
   "The case measured live. An operator lists a sister in another repository by
-   typing its full id, which carries one separator at the join; that sister later
-   leaves under the id its own session resolves, which carries two. One agent,
-   one entry, and it is departed.
+   typing its full id, and types a namespace that already ends in a separator, so
+   the join carries two; that sister later leaves under the id its own session
+   resolves, which carries one. One agent, one entry, and it is departed.
 
    Split in two, the typed entry could never be departed by anything: leaving
    only ever departs the identity the session resolves for itself, so the roster
    would show one agent as enrolled and departed at once, forever."
   (with-roster (roster-dir state-path)
-    (let ((typed (hand-typed-id "parachute"))
+    (let ((typed (doubled-id "parachute"))
           (built (constructed-id "parachute")))
       (roster:enroll typed roster-dir state-path)
       (roster:disenroll built roster-dir)
@@ -253,7 +255,7 @@ busmaster derives the held cursor's filename from")))))
    cursor was created under that spelling and a typed departure must not point
    the busmaster at a file that does not exist."
   (with-roster (roster-dir state-path)
-    (let ((typed (hand-typed-id "fulcrum"))
+    (let ((typed (doubled-id "fulcrum"))
           (built (constructed-id "fulcrum")))
       (roster:enroll built roster-dir state-path)
       (roster:disenroll typed roster-dir)
@@ -270,7 +272,7 @@ busmaster derives the held cursor's filename from")))))
    lookup that missed would be worse than a duplicate write: the caller is told
    the agent is absent, and goes on to create the second entry itself."
   (with-roster (roster-dir state-path)
-    (let ((typed (hand-typed-id "hekate"))
+    (let ((typed (doubled-id "hekate"))
           (built (constructed-id "hekate")))
       (roster:enroll built roster-dir state-path)
       (multiple-value-bind (record present) (roster:entry typed roster-dir)
@@ -356,7 +358,7 @@ busmaster derives the held cursor's filename from")))))
    spelled the way the roster spells that agent's entry. A leader printed in a
    spelling no entry uses leaves a reader unable to match the two up."
   (with-roster (roster-dir state-path)
-    (let ((typed (hand-typed-id "valis"))
+    (let ((typed (doubled-id "valis"))
           (built (constructed-id "valis")))
       (roster:declare-leader typed state-path)
       (roster:declare-leader built state-path)

@@ -111,6 +111,23 @@
     (false (string= a b) "two ephemeral ids in one namespace differ")
     (is = 0 (search "/p/" a) "an ephemeral id is still scoped to its namespace")))
 
+(define-test one-separator-lands-at-the-join-whatever-the-namespace-looked-like
+  "A namespace in directory form and the same namespace written bare build one
+   id. A project root arrives with its trailing separator and a namespace typed
+   by hand arrives without, and every file an agent owns is named from this
+   string, so a second spelling is a second cursor, a second heartbeat and a
+   second roster entry for one identity."
+  (is string= "/home/fade/proj/sister"
+      (envelope:agent-id "/home/fade/proj/" :name "sister")
+      "a directory-form namespace does not double the separator")
+  (is string= (envelope:agent-id "/home/fade/proj" :name "sister")
+      (envelope:agent-id "/home/fade/proj/" :name "sister")
+      "and both spellings of the namespace agree")
+  (is string= "solo" (envelope:agent-id "" :name "solo")
+      "an empty namespace leaves the name standing on its own")
+  (is string= "solo" (envelope:agent-id nil :name "solo")
+      "and so does no namespace at all"))
+
 (define-test foreign-self-id-p-recognizes-own-foreign-and-legacy
   "The shared delivery predicate, the single comparison the receive filter, the
    pending count, and the watcher all turn on. An agent's OWN encoded id is not

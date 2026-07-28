@@ -176,8 +176,9 @@
 
 (defun %qualified (session name)
   "The full bus id a bare NAME resolves to under SESSION's namespace, built the
-   way the bus builds it."
-  (format nil "~A/~A" (%own-namespace session) name))
+   way the bus builds it: the project root with its trailing separator serving as
+   the single separator at the join."
+  (concatenate 'string (%own-namespace session) name))
 
 (defun %durable-cursor (a)
   "The seq A's durable cursor file holds, or 0 when there is nothing readable
