@@ -219,6 +219,14 @@
   (append-record path seq (if self-id (wrap-envelope "c1" self-id text) text))
   seq)
 
+(defun append-addressed (path seq self-id to &optional (text "x"))
+  "Append record SEQ to PATH as published by SELF-ID and addressed to TO, using
+   the shared envelope leaf rather than a hand-built body. Building the wire
+   string here would let this file and the publisher disagree about the format
+   the watcher is supposed to be reading."
+  (append-record path seq (wrap-envelope "c1" self-id text :to to))
+  seq)
+
 (define-test unknown-flag-warns-and-parsing-continues
   ;; A mistyped flag must not deafen the agent: it is named on stderr, skipped,
   ;; and the flags around it still take effect.
@@ -474,6 +482,77 @@
   (with-wal (w)
     (append-from w 1 (agent-id "/p" :name "me"))
     (is = 1 (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 5))))
+
+(define-test a-broadcast-still-fires-the-watch
+  ;; The default case, pinned explicitly now that the filter asks a second
+  ;; question: a record naming nobody is for everybody, and narrowing the filter
+  ;; must not have narrowed it to nothing.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them")))
+      (append-from w 1 them)
+      (is = 1 (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 5
+                                       :self-id me)))))
+
+(define-test mail-addressed-to-us-fires-the-watch
+  ;; The point of the whole feature at this end: a message that names this
+  ;; watcher's identity must wake it, exactly as a broadcast does.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them")))
+      (append-addressed w 1 them me)
+      (is = 1 (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 5
+                                       :self-id me)))))
+
+(define-test mail-for-somebody-else-does-not-fire-the-watch
+  ;; The reason the filter narrowed. Waking this agent for a message it will
+  ;; never be shown burns a context window and returns nothing, so the watch
+  ;; must sit through it and recycle on its own idle window instead.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them"))
+          (someone-else (agent-id "/p" :name "someone-else")))
+      (append-addressed w 1 them someone-else)
+      (false (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 0.05
+                                      :self-id me)
+             "other people's mail leaves the watch running to its recycle"))))
+
+(define-test a-broadcast-fires-past-mail-for-somebody-else
+  ;; Skipping someone else's mail must not skip what follows it, and the fired
+  ;; seq is the broadcast's own rather than the head of the log.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them"))
+          (someone-else (agent-id "/p" :name "someone-else")))
+      (append-addressed w 1 them someone-else)
+      (append-from w 2 them)
+      (append-addressed w 3 them someone-else)
+      (is = 2 (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 5
+                                       :self-id me)))))
+
+(define-test without-an-identity-mail-for-somebody-else-still-fires
+  ;; The no-identity branch is unchanged. With nothing resolved there is no self
+  ;; to recognise and no addressee to compare, so everything counts, which is
+  ;; the pre-identity behaviour and still the only safe reading: a watcher that
+  ;; cannot tell whose mail it is must not decide it is not ours.
+  (with-wal (w)
+    (let ((them (agent-id "/p" :name "them"))
+          (someone-else (agent-id "/p" :name "someone-else")))
+      (append-addressed w 1 them someone-else)
+      (is = 1 (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 5)))))
+
+(define-test mail-addressed-to-us-before-the-arm-fires-on-the-first-poll
+  ;; Level-triggered arming, over the narrowed filter. A message that landed
+  ;; between the agent's last drain and this arm sits above the cursor, and it
+  ;; must still be found on the first look rather than waiting for the next
+  ;; record to come along.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them")))
+      (append-from w 1 me)
+      (append-addressed w 2 them me)
+      (is = 2 (watch-until-foreign w 0 :poll-ms 5 :recycle-seconds 5
+                                       :self-id me)))))
 
 (define-test streaming-skips-our-own-and-still-steps-over-them
   ;; One signal per foreign seq, and the cursor clears the skipped records so

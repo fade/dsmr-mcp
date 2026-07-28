@@ -162,14 +162,29 @@
 
 (defun %highest-foreign-seq (wal-path baseline own-encoded
                              &optional (reader (wal:make-reader)))
-  "The highest seq above BASELINE belonging to a record this agent did not
-   publish, or NIL when there is no such record. Returns (values seq last-seq
-   restarted-p).
+  "The highest seq above BASELINE belonging to a record this agent would
+   actually be handed, or NIL when there is no such record. Returns (values seq
+   last-seq restarted-p).
 
    Without an identity this is just the log head when it exceeds BASELINE. With
    one, the records above BASELINE are read and filtered, so a burst made up
    entirely of this agent's own publishes leaves the watch waiting instead of
    waking it up to find nothing addressed to it.
+
+   The filter asks the SAME question delivery asks, which is now two questions
+   rather than one: the record must not be this agent's own publish, and it must
+   not be mail naming somebody else. A watcher armed for one agent used to fire
+   on a message addressed to another, waking that agent to read a bus that would
+   then show it nothing. That is a spurious wake and never a missed one, so it is
+   safe rather than dangerous, but a spurious wake costs a whole context window,
+   which is the scarce resource in this system.
+
+   Note that this binary deploys separately from the core that publishes for it
+   (make install-bus-watch, not make core), so during a staggered rollout a
+   watcher still on the old build wakes on addressed mail it will not be shown.
+   The failure mode there is extra wakes, never silence, which is the direction
+   this component must always fail in: an over-eager watch costs context, and a
+   silent one costs messages.
 
    READER is the caller's position in the log. A caller that supplies one and
    keeps it across polls pays for the tail; the default is a throwaway reader,
@@ -189,7 +204,7 @@
                   (and (> last floor) last)
                   (let ((highest nil))
                     (dolist (record records highest)
-                      (when (envelope:foreign-record-p record own-encoded)
+                      (when (envelope:deliverable-record-p record own-encoded)
                         (setf highest (record-seq record))))))
               last
               restarted))))
