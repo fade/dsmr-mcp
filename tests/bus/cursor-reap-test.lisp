@@ -21,7 +21,10 @@
 (defpackage #:dsmr-mcp/tests/bus/cursor-reap-test
   (:use #:cl #:parachute)
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
-                    (#:envelope #:dsmr-mcp/src/bus/envelope)))
+                    (#:cursor #:dsmr-mcp/src/bus/cursor)
+                    (#:envelope #:dsmr-mcp/src/bus/envelope)
+                    (#:roster #:dsmr-mcp/src/bus/roster)
+                    (#:wal #:dsmr-mcp/src/bus/wal)))
 
 (in-package #:dsmr-mcp/tests/bus/cursor-reap-test)
 
@@ -130,3 +133,206 @@
       (dolist (path aged)
         (true (probe-file path)))
       (is = 2 (broker:reap-orphaned-cursors paths :max-age-days 7)))))
+
+;;; -------------------------------------------------- cursors held for the gone
+;;;
+;;; A cursor whose owner recorded leaving is the busmaster's to keep: it is
+;;; advanced with fleet traffic so it can never pin the log, and retired once the
+;;; departure is old enough. Everything below turns on where the age comes from.
+;;; A held cursor is written every time the bus is swept, so its modification
+;;; time is always current; only the departure stamp on the roster can say how
+;;; long ago the agent actually went.
+
+(defun cursor-seq (path)
+  "The sequence a cursor file holds, read the way every reader reads it."
+  (with-open-file (in path :if-does-not-exist nil)
+    (and in (read in nil nil))))
+
+(defun record-departure (paths id &key (age-days 0))
+  "Put ID on the roster as having departed AGE-DAYS ago, and return the entry's
+   path.
+
+   The real disenroll writes it first, so the entry's shape is whatever the
+   roster actually writes rather than a restatement of it here. Backdating then
+   rewrites the one field, because nothing in the roster can stamp the past and
+   nothing should be able to."
+  (let* ((dir (broker:bus-paths-roster-dir paths))
+         (record (roster:disenroll id dir))
+         (path (roster:roster-entry-path id dir)))
+    (when (plusp age-days)
+      (let ((amended (copy-list record)))
+        (setf (getf amended :departed-at)
+              (- (get-universal-time) (* age-days 24 60 60)))
+        (with-open-file (out path :direction :output
+                                  :if-exists :supersede
+                                  :if-does-not-exist :create)
+          (with-standard-io-syntax (prin1 amended out)))))
+    path))
+
+(defun enroll-agent (paths id)
+  (roster:enroll id
+                 (broker:bus-paths-roster-dir paths)
+                 (broker:bus-paths-roster-state paths)))
+
+(define-test the-busmaster-and-the-subscriber-name-one-cursor-file
+  "The busmaster writes the file the participant reads. Two derivations of the
+   same name is the way that stops being true without anything saying so."
+  (with-bus-root (paths)
+    (let ((id (stable-id "shared-name")))
+      (is equal (cursor-path paths id) (broker:cursor-path-for paths id)))))
+
+(define-test a-departed-cursor-is-advanced-to-the-head
+  "Custody has transferred, so the busmaster moves the cursor up to the log head
+   and reports having done it."
+  (with-bus-root (paths)
+    (let* ((id (stable-id "leaver"))
+           (path (seed-cursor paths id :seq 2)))
+      (record-departure paths id)
+      (is = 1 (broker:advance-held-cursors paths 9))
+      (is = 9 (cursor-seq path)))))
+
+(define-test a-held-cursor-is-still-a-bare-printed-integer
+  "The format did not widen. Every existing reader treats anything that is not a
+   non-negative integer as position zero, silently, so a richer cursor file would
+   not fail against an older reader: it would quietly send that agent back to the
+   start of the log."
+  (with-bus-root (paths)
+    (let* ((id (stable-id "plain"))
+           (path (seed-cursor paths id :seq 1)))
+      (record-departure paths id)
+      (broker:advance-held-cursors paths 12)
+      (is equal "12" (string-trim '(#\Space #\Newline #\Return)
+                                  (uiop:read-file-string path))))))
+
+(define-test a-held-cursor-pins-nothing
+  "Having tracked the head, a departed agent has nothing pending, so it can never
+   be the cursor holding the log back from retention."
+  (with-bus-root (paths)
+    (let* ((id (stable-id "gone-quiet"))
+           (log (broker:bus-paths-wal paths))
+           (path (seed-cursor paths id :seq 0)))
+      (dotimes (i 3)
+        (wal:append-record log (1+ i) (format nil "record ~D" (1+ i))))
+      (record-departure paths id)
+      (broker:advance-held-cursors paths (wal:scan log))
+      (is = 0 (cursor:pending-count (cursor:make-subscriber id log path))))))
+
+(define-test an-enrolled-agents-cursor-is-never-written
+  "A live participant owns its own delivery position. Nothing here may move it."
+  (with-bus-root (paths)
+    (let* ((id (stable-id "present"))
+           (path (seed-cursor paths id :seq 2)))
+      (enroll-agent paths id)
+      (is = 0 (broker:advance-held-cursors paths 9))
+      (is = 2 (cursor-seq path)))))
+
+(define-test a-cursor-with-no-roster-entry-is-never-written
+  "No departure record means no transfer of custody, whatever the file looks
+   like."
+  (with-bus-root (paths)
+    (let ((path (seed-cursor paths (stable-id "unrecorded") :seq 2)))
+      (is = 0 (broker:advance-held-cursors paths 9))
+      (is = 2 (cursor-seq path)))))
+
+(define-test a-departed-agent-with-no-cursor-gets-none-created
+  "It read nothing, so it holds nothing back. A file invented for it would only
+   have to be retired later."
+  (with-bus-root (paths)
+    (let ((id (stable-id "never-read")))
+      (record-departure paths id)
+      (is = 0 (broker:advance-held-cursors paths 9))
+      (false (probe-file (cursor-path paths id))))))
+
+(define-test an-aged-departure-retires-its-cursor-and-its-entry
+  "Past the threshold both the held cursor and the record of the departure go,
+   and the sweep says how many."
+  (with-bus-root (paths)
+    (let* ((id (stable-id "long-gone"))
+           (path (seed-cursor paths id :seq 4))
+           (entry (record-departure paths id :age-days 30)))
+      (is = 1 (broker:age-departed-cursors paths))
+      (false (probe-file path))
+      (false (probe-file entry)))))
+
+(define-test a-recent-departure-is-left-alone
+  "Inside the threshold nothing is taken, so an agent that comes straight back
+   finds its position where it left it."
+  (with-bus-root (paths)
+    (let* ((id (stable-id "just-left"))
+           (path (seed-cursor paths id :seq 4))
+           (entry (record-departure paths id)))
+      (is = 0 (broker:age-departed-cursors paths))
+      (true (probe-file path))
+      (true (probe-file entry)))))
+
+(define-test an-aged-departure-retires-though-its-cursor-was-just-written
+  "The regression this sweep exists to protect. The cursor file is written last,
+   so its modification time is seconds old while the departure is a month old.
+   Anything keyed on the file's own age would spare this forever, which is
+   exactly what advancing a held cursor would cause."
+  (with-bus-root (paths)
+    (let* ((id (stable-id "held-forever"))
+           (entry (record-departure paths id :age-days 30))
+           (path (seed-cursor paths id :seq 4)))
+      (true (> (file-write-date path) (- (get-universal-time) 120))
+            "the held cursor's modification time is current")
+      (is = 1 (broker:age-departed-cursors paths))
+      (false (probe-file path))
+      (false (probe-file entry)))))
+
+(define-test an-enrolled-agent-is-never-aged-out-however-dormant
+  "Aging keys on a departure, never on inactivity. A named agent that has not
+   read for years is quiet, not gone."
+  (with-bus-root (paths)
+    (let* ((id (stable-id "dormant"))
+           (path (seed-cursor paths id :age-days 3650)))
+      (enroll-agent paths id)
+      (is = 0 (broker:age-departed-cursors paths))
+      (true (probe-file path)))))
+
+(define-test the-aging-threshold-is-a-parameter
+  "The same fixture swept against a far larger threshold retires nothing."
+  (with-bus-root (paths)
+    (let* ((id (stable-id "borderline"))
+           (path (seed-cursor paths id :seq 4)))
+      (record-departure paths id :age-days 30)
+      (is = 0 (broker:age-departed-cursors paths :max-age-days 3650))
+      (true (probe-file path))
+      (is = 1 (broker:age-departed-cursors paths :max-age-days 7))
+      (false (probe-file path)))))
+
+(define-test the-two-sweeps-do-not-handle-each-others-files
+  "An ephemeral cursor nobody recorded leaving is the reaper's; a departed
+   agent's is the aging sweep's. Neither takes the other's, and the second pass
+   finds nothing left to do."
+  (with-bus-root (paths)
+    (let* ((ephemeral (seed-cursor paths (ephemeral-id) :age-days 30))
+           (id (stable-id "departed"))
+           (held (seed-cursor paths id))
+           (entry (record-departure paths id :age-days 30)))
+      (is = 1 (broker:reap-orphaned-cursors paths))
+      (false (probe-file ephemeral))
+      (true (probe-file held))
+      (is = 1 (broker:age-departed-cursors paths))
+      (false (probe-file held))
+      (false (probe-file entry))
+      (is = 0 (broker:age-departed-cursors paths))
+      (is = 0 (broker:reap-orphaned-cursors paths)))))
+
+(define-test the-custodial-tick-advances-at-most-once-an-interval
+  "The sweeps run off the serve loop, which turns several times a second. The
+   tick is what keeps that from meaning a file write per turn."
+  (with-bus-root (paths)
+    (let* ((id (stable-id "ticking"))
+           (path (seed-cursor paths id :seq 0))
+           (br (dsmr-mcp/src/bus/broker::%make-broker :paths paths :seq 7)))
+      (record-departure paths id)
+      (broker:custodial-tick br)
+      (is = 7 (cursor-seq path))
+      ;; A second tick inside the interval must not sweep again, so a head that
+      ;; moved between them is not picked up until the interval is out.
+      (setf (dsmr-mcp/src/bus/broker::broker-seq br) 11)
+      (broker:custodial-tick br)
+      (is = 7 (cursor-seq path))
+      (broker:custodial-tick br :advance-seconds 0)
+      (is = 11 (cursor-seq path)))))

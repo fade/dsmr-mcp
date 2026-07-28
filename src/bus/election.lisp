@@ -24,7 +24,8 @@
 ;;;; This is dsmr-mcp's own single-host infrastructure and is intentionally
 ;;;; SBCL-specific; it is never injected into a foreign attached image.
 
-(require :sb-posix)
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-posix))
 
 (defpackage #:dsmr-mcp/src/bus/election
   (:use #:cl)

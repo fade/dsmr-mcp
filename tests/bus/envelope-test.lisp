@@ -16,12 +16,21 @@
 
 (defpackage #:dsmr-mcp/tests/bus/envelope-test
   (:use #:cl #:parachute)
-  (:local-nicknames (#:envelope #:dsmr-mcp/src/bus/envelope)))
+  (:local-nicknames (#:envelope #:dsmr-mcp/src/bus/envelope)
+                    (#:wal #:dsmr-mcp/src/bus/wal)))
 
 (in-package #:dsmr-mcp/tests/bus/envelope-test)
 
 (defun delimiter-count (string)
   (count envelope:+envelope-delimiter+ string))
+
+(defun record-carrying (body-string)
+  "A WAL record whose body is BODY-STRING, built without going near a log file.
+   The record-level predicates take a record and decode it themselves, so they
+   need one to look at; nothing about what they decide depends on the record
+   having been read off disk."
+  (wal::%make-record 1 0 (sb-ext:string-to-octets body-string
+                                                  :external-format :utf-8)))
 
 (define-test envelope-round-trips-payload-and-ids
   "A wrapped body decodes back to the payload, the correlation id, and the
@@ -102,6 +111,23 @@
     (false (string= a b) "two ephemeral ids in one namespace differ")
     (is = 0 (search "/p/" a) "an ephemeral id is still scoped to its namespace")))
 
+(define-test one-separator-lands-at-the-join-whatever-the-namespace-looked-like
+  "A namespace in directory form and the same namespace written bare build one
+   id. A project root arrives with its trailing separator and a namespace typed
+   by hand arrives without, and every file an agent owns is named from this
+   string, so a second spelling is a second cursor, a second heartbeat and a
+   second roster entry for one identity."
+  (is string= "/home/fade/proj/sister"
+      (envelope:agent-id "/home/fade/proj/" :name "sister")
+      "a directory-form namespace does not double the separator")
+  (is string= (envelope:agent-id "/home/fade/proj" :name "sister")
+      (envelope:agent-id "/home/fade/proj/" :name "sister")
+      "and both spellings of the namespace agree")
+  (is string= "solo" (envelope:agent-id "" :name "solo")
+      "an empty namespace leaves the name standing on its own")
+  (is string= "solo" (envelope:agent-id nil :name "solo")
+      "and so does no namespace at all"))
+
 (define-test foreign-self-id-p-recognizes-own-foreign-and-legacy
   "The shared delivery predicate, the single comparison the receive filter, the
    pending count, and the watcher all turn on. An agent's OWN encoded id is not
@@ -168,3 +194,145 @@
   (false (envelope:decode-id nil) "no token decodes to no id")
   (false (envelope:decode-id "%ZZ") "a non-hex escape is refused")
   (false (envelope:decode-id "abc%2") "a truncated escape is refused"))
+
+(define-test addressed-record-carries-its-recipient-in-the-routing-field
+  "Naming a recipient puts an encoded addressee beside the encoded self-id in the
+   envelope's second field. The delimiter count is unchanged, the text and the
+   correlation id decode exactly as they do for a broadcast, and the self-id comes
+   back on its own with the addressee separated off."
+  (let* ((self "/home/fade/proj/valis")
+         (to "/home/fade/other/fulcrum")
+         (wire (envelope:wrap-envelope "c1" self "status please" :to to)))
+    (is = 2 (delimiter-count wire)
+        "naming a recipient does not add a delimiter")
+    (multiple-value-bind (text cid sid addressee) (envelope:decode-envelope wire)
+      (is string= "status please" text)
+      (is string= "c1" cid)
+      (is string= (envelope:encode-id self) sid
+          "the self id comes back without the addressee attached")
+      (is string= (envelope:encode-id to) addressee))))
+
+(define-test a-broadcast-is-byte-for-byte-what-it-always-was
+  "With no recipient named the wire string is exactly the one this format has
+   always produced, and the fourth decoded value is NIL. If a broadcast paid
+   anything at all for the existence of addressing, every reader that has not
+   been upgraded would have to be upgraded before anyone could publish."
+  (let ((wire (envelope:wrap-envelope "c2" "/p/n" "hello"))
+        (explicit (envelope:wrap-envelope "c2" "/p/n" "hello" :to nil)))
+    (is string= (format nil "c2~A~A~A~A"
+                        envelope:+envelope-delimiter+
+                        (envelope:encode-id "/p/n")
+                        envelope:+envelope-delimiter+
+                        "hello")
+        wire)
+    (is string= wire explicit
+        "an explicit absent recipient is the same wire as none at all")
+    (false (nth-value 3 (envelope:decode-envelope wire))
+           "a broadcast names nobody")))
+
+(define-test a-legacy-payload-containing-the-delimiter-still-decodes-whole
+  "The case that decided where the addressee lives. A record published before
+   addressing existed may carry the delimiter in its own text, so it already
+   presents three delimiters. A reader that inferred a recipient from the
+   delimiter COUNT would take part of that message as routing information and
+   silently truncate the rest. Reading the recipient out of the second field
+   instead leaves such a record decoding exactly as it always did, payload
+   intact and nobody named."
+  (let* ((payload (format nil "see foo~Abar" envelope:+envelope-delimiter+))
+         (wire (envelope:wrap-envelope "c3" "/p/sender" payload)))
+    (is = 3 (delimiter-count wire)
+        "the record really does carry three delimiters")
+    (multiple-value-bind (text cid sid addressee) (envelope:decode-envelope wire)
+      (is string= payload text "the payload survives whole, not truncated")
+      (is string= "c3" cid)
+      (is string= (envelope:encode-id "/p/sender") sid)
+      (false addressee
+             "nothing in a payload can be read as a recipient"))))
+
+(define-test an-un-upgraded-reader-over-delivers-rather-than-mis-parsing
+  "The degradation rung, stated as a test because it is what makes a staggered
+   rollout safe. A reader that knows nothing about addressing frames the body on
+   the first two delimiters and takes the whole second field as the self-id. It
+   therefore shows the same text an upgraded reader shows, matches nobody's
+   identity, judges the record foreign and hands it over. Over-delivery is the
+   safe direction: no message text is altered and nothing is dropped. The one
+   cost is that the sender's own un-upgraded reader stops recognising its own
+   publish, which can only happen once somebody has turned addressing on."
+  (let* ((self "/p/valis")
+         (to "/p/fulcrum")
+         (wire (envelope:wrap-envelope "c4" self "for you only" :to to))
+         (d1 (position envelope:+envelope-delimiter+ wire))
+         (d2 (position envelope:+envelope-delimiter+ wire :start (1+ d1)))
+         (old-text (subseq wire (1+ d2)))
+         (old-routing (subseq wire (1+ d1) d2)))
+    (is string= "for you only" old-text
+        "the text an old reader frames is the text the new decoder returns")
+    (is string= old-text (envelope:decode-envelope wire))
+    (true (envelope:foreign-self-id-p old-routing (envelope:encode-id to))
+          "the recipient's old reader reads a stranger and delivers")
+    (true (envelope:foreign-self-id-p old-routing (envelope:encode-id self))
+          "and the sender's old reader takes delivery of its own message")))
+
+(define-test an-addressed-record-with-no-self-id-decodes-both-halves
+  "A publisher with no stable identity can still name a recipient. The first half
+   of the routing field is empty and decodes to NIL, exactly as it does for a
+   broadcast, and the recipient is unaffected by its absence."
+  (let ((wire (envelope:wrap-envelope "c5" nil "anon note" :to "/p/lead")))
+    (is = 2 (delimiter-count wire))
+    (multiple-value-bind (text cid sid addressee) (envelope:decode-envelope wire)
+      (is string= "anon note" text)
+      (is string= "c5" cid)
+      (false sid "an empty first half is still no self-id")
+      (is string= (envelope:encode-id "/p/lead") addressee))))
+
+(define-test record-level-predicates-agree-with-the-decoded-fields
+  "RECORD-ADDRESSEE and DELIVERABLE-RECORD-P decode a record themselves and reach
+   the verdict the field-level predicate reaches, which is what lets the receive
+   path and the pending count share one answer. FOREIGN-RECORD-P is deliberately
+   left alone and still answers about the sender only: the standalone watcher
+   binary reads it and ships on a schedule of its own, so a shift in its meaning
+   would reach the fleet at a different time from the core publishing for it."
+  (let* ((mine (envelope:encode-id "/p/me"))
+         (broadcast (record-carrying
+                     (envelope:wrap-envelope "c6" "/p/them" "all hands")))
+         (for-me (record-carrying
+                  (envelope:wrap-envelope "c7" "/p/them" "just you" :to "/p/me")))
+         (for-them (record-carrying
+                    (envelope:wrap-envelope "c8" "/p/them" "not you"
+                                            :to "/p/other")))
+         (legacy (record-carrying "a plain old body")))
+    (false (envelope:record-addressee broadcast) "a broadcast names nobody")
+    (false (envelope:record-addressee legacy) "a legacy record names nobody")
+    (is string= mine (envelope:record-addressee for-me))
+    (true (envelope:deliverable-record-p broadcast mine))
+    (true (envelope:deliverable-record-p for-me mine))
+    (false (envelope:deliverable-record-p for-them mine)
+           "somebody else's mail is not handed to me")
+    (true (envelope:deliverable-record-p legacy mine))
+    (true (envelope:foreign-record-p for-them mine)
+          "while foreign-record-p, asked only about the sender, still says yes")))
+
+(define-test deliverable-p-hands-over-broadcasts-and-only-my-own-mail
+  "The single delivery verdict, in every combination it has to answer. A
+   broadcast from somebody else arrives; my own publish never does, addressed or
+   not; a record naming me arrives; a record naming somebody else does not; a
+   legacy un-enveloped record still arrives; and with no identity resolved
+   everything arrives, because there is no self to recognise and nothing to
+   compare a recipient against."
+  (let ((mine (envelope:encode-id "/p/me"))
+        (theirs (envelope:encode-id "/p/them"))
+        (other (envelope:encode-id "/p/other")))
+    (true (envelope:deliverable-p theirs nil mine)
+          "a foreign broadcast arrives")
+    (false (envelope:deliverable-p mine nil mine)
+           "my own broadcast does not come back to me")
+    (true (envelope:deliverable-p theirs mine mine)
+          "mail addressed to me arrives")
+    (false (envelope:deliverable-p theirs other mine)
+           "mail addressed to somebody else does not")
+    (false (envelope:deliverable-p mine other mine)
+           "and neither does my own addressed publish")
+    (true (envelope:deliverable-p nil nil mine)
+          "a legacy record with no self-id still arrives")
+    (true (envelope:deliverable-p theirs other nil)
+          "with no identity resolved, addressed mail arrives too")))

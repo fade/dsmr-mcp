@@ -24,15 +24,23 @@
 (defpackage #:dsmr-mcp/src/bus/broker
   (:use #:cl)
   (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal)
+                    (#:cursor #:dsmr-mcp/src/bus/cursor)
+                    (#:envelope #:dsmr-mcp/src/bus/envelope)
                     (#:election #:dsmr-mcp/src/bus/election)
                     (#:archive #:dsmr-mcp/src/bus/archive)
-                    (#:tz #:dsmr-mcp/src/bus/zmq))
+                    (#:tz #:dsmr-mcp/src/bus/zmq)
+                    (#:selector #:dsmr-mcp/src/bus/selector)
+                    (#:roster #:dsmr-mcp/src/bus/roster))
   (:export #:bus-paths #:make-bus-paths #:default-state-root
            #:bus-paths-root #:bus-paths-wal #:bus-paths-lock #:bus-paths-members
-           #:bus-paths-cursors-dir #:bus-paths-submit-endpoint #:bus-paths-pub-endpoint
+           #:bus-paths-cursors-dir
+           #:bus-paths-roster-dir #:bus-paths-roster-state
+           #:bus-paths-submit-endpoint #:bus-paths-pub-endpoint
            #:ensure-bus-dirs #:reap-orphaned-cursors
+           #:cursor-path-for #:advance-held-cursors #:age-departed-cursors
            #:broker #:broker-seq
            #:start-broker #:broker-step #:serve-broker #:stop-broker
+           #:custodial-tick
            #:join-members
            #:broker-running-p #:broker-main #:spawn-broker #:ensure-broker))
 
@@ -40,23 +48,36 @@
 
 ;;; --------------------------------------------------------------- paths
 
-(defun default-state-root ()
-  "The default bus state directory: $XDG_STATE_HOME/dsmr-mcp/bus/ (falling back
-   to ~/.local/state/dsmr-mcp/bus/). Survives a reboot."
-  (let ((xdg (uiop:getenv "XDG_STATE_HOME")))
-    (merge-pathnames "dsmr-mcp/bus/"
-                     (if (and xdg (plusp (length xdg)))
-                         (uiop:ensure-directory-pathname xdg)
-                         (merge-pathnames ".local/state/" (user-homedir-pathname))))))
+(defun default-state-root (&optional bus)
+  "The bus state directory, ordinarily ~/.local/state/dsmr-mcp/bus/. Survives a
+   reboot. The selector leaf documents how it is derived and is the only place
+   that derives it.
+
+   A non-nil BUS names a private bus root under that directory, isolated from
+   every other bus on the host. The derivation itself lives in the shared
+   selector leaf, which is the only place in the tree that does this arithmetic;
+   this function stays because every caller of it already spells it this way.
+
+   Signals SELECTOR:INVALID-BUS-NAME for a name that is malformed, reserved, or
+   long enough that the derived socket path would not fit."
+  (selector:bus-root bus))
 
 (defstruct (bus-paths (:constructor %make-bus-paths))
-  root wal lock members cursors-dir submit-endpoint pub-endpoint)
+  root wal lock members cursors-dir roster-dir roster-state
+  submit-endpoint pub-endpoint)
 
 (defun %ipc (root name)
   (format nil "ipc://~A~A" (namestring root) name))
 
 (defun make-bus-paths (&optional (root (default-state-root)))
-  "Derive every on-disk and socket path for a bus rooted at ROOT."
+  "Derive every on-disk and socket path for a bus rooted at ROOT.
+
+   ROSTER-DIR and ROSTER-STATE are the busmaster's record of who is enrolled on
+   this bus, who leads it, and whether enrollment is open. They are metadata the
+   broker holds, never a membership check: nothing on the serving path consults
+   them. Note that ROSTER-DIR is a wholly different thing from MEMBERS one
+   directory up, which is the shared lock every live process holds and which dies
+   with the processes holding it."
   (let ((root (uiop:ensure-directory-pathname root)))
     (%make-bus-paths
      :root root
@@ -64,13 +85,22 @@
      :lock (merge-pathnames "broker.lock" root)
      :members (merge-pathnames "members" root)
      :cursors-dir (merge-pathnames "cursors/" root)
+     :roster-dir (merge-pathnames "roster/" root)
+     :roster-state (merge-pathnames "roster.state" root)
      :submit-endpoint (%ipc root "submit.ipc")
      :pub-endpoint (%ipc root "pub.ipc"))))
 
 (defun ensure-bus-dirs (paths)
-  "Create the bus root and cursors directory if absent."
+  "Create the bus root, the cursors directory and the roster directory if absent.
+
+   The roster directory is created eagerly so every bus root that exists at all
+   has one to list. The roster STATE file is deliberately not created here: an
+   absent state file reads as open enrollment with no declared leader, which is
+   the right answer for a bus nobody has closed, and writing one would only make
+   a default look like a decision."
   (ensure-directories-exist (bus-paths-root paths))
   (ensure-directories-exist (bus-paths-cursors-dir paths))
+  (ensure-directories-exist (bus-paths-roster-dir paths))
   paths)
 
 (defun join-members (paths)
@@ -157,10 +187,127 @@
               reaped max-age-days))
     reaped))
 
+;;; ------------------------------------------------- custody of a held cursor
+
+(defun cursor-path-for (paths id)
+  "Where agent ID's delivery cursor lives on the bus at PATHS.
+
+   The same percent-encoded token the subscriber layer names the file by, under
+   the same directory, so the busmaster and the participant address one file and
+   not two. The encoder is shared with the roster entry and the heartbeat, which
+   is what keeps the three names for one identity from drifting apart."
+  (merge-pathnames (envelope:encode-id id) (bus-paths-cursors-dir paths)))
+
+(defun advance-held-cursors (paths head-seq)
+  "Move every departed agent's cursor up to HEAD-SEQ and return how many moved.
+
+   A cursor is ordinarily written by one process only, the session consuming the
+   bus through it, and writing one from outside would move that session's
+   delivery position behind its back. Custody transfers on a clean leave: the
+   departing agent records its departure on the roster, and from then on the
+   busmaster holds the cursor. That is why the roster is consulted for every
+   file touched here. An id that is enrolled, or has no entry at all, is never
+   written, so a live participant's position is untouchable by this.
+
+   Holding a cursor rather than deleting it is what dissolves the difference
+   between an agent that has gone and one that is merely quiet: a departed agent
+   keeps pace with the log, so it can never be the cursor pinning retention,
+   while an agent that simply went silent keeps every record it is owed.
+
+   A departed agent that never had a cursor gets none created. It read nothing,
+   so it holds nothing back, and a file invented for it would only have to be
+   retired later.
+
+   Nothing here may abort a serving broker: one unreadable entry or unwritable
+   cursor is named on stderr and skipped."
+  (let ((advanced 0))
+    (handler-case
+        (dolist (entry (roster:departed-members (bus-paths-roster-dir paths)))
+          (handler-case
+              (let* ((id (roster:entry-id entry))
+                     (path (and (stringp id) (cursor-path-for paths id))))
+                (when (and path (probe-file path))
+                  (let ((held (cursor:make-subscriber
+                               id (bus-paths-wal paths) path)))
+                    (when (< (cursor:cursor-value held) head-seq)
+                      (setf (cursor:cursor-value held) head-seq)
+                      (incf advanced)))))
+            (error (e)
+              (format *error-output*
+                      "dsmr-mcp bus: skipping held cursor for ~A: ~A~%"
+                      (roster:entry-id entry) e))))
+      (error (e)
+        (format *error-output*
+                "dsmr-mcp bus: could not scan the roster to advance held cursors: ~A~%"
+                e)))
+    advanced))
+
+(defun age-departed-cursors (paths &key (max-age-days 7))
+  "Retire the cursor and the roster entry of every agent that left more than
+   MAX-AGE-DAYS ago, and return how many were retired.
+
+   This scans the ROSTER, and the only thing it weighs is the departure time the
+   departing agent recorded. Neither of the two obvious alternatives is usable
+   here, and both are prohibited rather than merely unused.
+
+   The file's own modification time cannot be the key. A held cursor is advanced
+   with fleet traffic, so its modification time is within seconds of now for as
+   long as the bus carries anything at all: aging on it would never fire, and
+   holding a cursor would quietly become keeping it forever.
+
+   The ephemeral name shape cannot be the key either. That predicate matches
+   auto-generated names alone, deliberately and with a test asserting that a
+   stable identity dormant for years keeps its cursor. Widening it to stable
+   names would start discarding the backlog of live named agents on inactivity,
+   which is exactly what a departure record exists to avoid needing.
+
+   This is therefore a separate sweep from REAP-ORPHANED-CURSORS and not a
+   parameter on it. The two never contend: that one takes ephemeral cursors that
+   nobody recorded leaving, this one takes cursors whose owner said goodbye.
+
+   Nothing here may abort a serving broker: one entry that cannot be read or
+   removed is named on stderr and skipped."
+  (let ((retired 0)
+        (roster-dir (bus-paths-roster-dir paths)))
+    (handler-case
+        (let ((cutoff (- (get-universal-time)
+                         (* max-age-days 24 60 60))))
+          (dolist (entry (roster:departed-members roster-dir))
+            (handler-case
+                (let ((id (roster:entry-id entry))
+                      (left (roster:entry-departed-at entry)))
+                  (when (and (stringp id) (integerp left) (< left cutoff))
+                    (let ((path (cursor-path-for paths id)))
+                      (when (probe-file path) (delete-file path)))
+                    (let ((path (roster:roster-entry-path id roster-dir)))
+                      (when (probe-file path) (delete-file path)))
+                    (incf retired)))
+              (error (e)
+                (format *error-output*
+                        "dsmr-mcp bus: skipping departed entry ~A while aging: ~A~%"
+                        (roster:entry-id entry) e)))))
+      (error (e)
+        (format *error-output*
+                "dsmr-mcp bus: could not scan the roster to age departures: ~A~%"
+                e)))
+    (when (plusp retired)
+      (format *error-output*
+              "dsmr-mcp bus: retired ~D held cursor~:P for agent~:P that left over ~D day~:P ago~%"
+              retired max-age-days))
+    retired))
+
 ;;; --------------------------------------------------------------- broker
 
 (defstruct (broker (:constructor %make-broker))
-  paths lock-fd members-fd intake publisher (seq 0))
+  "A serving broker and the two clocks its custodial work runs on.
+
+   CURSORS-ADVANCED-AT and DEPARTURES-AGED-AT are the universal times those two
+   sweeps last ran. Both start at zero so a broker coming up does its first pass
+   immediately rather than waiting out an interval on a bus that may already
+   have departures on it."
+  paths lock-fd members-fd intake publisher (seq 0)
+  (cursors-advanced-at 0)
+  (departures-aged-at 0))
 
 (defun start-broker (paths &key (block t) (intake-timeout-ms 100) (join t))
   "Contend for the broker role on PATHS. If another broker holds it and BLOCK is
@@ -169,11 +316,15 @@
    learn the next seq, optionally JOIN membership, and bind the intake and
    publisher sockets. Returns a BROKER.
 
-   Also reaps long-dead ephemeral cursors, once per broker process. The broker
-   already owns the cursor directory's lifecycle, and this is the one place
-   that runs rarely enough for the sweep to cost nothing."
+   Also runs both custodial sweeps once on the way up: the ephemeral-cursor reap,
+   and the retirement of cursors whose owner recorded leaving long enough ago.
+   The broker already owns the cursor directory's lifecycle, and this is the one
+   place that runs rarely enough for a full scan to cost nothing. The second
+   sweep also runs periodically while serving, for the reason SERVE-BROKER
+   gives."
   (ensure-bus-dirs paths)
   (reap-orphaned-cursors paths)
+  (age-departed-cursors paths)
   (let ((lock-fd (election:open-lock (bus-paths-lock paths))))
     (cond
       ((election:try-lock-exclusive lock-fd))      ; won immediately
@@ -199,9 +350,44 @@
         (tz:send-message (broker-publisher broker) (princ-to-string seq))
         seq))))
 
+(defun custodial-tick (broker &key (advance-seconds 30) (age-seconds 3600))
+  "Run whichever of the broker's custodial sweeps is due, and return the broker.
+
+   Cheap to call on every turn of the serve loop: it reads a clock and compares
+   two numbers, and does the work at most once per interval.
+
+   Held cursors are advanced at most every ADVANCE-SECONDS and departures aged
+   at most every AGE-SECONDS. Tracking the head within half a minute is what
+   advancing with fleet traffic asks for; advancing on every append would put
+   one file write per departed agent into the hot path and buy nothing."
+  (let ((now (get-universal-time))
+        (paths (broker-paths broker)))
+    (when (>= (- now (broker-cursors-advanced-at broker)) advance-seconds)
+      (setf (broker-cursors-advanced-at broker) now)
+      (advance-held-cursors paths (broker-seq broker)))
+    (when (>= (- now (broker-departures-aged-at broker)) age-seconds)
+      (setf (broker-departures-aged-at broker) now)
+      (age-departed-cursors paths)))
+  broker)
+
 (defun serve-broker (broker stop-fn)
-  "Run BROKER-STEP until STOP-FN returns true. Returns the broker."
-  (loop until (funcall stop-fn) do (broker-step broker))
+  "Run BROKER-STEP until STOP-FN returns true, running the custodial sweeps as
+   they come due. Returns the broker.
+
+   Sweeping from the loop is a deliberate departure from REAP-ORPHANED-CURSORS,
+   which runs once at startup and never again. A held cursor has to advance WITH
+   the traffic to be worth holding, and a broker that has been up for six days
+   would otherwise never have advanced one: every departed agent's position
+   would still be wherever it stopped reading, pinning the log against
+   retention, which is the whole problem holding a cursor was meant to solve.
+
+   BROKER-STEP blocks up to the intake timeout, a tenth of a second by default,
+   so the loop already ticks on its own on an idle bus. No timer and no second
+   thread is involved, and none should be added: a sweep on the serving thread
+   cannot race the appends it reads a head sequence from."
+  (loop until (funcall stop-fn)
+        do (broker-step broker)
+           (custodial-tick broker))
   broker)
 
 (defun stop-broker (broker &key (archive t))
