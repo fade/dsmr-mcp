@@ -32,6 +32,35 @@ is the only delivery mechanism.
 The cheap tell: compare the broker's start time against the last commit that
 touched anything under `src/bus/`.
 
+## Name the bus FIRST, and derive its root
+
+⛔ **Every measurement below reads a file under `$B`. Set `$B` from the bus you
+are actually rotating, or you will measure a different bus and never be told.**
+
+Named buses live one level below the shared one, at `<base>/<name>/`. A rotation
+of `valis` that measures `<base>/members` is reading the shared bus's lock, and
+that mistake is invisible: both files exist, both answer, and the answer is
+plausible. Do this once, at the top, and reuse `$B` throughout:
+
+```bash
+BUS=valis                                  # the bus being rotated; empty = shared
+BASE="${XDG_STATE_HOME:-$HOME/.local/state}/dsmr-mcp/bus"
+B="${BUS:+$BASE/$BUS}"; B="${B:-$BASE}"
+[ -d "$B" ] || { echo "no such bus root: $B" >&2; return 1 2>/dev/null || exit 1; }
+echo "rotating bus: ${BUS:-<shared>}   root: $B"
+```
+
+This is the derivation `scripts/bus-inspect.sh` uses, and it honours
+`XDG_STATE_HOME` rather than assuming `~/.local/state`. **Read the echoed root
+back before you signal anything.** It is one line, and it is the only thing
+standing between you and a correct verdict about the wrong file.
+
+⚠ This file previously hardcoded the shared root at every site. On 2026-07-28 it
+returned the right verdict about `valis` from the shared bus's lock, because two
+unrelated processes happened to hold the two locks. That is luck, not a check.
+With the shared broker gone, the same run would announce LAST MEMBER OUT for a
+busy bus and rotate its WAL.
+
 ## The one thing to measure BEFORE you signal
 
 On a clean shutdown the broker runs `archive-on-clean-exit`, which rotates the
@@ -40,7 +69,6 @@ that does not fire, but "should not" is not a measurement, and a surprise WAL
 rotation is fleet-visible.
 
 ```bash
-B=~/.local/state/dsmr-mcp/bus
 lsof "$B/members" 2>/dev/null | awk 'NR>1{print $2}' | sort -u   # who is a member
 flock -n -x "$B/members" -c 'echo "LAST MEMBER OUT: rotation WILL fire"' \
   || echo "other members hold it: rotation will NOT fire"
@@ -58,8 +86,9 @@ independent corroboration, and it costs nothing.
 
 ### 1. Capture pre-state, so you can prove what did and did not change
 
+Using the `$B` you derived above, not a fresh path:
+
 ```bash
-B=~/.local/state/dsmr-mcp/bus
 stat -c 'bus.wal inode=%i size=%s' "$B/bus.wal"
 ls -la "$B"/*.ipc
 ls "$B/cursors" | wc -l
@@ -156,6 +185,12 @@ to watch. It is a textbook false positive and it reads exactly like success.
 Match on a string that cannot appear in your own command, or better, use the
 election lock, which cannot be faked by a bystander process.
 
+⛔ **`grep 'dsmr-mcp/src/bus/broker'` matches every broker on the host, not
+yours.** All of them load the same system from the same source directory, so the
+pattern says "a broker is running" when the question was "is the broker for THIS
+bus running". Two were live on 2026-07-28, one shared and one for `valis`.
+Discriminate on the bus root in argv, as the verify block does.
+
 ⚠ **`broker.log` is appended by the spawning process's redirection, not by the
 broker's own logging.** If you launch without redirecting, the log's mtime stays
 frozen at the previous broker's start and looks like proof that nothing spawned.
@@ -164,7 +199,10 @@ Check the mtime, but never treat a stale one as conclusive on its own.
 ## Verify, with the WAL inode as the anchor
 
 ```bash
-ps -eo pid,lstart,args | grep 'dsmr-mcp/src/bus/broker' | grep -v grep
+# Match the bus root in the broker's OWN argv, so this cannot answer for a
+# different bus's broker. broker-main takes the root as its first argument,
+# and it appears in argv as a quoted absolute path with a trailing slash.
+ps -eo pid,lstart,args | grep -F "\"$B/\"" | grep -v grep
 stat -c 'bus.wal inode=%i size=%s' "$B/bus.wal"   # inode MUST match pre-state
 ls -la "$B"/*.ipc                                  # timestamps should be NOW
 ls -d "$B"/archive* 2>/dev/null | wc -l            # expect unchanged
