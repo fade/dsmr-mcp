@@ -47,8 +47,9 @@
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht)
   (:import-from #:slynk-client
-                #:slime-eval
-                #:slime-close))
+                #:slime-close)
+  (:import-from #:dsmr-mcp/tests/support/bounded-eval
+                #:eval-in-image))
 
 (in-package #:dsmr-mcp/tests/attach/repl-eval-attach-test)
 
@@ -80,7 +81,7 @@ value directly on the session object."
   "repl-eval results are identical to slime-eval. All returned values are presented."
   (with-temporary-slynk-listener (conn)
     ;; a) Direct slime-eval parity: the in-process listener returns 3 for (+ 1 2).
-    (is = 3 (slime-eval '(+ 1 2) conn))
+    (is = 3 (eval-in-image '(+ 1 2) conn :label "eval parity probe"))
     ;; b) %dispatch-attach parity.
     (multiple-value-bind (session tool)
         (%make-attach-session "crit-1-eval" conn)
