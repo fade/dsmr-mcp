@@ -96,7 +96,14 @@
 
 (defun %signal-seq (seq)
   "Emit a wake signal for SEQ on *standard-output* (the signal channel) and
-   flush, so a watching harness sees it immediately."
+   flush, so a watching harness sees it immediately.
+
+   The line says CHECK THE BUS, not A MESSAGE WITH THIS SEQ IS WAITING. The
+   reader re-checks what is actually pending and drains all of it, so in
+   streaming mode SEQ is the highest seq the emitting poll turned up and the
+   records below it in the same batch get no line of their own. Consecutive
+   lines may therefore skip sequence numbers; a gap is normal and never a
+   dropped record."
   (format *standard-output* "bus:~D~%" seq)
   (force-output *standard-output*))
 
@@ -304,14 +311,36 @@
       (values (if restarted last (max last cursor))
               restarted))))
 
-(defun watch-stream (wal-path baseline
-                     &key (poll-ms 1000) (recycle-seconds 600) self-id
-                          (emit (lambda (s) (%signal-seq s)))
-                          on-poll)
-  "Stream every new FOREIGN seq beyond BASELINE by calling EMIT once per such
-   message, looping until the recycle window elapses with no further activity,
-   then return the final cursor. Used by the persistent-monitor mode; EMIT
-   defaults to printing the bus:<SEQ> signal line.
+(defun watch-stream
+       (wal-path baseline
+        &key (poll-ms 1000) (recycle-seconds 600) self-id
+        (emit (lambda (s) (%signal-seq s))) on-poll)
+  "Stream new FOREIGN activity beyond BASELINE by calling EMIT at most ONCE per
+   poll, with the highest foreign seq that poll turned up, looping until the
+   recycle window elapses with no further activity, then return the final
+   cursor. Used by the persistent-monitor mode; EMIT defaults to printing the
+   bus:<SEQ> signal line.
+
+   One wake per poll batch, not one per record. The reader on the other end of
+   the signal drains everything pending in a single call, so when several
+   records land between two polls only the first wake has anything to deliver
+   and the rest wake an agent to discover the work is already done. Each of
+   those costs an agent turn, which is the scarce resource here.
+
+   A wake therefore means CHECK THE BUS, never THERE IS EXACTLY ONE MESSAGE
+   WAITING. The reader must re-check what is actually pending rather than trust
+   the signal to describe it, the same discipline a POSIX condition variable
+   mandates for the same reason. A consequence worth stating plainly: consecutive
+   bus:<SEQ> lines may SKIP sequence numbers, so anything parsing them has to
+   expect gaps and must not treat a gap as a lost record.
+
+   The coalescing happens here rather than in POLL-NEW, which stays a pure
+   per-record enumerator: this loop hands POLL-NEW a collecting closure and calls
+   the real EMIT once afterwards. Nothing is remembered between polls, so there
+   is no timer and no debounce window and hence none of the lost-wakeup failures
+   those bring. A record appended after a poll's read is simply picked up by the
+   next poll, and the cursor advances to the head of each read regardless of what
+   was emitted, exactly as before.
 
    SELF-ID has the same meaning it has for the exit-on-event loop: this agent's
    own publishes advance the cursor but emit nothing. The idle window resets on
@@ -336,19 +365,22 @@
         (deadline (+ (now-ms) (round (* recycle-seconds 1000))))
         (sleep-s (/ poll-ms 1000.0))
         (reader (wal:make-reader)))
-    (loop
-      (when on-poll (funcall on-poll))
-      (multiple-value-bind (advanced restarted)
-          (poll-new wal-path cursor emit self-id reader)
-        (when restarted
-          (%warn "wal rotated or truncated under the watch; streaming from the head of the new log"))
-        (when (or restarted (> advanced cursor))
-          (setf cursor advanced
-                ;; activity resets the idle window
-                deadline (+ (now-ms) (round (* recycle-seconds 1000))))))
-      (when (>= (now-ms) deadline)
-        (return cursor))
-      (sleep sleep-s))))
+    (loop (when on-poll (funcall on-poll))
+          (let ((highest nil))
+            (multiple-value-bind (advanced restarted)
+                (poll-new wal-path cursor
+                          (lambda (s)
+                            (setf highest (if highest (max highest s) s)))
+                          self-id reader)
+              (when restarted
+                (%warn
+                 "wal rotated or truncated under the watch; streaming from the head of the new log"))
+              (when (or restarted (> advanced cursor))
+                (setf cursor advanced
+                      deadline (+ (now-ms) (round (* recycle-seconds 1000))))))
+            (when (and emit highest) (funcall emit highest)))
+          (when (>= (now-ms) deadline) (return cursor))
+          (sleep sleep-s))))
 
 ;;; ---------------------------------------------------------------------- main
 
@@ -387,10 +419,15 @@ Options:
                        (default: the resolved agent's cursor, or the WAL's
                         current max seq when no agent resolves; 0 = fire on any
                         record)
-  --stream             stream one `bus:<SEQ>` line per new foreign seq on STDOUT
-                       (for a persistent monitor); on an idle window it
-                       self-recycles by exiting 0 so a supervisor re-arms it
-                       fresh. Recycle/lifecycle notes go to STDERR, never STDOUT.
+  --stream             stream one `bus:<SEQ>` line per POLL that turned up new
+                       foreign records, carrying the highest such seq, on STDOUT
+                       (for a persistent monitor). One wake per batch, not per
+                       record: the reader drains everything pending in one call,
+                       so a line means `check the bus` rather than `exactly one
+                       message is waiting`, and consecutive lines may skip
+                       sequence numbers. On an idle window it self-recycles by
+                       exiting 0 so a supervisor re-arms it fresh.
+                       Recycle/lifecycle notes go to STDERR, never STDOUT.
                        Default is exit-on-event.
   --poll-ms N          poll interval in milliseconds (default 1000)
   --recycle-seconds N  idle self-recycle window in seconds (default 600)
@@ -414,9 +451,10 @@ then ignored — the watcher keeps running on defaults rather than leaving the
 agent deaf to the bus.
 
 Exit-on-event prints one `bus:<SEQ>` line then exits 0; on idle recycle it
-prints `recycle:` then exits 0. Streaming prints `bus:<SEQ>` per new foreign seq
-on stdout and self-recycles by exiting 0 on an idle window, so its supervising
-monitor re-arms it fresh; its recycle/lifecycle diagnostics go only to STDERR.
+prints `recycle:` then exits 0. Streaming prints one `bus:<SEQ>` line per poll
+that turned up new foreign records, carrying the highest of them, and
+self-recycles by exiting 0 on an idle window, so its supervising monitor re-arms
+it fresh; its recycle/lifecycle diagnostics go only to STDERR.
 
 While a watch runs it refreshes a heartbeat file every poll and removes it on
 clean exit; a dead watch leaves no fresh beat. --check-live reads that beat so a

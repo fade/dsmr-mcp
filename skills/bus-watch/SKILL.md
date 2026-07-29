@@ -30,10 +30,19 @@ Same watcher, different harness primitive. Use the Monitor.
 ## The tool underneath
 
 `dsmr-bus-watch` (on `PATH` at `~/.local/bin/dsmr-bus-watch`) watches the bus
-write-ahead log. In `--stream` mode it prints one `bus:<SEQ>` line per new
-message you have not consumed and keeps running; on an idle window it prints
-`recycle:` and exits (the outer loop restarts it). Signal goes to stdout;
-diagnostics to stderr.
+write-ahead log. In `--stream` mode it prints one `bus:<SEQ>` line per poll that
+turned up anything new for you, carrying the highest such seq, and keeps running;
+on an idle window it prints `recycle:` and exits (the outer loop restarts it).
+Signal goes to stdout; diagnostics to stderr.
+
+⚠ **A line means CHECK THE BUS, not "one message with this seq is waiting."**
+`bus-receive` drains everything pending in a single call, so when several records
+land between two polls they arrive as ONE line carrying the highest seq. That is
+why the drain-on-wake step below is written to keep receiving until the bus says
+empty, rather than assuming one line means one message.
+
+⚠ **Consecutive lines may SKIP sequence numbers.** A gap is normal and never a
+dropped record. Do not build anything that treats the seq stream as contiguous.
 
 ## Identity — mandatory, not optional
 
