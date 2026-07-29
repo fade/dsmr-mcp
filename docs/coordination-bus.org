@@ -224,8 +224,13 @@ installer (=~/.local/bin/dsmr-bus-watch=).
 
 ** Two modes, and which one to stand on
 
-- *Streaming* (=--stream=) — prints =bus:<SEQ>= once per new message and keeps
-  running. This is the STANDING listener: run it under a persistent *Monitor*
+- *Streaming* (=--stream=) prints =bus:<SEQ>= once per poll that turned something
+  up, carrying the highest new seq that poll found, and keeps running. A wake
+  means CHECK THE BUS, not "a message with this seq is waiting": the reader
+  drains everything pending in one call, so records below the signalled seq get
+  no line of their own. Consecutive lines may therefore SKIP sequence numbers.
+  A gap is normal and never a dropped record, so anything parsing these lines
+  must expect one. This is the STANDING listener: run it under a persistent *Monitor*
   (the Claude Code harness primitive that turns each printed line into a live
   notification), armed once at bring-up, and every message wakes the agent with
   no per-turn re-arm. See the =bus-watch= skill for the exact Monitor command.
@@ -346,7 +351,8 @@ dsmr-bus-watch [--wal PATH] [--after SEQ] [--stream] [--poll-ms N] [--recycle-se
   (falls back to =~/.local/state/dsmr-mcp/bus/bus.wal=).
 - =--after SEQ= — baseline; fire on the first seq greater than =SEQ=. Default is
   the WAL's current max seq, read at arm time (=0= fires on any record).
-- =--stream= — stream one line per new seq and keep running (else exit-on-event).
+- =--stream= streams one line per poll that found new records, carrying the
+  highest such seq, and keeps running (else exit-on-event). Seq gaps are expected.
 - =--poll-ms N= — poll interval in milliseconds (default =1000=).
 - =--recycle-seconds N= — idle self-recycle window in seconds (default =600=).
 - =-h=, =--help= — print help and exit 0.
