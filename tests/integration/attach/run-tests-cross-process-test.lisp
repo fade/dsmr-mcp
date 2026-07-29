@@ -38,8 +38,9 @@
                 #:make-ht)
   (:import-from #:slynk-client
                 #:slime-connect
-                #:slime-close
-                #:slime-eval)
+                #:slime-close)
+  (:import-from #:dsmr-mcp/tests/support/bounded-eval
+                #:eval-in-image)
   (:import-from #:dsmr-mcp/tests/integration/support
                 #:with-foreign-slynk-child-or-skip))
 
@@ -212,8 +213,9 @@ second call succeeds through the bootstrap's :CURRENT path."
     (with-foreign-test-image (conn probe-dir)
       (declare (ignorable probe-dir))
       ;; Sanity: the link works and the image is genuinely foreign.
-      (is = 3 (slime-eval '(+ 1 2) conn))
-      (false (slime-eval '(find-package "DSMR-MCP/SRC/TEST-RUNNER-ENGINE") conn))
+      (is = 3 (eval-in-image '(+ 1 2) conn :label "foreign runner link probe"))
+      (false (eval-in-image '(find-package "DSMR-MCP/SRC/TEST-RUNNER-ENGINE") conn
+                            :label "engine absent before bootstrap"))
 
       (let* ((tool (%attach-repl-tool "xproc-run-tests" conn))
              (params (make-ht "system" "dsmr-xproc-runner-probe"
@@ -237,8 +239,10 @@ second call succeeds through the bootstrap's :CURRENT path."
           (true (search "XPROC-PROBE-FAILS" summary)))
         ;; The bootstrap installed the engine; the umbrella stayed
         ;; packageless (resolution went through ASDF, not a name match).
-        (true (slime-eval '(and (find-package "DSMR-MCP/SRC/TEST-RUNNER-ENGINE") t) conn))
-        (false (slime-eval '(find-package "DSMR-XPROC-RUNNER-PROBE") conn))
+        (true (eval-in-image '(and (find-package "DSMR-MCP/SRC/TEST-RUNNER-ENGINE") t) conn
+                             :label "engine present after bootstrap"))
+        (false (eval-in-image '(find-package "DSMR-XPROC-RUNNER-PROBE") conn
+                              :label "umbrella stayed packageless"))
         ;; Second call: the version gate is :CURRENT, the run still works.
         (let ((res2 (%dispatch-attach-run-tests tool 2 params)))
           (false (gethash "isError" res2))

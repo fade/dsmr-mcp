@@ -48,8 +48,8 @@
                 #:register-object)
   (:import-from #:dsmr-mcp/src/hermetic/worker/inspect
                 #:inspect-object-by-id)
-  (:import-from #:slynk-client
-                #:slime-eval))
+  (:import-from #:dsmr-mcp/tests/support/bounded-eval
+                #:eval-in-image))
 
 (in-package #:dsmr-mcp/tests/attach/inspect-test)
 
@@ -78,16 +78,17 @@ INSPECT-TOOL is the inspect-object-tool instance for the same session."
 
 (defun %ensure-test-class (conn)
   "Install cl-user::test-inspect-widget in the attached image (idempotent)."
-  (slime-eval '(progn
-                (unless (find-class 'cl-user::test-inspect-widget nil)
-                  (defclass cl-user::test-inspect-widget
-                      ()
-                    ((color :initarg :color :initform "red")
-                     (count :initarg :count :initform 0)
-                     (nested :initarg :nested :initform nil))
-                    (:documentation "Throwaway CLOS class for inspect-test.")))
-                nil)
-              conn))
+  (eval-in-image '(progn
+                   (unless (find-class 'cl-user::test-inspect-widget nil)
+                     (defclass cl-user::test-inspect-widget
+                         ()
+                       ((color :initarg :color :initform "red")
+                        (count :initarg :count :initform 0)
+                        (nested :initarg :nested :initform nil))
+                       (:documentation "Throwaway CLOS class for inspect-test.")))
+                   nil)
+                 conn
+                 :label "inspect-test fixture class"))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CLOS slot inspection
