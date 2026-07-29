@@ -45,9 +45,10 @@
   (:import-from #:slynk-client
                 #:slime-connect
                 #:slime-close
-                #:slime-eval
                 #:slime-eval-async
                 #:slime-network-error)
+  (:import-from #:dsmr-mcp/tests/support/bounded-eval
+                #:eval-in-image)
   (:import-from #:bordeaux-threads
                 #:current-thread)
   (:import-from #:dsmr-mcp/tests/integration/support
@@ -169,7 +170,8 @@ cancel-attached-eval reports :aborted-clean and records no orphan."
   (with-foreign-slynk-child-or-skip
     (with-foreign-slynk-image (conn)
       ;; Sanity: the foreign image evaluates a trivial form (proves the link).
-      (is = 3 (slime-eval '(+ 1 2) conn))
+      (is = 3 (eval-in-image '(+ 1 2) conn
+                             :label "clean-abort link probe"))
       (let ((promise (make-dispatch-promise
                       :request-id "cancel-clean-1"
                       :session-id "cancel-clean-session"
@@ -197,7 +199,8 @@ cancel-attached-eval reports :orphaned, records a :mode :attached orphan, leaves
 the connection open, and raises no slime-network-error (wire-literal guard)."
   (with-foreign-slynk-child-or-skip
     (with-foreign-slynk-image (conn)
-      (is = 3 (slime-eval '(+ 1 2) conn))
+      (is = 3 (eval-in-image '(+ 1 2) conn
+                             :label "orphan-path link probe"))
       (let* ((request-id "cancel-orphan-1")
              (promise (make-dispatch-promise
                        :request-id request-id
