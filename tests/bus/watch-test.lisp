@@ -6,8 +6,10 @@
 ;;;; (so an agent's own just-published message, which is at-or-below the baseline
 ;;;; once it re-arms, never wakes it), it self-recycles to NIL when the idle
 ;;;; window passes with nothing new, it tolerates a missing/empty WAL, and the
-;;;; streaming step emits exactly one signal per new message. The watch loop is a
-;;;; named function exercised directly in-process — no subprocess, no real waiting.
+;;;; streaming step emits exactly one signal per new message, and the streaming
+;;;; LOOP coalesces each poll's batch into a single wake carrying the highest seq
+;;;; it turned up. The watch loop is a named function exercised directly
+;;;; in-process, with no subprocess and no real waiting.
 
 ;; Package evolution guard
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -615,6 +617,82 @@
                                      :emit (lambda (s) (push s seen)))))
         (is = 3 final)
         (is equal '(2) (reverse seen))))))
+
+(define-test streaming-wakes-once-per-poll-batch-carrying-the-highest-seq
+  ;; The reader on the other end of the signal drains everything pending in one
+  ;; call, so a burst that lands between two polls has to produce ONE wake and
+  ;; not one per record. The extra wakes were never merely redundant: each one
+  ;; costs the woken agent a whole turn to discover the work was already done.
+  ;;
+  ;; The burst is published from inside the poll thunk, on the second poll, so
+  ;; it genuinely arrives between two reads rather than sitting there at arm.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them"))
+          (seen '())
+          (polls 0))
+      (flet ((publish-a-burst-on-the-second-poll ()
+               (incf polls)
+               (when (= polls 2)
+                 (append-from w 1 them)
+                 (append-from w 2 them)
+                 (append-from w 3 them)
+                 (append-from w 4 them))))
+        (let ((final (watch-stream w 0 :poll-ms 5 :recycle-seconds 0.25
+                                       :self-id me
+                                       :emit (lambda (s) (push s seen))
+                                       :on-poll
+                                       #'publish-a-burst-on-the-second-poll)))
+          (is = 4 final)
+          (is = 1 (length seen)
+              "a four-record burst must wake the reader exactly once")
+          (is equal '(4) seen
+              "and that one wake must carry the highest seq of the batch"))))))
+
+(define-test streaming-wakes-once-for-a-single-record
+  ;; The degenerate batch, and most of the traffic on a quiet bus. Coalescing a
+  ;; burst must not cost the ordinary case its wake, nor duplicate it.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them"))
+          (seen '())
+          (polls 0))
+      (flet ((publish-one-on-the-second-poll ()
+               (incf polls)
+               (when (= polls 2) (append-from w 1 them))))
+        (let ((final (watch-stream w 0 :poll-ms 5 :recycle-seconds 0.25
+                                       :self-id me
+                                       :emit (lambda (s) (push s seen))
+                                       :on-poll #'publish-one-on-the-second-poll)))
+          (is = 1 final)
+          (is = 1 (length seen) "one record must produce exactly one wake")
+          (is equal '(1) seen))))))
+
+(define-test streaming-arm-coalesces-a-standing-backlog-into-one-wake
+  ;; The same property on the first poll, which is the one that reads the whole
+  ;; log. A backlog waiting at arm time is the largest batch a watch ever sees,
+  ;; so it is also the worst case for one-wake-per-record: an agent coming back
+  ;; up to a quiet stretch of mail would be woken once for every message in it.
+  ;;
+  ;; A recycle window of zero puts the deadline in the past, so the loop gets
+  ;; exactly one poll and the count cannot be confused by a later one. The
+  ;; trailing record is our own publish, which advances the cursor past the
+  ;; wake it does not cause.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them"))
+          (seen '()))
+      (append-from w 1 them)
+      (append-from w 2 them)
+      (append-from w 3 them)
+      (append-from w 4 me)
+      (let ((final (watch-stream w 0 :poll-ms 5 :recycle-seconds 0
+                                     :self-id me
+                                     :emit (lambda (s) (push s seen)))))
+        (is = 4 final "the cursor clears our own publish too")
+        (is = 1 (length seen) "a standing backlog is one wake, not three")
+        (is equal '(3) seen
+            "carrying the highest seq we would actually be handed")))))
 
 ;;; heartbeat -----------------------------------------------------------------
 
