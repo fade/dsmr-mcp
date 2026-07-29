@@ -36,8 +36,8 @@
                 #:session-slynk-attach)
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht)
-  (:import-from #:slynk-client
-                #:slime-eval))
+  (:import-from #:dsmr-mcp/tests/support/bounded-eval
+                #:eval-in-image))
 
 (in-package #:dsmr-mcp/tests/attach/registry-test)
 
@@ -66,12 +66,13 @@ string in the response envelope. Primitives (numbers) must NOT produce one."
     ;; default CL-USER package can reference it without a package qualifier.
     ;; Using cl-user:: here ensures the symbol is interned in CL-USER at
     ;; test-file read time, matching where the wrap-form reader will look.
-    (slime-eval '(progn
-                  (unless (find-class 'cl-user::test-registry-widget nil)
-                    (defclass cl-user::test-registry-widget
-                        () ((val :initarg :val :initform 0))))
-                  nil)
-                conn)
+    (eval-in-image '(progn
+                     (unless (find-class 'cl-user::test-registry-widget nil)
+                       (defclass cl-user::test-registry-widget
+                           () ((val :initarg :val :initform 0))))
+                     nil)
+                   conn
+                   :label "result-object-id-present fixture class")
     (multiple-value-bind (session tool)
         (%make-attach-session "reg-test-present" conn)
       (declare (ignore session))
@@ -97,12 +98,13 @@ string in the response envelope. Primitives (numbers) must NOT produce one."
   "Two sequential repl-eval calls in the same session each return a distinct
 result_object_id. Both underlying raw IDs remain look-up-able in the image table."
   (with-temporary-slynk-listener (conn)
-    (slime-eval '(progn
-                  (unless (find-class 'cl-user::test-registry-widget nil)
-                    (defclass cl-user::test-registry-widget
-                        () ((val :initarg :val :initform 0))))
-                  nil)
-                conn)
+    (eval-in-image '(progn
+                     (unless (find-class 'cl-user::test-registry-widget nil)
+                       (defclass cl-user::test-registry-widget
+                           () ((val :initarg :val :initform 0))))
+                     nil)
+                   conn
+                   :label "ids-survive-across-calls fixture class")
     (multiple-value-bind (session tool)
         (%make-attach-session "reg-test-survive" conn)
       (declare (ignore session))
@@ -151,12 +153,13 @@ result_object_id. Both underlying raw IDs remain look-up-able in the image table
   "An ID minted by session A, when looked up with session B's session-id,
 resolves to :object-not-found — never another session's object."
   (with-temporary-slynk-listener (conn)
-    (slime-eval '(progn
-                  (unless (find-class 'cl-user::test-registry-widget nil)
-                    (defclass cl-user::test-registry-widget
-                        () ((val :initarg :val :initform 0))))
-                  nil)
-                conn)
+    (eval-in-image '(progn
+                     (unless (find-class 'cl-user::test-registry-widget nil)
+                       (defclass cl-user::test-registry-widget
+                           () ((val :initarg :val :initform 0))))
+                     nil)
+                   conn
+                   :label "session-isolation fixture class")
     ;; Session A mints an ID.
     (multiple-value-bind (session-a tool-a)
         (%make-attach-session "reg-test-session-a" conn)
@@ -186,12 +189,13 @@ resolves to :object-not-found — never another session's object."
   "When register_result is false in the params, result_object_id must be absent
 from the response, even for an inspectable (CLOS) result."
   (with-temporary-slynk-listener (conn)
-    (slime-eval '(progn
-                  (unless (find-class 'cl-user::test-registry-widget nil)
-                    (defclass cl-user::test-registry-widget
-                        () ((val :initarg :val :initform 0))))
-                  nil)
-                conn)
+    (eval-in-image '(progn
+                     (unless (find-class 'cl-user::test-registry-widget nil)
+                       (defclass cl-user::test-registry-widget
+                           () ((val :initarg :val :initform 0))))
+                     nil)
+                   conn
+                   :label "register-result-false-suppresses-id fixture class")
     (multiple-value-bind (session tool)
         (%make-attach-session "reg-test-no-register" conn)
       (declare (ignore session))

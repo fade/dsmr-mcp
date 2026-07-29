@@ -52,8 +52,9 @@
                 #:make-ht)
   (:import-from #:slynk-client
                 #:slime-connect
-                #:slime-close
-                #:slime-eval)
+                #:slime-close)
+  (:import-from #:dsmr-mcp/tests/support/bounded-eval
+                #:eval-in-image)
   (:import-from #:dsmr-mcp/tests/integration/support
                 #:with-foreign-slynk-child-or-skip))
 
@@ -197,9 +198,10 @@ tool-handle methods pass to their %dispatch-attach-* functions."
   (with-foreign-slynk-child-or-skip
     (with-foreign-slynk-image (conn)
       ;; Sanity: the foreign image evaluates a trivial form (proves the link).
-      (is = 3 (slime-eval '(+ 1 2) conn))
+      (is = 3 (eval-in-image '(+ 1 2) conn :label "foreign wire link probe"))
       (is equal "ALEXANDRIA"
-          (slime-eval '(package-name (symbol-package 'alexandria:flatten)) conn))
+          (eval-in-image '(package-name (symbol-package 'alexandria:flatten)) conn
+                         :label "foreign library symbol probe"))
 
       ;; repl-eval: a base-string-producing expression must survive the round-trip.
       (let* ((tool (%attach-repl-tool "xproc-repl" conn))
