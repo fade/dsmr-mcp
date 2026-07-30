@@ -1,16 +1,25 @@
 ;;;; tests/lisp-edit-comment-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Tests for the comment-region locator: how a maximal comment run is
-;;;; collapsed, which runs stand free of any form and which belong to the form
-;;;; below them, and how substring anchoring refuses to guess.
+;;;; Tests for comment-region editing, from locating a region through to
+;;;; the write: how a maximal comment run is collapsed, which runs stand
+;;;; free of any form and which belong to the form below them, how
+;;;; substring anchoring refuses to guess, and what an edit has to leave
+;;;; untouched.
 ;;;;
 ;;;; The file-header cases are here because a reader's intuition and the
-;;;; attachment rule disagree about them.  A header separated from the first
-;;;; form by a blank line is free-standing; a header sitting flush on top of
-;;;; the first form is that form's leading comment and substring anchoring
-;;;; will not see it at all.  Both spellings are pinned so neither has to be
-;;;; rediscovered.
+;;;; attachment rule disagree about them.  A header separated from the
+;;;; first form by a blank line is free-standing; a header sitting flush on
+;;;; top of the first form is that form's leading comment and substring
+;;;; anchoring will not see it at all.  Both spellings are pinned so
+;;;; neither has to be rediscovered.
+;;;;
+;;;; Two guarantees in the editing tests are easy to lose.  Every form
+;;;; around an edited comment must come back byte for byte, and the only
+;;;; check that sees a replacement swallowing a form is the comparison of
+;;;; the re-parsed forms; the delimiter scan passes that case.  And a
+;;;; comment written after code on the same line is refused rather than
+;;;; treated as the next form's, because nothing later could catch that.
 
 ;; Package evolution guard
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -35,12 +44,20 @@
   (:import-from #:dsmr-mcp/src/lisp-edit-form-core
                 #:%find-target)
   (:import-from #:dsmr-mcp/src/cst
+                #:cst-node-kind
                 #:cst-node-start
                 #:cst-node-end
                 #:cst-node-start-line
                 #:cst-node-end-line
                 #:cst-node-value
                 #:parse-top-level-forms)
+  (:import-from #:dsmr-mcp/src/lisp-edit-comment
+                #:edit-comment
+                #:comment-operation-error
+                #:comment-operation-reason)
+  (:import-from #:dsmr-mcp/src/validate
+                #:scan-parens
+                #:try-reader-check)
   (:import-from #:dsmr-mcp/tests/support/fs-fixture
                 #:with-temp-project-root
                 #:write-fixture-file))
@@ -391,3 +408,230 @@ the file, and returns its free-standing regions alongside the parse."
     (true session)
     (write-fixture-file root "fixture.lisp" +banner-between-forms+)
     (fail (%locate-comment-regions "../../etc/passwd" nil root) error)))
+
+;;;; -------------------------------------------------------------------------
+;;;; Editing a region: the comment changes, the code around it does not
+;;;; -------------------------------------------------------------------------
+
+(define-test banner-replace-keeps-neighbours
+  "Replacing a free-standing banner rewrites the comment and leaves the forms
+either side of it byte for byte as they were."
+  (with-temp-project-root (session root)
+    (true session)
+    (let ((path (write-fixture-file root "banner.lisp" +banner-between-forms+)))
+      (edit-comment (namestring root) (namestring path) "region" "replace"
+                    :substring "Descriptor passing."
+                    :content (format nil ";;; Rewritten in one line.~%"))
+      (let ((result (uiop:read-file-string path)))
+        (true (search "Rewritten in one line." result))
+        (false (search "Descriptor passing." result))
+        (is string= (format nil "(defun before () 1)~%~%~
+;;; Rewritten in one line.~%~%(defun after () 2)~%")
+            result)))))
+
+(define-test banner-delete-leaves-one-blank-line
+  "Deleting a banner takes the whitespace run that followed it and no more, so
+the forms either side end up separated by a single blank line rather than by
+the gap the banner used to fill."
+  (with-temp-project-root (session root)
+    (true session)
+    (let ((path (write-fixture-file root "banner.lisp" +banner-between-forms+)))
+      (edit-comment (namestring root) (namestring path) "region" "delete"
+                    :substring "Descriptor passing.")
+      (is string= (format nil "(defun before () 1)~%~%(defun after () 2)~%")
+          (uiop:read-file-string path)))))
+
+(define-test mixed-style-run-edits-as-one-region
+  "A block comment and the semicolon line flush beneath it are one region, so a
+single replace covers both styles at once."
+  (with-temp-project-root (session root)
+    (true session)
+    (let ((path (write-fixture-file root "mixed.lisp" +mixed-style-run+)))
+      (edit-comment (namestring root) (namestring path) "region" "replace"
+                    :substring "Block opens here"
+                    :content (format nil ";; One line replaces both styles.~%"))
+      (let ((result (uiop:read-file-string path)))
+        (false (search "Block opens here" result))
+        (false (search "semicolon line flush" result))
+        (is string= (format nil "(defun before () 1)~%~%~
+;; One line replaces both styles.~%~%(defun after () 2)~%")
+            result)))))
+
+;;;; -------------------------------------------------------------------------
+;;;; Editing the comment attached to a form, and what counts as attached
+;;;; -------------------------------------------------------------------------
+
+(define-test alien-routine-leading-edit-keeps-the-form
+  "The shape that prompted this work: a banner sitting flush on top of an alien
+routine whose name is a compound spec. Naming the routine reaches the banner,
+and the routine comes back byte for byte unchanged, as do the forms either
+side of it."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((routine (format nil "(sb-alien:define-alien-routine ~
+(\"sendmsg\" %scm-sendmsg) sb-alien:long~%  (fd sb-alien:int)~%~
+  (msg sb-alien:system-area-pointer)~%  (flags sb-alien:int))"))
+           (source (format nil "(defun closer () nil)~%~%~
+;;; SCM_RIGHTS fd passing.~%;;; Stale wording to correct.~%~A~%~%~
+(defun neighbour (x) (1+ x))~%" routine))
+           (path (write-fixture-file root "alien.lisp" source)))
+      (edit-comment (namestring root) (namestring path) "leading" "replace"
+                    :form-type "define-alien-routine" :form-name "%scm-sendmsg"
+                    :content (format nil ";;; Descriptor passing over a unix socket.~%"))
+      (let ((result (uiop:read-file-string path)))
+        (true (search "Descriptor passing over a unix socket." result))
+        (false (search "Stale wording to correct." result))
+        (true (search routine result))
+        (true (search "(defun closer () nil)" result))
+        (true (search "(defun neighbour (x) (1+ x))" result))))))
+
+(define-test leading-comment-flush-against-a-form-is-editable
+  "A comment directly above a form, with no blank line, is reached by naming
+the form and is rewritten in place without the form moving."
+  (with-temp-project-root (session root)
+    (true session)
+    (let ((path (write-fixture-file root "flush.lisp" +leading-flush+)))
+      (edit-comment (namestring root) (namestring path) "leading" "replace"
+                    :form-type "defun" :form-name "after"
+                    :content (format nil ";; Now says something else.~%"))
+      (is string= (format nil "(defun before () 1)~%~%~
+;; Now says something else.~%(defun after () 2)~%")
+          (uiop:read-file-string path)))))
+
+(define-test blank-line-detaches-a-comment-from-leading-mode
+  "A blank line between a comment and the form below it makes the comment
+free-standing. Leading mode refuses it and writes nothing; region mode reaches
+the same comment and edits it."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((path (write-fixture-file root "detached.lisp" +leading-detached+))
+           (err (error-from (lambda ()
+                              (edit-comment (namestring root) (namestring path)
+                                            "leading" "replace"
+                                            :form-type "defun" :form-name "after"
+                                            :content ";; taken by the wrong form")))))
+      (true (typep err 'comment-operation-error))
+      (is string= +leading-detached+ (uiop:read-file-string path))
+      (edit-comment (namestring root) (namestring path) "region" "replace"
+                    :substring "Explains nothing in particular."
+                    :content (format nil ";; Reached through region mode.~%"))
+      (true (search "Reached through region mode." (uiop:read-file-string path))))))
+
+(define-test same-line-trailing-comment-is-not-a-leading-comment
+  "A comment written after code on the same line is prose about that code. The
+line-adjacency test on its own hands it to the form on the next line, and
+replacing it would then destroy a comment belonging to the form above while
+every form in the file stayed byte for byte identical, so no later check could
+notice. Leading mode refuses such a run outright and writes nothing. A run
+that does begin its own line is unaffected and still edits."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((source (format nil "(defun a () 1) ; note about a~%(defun b () 2)~%"))
+           (path (write-fixture-file root "trailing.lisp" source))
+           (err (error-from (lambda ()
+                              (edit-comment (namestring root) (namestring path)
+                                            "leading" "replace"
+                                            :form-type "defun" :form-name "b"
+                                            :content ";; taken by the wrong form")))))
+      (true (typep err 'comment-operation-error))
+      (true (search "same line" (comment-operation-reason err)))
+      (is string= source (uiop:read-file-string path)))
+    (let* ((source (format nil "(defun a () 1)~%; note about b~%(defun b () 2)~%"))
+           (path (write-fixture-file root "own-line.lisp" source)))
+      (edit-comment (namestring root) (namestring path) "leading" "replace"
+                    :form-type "defun" :form-name "b"
+                    :content (format nil "; note that now says more~%"))
+      (is string= (format nil "(defun a () 1)~%; note that now says more~%~
+(defun b () 2)~%")
+          (uiop:read-file-string path)))))
+
+;;;; -------------------------------------------------------------------------
+;;;; Refusing to write: bad anchors, previews, and a corrupting replacement
+;;;; -------------------------------------------------------------------------
+
+(define-test absent-substring-writes-nothing
+  "A substring naming no region signals before the splice, so the file on disk
+is exactly what it was."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((path (write-fixture-file root "banner.lisp" +banner-between-forms+))
+           (err (error-from (lambda ()
+                              (edit-comment (namestring root) (namestring path)
+                                            "region" "replace"
+                                            :substring "nowhere in this file"
+                                            :content ";; never written")))))
+      (true (typep err 'comment-operation-error))
+      (is string= +banner-between-forms+ (uiop:read-file-string path)))))
+
+(define-test ambiguous-substring-writes-nothing
+  "A substring matching two regions lists both and edits neither, so a caller
+picks rather than discovers afterwards which one was rewritten."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((source (format nil "(defun before () 1)~%~%;; Shared wording here.~%~%~
+;; Shared wording there.~%~%(defun after () 2)~%"))
+           (path (write-fixture-file root "ambiguous.lisp" source))
+           (err (error-from (lambda ()
+                              (edit-comment (namestring root) (namestring path)
+                                            "region" "replace"
+                                            :substring "Shared wording"
+                                            :content ";; never written")))))
+      (true (typep err 'comment-operation-error))
+      (true (search "Shared wording here." (comment-operation-reason err)))
+      (true (search "Shared wording there." (comment-operation-reason err)))
+      (is string= source (uiop:read-file-string path)))))
+
+(define-test dry-run-preview-matches-the-applied-file
+  "The preview comes off the same splice the real edit uses, so it equals the
+file a real apply produces, and the previewed file is left untouched. The
+changed-region report names the lines the comment occupied and the line the
+replacement now ends on."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((replacement (format nil ";;; Fresh wording.~%;;; Over two lines.~%"))
+           (dry-path (write-fixture-file root "dry.lisp" +banner-between-forms+))
+           (preview (edit-comment (namestring root) (namestring dry-path)
+                                  "region" "replace"
+                                  :substring "Descriptor passing."
+                                  :content replacement :dry-run t))
+           (real-path (write-fixture-file root "real.lisp" +banner-between-forms+)))
+      (true (gethash "would_change" preview))
+      (is string= +banner-between-forms+ (uiop:read-file-string dry-path))
+      (edit-comment (namestring root) (namestring real-path) "region" "replace"
+                    :substring "Descriptor passing." :content replacement)
+      (is string= (uiop:read-file-string real-path) (gethash "preview" preview))
+      (let ((report (gethash "changed_region" preview)))
+        (is = 3 (gethash "line_start" report))
+        (is = 4 (gethash "line_end" report))
+        (is = 4 (gethash "line_end_after" report))
+        (is string= replacement (gethash "after" report))))))
+
+(define-test form-absorbing-content-is-refused-before-the-write
+  "Replacement text that opens a block comment closed by a delimiter already
+sitting further down the file turns a whole form into comment text. The
+delimiter scan and the reader both pass on the result, which is why comparing
+the forms of the re-parsed file against the originals is the check that has to
+run: it is the only one that sees a form has gone. It runs before the write,
+so the file is left alone."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((source (format nil "(defun before () 1)~%~%;;; Banner to rewrite.~%~%~
+(defun after () 2)~%;; tail |#~%(defun last-one () 3)~%"))
+           (absorbing "#| swallow")
+           (spliced (format nil "(defun before () 1)~%~%~A~%(defun after () 2)~%~
+;; tail |#~%(defun last-one () 3)~%" absorbing))
+           (path (write-fixture-file root "absorbing.lisp" source)))
+      ;; The cheaper guards see nothing wrong with the spliced file: it is
+      ;; balanced and it reads without error, and yet it holds one form fewer.
+      (true (getf (scan-parens spliced) :ok))
+      (is eq nil (try-reader-check spliced))
+      (is = 3 (count :expr (parse-top-level-forms source) :key #'cst-node-kind))
+      (is = 2 (count :expr (parse-top-level-forms spliced) :key #'cst-node-kind))
+      (let ((err (error-from (lambda ()
+                               (edit-comment (namestring root) (namestring path)
+                                             "region" "replace"
+                                             :substring "Banner to rewrite."
+                                             :content absorbing)))))
+        (true (typep err 'comment-operation-error))
+        (true (search "forms" (comment-operation-reason err)))
+        (is string= source (uiop:read-file-string path))))))
