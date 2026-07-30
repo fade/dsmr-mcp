@@ -625,6 +625,86 @@ Provide either path (file read under sandbox) or code (inline text) — not both
 }
 #+end_src
 
+* lisp-edit-comment
+
+Structure-aware edit of a comment in a Lisp source file. 
+Replaces or deletes a comment the form editors cannot reach: a free-standing 
+banner between top-level forms, or the comment sitting flush on top of a named 
+form. Region mode names the comment by a unique substring of it, narrowed by 
+line_start and line_end when that substring matches more than one. Leading mode 
+names the form the comment sits on, through form_type and form_name; a blank 
+line between a comment and the form makes that comment free-standing, so name it 
+by substring instead. Every surrounding form is proven byte for byte identical 
+before anything is written, and an anchor naming no comment or more than one 
+fails without writing. Use this instead of a plain text edit when changing 
+comments in Lisp source. Adding a brand new comment is not offered here: 
+lisp-edit-form insert_before already places one relative to a form.
+
+#+begin_src json
+{
+  "properties": {
+    "content": {
+      "description": "Replacement comment text, including its own comment \ncharacters. Required for replace; ignored for delete.",
+      "type": "string"
+    },
+    "dry_run": {
+      "description": "When true, return a preview without writing to disk.",
+      "type": "boolean"
+    },
+    "file_path": {
+      "description": "Target file path (absolute, or relative to project root).",
+      "type": "string"
+    },
+    "form_name": {
+      "description": "Leading mode: name of the form the comment sits on. \nFor defmethod include specializers. Reader macro prefixes #: and : are stripped \nautomatically.",
+      "type": "string"
+    },
+    "form_type": {
+      "description": "Leading mode: form type the comment sits on, \ne.g. \"defun\", \"defmacro\", \"defmethod\".",
+      "type": "string"
+    },
+    "line_end": {
+      "description": "Region mode: last source line of the wanted comment, \n1-based. Only needed when substring alone matches more than one comment.",
+      "type": "integer"
+    },
+    "line_start": {
+      "description": "Region mode: first source line of the wanted comment, \n1-based. Only needed when substring alone matches more than one comment.",
+      "type": "integer"
+    },
+    "mode": {
+      "description": "How the comment is named: \"region\" for a free-standing \ncomment named by substring, or \"leading\" for the comment flush on top of a form.",
+      "enum": [
+        "region",
+        "leading"
+      ],
+      "type": "string"
+    },
+    "operation": {
+      "description": "Operation: replace or delete.",
+      "enum": [
+        "replace",
+        "delete"
+      ],
+      "type": "string"
+    },
+    "readtable": {
+      "description": "Named-readtable designator. A file read through a custom \nreadtable yields no comments at all, so naming one here makes every comment in the \nfile unreachable by this tool.",
+      "type": "string"
+    },
+    "substring": {
+      "description": "Region mode: a substring of the comment to edit. Must \nmatch exactly one free-standing comment unless line_start and line_end narrow it.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "file_path",
+    "mode",
+    "operation"
+  ],
+  "type": "object"
+}
+#+end_src
+
 * lisp-edit-form
 
 Structure-aware edit of a top-level Lisp form using Eclector CST parsing. 
