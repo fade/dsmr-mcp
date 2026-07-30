@@ -2,10 +2,10 @@
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
 ;;;; Tests for comment-region editing, from locating a region through to
-;;;; the write: how a maximal comment run is collapsed, which runs stand
-;;;; free of any form and which belong to the form below them, how
-;;;; substring anchoring refuses to guess, and what an edit has to leave
-;;;; untouched.
+;;;; the write and out to the verb an agent calls: how a maximal comment
+;;;; run is collapsed, which runs stand free of any form and which belong
+;;;; to the form below them, how substring anchoring refuses to guess, and
+;;;; what an edit has to leave untouched.
 ;;;;
 ;;;; The file-header cases are here because a reader's intuition and the
 ;;;; attachment rule disagree about them.  A header separated from the
@@ -20,6 +20,11 @@
 ;;;; the re-parsed forms; the delimiter scan passes that case.  And a
 ;;;; comment written after code on the same line is refused rather than
 ;;;; treated as the next form's, because nothing later could catch that.
+;;;;
+;;;; The last four tests go through the verb rather than the function under
+;;;; it, because what they pin belongs to the verb: refusing to act with no
+;;;; project root set, telling an expected anchor failure apart from an
+;;;; unexpected one by its error type, and offering no way to insert.
 
 ;; Package evolution guard
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -58,6 +63,12 @@
   (:import-from #:dsmr-mcp/src/validate
                 #:scan-parens
                 #:try-reader-check)
+  (:import-from #:dsmr-mcp/src/state
+                #:make-session
+                #:get-tool-instance)
+  (:import-from #:dsmr-mcp/src/tools/base
+                #:tool-handle)
+  (:import-from #:dsmr-mcp/src/tools/lisp-edit-comment)
   (:import-from #:dsmr-mcp/tests/support/fs-fixture
                 #:with-temp-project-root
                 #:write-fixture-file))
@@ -88,6 +99,13 @@
   "Call THUNK and return the error it signalled, or NIL when it returned."
   (handler-case (progn (funcall thunk) nil)
     (error (e) e)))
+
+(defun make-args (&rest kvs)
+  "Build the string-keyed argument table a tool-handle call expects."
+  (let ((ht (make-hash-table :test 'equal)))
+    (loop for (k v) on kvs by #'cddr
+          do (setf (gethash k ht) v))
+    ht))
 
 ;;;; -------------------------------------------------------------------------
 ;;;; Fixtures
@@ -635,3 +653,73 @@ so the file is left alone."
         (true (typep err 'comment-operation-error))
         (true (search "forms" (comment-operation-reason err)))
         (is string= source (uiop:read-file-string path))))))
+
+(define-test no-project-root-refuses-a-comment-edit
+  "With no project root set the verb answers with a typed error instead of
+touching the filesystem."
+  (let* ((session (make-session :id "no-root" :project-root nil))
+         (tool (get-tool-instance session "lisp-edit-comment"))
+         (args (make-args "file_path" "/tmp/x.lisp"
+                          "mode" "region"
+                          "operation" "replace"
+                          "substring" "Descriptor passing."
+                          "content" ";;; New banner."))
+         (res (gethash "result" (tool-handle tool 1 args))))
+    (true (gethash "isError" res))
+    (is string= "project-root-not-set" (gethash "error_type" res))))
+
+(define-test verb-replaces-a-banner-and-reports-the-region
+  "A region replace driven through the verb rewrites the banner, leaves the
+forms around it alone, and reports the lines the edit covered."
+  (with-temp-project-root (session root)
+    (let* ((path (write-fixture-file root "banner.lisp" +banner-between-forms+))
+           (tool (get-tool-instance session "lisp-edit-comment"))
+           (args (make-args "file_path" (namestring path)
+                            "mode" "region"
+                            "operation" "replace"
+                            "substring" "Descriptor passing."
+                            "content" ";;; Rewritten banner."))
+           (res (gethash "result" (tool-handle tool 1 args))))
+      (is eq nil (gethash "isError" res))
+      (true (gethash "would_change" res))
+      (let ((report (gethash "changed_region" res)))
+        (is = 3 (gethash "line_start" report))
+        (is = 4 (gethash "line_end" report))
+        (true (gethash "surroundings_unchanged" report)))
+      (let ((written (uiop:read-file-string path)))
+        (true (search ";;; Rewritten banner." written))
+        (true (search "(defun before () 1)" written))
+        (true (search "(defun after () 2)" written))))))
+
+(define-test verb-reports-an-absent-anchor-as-a-typed-error
+  "A substring naming no comment comes back as its own error type, distinct
+from an unexpected failure, and the file is left as it was."
+  (with-temp-project-root (session root)
+    (let* ((path (write-fixture-file root "banner.lisp" +banner-between-forms+))
+           (tool (get-tool-instance session "lisp-edit-comment"))
+           (args (make-args "file_path" (namestring path)
+                            "mode" "region"
+                            "operation" "replace"
+                            "substring" "no such text anywhere"
+                            "content" ";;; Rewritten banner."))
+           (res (gethash "result" (tool-handle tool 1 args))))
+      (true (gethash "isError" res))
+      (is string= "comment-operation-error" (gethash "error_type" res))
+      (is string= +banner-between-forms+ (uiop:read-file-string path)))))
+
+(define-test verb-offers-no-insert-operation
+  "Replace and delete are the whole operation set. Placing a brand new comment
+relative to a form is what the form editor's insert operations already do, so
+an insert here is refused as an argument error and nothing is written."
+  (with-temp-project-root (session root)
+    (let* ((path (write-fixture-file root "banner.lisp" +banner-between-forms+))
+           (tool (get-tool-instance session "lisp-edit-comment"))
+           (args (make-args "file_path" (namestring path)
+                            "mode" "region"
+                            "operation" "insert_before"
+                            "substring" "Descriptor passing."
+                            "content" ";;; New banner."))
+           (res (gethash "result" (tool-handle tool 1 args))))
+      (true (gethash "isError" res))
+      (is string= "invalid-argument" (gethash "error_type" res))
+      (is string= +banner-between-forms+ (uiop:read-file-string path)))))
