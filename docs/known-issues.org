@@ -22,11 +22,37 @@ needed to rewrite that comment to match a changed design. Neither
 =lisp-patch-form= (scopes *within* a matched form) nor =lisp-edit-form= (matches
 a *whole* form) can address a comment that is not inside a form.
 
+** Second reproduction: a file-header comment
+The same hole swallows a *file header*: an SPDX block plus the file's leading
+commentary, sitting above every top-level form rather than between two of them.
+
+This spelling makes the gap total rather than awkward, because the one remaining
+write path is closed by design: =fs-write-file= refuses to overwrite an existing
+=.lisp= file. That refusal is correct and should stay. The consequence is that
+out-of-form text has no compliant route at all.
+
+Which mode will reach a header depends on a blank line, and the intuitive choice
+is the wrong one in the common case:
+- separated from the first form by a blank line, the header is a free-standing
+  region and is matched by a unique substring;
+- flush against the first form with no blank line, it is that form's *leading
+  comment* instead, so free-standing matching will not find it.
+
+A header flush against =(in-package …)= is the ordinary shape, so the second case
+is the one that will be hit. It is reachable: =%definition-candidates= reads the
+name from the form's second position and accepts a keyword, so =in-package= is
+matchable by form type plus form name. Nothing in an absent-anchor error would
+tell a caller to look there, which is the part worth fixing alongside the verb.
+
 ** Impact
 The only way to fix the comment was to fall back to a plain text editor — which
 the DSMR workflow explicitly forbids for =.lisp= files, because the whole point
 of the structure-aware tools is to keep edits off the generic text path. Every
 comment-accuracy pass over banner/section comments hits this.
+
+Both sightings arrived from ordinary maintenance in other repos rather than from
+anyone probing the tools, and in both the developer had to choose between leaving
+a stale comment in place and stepping outside the workflow.
 
 ** Suggested fix
 Add a way to target a free-standing comment region — options, roughly in order

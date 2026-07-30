@@ -23,6 +23,21 @@ rediscovering the problem.
    for =.lisp= files, defeating the point of the structure-aware tools. Every
    comment-accuracy pass over banner/section comments hits this.
 
+   Second reproduction: a *file header* (SPDX block plus leading commentary)
+   above every top-level form, not between two of them. This spelling makes the
+   gap total rather than awkward, because =fs-write-file= refuses to overwrite an
+   existing =.lisp= file by design, correctly, so out-of-form text has no
+   compliant route at all.
+
+   Which mode reaches a header turns on a blank line, and the intuitive choice is
+   wrong in the common case: separated from the first form the header is a
+   free-standing region matched by substring, but flush against the first form it
+   is that form's leading comment and free-standing matching misses it. Flush
+   against =(in-package …)= is the ordinary shape. It is reachable, since
+   =%definition-candidates= accepts a keyword in the name position, so
+   =in-package= is matchable by form type plus name, but no absent-anchor error
+   would tell a caller to look there. Fix that error text alongside the verb.
+
    Suggested fix:
    - Let =lisp-patch-form= / =lisp-edit-form= scope to the *leading comment*
      attached to a named form (edit the comment without touching the form), and
