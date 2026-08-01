@@ -362,19 +362,29 @@ cannot go through %LOCATE-TARGET-FORM.  SESSION-ROOT is the session's project
 root, passed explicitly rather than read from a global, and FILE-PATH must
 resolve inside the read allow-list.
 
-Returns five values:
+Returns six values:
   ABS      -- absolute pathname of the file
   REL      -- project-relative namestring, for writes via ENSURE-WRITE-PATH
   ORIGINAL -- full file text
   NODES    -- parsed CST nodes in source order
-  REGIONS  -- free-standing comment regions in source order"
+  REGIONS  -- free-standing comment regions in source order
+  UNPARSED-FROM -- offset past which NODES describe nothing, or NIL for a parse
+                   that reached the end of the file
+
+The last value travels with the nodes rather than being worked out from them
+afterwards.  A caller looking only at offsets cannot tell a file that ends
+after its last form from one the reader abandoned there, and the difference
+decides whether a statement about the nodes is also a statement about the
+file."
   (multiple-value-bind (abs rel) (%normalize-paths file-path session-root)
     (let ((pn (allowed-read-path (namestring abs) session-root)))
       (unless pn
         (%locator-error "~A is outside the read allow-list (root: ~A)"
                         file-path session-root))
-      (let* ((original (read-file-string pn))
-             (nodes (parse-top-level-forms original
-                                           :readtable readtable
-                                           :source-path pn)))
-        (values pn rel original nodes (%comment-regions nodes original))))))
+      (let ((original (read-file-string pn)))
+        (multiple-value-bind (nodes unparsed-from)
+            (parse-top-level-forms original
+                                   :readtable readtable
+                                   :source-path pn)
+          (values pn rel original nodes (%comment-regions nodes original)
+                  unparsed-from))))))
