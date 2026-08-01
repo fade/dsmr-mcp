@@ -37,8 +37,13 @@
 ;;;; conditional is skipped by the reader rather than read as an expression, so
 ;;;; a check written in terms of expressions cannot see one turn into comment
 ;;;; text, and the file that lost the definition still loads cleanly on the
-;;;; machine that made the edit.  Both checks run before the write branch, so a
-;;;; rejected edit leaves the file exactly as it was.
+;;;; machine that made the edit.
+;;;;
+;;;; A cheaper guard runs in front of all that.  Replacement text that leaves a
+;;;; delimiter or a block comment open is refused on sight, before the file is
+;;;; even read, since the only thing available to close it is something already
+;;;; sitting below the comment.  Every check here runs before the write branch,
+;;;; so a rejected edit leaves the file exactly as it was.
 
 (defpackage #:dsmr-mcp/src/lisp-edit-comment
   (:use #:cl)
@@ -93,10 +98,11 @@
     :documentation "Human-readable description of why the comment edit failed."))
   (:report (lambda (c s) (write-string (comment-operation-reason c) s)))
   (:documentation "Signalled for expected comment-edit failures: an anchor that
-names no comment region or more than one, a run that does not begin its own
-line and so belongs to the code beside it, and a splice whose result no longer
-holds everything the file held outside its comments.  The file is never written
-when this condition is signalled."))
+names no comment region or more than one, replacement text that leaves a
+delimiter open, a run that does not begin its own line and so belongs to the
+code beside it, and a splice whose result no longer holds everything the file
+held outside its comments.  The file is never written when this condition is
+signalled."))
 
 ;;;; -------------------------------------------------------------------------
 ;;;; Splice
@@ -165,6 +171,33 @@ whitespace following the comment so a removed banner leaves no blank line."
 ;;;; -------------------------------------------------------------------------
 ;;;; Verification, run before any write
 ;;;; -------------------------------------------------------------------------
+
+(defun %verify-content-self-contained (content)
+  "Signal COMMENT-OPERATION-ERROR when CONTENT leaves a delimiter open.
+
+The cheapest guard in the verb, and the one that kills the whole class at its
+source: replacement text that opens a block comment or a delimiter it never
+closes can only go on to re-type whatever follows it in the file.  Refusing it
+outright costs one scan of the caller's own text, before the file is even read.
+
+Delimiters inside comment text do not count, which is what keeps this from
+refusing ordinary prose.  A comment reading `call (foo with one paren` is a
+perfectly good comment and stays acceptable; only an opening that would still
+be open once the reader leaves the replacement is refused.
+
+The comparison of the whole file after the splice stays where it is.  This
+guard sees a replacement that opens something, and that check sees a
+replacement that damages something, which are not the same set."
+  (let ((parens (scan-parens content)))
+    (unless (getf parens :ok)
+      (error 'comment-operation-error
+             :reason (format nil "the replacement text is not self-contained: ~
+it leaves ~A open at line ~A, column ~A of the replacement, so the code below ~
+the comment would be re-typed by whatever closes it. Nothing was written."
+                             (getf parens :kind)
+                             (getf parens :line)
+                             (getf parens :column)))))
+  t)
 
 (defun %non-comment-nodes (nodes)
   "Return every node of NODES that is not comment text.
@@ -418,9 +451,10 @@ through FORM-TYPE and FORM-NAME.
 OPERATION is \"replace\", which needs CONTENT, or \"delete\".
 
 An anchor naming no comment or more than one signals COMMENT-OPERATION-ERROR
-and writes nothing, as does a comment that begins after code on the same line
-and a splice whose result no longer holds everything the file held outside its
-comments.  All three checks run before the write branch is reached.
+and writes nothing, as do CONTENT that leaves a delimiter or a block comment
+open, a comment that begins after code on the same line, and a splice whose
+result no longer holds everything the file held outside its comments.  Every
+one of those checks runs before the write branch is reached.
 
 When DRY-RUN is true the change is previewed and nothing is written.  After a
 real write a textDocument/didChange notification is sent to the project's LSP
@@ -432,9 +466,12 @@ Returns:
   On apply:   (values updated-text changed-p changed-region-report)"
   (let ((mode-key (%normalize-mode mode))
         (operation-key (%normalize-operation operation)))
-    (when (and (eq operation-key :replace) (not (stringp content)))
-      (error 'comment-operation-error
-             :reason "content is required to replace a comment region"))
+    (when (eq operation-key :replace)
+      (unless (stringp content)
+        (error 'comment-operation-error
+               :reason "content is required to replace a comment region"))
+      ;; Checked before the file is read, since it depends on nothing else.
+      (%verify-content-self-contained content))
     (ecase mode-key
       (:region
        (unless (and (stringp substring) (plusp (length substring)))
