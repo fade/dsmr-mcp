@@ -60,6 +60,7 @@
   (:import-from #:dsmr-mcp/src/lisp-edit-form-core
                 #:%locate-target-form)
   (:import-from #:dsmr-mcp/src/lisp-edit-comment-core
+                #:comment-locator-error
                 #:%comment-runs
                 #:%comment-node-p
                 #:%leading-comment-run
@@ -373,27 +374,68 @@ delimiters: ~A at line ~A, column ~A. Nothing was written."
   (concatenate 'string
                "A #; datum comment earlier in the file ends the parse there, "
                "which hides everything below it from this verb.")
-  "Explanation appended to an anchor failure, because the anchor genuinely is
-absent from the parse in that case and the file alone does not show why.")
+  "Explanation offered with an anchor failure when a datum comment is why the
+anchor is absent from the parse.  The file on its own does not show that, which
+is the whole reason for saying it.")
+
+(defun %unparsed-tail (original nodes)
+  "Return the text of ORIGINAL the parse never reached, or NIL if it read it all.
+
+The parse stops at input it cannot get past, and NODES then describe only the
+part of the file above that point.  Trailing whitespace is not a tail: every
+file ends in some, and none of it hides anything."
+  (let ((end (if nodes
+                 (reduce #'max nodes :key #'cst-node-end)
+                 0)))
+    (when (< end (length original))
+      (let ((tail (subseq original end)))
+        (unless (every #'%blank-char-p tail)
+          tail)))))
+
+(defun %datum-comment-note (original nodes)
+  "Return the datum-comment explanation when it applies to ORIGINAL, else NIL.
+
+Offered with a refusal only when the parse stopped short of the end of the file
+and a datum comment sits in the part it never reached.  Attached to every
+refusal instead, it would carry no information at all: a reader cannot tell the
+occasional case where it names the true cause from the many where it was
+printed regardless, so the one time it would have helped it reads as the noise
+it has been every other time.
+
+There is no node to look for.  The parse ends at the datum comment, emitting
+nothing for it and nothing for anything below it, so the truncation is the only
+evidence available.  A file truncated by something else that happens to carry a
+datum comment further down is described wrongly, which is why this is worded as
+an explanation to consider rather than as a finding."
+  (let ((tail (%unparsed-tail original nodes)))
+    (when (and tail (search "#;" tail))
+      *datum-comment-note*)))
 
 (defun %resolve-leading-target (file-path form-type form-name readtable session-root)
   "Locate the comment run attached above a named form.
 
 Returns eight values: the absolute pathname, the project-relative namestring,
 the file text, its CST nodes, the run's first and last byte offsets, and the
-run's first and last source line."
+run's first and last source line.
+
+Only the failures the shared prologue raises deliberately are retyped as
+expected ones.  It signals its own refusals with a format string and a path
+that is not there arrives as a file error; anything else reaching here is a
+fault, and it travels on so the caller reports a bug instead of retyping an
+anchor that was already right."
   (multiple-value-bind (abs rel original nodes target)
       (handler-case
           (%locate-target-form file-path form-type form-name readtable session-root)
-        (error (e)
+        ((or simple-error file-error) (e)
           (error 'comment-operation-error :reason (princ-to-string e))))
     (let ((run (%leading-comment-run nodes target)))
       (unless run
         (error 'comment-operation-error
                :reason (format nil "~A ~A has no comment sitting flush on top of ~
 it. A blank line between a comment and the form makes that comment ~
-free-standing, so name it by a substring in region mode instead. ~A"
-                               form-type form-name *datum-comment-note*)))
+free-standing, so name it by a substring in region mode instead.~@[ ~A~]"
+                               form-type form-name
+                               (%datum-comment-note original nodes))))
       (let ((first-node (first run))
             (last-node (car (last run))))
         (values abs rel original nodes
@@ -417,25 +459,30 @@ have worked instead of only reporting an absence."
                                readtable session-root)
   "Locate the free-standing comment region named by SUBSTRING.
 
-LINE-START and LINE-END narrow the candidates only when the substring alone
-matches more than one region.  Returns the same eight values as
-%RESOLVE-LEADING-TARGET."
+LINE-START and LINE-END constrain which region is meant whenever they are
+given.  Returns the same eight values as %RESOLVE-LEADING-TARGET.
+
+Only the locator's own condition, and a path that is not there, are retyped as
+expected failures.  A type error or any other fault raised inside the locator
+travels on untouched, so it reaches the verb's unexpected-failure channel: a
+caller told the anchor was wrong retries with a different one, and a caller
+told something failed unexpectedly reports it."
   (multiple-value-bind (abs rel original nodes regions)
       (handler-case (%locate-comment-regions file-path readtable session-root)
-        (error (e)
+        ((or comment-locator-error file-error) (e)
           (error 'comment-operation-error :reason (princ-to-string e))))
     (let ((region
             (handler-case
                 (%match-region-by-substring regions substring line-start line-end)
-              (error (e)
+              (comment-locator-error (e)
                 (let ((anchor (%form-claiming-substring nodes original substring)))
                   (error 'comment-operation-error
                          :reason (format nil "~A~@[~%That text sits in the comment ~
 attached to the form beginning on line ~D; name that form in leading mode to ~
-reach it.~]~%~A"
+reach it.~]~@[~%~A~]"
                                          (princ-to-string e)
                                          (and anchor (cst-node-start-line anchor))
-                                         *datum-comment-note*)))))))
+                                         (%datum-comment-note original nodes))))))))
       (multiple-value-bind (region-start-line region-end-line)
           (%region-line-range region)
         (values abs rel original nodes
