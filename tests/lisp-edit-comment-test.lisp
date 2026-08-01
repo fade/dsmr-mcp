@@ -402,8 +402,10 @@ so the caller can pick rather than have one chosen silently."
       (true (search "Shared wording there." report)))))
 
 (define-test line-range-narrows-an-ambiguous-substring
-  "A line range settles a substring that matches more than one region, and is
-only consulted once the substring alone has failed to."
+  "A line range settles a substring that matches more than one region. It is
+applied whenever it is given rather than only once the substring alone has
+failed, so this is the case where the two constraints agree and the narrowing
+is what the caller wanted."
   (let* ((source (format nil "(defun before () 1)~%~%~
 ;; Shared wording here.~%~%~
 ;; Shared wording there.~%~%~
@@ -422,6 +424,33 @@ to the substring's own ambiguous result."
 (defun after () 2)~%"))
          (regions (%comment-regions (nodes-of source) source)))
     (fail (%match-region-by-substring regions "Shared wording" 90 99) error)))
+
+(define-test sole-substring-hit-outside-the-line-range-is-refused
+  "A caller who states both a substring and a line range has stated two
+constraints about one comment. When they disagree the range used to be dropped
+without a word and the substring's region rewritten, so a caller working from
+line numbers that had moved got a silent edit of a comment they did not name.
+
+The refusal names both, because from the outside there is no way to tell which
+of the two went stale. The whole call is driven through the verb so the promise
+being made is the one that matters: the file on disk is byte for byte what it
+was."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((source (format nil "(defun before () 1)~%~%;; Alpha banner.~%~%~
+;; Beta banner.~%~%(defun after () 2)~%"))
+           (path (write-fixture-file root "ranged.lisp" source))
+           (err (error-from
+                 (lambda ()
+                   (edit-comment (namestring root) (namestring path)
+                                 "region" "replace"
+                                 :substring "Alpha" :line-start 5 :line-end 5
+                                 :content (format nil ";; Rewritten alpha.~%"))))))
+      (true (typep err 'comment-operation-error))
+      (let ((reason (comment-operation-reason err)))
+        (true (search "lines 3 to 3" reason))
+        (true (search "lines 5 to 5" reason)))
+      (is string= source (uiop:read-file-string path)))))
 
 ;;;; -------------------------------------------------------------------------
 ;;;; Prologue and read sandbox
