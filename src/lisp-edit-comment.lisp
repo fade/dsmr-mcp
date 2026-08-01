@@ -14,6 +14,14 @@
 ;;;; following the comment, which is what keeps a removed banner from leaving a
 ;;;; blank line behind.
 ;;;;
+;;;; Whichever way the target was named, the run has to begin its own line.  A
+;;;; comment written after code is prose about that code, and editing it there
+;;;; rewrites the line the code sits on while the file still holds every form
+;;;; it started with, so nothing after the write reports the loss.  That rule
+;;;; belongs to the verb rather than to either way of naming a comment, so it
+;;;; is applied once, to the offset the splice will use, and a further way of
+;;;; naming a comment inherits it instead of needing its own copy.
+;;;;
 ;;;; Why comparing the forms afterwards is not redundant with the delimiter
 ;;;; scan: a replacement comment can open a block comment that closes on a
 ;;;; delimiter already present further down the file, swallowing whole forms
@@ -88,16 +96,17 @@ condition is signalled."))
   "Return T when CHARACTER is one of the whitespace characters a delete trims."
   (member character '(#\Space #\Tab #\Newline #\Return)))
 
-(defun %starts-its-own-line-p (text node)
-  "Return T when nothing but whitespace precedes NODE on its source line.
+(defun %starts-its-own-line-p (text offset)
+  "Return T when nothing but whitespace precedes OFFSET on its source line.
 
 A comment written after code on the same line is prose about that code,
-whatever happens to sit on the next line.  Leading mode refuses such a run
-rather than treat it as the following form's comment, and it has to refuse it
-here, before the splice: replacing it damages nothing a later check can see.
-Every form in the file stays byte for byte identical while the comment itself
-is gone, so the edit passes the form comparison and the delimiter scan alike."
-  (let ((index (cst-node-start node)))
+whatever happens to sit on the next line.  Either way of naming a comment can
+reach such a run, so the verb tests the offset the splice will use rather than
+testing it per mode, and it tests it before the splice: editing such a run
+damages nothing a later check can see.  Every form in the file stays byte for
+byte identical while the comment beside the code is rewritten or gone, so the
+edit passes the form comparison and the delimiter scan alike."
+  (let ((index offset))
     (loop
       (decf index)
       (when (minusp index)
@@ -106,6 +115,21 @@ is gone, so the edit passes the form comparison and the delimiter scan alike."
         (cond ((char= character #\Newline) (return t))
               ((%blank-char-p character))
               (t (return nil)))))))
+
+(defun %same-line-refusal (mode-key form-type form-name)
+  "Return the reason text for refusing a comment that begins after code.
+
+One function builds this for both ways of naming a comment, so the two cannot
+drift into saying different things about the same rule.  MODE-KEY only decides
+how the run is described back to the caller: a caller who named a form gets the
+form named back, a caller who named a substring gets the substring."
+  (format nil "~A begins after code on the same line, so it is prose about that ~
+code and not a comment of its own. Editing it here would rewrite the line that ~
+code sits on, and nothing after the write could report the damage: every form ~
+in the file would still be byte for byte identical."
+          (if (eq mode-key :leading)
+              (format nil "the comment above ~A ~A" form-type form-name)
+              "the comment that substring names")))
 
 (defun %splice (text start end operation content)
   "Rewrite TEXT's bytes from START to END according to OPERATION.
@@ -226,12 +250,6 @@ run's first and last source line."
 it. A blank line between a comment and the form makes that comment ~
 free-standing, so name it by a substring in region mode instead. ~A"
                                form-type form-name *datum-comment-note*)))
-      (unless (%starts-its-own-line-p original (first run))
-        (error 'comment-operation-error
-               :reason (format nil "the comment above ~A ~A begins after code on ~
-the same line, so it is prose about that code and not about the form below it. ~
-Leading mode will not rewrite it."
-                               form-type form-name)))
       (let ((first-node (first run))
             (last-node (car (last run))))
         (values abs rel original nodes
@@ -351,8 +369,9 @@ through FORM-TYPE and FORM-NAME.
 OPERATION is \"replace\", which needs CONTENT, or \"delete\".
 
 An anchor naming no comment or more than one signals COMMENT-OPERATION-ERROR
-and writes nothing, as does a splice whose result no longer holds the forms the
-file started with.  Both checks run before the write branch is reached.
+and writes nothing, as does a comment that begins after code on the same line
+and a splice whose result no longer holds the forms the file started with.  All
+three checks run before the write branch is reached.
 
 When DRY-RUN is true the change is previewed and nothing is written.  After a
 real write a textDocument/didChange notification is sent to the project's LSP
@@ -383,6 +402,16 @@ Returns:
                                            readtable session-root))
           (:leading (%resolve-leading-target file-path form-type form-name
                                              readtable session-root)))
+      ;; The offset resolved here is the one the splice will use, so testing it
+      ;; at this point covers every way of naming a comment and cannot be
+      ;; bypassed by adding another.  It refuses both operations rather than
+      ;; delete alone: replacing with text that carries no newline of its own
+      ;; rewrites the same line of code and takes the blank line with it, and
+      ;; the form comparison sees neither case, since the forms stay byte for
+      ;; byte identical at shifted offsets in both.
+      (unless (%starts-its-own-line-p original start)
+        (error 'comment-operation-error
+               :reason (%same-line-refusal mode-key form-type form-name)))
       (multiple-value-bind (updated removed-start removed-end inserted)
           (%splice original start end operation-key
                    (if (eq operation-key :delete) "" content))
