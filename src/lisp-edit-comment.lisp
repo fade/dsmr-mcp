@@ -457,20 +457,35 @@ reach it.~]~%~A"
              (max 0 (1- breaks))
              breaks)))))
 
-(defun %changed-region-report (original start end line-start line-end inserted)
+(defun %changed-region-report (original removed-start removed-end
+                               line-start line-end inserted verified)
   "Return a hash-table describing the span the edit covered.
 
-It carries the comment's line range and text before the edit, the text put in
-its place, and the line that replacement now ends on, so a caller can show what
-moved without reading the file again."
+It carries the comment's line range, the text the splice took out, the text put
+in its place, and the line that replacement now ends on, so a caller can show
+what moved without reading the file again.
+
+The text reported as removed is the whole span the splice covered rather than
+the comment's own bytes.  A delete additionally takes the whitespace run
+following the comment, and reporting the comment alone would understate what
+went by exactly that whitespace.
+
+VERIFIED is the result of the comparison that ran, not a constant.  It says the
+file's nodes outside its comments were compared against the original and every
+one of them came back unchanged.  It is false when the edit changed nothing,
+because then no comparison was performed and there is nothing to report having
+proved.  It is never a claim about the whitespace around the comment: a delete
+removes some of that by design, and the comparison never looked at it."
   (let ((report (make-hash-table :test 'equal)))
-    (setf (gethash "line_start"             report) line-start
-          (gethash "line_end"               report) line-end
-          (gethash "line_end_after"         report) (%inserted-end-line line-start
-                                                                        inserted)
-          (gethash "before"                 report) (subseq original start end)
-          (gethash "after"                  report) inserted
-          (gethash "surroundings_unchanged" report) t)
+    (setf (gethash "line_start"               report) line-start
+          (gethash "line_end"                 report) line-end
+          (gethash "line_end_after"           report) (%inserted-end-line line-start
+                                                                          inserted)
+          (gethash "before"                   report) (subseq original
+                                                              removed-start
+                                                              removed-end)
+          (gethash "after"                    report) inserted
+          (gethash "forms_verified_unchanged" report) verified)
     report))
 
 ;;;; -------------------------------------------------------------------------
@@ -563,14 +578,19 @@ Returns:
       (multiple-value-bind (updated removed-start removed-end inserted)
           (%splice original start end operation-key
                    (if (eq operation-key :delete) "" content))
-        (let ((would-change (not (string= original updated))))
+        (let ((would-change (not (string= original updated)))
+              (forms-verified nil))
           (when would-change
-            (%verify-forms-survived original nodes updated readtable
-                                    removed-start removed-end inserted)
+            ;; The report's verification field is this call's own answer rather
+            ;; than a constant, so a reader of the report learns what was
+            ;; checked instead of what the verb hoped.
+            (setf forms-verified
+                  (%verify-forms-survived original nodes updated readtable
+                                          removed-start removed-end inserted))
             (%verify-still-reads updated))
-          (let ((report (%changed-region-report original start end
+          (let ((report (%changed-region-report original removed-start removed-end
                                                 region-start-line region-end-line
-                                                inserted)))
+                                                inserted forms-verified)))
             (log-event :debug "lisp.edit.comment"
                        "path" (namestring abs)
                        "mode" (string-downcase (symbol-name mode-key))

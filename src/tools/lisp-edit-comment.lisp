@@ -134,13 +134,24 @@ and dry-run previews the exact text that would be written."))
   (and value (stringp value) (plusp (length value))))
 
 (defun %region-summary (report)
-  "Render REPORT, the changed-region hash-table, as the body of a result message."
-  (format nil "Lines ~A to ~A~@[, now ending on line ~A~].~%~
-Surrounding forms verified unchanged.~%~%\
+  "Render REPORT, the changed-region hash-table, as the body of a result message.
+
+The line about verification states what was actually checked rather than a fixed
+claim.  The check compares the file's forms against the original and says they
+all came back unchanged; when the edit changed nothing there was no comparison
+to run and the message says that instead.
+
+It makes no claim about the whitespace around the comment.  A delete removes the
+whitespace run following the comment by design, so a message promising the
+surroundings were left alone would be false every time a delete succeeded."
+  (format nil "Lines ~A to ~A~@[, now ending on line ~A~].~%~A~%~%\
 --- before ---~%~A~@[~%--- after ---~%~A~]"
           (gethash "line_start" report)
           (gethash "line_end" report)
           (gethash "line_end_after" report)
+          (if (gethash "forms_verified_unchanged" report)
+              "Every form in the file was compared against the original and came back unchanged."
+              "Nothing changed, so there was no comparison to run.")
           (gethash "before" report)
           (let ((after (gethash "after" report)))
             (and (plusp (length after)) after))))
@@ -245,7 +256,11 @@ Call fs-set-project-root first.")))))
                                       "mode"           mode
                                       "operation"      operation
                                       "would_change"   changed-p
-                                      "bytes"          (length updated)
+                                      ;; A character count, which is what the
+                                      ;; string holds. The file on disk is
+                                      ;; longer whenever it carries anything
+                                      ;; outside ASCII.
+                                      "characters"     (length updated)
                                       "changed_region" report
                                       "content"        (text-content summary))))))
         (comment-operation-error (e)
