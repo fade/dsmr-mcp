@@ -47,9 +47,12 @@ line_end constrain which comment is meant, either of them on its own is enough, 
 and a match outside the range they give is refused rather than edited. Leading \
 mode names the form the comment sits on, through form_type and form_name; a blank \
 line between a comment and the form makes that comment free-standing, so name it \
-by substring instead. Every surrounding form is proven byte for byte identical \
-before anything is written, and an anchor naming no comment or more than one \
-fails without writing. Use this instead of a plain text edit when changing \
+by substring instead. Surrounding forms are proven byte for byte identical \
+before anything is written, and the result says how far down the file that \
+proof reached: a file the reader cannot get through, most often because of a \
+#; datum comment, is parsed only as far as that point, and forms below it are \
+not compared. An anchor naming no comment or more than one fails without \
+writing. Use this instead of a plain text edit when changing \
 comments in Lisp source. Adding a brand new comment is not offered here: \
 lisp-edit-form insert_before already places one relative to a form.")
    (dsmr-mcp/src/tools/base::input-schema
@@ -121,8 +124,9 @@ file unreachable by this tool."))
   (:documentation "MCP tool: structure-aware comment-region editor.
 Locates a comment run by a substring of it or by the form it sits on, then
 replaces or deletes exactly that run's bytes. The whitespace around the comment
-survives untouched, every other form is compared byte for byte before the write,
-and dry-run previews the exact text that would be written."))
+survives untouched, the other forms are compared byte for byte before the write,
+with the report naming how much of the file that comparison covered, and dry-run
+previews the exact text that would be written."))
 
 (c2mop:ensure-finalized (find-class 'lisp-edit-comment-tool))
 
@@ -136,13 +140,42 @@ and dry-run previews the exact text that would be written."))
   "Return T when VALUE is a string with at least one character in it."
   (and value (stringp value) (plusp (length value))))
 
+(defun %verification-line (report)
+  "Return the sentence stating what the form comparison actually established.
+
+Four cases, because four different things can have happened and one sentence
+for all of them would be false for three.  The edit changed nothing and no
+comparison ran; the parse covered the file and so did the comparison; the parse
+stopped partway, so the comparison saw the file down to a line and nothing at
+all below it; or the parse produced nothing and the comparison established
+nothing.
+
+The truncated case is the one worth the care.  It used to print the whole-file
+sentence, which was not merely imprecise: a caller reading it had been told in
+as many words that definitions the check never looked at had come back
+unchanged."
+  (let ((verified (gethash "forms_verified_unchanged" report))
+        (through  (gethash "forms_verified_through" report)))
+    (cond
+      ((not verified)
+       "Nothing changed, so there was no comparison to run.")
+      ((null through)
+       "Every form in the file was compared against the original and came back unchanged.")
+      ((and (integerp through) (plusp through))
+       (format nil "Every form through line ~D was compared against the original ~
+and came back unchanged. The file does not parse past there, so nothing below ~
+line ~D was compared and nothing is claimed about it."
+               through through))
+      (t
+       (format nil "The file does not parse at all, so no form in it could be ~
+compared against the original. Only the named comment text was changed.")))))
+
 (defun %region-summary (report)
   "Render REPORT, the changed-region hash-table, as the body of a result message.
 
 The line about verification states what was actually checked rather than a fixed
-claim.  The check compares the file's forms against the original and says they
-all came back unchanged; when the edit changed nothing there was no comparison
-to run and the message says that instead.
+claim: which forms were compared, and how much of the file that reached.  It is
+built by %VERIFICATION-LINE, where the cases are set out.
 
 It makes no claim about the whitespace around the comment.  A delete removes the
 whitespace run following the comment by design, so a message promising the
@@ -157,9 +190,7 @@ sound."
           (gethash "line_start" report)
           (gethash "line_end" report)
           (gethash "line_end_after" report)
-          (if (gethash "forms_verified_unchanged" report)
-              "Every form in the file was compared against the original and came back unchanged."
-              "Nothing changed, so there was no comparison to run.")
+          (%verification-line report)
           (and (gethash "already_unreadable" report)
                (format nil "This file did not balance or read cleanly before ~
 the edit either, so that check was skipped rather than charged to the edit."))
