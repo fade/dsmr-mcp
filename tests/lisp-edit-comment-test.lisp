@@ -920,6 +920,36 @@ new wording still resolves."
                                    :dry-run t)))
         (true (gethash "would_change" preview))))))
 
+(define-test header-replaced-without-a-newline-keeps-the-form-below-it
+  "The leading-mode half of the guarantee above, where the cost is far higher
+than a lost handle. A file header sits flush on top of the first form, so the
+run's bytes end on the newline that closes the header's last line and the form
+below starts the next line. Splicing replacement text that carries no newline
+of its own puts that form on the header's last line, inside the comment: the
+opening paren is commented out and the form's remaining lines are left as loose
+top-level junk ending in a close paren the reader cannot match.
+
+What a caller sees when that happens is not the damage but a count. The re-parse
+gives up at the stray close paren, so the comparison reports far fewer nodes
+than the file had, and it reports the same shortfall whatever the replacement
+said, because the shortfall is the truncated parse rather than the content. That
+is the reading that sends someone looking for a miscomputed span, so the shape
+is pinned here: the form below the header keeps its own line, and the file still
+holds every expression it held before."
+  (with-temp-project-root (session root)
+    (true session)
+    (let ((path (write-fixture-file root "header.lisp" +header-flush+)))
+      (edit-comment (namestring root) (namestring path) "leading" "replace"
+                    :form-type "in-package" :form-name "fixture-package"
+                    :content ";;;; One line, carrying no newline of its own.")
+      (let ((updated (uiop:read-file-string path)))
+        (is string= (format nil ";;;; One line, carrying no newline of its own.~%~
+(in-package :fixture-package)~%~%(defun body () 1)~%")
+            updated)
+        (flet ((expression-count (source)
+                 (count :expr (nodes-of source) :key #'cst-node-kind)))
+          (is = (expression-count +header-flush+) (expression-count updated)))))))
+
 (define-test crlf-file-keeps-its-line-endings-through-a-replace
   "Replacement text arrives with whatever line endings the caller's editor
 produced. Splicing it verbatim into a file terminated by carriage return and
