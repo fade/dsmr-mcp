@@ -2,9 +2,9 @@
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
 ;;;; Editing a comment region in place: splice the exact bytes of the run,
-;;;; prove every form in the file survived the splice unchanged, and only then
-;;;; write.  Mode-independent (dispatcher-side): it reads and writes files on
-;;;; disk and never talks to an attached Lisp image.
+;;;; prove the file still holds everything it held outside its comments, and
+;;;; only then write.  Mode-independent (dispatcher-side): it reads and writes
+;;;; files on disk and never talks to an attached Lisp image.
 ;;;;
 ;;;; There are two ways to name the target.  Region mode takes a substring of a
 ;;;; free-standing run.  Leading mode names the form the run sits flush on top
@@ -22,14 +22,23 @@
 ;;;; is applied once, to the offset the splice will use, and a further way of
 ;;;; naming a comment inherits it instead of needing its own copy.
 ;;;;
-;;;; Why comparing the forms afterwards is not redundant with the delimiter
-;;;; scan: a replacement comment can open a block comment that closes on a
-;;;; delimiter already present further down the file, swallowing whole forms
-;;;; into comment text while the file still reads as balanced and parses
-;;;; without error.  Comparing the re-parsed forms against the originals, byte
-;;;; for byte at their shifted offsets, is the only check here that sees that.
-;;;; Both checks run before the write branch, so a rejected edit leaves the
-;;;; file exactly as it was.
+;;;; Why re-parsing and comparing afterwards is not redundant with the
+;;;; delimiter scan: a replacement comment can open a block comment that closes
+;;;; on a delimiter already present further down the file, swallowing whole
+;;;; definitions into comment text while the file still reads as balanced and
+;;;; parses without error.  Comparing the re-parsed file against the original,
+;;;; byte for byte at shifted offsets, is the only check here that sees that.
+;;;;
+;;;; That comparison covers every node the locator does not call comment text.
+;;;; Comment text is the one thing this verb may change, so it is the one thing
+;;;; excluded, and a single predicate decides it for the half that picks a
+;;;; target and the half that checks the result alike.  Excluding anything else
+;;;; would leave a hole shaped like the kind of node excluded: a reader
+;;;; conditional is skipped by the reader rather than read as an expression, so
+;;;; a check written in terms of expressions cannot see one turn into comment
+;;;; text, and the file that lost the definition still loads cleanly on the
+;;;; machine that made the edit.  Both checks run before the write branch, so a
+;;;; rejected edit leaves the file exactly as it was.
 
 (defpackage #:dsmr-mcp/src/lisp-edit-comment
   (:use #:cl)
@@ -47,6 +56,7 @@
                 #:%locate-target-form)
   (:import-from #:dsmr-mcp/src/lisp-edit-comment-core
                 #:%comment-runs
+                #:%comment-node-p
                 #:%leading-comment-run
                 #:%match-region-by-substring
                 #:%locate-comment-regions
@@ -85,8 +95,8 @@
   (:documentation "Signalled for expected comment-edit failures: an anchor that
 names no comment region or more than one, a run that does not begin its own
 line and so belongs to the code beside it, and a splice whose result no longer
-holds the forms the file started with.  The file is never written when this
-condition is signalled."))
+holds everything the file held outside its comments.  The file is never written
+when this condition is signalled."))
 
 ;;;; -------------------------------------------------------------------------
 ;;;; Splice
@@ -156,46 +166,85 @@ whitespace following the comment so a removed banner leaves no blank line."
 ;;;; Verification, run before any write
 ;;;; -------------------------------------------------------------------------
 
-(defun %form-nodes (nodes)
-  "Return only the form nodes of NODES, dropping comments and skipped input."
-  (remove-if-not (lambda (node) (eq (cst-node-kind node) :expr)) nodes))
+(defun %non-comment-nodes (nodes)
+  "Return every node of NODES that is not comment text.
+
+The verb is allowed to change comment text and nothing else, so everything the
+locator's own predicate rejects is what the edit has to preserve: ordinary
+expressions, reader-conditional forms, datum comments, and any other input the
+reader skips over.  Selecting by that predicate rather than by a list of node
+kinds means a kind nobody has thought of yet is protected by default instead of
+being invisible until someone adds it to the list.
+
+The edited run's own nodes are comment text, so they drop out of both the
+before list and the after list without any span arithmetic."
+  (remove-if #'%comment-node-p nodes))
+
+(defun %node-headline (text node)
+  "Return the first line of NODE's text in TEXT, shortened for a message.
+
+Enough for a caller to recognise which piece of the file the check is talking
+about without printing a whole definition back at them."
+  (let* ((raw (subseq text (cst-node-start node) (cst-node-end node)))
+         (break (position #\Newline raw))
+         (line (string-trim '(#\Space #\Tab #\Return) (subseq raw 0 break))))
+    (if (> (length line) 60)
+        (concatenate 'string (subseq line 0 57) "...")
+        line)))
 
 (defun %verify-forms-survived (original original-nodes updated readtable
                                removed-start removed-end inserted)
-  "Signal COMMENT-OPERATION-ERROR unless UPDATED holds exactly ORIGINAL's forms.
+  "Signal COMMENT-OPERATION-ERROR unless UPDATED holds everything but comment text.
 
-Every form must still be there, in the same order, with the same text, at the
-offset it had plus whatever length the edit added or removed.  The comparison
-is on raw bytes rather than on the values the reader produced: read values are
-blind to whitespace damage inside a form and awkward to compare for floats and
-uninterned symbols.
+The verb may change comment text.  Everything else the file holds has to come
+back: the same nodes, in the same order, of the same kind, with the same bytes,
+each at the offset it had plus whatever length the edit added or removed.  What
+counts as comment text is not decided here, it is asked of the locator's own
+predicate, so the half of the editor that chooses a target and the half that
+checks the result cannot disagree about which bytes were up for change.
 
-This is the check that catches a replacement swallowing a neighbouring form.
-A delimiter scan cannot: an opening block comment closed by a delimiter already
-present further down leaves the file balanced and readable while a form has
-quietly become comment text."
+Reader-conditional definitions are the reason this covers more than
+expressions.  The reader skips a sharpsign-plus form on an implementation the
+feature test excludes, so it arrives as skipped input rather than as an
+expression, and a check that looked only at expressions could not see one being
+swallowed.  The file that lost the definition still loads cleanly on the
+machine that made the edit, which is exactly what makes the loss hard to notice
+later.
+
+The comparison is on raw bytes rather than on the values the reader produced:
+read values are blind to whitespace damage inside a form and awkward to compare
+for floats and uninterned symbols.
+
+This is the check that catches a replacement swallowing its neighbours.  A
+delimiter scan cannot: an opening block comment closed by a delimiter already
+present further down leaves the file balanced and readable while whole
+definitions have quietly become comment text."
   (let* ((delta (- (length inserted) (- removed-end removed-start)))
-         (before (%form-nodes original-nodes))
-         (after (%form-nodes (parse-top-level-forms updated :readtable readtable))))
+         (before (%non-comment-nodes original-nodes))
+         (after (%non-comment-nodes
+                 (parse-top-level-forms updated :readtable readtable))))
     (unless (= (length before) (length after))
       (error 'comment-operation-error
-             :reason (format nil "the edit changed which forms the file holds: ~
-~D before, ~D after. The replacement text alters how the reader sees the code ~
-around it, so nothing was written."
+             :reason (format nil "the edit changed what the file holds outside ~
+its comments: ~D before, ~D after. The replacement text alters how the reader ~
+sees the code around it, most often by opening a block comment that closes ~
+further down, so nothing was written."
                              (length before) (length after))))
     (loop for old in before
           for new in after
           for shift = (if (<= (cst-node-end old) removed-start) 0 delta)
-          do (unless (and (= (cst-node-start new) (+ (cst-node-start old) shift))
+          do (unless (and (eq (cst-node-kind new) (cst-node-kind old))
+                          (= (cst-node-start new) (+ (cst-node-start old) shift))
                           (= (cst-node-end new) (+ (cst-node-end old) shift))
                           (string= (subseq original
                                            (cst-node-start old) (cst-node-end old))
                                    (subseq updated
                                            (cst-node-start new) (cst-node-end new))))
                (error 'comment-operation-error
-                      :reason (format nil "the form beginning on line ~D did not ~
-survive the edit unchanged, so nothing was written."
-                                      (cst-node-start-line old)))))
+                      :reason (format nil "the code beginning on line ~D did not ~
+survive the edit unchanged: ~A. Nothing was written."
+                                      (cst-node-start-line old)
+                                      (%node-headline original old)))))
     t))
 
 (defun %verify-still-reads (updated)
@@ -370,8 +419,8 @@ OPERATION is \"replace\", which needs CONTENT, or \"delete\".
 
 An anchor naming no comment or more than one signals COMMENT-OPERATION-ERROR
 and writes nothing, as does a comment that begins after code on the same line
-and a splice whose result no longer holds the forms the file started with.  All
-three checks run before the write branch is reached.
+and a splice whose result no longer holds everything the file held outside its
+comments.  All three checks run before the write branch is reached.
 
 When DRY-RUN is true the change is previewed and nothing is written.  After a
 real write a textDocument/didChange notification is sent to the project's LSP
