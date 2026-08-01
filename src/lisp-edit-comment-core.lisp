@@ -293,10 +293,18 @@ LINE-END.  A null LINE-END means the range is the single line LINE-START."
 (defun %match-region-by-substring (regions substring &optional line-start line-end)
   "Return the one region in REGIONS whose text contains SUBSTRING.
 
-LINE-START and LINE-END are a constraint on the target rather than a tie-break.
-Whenever LINE-START is supplied the candidates are narrowed to the regions
-overlapping that range before the number of them decides anything, so a caller
-who states both a substring and a range gets the region they named or an error.
+LINE-START and LINE-END are a constraint on the target rather than a tie-break,
+and either of them on its own is a whole constraint.  The bound that was given
+stands for both ends, so naming only the last line asks for that single line
+exactly as naming only the first line does.  Whenever either is supplied the
+candidates are narrowed to the regions overlapping the resolved range before the
+number of them decides anything, so a caller who states both a substring and a
+range gets the region they named or an error.  Dropping a bound because its
+partner was absent would let a mutating edit land on a region the caller had
+ruled out, and the report would say the edit succeeded.
+
+A range written end first is left as the caller wrote it, and it selects only a
+region spanning the whole of it, which is what a reversed range describes.
 
 Two constraints that disagree are a failure and not a tie to break.  A caller
 in that position is holding one piece of information that has gone stale and
@@ -314,24 +322,25 @@ range rather than numbered, because there is no index argument to answer with."
     (when (null hits)
       (%locator-error "No comment region contains ~S. Regions available:~%~{  ~A~%~}"
                       substring (%describe-region-candidates regions)))
-    (let ((candidates (if line-start
-                          (remove-if-not
-                           (lambda (region)
-                             (%region-overlaps-lines-p region line-start line-end))
-                           hits)
-                          hits))
-          (high (or line-end line-start)))
+    (let* ((low  (or line-start line-end))
+           (high (or line-end line-start))
+           (candidates (if low
+                           (remove-if-not
+                            (lambda (region)
+                              (%region-overlaps-lines-p region low high))
+                            hits)
+                           hits)))
       (cond
         ((and (null candidates) (null (rest hits)))
          (multiple-value-bind (match-start match-end) (%region-line-range (first hits))
            (%locator-error "~S names one comment region and it is on lines ~D to ~
 ~D, but the range asked for is lines ~D to ~D. Those two disagree, so nothing ~
 was edited: one of them is out of date."
-                           substring match-start match-end line-start high)))
+                           substring match-start match-end low high)))
         ((null candidates)
          (%locator-error "~S matches ~D comment regions and none of them lies ~
 within lines ~D to ~D:~%~{  ~A~%~}"
-                         substring (length hits) line-start high
+                         substring (length hits) low high
                          (%describe-region-candidates hits)))
         ((null (rest candidates))
          (first candidates))
