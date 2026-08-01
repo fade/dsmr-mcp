@@ -478,8 +478,8 @@ have worked instead of only reporting an absence."
                                readtable session-root)
   "Locate the free-standing comment region named by SUBSTRING.
 
-LINE-START and LINE-END constrain which region is meant whenever they are
-given.  Returns the same eight values as %RESOLVE-LEADING-TARGET.
+LINE-START and LINE-END constrain which region is meant whenever either of them
+is given.  Returns the same eight values as %RESOLVE-LEADING-TARGET.
 
 Only the locator's own condition, and a path that is not there, are retyped as
 expected failures.  A type error or any other fault raised inside the locator
@@ -594,9 +594,9 @@ already what the form editor's insert operations do."
   "Replace or delete a comment region in FILE-PATH under SESSION-ROOT.
 
 MODE is \"region\" to name a free-standing comment by a unique SUBSTRING of it,
-optionally narrowed by LINE-START and LINE-END when the substring alone matches
-more than one; or \"leading\" to name the form the comment sits flush on top of,
-through FORM-TYPE and FORM-NAME.
+constrained by LINE-START and LINE-END whenever either is given; or \"leading\"
+to name the form the comment sits flush on top of, through FORM-TYPE and
+FORM-NAME.
 
 OPERATION is \"replace\", which needs CONTENT, or \"delete\".
 
