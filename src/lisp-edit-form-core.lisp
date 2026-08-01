@@ -278,14 +278,20 @@ Reads FILE-PATH (checking that it is allowed under SESSION-ROOT), parses it
 into CST nodes, locates the target form matching FORM-TYPE and FORM-NAME, and
 returns the matched node together with the file text and related data.
 
-Returns seven values:
+Returns eight values:
   ABS          -- absolute pathname of the file
   REL          -- project-relative namestring (for writes via ensure-write-path)
   ORIGINAL     -- full file text string
   NODES        -- list of parsed CST nodes in source order
   TARGET       -- matched CST node
   TARGET-SNIPPET -- text of the matched form (subseq of ORIGINAL)
-  FILE-PACKAGE-NAME -- package name named by the file's first IN-PACKAGE form"
+  FILE-PACKAGE-NAME -- package name named by the file's first IN-PACKAGE form
+  UNPARSED-FROM -- offset past which NODES describe nothing, or NIL for a parse
+                   that reached the end of the file
+
+The last value is carried because NODES are a prefix of the file whenever it
+is non-nil, and a caller that goes on to make a claim about the file rather
+than about the forms it found needs to know which of the two it has."
   (let ((form-type-str (string-downcase form-type)))
     (multiple-value-bind (abs rel)
         (%normalize-paths file-path session-root)
@@ -294,16 +300,17 @@ Returns seven values:
           (error "~A is outside the read allow-list (root: ~A)"
                  file-path session-root))
         (multiple-value-bind (original) (read-file-string pn)
-          (let* ((nodes (parse-top-level-forms original
-                                               :readtable readtable
-                                               :source-path pn))
-                 (target (%find-target nodes form-type-str form-name)))
-            (unless target
-              (error "Form ~A ~A not found in ~A"
-                     form-type form-name (namestring pn)))
-            (let ((target-snippet (subseq original
-                                          (cst-node-start target)
-                                          (cst-node-end target)))
-                  (file-package-name (extract-in-package-name-from-text original)))
-              (values pn rel original nodes target target-snippet
-                      file-package-name))))))))
+          (multiple-value-bind (nodes unparsed-from)
+              (parse-top-level-forms original
+                                     :readtable readtable
+                                     :source-path pn)
+            (let ((target (%find-target nodes form-type-str form-name)))
+              (unless target
+                (error "Form ~A ~A not found in ~A"
+                       form-type form-name (namestring pn)))
+              (let ((target-snippet (subseq original
+                                            (cst-node-start target)
+                                            (cst-node-end target)))
+                    (file-package-name (extract-in-package-name-from-text original)))
+                (values pn rel original nodes target target-snippet
+                        file-package-name unparsed-from)))))))))

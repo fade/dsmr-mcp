@@ -6,7 +6,30 @@ reproduction, impact, and a suggested fix so the work is actionable without
 rediscovering the problem.
 
 * Structure-aware editing tools
-** TODO Structure-aware editors cannot target a free-standing comment block
+** DONE Structure-aware editors cannot target a free-standing comment block
+   CLOSED: 2026-07-30
+
+   Fixed: the =lisp-edit-comment= verb replaces or deletes a comment that
+   belongs to no form. Region mode names a free-standing banner by a unique
+   substring of it, narrowed by a line range when the substring alone is
+   ambiguous. Leading mode names the form the comment sits flush on top of,
+   which is what reaches a file header written against =(in-package …)=, the
+   shape the second reproduction below is about. Replace and delete are the
+   whole operation set; placing a brand new comment relative to a form is
+   already what =lisp-edit-form= =insert_before= does.
+
+   Two things make the verb safe to point at real files. Every surrounding form
+   is compared byte for byte at its shifted offset before anything is written,
+   so a replacement that would swallow neighbouring code into comment text is
+   refused rather than applied, and a delimiter scan alone does not see that
+   case. And an anchor naming no comment, or more than one, reports the
+   candidates instead of guessing, naming the form that claims the text so a
+   caller who reached for the wrong mode is told which one would have worked.
+
+   Implementation in =src/lisp-edit-comment-core.lisp=,
+   =src/lisp-edit-comment.lisp= and =src/tools/lisp-edit-comment.lisp=, tests in
+   =tests/lisp-edit-comment-test.lisp=. Description below kept for the record.
+
    =lisp-edit-form= and =lisp-patch-form= operate on *named top-level forms*. A
    =;;;= banner / section comment that sits *between* top-level forms — not
    reachable as text inside any =(defun …)= / =(defmethod …)= body — has no
@@ -22,6 +45,21 @@ rediscovering the problem.
    Impact: the only fix was a plain text edit — which the DSMR workflow forbids
    for =.lisp= files, defeating the point of the structure-aware tools. Every
    comment-accuracy pass over banner/section comments hits this.
+
+   Second reproduction: a *file header* (SPDX block plus leading commentary)
+   above every top-level form, not between two of them. This spelling makes the
+   gap total rather than awkward, because =fs-write-file= refuses to overwrite an
+   existing =.lisp= file by design, correctly, so out-of-form text has no
+   compliant route at all.
+
+   Which mode reaches a header turns on a blank line, and the intuitive choice is
+   wrong in the common case: separated from the first form the header is a
+   free-standing region matched by substring, but flush against the first form it
+   is that form's leading comment and free-standing matching misses it. Flush
+   against =(in-package …)= is the ordinary shape. It is reachable, since
+   =%definition-candidates= accepts a keyword in the name position, so
+   =in-package= is matchable by form type plus name, but no absent-anchor error
+   would tell a caller to look there. Fix that error text alongside the verb.
 
    Suggested fix:
    - Let =lisp-patch-form= / =lisp-edit-form= scope to the *leading comment*
