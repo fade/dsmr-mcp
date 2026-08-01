@@ -52,6 +52,7 @@
                 #:cst-node-start
                 #:cst-node-end
                 #:cst-node-start-line
+                #:cst-node-end-line
                 #:parse-top-level-forms)
   (:import-from #:dsmr-mcp/src/fs
                 #:write-file-string-atomically)
@@ -314,7 +315,14 @@ for floats and uninterned symbols.
 This is the check that catches a replacement swallowing its neighbours.  A
 delimiter scan cannot: an opening block comment closed by a delimiter already
 present further down leaves the file balanced and readable while whole
-definitions have quietly become comment text."
+definitions have quietly become comment text.
+
+It reaches exactly as far as the parse did.  ORIGINAL-NODES stop at the first
+input the reader could not get past, and UPDATED is re-parsed under the same
+rule, so on such a file both lists describe a prefix and the check is silent
+about everything below it.  That bound is not knowable from here, since neither
+list carries any mark where it was cut short; the caller holds it and is the
+one that reports it."
   (let* ((delta (- (length inserted) (- removed-end removed-start)))
          (before (%non-comment-nodes original-nodes))
          (after (%non-comment-nodes
@@ -355,11 +363,17 @@ reported, so the caller is never told a file came back clean that never was.
 When the original passes and the updated text does not, the refusal is exactly
 what it was.
 
-Skipping one leaves the edit guarded.  The comparison of everything the file
-holds outside its comments runs in every case, whatever state the file arrived
-in, and that is the check carrying the guarantee.  These two prove only that the
-file as a whole still balances and still reads; neither says anything about
-whether what it holds is what it held before.
+Skipping one leaves the edit guarded by the comparison of everything the file
+holds outside its comments, which runs in every case whatever state the file
+arrived in.  These two prove only that the file as a whole still balances and
+still reads; neither says anything about whether what it holds is what it held
+before.
+
+How far that comparison reaches is a separate question, and on a file that
+fails to read it is usually not the whole file: the parse ends at whatever the
+reader could not get past, so forms below that point are in neither list.  The
+verb reports the bound rather than leaving the guard to be read as covering
+more than it does.
 
 Returns T when ORIGINAL already failed one of the two, so the report can say the
 file was in that state before the edit rather than because of it."
@@ -397,21 +411,25 @@ delimiters: ~A at line ~A, column ~A. Nothing was written."
 anchor is absent from the parse.  The file on its own does not show that, which
 is the whole reason for saying it.")
 
-(defun %unparsed-tail (original nodes)
-  "Return the text of ORIGINAL the parse never reached, or NIL if it read it all.
+(defun %comparison-through-line (nodes unparsed-from)
+  "Return the last source line the form comparison could have covered.
 
-The parse stops at input it cannot get past, and NODES then describe only the
-part of the file above that point.  Trailing whitespace is not a tail: every
-file ends in some, and none of it hides anything."
-  (let ((end (if nodes
-                 (reduce #'max nodes :key #'cst-node-end)
-                 0)))
-    (when (< end (length original))
-      (let ((tail (subseq original end)))
-        (unless (every #'%blank-char-p tail)
-          tail)))))
+NIL when the parse reached the end of the file, meaning the comparison covered
+all of it.  Otherwise the last line any parsed node occupies, which is where
+the parse gave out: nothing below that line was in either list, so nothing
+below it was compared.  Zero when the parse produced no nodes at all and the
+comparison therefore established nothing.
 
-(defun %datum-comment-note (original nodes)
+The line comes from the nodes rather than from UNPARSED-FROM directly because
+the two answer different questions.  UNPARSED-FROM says where the coverage
+ends; the nodes say which line that offset falls on, and the report is written
+in lines because that is what a caller can look at in the file."
+  (when unparsed-from
+    (if nodes
+        (reduce #'max nodes :key #'cst-node-end-line)
+        0)))
+
+(defun %datum-comment-note (original unparsed-from)
   "Return the datum-comment explanation when it applies to ORIGINAL, else NIL.
 
 Offered with a refusal only when the parse stopped short of the end of the file
@@ -422,31 +440,40 @@ printed regardless, so the one time it would have helped it reads as the noise
 it has been every other time.
 
 There is no node to look for.  The parse ends at the datum comment, emitting
-nothing for it and nothing for anything below it, so the truncation is the only
-evidence available.  A file truncated by something else that happens to carry a
-datum comment further down is described wrongly, which is why this is worded as
-an explanation to consider rather than as a finding."
-  (let ((tail (%unparsed-tail original nodes)))
-    (when (and tail (search "#;" tail))
-      *datum-comment-note*)))
+nothing for it and nothing for anything below it, so where the coverage stops
+is the only evidence available.  A file truncated by something else that
+happens to carry a datum comment further down is described wrongly, which is
+why this is worded as an explanation to consider rather than as a finding.
+
+UNPARSED-FROM comes from the parse itself rather than from an inspection of the
+node offsets afterwards.  Read off the offsets, a file that simply ends after
+its last form is indistinguishable from one the reader walked out on, and the
+note would then have to be withheld from short files to avoid being printed for
+sound ones."
+  (when unparsed-from
+    (let ((tail (subseq original unparsed-from)))
+      (when (search "#;" tail)
+        *datum-comment-note*))))
 
 (defun %resolve-leading-target (file-path form-type form-name readtable session-root)
   "Locate the comment run attached above a named form.
 
-Returns eight values: the absolute pathname, the project-relative namestring,
-the file text, its CST nodes, the run's first and last byte offsets, and the
-run's first and last source line.
+Returns nine values: the absolute pathname, the project-relative namestring,
+the file text, its CST nodes, the run's first and last byte offsets, the run's
+first and last source line, and the offset past which the nodes describe
+nothing (NIL when the parse reached the end of the file).
 
 Only the failures the shared prologue raises deliberately are retyped as
 expected ones.  It signals its own refusals with a format string and a path
 that is not there arrives as a file error; anything else reaching here is a
 fault, and it travels on so the caller reports a bug instead of retyping an
 anchor that was already right."
-  (multiple-value-bind (abs rel original nodes target)
+  (multiple-value-bind (abs rel original nodes target snippet package unparsed-from)
       (handler-case
           (%locate-target-form file-path form-type form-name readtable session-root)
         ((or simple-error file-error) (e)
           (error 'comment-operation-error :reason (princ-to-string e))))
+    (declare (ignore snippet package))
     (let ((run (%leading-comment-run nodes target)))
       (unless run
         (error 'comment-operation-error
@@ -454,14 +481,15 @@ anchor that was already right."
 it. A blank line between a comment and the form makes that comment ~
 free-standing, so name it by a substring in region mode instead.~@[ ~A~]"
                                form-type form-name
-                               (%datum-comment-note original nodes))))
+                               (%datum-comment-note original unparsed-from))))
       (let ((first-node (first run))
             (last-node (car (last run))))
         (values abs rel original nodes
                 (cst-node-start first-node)
                 (cst-node-end last-node)
                 (cst-node-start-line first-node)
-                (%true-end-line last-node))))))
+                (%true-end-line last-node)
+                unparsed-from)))))
 
 (defun %form-claiming-substring (nodes original substring)
   "Return the form whose attached comment contains SUBSTRING, or NIL.
@@ -479,14 +507,14 @@ have worked instead of only reporting an absence."
   "Locate the free-standing comment region named by SUBSTRING.
 
 LINE-START and LINE-END constrain which region is meant whenever either of them
-is given.  Returns the same eight values as %RESOLVE-LEADING-TARGET.
+is given.  Returns the same nine values as %RESOLVE-LEADING-TARGET.
 
 Only the locator's own condition, and a path that is not there, are retyped as
 expected failures.  A type error or any other fault raised inside the locator
 travels on untouched, so it reaches the verb's unexpected-failure channel: a
 caller told the anchor was wrong retries with a different one, and a caller
 told something failed unexpectedly reports it."
-  (multiple-value-bind (abs rel original nodes regions)
+  (multiple-value-bind (abs rel original nodes regions unparsed-from)
       (handler-case (%locate-comment-regions file-path readtable session-root)
         ((or comment-locator-error file-error) (e)
           (error 'comment-operation-error :reason (princ-to-string e))))
@@ -501,14 +529,16 @@ attached to the form beginning on line ~D; name that form in leading mode to ~
 reach it.~]~@[~%~A~]"
                                          (princ-to-string e)
                                          (and anchor (cst-node-start-line anchor))
-                                         (%datum-comment-note original nodes))))))))
+                                         (%datum-comment-note original
+                                                              unparsed-from))))))))
       (multiple-value-bind (region-start-line region-end-line)
           (%region-line-range region)
         (values abs rel original nodes
                 (cst-node-start (%region-first-node region))
                 (cst-node-end (%region-last-node region))
                 region-start-line
-                region-end-line)))))
+                region-end-line
+                unparsed-from)))))
 
 ;;;; -------------------------------------------------------------------------
 ;;;; Reporting
@@ -525,7 +555,7 @@ reach it.~]~@[~%~A~]"
 
 (defun %changed-region-report (original removed-start removed-end
                                line-start line-end inserted verified
-                               already-unreadable)
+                               verified-through already-unreadable)
   "Return a hash-table describing the span the edit covered.
 
 It carries the comment's line range, the text the splice took out, the text put
@@ -544,6 +574,14 @@ because then no comparison was performed and there is nothing to report having
 proved.  It is never a claim about the whitespace around the comment: a delete
 removes some of that by design, and the comparison never looked at it.
 
+VERIFIED-THROUGH is how much of the file that comparison reached, and it is
+what keeps VERIFIED from being read as more than it is.  NIL says the parse ran
+to the end of the file, so every form in it was compared.  A line number says
+the reader could not get past that point, so the comparison saw the file down
+to that line and nothing at all below it.  Zero says the parse produced no
+nodes, so the comparison established nothing.  It is meaningful only when
+VERIFIED is true; with no comparison there is no coverage to report.
+
 ALREADY-UNREADABLE says the file failed to balance or to read before the edit
 was made.  A check the file was already failing was skipped rather than charged
 to the edit, and saying so is what keeps the caller from reading the success as
@@ -558,6 +596,7 @@ a clean bill of health for a file that never had one."
                                                               removed-end)
           (gethash "after"                    report) inserted
           (gethash "forms_verified_unchanged" report) verified
+          (gethash "forms_verified_through"   report) verified-through
           (gethash "already_unreadable"       report) already-unreadable)
     report))
 
@@ -610,10 +649,17 @@ A file that already fails to balance or to read is still editable.  The two
 whole-file checks run against the original first, and one the file was already
 failing is skipped rather than charged to the edit, with the fact reported.
 Refusing there would blame the edit for damage that was already present and
-would put every comment in the file out of reach for good.  Nothing is left
-unguarded by that: the comparison of everything outside the file's comments
-runs whatever state the file arrived in, and it is the check that carries the
-guarantee.
+would put every comment in the file out of reach for good.
+
+What the comparison covers on such a file is reported rather than assumed.  The
+reader stops at the first input it cannot get past, and on a file carrying a #;
+datum comment or an unreadable token the parse therefore describes a prefix,
+with whole definitions below it in neither the before list nor the after list.
+The edit is still allowed: refusing would restore exactly the lockout described
+above, and the splice is string surgery that copies those bytes through
+untouched.  The report says how far the comparison reached, so what it proved
+and what it did not are both on the record instead of one being read as the
+other.
 
 When DRY-RUN is true the change is previewed and nothing is written.  After a
 real write a textDocument/didChange notification is sent to the project's LSP
@@ -641,7 +687,8 @@ Returns:
                     (stringp form-name) (plusp (length form-name)))
          (error 'comment-operation-error
                 :reason "leading mode needs a form type and a form name"))))
-    (multiple-value-bind (abs rel original nodes start end region-start-line region-end-line)
+    (multiple-value-bind (abs rel original nodes start end
+                          region-start-line region-end-line unparsed-from)
         (ecase mode-key
           (:region (%resolve-region-target file-path substring line-start line-end
                                            readtable session-root))
@@ -662,18 +709,26 @@ Returns:
                    (if (eq operation-key :delete) "" content))
         (let ((would-change (not (string= original updated)))
               (forms-verified nil)
+              (forms-verified-through nil)
               (already-unreadable nil))
           (when would-change
-            ;; Both report fields are these calls' own answers rather than
+            ;; All three report fields are these calls' own answers rather than
             ;; constants, so a reader of the report learns what was checked
             ;; instead of what the verb hoped.
             (setf forms-verified
                   (%verify-forms-survived original nodes updated readtable
                                           removed-start removed-end inserted))
+            ;; Recorded next to the check it qualifies. A comparison that
+            ;; passed over a prefix of the file and one that passed over the
+            ;; whole of it are the same T, and the difference is the whole
+            ;; content of the guarantee.
+            (setf forms-verified-through
+                  (%comparison-through-line nodes unparsed-from))
             (setf already-unreadable (%verify-still-reads original updated)))
           (let ((report (%changed-region-report original removed-start removed-end
                                                 region-start-line region-end-line
                                                 inserted forms-verified
+                                                forms-verified-through
                                                 already-unreadable)))
             (log-event :debug "lisp.edit.comment"
                        "path" (namestring abs)
