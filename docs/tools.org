@@ -630,8 +630,9 @@ Provide either path (file read under sandbox) or code (inline text) — not both
 Structure-aware edit of a comment in a Lisp source file. 
 Replaces or deletes a comment the form editors cannot reach: a free-standing 
 banner between top-level forms, or the comment sitting flush on top of a named 
-form. Region mode names the comment by a unique substring of it, narrowed by 
-line_start and line_end when that substring matches more than one. Leading mode 
+form. Region mode names the comment by a unique substring of it; line_start and 
+line_end constrain which comment is meant, and a match outside them is refused 
+rather than edited. Leading mode 
 names the form the comment sits on, through form_type and form_name; a blank 
 line between a comment and the form makes that comment free-standing, so name it 
 by substring instead. Every surrounding form is proven byte for byte identical 
@@ -644,7 +645,7 @@ lisp-edit-form insert_before already places one relative to a form.
 {
   "properties": {
     "content": {
-      "description": "Replacement comment text, including its own comment \ncharacters. Required for replace; ignored for delete.",
+      "description": "Replacement comment text, including its own comment \ncharacters. Required for replace; ignored for delete. It replaces the comment \nrun's own bytes, and those bytes end after the newline closing the comment's last \nline: when the text does not end in a newline, one is supplied, so the blank line \nbelow the comment survives and the comment can still be found by substring \nafterwards. Line endings are converted to the ones the file already uses. The \nempty string is spliced exactly as given.",
       "type": "string"
     },
     "dry_run": {
@@ -664,11 +665,11 @@ lisp-edit-form insert_before already places one relative to a form.
       "type": "string"
     },
     "line_end": {
-      "description": "Region mode: last source line of the wanted comment, \n1-based. Only needed when substring alone matches more than one comment.",
+      "description": "Region mode: last source line of the wanted comment, \n1-based. Defaults to line_start when omitted. It constrains the target the same \nway line_start does.",
       "type": "integer"
     },
     "line_start": {
-      "description": "Region mode: first source line of the wanted comment, \n1-based. Only needed when substring alone matches more than one comment.",
+      "description": "Region mode: first source line of the wanted comment, \n1-based. This constrains which comment is meant, rather than settling a tie: a \ncomment matching substring but lying outside the range is refused, naming both the \nrange given and the lines the match sits on.",
       "type": "integer"
     },
     "mode": {
@@ -680,7 +681,7 @@ lisp-edit-form insert_before already places one relative to a form.
       "type": "string"
     },
     "operation": {
-      "description": "Operation: replace or delete.",
+      "description": "Operation: replace or delete. Delete also removes \nthe whitespace run following the comment, so the forms either side end up \nseparated by a single blank line. A comment that ends the file has nothing after \nit to remove, so the blank line above it stays.",
       "enum": [
         "replace",
         "delete"
@@ -692,7 +693,7 @@ lisp-edit-form insert_before already places one relative to a form.
       "type": "string"
     },
     "substring": {
-      "description": "Region mode: a substring of the comment to edit. Must \nmatch exactly one free-standing comment unless line_start and line_end narrow it.",
+      "description": "Region mode: a substring of the comment to edit. Must \nmatch exactly one free-standing comment, or exactly one lying within line_start \nand line_end when those are given.",
       "type": "string"
     }
   },
