@@ -501,14 +501,31 @@ either side of it byte for byte as they were."
 (define-test banner-delete-leaves-one-blank-line
   "Deleting a banner takes the whitespace run that followed it and no more, so
 the forms either side end up separated by a single blank line rather than by
-the gap the banner used to fill."
+the gap the banner used to fill.
+
+What the report says it removed is that whole span and not the comment alone.
+The two differ by exactly the whitespace the delete took, so a report naming the
+comment's own bytes understates the edit by the one part of it a caller would
+not have predicted."
   (with-temp-project-root (session root)
     (true session)
     (let ((path (write-fixture-file root "banner.lisp" +banner-between-forms+)))
-      (edit-comment (namestring root) (namestring path) "region" "delete"
-                    :substring "Descriptor passing.")
-      (is string= (format nil "(defun before () 1)~%~%(defun after () 2)~%")
-          (uiop:read-file-string path)))))
+      (multiple-value-bind (updated changed report)
+          (edit-comment (namestring root) (namestring path) "region" "delete"
+                        :substring "Descriptor passing.")
+        (declare (ignore updated))
+        (true changed)
+        (is string= (format nil "(defun before () 1)~%~%(defun after () 2)~%")
+            (uiop:read-file-string path))
+        ;; The banner's own bytes end with the newline closing its last line.
+        ;; The span removed carries the blank line after it as well.
+        (let ((removed (gethash "before" report))
+              (comment (format nil ";;; Descriptor passing.~%~
+;;; Two lines, one banner.~%")))
+          (is string= (concatenate 'string comment (string #\Newline)) removed)
+          (is = (1+ (length comment)) (length removed)))
+        ;; The comparison ran and is reported as having run.
+        (true (gethash "forms_verified_unchanged" report))))))
 
 (define-test mixed-style-run-edits-as-one-region
   "A block comment and the semicolon line flush beneath it are one region, so a
@@ -936,6 +953,27 @@ distinguishes an empty replace from a delete."
       (is string= (format nil "(defun before () 1)~%~%~%(defun after () 2)~%")
           (uiop:read-file-string path)))))
 
+(define-test unchanged-content-reports-no-verification
+  "A replacement identical to what is already there changes nothing, so the
+comparison that would prove the rest of the file survived is never run. The
+report says so rather than carrying a verification that did not happen.
+
+This is the case that shows the field is derived. A constant would read exactly
+the same here as on an edit that was genuinely checked, and a caller with no way
+to tell the two apart is better off with no field at all."
+  (with-temp-project-root (session root)
+    (true session)
+    (let ((path (write-fixture-file root "noop.lisp" +banner-between-forms+)))
+      (multiple-value-bind (updated changed report)
+          (edit-comment (namestring root) (namestring path) "region" "replace"
+                        :substring "Descriptor passing."
+                        :content (format nil ";;; Descriptor passing.~%~
+;;; Two lines, one banner.~%"))
+        (is string= +banner-between-forms+ updated)
+        (is eq nil changed)
+        (is eq nil (gethash "forms_verified_unchanged" report))
+        (is string= +banner-between-forms+ (uiop:read-file-string path))))))
+
 (define-test verb-replaces-a-banner-and-reports-the-region
   "A region replace driven through the verb rewrites the banner, leaves the
 forms around it alone, and reports the lines the edit covered.
@@ -960,7 +998,13 @@ defect for a whole phase without pinning anything about it."
         (is = 3 (gethash "line_start" report))
         (is = 4 (gethash "line_end" report))
         (is = 3 (gethash "line_end_after" report))
-        (true (gethash "surroundings_unchanged" report)))
+        (true (gethash "forms_verified_unchanged" report)))
+      ;; The prose says what was compared. It used to promise the surroundings
+      ;; were unchanged, which a delete makes false by design.
+      (let ((summary (gethash "text" (elt (gethash "content" res) 0))))
+        (true (search "compared against the original" summary))
+        (false (search "Surrounding forms verified unchanged" summary)))
+      (is = (length (uiop:read-file-string path)) (gethash "characters" res))
       (is string= (format nil "(defun before () 1)~%~%;;; Rewritten banner.~%~%~
 (defun after () 2)~%")
           (uiop:read-file-string path)))))
