@@ -474,6 +474,51 @@ was."
         (true (search "lines 5 to 5" reason)))
       (is string= source (uiop:read-file-string path)))))
 
+(define-test line-end-alone-names-the-comment-on-that-line
+  "The other half of the same rule: a lone line_end is a whole constraint, so
+it selects the comment sitting on that line rather than being ignored. Without
+this the refusal below could be satisfied by an implementation that treated any
+lone line_end as an impossible range and refused everything."
+  (let* ((source (format nil "(defun before () 1)~%~%~
+;; Shared wording here.~%~%~
+;; Shared wording there.~%~%~
+(defun after () 2)~%"))
+         (regions (%comment-regions (nodes-of source) source))
+         (picked (%match-region-by-substring regions "Shared wording" nil 5)))
+    (true (search "Shared wording there." (%region-text picked)))
+    (is equal '(5 5) (multiple-value-list (%region-line-range picked)))))
+
+(define-test line-end-alone-refuses-a-match-outside-it
+  "A caller who names only the last line has named a line, and a substring
+resolving somewhere else is a disagreement exactly as it is when the first line
+was the one named.
+
+The bound used to be dropped whenever its partner was absent, so this call
+rewrote the comment the substring alone found, reported success, and named a
+line the caller had not asked for. The whole thing is driven through the verb
+because only the verb shows the call is reachable: nothing in the schema
+requires line_start, so line_end on its own arrives over the wire. The file is
+read back afterwards because the promise is about the file, not about the
+report."
+  (with-temp-project-root (session root)
+    (let* ((source (format nil "(defun before () 1)~%~%;; Alpha banner.~%~%~
+;; Beta banner.~%~%(defun after () 2)~%"))
+           (path (write-fixture-file root "ranged.lisp" source))
+           (tool (get-tool-instance session "lisp-edit-comment"))
+           (args (make-args "file_path" (namestring path)
+                            "mode" "region"
+                            "operation" "replace"
+                            "substring" "Alpha"
+                            "line_end" 5
+                            "content" (format nil ";; WRONG TARGET.~%")))
+           (res (gethash "result" (tool-handle tool 1 args))))
+      (true (gethash "isError" res))
+      (is string= "comment-operation-error" (gethash "error_type" res))
+      (let ((report (gethash "text" (elt (gethash "content" res) 0))))
+        (true (search "lines 3 to 3" report))
+        (true (search "lines 5 to 5" report)))
+      (is string= source (uiop:read-file-string path)))))
+
 ;;;; -------------------------------------------------------------------------
 ;;;; Prologue and read sandbox
 ;;;; -------------------------------------------------------------------------
