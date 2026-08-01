@@ -35,7 +35,6 @@
                 #:cst-node-end-line
                 #:parse-top-level-forms)
   (:import-from #:dsmr-mcp/src/lisp-edit-form-core
-                #:%locate-target-form
                 #:%normalize-paths)
   (:import-from #:dsmr-mcp/src/project-root
                 #:allowed-read-path)
@@ -43,6 +42,7 @@
                 #:read-file-string)
   (:export #:%comment-regions
            #:%comment-runs
+           #:%comment-node-p
            #:%leading-comment-run
            #:%match-region-by-substring
            #:%locate-comment-regions
@@ -73,7 +73,15 @@ not comment text either."
       (eq value :block-comment)))
 
 (defun %comment-node-p (node)
-  "Return T when NODE is a CST node holding comment text."
+  "Return T when NODE is a CST node holding comment text.
+
+This is the single answer to what counts as comment text, and both halves of
+the editor ask it.  The locator asks so it only ever targets prose.  The
+post-splice comparison asks so it protects everything else in the file: a node
+this rejects is code, whether the reader treats it as a form or skips over it,
+and an edit that turns one into comment text is refused.  Asking one predicate
+in both places is what keeps the two from disagreeing about which bytes the
+verb is allowed to change."
   (and (typep node 'cst-node)
        (eq (cst-node-kind node) :skipped)
        (%comment-reason-p (cst-node-value node))))
