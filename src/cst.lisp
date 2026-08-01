@@ -38,7 +38,11 @@
 
 (defstruct cst-node
   "A node produced by parse-top-level-forms.
-KIND is :EXPR for expression nodes or :SKIPPED for comments and #; forms.
+KIND is :EXPR for expression nodes, or :SKIPPED for input the reader passed
+over: a line comment, a block comment, or a form a false reader conditional
+excluded.  There is no node for a #; datum comment, and none for anything below
+one: the reader signals on it, so the parse ends there and reports how far it
+covered through PARSE-TOP-LEVEL-FORMS' second value.
 VALUE is the read Lisp value (:EXPR) or the skip reason keyword (:SKIPPED).
 CHILDREN are child CST nodes from Eclector's orphan list.
 START/END are 0-based byte offsets into the source text.
@@ -190,10 +194,26 @@ past EOF maps to the last line."
         (when (and find-fn (fboundp find-fn))
           (funcall find-fn designator))))))
 
+(defun %coverage-end (nodes)
+  "Return the offset past the last text any node of NODES covers, 0 for none.
+
+NODES may be in any order, so the answer is the largest end offset in the list
+rather than the end of its last element.  Orphaned skipped input is pushed onto
+the accumulator as it arrives and does not always land in source order."
+  (if nodes
+      (reduce #'max nodes :key #'cst-node-end)
+      0))
+
 (defun %read-remaining-with-cl-reader (stream nodes custom-readtable)
   "Read remaining forms from STREAM using the standard CL reader with CUSTOM-READTABLE.
 Fallback path after an IN-READTABLE form is encountered.
-Returns the complete node list in source order."
+
+Returns (values nodes unparsed-from).  UNPARSED-FROM is NIL when the reader
+reached end of stream, and otherwise the offset past which the returned nodes
+describe nothing: the read stopped there and everything below it is unaccounted
+for.  The standard reader says nothing about what it choked on, so without that
+second value a caller cannot tell a file it read whole from a file it read the
+first half of."
   (let ((*readtable* custom-readtable)
         (*read-eval* nil))
     (loop
@@ -204,9 +224,12 @@ Returns the complete node list in source order."
               do (read-char stream))
         (setf start-pos (file-position stream))
         (let ((form (handler-case (read stream nil :eof)
-                      (error () (return (nreverse nodes))))))
+                      (error ()
+                        ;; Computed before the NREVERSE, which consumes NODES.
+                        (let ((covered (%coverage-end nodes)))
+                          (return (values (nreverse nodes) covered)))))))
           (when (eq form :eof)
-            (return (nreverse nodes)))
+            (return (values (nreverse nodes) nil)))
           (let* ((end-pos (file-position stream))
                  (node (make-cst-node :kind :expr
                                       :value form
@@ -238,19 +261,34 @@ Returns the complete node list in source order."
 
 (defun %check-in-readtable (result stream nodes)
   "If RESULT is an in-readtable CST node, switch to the CL reader.
-Returns (values custom-rt-nodes t) when switching, (values nil nil) otherwise."
+Returns (values custom-rt-nodes t unparsed-from) when switching, and
+(values nil nil nil) otherwise.  UNPARSED-FROM carries the standard reader's
+own account of how far it got, since the switch hands the rest of the file to
+it and the Eclector loop learns nothing more about that text."
   (when (and (typep result 'cst-node)
              (eq (cst-node-kind result) :expr))
     (let ((designator (%in-readtable-form-p (cst-node-value result))))
       (when designator
         (let ((custom-rt (%try-switch-readtable designator)))
           (when custom-rt
-            (return-from %check-in-readtable
-              (values (%read-remaining-with-cl-reader stream nodes custom-rt) t)))))))
-  (values nil nil))
+            (multiple-value-bind (rt-nodes unparsed-from)
+                (%read-remaining-with-cl-reader stream nodes custom-rt)
+              (return-from %check-in-readtable
+                (values rt-nodes t unparsed-from))))))))
+  (values nil nil nil))
 
 (defun %eclector-parse-loop (text)
-  "Inner Eclector parse loop.  *LINE-TABLE* and *PACKAGE* must be bound."
+  "Inner Eclector parse loop.  *LINE-TABLE* and *PACKAGE* must be bound.
+
+Returns (values nodes unparsed-from).  UNPARSED-FROM is NIL when the loop
+reached end of input; when the reader could not get past something, it is the
+offset past which the returned nodes describe nothing.
+
+That offset is the end of the text the nodes cover, not the position the reader
+had consumed to when it gave up.  The two are not the same: the reader may have
+eaten part of the input it then failed on, and that stretch produced no node,
+so it is uncovered as surely as the text below it.  Reporting the reader's own
+position would licence a claim about a span nothing ever examined."
   (let ((*readtable* (copy-readtable))
         (*read-eval* nil)
         (nodes '())
@@ -265,13 +303,13 @@ Returns (values custom-rt-nodes t) when switching, (values nil nil) otherwise."
                  (dolist (orphan orphan-results)
                    (push orphan nodes))
                  (when (eq result :eof)
-                   (return (nreverse nodes)))
+                   (return (values (nreverse nodes) nil)))
                  (push result nodes)
                  (%update-package-from-node result)
-                 (multiple-value-bind (rt-nodes switched)
+                 (multiple-value-bind (rt-nodes switched rt-unparsed)
                      (%check-in-readtable result stream nodes)
                    (when switched
-                     (return rt-nodes)))))))
+                     (return (values rt-nodes rt-unparsed))))))))
         (reader-error (e)
           (let ((msg (format nil "~A" e)))
             (if (search "READ-EVAL" msg)
@@ -279,11 +317,15 @@ Returns (values custom-rt-nodes t) when switching, (values nil nil) otherwise."
                  "Reader error: ~A~%~%Read-time evaluation (#.) is disabled for ~
 security. If you need to parse files containing #., consider removing or ~
 replacing the #. forms, or use a separate evaluation step." e)
-                (nreverse nodes))))))))
+                ;; Computed before the NREVERSE, which consumes NODES.
+                (let ((covered (%coverage-end nodes)))
+                  (values (nreverse nodes) covered)))))))))
 
 (defun %parse-core (text readtable)
   "Run the Eclector or CL-reader parse loop over TEXT.
-*LINE-TABLE* and *PACKAGE* must already be bound by the caller."
+*LINE-TABLE* and *PACKAGE* must already be bound by the caller.
+
+Returns (values nodes unparsed-from) from whichever loop ran."
   (if readtable
       (let ((custom-rt (%try-switch-readtable readtable)))
         (if custom-rt
@@ -301,9 +343,26 @@ replacing the #. forms, or use a separate evaluation step." e)
 (defun parse-top-level-forms (text &key readtable source-path initial-package)
   "Parse TEXT into a list of CST-NODE values in source order.
 
+Returns (values nodes unparsed-from).
+
 Each node is either:
   :EXPR    -- a successfully read Lisp form with byte offsets and line numbers.
-  :SKIPPED -- a comment or #; suppressed form, also with offsets/lines.
+  :SKIPPED -- input the reader passed over: a line comment, a block comment, or
+              a form a false reader conditional excluded.  A #; datum comment is
+              not one of these; see UNPARSED-FROM below.
+
+UNPARSED-FROM is NIL when the parse reached the end of TEXT, and is otherwise
+the offset past which NODES describe nothing at all.  The reader stops at the
+first input it cannot get past, and the nodes then account for a prefix of the
+file rather than for the file.  A caller that treats the list as the whole
+contents will draw a conclusion about text nothing ever looked at, which is why
+the fact is returned rather than left to be guessed at from the offsets.
+
+A #; datum comment is the common way to reach that state and the one least
+likely to be expected, because the file is otherwise perfectly well formed.
+The reader signals on it, so the parse ends there, and it also discards the
+skipped input already accumulated for the failing read: text between the last
+completed form and the datum comment is dropped along with everything below it.
 
 Keyword arguments:
   READTABLE       -- a named-readtable designator string; when supplied, the
