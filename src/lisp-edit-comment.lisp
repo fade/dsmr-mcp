@@ -343,28 +343,47 @@ survive the edit unchanged: ~A. Nothing was written."
                                       (%node-headline original old)))))
     t))
 
-(defun %verify-still-reads (updated)
-  "Signal COMMENT-OPERATION-ERROR when UPDATED no longer reads cleanly.
+(defun %verify-still-reads (original updated)
+  "Signal COMMENT-OPERATION-ERROR when the edit cost UPDATED its readability.
 
-A second guard behind the form comparison rather than a substitute for it: it
-proves the file as a whole is balanced and readable, and says nothing about
-whether the forms it holds are the forms that were there before."
-  (let ((parens (scan-parens updated)))
-    (unless (getf parens :ok)
-      (error 'comment-operation-error
-             :reason (format nil "the edited file no longer has balanced ~
+Two checks, delimiter balance and a full read, and each runs against ORIGINAL
+before it runs against UPDATED.  A check the original already fails proves
+nothing at all about the edit: the file arrived in that state, and refusing on
+it blames the edit for damage that was already there and locks every comment in
+that file out of this verb for good.  Such a check is skipped, and the fact is
+reported, so the caller is never told a file came back clean that never was.
+When the original passes and the updated text does not, the refusal is exactly
+what it was.
+
+Skipping one leaves the edit guarded.  The comparison of everything the file
+holds outside its comments runs in every case, whatever state the file arrived
+in, and that is the check carrying the guarantee.  These two prove only that the
+file as a whole still balances and still reads; neither says anything about
+whether what it holds is what it held before.
+
+Returns T when ORIGINAL already failed one of the two, so the report can say the
+file was in that state before the edit rather than because of it."
+  (let ((already nil))
+    (if (getf (scan-parens original) :ok)
+        (let ((parens (scan-parens updated)))
+          (unless (getf parens :ok)
+            (error 'comment-operation-error
+                   :reason (format nil "the edited file no longer has balanced ~
 delimiters: ~A at line ~A, column ~A. Nothing was written."
-                             (getf parens :kind)
-                             (getf parens :line)
-                             (getf parens :column)))))
-  (let ((reader (try-reader-check updated)))
-    (when reader
-      (error 'comment-operation-error
-             :reason (format nil "the edited file no longer reads cleanly: ~A~
+                                   (getf parens :kind)
+                                   (getf parens :line)
+                                   (getf parens :column)))))
+        (setf already t))
+    (if (try-reader-check original)
+        (setf already t)
+        (let ((reader (try-reader-check updated)))
+          (when reader
+            (error 'comment-operation-error
+                   :reason (format nil "the edited file no longer reads cleanly: ~A~
 ~@[ at line ~A~]. Nothing was written."
-                             (getf reader :message)
-                             (getf reader :line)))))
-  t)
+                                   (getf reader :message)
+                                   (getf reader :line))))))
+    already))
 
 ;;;; -------------------------------------------------------------------------
 ;;;; Target resolution
@@ -505,7 +524,8 @@ reach it.~]~@[~%~A~]"
              breaks)))))
 
 (defun %changed-region-report (original removed-start removed-end
-                               line-start line-end inserted verified)
+                               line-start line-end inserted verified
+                               already-unreadable)
   "Return a hash-table describing the span the edit covered.
 
 It carries the comment's line range, the text the splice took out, the text put
@@ -522,7 +542,12 @@ file's nodes outside its comments were compared against the original and every
 one of them came back unchanged.  It is false when the edit changed nothing,
 because then no comparison was performed and there is nothing to report having
 proved.  It is never a claim about the whitespace around the comment: a delete
-removes some of that by design, and the comparison never looked at it."
+removes some of that by design, and the comparison never looked at it.
+
+ALREADY-UNREADABLE says the file failed to balance or to read before the edit
+was made.  A check the file was already failing was skipped rather than charged
+to the edit, and saying so is what keeps the caller from reading the success as
+a clean bill of health for a file that never had one."
   (let ((report (make-hash-table :test 'equal)))
     (setf (gethash "line_start"               report) line-start
           (gethash "line_end"                 report) line-end
@@ -532,7 +557,8 @@ removes some of that by design, and the comparison never looked at it."
                                                               removed-start
                                                               removed-end)
           (gethash "after"                    report) inserted
-          (gethash "forms_verified_unchanged" report) verified)
+          (gethash "forms_verified_unchanged" report) verified
+          (gethash "already_unreadable"       report) already-unreadable)
     report))
 
 ;;;; -------------------------------------------------------------------------
@@ -580,6 +606,15 @@ open, a comment that begins after code on the same line, and a splice whose
 result no longer holds everything the file held outside its comments.  Every
 one of those checks runs before the write branch is reached.
 
+A file that already fails to balance or to read is still editable.  The two
+whole-file checks run against the original first, and one the file was already
+failing is skipped rather than charged to the edit, with the fact reported.
+Refusing there would blame the edit for damage that was already present and
+would put every comment in the file out of reach for good.  Nothing is left
+unguarded by that: the comparison of everything outside the file's comments
+runs whatever state the file arrived in, and it is the check that carries the
+guarantee.
+
 When DRY-RUN is true the change is previewed and nothing is written.  After a
 real write a textDocument/didChange notification is sent to the project's LSP
 instance when one is registered; a failure there never reaches the caller.
@@ -626,18 +661,20 @@ Returns:
           (%splice original start end operation-key
                    (if (eq operation-key :delete) "" content))
         (let ((would-change (not (string= original updated)))
-              (forms-verified nil))
+              (forms-verified nil)
+              (already-unreadable nil))
           (when would-change
-            ;; The report's verification field is this call's own answer rather
-            ;; than a constant, so a reader of the report learns what was
-            ;; checked instead of what the verb hoped.
+            ;; Both report fields are these calls' own answers rather than
+            ;; constants, so a reader of the report learns what was checked
+            ;; instead of what the verb hoped.
             (setf forms-verified
                   (%verify-forms-survived original nodes updated readtable
                                           removed-start removed-end inserted))
-            (%verify-still-reads updated))
+            (setf already-unreadable (%verify-still-reads original updated)))
           (let ((report (%changed-region-report original removed-start removed-end
                                                 region-start-line region-end-line
-                                                inserted forms-verified)))
+                                                inserted forms-verified
+                                                already-unreadable)))
             (log-event :debug "lisp.edit.comment"
                        "path" (namestring abs)
                        "mode" (string-downcase (symbol-name mode-key))
