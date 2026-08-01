@@ -147,10 +147,11 @@ numbering breaks in some way that happens to land on it again."
 (defun edit-and-read (session root name text substring operation &optional content)
   "Drive the verb over TEXT written as NAME and return what came of it.
 
-Three values: the coverage bound the report carries, the file as it now stands
-on disk, and the summary sentence an agent reads.  The file is read back rather
-than taken from the return value, since the whole question is what the bound
-says about the bytes a caller will find there."
+Four values: the coverage bound the report carries, the file as it now stands
+on disk, the summary sentence an agent reads, and the whole changed-region
+report.  The file is read back rather than taken from the return value, since
+the whole question is what the bound says about the bytes a caller will find
+there."
   (let* ((path (write-fixture-file root name text))
          (tool (get-tool-instance session "lisp-edit-comment"))
          (args (apply #'make-args
@@ -162,7 +163,8 @@ says about the bytes a caller will find there."
          (res (gethash "result" (tool-handle tool 1 args))))
     (values (gethash "forms_verified_through" (gethash "changed_region" res))
             (uiop:read-file-string path)
-            (gethash "text" (elt (gethash "content" res) 0)))))
+            (gethash "text" (elt (gethash "content" res) 0))
+            (gethash "changed_region" res))))
 
 ;;;; -------------------------------------------------------------------------
 ;;;; Fixtures
@@ -1618,3 +1620,62 @@ bound at all, and no arithmetic may invent one."
       (false (search ";;; Descriptor passing." written))
       (is eq nil bound)
       (true (search "Every form in the file was compared" summary)))))
+
+(define-test summary-says-which-file-each-number-is-counted-in
+  "Every number the summary prints says which side of the edit it is counted on.
+
+The report deliberately carries numbers from both files.  The comment's range is
+where it was before the edit, and the line the replacement now ends on is in the
+file the edit leaves.  Nothing in the numbers themselves distinguishes the two,
+and a reviewer with no way to tell cannot check either of them.  That is not a
+hypothetical: a bound printed in the wrong file's numbering shipped, went through
+two acceptance passes and a green suite, and was caught only by someone counting
+lines in the file by hand.
+
+On a shrinking edit the pre-edit end is the larger number and the post-edit end
+the smaller, so the pair reads as a contradiction until each is labelled.  This
+drives that exact shape.
+
+The numbers in the assertions come from the report rather than being written out
+here, so the sentence is pinned to the fields it claims to be rendering.  What
+they are checked against is the file on disk: the pre-edit end has to be a line
+that file no longer has, and the post-edit end a line it does.  Those two are
+also what hold the fields on the sides they are documented to be on, so a change
+that quietly moved either one fails here."
+  (with-temp-project-root (session root)
+    (multiple-value-bind (bound written summary report)
+        (edit-and-read session root "anchored.lisp"
+                       +long-banner-above-a-datum-comment+
+                       "Banner line one." "replace"
+                       (format nil ";; Rewritten.~%"))
+      (let ((start (gethash "line_start" report))
+            (end   (gethash "line_end" report))
+            (after (gethash "line_end_after" report)))
+        ;; The sentence renders the report's own numbers, labelled.
+        (true (search (format nil "Lines ~D to ~D before the edit" start end)
+                      summary))
+        (true (search (format nil "now ending on line ~D" after) summary))
+        ;; The shape that reads as a contradiction without the labels.
+        (true (> end after))
+        ;; The pre-edit end is a line the file no longer has, which is what
+        ;; makes labelling it necessary rather than merely tidy.
+        (true (> end (last-line-number written)))
+        ;; The post-edit end is a line the file does have.
+        (true (<= after (last-line-number written)))
+        ;; line_start is the same number on both sides. That is a coincidence
+        ;; of the edit having to begin at the start of a line, not a property
+        ;; to lean on, so it is pinned as the coincidence it is.
+        (is = start (line-holding written ";; Rewritten."))
+        ;; And the coverage bound names the numbering it is counted in.
+        ;;
+        ;; The bound is checked against the file before it is checked against
+        ;; the sentence. Tying the sentence to the report field on its own
+        ;; proves only that the two agree with each other, which they do just
+        ;; as readily when both are wrong: the first draft of this test held
+        ;; only that tie and stayed green with the original defect put back.
+        (true (<= bound (last-line-number written)))
+        (is = (last-parsed-end-line written) bound)
+        (true (search (format nil "Every form through line ~D was compared" bound)
+                      summary))
+        (true (search "counting lines in the file as this edit leaves it"
+                      summary))))))
