@@ -113,9 +113,15 @@ Allows replace to delete a form by replacing it with a '; removed' comment."
 
 (defun %try-parse-content (text)
   "Try to read TEXT as a single top-level form under lenient package handling.
-Returns TEXT on success, or (values nil error) on failure."
+Returns TEXT on success, or (values nil error kind) on failure.
+
+KIND is :multiple-forms when TEXT holds more than one top-level form, and
+:unreadable for every other failure. It lets the caller tell a missing
+delimiter, which a parinfer repair can fix, from a payload that is simply not
+one form, which it cannot."
   (let ((*read-eval* nil)
-        (*readtable* (copy-readtable nil)))
+        (*readtable* (copy-readtable nil))
+        (kind :unreadable))
     (handler-case
         (call-with-lenient-packages
          (lambda ()
@@ -137,12 +143,13 @@ Returns TEXT on success, or (values nil error) on failure."
                          (read-from-string text nil :eof :start rest-start :end len)
                        (declare (ignore ignored))
                        (unless (eq form2 :eof)
+                         (setf kind :multiple-forms)
                          (error "content must contain exactly one top-level form")))
                    (end-of-file () nil)
                    (reader-error () nil))))
              text)))
       (error (e)
-        (values nil e)))))
+        (values nil e kind)))))
 
 (defun validate-and-repair-content (content &optional package-name source-path)
   "Ensure CONTENT is a single valid top-level form.
@@ -152,6 +159,11 @@ If it fails due to missing closing parens, attempt repair via apply-indent-mode
 and return (values repaired-content parinfer-warning-string) when repair succeeds.
 Signals an error when both the original and the repaired content fail to parse.
 
+Content holding more than one top-level form is refused outright rather than
+handed to parinfer. Parinfer closes forms from indentation, so on a multi-form
+payload it answers confidently and wrongly, and the caller gets a corrupted
+write reported as a success instead of a refusal.
+
 Comment-only content (no readable form, has ';' or '#|') is accepted verbatim
 with a nil second value.
 
@@ -160,26 +172,30 @@ a 'parinfer_warning' field in the result, so the agent sees what was auto-repair
   (declare (ignore package-name source-path))
   (when (%comment-only-p content)
     (return-from validate-and-repair-content (values content nil)))
-  (multiple-value-bind (result err)
+  (multiple-value-bind (result err kind)
       (%try-parse-content content)
-    (if result
-        (values result nil)
-        ;; Attempt parinfer repair.
-        (let ((repaired (apply-indent-mode content)))
-          (multiple-value-bind (repaired-result repaired-err)
-              (%try-parse-content repaired)
-            (cond
-              (repaired-result
-               (log-event :info "lisp.edit.form" "auto-repair" "success"
-                          "original-error" (princ-to-string err))
-               (let ((added-count (- (length repaired) (length content))))
-                 (values repaired-result
-                         (format nil "~D closing delimiter~:P ~
+    (cond
+      (result (values result nil))
+      ((eq kind :multiple-forms)
+       (error "content parse error: ~A. Send one form per call; use a second ~
+call, or insert_after, to add the next one." err))
+      (t
+       ;; Attempt parinfer repair.
+       (let ((repaired (apply-indent-mode content)))
+         (multiple-value-bind (repaired-result repaired-err)
+             (%try-parse-content repaired)
+           (cond
+             (repaired-result
+              (log-event :info "lisp.edit.form" "auto-repair" "success"
+                         "original-error" (princ-to-string err))
+              (let ((added-count (- (length repaired) (length content))))
+                (values repaired-result
+                        (format nil "~D closing delimiter~:P ~
 ~[were~;was~:;were~] added by parinfer"
-                                 added-count added-count))))
-              (t
-               (error "content parse error: ~A (repair also failed: ~A)"
-                      err repaired-err))))))))
+                                added-count added-count))))
+             (t
+              (error "content parse error: ~A (repair also failed: ~A)"
+                     err repaired-err)))))))))
 
 ;;;; -------------------------------------------------------------------------
 ;;;; Operation application
