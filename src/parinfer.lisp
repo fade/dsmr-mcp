@@ -172,6 +172,13 @@ Closes open forms when indentation decreases, drops excess close parens,
 and ignores parentheses inside strings or ';' comments.  Preserves the
 trailing-newline state of the input.
 
+A line that begins inside a string literal is copied through with its
+indentation ignored: leading whitespace there is text, not structure.  Read as
+structure, a docstring continuation flush at column zero looks like a dedent
+back to top level, which closes the enclosing form early.  The close paren then
+lands inside the docstring and the form's own closing paren, arriving with an
+empty stack, is discarded as an excess one.
+
 Typical use: repair LLM-generated content that is missing one or more
 closing parens before splicing it into a file."
   (let ((ends-with-newline (and (plusp (length text))
@@ -180,12 +187,13 @@ closing parens before splicing it into a file."
         (state (%make-parinfer-state))
         (processed-lines '()))
     (dolist (line lines)
-      (let ((indent (%count-leading-spaces line))
-            (code-line-p (not (%line-empty-or-comment-p line))))
-        (when code-line-p
-          (let ((pending (%dedent-closes state indent)))
-            (%append-closes-to-previous processed-lines pending)))
-        (push (%process-line-characters line state) processed-lines)))
+      (unless (parinfer-state-in-string state)
+        (let ((indent (%count-leading-spaces line))
+              (code-line-p (not (%line-empty-or-comment-p line))))
+          (when code-line-p
+            (let ((pending (%dedent-closes state indent)))
+              (%append-closes-to-previous processed-lines pending)))))
+      (push (%process-line-characters line state) processed-lines))
     ;; Close any parens still open at EOF.
     (%append-remaining-closes state processed-lines)
     ;; Rebuild the text, preserving the original trailing-newline state.

@@ -16,6 +16,8 @@
   (:import-from #:dsmr-mcp/src/lisp-edit-form
                 #:edit-form
                 #:validate-and-repair-content)
+  (:import-from #:dsmr-mcp/src/parinfer
+                #:apply-indent-mode)
   (:import-from #:dsmr-mcp/src/state
                 #:get-tool-instance)
   (:import-from #:dsmr-mcp/src/tools/base
@@ -220,3 +222,68 @@ spec (ignoring C-name strings), while the defstruct-with-options and
   (is equal '("frobnicate")
       (dsmr-mcp/src/lisp-edit-form-core::%definition-candidates
        '(defun frobnicate (a b)) "defun")))
+
+(define-test two-top-level-forms-in-one-call-is-refused
+  "Content holding two top-level forms is refused, and the file is left byte
+for byte as it was.
+
+Parinfer repairs a missing delimiter; it cannot repair a payload that is simply
+not one form, and asked to try it answers confidently and wrongly. It reads the
+payload's indentation as structure, so a docstring continuation flush at column
+zero looks like a dedent back to top level: a close paren lands inside the
+docstring, the form's own closing paren then looks like an excess one and is
+dropped, and the call still reports success. The refusal is what keeps the file
+readable."
+  (with-temp-project-root (session root)
+    (let* ((source "(in-package #:cl-user)
+
+(defun alpha (x)
+  \"Alpha docstring.\"
+  (* x 2))
+
+(defun gamma (z)
+  \"Gamma stays put.\"
+  z)
+")
+           (pn (write-fixture-file root "two-form.lisp" source))
+           ;; Two top-level forms in one payload. The second carries a
+           ;; multi-line docstring whose continuation lines sit at column zero.
+           (two-forms "(defun alpha (x)
+  \"Alpha docstring.\"
+  (* x 2))
+
+(defun beta (y)
+  \"First line of beta docstring.
+Second line, flush at column zero.
+Third line.\"
+  (+ y 1))"))
+      ;; The call must refuse outright.
+      (fail (edit-form (namestring root) (namestring pn)
+                       "defun" "alpha" "replace" two-forms
+                       :dry-run nil))
+      (let ((after (uiop:read-file-string pn)))
+        ;; Nothing was written.
+        (is string= source after)
+        ;; In particular no close paren was smuggled into a docstring.
+        (false (search "docstring.)" after))
+        ;; And the form below the target still stands on its own.
+        (true (search "(defun gamma (z)" after))))))
+
+(define-test string-continuation-lines-are-not-read-as-indentation
+  "apply-indent-mode leaves a multi-line string literal alone.
+
+Leading whitespace on a line that begins inside a string is text, not
+indentation. Read as indentation, a docstring continuation flush at column zero
+dedents the enclosing form closed: the repair puts a close paren inside the
+docstring and then drops the form's real one. Repairing the form below has to
+append the single missing paren at the end and change nothing else."
+  (let* ((paren-short "(defun alpha (x)
+  \"First line of the docstring.
+Second line, flush at column zero.
+Third line.\"
+  (* x 2)")
+         (repaired (apply-indent-mode paren-short)))
+    ;; No close paren was smuggled into the docstring.
+    (false (search "docstring.)" repaired))
+    ;; The repair is exactly one appended delimiter, nothing else moved.
+    (is string= (concatenate 'string paren-short ")") repaired)))
