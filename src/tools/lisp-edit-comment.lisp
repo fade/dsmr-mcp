@@ -43,9 +43,9 @@
 Replaces or deletes a comment the form editors cannot reach: a free-standing \
 banner between top-level forms, or the comment sitting flush on top of a named \
 form. Region mode names the comment by a unique substring of it; line_start and \
-line_end constrain which comment is meant, and a match outside them is refused \
-rather than edited. Leading mode \
-names the form the comment sits on, through form_type and form_name; a blank \
+line_end constrain which comment is meant, either of them on its own is enough, \
+and a match outside the range they give is refused rather than edited. Leading \
+mode names the form the comment sits on, through form_type and form_name; a blank \
 line between a comment and the form makes that comment free-standing, so name it \
 by substring instead. Every surrounding form is proven byte for byte identical \
 before anything is written, and an anchor naming no comment or more than one \
@@ -74,19 +74,22 @@ it to remove, so the blank line above it stays."
                  (substring
                   :type :string
                   :description "Region mode: a substring of the comment to edit. Must \
-match exactly one free-standing comment, or exactly one lying within line_start \
-and line_end when those are given.")
+match exactly one free-standing comment, or exactly one lying within the line \
+range, when either line_start or line_end is given.")
                  (line_start
                   :type :integer
                   :description "Region mode: first source line of the wanted comment, \
 1-based. This constrains which comment is meant, rather than settling a tie: a \
 comment matching substring but lying outside the range is refused, naming both the \
-range given and the lines the match sits on.")
+range given and the lines the match sits on. It stands on its own: with line_end \
+omitted the range is the single line named here.")
                  (line_end
                   :type :integer
                   :description "Region mode: last source line of the wanted comment, \
-1-based. Defaults to line_start when omitted. It constrains the target the same \
-way line_start does.")
+1-based. It constrains the target exactly as line_start does, and it stands on \
+its own the same way: with line_start omitted the range is the single line named \
+here, and a comment matching substring elsewhere is refused rather than edited. \
+Given both, the range runs from line_start to line_end.")
                  (form_type
                   :type :string
                   :description "Leading mode: form type the comment sits on, \
