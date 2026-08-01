@@ -259,28 +259,53 @@ LINE-END.  A null LINE-END means the range is the single line LINE-START."
 
 (defun %match-region-by-substring (regions substring &optional line-start line-end)
   "Return the one region in REGIONS whose text contains SUBSTRING.
-When SUBSTRING appears in more than one region and LINE-START is supplied, the
-candidates are narrowed to those overlapping the line range before deciding.
+
+LINE-START and LINE-END are a constraint on the target rather than a tie-break.
+Whenever LINE-START is supplied the candidates are narrowed to the regions
+overlapping that range before the number of them decides anything, so a caller
+who states both a substring and a range gets the region they named or an error.
+
+Two constraints that disagree are a failure and not a tie to break.  A caller
+in that position is holding one piece of information that has gone stale and
+has no way to tell which, so acting on the other one rewrites a region they did
+not name, and nothing in the result would say so.  The refusal names the range
+given and the lines the match actually sits on, which is enough to see which of
+the two is out of date.
 
 Signals an error listing every candidate when SUBSTRING matches no region or
-still matches more than one, so an anchor that does not name exactly one
-region can never resolve to a target."
+still matches more than one, so an anchor that does not name exactly one region
+can never resolve to a target."
   (let ((hits (remove-if-not (lambda (region) (search substring (%region-text region)))
                              regions)))
-    (when (and (rest hits) line-start)
-      (setf hits (remove-if-not (lambda (region)
-                                  (%region-overlaps-lines-p region line-start line-end))
-                                hits)))
-    (cond
-      ((null hits)
-       (error "No comment region contains ~S. Regions available:~%~{  ~A~%~}"
-              substring (%describe-region-candidates regions)))
-      ((null (rest hits))
-       (first hits))
-      (t
-       (error "~S matches ~D comment regions. Narrow it with a longer ~
+    (when (null hits)
+      (error "No comment region contains ~S. Regions available:~%~{  ~A~%~}"
+             substring (%describe-region-candidates regions)))
+    (let ((candidates (if line-start
+                          (remove-if-not
+                           (lambda (region)
+                             (%region-overlaps-lines-p region line-start line-end))
+                           hits)
+                          hits))
+          (high (or line-end line-start)))
+      (cond
+        ((and (null candidates) (null (rest hits)))
+         (multiple-value-bind (match-start match-end) (%region-line-range (first hits))
+           (error "~S names one comment region and it is on lines ~D to ~D, but ~
+the range asked for is lines ~D to ~D. Those two disagree, so nothing was ~
+edited: one of them is out of date."
+                  substring match-start match-end line-start high)))
+        ((null candidates)
+         (error "~S matches ~D comment regions and none of them lies within ~
+lines ~D to ~D:~%~{  ~A~%~}"
+                substring (length hits) line-start high
+                (%describe-region-candidates hits)))
+        ((null (rest candidates))
+         (first candidates))
+        (t
+         (error "~S matches ~D comment regions. Narrow it with a longer ~
 substring or a line range:~%~{  ~A~%~}"
-              substring (length hits) (%describe-region-candidates hits))))))
+                substring (length candidates)
+                (%describe-region-candidates candidates)))))))
 
 ;;;; -------------------------------------------------------------------------
 ;;;; Prologue
