@@ -143,8 +143,13 @@ to run and the message says that instead.
 
 It makes no claim about the whitespace around the comment.  A delete removes the
 whitespace run following the comment by design, so a message promising the
-surroundings were left alone would be false every time a delete succeeded."
-  (format nil "Lines ~A to ~A~@[, now ending on line ~A~].~%~A~%~%\
+surroundings were left alone would be false every time a delete succeeded.
+
+A file that was already failing to balance or to read says so on its own line,
+because the whole-file checks were skipped for it rather than charged to this
+edit, and a caller reading a plain success would otherwise take the file for
+sound."
+  (format nil "Lines ~A to ~A~@[, now ending on line ~A~].~%~A~@[~%~A~]~%~%\
 --- before ---~%~A~@[~%--- after ---~%~A~]"
           (gethash "line_start" report)
           (gethash "line_end" report)
@@ -152,6 +157,9 @@ surroundings were left alone would be false every time a delete succeeded."
           (if (gethash "forms_verified_unchanged" report)
               "Every form in the file was compared against the original and came back unchanged."
               "Nothing changed, so there was no comparison to run.")
+          (and (gethash "already_unreadable" report)
+               (format nil "This file did not balance or read cleanly before ~
+the edit either, so that check was skipped rather than charged to the edit."))
           (gethash "before" report)
           (let ((after (gethash "after" report)))
             (and (plusp (length after)) after))))

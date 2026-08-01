@@ -175,6 +175,13 @@ datum-comment explanation describes. The parse stops at the datum comment, so
 the banner above it never reaches the node list either and a substring naming it
 finds nothing at all.")
 
+(defparameter +damage-below-the-banner+
+  (format nil "(defun a () 1)~%~%;;; Banner to rewrite.~%~%(defun b () 2)~%~%~
+(defun c () #<unreadable>)~%")
+  "A file the standard reader cannot get through, with the damage seven lines
+below the comment anyone would want to edit. The comment edit is harmless and
+has nothing to do with the token on the last line.")
+
 (defparameter +header-detached+
   (format nil ";;;; SPDX-License-Identifier: AGPL-3.0-or-later~%~
 ;;;; File header prose.~%~%~
@@ -1119,6 +1126,76 @@ channel, and it carries no anchor advice, because none of that advice applies."
         (false (search "#; datum comment" text))
         (false (search "Regions available" text)))
       (is string= source (uiop:read-file-string path)))))
+
+(define-test pre-existing-damage-does-not-block-a-comment-edit
+  "The whole-file checks used to run against the edited text only, so any token
+the reader could not get through, anywhere in the file, was reported as damage
+this edit had caused. The message said the edit broke the file and named a line
+the edit never touched, and no comment anywhere in such a file could be reached
+by this verb again.
+
+The checks run against the original first now. One the file was already failing
+says nothing about the edit, so it is skipped and the state is reported instead
+of charged. The comment lands, the file is written, and the report says the file
+was already in that state.
+
+The reader error sits seven lines below the banner, which is the reproduction
+the review recorded."
+  (with-temp-project-root (session root)
+    (true session)
+    ;; The precondition, asserted rather than assumed: the file really does
+    ;; fail to read, and the failure really is below the comment.
+    (let ((reader (try-reader-check +damage-below-the-banner+)))
+      (true reader)
+      (is = 7 (getf reader :line)))
+    (let ((path (write-fixture-file root "damaged.lisp" +damage-below-the-banner+)))
+      (multiple-value-bind (updated changed report)
+          (edit-comment (namestring root) (namestring path) "region" "replace"
+                        :substring "Banner to rewrite."
+                        :content (format nil ";;; Rewritten banner.~%"))
+        (declare (ignore updated))
+        (true changed)
+        (true (gethash "already_unreadable" report))
+        (true (gethash "forms_verified_unchanged" report)))
+      (let ((written (uiop:read-file-string path)))
+        (is string= (format nil "(defun a () 1)~%~%;;; Rewritten banner.~%~%~
+(defun b () 2)~%~%(defun c () #<unreadable>)~%")
+            written)
+        ;; The damage is untouched, which is the point: the edit neither caused
+        ;; it nor took it upon itself to repair it.
+        (true (search "#<unreadable>" written))))))
+
+(define-test a-clean-file-is-still-refused-when-the-edit-would-break-it
+  "The converse, and the reason the skip narrows the check rather than removing
+it. When the original passes and the edited text fails, the refusal is exactly
+what it always was and nothing is written. Only a check the file was already
+failing is skipped, and only for that file.
+
+Both branches are driven directly, because the comparison of everything outside
+the file's comments sits in front of them and refuses damaging content sooner.
+That ordering is what makes these two a backstop rather than the guarantee, and
+it is why the guarantee is stated in terms of the comparison."
+  (let* ((clean +banner-between-forms+)
+         (unbalanced (format nil "(defun a () 1)~%~%;; Banner.~%~%(defun b () 2~%"))
+         (unreadable (format nil "(defun a () 1)~%~%;; Banner.~%~%~
+(defun b () #<unreadable>)~%"))
+         (parens-err (error-from
+                      (lambda ()
+                        (dsmr-mcp/src/lisp-edit-comment::%verify-still-reads
+                         clean unbalanced))))
+         (reader-err (error-from
+                      (lambda ()
+                        (dsmr-mcp/src/lisp-edit-comment::%verify-still-reads
+                         clean unreadable)))))
+    (true (typep parens-err 'comment-operation-error))
+    (true (search "no longer has balanced delimiters"
+                  (comment-operation-reason parens-err)))
+    (true (typep reader-err 'comment-operation-error))
+    (true (search "no longer reads cleanly" (comment-operation-reason reader-err)))
+    ;; A file already in that state reports it instead of signalling, and a
+    ;; clean file that stays clean reports nothing.
+    (true (dsmr-mcp/src/lisp-edit-comment::%verify-still-reads unreadable unreadable))
+    (is eq nil (dsmr-mcp/src/lisp-edit-comment::%verify-still-reads clean clean))))
 
 (define-test verb-offers-no-insert-operation
   "Replace and delete are the whole operation set. Placing a brand new comment
