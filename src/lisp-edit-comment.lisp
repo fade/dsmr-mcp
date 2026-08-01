@@ -147,21 +147,83 @@ in the file would still be byte for byte identical."
               (format nil "the comment above ~A ~A" form-type form-name)
               "the comment that substring names")))
 
+(defun %file-line-terminator (text)
+  "Return the line terminator TEXT already uses, as a string.
+
+Carriage return and newline when the first newline in TEXT is preceded by a
+carriage return, a bare newline otherwise.  One sample decides it: a source file
+with two conventions in it is already broken in a way this verb cannot repair,
+and picking the first tells the caller which one the edit will follow.
+
+A file holding no newline at all answers with a bare newline.  Nothing below the
+edit can disagree with that guess, because there is nothing below the edit."
+  (let ((break (position #\Newline text)))
+    (if (and break (plusp break) (char= (char text (1- break)) #\Return))
+        (concatenate 'string (string #\Return) (string #\Newline))
+        (string #\Newline))))
+
+(defun %content-with-file-terminator (content terminator)
+  "Return CONTENT with every line ending in it rewritten to TERMINATOR.
+
+Replacement text arrives with whatever line endings the caller's own editor
+produced, and splicing it verbatim leaves a file with two conventions in it.
+The file already states which one it uses, so the caller does not have to."
+  (let ((flattened
+          (with-output-to-string (out)
+            (loop with limit = (length content)
+                  for index from 0 below limit
+                  for character = (char content index)
+                  do (unless (and (char= character #\Return)
+                                  (< (1+ index) limit)
+                                  (char= (char content (1+ index)) #\Newline))
+                       (write-char character out))))))
+    (if (string= terminator (string #\Newline))
+        flattened
+        (with-output-to-string (out)
+          (loop for character across flattened
+                do (if (char= character #\Newline)
+                       (write-string terminator out)
+                       (write-char character out)))))))
+
 (defun %splice (text start end operation content)
   "Rewrite TEXT's bytes from START to END according to OPERATION.
 
 Returns four values: the updated text, the first offset removed, the offset one
 past the last removed, and the text put in their place.  The three position
 values describe the whole edit, which is what lets the form comparison know
-exactly how far each later form moved.
+exactly how far each later form moved.  The fourth is the text as it was
+actually spliced, which is not always the text the caller handed over.
 
 Replace covers the comment run's own bytes and no more, so the whitespace
-around it survives untouched.  Delete additionally takes the single run of
-whitespace following the comment so a removed banner leaves no blank line."
+around it survives untouched.  A run's bytes end after the newline closing its
+last line, so replacement text carrying no newline of its own would take the
+blank line below the comment with it, leaving the comment flush against the
+form beneath and unreachable by substring afterwards.  One terminator is
+appended when that would otherwise happen: when the bytes being removed end in
+a newline and the content is neither empty nor already newline-terminated.
+Empty content is spliced exactly as given, since a caller passing it is saying
+there should be nothing here and appending would put the line back.  The
+terminator appended, and the terminator inside the content, is the one the file
+already uses.
+
+Delete additionally takes the single run of whitespace following the comment so
+a removed banner leaves no blank line.  The one exception is a comment that
+ends the file: the trim only runs forward, so there is nothing after the
+comment for it to absorb and the blank line above the comment stays where it
+is.  Harmless, and worth knowing before a whitespace linter reports it."
   (ecase operation
     (:replace
-     (values (concatenate 'string (subseq text 0 start) content (subseq text end))
-             start end content))
+     (let* ((terminator (%file-line-terminator text))
+            (normalized (%content-with-file-terminator content terminator))
+            (spliced (if (and (plusp (length normalized))
+                              (plusp end)
+                              (char= (char text (1- end)) #\Newline)
+                              (not (char= (char normalized (1- (length normalized)))
+                                          #\Newline)))
+                         (concatenate 'string normalized terminator)
+                         normalized)))
+       (values (concatenate 'string (subseq text 0 start) spliced (subseq text end))
+               start end spliced)))
     (:delete
      (let* ((suffix (subseq text end))
             (trim (or (position-if-not #'%blank-char-p suffix) (length suffix))))

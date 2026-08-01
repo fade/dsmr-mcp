@@ -159,6 +159,14 @@ and closes here. |#~%~
   (format nil "(defun a () 1) ; note about a~%~%(defun b () 2)~%")
   "A comment after code, detached from the form below it by a blank line.")
 
+(defparameter +banner-between-forms-crlf+
+  (let ((eol (concatenate 'string (string #\Return) (string #\Newline))))
+    (format nil "(defun a () 1)~A~A;; Banner.~A~A(defun b () 2)~A"
+            eol eol eol eol eol))
+  "The banner shape again, written the way a file edited on Windows arrives.
+Nothing else in the suite has carriage returns in it, and the splice used to
+put a bare newline into exactly this file.")
+
 (defparameter +header-detached+
   (format nil ";;;; SPDX-License-Identifier: AGPL-3.0-or-later~%~
 ;;;; File header prose.~%~%~
@@ -817,9 +825,97 @@ touching the filesystem."
     (true (gethash "isError" res))
     (is string= "project-root-not-set" (gethash "error_type" res))))
 
+(define-test newline-free-content-keeps-the-comment-free-standing
+  "A comment run's bytes end after the newline closing its last line, so
+replacement text carrying no newline of its own used to take the blank line
+below the comment with it. That blank line is what made the run free-standing:
+without it the comment is flush against the form beneath, which means substring
+anchoring cannot see it and the caller has lost the only handle this verb
+offers on the comment it just wrote.
+
+So the assertion is in two halves. The file differs from the original in the
+banner's own line and nowhere else, and a second region-mode call naming the
+new wording still resolves."
+  (with-temp-project-root (session root)
+    (true session)
+    (let ((path (write-fixture-file root "banner.lisp" +banner-between-forms+)))
+      (edit-comment (namestring root) (namestring path) "region" "replace"
+                    :substring "Descriptor passing."
+                    :content ";;; Rewritten banner.")
+      (is string= (format nil "(defun before () 1)~%~%;;; Rewritten banner.~%~%~
+(defun after () 2)~%")
+          (uiop:read-file-string path))
+      (let ((preview (edit-comment (namestring root) (namestring path)
+                                   "region" "replace"
+                                   :substring "Rewritten banner."
+                                   :content (format nil ";;; Third pass.~%")
+                                   :dry-run t)))
+        (true (gethash "would_change" preview))))))
+
+(define-test crlf-file-keeps-its-line-endings-through-a-replace
+  "Replacement text arrives with whatever line endings the caller's editor
+produced. Splicing it verbatim into a file terminated by carriage return and
+newline leaves the rewritten line the only bare-newline line in the file, which
+is the sort of damage that shows up as a whole-file diff the next time anyone
+touches it. The content is converted to the terminator the file already uses,
+including the one appended because the content carries none of its own."
+  (with-temp-project-root (session root)
+    (true session)
+    (let ((path (write-fixture-file root "crlf.lisp" +banner-between-forms-crlf+)))
+      (edit-comment (namestring root) (namestring path) "region" "replace"
+                    :substring "Banner."
+                    :content ";; Rewritten.")
+      (let ((written (uiop:read-file-string path)))
+        (true (search "Rewritten." written))
+        (is = 0 (loop for index from 0 below (length written)
+                      count (and (char= (char written index) #\Newline)
+                                 (or (zerop index)
+                                     (not (char= (char written (1- index))
+                                                 #\Return))))))
+        (let ((eol (concatenate 'string (string #\Return) (string #\Newline))))
+          (is string= (format nil "(defun a () 1)~A~A;; Rewritten.~A~A~
+(defun b () 2)~A" eol eol eol eol eol)
+              written))))))
+
+(define-test deleting-the-last-comment-leaves-the-blank-line-above-it
+  "The whitespace trim a delete performs only runs forward, so a comment that
+ends the file has nothing after it to absorb and the blank line above it stays.
+This is the documented behaviour rather than the intended one, and it is pinned
+here so the docstring that now states the exception cannot quietly stop being
+true. Harmless in itself, but it is the shape a whitespace linter reports."
+  (with-temp-project-root (session root)
+    (true session)
+    (let ((path (write-fixture-file
+                 root "tail.lisp"
+                 (format nil "(defun a () 1)~%~%;; Trailing banner.~%"))))
+      (edit-comment (namestring root) (namestring path) "region" "delete"
+                    :substring "Trailing banner.")
+      (is string= (format nil "(defun a () 1)~%~%")
+          (uiop:read-file-string path)))))
+
+(define-test empty-replacement-content-is-spliced-verbatim
+  "A caller passing the empty string is saying there should be nothing here.
+Appending a terminator to that would put back the line they asked to remove, so
+the empty string is the one content the terminator rule leaves alone. The blank
+line the comment used to sit between survives on both sides, which is what
+distinguishes an empty replace from a delete."
+  (with-temp-project-root (session root)
+    (true session)
+    (let ((path (write-fixture-file root "empty.lisp" +banner-between-forms+)))
+      (edit-comment (namestring root) (namestring path) "region" "replace"
+                    :substring "Descriptor passing." :content "")
+      (is string= (format nil "(defun before () 1)~%~%~%(defun after () 2)~%")
+          (uiop:read-file-string path)))))
+
 (define-test verb-replaces-a-banner-and-reports-the-region
   "A region replace driven through the verb rewrites the banner, leaves the
-forms around it alone, and reports the lines the edit covered."
+forms around it alone, and reports the lines the edit covered.
+
+The content here carries no newline of its own, which is the case a caller
+reaches by accident, so the assertion is on the whole file rather than on
+fragments of it: searching for three pieces passes just as happily when the
+blank line below the banner has been eaten, which is how this test drove that
+defect for a whole phase without pinning anything about it."
   (with-temp-project-root (session root)
     (let* ((path (write-fixture-file root "banner.lisp" +banner-between-forms+))
            (tool (get-tool-instance session "lisp-edit-comment"))
@@ -834,11 +930,11 @@ forms around it alone, and reports the lines the edit covered."
       (let ((report (gethash "changed_region" res)))
         (is = 3 (gethash "line_start" report))
         (is = 4 (gethash "line_end" report))
+        (is = 3 (gethash "line_end_after" report))
         (true (gethash "surroundings_unchanged" report)))
-      (let ((written (uiop:read-file-string path)))
-        (true (search ";;; Rewritten banner." written))
-        (true (search "(defun before () 1)" written))
-        (true (search "(defun after () 2)" written))))))
+      (is string= (format nil "(defun before () 1)~%~%;;; Rewritten banner.~%~%~
+(defun after () 2)~%")
+          (uiop:read-file-string path)))))
 
 (define-test verb-reports-an-absent-anchor-as-a-typed-error
   "A substring naming no comment comes back as its own error type, distinct
