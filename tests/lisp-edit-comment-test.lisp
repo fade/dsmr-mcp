@@ -19,7 +19,10 @@
 ;;;; check that sees a replacement swallowing a form is the comparison of
 ;;;; the re-parsed forms; the delimiter scan passes that case.  And a
 ;;;; comment written after code on the same line is refused rather than
-;;;; treated as the next form's, because nothing later could catch that.
+;;;; edited, because nothing later could catch that: naming the form below
+;;;; it and naming a substring of it both reach the same run, so both are
+;;;; pinned, and the substring case is pinned for replacing as well as for
+;;;; deleting.
 ;;;;
 ;;;; The last four tests go through the verb rather than the function under
 ;;;; it, because what they pin belongs to the verb: refusing to act with no
@@ -144,6 +147,10 @@ and closes here. |#~%~
 ;; Explains nothing in particular.~%~%~
 (defun after () 2)~%")
   "The same comment with a blank line before the form.")
+
+(defparameter +trailing-comment-then-blank+
+  (format nil "(defun a () 1) ; note about a~%~%(defun b () 2)~%")
+  "A comment after code, detached from the form below it by a blank line.")
 
 (defparameter +header-detached+
   (format nil ";;;; SPDX-License-Identifier: AGPL-3.0-or-later~%~
@@ -560,6 +567,72 @@ that does begin its own line is unaffected and still edits."
                     :form-type "defun" :form-name "b"
                     :content (format nil "; note that now says more~%"))
       (is string= (format nil "(defun a () 1)~%; note that now says more~%~
+(defun b () 2)~%")
+          (uiop:read-file-string path)))))
+
+(define-test free-standing-trailing-comment-refuses-a-region-delete
+  "A comment written after code is free-standing as soon as a blank line
+detaches it from the form below, so a substring reaches it and the rule leading
+mode enforces has to hold here too. Deleting this one takes the blank line
+along with the comment and leaves the two forms on a single line, while every
+form survives byte for byte at a correctly shifted offset: the form comparison,
+the delimiter scan and the reader all pass a file that has just lost the shape
+it was written in. The run is refused for beginning after code, before anything
+is written."
+  (with-temp-project-root (session root)
+    (true session)
+    ;; The refusals here and below would pass for the wrong reason if this
+    ;; shape ever stopped being free-standing, so the precondition is asserted
+    ;; rather than assumed.
+    (let ((regions (%comment-regions (nodes-of +trailing-comment-then-blank+)
+                                     +trailing-comment-then-blank+)))
+      (is = 1 (length regions))
+      (true (search "note about a" (%region-text (first regions)))))
+    (let* ((path (write-fixture-file root "trailing-free.lisp"
+                                     +trailing-comment-then-blank+))
+           (err (error-from (lambda ()
+                              (edit-comment (namestring root) (namestring path)
+                                            "region" "delete"
+                                            :substring "note about a")))))
+      (true (typep err 'comment-operation-error))
+      (true (search "same line" (comment-operation-reason err)))
+      (is string= +trailing-comment-then-blank+ (uiop:read-file-string path))
+      ;; Naming the damage rather than leaving it to the byte comparison: this
+      ;; is the single line the two forms were merged onto.
+      (false (search "(defun a () 1) (defun b () 2)"
+                     (uiop:read-file-string path))))))
+
+(define-test free-standing-trailing-comment-refuses-a-region-replace
+  "Replacing that same run is refused on the same rule rather than on the
+operation. Replacement text carrying no newline of its own consumes the blank
+line and rewrites the line the code sits on, and the form comparison sees that
+no better than it sees the delete, so one rule that fails closed covers both."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((path (write-fixture-file root "trailing-free-replace.lisp"
+                                     +trailing-comment-then-blank+))
+           (err (error-from (lambda ()
+                              (edit-comment (namestring root) (namestring path)
+                                            "region" "replace"
+                                            :substring "note about a"
+                                            :content "; rewritten")))))
+      (true (typep err 'comment-operation-error))
+      (true (search "same line" (comment-operation-reason err)))
+      (is string= +trailing-comment-then-blank+ (uiop:read-file-string path)))))
+
+(define-test own-line-banner-still-edits-in-region-mode
+  "The refusal narrows nothing else. A banner that begins its own line between
+two forms is still rewritten in region mode, and the forms either side of it
+come back byte for byte unchanged."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((source (format nil "(defun a () 1)~%~%; note about neither.~%~%~
+(defun b () 2)~%"))
+           (path (write-fixture-file root "own-line-region.lisp" source)))
+      (edit-comment (namestring root) (namestring path) "region" "replace"
+                    :substring "note about neither."
+                    :content (format nil "; note that now says more.~%"))
+      (is string= (format nil "(defun a () 1)~%~%; note that now says more.~%~%~
 (defun b () 2)~%")
           (uiop:read-file-string path)))))
 
