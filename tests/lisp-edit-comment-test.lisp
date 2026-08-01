@@ -14,10 +14,17 @@
 ;;;; anchoring will not see it at all.  Both spellings are pinned so
 ;;;; neither has to be rediscovered.
 ;;;;
-;;;; Two guarantees in the editing tests are easy to lose.  Every form
+;;;; Three guarantees in the editing tests are easy to lose.  Everything
 ;;;; around an edited comment must come back byte for byte, and the only
-;;;; check that sees a replacement swallowing a form is the comparison of
-;;;; the re-parsed forms; the delimiter scan passes that case.  And a
+;;;; check that sees a replacement swallowing it is the comparison of the
+;;;; re-parsed file; the delimiter scan passes that case.  That comparison
+;;;; is written in terms of every node that is not comment text rather than
+;;;; in terms of expressions, so the swallow test puts reader-conditional
+;;;; definitions in the span being absorbed: they are the case an
+;;;; expression-shaped check cannot see, and the file that loses one still
+;;;; loads on the machine that made the edit.  Replacement text that leaves
+;;;; a delimiter open is refused ahead of all that, and the pair of tests
+;;;; either side of that guard is what says where its boundary sits.  And a
 ;;;; comment written after code on the same line is refused rather than
 ;;;; edited, because nothing later could catch that: naming the form below
 ;;;; it and naming a substring of it both reach the same run, so both are
@@ -699,33 +706,102 @@ replacement now ends on."
 
 (define-test form-absorbing-content-is-refused-before-the-write
   "Replacement text that opens a block comment closed by a delimiter already
-sitting further down the file turns a whole form into comment text. The
-delimiter scan and the reader both pass on the result, which is why comparing
-the forms of the re-parsed file against the originals is the check that has to
-run: it is the only one that sees a form has gone. It runs before the write,
-so the file is left alone."
+sitting further down the file turns whatever it spans into comment text. The
+swallowed span here holds reader-conditional definitions, and that is the case
+that matters: the reader skips a #+ccl form on an implementation that is not
+CCL, so it never arrives as an expression, and the file that lost the function
+still loads cleanly on the machine that made the edit. Nobody finds out until
+the file is loaded somewhere else.
+
+The delimiter scan and the reader both pass on the spliced file, and the count
+of expressions in it does not move, so neither of those can see the loss.
+Comparing every node that is not comment text does see it, which is why the
+comparison is written that way rather than in terms of expressions. It runs
+before the write, so the file is left alone."
   (with-temp-project-root (session root)
     (true session)
-    (let* ((source (format nil "(defun before () 1)~%~%;;; Banner to rewrite.~%~%~
-(defun after () 2)~%;; tail |#~%(defun last-one () 3)~%"))
+    (let* ((banner (format nil ";;; Banner to rewrite.~%"))
+           (source (format nil "(defun before () 1)~%~%~A~%~
+#+ccl  (defun ccl-only  () (ccl-frob))~%~
+#+abcl (defun abcl-only () (abcl-frob))~%~%~
+;; tail |#~%(defun after () 3)~%" banner))
            (absorbing "#| swallow")
-           (spliced (format nil "(defun before () 1)~%~%~A~%(defun after () 2)~%~
-;; tail |#~%(defun last-one () 3)~%" absorbing))
+           (start (search banner source))
+           (end (+ start (length banner)))
+           (spliced (concatenate 'string (subseq source 0 start) absorbing
+                                 (subseq source end)))
            (path (write-fixture-file root "absorbing.lisp" source)))
       ;; The cheaper guards see nothing wrong with the spliced file: it is
-      ;; balanced and it reads without error, and yet it holds one form fewer.
+      ;; balanced and it reads without error.
       (true (getf (scan-parens spliced) :ok))
       (is eq nil (try-reader-check spliced))
-      (is = 3 (count :expr (parse-top-level-forms source) :key #'cst-node-kind))
+      ;; Counting expressions sees nothing either, because a conditional
+      ;; definition is not one. Counting everything that is not comment text
+      ;; sees two definitions go. Narrow the comparison back to expressions and
+      ;; these two lines say the file was unharmed.
+      (is = 2 (count :expr (parse-top-level-forms source) :key #'cst-node-kind))
       (is = 2 (count :expr (parse-top-level-forms spliced) :key #'cst-node-kind))
+      (is = 4 (count-if-not
+               (lambda (n) (dsmr-mcp/src/lisp-edit-comment-core::%comment-node-p n))
+               (parse-top-level-forms source)))
+      (is = 2 (count-if-not
+               (lambda (n) (dsmr-mcp/src/lisp-edit-comment-core::%comment-node-p n))
+               (parse-top-level-forms spliced)))
+      ;; The comparison itself, on exactly the splice the verb would perform.
+      (let ((err (error-from
+                  (lambda ()
+                    (dsmr-mcp/src/lisp-edit-comment::%verify-forms-survived
+                     source (parse-top-level-forms source) spliced nil
+                     start end absorbing)))))
+        (true (typep err 'comment-operation-error)))
+      ;; And through the verb, where the content guard reaches the same
+      ;; conclusion sooner. Either way nothing is written and both conditional
+      ;; definitions are still there to be found by name.
       (let ((err (error-from (lambda ()
                                (edit-comment (namestring root) (namestring path)
                                              "region" "replace"
                                              :substring "Banner to rewrite."
-                                             :content absorbing)))))
+                                             :content absorbing))))
+            (on-disk (uiop:read-file-string path)))
         (true (typep err 'comment-operation-error))
-        (true (search "forms" (comment-operation-reason err)))
-        (is string= source (uiop:read-file-string path))))))
+        (is string= source on-disk)
+        (true (search "ccl-only" on-disk))
+        (true (search "abcl-only" on-disk))))))
+
+(define-test replacement-that-leaves-a-block-comment-open-is-refused
+  "A replacement is refused outright when it opens a delimiter it never closes.
+Whatever eventually closes it is code already sitting below the comment, so
+such text can only re-type that code. The check needs nothing but the caller's
+own string, so it runs before the file is even read."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((path (write-fixture-file root "open.lisp" +banner-between-forms+))
+           (err (error-from (lambda ()
+                              (edit-comment (namestring root) (namestring path)
+                                            "region" "replace"
+                                            :substring "Descriptor passing."
+                                            :content "#| swallow")))))
+      (true (typep err 'comment-operation-error))
+      (true (search "self-contained" (comment-operation-reason err)))
+      (is string= +banner-between-forms+ (uiop:read-file-string path)))))
+
+(define-test unbalanced-delimiter-inside-comment-prose-is-still-accepted
+  "Prose is allowed to be lopsided. A comment saying call (foo with one paren
+leaves a delimiter unclosed only in the sense that the character is on the
+line; the reader never sees it, so refusing such text would make the verb
+useless for exactly the comments people write about code. The boundary the
+guard has to respect is that this lands and the unclosed block comment above
+does not."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((path (write-fixture-file root "prose.lisp" +banner-between-forms+))
+           (replacement (format nil ";;; call (foo with one paren~%")))
+      (edit-comment (namestring root) (namestring path) "region" "replace"
+                    :substring "Descriptor passing." :content replacement)
+      (let ((on-disk (uiop:read-file-string path)))
+        (true (search "call (foo with one paren" on-disk))
+        (true (search "(defun before () 1)" on-disk))
+        (is eq nil (search "Descriptor passing." on-disk))))))
 
 (define-test no-project-root-refuses-a-comment-edit
   "With no project root set the verb answers with a typed error instead of
