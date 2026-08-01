@@ -167,6 +167,14 @@ and closes here. |#~%~
 Nothing else in the suite has carriage returns in it, and the splice used to
 put a bare newline into exactly this file.")
 
+(defparameter +datum-comment-hides-the-banner+
+  (format nil "(defun a () 1)~%~%;; Banner text.~%~%~
+#;(defun skipped () 2)~%~%(defun b () 2)~%")
+  "A file whose banner is genuinely unreachable, and the one shape the
+datum-comment explanation describes. The parse stops at the datum comment, so
+the banner above it never reaches the node list either and a substring naming it
+finds nothing at all.")
+
 (defparameter +header-detached+
   (format nil ";;;; SPDX-License-Identifier: AGPL-3.0-or-later~%~
 ;;;; File header prose.~%~%~
@@ -385,7 +393,12 @@ region at all; naming the IN-PACKAGE form is what reaches the header."
 
 (define-test ambiguous-substring-fails-loud
   "A substring matching more than one region signals and lists the candidates,
-so the caller can pick rather than have one chosen silently."
+so the caller can pick rather than have one chosen silently.
+
+The candidates are listed by line range and opening line. They used to be
+numbered, which advertised a selector this verb does not have: there is no index
+argument here, so a caller reading a number off the list had nothing to put it
+in. The line range is what the verb does accept."
   (let* ((source (format nil "(defun before () 1)~%~%~
 ;; Shared wording here.~%~%~
 ;; Shared wording there.~%~%~
@@ -396,8 +409,10 @@ so the caller can pick rather than have one chosen silently."
     (is = 2 (length regions))
     (true err)
     (let ((report (princ-to-string err)))
-      (true (search "[0]" report))
-      (true (search "[1]" report))
+      (true (search "lines 3-3:" report))
+      (true (search "lines 5-5:" report))
+      (false (search "[0]" report))
+      (false (search "[1]" report))
       (true (search "Shared wording here." report))
       (true (search "Shared wording there." report)))))
 
@@ -1024,6 +1039,86 @@ from an unexpected failure, and the file is left as it was."
       (true (gethash "isError" res))
       (is string= "comment-operation-error" (gethash "error_type" res))
       (is string= +banner-between-forms+ (uiop:read-file-string path)))))
+
+(define-test datum-comment-note-appears-only-where-it-applies
+  "The explanation about datum comments used to be appended to every region-mode
+refusal, including on files with no datum comment anywhere in them. An
+explanation attached to every failure carries no information: a reader cannot
+tell the occasional case where it names the true cause from the many where it
+was printed regardless, so the one time it would have helped it reads as the
+noise it has been every other time.
+
+Both directions are pinned, because either one alone is satisfied by a constant.
+On a file with no datum comment neither an absent substring nor an ambiguous one
+mentions them. On a file with one the note is there, and it is the true cause:
+the parse stops at the datum comment, so the banner above it is not in the node
+list and the substring finds nothing."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((clean (format nil "(defun before () 1)~%~%;; Alpha banner.~%~%~
+;; Beta banner.~%~%(defun after () 2)~%"))
+           (clean-path (write-fixture-file root "clean.lisp" clean))
+           (absent (error-from
+                    (lambda ()
+                      (edit-comment (namestring root) (namestring clean-path)
+                                    "region" "replace"
+                                    :substring "nowhere in this file"
+                                    :content ";; never written"))))
+           (ambiguous (error-from
+                       (lambda ()
+                         (edit-comment (namestring root) (namestring clean-path)
+                                       "region" "replace"
+                                       :substring "banner."
+                                       :content ";; never written")))))
+      (true (typep absent 'comment-operation-error))
+      (false (search "#;" (comment-operation-reason absent)))
+      (false (search "datum" (comment-operation-reason absent)))
+      (true (typep ambiguous 'comment-operation-error))
+      (false (search "#;" (comment-operation-reason ambiguous)))
+      (is string= clean (uiop:read-file-string clean-path)))
+    (let* ((path (write-fixture-file root "datum.lisp"
+                                     +datum-comment-hides-the-banner+))
+           (err (error-from
+                 (lambda ()
+                   (edit-comment (namestring root) (namestring path)
+                                 "region" "replace"
+                                 :substring "Banner text."
+                                 :content ";; never written")))))
+      (true (typep err 'comment-operation-error))
+      (true (search "#; datum comment" (comment-operation-reason err)))
+      (is string= +datum-comment-hides-the-banner+ (uiop:read-file-string path)))))
+
+(define-test internal-failure-reaches-the-unexpected-error-channel
+  "An anchor failure and a fault in the verb are different news, and a caller
+acts on them differently: a bad anchor is retried with a better one, a fault is
+reported. Both used to arrive as the anchor-failure type, because the resolvers
+retyped every condition raised anywhere beneath them, so an agent reading the
+result retried an anchor that was already right while the defect went
+unreported.
+
+A value of the wrong type for the line range is the case the review drove. Over
+the wire the schema catches this one at dispatch; what matters is where a fault
+lands once it is past the schema, so the call goes straight to the verb. Only
+the locator's own condition is retyped now, so this reaches the unexpected
+channel, and it carries no anchor advice, because none of that advice applies."
+  (with-temp-project-root (session root)
+    (let* ((source (format nil "(defun before () 1)~%~%;; Alpha banner.~%~%~
+;; Beta banner.~%~%(defun after () 2)~%"))
+           (path (write-fixture-file root "typed.lisp" source))
+           (tool (get-tool-instance session "lisp-edit-comment"))
+           (args (make-args "file_path" (namestring path)
+                            "mode" "region"
+                            "operation" "replace"
+                            "substring" "Alpha"
+                            "line_start" "5"
+                            "content" (format nil ";; never written~%")))
+           (res (gethash "result" (tool-handle tool 1 args))))
+      (true (gethash "isError" res))
+      (is string= "edit-comment-error" (gethash "error_type" res))
+      (let ((text (gethash "text" (elt (gethash "content" res) 0))))
+        (false (search "#; datum comment" text))
+        (false (search "Regions available" text)))
+      (is string= source (uiop:read-file-string path)))))
 
 (define-test verb-offers-no-insert-operation
   "Replace and delete are the whole operation set. Placing a brand new comment

@@ -40,7 +40,9 @@
                 #:allowed-read-path)
   (:import-from #:dsmr-mcp/src/fs
                 #:read-file-string)
-  (:export #:%comment-regions
+  (:export #:comment-locator-error
+           #:comment-locator-reason
+           #:%comment-regions
            #:%comment-runs
            #:%comment-node-p
            #:%leading-comment-run
@@ -54,6 +56,34 @@
            #:%true-end-line))
 
 (in-package #:dsmr-mcp/src/lisp-edit-comment-core)
+
+;;;; -------------------------------------------------------------------------
+;;;; The failures this locator raises on purpose
+;;;; -------------------------------------------------------------------------
+
+(define-condition comment-locator-error (error)
+  ((reason
+    :initarg :reason
+    :reader comment-locator-reason
+    :documentation "Human-readable description of why the anchor did not resolve."))
+  (:report (lambda (c s) (write-string (comment-locator-reason c) s)))
+  (:documentation "Signalled for the failures this locator raises deliberately:
+a path outside the read allow-list, and a substring or line range that names no
+comment region or more than one.
+
+Having a condition of its own is what lets a caller catch the locator saying no
+without also catching a bug.  Wrapping every error the locator's dynamic extent
+can produce reports a type error or an arithmetic fault as though the anchor
+were wrong, which sends the caller to retype an anchor that was fine while the
+defect goes unreported."))
+
+(defun %locator-error (format-control &rest arguments)
+  "Signal COMMENT-LOCATOR-ERROR with a message built from FORMAT-CONTROL.
+
+Every deliberate refusal in this file goes through here, so none of them can be
+raised as a bare error that a caller cannot tell apart from a fault."
+  (error 'comment-locator-error
+         :reason (apply #'format nil format-control arguments)))
 
 ;;;; -------------------------------------------------------------------------
 ;;;; Comment node recognition
@@ -235,18 +265,21 @@ a free-standing banner instead."
     (string-trim '(#\Space #\Tab #\Return)
                  (subseq text 0 (or break (length text))))))
 
-(defun %describe-region-candidate (region index)
+(defun %describe-region-candidate (region)
   "Return a one-line description of REGION for an error report.
-INDEX is the region's position among the candidates being listed."
+
+The candidates are described by where they sit rather than numbered.  A number
+advertises a selector this verb does not have: there is no index argument here,
+unlike the form editor, so a caller who read one off the list would have nothing
+to put it in.  The line range and the opening line are what a caller can act on,
+either by narrowing the substring or by stating the range."
   (multiple-value-bind (start-line end-line) (%region-line-range region)
-    (format nil "[~D] lines ~D-~D: ~A"
-            index start-line end-line (%region-summary-line region))))
+    (format nil "lines ~D-~D: ~A"
+            start-line end-line (%region-summary-line region))))
 
 (defun %describe-region-candidates (regions)
-  "Return a list of one-line descriptions for REGIONS, numbered from zero."
-  (loop for region in regions
-        for index from 0
-        collect (%describe-region-candidate region index)))
+  "Return a list of one-line descriptions for REGIONS, in source order."
+  (mapcar #'%describe-region-candidate regions))
 
 (defun %region-overlaps-lines-p (region line-start line-end)
   "Return T when REGION covers any line in the inclusive range LINE-START to
@@ -272,14 +305,15 @@ not name, and nothing in the result would say so.  The refusal names the range
 given and the lines the match actually sits on, which is enough to see which of
 the two is out of date.
 
-Signals an error listing every candidate when SUBSTRING matches no region or
-still matches more than one, so an anchor that does not name exactly one region
-can never resolve to a target."
+Signals COMMENT-LOCATOR-ERROR listing every candidate when SUBSTRING matches no
+region or still matches more than one, so an anchor that does not name exactly
+one region can never resolve to a target.  The candidates are listed by line
+range rather than numbered, because there is no index argument to answer with."
   (let ((hits (remove-if-not (lambda (region) (search substring (%region-text region)))
                              regions)))
     (when (null hits)
-      (error "No comment region contains ~S. Regions available:~%~{  ~A~%~}"
-             substring (%describe-region-candidates regions)))
+      (%locator-error "No comment region contains ~S. Regions available:~%~{  ~A~%~}"
+                      substring (%describe-region-candidates regions)))
     (let ((candidates (if line-start
                           (remove-if-not
                            (lambda (region)
@@ -290,22 +324,22 @@ can never resolve to a target."
       (cond
         ((and (null candidates) (null (rest hits)))
          (multiple-value-bind (match-start match-end) (%region-line-range (first hits))
-           (error "~S names one comment region and it is on lines ~D to ~D, but ~
-the range asked for is lines ~D to ~D. Those two disagree, so nothing was ~
-edited: one of them is out of date."
-                  substring match-start match-end line-start high)))
+           (%locator-error "~S names one comment region and it is on lines ~D to ~
+~D, but the range asked for is lines ~D to ~D. Those two disagree, so nothing ~
+was edited: one of them is out of date."
+                           substring match-start match-end line-start high)))
         ((null candidates)
-         (error "~S matches ~D comment regions and none of them lies within ~
-lines ~D to ~D:~%~{  ~A~%~}"
-                substring (length hits) line-start high
-                (%describe-region-candidates hits)))
+         (%locator-error "~S matches ~D comment regions and none of them lies ~
+within lines ~D to ~D:~%~{  ~A~%~}"
+                         substring (length hits) line-start high
+                         (%describe-region-candidates hits)))
         ((null (rest candidates))
          (first candidates))
         (t
-         (error "~S matches ~D comment regions. Narrow it with a longer ~
+         (%locator-error "~S matches ~D comment regions. Narrow it with a longer ~
 substring or a line range:~%~{  ~A~%~}"
-                substring (length candidates)
-                (%describe-region-candidates candidates)))))))
+                         substring (length candidates)
+                         (%describe-region-candidates candidates)))))))
 
 ;;;; -------------------------------------------------------------------------
 ;;;; Prologue
@@ -328,8 +362,8 @@ Returns five values:
   (multiple-value-bind (abs rel) (%normalize-paths file-path session-root)
     (let ((pn (allowed-read-path (namestring abs) session-root)))
       (unless pn
-        (error "~A is outside the read allow-list (root: ~A)"
-               file-path session-root))
+        (%locator-error "~A is outside the read allow-list (root: ~A)"
+                        file-path session-root))
       (let* ((original (read-file-string pn))
              (nodes (parse-top-level-forms original
                                            :readtable readtable
