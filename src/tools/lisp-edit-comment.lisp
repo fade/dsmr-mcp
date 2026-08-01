@@ -42,8 +42,9 @@
     :initform "Structure-aware edit of a comment in a Lisp source file. \
 Replaces or deletes a comment the form editors cannot reach: a free-standing \
 banner between top-level forms, or the comment sitting flush on top of a named \
-form. Region mode names the comment by a unique substring of it, narrowed by \
-line_start and line_end when that substring matches more than one. Leading mode \
+form. Region mode names the comment by a unique substring of it; line_start and \
+line_end constrain which comment is meant, and a match outside them is refused \
+rather than edited. Leading mode \
 names the form the comment sits on, through form_type and form_name; a blank \
 line between a comment and the form makes that comment free-standing, so name it \
 by substring instead. Every surrounding form is proven byte for byte identical \
@@ -65,20 +66,27 @@ comment named by substring, or \"leading\" for the comment flush on top of a for
                   :enum ("region" "leading"))
                  (operation
                   :type :string
-                  :description "Operation: replace or delete."
+                  :description "Operation: replace or delete. Delete also removes \
+the whitespace run following the comment, so the forms either side end up \
+separated by a single blank line. A comment that ends the file has nothing after \
+it to remove, so the blank line above it stays."
                   :enum ("replace" "delete"))
                  (substring
                   :type :string
                   :description "Region mode: a substring of the comment to edit. Must \
-match exactly one free-standing comment unless line_start and line_end narrow it.")
+match exactly one free-standing comment, or exactly one lying within line_start \
+and line_end when those are given.")
                  (line_start
                   :type :integer
                   :description "Region mode: first source line of the wanted comment, \
-1-based. Only needed when substring alone matches more than one comment.")
+1-based. This constrains which comment is meant, rather than settling a tie: a \
+comment matching substring but lying outside the range is refused, naming both the \
+range given and the lines the match sits on.")
                  (line_end
                   :type :integer
                   :description "Region mode: last source line of the wanted comment, \
-1-based. Only needed when substring alone matches more than one comment.")
+1-based. Defaults to line_start when omitted. It constrains the target the same \
+way line_start does.")
                  (form_type
                   :type :string
                   :description "Leading mode: form type the comment sits on, \
@@ -91,7 +99,12 @@ automatically.")
                  (content
                   :type :string
                   :description "Replacement comment text, including its own comment \
-characters. Required for replace; ignored for delete.")
+characters. Required for replace; ignored for delete. It replaces the comment \
+run's own bytes, and those bytes end after the newline closing the comment's last \
+line: when the text does not end in a newline, one is supplied, so the blank line \
+below the comment survives and the comment can still be found by substring \
+afterwards. Line endings are converted to the ones the file already uses. The \
+empty string is spliced exactly as given.")
                  (dry_run
                   :type :boolean
                   :description "When true, return a preview without writing to disk.")
