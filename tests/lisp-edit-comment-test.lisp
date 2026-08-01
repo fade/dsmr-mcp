@@ -175,6 +175,17 @@ datum-comment explanation describes. The parse stops at the datum comment, so
 the banner above it never reaches the node list either and a substring naming it
 finds nothing at all.")
 
+(defparameter +definitions-below-a-datum-comment+
+  (format nil "(defun a () 1)~%~%;; Banner.~%~%(defun b () 2)~%~%~
+#;(defun c () 1)~%~%(defun d () 2)~%")
+  "A file whose banner is reachable and whose last two definitions are not.
+
+A completed form sits between the banner and the datum comment, so the banner
+survives into the node list where +DATUM-COMMENT-HIDES-THE-BANNER+'s does not
+and the edit goes through.  What the parse never reaches is two whole
+definitions, and an edit to the banner has to account for them rather than
+counting them as checked.")
+
 (defparameter +damage-below-the-banner+
   (format nil "(defun a () 1)~%~%;;; Banner to rewrite.~%~%(defun b () 2)~%~%~
 (defun c () #<unreadable>)~%")
@@ -1288,3 +1299,124 @@ an insert here is refused as an argument error and nothing is written."
       (true (gethash "isError" res))
       (is string= "invalid-argument" (gethash "error_type" res))
       (is string= +banner-between-forms+ (uiop:read-file-string path)))))
+
+(define-test parse-reports-how-much-of-the-file-it-covered
+  "The parser stops at the first input it cannot get past and returns what it
+read up to there.  Nothing in the return value used to say which of the two had
+happened, so a caller could not tell a file it had parsed whole from a file it
+had parsed the top of, and every conclusion drawn from the node list quietly
+extended over text nothing had looked at.
+
+The second value answers that: NIL for a parse that reached the end, and
+otherwise the offset past which the nodes describe nothing.
+
+The offset is asserted against the text it points at rather than against a
+literal, because the number on its own proves nothing.  What matters is that
+the two definitions below it really are outside the covered span."
+  ;; A parse that reached the end of the file says so.
+  (multiple-value-bind (nodes unparsed) (parse-top-level-forms +banner-between-forms+)
+    (true nodes)
+    (is eq nil unparsed))
+  ;; Trailing whitespace is not an unreached tail. Every file ends in some and
+  ;; none of it hides anything, so a file that merely ends still reports NIL.
+  (multiple-value-bind (nodes unparsed)
+      (parse-top-level-forms (format nil "(defun a () 1)~%~%~%   ~%"))
+    (is = 1 (length nodes))
+    (is eq nil unparsed))
+  ;; A datum comment ends the parse, and the offset marks where coverage stops.
+  (multiple-value-bind (nodes unparsed)
+      (parse-top-level-forms +definitions-below-a-datum-comment+)
+    (is = 3 (length nodes))
+    (true unparsed)
+    ;; Everything the nodes cover lies above the offset.
+    (true (every (lambda (node) (<= (cst-node-end node) unparsed)) nodes))
+    ;; And what lies below it is the two definitions the parse never reached.
+    (let ((uncovered (subseq +definitions-below-a-datum-comment+ unparsed)))
+      (true (search "(defun c () 1)" uncovered))
+      (true (search "(defun d () 2)" uncovered))))
+  ;; A datum comment before anything else leaves nothing covered at all, which
+  ;; is zero rather than NIL: NIL is reserved for having read the whole file.
+  (multiple-value-bind (nodes unparsed)
+      (parse-top-level-forms (format nil "#;(defun x () 1)~%(defun y () 2)~%"))
+    (is eq nil nodes)
+    (is = 0 unparsed)))
+
+(define-test truncated-parse-gets-no-whole-file-guarantee
+  "A file the reader cannot get through is editable, and the report says how
+much of it the comparison covered.
+
+Refusing such a file is what it used to be locked out by, and that refusal
+blamed the edit for damage already present.  Admitting it was right.  What came
+in with it was a success message claiming every form in the file had been
+compared and come back unchanged, on a file where two whole definitions were in
+neither the before list nor the after list.
+
+The precondition is asserted rather than assumed: the parse really does stop
+above the last two definitions, so the claim really would have been false.  The
+whole thing is driven through the verb, because the sentence is what an agent
+reads and acts on."
+  (with-temp-project-root (session root)
+    ;; The definitions the comparison cannot see are genuinely absent from the
+    ;; parse. Without this the test would pass for a file that has nothing
+    ;; below the stopping point, which is the case that never needed fixing.
+    (let ((nodes (parse-top-level-forms +definitions-below-a-datum-comment+)))
+      (is = 3 (length nodes))
+      (false (find-if (lambda (node)
+                        (and (eq (cst-node-kind node) :expr)
+                             (search "defun c" (node-text
+                                                +definitions-below-a-datum-comment+
+                                                node))))
+                      nodes)))
+    (let* ((path (write-fixture-file root "truncating.lisp"
+                                     +definitions-below-a-datum-comment+))
+           (tool (get-tool-instance session "lisp-edit-comment"))
+           (args (make-args "file_path" (namestring path)
+                            "mode" "region"
+                            "operation" "replace"
+                            "substring" "Banner."
+                            "content" (format nil ";; Rewritten.~%")))
+           (res (gethash "result" (tool-handle tool 1 args))))
+      (is eq nil (gethash "isError" res))
+      (true (gethash "would_change" res))
+      (let ((report (gethash "changed_region" res)))
+        ;; The comparison ran and passed, over the part of the file it could
+        ;; see. Line 5 is where (defun b () 2) ends and the coverage with it.
+        (true (gethash "forms_verified_unchanged" report))
+        (is = 5 (gethash "forms_verified_through" report)))
+      (let ((summary (gethash "text" (elt (gethash "content" res) 0))))
+        ;; The claim that was false for this file.
+        (false (search "Every form in the file was compared" summary))
+        ;; And what is said instead: the bound, and that nothing below it was
+        ;; looked at.
+        (true (search "Every form through line 5 was compared" summary))
+        (true (search "nothing below line 5 was compared" summary)))
+      ;; The edit landed and the text the comparison never covered came through
+      ;; untouched, which is why admitting the file is safe enough to do.
+      (let ((written (uiop:read-file-string path)))
+        (true (search ";; Rewritten." written))
+        (false (search ";; Banner." written))
+        (true (search "#;(defun c () 1)" written))
+        (true (search "(defun d () 2)" written))))))
+
+(define-test whole-file-guarantee-survives-on-a-file-that-parses
+  "The converse, and the reason the qualification is a qualification rather
+than a retreat.  A file the reader gets through is covered end to end, so the
+report carries no bound and the message says what it always said.  Without this
+the fix could have been to stop making the claim at all, which would cost a
+caller the one case where it is true."
+  (with-temp-project-root (session root)
+    (let* ((path (write-fixture-file root "banner.lisp" +banner-between-forms+))
+           (tool (get-tool-instance session "lisp-edit-comment"))
+           (args (make-args "file_path" (namestring path)
+                            "mode" "region"
+                            "operation" "replace"
+                            "substring" "Descriptor passing."
+                            "content" (format nil ";;; Rewritten banner.~%")))
+           (res (gethash "result" (tool-handle tool 1 args))))
+      (is eq nil (gethash "isError" res))
+      (let ((report (gethash "changed_region" res)))
+        (true (gethash "forms_verified_unchanged" report))
+        (is eq nil (gethash "forms_verified_through" report)))
+      (let ((summary (gethash "text" (elt (gethash "content" res) 0))))
+        (true (search "Every form in the file was compared" summary))
+        (false (search "nothing is claimed about it" summary))))))
