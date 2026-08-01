@@ -153,7 +153,14 @@ nothing.
 The truncated case is the one worth the care.  It used to print the whole-file
 sentence, which was not merely imprecise: a caller reading it had been told in
 as many words that definitions the check never looked at had come back
-unchanged."
+unchanged.
+
+It then printed a bound that was right about how far the comparison reached and
+wrong about which file's lines it was counting, which put the same falsehood
+back on a shrinking edit.  The sentence now says which file it is counting in,
+once, and both mentions of the number in it are covered by that.  A number with
+no file named against it cannot be checked by the person reading it, and that
+is what let the second version through review."
   (let ((verified (gethash "forms_verified_unchanged" report))
         (through  (gethash "forms_verified_through" report)))
     (cond
@@ -163,8 +170,9 @@ unchanged."
        "Every form in the file was compared against the original and came back unchanged.")
       ((and (integerp through) (plusp through))
        (format nil "Every form through line ~D was compared against the original ~
-and came back unchanged. The file does not parse past there, so nothing below ~
-line ~D was compared and nothing is claimed about it."
+and came back unchanged, counting lines in the file as this edit leaves it. The ~
+file does not parse past there, so nothing below line ~D was compared and ~
+nothing is claimed about it."
                through through))
       (t
        (format nil "The file does not parse at all, so no form in it could be ~
@@ -177,6 +185,18 @@ The line about verification states what was actually checked rather than a fixed
 claim: which forms were compared, and how much of the file that reached.  It is
 built by %VERIFICATION-LINE, where the cases are set out.
 
+The numbers come off both sides of the edit and the words say so.  The range is
+where the comment was before the edit; the line after it is where the new text
+ends now.  On an edit that shortens the file the second number is the smaller,
+which is only readable if the two are labelled, and the labels are the whole
+reason those four words are there.  No single sentence could name one numbering
+for the summary, because the summary honestly reports both.
+
+The same wording has to hold on a dry run, where nothing has been written.  It
+does: the range describes the file on disk, which that path leaves alone, and
+the rest describes the preview.  Any phrasing built around the file the verb had
+just written would have been false on that path.
+
 It makes no claim about the whitespace around the comment.  A delete removes the
 whitespace run following the comment by design, so a message promising the
 surroundings were left alone would be false every time a delete succeeded.
@@ -185,7 +205,7 @@ A file that was already failing to balance or to read says so on its own line,
 because the whole-file checks were skipped for it rather than charged to this
 edit, and a caller reading a plain success would otherwise take the file for
 sound."
-  (format nil "Lines ~A to ~A~@[, now ending on line ~A~].~%~A~@[~%~A~]~%~%\
+  (format nil "Lines ~A to ~A before the edit~@[, now ending on line ~A~].~%~A~@[~%~A~]~%~%\
 --- before ---~%~A~@[~%--- after ---~%~A~]"
           (gethash "line_start" report)
           (gethash "line_end" report)
@@ -301,7 +321,11 @@ Call fs-set-project-root first.")))))
                                       ;; A character count, which is what the
                                       ;; string holds. The file on disk is
                                       ;; longer whenever it carries anything
-                                      ;; outside ASCII.
+                                      ;; outside ASCII. It counts the file as
+                                      ;; the edit leaves it. Unlike the line
+                                      ;; numbers in the report it is a size and
+                                      ;; not a position, so there is no second
+                                      ;; numbering it could have been stated in.
                                       "characters"     (length updated)
                                       "changed_region" report
                                       "content"        (text-content summary))))))

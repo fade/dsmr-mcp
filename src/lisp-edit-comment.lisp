@@ -624,6 +624,28 @@ It carries the comment's line range, the text the splice took out, the text put
 in its place, and the line that replacement now ends on, so a caller can show
 what moved without reading the file again.
 
+Every line number here belongs to one of two files, the one the edit read and
+the one it leaves behind, and the report deliberately carries both.  A reader
+cannot tell them apart from the numbers, so each field says which it is on:
+
+  LINE-START is the comment's first line, and it is the same number in both.
+  That is a coincidence and not a property to lean on: the edit is refused
+  unless it begins at the start of a line, so nothing above that line can move.
+  A change to what may be edited takes this with it.
+
+  LINE-END is the comment's last line in the file the edit read.  It has no
+  meaning in the file that comes out, where those lines are gone.
+
+  LINE-END-AFTER is where the inserted text ends in the file the edit leaves,
+  and NIL when nothing was inserted.
+
+  VERIFIED-THROUGH is in the file the edit leaves, described below.
+
+The pair LINE-END and LINE-END-AFTER therefore sit on opposite sides, and on an
+edit that shortens the file the second is the smaller of the two.  That reads
+like a contradiction and is not one.  Whatever renders this has to say which
+side it is quoting rather than printing two bare numbers next to each other.
+
 The text reported as removed is the whole span the splice covered rather than
 the comment's own bytes.  A delete additionally takes the whitespace run
 following the comment, and reporting the comment alone would understate what
