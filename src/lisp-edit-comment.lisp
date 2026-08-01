@@ -423,11 +423,73 @@ comparison therefore established nothing.
 The line comes from the nodes rather than from UNPARSED-FROM directly because
 the two answer different questions.  UNPARSED-FROM says where the coverage
 ends; the nodes say which line that offset falls on, and the report is written
-in lines because that is what a caller can look at in the file."
+in lines because that is what a caller can look at in the file.
+
+The nodes are the ones parsed before the edit, so the line is numbered in the
+file as it was.  That is not the file the caller has, and %LINE-AFTER-SPLICE
+translates the number before it is reported."
   (when unparsed-from
     (if nodes
         (reduce #'max nodes :key #'cst-node-end-line)
         0)))
+
+(defun %line-at-offset (text offset)
+  "Return the 1-based line OFFSET falls on in TEXT."
+  (1+ (count #\Newline text :end offset)))
+
+(defun %line-after-splice (line original updated removed-start removed-end)
+  "Translate LINE out of ORIGINAL's line numbering and into UPDATED's.
+
+The comparison runs over the nodes of the file as it was, so every line it can
+name is a line of ORIGINAL.  What the caller has is the file the splice just
+wrote.  On an edit that changes the line count the two numberings disagree by
+exactly that count, and a bound left in the old one names a line of a file
+nobody has any more: too far down when the edit shrank the file, which reads as
+coverage over definitions nothing ever compared, and too far up when it grew.
+
+NIL and zero pass through untouched.  Neither is a line number.  NIL says the
+parse reached the end of the file and zero says it produced nothing, and both
+say the same thing in either numbering.
+
+The shift is counted across ORIGINAL and UPDATED rather than across the text
+handed to the splice.  UPDATED is the string that gets written, so a difference
+taken between the two is the difference the caller will actually find in the
+file, and nothing the splice did with the content it was given can make the two
+disagree.
+
+A line can sit in three places relative to the edit, and only the second of
+these is routinely taken:
+
+  Before the edit begins.  Nothing there moved, so the line stands.
+
+  At or after the last line the removal touched.  The line moves by the shift.
+  A partly removed line belongs here: what survives of it follows the inserted
+  text, which is where the shift puts it.
+
+  Inside the removed span.  The line is gone and has no image at all, so what
+  comes back is the last line the edit left alone.  That understates the
+  coverage rather than overstating it, which is the direction to be wrong in.
+  Zero can come out of it when the edit starts on line 1, and zero is the right
+  answer there: a bound inside a run at the top of the file means no form was
+  compared, which is what zero already says.
+
+Neither the first nor the third can arise from the comparison bound as it
+stands.  The bound is the largest end line over the parsed nodes and the run
+being edited is one of them, so the edit never starts below the bound; and a
+run reaches the node list only once a form beneath it completes, so a run is
+never the last node and the bound is never inside one.  They are handled anyway, because a
+translation that holds only for the input it happens to be given is a trap laid
+for whoever calls it next."
+  (if (or (null line) (zerop line))
+      line
+      (let* ((edit-start-line (%line-at-offset original removed-start))
+             (removed-breaks (count #\Newline original
+                                    :start removed-start :end removed-end))
+             (last-touched-line (+ edit-start-line removed-breaks))
+             (shift (- (count #\Newline updated) (count #\Newline original))))
+        (cond ((< line edit-start-line) line)
+              ((>= line last-touched-line) (+ line shift))
+              (t (max 0 (1- edit-start-line)))))))
 
 (defun %datum-comment-note (original unparsed-from)
   "Return the datum-comment explanation when it applies to ORIGINAL, else NIL.
@@ -562,6 +624,28 @@ It carries the comment's line range, the text the splice took out, the text put
 in its place, and the line that replacement now ends on, so a caller can show
 what moved without reading the file again.
 
+Every line number here belongs to one of two files, the one the edit read and
+the one it leaves behind, and the report deliberately carries both.  A reader
+cannot tell them apart from the numbers, so each field says which it is on:
+
+  LINE-START is the comment's first line, and it is the same number in both.
+  That is a coincidence and not a property to lean on: the edit is refused
+  unless it begins at the start of a line, so nothing above that line can move.
+  A change to what may be edited takes this with it.
+
+  LINE-END is the comment's last line in the file the edit read.  It has no
+  meaning in the file that comes out, where those lines are gone.
+
+  LINE-END-AFTER is where the inserted text ends in the file the edit leaves,
+  and NIL when nothing was inserted.
+
+  VERIFIED-THROUGH is in the file the edit leaves, described below.
+
+The pair LINE-END and LINE-END-AFTER therefore sit on opposite sides, and on an
+edit that shortens the file the second is the smaller of the two.  That reads
+like a contradiction and is not one.  Whatever renders this has to say which
+side it is quoting rather than printing two bare numbers next to each other.
+
 The text reported as removed is the whole span the splice covered rather than
 the comment's own bytes.  A delete additionally takes the whitespace run
 following the comment, and reporting the comment alone would understate what
@@ -579,7 +663,9 @@ what keeps VERIFIED from being read as more than it is.  NIL says the parse ran
 to the end of the file, so every form in it was compared.  A line number says
 the reader could not get past that point, so the comparison saw the file down
 to that line and nothing at all below it.  Zero says the parse produced no
-nodes, so the comparison established nothing.  It is meaningful only when
+nodes, so the comparison established nothing.  The line is numbered in the file
+as the edit leaves it, which is the file the caller is holding, rather than in
+the file the comparison ran against.  It is meaningful only when
 VERIFIED is true; with no comparison there is no coverage to report.
 
 ALREADY-UNREADABLE says the file failed to balance or to read before the edit
@@ -659,7 +745,8 @@ The edit is still allowed: refusing would restore exactly the lockout described
 above, and the splice is string surgery that copies those bytes through
 untouched.  The report says how far the comparison reached, so what it proved
 and what it did not are both on the record instead of one being read as the
-other.
+other.  It says so in the line numbers of the file the edit leaves behind,
+since that is the file a caller can go and read.
 
 When DRY-RUN is true the change is previewed and nothing is written.  After a
 real write a textDocument/didChange notification is sent to the project's LSP
@@ -722,8 +809,14 @@ Returns:
             ;; passed over a prefix of the file and one that passed over the
             ;; whole of it are the same T, and the difference is the whole
             ;; content of the guarantee.
+            ;;
+            ;; Translated out of the original's line numbering on the way,
+            ;; because the file a caller can go and look at is the one the
+            ;; splice has just produced, and on an edit that changes the line
+            ;; count the two do not agree.
             (setf forms-verified-through
-                  (%comparison-through-line nodes unparsed-from))
+                  (%line-after-splice (%comparison-through-line nodes unparsed-from)
+                                      original updated removed-start removed-end))
             (setf already-unreadable (%verify-still-reads original updated)))
           (let ((report (%changed-region-report original removed-start removed-end
                                                 region-start-line region-end-line

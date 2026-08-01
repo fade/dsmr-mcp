@@ -117,6 +117,55 @@
           do (setf (gethash k ht) v))
     ht))
 
+(defun last-line-number (text)
+  "Return the number of the last line TEXT has.
+
+A file ending in a newline has no line after it, so the trailing break does not
+open one.  Getting that wrong would make an off-by-one bound look like a line
+the file still has."
+  (let ((breaks (count #\Newline text)))
+    (if (and (plusp (length text))
+             (char= (char text (1- (length text))) #\Newline))
+        breaks
+        (1+ breaks))))
+
+(defun line-holding (text substring)
+  "Return the 1-based line SUBSTRING begins on in TEXT, or NIL when absent."
+  (let ((at (search substring text)))
+    (and at (1+ (count #\Newline text :end at)))))
+
+(defun last-parsed-end-line (text)
+  "Return the last line any node of TEXT's parse occupies, NIL for no nodes.
+
+The same quantity the verb reports as its coverage bound, computed here against
+the file the verb has just written.  Asserting the bound against this rather
+than against a literal is the point: a literal goes on matching whenever the
+numbering breaks in some way that happens to land on it again."
+  (let ((nodes (parse-top-level-forms text)))
+    (and nodes (reduce #'max nodes :key #'cst-node-end-line))))
+
+(defun edit-and-read (session root name text substring operation &optional content)
+  "Drive the verb over TEXT written as NAME and return what came of it.
+
+Four values: the coverage bound the report carries, the file as it now stands
+on disk, the summary sentence an agent reads, and the whole changed-region
+report.  The file is read back rather than taken from the return value, since
+the whole question is what the bound says about the bytes a caller will find
+there."
+  (let* ((path (write-fixture-file root name text))
+         (tool (get-tool-instance session "lisp-edit-comment"))
+         (args (apply #'make-args
+                      "file_path" (namestring path)
+                      "mode" "region"
+                      "operation" operation
+                      "substring" substring
+                      (when content (list "content" content))))
+         (res (gethash "result" (tool-handle tool 1 args))))
+    (values (gethash "forms_verified_through" (gethash "changed_region" res))
+            (uiop:read-file-string path)
+            (gethash "text" (elt (gethash "content" res) 0))
+            (gethash "changed_region" res))))
+
 ;;;; -------------------------------------------------------------------------
 ;;;; Fixtures
 ;;;; -------------------------------------------------------------------------
@@ -206,6 +255,25 @@ has nothing to do with the token on the last line.")
 (in-package :fixture-package)~%~%~
 (defun body () 1)~%")
   "A file header sitting flush on top of the first form, the ordinary shape.")
+
+(defparameter +long-banner-above-a-datum-comment+
+  (format nil "(defun a () 1)~%~%~
+;; Banner line one.~%;; Banner line two.~%;; Banner line three.~%~
+;; Banner line four.~%;; Banner line five.~%;; Banner line six.~%~
+;; Banner line seven.~%;; Banner line eight.~%~%~
+(defun b () 2)~%~%#;(defun c () 1)~%~%(defun d () 2)~%")
+  "+DEFINITIONS-BELOW-A-DATUM-COMMENT+ with a banner long enough to move things.
+
+Eight banner lines rather than one, so an edit to the banner shifts everything
+under it by seven lines or more and the file's two numberings, before the edit
+and after it, come apart far enough to tell apart.  The one-line banner cannot
+do that: replacing it line for line leaves both numberings identical and a
+number stated in the wrong one still reads as correct.
+
+What sits below the datum comment is the same two definitions, and they are the
+reason the size matters.  Shrink the file by enough and a bound left in the old
+numbering points past them, so the sentence claims coverage over definitions
+the comparison never had in either list.")
 
 ;;;; -------------------------------------------------------------------------
 ;;;; Run collapsing
@@ -1420,3 +1488,194 @@ caller the one case where it is true."
       (let ((summary (gethash "text" (elt (gethash "content" res) 0))))
         (true (search "Every form in the file was compared" summary))
         (false (search "nothing is claimed about it" summary))))))
+
+(define-test shrinking-replace-states-its-bound-in-the-file-it-wrote
+  "The dangerous direction, and the one that shipped.
+
+The bound comes off the parse of the file as it was, and it used to be reported
+in that file's line numbers while the caller was looking at the file the verb
+had just written.  On an edit that shortens the file the stale number runs on
+past the end of the new one, and the exclusion clause that is supposed to fence
+off the uncompared part of the file then fences off nothing: the two
+definitions below the datum comment sit above the stated bound, inside the
+region the sentence says was compared and came back unchanged.
+
+Nothing is asserted against a literal.  The bound has to equal the last line
+the parse of the file on disk reaches, and the definitions that were never
+compared have to lie below it.  A number that is wrong in some other way fails
+those; a number that happens to match one of them does not pass both."
+  (with-temp-project-root (session root)
+    (multiple-value-bind (bound written summary)
+        (edit-and-read session root "shrinking.lisp"
+                       +long-banner-above-a-datum-comment+
+                       "Banner line one." "replace"
+                       (format nil ";; Rewritten.~%"))
+      ;; The edit really did shorten the file, or the case under test is absent.
+      (true (< (last-line-number written)
+               (last-line-number +long-banner-above-a-datum-comment+)))
+      (true (integerp bound))
+      ;; A line the file still has.
+      (true (<= bound (last-line-number written)))
+      ;; The last line the parse of that file reaches, which is what the
+      ;; sentence claims coverage through.
+      (is = (last-parsed-end-line written) bound)
+      ;; And the definitions nothing compared are below it, so the exclusion
+      ;; clause covers them. This is the assertion the shipped bound failed.
+      (true (< bound (line-holding written "#;(defun c () 1)")))
+      (true (< bound (line-holding written "(defun d () 2)")))
+      ;; The sentence an agent reads carries the same number.
+      (true (search (format nil "Every form through line ~D was compared" bound)
+                    summary)))))
+
+(define-test shrinking-delete-states-its-bound-in-the-file-it-wrote
+  "The same fault on the other operation, which is where it was first seen.
+
+A delete takes the comment run and the whitespace after it, so it shortens the
+file by more than a replace of the same run does, and the stale bound overshoots
+by correspondingly more.  It is pinned separately because the two operations
+reach the splice by different paths and a fix applied to one of them would leave
+the other exactly as it was."
+  (with-temp-project-root (session root)
+    (multiple-value-bind (bound written summary)
+        (edit-and-read session root "shrinking-delete.lisp"
+                       +long-banner-above-a-datum-comment+
+                       "Banner line one." "delete")
+      (false (search ";; Banner line one." written))
+      (true (< (last-line-number written)
+               (last-line-number +long-banner-above-a-datum-comment+)))
+      (true (integerp bound))
+      (true (<= bound (last-line-number written)))
+      (is = (last-parsed-end-line written) bound)
+      (true (< bound (line-holding written "#;(defun c () 1)")))
+      (true (< bound (line-holding written "(defun d () 2)")))
+      (true (search (format nil "Every form through line ~D was compared" bound)
+                    summary)))))
+
+(define-test growing-replace-states-its-bound-in-the-file-it-wrote
+  "The other direction, wrong but harmless, and pinned for that reason.
+
+An edit that lengthens the file leaves the stale bound short, so the excluded
+region comes out larger than it really is and nothing uncompared is falsely
+covered.  Safe is not correct: the number points at a line with no relation to
+where the coverage stops, in this shape at a line inside the comment the verb
+had just written.  A repair aimed only at the direction that hurts would leave
+this standing and leave the number meaning nothing in half the cases."
+  (with-temp-project-root (session root)
+    (multiple-value-bind (bound written summary)
+        (edit-and-read session root "growing.lisp"
+                       +definitions-below-a-datum-comment+
+                       "Banner." "replace"
+                       (format nil ";; Rewritten line one.~%~
+;; Rewritten line two.~%;; Rewritten line three.~%~
+;; Rewritten line four.~%;; Rewritten line five.~%~
+;; Rewritten line six.~%;; Rewritten line seven.~%~
+;; Rewritten line eight.~%"))
+      ;; The edit really did lengthen the file.
+      (true (> (last-line-number written)
+               (last-line-number +definitions-below-a-datum-comment+)))
+      (true (integerp bound))
+      (is = (last-parsed-end-line written) bound)
+      ;; The last form the comparison saw is inside the covered region rather
+      ;; than below the bound, which is what the short number got wrong.
+      (true (>= bound (line-holding written "(defun b () 2)")))
+      (true (< bound (line-holding written "(defun d () 2)")))
+      (true (search (format nil "Every form through line ~D was compared" bound)
+                    summary)))))
+
+(define-test bound-holds-where-the-line-count-does-not-move
+  "The control, and the reason the other three had to be written at all.
+
+An edit that leaves the line count alone is described identically in both
+numberings, so a bound stated in the wrong one is correct by coincidence.  Two
+live acceptance cases and a green suite sat on exactly that coincidence.  This
+pins the coincidence deliberately: the neutral case has to keep passing, so a
+translation that shifts a line it should not have touched is caught here rather
+than being taken for the fix working.
+
+The delete side of this arm has no bound to state.  A delete is neutral only
+when the run it removes carries no line break of its own, which means a run
+ending the file with no newline after it, and on a file the reader cannot get
+through such a run lies below the point the parse stopped and the verb cannot
+reach it.  What is driven instead is the case where the translation must be a
+no-op for a different reason: a delete on a file that parses whole reports no
+bound at all, and no arithmetic may invent one."
+  (with-temp-project-root (session root)
+    ;; Neutral replace on a truncated file: a bound is reported, and it is the
+    ;; same line in both numberings.
+    (multiple-value-bind (bound written summary)
+        (edit-and-read session root "neutral.lisp"
+                       +definitions-below-a-datum-comment+
+                       "Banner." "replace" (format nil ";; Rewritten.~%"))
+      (is = (last-line-number +definitions-below-a-datum-comment+)
+          (last-line-number written))
+      (true (integerp bound))
+      (is = (last-parsed-end-line written) bound)
+      (true (< bound (line-holding written "(defun d () 2)")))
+      (true (search (format nil "Every form through line ~D was compared" bound)
+                    summary)))
+    ;; Delete on a file that parses whole: no bound, and none conjured.
+    (multiple-value-bind (bound written summary)
+        (edit-and-read session root "whole.lisp" +banner-between-forms+
+                       "Descriptor passing." "delete")
+      (false (search ";;; Descriptor passing." written))
+      (is eq nil bound)
+      (true (search "Every form in the file was compared" summary)))))
+
+(define-test summary-says-which-file-each-number-is-counted-in
+  "Every number the summary prints says which side of the edit it is counted on.
+
+The report deliberately carries numbers from both files.  The comment's range is
+where it was before the edit, and the line the replacement now ends on is in the
+file the edit leaves.  Nothing in the numbers themselves distinguishes the two,
+and a reviewer with no way to tell cannot check either of them.  That is not a
+hypothetical: a bound printed in the wrong file's numbering shipped, went through
+two acceptance passes and a green suite, and was caught only by someone counting
+lines in the file by hand.
+
+On a shrinking edit the pre-edit end is the larger number and the post-edit end
+the smaller, so the pair reads as a contradiction until each is labelled.  This
+drives that exact shape.
+
+The numbers in the assertions come from the report rather than being written out
+here, so the sentence is pinned to the fields it claims to be rendering.  What
+they are checked against is the file on disk: the pre-edit end has to be a line
+that file no longer has, and the post-edit end a line it does.  Those two are
+also what hold the fields on the sides they are documented to be on, so a change
+that quietly moved either one fails here."
+  (with-temp-project-root (session root)
+    (multiple-value-bind (bound written summary report)
+        (edit-and-read session root "anchored.lisp"
+                       +long-banner-above-a-datum-comment+
+                       "Banner line one." "replace"
+                       (format nil ";; Rewritten.~%"))
+      (let ((start (gethash "line_start" report))
+            (end   (gethash "line_end" report))
+            (after (gethash "line_end_after" report)))
+        ;; The sentence renders the report's own numbers, labelled.
+        (true (search (format nil "Lines ~D to ~D before the edit" start end)
+                      summary))
+        (true (search (format nil "now ending on line ~D" after) summary))
+        ;; The shape that reads as a contradiction without the labels.
+        (true (> end after))
+        ;; The pre-edit end is a line the file no longer has, which is what
+        ;; makes labelling it necessary rather than merely tidy.
+        (true (> end (last-line-number written)))
+        ;; The post-edit end is a line the file does have.
+        (true (<= after (last-line-number written)))
+        ;; line_start is the same number on both sides. That is a coincidence
+        ;; of the edit having to begin at the start of a line, not a property
+        ;; to lean on, so it is pinned as the coincidence it is.
+        (is = start (line-holding written ";; Rewritten."))
+        ;; And the coverage bound names the numbering it is counted in.
+        ;;
+        ;; The bound is checked against the file before it is checked against
+        ;; the sentence. Tying the sentence to the report field on its own
+        ;; proves only that the two agree with each other, which they do just
+        ;; as readily when both are wrong: the first draft of this test held
+        ;; only that tie and stayed green with the original defect put back.
+        (true (<= bound (last-line-number written)))
+        (is = (last-parsed-end-line written) bound)
+        (true (search (format nil "Every form through line ~D was compared" bound)
+                      summary))
+        (true (search "counting lines in the file as this edit leaves it"
+                      summary))))))
