@@ -26,6 +26,13 @@
 ;;;; with no self-id is a legacy un-enveloped one and counts as foreign, so a
 ;;;; staggered rollout drops nothing.
 ;;;;
+;;;; The streaming line carries those decoded publishers rather than throwing
+;;;; them away. Deciding a record is foreign already establishes who wrote it,
+;;;; and a line that named only a seq left the woken agent to spend a turn and a
+;;;; bus fetch recovering it. The seq stays at the front of the line, because
+;;;; watchers armed across the fleet filter this stream on that prefix and are
+;;;; not restarted when this binary changes.
+;;;;
 ;;;; The BASELINE it arms at comes from that same identity's durable cursor: the
 ;;;; position the agent has actually consumed to. A message that landed while
 ;;;; the agent was between a drain and this arm is above that cursor, so the
@@ -59,6 +66,7 @@
            #:watch-until-foreign
            #:watch-stream
            #:poll-new
+           #:poll-new-records
            #:default-wal-path
            #:default-cursors-dir
            #:default-watch-dir))
@@ -94,7 +102,48 @@
 
 ;;; ---------------------------------------------------------------- signalling
 
-(defun %signal-seq (seq)
+(defun %field-token (name)
+  "NAME rendered safe to carry as one field on a signal line: whitespace, a
+   comma, an equals sign and any control character each become an underscore.
+
+   A bus name is an ordinary bare word and passes through untouched. A namespace
+   is a project root, though, and a path carrying a space would otherwise split
+   one name across two fields and make the line lie about who published. The
+   comma separates names within a field and the equals sign introduces one, so
+   neither can be allowed to occur inside a name either."
+  (map 'string
+       (lambda (ch)
+         (if (or (char<= ch #\Space) (char= ch #\,) (char= ch #\=))
+             #\_
+             ch))
+       name))
+
+(defun %signal-line (seq froms tos)
+  "The text of one wake: `bus:<SEQ>`, then `from=` naming every agent that
+   published a record in the batch, then `to=` when any of those records named a
+   recipient.
+
+   The seq comes first and the prefix is untouched. Watchers armed across the
+   fleet filter this stream through ^(bus|error): and read the number after the
+   colon, so anything added has to arrive AFTER the seq: a field in front of it,
+   or a different prefix, silently deafens every watcher already running.
+
+   FROMS is a list because one poll can turn up several records from several
+   publishers. Naming one of them would present a batch as though it were a
+   single message, which is precisely the misattribution the author field exists
+   to prevent, so all of them are named.
+
+   TOS is omitted entirely when nothing in the batch was addressed. An empty
+   `to=` would read as a recipient whose name failed to render, and a reader
+   cannot tell that from a broadcast. Note that a mixed batch carries both kinds:
+   the recipients named are the ones some record named, never a claim about the
+   whole batch."
+  (with-output-to-string (line)
+    (format line "bus:~D" seq)
+    (when froms (format line " from=~{~A~^,~}" froms))
+    (when tos (format line " to=~{~A~^,~}" tos))))
+
+(defun %signal-seq (seq &optional froms tos)
   "Emit a wake signal for SEQ on *standard-output* (the signal channel) and
    flush, so a watching harness sees it immediately.
 
@@ -103,8 +152,15 @@
    streaming mode SEQ is the highest seq the emitting poll turned up and the
    records below it in the same batch get no line of their own. Consecutive
    lines may therefore skip sequence numbers; a gap is normal and never a
-   dropped record."
-  (format *standard-output* "bus:~D~%" seq)
+   dropped record.
+
+   FROMS and TOS name the agents the batch came from and, where a record said
+   so, the agent it was for. They are what stops the woken reader spending a
+   turn establishing something the watch already knew: the watch decodes every
+   publisher's id to decide the record is not its own, and used to throw that
+   answer away. Both are absent on the exit-on-event path, which prints the seq
+   alone exactly as it always has."
+  (format *standard-output* "~A~%" (%signal-line seq froms tos))
   (force-output *standard-output*))
 
 (defun %signal-recycle ()
@@ -263,6 +319,66 @@
         (return nil))
       (sleep sleep-s))))
 
+(defun %batch-parties (records own-namespace)
+  "Who RECORDS came from, and who any of them was for: two lists of line-safe
+   tokens, each holding distinct names in the order the batch first mentions
+   them. OWN-NAMESPACE is the reading agent's namespace, which is what decides
+   whether a sender is rendered as a bare name or as name@namespace.
+
+   Every one of these ids was already decoded on the way to deciding the record
+   was deliverable. This reads the answer out of the same envelope instead of
+   discarding it and leaving the woken agent to fetch the message back to learn
+   who sent it, a whole turn spent recovering something the watch held.
+
+   A publisher that cannot be named renders as \"unknown\", the same string the
+   delivery path shows for the same record: an un-enveloped message from an older
+   core, or an id that will not decode. Failing to name an author must never
+   withhold the wake."
+  (let ((froms '())
+        (tos '()))
+    (dolist (record records (values (nreverse froms) (nreverse tos)))
+      (multiple-value-bind (text correlation-id self-id addressee)
+          (envelope:decode-envelope (record-body-string record))
+        (declare (ignore text correlation-id))
+        (pushnew (%field-token (envelope:author-display self-id own-namespace))
+                 froms :test #'string=)
+        (when addressee
+          (pushnew (%field-token (envelope:author-display addressee own-namespace))
+                   tos :test #'string=))))))
+
+(defun poll-new-records (wal-path cursor self-id
+                         &optional (reader (wal:make-reader)))
+  "One streaming step, kept as records: the records with seq in (CURSOR,
+   last-committed] that this agent would actually be handed, oldest first.
+   Returns (values records new-cursor restarted-p).
+
+   This is the whole of POLL-NEW's work; POLL-NEW is now this function with the
+   records reduced to their seqs on the way out. Keeping them is what lets the
+   streaming loop say who published, since the envelope it would have to re-open
+   to find out has already been opened here.
+
+   The returned cursor is the highest committed seq regardless of who published
+   what, so a record withheld under either delivery condition is still stepped
+   over and never examined twice. Withholding must never hold the cursor back, or
+   the log pins at the first record this agent is not shown. With SELF-ID NIL
+   nothing is filtered and every record comes back.
+
+   RESTARTED-P is true when the log was rotated or truncated under the reader.
+   The cursor returned in that case is the new log's head rather than the old
+   cursor carried forward, because the two number different logs and keeping the
+   larger would leave this watch permanently above every record the new log can
+   produce."
+  (let ((own (and self-id (envelope:encode-id self-id))))
+    (multiple-value-bind (records last restarted)
+        (%poll-forward wal-path reader cursor)
+      (values (if (null own)
+                  records
+                  (remove-if-not (lambda (record)
+                                   (envelope:deliverable-record-p record own))
+                                 records))
+              (if restarted last (max last cursor))
+              restarted))))
+
 (defun poll-new (wal-path cursor &optional emit self-id
                                            (reader (wal:make-reader)))
   "One streaming step: call EMIT (when supplied) once per record with seq in
@@ -290,42 +406,52 @@
    is what every one-shot caller wants and what this did before it took a
    position.
 
-   The records and the head seq now come out of ONE read rather than a scan
-   followed by a separate replay. That closes a small race as a side effect: a
-   record appended between those two reads used to be visible to the replay but
-   above the cursor the scan had just fixed, and had to be filtered back out to
-   avoid returning a cursor that skipped it. One read cannot disagree with
-   itself.
+   The records and the head seq come out of ONE read rather than a scan followed
+   by a separate replay. That closes a small race as a side effect: a record
+   appended between those two reads used to be visible to the replay but above
+   the cursor the scan had just fixed, and had to be filtered back out to avoid
+   returning a cursor that skipped it. One read cannot disagree with itself.
 
    RESTARTED-P is true when the log was rotated or truncated under the reader.
    The cursor returned in that case is the new log's head, not the old cursor
    carried forward, because the two number different logs and keeping the larger
-   would leave this watch permanently above every record the new log can produce."
-  (let ((own (and self-id (envelope:encode-id self-id))))
-    (multiple-value-bind (records last restarted)
-        (%poll-forward wal-path reader cursor)
-      (when emit
-        (dolist (record records)
-          (when (or (null own) (envelope:deliverable-record-p record own))
-            (funcall emit (record-seq record)))))
-      (values (if restarted last (max last cursor))
-              restarted))))
+   would leave this watch permanently above every record the new log can produce.
+
+   This is the seq-only view of POLL-NEW-RECORDS, which is where the step itself
+   now lives. Callers that need the records themselves, such as anything that
+   has to name the agent a record came from, take them from there rather than
+   reopening the envelope this already decoded."
+  (multiple-value-bind (records new-cursor restarted)
+      (poll-new-records wal-path cursor self-id reader)
+    (when emit
+      (dolist (record records)
+        (funcall emit (record-seq record))))
+    (values new-cursor restarted)))
 
 (defun watch-stream
        (wal-path baseline
         &key (poll-ms 1000) (recycle-seconds 600) self-id
-        (emit (lambda (s) (%signal-seq s))) on-poll)
+        (emit (lambda (seq froms tos) (%signal-seq seq froms tos))) on-poll)
   "Stream new FOREIGN activity beyond BASELINE by calling EMIT at most ONCE per
-   poll, with the highest foreign seq that poll turned up, looping until the
-   recycle window elapses with no further activity, then return the final
-   cursor. Used by the persistent-monitor mode; EMIT defaults to printing the
-   bus:<SEQ> signal line.
+   poll, looping until the recycle window elapses with no further activity, then
+   return the final cursor. Used by the persistent-monitor mode; EMIT defaults to
+   printing the signal line.
+
+   EMIT is called with three arguments: the highest foreign seq that poll turned
+   up, the distinct agents that published the poll's records, and the distinct
+   agents any of those records were addressed to (empty when none of them named
+   anybody). The identities cost nothing to report, since the loop decodes each
+   publisher's id to decide the record is not its own, and reporting them is
+   what saves the woken reader a turn spent rediscovering an author this loop
+   already had in hand.
 
    One wake per poll batch, not one per record. The reader on the other end of
    the signal drains everything pending in a single call, so when several
    records land between two polls only the first wake has anything to deliver
    and the rest wake an agent to discover the work is already done. Each of
-   those costs an agent turn, which is the scarce resource here.
+   those costs an agent turn, which is the scarce resource here. It also means
+   the batch is genuinely plural and its authorship with it, which is why the
+   agents are reported as a list rather than as a sender.
 
    A wake therefore means CHECK THE BUS, never THERE IS EXACTLY ONE MESSAGE
    WAITING. The reader must re-check what is actually pending rather than trust
@@ -334,24 +460,26 @@
    bus:<SEQ> lines may SKIP sequence numbers, so anything parsing them has to
    expect gaps and must not treat a gap as a lost record.
 
-   The coalescing happens here rather than in POLL-NEW, which stays a pure
-   per-record enumerator: this loop hands POLL-NEW a collecting closure and calls
-   the real EMIT once afterwards. Nothing is remembered between polls, so there
-   is no timer and no debounce window and hence none of the lost-wakeup failures
-   those bring. A record appended after a poll's read is simply picked up by the
-   next poll, and the cursor advances to the head of each read regardless of what
-   was emitted, exactly as before.
+   The coalescing happens here rather than in the poll step, which stays a pure
+   enumerator: this loop takes the batch and calls the real EMIT once. Nothing is
+   remembered between polls, so there is no timer and no debounce window and
+   hence none of the lost-wakeup failures those bring. A record appended after a
+   poll's read is simply picked up by the next poll, and the cursor advances to
+   the head of each read regardless of what was emitted, exactly as before.
 
    SELF-ID has the same meaning it has for the exit-on-event loop: this agent's
    own publishes advance the cursor but emit nothing. The idle window resets on
    any activity, this agent's own included — the log moved, so the watch is
-   demonstrably alive and has no reason to recycle.
+   demonstrably alive and has no reason to recycle. It also fixes the namespace
+   the reported agents are rendered against, so a sister in this agent's own
+   project is named plainly and one from another project carries where it is
+   from.
 
    ON-POLL, when supplied, is a nullary thunk called at the top of every poll,
    before the advance check, on the same contract watch-until-foreign gives it:
    fired once at arm with no race window, then every poll. It carries the
-   heartbeat refresh, kept out of the pure poll-new step so the streaming unit
-   tests see no new behavior.
+   heartbeat refresh, kept out of the pure poll step so the streaming unit tests
+   see no new behavior.
 
    One reader is held for the life of the stream, so a quiet poll reads the bytes
    appended since the last one rather than the whole log. This is the loop that
@@ -364,21 +492,23 @@
   (let ((cursor baseline)
         (deadline (+ (now-ms) (round (* recycle-seconds 1000))))
         (sleep-s (/ poll-ms 1000.0))
+        (own-namespace (and self-id
+                            (nth-value 0 (envelope:split-agent-id self-id))))
         (reader (wal:make-reader)))
     (loop (when on-poll (funcall on-poll))
-          (let ((highest nil))
-            (multiple-value-bind (advanced restarted)
-                (poll-new wal-path cursor
-                          (lambda (s)
-                            (setf highest (if highest (max highest s) s)))
-                          self-id reader)
-              (when restarted
-                (%warn
-                 "wal rotated or truncated under the watch; streaming from the head of the new log"))
-              (when (or restarted (> advanced cursor))
-                (setf cursor advanced
-                      deadline (+ (now-ms) (round (* recycle-seconds 1000))))))
-            (when (and emit highest) (funcall emit highest)))
+          (multiple-value-bind (records advanced restarted)
+              (poll-new-records wal-path cursor self-id reader)
+            (when restarted
+              (%warn
+               "wal rotated or truncated under the watch; streaming from the head of the new log"))
+            (when (or restarted (> advanced cursor))
+              (setf cursor advanced
+                    deadline (+ (now-ms) (round (* recycle-seconds 1000)))))
+            (when (and emit records)
+              (multiple-value-bind (froms tos)
+                  (%batch-parties records own-namespace)
+                (funcall emit (reduce #'max records :key #'record-seq)
+                         froms tos))))
           (when (>= (now-ms) deadline) (return cursor))
           (sleep sleep-s))))
 
@@ -419,14 +549,35 @@ Options:
                        (default: the resolved agent's cursor, or the WAL's
                         current max seq when no agent resolves; 0 = fire on any
                         record)
-  --stream             stream one `bus:<SEQ>` line per POLL that turned up new
-                       foreign records, carrying the highest such seq, on STDOUT
-                       (for a persistent monitor). One wake per batch, not per
-                       record: the reader drains everything pending in one call,
-                       so a line means `check the bus` rather than `exactly one
-                       message is waiting`, and consecutive lines may skip
-                       sequence numbers. On an idle window it self-recycles by
-                       exiting 0 so a supervisor re-arms it fresh.
+  --stream             stream one line per POLL that turned up new foreign
+                       records on STDOUT (for a persistent monitor), in the form
+
+                         bus:<SEQ> from=<name>[,<name>...] [to=<name>[,<name>...]]
+
+                       SEQ is the highest such seq and comes first, so a monitor
+                       filtering on ^(bus|error): and reading the number after
+                       the colon behaves exactly as it always has; the named
+                       fields follow it.
+                       from= lists every agent that published a record in the
+                       batch, distinct and in the order the batch mentions them.
+                       It is a list because a poll can turn up several records
+                       from several agents, and it saves the woken reader the
+                       turn it would otherwise spend asking the bus who wrote to
+                       it. A publisher whose id is missing or will not decode is
+                       named `unknown`, the same way the bus itself renders it.
+                       An agent in the reading agent's own project is named
+                       plainly; one from another project is name@namespace.
+                       to= appears only when some record in the batch named a
+                       recipient, and is absent otherwise rather than empty, so
+                       an addressed message and a broadcast never look alike. A
+                       mixed batch carries both, so the field names who was
+                       written to, never that the whole batch was addressed.
+                       One wake per batch, not per record: the reader drains
+                       everything pending in one call, so a line means `check the
+                       bus` rather than `exactly one message is waiting`, and
+                       consecutive lines may skip sequence numbers. On an idle
+                       window it self-recycles by exiting 0 so a supervisor
+                       re-arms it fresh.
                        Recycle/lifecycle notes go to STDERR, never STDOUT.
                        Default is exit-on-event.
   --poll-ms N          poll interval in milliseconds (default 1000)
@@ -451,10 +602,11 @@ then ignored — the watcher keeps running on defaults rather than leaving the
 agent deaf to the bus.
 
 Exit-on-event prints one `bus:<SEQ>` line then exits 0; on idle recycle it
-prints `recycle:` then exits 0. Streaming prints one `bus:<SEQ>` line per poll
-that turned up new foreign records, carrying the highest of them, and
-self-recycles by exiting 0 on an idle window, so its supervising monitor re-arms
-it fresh; its recycle/lifecycle diagnostics go only to STDERR.
+prints `recycle:` then exits 0. Streaming prints one
+`bus:<SEQ> from=<name>[,...] [to=<name>[,...]]` line per poll that turned up new
+foreign records, carrying the highest of them and naming the agents it came
+from, and self-recycles by exiting 0 on an idle window, so its supervising
+monitor re-arms it fresh; its recycle/lifecycle diagnostics go only to STDERR.
 
 While a watch runs it refreshes a heartbeat file every poll and removes it on
 clean exit; a dead watch leaves no fresh beat. --check-live reads that beat so a

@@ -224,8 +224,15 @@ installer (=~/.local/bin/dsmr-bus-watch=).
 
 ** Two modes, and which one to stand on
 
-- *Streaming* (=--stream=) prints =bus:<SEQ>= once per poll that turned something
-  up, carrying the highest new seq that poll found, and keeps running. A wake
+- *Streaming* (=--stream=) prints =bus:<SEQ> from=<name>[,<name>...]
+  [to=<name>[,<name>...]]= once per poll that turned something up, carrying the
+  highest new seq that poll found and naming the agents it came from, and keeps
+  running. The seq stays at the front of the line, so a monitor filtering on
+  =^(bus|error):= and reading the number after the colon is unaffected. =from=
+  is a list because a poll can turn up records from several agents, and it
+  spares the woken reader the turn it would otherwise spend asking the bus who
+  wrote to it; =to= appears only when some record in the batch named a
+  recipient, and is absent otherwise rather than empty. A wake
   means CHECK THE BUS, not "a message with this seq is waiting": the reader
   drains everything pending in one call, so records below the signalled seq get
   no line of their own. Consecutive lines may therefore SKIP sequence numbers.
@@ -352,14 +359,15 @@ dsmr-bus-watch [--wal PATH] [--after SEQ] [--stream] [--poll-ms N] [--recycle-se
 - =--after SEQ= — baseline; fire on the first seq greater than =SEQ=. Default is
   the WAL's current max seq, read at arm time (=0= fires on any record).
 - =--stream= streams one line per poll that found new records, carrying the
-  highest such seq, and keeps running (else exit-on-event). Seq gaps are expected.
+  highest such seq and the agents it came from, and keeps running (else
+  exit-on-event). Seq gaps are expected.
 - =--poll-ms N= — poll interval in milliseconds (default =1000=).
 - =--recycle-seconds N= — idle self-recycle window in seconds (default =600=).
 - =-h=, =--help= — print help and exit 0.
 
-*stdout is the signal channel* — only =bus:<SEQ>= (a new message) and =recycle:=
-(an idle self-recycle) ever go to stdout; usage, diagnostics, and errors go to
-stderr. A usage error exits =64=; a fired or recycled watch exits =0=.
+*stdout is the signal channel*: only a =bus:= line (a new message, with the
+agents it came from when streaming) and =recycle:= (an idle self-recycle) ever
+go to stdout; usage, diagnostics, and errors go to stderr. A usage error exits =64=; a fired or recycled watch exits =0=.
 
 ** Idle self-recycle
 
