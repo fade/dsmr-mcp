@@ -94,11 +94,9 @@ for a helper thread is bounded even when the thread itself misbehaves."
   "Evaluate BODY only when bin/dsmr-mcp-bridge is on disk, and otherwise record a
 parachute skip WITHOUT evaluating BODY.
 
-Parachute's SKIP does not abort its enclosing test. Used bare as a guard it
-records the skip and falls straight through into the body, and wrapping the body
-in it only forces the assertions' status while the surrounding code still runs.
-A lane that never built the binary must execute none of the body, so the guard
-has to be a real branch."
+SKIP stands the enclosing test down, so a bare guard would also work. The branch
+is kept because it states the requirement in the code rather than resting on how
+SKIP unwinds: a lane that never built the binary must execute none of the body."
   `(if (%bridge-binary-present-p)
        (progn ,@body)
        (skip "bridge binary not built; run 'make bridge' to enable this test")))
