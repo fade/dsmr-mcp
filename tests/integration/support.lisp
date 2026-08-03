@@ -17,10 +17,11 @@
 ;;;; A presence check on sbcl + setup.lisp cannot tell these apart: a runner
 ;;;; with Quicklisp installed but the project off the child's source registry
 ;;;; passes the presence check, then the child fails to build — and the test
-;;;; reports a failure instead of the intended skip. Worse, parachute's SKIP
-;;;; does not abort the enclosing test (it records a skipped sub-result and
-;;;; returns), so a bare `(unless (spawnable) (skip ...))` guard falls through
-;;;; into the spawn anyway.
+;;;; reports a failure instead of the intended skip. Parachute's SKIP records a
+;;;; skipped result and then stands the enclosing test down, so a bare
+;;;; `(unless (spawnable) (skip ...))` guard would also work. The branch below is
+;;;; kept because it says in the code which side runs, rather than resting on how
+;;;; SKIP unwinds.
 ;;;;
 ;;;; This module closes both gaps. A one-shot build probe spawns a throwaway
 ;;;; child that does nothing but resolve and load the systems the real child
