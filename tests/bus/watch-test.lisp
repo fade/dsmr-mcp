@@ -24,7 +24,10 @@
                 #:append-record
                 ;; the incremental-read machinery the poll path now rides on
                 #:make-reader
-                #:reader-offset)
+                #:reader-offset
+                ;; the record accessor, for the poll step that hands records
+                ;; back rather than reducing them to their seqs
+                #:record-seq)
   (:import-from #:dsmr-mcp/src/bus/envelope
                 #:agent-id
                 #:encode-id
@@ -33,6 +36,7 @@
                 #:watch-until-foreign
                 #:watch-stream
                 #:poll-new
+                #:poll-new-records
                 #:default-wal-path
                 #:default-cursors-dir
                 #:default-watch-dir
@@ -44,6 +48,11 @@
                 ;; restart verdict is the whole of the rotation defence and is
                 ;; not observable through the loops' return values.
                 #:%poll-forward
+                ;; internal: the text of a wake line. The seq has to stay at
+                ;; the front of it, since every armed watcher in the fleet
+                ;; filters this stream on that prefix, and reading it back is
+                ;; the only way to hold that shape without running a watcher.
+                #:%signal-line
                 #:%highest-foreign-seq
                 #:%resolve-self-id
                 #:%resolve-bus
@@ -155,6 +164,18 @@
 
 (defmacro capturing-stderr (&body body)
   `(call-capturing-stderr (lambda () ,@body)))
+
+(defun call-capturing-stdout (thunk)
+  "Run THUNK with *standard-output* redirected, and return (values result text).
+   Stdout is the signal channel, so what a watch prints there is the contract a
+   monitor actually reads: a test that only inspects the emit callback would
+   pass on a watcher that printed something else entirely."
+  (let* ((stream (make-string-output-stream))
+         (result (let ((*standard-output* stream)) (funcall thunk))))
+    (values result (get-output-stream-string stream))))
+
+(defmacro capturing-stdout (&body body)
+  `(call-capturing-stdout (lambda () ,@body)))
 
 (defun call-with-env-agent (value thunk)
   "Run THUNK with DSMR_BUS_AGENT set to VALUE (a NIL VALUE unsets it), then put
@@ -614,7 +635,9 @@
       (append-from w 3 me)
       (let ((final (watch-stream w 0 :poll-ms 5 :recycle-seconds 0.05
                                      :self-id me
-                                     :emit (lambda (s) (push s seen)))))
+                                     :emit (lambda (s &rest parties)
+                                             (declare (ignore parties))
+                                             (push s seen)))))
         (is = 3 final)
         (is equal '(2) (reverse seen))))))
 
@@ -640,7 +663,9 @@
                  (append-from w 4 them))))
         (let ((final (watch-stream w 0 :poll-ms 5 :recycle-seconds 0.25
                                        :self-id me
-                                       :emit (lambda (s) (push s seen))
+                                       :emit (lambda (s &rest parties)
+                                               (declare (ignore parties))
+                                               (push s seen))
                                        :on-poll
                                        #'publish-a-burst-on-the-second-poll)))
           (is = 4 final)
@@ -662,7 +687,9 @@
                (when (= polls 2) (append-from w 1 them))))
         (let ((final (watch-stream w 0 :poll-ms 5 :recycle-seconds 0.25
                                        :self-id me
-                                       :emit (lambda (s) (push s seen))
+                                       :emit (lambda (s &rest parties)
+                                               (declare (ignore parties))
+                                               (push s seen))
                                        :on-poll #'publish-one-on-the-second-poll)))
           (is = 1 final)
           (is = 1 (length seen) "one record must produce exactly one wake")
@@ -688,7 +715,9 @@
       (append-from w 4 me)
       (let ((final (watch-stream w 0 :poll-ms 5 :recycle-seconds 0
                                      :self-id me
-                                     :emit (lambda (s) (push s seen)))))
+                                     :emit (lambda (s &rest parties)
+                                             (declare (ignore parties))
+                                             (push s seen)))))
         (is = 4 final "the cursor clears our own publish too")
         (is = 1 (length seen) "a standing backlog is one wake, not three")
         (is equal '(3) seen
@@ -933,9 +962,137 @@
       (append-from w 2 them)
       (let ((final (watch-stream w 1 :poll-ms 5 :recycle-seconds 0
                                      :self-id me
-                                     :emit (lambda (s) (push s seen)))))
+                                     :emit (lambda (s &rest parties)
+                                             (declare (ignore parties))
+                                             (push s seen)))))
         (is = 2 final)
         (is equal '(2) (reverse seen))))))
+
+(define-test a-wake-line-keeps-the-seq-first-and-adds-its-fields-after-it
+  ;; Watchers armed across the fleet filter this stream through ^(bus|error):
+  ;; and read the number after the colon. They are long-lived processes and are
+  ;; not restarted when this binary changes, so a field placed in front of the
+  ;; seq, or a changed prefix, deafens every one of them at once. Whatever else
+  ;; a line carries, it opens `bus:<SEQ>`.
+  (is string= "bus:7" (%signal-line 7 nil nil))
+  (is string= "bus:7 from=them" (%signal-line 7 '("them") nil))
+  (is string= "bus:9 from=them,other" (%signal-line 9 '("them" "other") nil))
+  (is string= "bus:9 from=them to=me" (%signal-line 9 '("them") '("me")))
+  ;; An absent recipient is absent. An empty `to=` reads as a name that failed
+  ;; to render, and nothing downstream could tell that from a broadcast.
+  (false (search "to=" (%signal-line 9 '("them") nil)))
+  (dolist (line (list (%signal-line 7 nil nil)
+                      (%signal-line 9 '("them") '("me"))))
+    (is = 0 (search "bus:" line)
+        "~S must still open with the prefix every armed monitor filters on"
+        line)))
+
+(define-test a-wake-names-the-agent-it-came-from
+  ;; The property the whole streaming line exists for, taken on the PRINTED
+  ;; line rather than through the emit callback, because the printed line is
+  ;; what a monitor reads.
+  ;;
+  ;; The watch decodes the publisher's id on the way to deciding the record is
+  ;; not its own, so the name is already in hand when the line is written. A
+  ;; line that omits it costs the woken agent a turn and a bus fetch to recover
+  ;; something that was never lost, only discarded.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them")))
+      (append-from w 1 me)
+      (append-from w 2 them)
+      (multiple-value-bind (final out)
+          (capturing-stdout
+            (watch-stream w 0 :poll-ms 5 :recycle-seconds 0 :self-id me))
+        (is = 2 final)
+        (is string= (format nil "bus:2 from=them~%") out)))))
+
+(define-test a-batch-from-several-agents-names-every-one-of-them
+  ;; One line per poll means a line stands for a batch, so its authorship is
+  ;; plural whenever the batch is. Naming one publisher and leaving the reader
+  ;; to assume it was the only one is the misattribution an author field exists
+  ;; to remove, and it would be a new one: the reader has no way to tell a
+  ;; single-author batch from a truncated list.
+  ;;
+  ;; Each agent is named once, in the order the batch first mentions it, so a
+  ;; talkative sister does not fill the line with repetitions of itself.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them"))
+          (other (agent-id "/p" :name "other")))
+      (append-from w 1 them)
+      (append-from w 2 other)
+      (append-from w 3 them)
+      (multiple-value-bind (final out)
+          (capturing-stdout
+            (watch-stream w 0 :poll-ms 5 :recycle-seconds 0 :self-id me))
+        (is = 3 final)
+        (is string= (format nil "bus:3 from=them,other~%") out)))))
+
+(define-test an-addressed-record-names-its-recipient-and-a-broadcast-names-nobody
+  ;; Addressing is off by default, so the ordinary line carries no recipient at
+  ;; all. The two cases have to be told apart on sight: present means somebody
+  ;; was named, and absent means the field is not there, never an empty one.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them")))
+      (append-addressed w 1 them me)
+      (multiple-value-bind (final out)
+          (capturing-stdout
+            (watch-stream w 0 :poll-ms 5 :recycle-seconds 0 :self-id me))
+        (is = 1 final)
+        (is string= (format nil "bus:1 from=them to=me~%") out))))
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them")))
+      (append-from w 1 them)
+      (multiple-value-bind (final out)
+          (capturing-stdout
+            (watch-stream w 0 :poll-ms 5 :recycle-seconds 0 :self-id me))
+        (is = 1 final)
+        (is string= (format nil "bus:1 from=them~%") out)
+        (false (search "to=" out)
+               "a broadcast must carry no recipient field at all")))))
+
+(define-test a-sender-is-named-the-way-the-bus-itself-names-one
+  ;; The rendering is the delivery path's, not a second one invented here: a
+  ;; sister in this agent's own project by its bare name, one from another
+  ;; project with the project it is in, and a publisher whose id is missing or
+  ;; will not decode as `unknown`. Two renderings of one identity would be two
+  ;; names for one agent, which is the ambiguity the field exists to close.
+  ;;
+  ;; Being unable to name a publisher must never withhold the wake: a legacy
+  ;; un-enveloped record from an older core still has to wake its reader.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (elsewhere (agent-id "/other-project" :name "sister")))
+      (append-from w 1 nil)                 ; no envelope at all
+      (append-from w 2 elsewhere)
+      (multiple-value-bind (final out)
+          (capturing-stdout
+            (watch-stream w 0 :poll-ms 5 :recycle-seconds 0 :self-id me))
+        (is = 2 final)
+        (is string= (format nil "bus:2 from=unknown,sister@/other-project~%")
+            out)))))
+
+(define-test the-poll-step-hands-back-the-records-it-was-shown
+  ;; The step the streaming loop reads identities out of. It answers the same
+  ;; question the seq-only view answers and has to agree with it record for
+  ;; record: the ones this agent would be handed, oldest first, with the cursor
+  ;; clearing the ones it was not shown so a stretch of other people's mail
+  ;; cannot pin the log.
+  (with-wal (w)
+    (let ((me (agent-id "/p" :name "me"))
+          (them (agent-id "/p" :name "them"))
+          (someone-else (agent-id "/p" :name "someone-else")))
+      (append-from w 1 me)
+      (append-addressed w 2 them someone-else)
+      (append-from w 3 them)
+      (multiple-value-bind (records cursor restarted)
+          (poll-new-records w 0 me)
+        (false restarted)
+        (is = 3 cursor "the cursor clears the records we were not shown")
+        (is equal '(3) (mapcar #'record-seq records))))))
 
 (define-test a-held-reader-still-finds-a-foreign-record-after-quiet-polls
   ;; A reader hands each record over exactly once, so the exit-on-event filter
