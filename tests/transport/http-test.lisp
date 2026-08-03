@@ -2,11 +2,13 @@
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
 ;;;; Parachute integration tests for the Streamable HTTP transport.
-;;;; Every test body opens with (if (not (http-port-available-p)) (true t) ...)
-;;;; so sandboxed CI that denies the bind degrades to PASS.
+;;;; Every test body opens with (if (not (http-port-available-p)) (skip ...) ...)
+;;;; so an environment that denies the bind reports these tests as skipped.
+;;;; They must never report as passed there: a pass nobody earned makes the
+;;;; suite total read the same whether the transport was exercised or not.
 ;;;;
 ;;;; send-http-request and http-port-available-p are EXPORTED from this package
-;;;; (single source of truth — tests/transport/transport-parity-test.lisp
+;;;; (single source of truth, so tests/transport/transport-parity-test.lisp
 ;;;; imports them from here without re-defining them).
 
 (defpackage #:dsmr-mcp/tests/transport/http-test
@@ -140,7 +142,7 @@ Uses Connection: close to prevent keep-alive from hanging reads."
 (define-test http-server-lifecycle
   "start-http-server / stop-http-server is idempotent; running flag flips correctly."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       (unwind-protect
            (multiple-value-bind (acceptor port)
                (start-http-server :host "127.0.0.1" :port 0)
@@ -159,7 +161,7 @@ Uses Connection: close to prevent keep-alive from hanging reads."
 (define-test http-post-initialize-creates-session
   "POST /mcp with initialize body returns 200 + Mcp-Session-Id + JSON result."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       (unwind-protect
            (multiple-value-bind (acceptor port)
                (start-http-server :host "127.0.0.1" :port 0)
@@ -188,7 +190,7 @@ Uses Connection: close to prevent keep-alive from hanging reads."
 (define-test http-post-without-session-returns-400
   "POST /mcp non-initialize without Mcp-Session-Id header returns 400."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       (unwind-protect
            (multiple-value-bind (acceptor port)
                (start-http-server :host "127.0.0.1" :port 0)
@@ -208,7 +210,7 @@ Uses Connection: close to prevent keep-alive from hanging reads."
 (define-test http-post-with-unknown-session-returns-404
   "POST /mcp with syntactically valid but unknown Mcp-Session-Id returns 404."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       (unwind-protect
            (multiple-value-bind (acceptor port)
                (start-http-server :host "127.0.0.1" :port 0)
@@ -230,7 +232,7 @@ Uses Connection: close to prevent keep-alive from hanging reads."
 (define-test http-session-timeout-evicts-idle
   "A session whose last-access exceeds *session-timeout-seconds* is evicted by get-session."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       (unwind-protect
            (let ((*session-timeout-seconds* 1))
              (let* ((http-sess (create-session :slynk-attach nil :project-root nil))
@@ -248,7 +250,7 @@ Uses Connection: close to prevent keep-alive from hanging reads."
 (define-test http-session-active-requests-guard-prevents-eviction
   "A session with active-requests > 0 is NOT evicted even when expired."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       (unwind-protect
            (let ((*session-timeout-seconds* 1))
              (let* ((http-sess (create-session :slynk-attach nil :project-root nil))
@@ -274,7 +276,7 @@ Uses Connection: close to prevent keep-alive from hanging reads."
 (define-test http-get-returns-sse-stream
   "GET /mcp with Mcp-Session-Id returns 200 + Content-Type: text/event-stream."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       (unwind-protect
            (multiple-value-bind (acceptor port)
                (start-http-server :host "127.0.0.1" :port 0)
@@ -336,7 +338,7 @@ two GETs can both pass the not-already-attached check and install a channel.
 A pre-fix racy install would let two concurrent GETs both reach 200 (and
 orphan one subscriber).  Single-client tests never exercise this."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       (let ((sockets nil))
         (unwind-protect
              (multiple-value-bind (acceptor port)
@@ -353,9 +355,10 @@ orphan one subscriber).  Single-client tests never exercise this."
                      (error () (values nil nil)))
                  (let ((id (and init-status (eql init-status 200)
                                 (%extract-session-id init-headers))))
-                   ;; Degrade to PASS when the environment could not init.
+                   ;; No session id means the handshake never completed here,
+                   ;; so the race this test exists to observe cannot be set up.
                    (if (not id)
-                       (true t)
+                       (skip "HTTP initialize returned no session id, so the concurrent GET race cannot be staged here")
                        (let* ((n 8)
                               (go-latch (list nil))
                               (results (make-array n :initial-element nil)))
@@ -412,7 +415,7 @@ orphan one subscriber).  Single-client tests never exercise this."
 (define-test http-post-with-accept-event-stream-returns-sse
   "POST /mcp initialize with Accept: text/event-stream returns SSE body with result."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       (unwind-protect
            (multiple-value-bind (acceptor port)
                (start-http-server :host "127.0.0.1" :port 0)
@@ -436,7 +439,7 @@ orphan one subscriber).  Single-client tests never exercise this."
 (define-test http-delete-session-returns-204
   "DELETE /mcp with Mcp-Session-Id returns 204; subsequent POST returns 404."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       (unwind-protect
            (multiple-value-bind (acceptor port)
                (start-http-server :host "127.0.0.1" :port 0)
@@ -483,7 +486,7 @@ orphan one subscriber).  Single-client tests never exercise this."
 (define-test http-cors-loopback-allowed
   "OPTIONS /mcp with loopback Origin returns Access-Control-Allow-Origin echo."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       (unwind-protect
            (multiple-value-bind (acceptor port)
                (start-http-server :host "127.0.0.1" :port 0)
@@ -505,7 +508,7 @@ orphan one subscriber).  Single-client tests never exercise this."
 (define-test http-cors-substring-attack-rejected
   "OPTIONS /mcp with Origin: http://localhost.evil.com returns no ACAO header."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       (unwind-protect
            (multiple-value-bind (acceptor port)
                (start-http-server :host "127.0.0.1" :port 0)
@@ -528,7 +531,7 @@ orphan one subscriber).  Single-client tests never exercise this."
 (define-test http-protocol-version-absent-assumes-supported
   "POST /mcp without MCP-Protocol-Version header succeeds (assumes 2025-03-26)."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       (unwind-protect
            (multiple-value-bind (acceptor port)
                (start-http-server :host "127.0.0.1" :port 0)
@@ -550,7 +553,7 @@ orphan one subscriber).  Single-client tests never exercise this."
 (define-test http-protocol-version-invalid-returns-400
   "POST /mcp with unsupported MCP-Protocol-Version value returns 400."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       (unwind-protect
            (multiple-value-bind (acceptor port)
                (start-http-server :host "127.0.0.1" :port 0)
@@ -572,7 +575,7 @@ orphan one subscriber).  Single-client tests never exercise this."
 (define-test http-stdout-pollution-captured-not-leaked
   "POST initialize response body starts with '{' (stdout guard active)."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       (unwind-protect
            (multiple-value-bind (acceptor port)
                (start-http-server :host "127.0.0.1" :port 0)
@@ -600,7 +603,7 @@ orphan one subscriber).  Single-client tests never exercise this."
 (define-test per-session-slynk-attach-and-project-root-isolated
   "Two HTTP sessions own independent project-root slots; re-rooting one leaves the other unchanged."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       ;; Use the dsmr-mcp project root as the initial default — it exists on disk
       ;; so fs-set-project-root can validate and set the new root.
       (let* ((init-root

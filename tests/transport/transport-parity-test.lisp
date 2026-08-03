@@ -85,7 +85,7 @@ This is the canonical set that the stdio and TCP transports serve."
 (define-test tools-list-set-matches-across-transports
   "HTTP tools/list returns the same tool names as the in-process tool registry."
   (if (not (http-port-available-p))
-      (true t)
+      (skip "no loopback HTTP port bindable in this environment; socket bind is denied here")
       (unwind-protect
            (multiple-value-bind (acceptor port)
                (start-http-server :host "127.0.0.1" :port 0
