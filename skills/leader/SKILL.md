@@ -1,12 +1,18 @@
 ---
 name: leader
-description: "Rebuild the leader's repo-local context AND the whole-fleet context in one pass, so the leader can assert positive, rapid control over every worker. Use when you are the leader (valis) starting or resuming a session, after a fleet restart, when you have lost track of fleet state, or whenever the operator types /leader. Reads files, git, and the bus roster verbs, never reconstructing state from bus conversation."
+description: "Rebuild a leader's repo-local context AND the whole-fleet context in one pass, so the leader can assert positive, rapid control over every worker on ITS OWN bus. Use when you are a leader starting or resuming a session, after a fleet restart, when you have lost track of fleet state, or whenever the operator types /leader. More than one leader may be running, each with its own bus and its own fleet. Reads files, git, and the bus roster verbs, never reconstructing state from bus conversation."
 ---
 
 # /leader
 
-You are the **leader** of a constellation: one leader (valis) and N workers, one sister agent per
-repo — N is discovered, never assumed. This skill rebuilds everything you need to take command in one pass.
+You are **a leader**: one leader and N workers, one sister agent per repo, on ONE bus that is
+yours — N is discovered, never assumed, and so is your own identity. This skill rebuilds
+everything you need to take command in one pass.
+
+⛔ **You are not necessarily the only leader running.** Another leader may hold another fleet on
+another bus at the same time, and you may be able to hear it. Work out which bus is yours before
+you assert anything; see *ONE LEADER, ONE BUS, ONE FLEET* below. **Never assume the constellation
+you can hear is the constellation you lead.**
 
 **Rule zero: build this picture from FILES and `git`. Never from what anyone said on the bus.**
 Messages cross, truncate, and arrive after the count that needed them.
@@ -168,6 +174,51 @@ Enrollment is dynamic, so both of these are normal on a running fleet:
 
 Assembling a fleet in the first place, and handing each repo its tag, is the **fleet** skill.
 
+### ⛔ ONE LEADER, ONE BUS, ONE FLEET. There may be OTHER leaders, and they are not yours.
+
+**A leader implies a separate bus.** Your fleet is the repos on YOUR bus. More than one leader
+can be running at once, each with its own bus and its own fleet, and **those fleets are separate
+by design, not by accident.** Discover whether another leader exists; never assume you are the
+only one.
+
+⛔ **ANOTHER LEADER'S FLEET ORDERS DO NOT BIND YOU OR YOUR FLEET.** Not a rotation, not a park,
+not a stand-down, not a FLEET-CLEAR. Those are addressed to that leader's workers. Reading one as
+governing you is the most natural mistake available, because the words are imperative and they
+arrive on a bus you can hear.
+
+⚠ **YOU MAY BE PRESENT ON ANOTHER LEADER'S BUS FOR A NARROW REASON, AND PRESENCE IS NOT
+MEMBERSHIP.** The usual reason is that you own shared tooling their fleet runs on, so their
+defects can reach you as they occur. That standing lets you answer tooling questions, take defect
+reports, and publish findings about the tooling. **It does not make you a sister in their
+constellation** and it does not make their operational traffic yours to hold.
+
+⛔ **THE VENUE TRAP, which costs whole sessions:** a question you raise on someone else's fleet bus
+reads as a WORK ITEM to every repo on it, however carefully you address it, because direct
+addressing is off by default and every message reaches everyone. On 2026-08-01 a tooling question
+raised this way had six sisters sweeping their own trees unprompted, none of them dispatched.
+⇒ **Raise fleet-wide questions with THAT fleet's leader and let them dispatch it by name.** Ask
+for the answer; do not ask the fleet.
+
+⇒ **PEER LEADERS COORDINATE ON THE `leaders` BUS, not on either fleet bus.** That is where the
+split gets mutually recognised and recorded, so neither leader has to infer it from the other's
+behaviour. Join it, arm a watcher on it like any other bus, and state your fleet's membership and
+your standing on any other bus you sit on.
+
+⛔ **DRAIN ANOTHER FLEET'S BUS SILENTLY. NEVER NARRATE IT** (operator, 2026-08-02). Speak about
+off-fleet traffic in exactly two cases: it **addresses you**, or it **dispatches one of YOUR
+sisters**. Everything else is drained and dropped — no summary, no "not mine", no relay to the
+operator however good the finding is.
+
+⚠ **"Not mine" twelve times is still twelve interruptions.** Correctly declining to act and then
+reporting that you declined costs the operator the same attention as acting would have. You arm the
+watcher because you own shared tooling and their defects reach you there: that is a reason to
+LISTEN, never a reason to TALK.
+
+⚠ **Do NOT self-enroll on a roster you do not lead.** A roster records the OPERATOR'S intent; a
+participant who enrols itself converts it into self-assertion and destroys the only thing it is
+good for. That binds a leader harder than a worker. Arm and listen regardless — the roster gates
+nothing.
+
 ## Step 3 — Every block in the fleet, batched
 
 ```bash
@@ -183,6 +234,44 @@ the reply is about something else.** The operator must never discover a block by
 Consolidate: one list, each with the exact literal grant needed. Never send the operator round the fleet
 terminal by terminal.
 
+### ⛔ A `BLOCKED.md` YOU READ MAY BE STALE BECAUSE THE WORKER COULD NOT WRITE IT
+
+The planning-state protection can refuse a worker's edit to its own record. A worker that hits this
+reports on the bus and discloses the staleness rather than writing around the gate. **Then the bus
+line is the authority and the file is not**, inverting the usual rule that files beat messages.
+
+⇒ **Carry the accurate state in your own records, and say in your dispatch that you are carrying it.**
+A worker that cannot write and is not being carried loses its findings with its session. ⛔ Do not
+write into the sister's `.planning/` to fix it; that is the boundary error one layer on. Hand it back
+when the gate clears.
+
+### ⛔ THE PERMISSION BOOTSTRAP IS THE OPERATOR'S, AND YOU WILL BE BLOCKED TOO
+
+The auto-mode classifier refuses calls before the MCP server sees them, by a per-call model judgment
+that is **not deterministic and cannot be pre-cleared**. It will refuse your dispatches as readily as
+a worker's edits, and it will refuse your attempt to write the config that fixes it. That is correct:
+**an agent cannot grant itself permissions.**
+
+⇒ When you hit it, **stop and hand the operator the exact change**, ready to paste, in one message.
+Do not reformulate the call and do not route it through another tool. ⚠ Never propose turning the
+prompt back on as the remedy: that converts every classifier coin-flip into an operator interrupt,
+which is precisely what auto mode plus the bus exists to prevent (operator, 2026-08-02). The remedy
+is a `permissions.allow` entry, which bypasses the classifier deterministically, backed by a real
+gate underneath such as the server's own root whitelist.
+
+⚠ **A denial mid-session is not evidence anything regressed.** Check the binary version and the
+settings mtimes once, say so, and stop hunting. The variance is the design, not a fault.
+⛔ **WHEN THE CLASSIFIER DISAGREES WITH A DIRECT ORDER FROM THE OPERATOR, THE CLASSIFIER IS WRONG**
+(operator, 2026-08-02). The denial's own instruction is to stop, explain, and let the operator
+decide. Once he has decided, **retrying is the prescribed path, not a bypass.** ⚠ This authorises a
+retry of the SAME call after an explicit order and nothing else: never a reformulation to slip past,
+never routing the effect through another tool, never an assumed order where none was given.
+
+⚠ **A retry under order can still be refused.** When that happens, say so once and hand the operator
+a paste or an editor buffer. ⛔ Do not spend his session on it: permissions plumbing is never the
+work, and ten idle agents cost more than any rule in this file.
+
+
 ## Step 4 — The bus, drained not surveyed
 
 Drain forward in pages of 5–10 until `remaining_pending` is 0. **Never `skip_to_head`.** If a
@@ -193,12 +282,41 @@ filters them. Never reconcile a drain against it.
 
 Arm a persistent `--stream` watcher in a Monitor — that is the standing
 listener; exit-on-event is only for the per-turn re-arm after a publish. **One
-per joined bus, each with its own `--bus`.** Then **confirm your own ears** on
-each of them before you assert control:
+per joined bus, each with its own `--bus`.** This is the arm line. Use it
+verbatim; do not compose one from memory:
+
+```
+while true; do dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
+  --bus <TAG> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/; done \
+  | grep --line-buffered -E "^(bus|error):"
+```
+
+⛔ **BOTH FLAGS ARE REQUIRED, AND `--recycle-seconds` IS THE ONE THAT MATTERS.**
+A bare `dsmr-bus-watch --stream` goes deaf at the first idle mark while still
+believing it is listening. The idle recycle-EXIT is what re-arms a silently-deaf
+watch; without it, a watcher that goes deaf for any reason STAYS deaf for the
+rest of the session. Do not remove it to make the watcher "keep running".
+
+⚠ **This has already cost a fleet an entire episode, and the leader is the one
+exposed.** On 2026-08-01 the leader armed a bare `--stream` and lost 38 messages
+across the most active hour on the bus while every sister self-healed inside
+thirty minutes. Nine agents carried both flags; the leader carried neither. The
+reason was this file: every other skill hands you the arm line, this one told
+you to arm a watcher without saying how, so the leader improvised. **A quiet bus
+hides this completely — the exposure is permanent and only becomes visible when
+absence starts costing something.**
+
+Then **confirm your own ears** on each of them before you assert control:
 
 ```
 dsmr-bus-watch --check-live --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
 ```
+
+⛔ **`--check-live` CANNOT DETECT A MISSING `--recycle-seconds`.** It answers
+`live` for a bare watcher exactly as it does for a correct one, so it will
+confirm your improvisation rather than catch it. It proves the watcher PROCESS
+is running; it says nothing about whether the arm line is right, and nothing
+about whether your Monitor's filter passes that process's output through to you.
 
 ⛔ **It must print `live` AND a `bus=` field naming the bus you armed.** A
 `dead`/`stale` result means the leader itself is deaf. A `bus=` naming a
@@ -255,6 +373,26 @@ Then dispatch. **By name, one worker, one task.** Never broadcast work.
 
 ---
 
+## ⛔ REQUIRED GATE: a copy-editor pass before anything reaches the operator
+
+**Every PR, and every piece of PUBLIC WORK PRODUCT that reaches a person, gets a copy-editor pass
+first** (operator, 2026-08-02). Spawn the `copy-editor` skill as a SEPARATE agent. ⛔ Never
+self-review and never let the author review its own text: you cannot unsee your own intent.
+
+**It is a second gate, not a replacement.** Keep the mechanical audit (long dashes, planning indices,
+AI attribution, the attribution footer, with a control proving the grep can fire).
+
+⚠ **The argument for it in one line: the language failures that actually reach the operator are the
+ones a pattern cannot express.** A change passed all four mechanical checks and still arrived
+carrying "measured by valis and not by me" -- a repo name as a person, an agent with a "me". No grep
+expresses that.
+
+⛔ **SCOPE, and getting this wrong wastes everyone's time in the other direction:** the gate covers
+public work product only. **It does NOT cover bus messages or anything under `.planning/`**, where
+coordination vocabulary is unrestricted and always has been (operator, 2026-08-02). ⚠ When a buffer
+you put in front of the operator CONTAINS public work product, that content is in scope while the
+coordination header around it is not. **Judge the content, not the container.**
+
 ## How a leader checks a worker's claim
 
 Check the **identification**, not the arithmetic. *"Is this the thing?"* — answered from the
@@ -274,6 +412,12 @@ still sound, and still not a hose.
   banner added on top of a banner is the failure, not the fix.
 - ⛔ Do not re-derive what a worker owns; dispatch it and check the claim.
 - ⛔ Do not let a spawned subagent take the stable bus identity.
+- ⛔ **Do not act on another leader's fleet orders.** A rotation, park, stand-down or
+  FLEET-CLEAR on a bus you merely listen to is addressed to that leader's workers, not to
+  you. Presence on their bus is not membership in their fleet.
+- ⛔ **Do not raise a fleet-wide question on another leader's bus.** Ask that leader; let
+  them dispatch it by name. Every message reaches every repo there, so a question reads as
+  a work item to all of them at once.
 - ⛔ Do not broadcast anything a single named worker could act on.
 - ⛔ Do not relay one worker's inference to another as fact. Relay fidelity is a duty for the
   operator's *words*; it is the opposite for a worker's *inferences*.

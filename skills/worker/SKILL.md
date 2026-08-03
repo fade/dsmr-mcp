@@ -26,7 +26,40 @@ Check out `PARK.md`'s `branch`; confirm live HEAD equals its `sha`.
 ⛔ **Mismatch ⇒ STOP. Report it and do no work.** That check is the only thing separating a correct
 resume from a silent divergence.
 
+⚠ **DIAGNOSE THE FIELD BEFORE COMPARING IT.** `git rev-parse HEAD` returns 40 characters. A parked
+`sha` of any other length can never match, so a comparison alone reports a **FALSE DIVERGENCE** and
+halts a repo that parked perfectly cleanly, inverting the one signal this protocol exists to provide.
+
+```bash
+parked=$(awk '/^sha:/{print $2}' .planning/PARK.md)
+case "$parked" in
+  [0-9a-f]*) [ ${#parked} -eq 40 ] || echo "FORMAT DEFECT: sha is ${#parked} chars, not 40" ;;
+  *)         echo "FORMAT DEFECT: sha unreadable" ;;
+esac
+```
+
+⇒ **A short sha is a FORMAT DEFECT, not a divergence.** Say which one you found; they call for
+opposite responses. Repair the field from `git rev-parse HEAD` and continue.
+
+**Writing it, so there is nothing to remember:** derive the field with `git rev-parse HEAD` and read
+it back from the file afterwards to confirm what landed. ⛔ Never expand or retype a short sha you
+have seen quoted, and never copy one out of a merge confirmation. ⚠ **This has happened to an agent
+whose park was otherwise exemplary** -- content-verified guard, cold gate with a proven red, archive
+with a fired control. **Care did not prevent it and more emphasis here will not either**, which is
+why the check above exists rather than another sentence telling you to be careful.
+
 No `PARK.md`? Say so plainly — do not reconstruct one from memory and present it as state.
+
+### ⛔ FIRST, CHECK ANY PR YOUR RECORD CALLS OPEN. Before you trust the rest of the file.
+
+If `PARK.md` records an open PR, **query its real state now**, before believing anything else in the
+file. If it merged or closed while you were down, `sha`, `branch` and `open_prs` are all false and so
+is every sentence making a claim about them.
+
+⚠ **This is nobody's lapse and you cannot prevent it from your side.** A PR is frequently merged
+**from outside your session**, by a leader or by the operator, and nothing in your repo can know. The
+rule that the mover updates the record in the same act is correct and does not apply, because the
+mover is not you. Reconcile, then continue.
 
 ## Step 2 — Load the plan you are working under
 
@@ -91,6 +124,83 @@ NEEDS:   <the exact literal grant, copied from the real invocation>
 WHY:     <the phase/task it gates>
 SCOPE:   <what this grant does and does NOT authorise>
 ```
+
+### ⚠ THE PREFLIGHT CANNOT COVER THE AUTO-MODE CLASSIFIER
+
+The steps above clear the gates that are **configured**. The classifier is a second gate that is not:
+a per-call model judgment refusing the call before the MCP server sees it.
+
+⛔ **Not deterministic, cannot be enumerated in advance.** The same call is allowed one session and
+refused the next with no version or config change (2026-08-02: three long-working calls refused,
+binary and both settings files provably untouched for a week). ⇒ **"It worked last session" is not
+evidence of a regression, and there is nothing to hunt for.**
+
+Two shapes trip it reliably: a call reading as **self-granted elevation** (a project root outside the
+configured tree carrying a self-asserted `human_approved: true`), and a message reading as **coaching
+another agent past a denial**, however benign.
+
+⇒ **Record it and stop.** ⛔ Never reformulate it, and never reach for a shell redirect, heredoc or
+interpreter to the same effect: a denial is final whichever tool carries it. **An agent cannot grant
+itself permissions**, so this bootstrap is the operator's, not a puzzle for you. Name the exact verb
+in `NEEDS:`; the fix is a `permissions.allow` entry, which bypasses the classifier deterministically.
+
+### ⛔ WHEN YOU CANNOT WRITE YOUR OWN `BLOCKED.md`
+
+The planning-state protection can refuse your edit. Then the report goes on the bus and nowhere else:
+
+```
+BLOCKED <repo>: <one sentence>. Cannot update my own BLOCKED.md, it is STALE as of this message.
+```
+
+Say what your file now states wrongly, so the leader carries the accurate state. ⇒ **A stale record
+you have DISCLOSED is safe; one you wrote around a gate is not.** Then park.
+
+### ⛔ OPENING A PR: RECORD IT, THEN WATCH ITS FATE
+
+A sister whose record silently goes false **decays into irrelevant senility** (operator, 2026-08-02).
+Your park record is how you stay useful across your own amnesia, and one that reads as maintained
+while being false is worse than none.
+
+**The precondition, which is part of the rule:** open a PR only AFTER the commit hooks and lint pass
+and the copy-editor gate has returned a verdict you have acted on. The watch is the last step of
+opening a PR properly, never a substitute for an earlier one.
+
+1. **Record the open PR in `PARK.md` immediately.** ⛔ This matters more than the watch and is not
+   optional.
+2. **Arm a watch on the PR's fate.**
+3. **On merge:** check out your default branch, fast-forward, delete the merged branch with
+   `git branch -d` (⛔ never `-D`; the refusal IS the safety), then reconcile `PARK.md` in ONE act:
+   `sha`, `branch`, `open_prs`, **and every sentence that makes a claim ABOUT those fields.**
+
+⚠ **That last clause is the one that rots.** A record whose `sha` field is updated while a sentence
+asserting "HEAD is X and the sha field reads that too" is not, asserts something false about itself
+while looking maintained. It has rotted that way twice.
+
+**Three ways the watch goes wrong:**
+
+- ⛔ **Watch every terminal state, not just merged.** A PR can be closed unmerged. A watch firing
+  only on `MERGED` stays armed forever on a closed PR, waiting for something that will never happen.
+  Emit on merged AND closed, then exit.
+- ⛔ **The watch dies with your session**, which is why step 1 is not optional and why the bring-up
+  check in Step 1 exists. **The watch is the fast path; the record plus the bring-up check is what
+  actually holds.**
+- ⚠ **Poll at 30s or slower.** GitHub rate-limits, and a PR's fate is not urgent to the second.
+
+### Worktree re-roots are already permitted. Do not ask.
+
+`$HOME/SourceCode/lisp-scratch` is covered by `DSMR_RELATED_PROJECTS` (`~/.zshenv`), so
+`fs-set-project-root` at any worktree beneath it needs no approval, and you must **never** self-assert
+`human_approved`.
+
+⛔ **A running server keeps its startup environment.** A refusal there usually means a server
+predating the setting, so the fix is the operator's reconnect, not a retry. Confirm from
+`/proc/<pid>/environ` on your own `dsmr.core`, never from a fresh shell, which sees the value the
+server does not.
+
+⚠ `lisp-scratch` is **outside** the ASDF registry deliberately. ⛔ Never move worktrees into the
+scanned tree, and never add it to the registry: duplicate system names resolve by scan order and
+signal nothing, producing a successful build of the WRONG source. Assert
+`(asdf:system-source-directory :<system>)` names your worktree before believing any run.
 
 ## Step 4 — Verify your memory store
 
