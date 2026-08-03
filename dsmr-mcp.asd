@@ -144,6 +144,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp"
                "dsmr-mcp/tests/smoke-test"
                "dsmr-mcp/tests/support/json-asserts"
+               "dsmr-mcp/tests/support/parachute-report"
                "dsmr-mcp/tests/support/slynk-fixture"
                "dsmr-mcp/tests/support/bounded-eval"
                "dsmr-mcp/tests/support/portability-guard"
@@ -235,7 +236,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/tools/reset-local-test"
                "dsmr-mcp/tests/tools/reset-peer-test"
                "dsmr-mcp/tests/tools/restart-process-test"
-               "dsmr-mcp/tests/bus-listener-test")
+               "dsmr-mcp/tests/bus-listener-test"
+               "dsmr-mcp/tests/report/axis-summary-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
