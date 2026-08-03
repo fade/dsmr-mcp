@@ -61,7 +61,7 @@ Verifies that the document sync module sends the correct method and
 full-text contentChanges (D-10: eager write-then-notify).
 Red until Wave-2 dsmr-mcp/src/lsp/document is loaded."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (with-temp-project-root (session root)
         (let ((notify-did-change-sym (%document-sym "NOTIFY-DID-CHANGE")))
           (declare (ignore session))
@@ -91,7 +91,7 @@ outside the session's write-jail (D-11).  This prevents LSP document sync
 from leaking information about files outside the allowed root.
 Red until Wave-2 dsmr-mcp/src/lsp/document is loaded."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (with-temp-project-root (session root)
         (let ((notify-did-change-sym (%document-sym "NOTIFY-DID-CHANGE")))
           (declare (ignore session root))

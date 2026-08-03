@@ -2,8 +2,10 @@
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
 ;;;; Integration tests for the TCP transport.
-;;;; Each test wraps its body in (if (not (socket-available-p)) (true t) ...)
-;;;; so sandboxed CI that denies the bind degrades to PASS rather than failure.
+;;;; Each test wraps its body in (if (not (socket-available-p)) (skip ...) ...)
+;;;; so an environment that denies the bind reports these tests as skipped.
+;;;; They must never report as passed there: a pass nobody earned makes the
+;;;; suite total read the same whether the transport was exercised or not.
 
 (defpackage #:dsmr-mcp/tests/transport/tcp-test
   (:use #:cl #:parachute)
@@ -69,7 +71,7 @@ execute BODY, then clean up regardless of errors."
 and returns a well-formed JSON-RPC result containing protocolVersion.
 Verifies the basic end-to-end dispatch path works over a real socket."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (let ((port-var nil))
         (let ((thr (make-thread
                     (lambda ()
@@ -101,7 +103,7 @@ Verifies the basic end-to-end dispatch path works over a real socket."
 Stopping a running server sets the thread slot to NIL.
 A second stop call when no server is running returns T without error."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (unwind-protect
            (let ((t1 (start-tcp-server-thread :host "127.0.0.1" :port 0)))
              ;; Wait for the server to be visible as running.
@@ -127,7 +129,7 @@ A second stop call when no server is running returns T without error."
 response, confirming per-connection session isolation — one client's
 dispatch cannot affect the other's response."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (let ((port-var nil)
             (server-thr nil))
         (unwind-protect
@@ -198,7 +200,7 @@ dispatch cannot affect the other's response."
 is not dropped — the heartbeat only re-checks the stop flag, it never closes
 idle client connections.  Verifies the idle-stays-open guarantee."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (let ((port-var nil))
         (let ((thr (make-thread
                     (lambda ()
@@ -234,7 +236,7 @@ idle client connections.  Verifies the idle-stays-open guarantee."
 stray *standard-output* writes from tool bodies are captured and never
 appear in the JSON-RPC wire output.  The response line must be valid JSON."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (let ((port-var nil))
         (let ((thr (make-thread
                     (lambda ()

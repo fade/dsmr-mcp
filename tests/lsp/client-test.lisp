@@ -70,7 +70,7 @@ package is not loaded."
 identical content.  Verifies that the Content-Length write/read layer is
 byte-exact and symmetric across the loopback boundary."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       ;; Wave 0: the mock server is available but the Wave-1 client package is
       ;; not yet loaded.  Test the mock's own internal round-trip symmetry
       ;; by connecting with a raw usocket and doing a manual Content-Length
@@ -104,7 +104,7 @@ server capabilities.  After sending the initialized notification the server
 marks itself ready and the client's connected-p predicate returns T.
 This test is red until the Wave-1 client package is loaded."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (progn
         (unless (%lsp-client-pkg)
           ;; Wave 0: package absent — test is red (fail with a message).
@@ -134,7 +134,7 @@ during textDocument/rangeFormatting), the client reader thread responds with
 an empty config object without stalling the pending request.
 Red until Wave-1 reader thread is implemented."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (progn
         (unless (%lsp-client-pkg)
           (fail "Wave-1 package dsmr-mcp/src/lsp/client not yet loaded."))
@@ -156,7 +156,7 @@ port instead of spawning a new child process.  The returned client has
 attached-p = T.
 Red until Wave-1 ensure-lsp-client is implemented."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (progn
         (unless (%lsp-client-pkg)
           (fail "Wave-1 package dsmr-mcp/src/lsp/client not yet loaded."))
@@ -196,7 +196,7 @@ Red until Wave-1 spawn logic is implemented."
 client object (eq), confirming the per-root registry caches the connection.
 Red until Wave-1 *lsp-registry* and ensure-lsp-client are implemented."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (progn
         (unless (%lsp-client-pkg)
           (fail "Wave-1 package dsmr-mcp/src/lsp/client not yet loaded."))

@@ -63,7 +63,7 @@ a result hash-table with an 'items' key containing a vector of completion
 entries.  Each entry has a 'label' string key.
 Red until Wave-3 bridge-completions is implemented."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (progn
         (unless (%bridge-pkg)
           (fail "Wave-3 package dsmr-mcp/src/lsp/bridge not yet loaded."))
@@ -93,7 +93,7 @@ string (no hover available at position).  It never signals an error when
 alive-lsp is up.
 Red until Wave-3 bridge-hover is implemented."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (progn
         (unless (%bridge-pkg)
           (fail "Wave-3 package dsmr-mcp/src/lsp/bridge not yet loaded."))
@@ -121,7 +121,7 @@ and returns a result hash-table containing a 'messages' key with at least one
 entry.  Each entry has 'severity' and 'message' keys.
 Red until Wave-3 bridge-diagnostics is implemented."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (progn
         (unless (%bridge-pkg)
           (fail "Wave-3 package dsmr-mcp/src/lsp/bridge not yet loaded."))
@@ -168,7 +168,7 @@ the result is an empty vector — discover never errors, it just returns what
 the server supports at the given position.
 Red until Wave-3 bridge-code-actions is implemented."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (progn
         (unless (%bridge-pkg)
           (fail "Wave-3 package dsmr-mcp/src/lsp/bridge not yet loaded."))
@@ -304,7 +304,7 @@ textDocument/rangeFormatting, not a JSON array (which would result from passing
 a Lisp cons directly) and not null (which would result from nil bounds).
 This test uses the mock server to capture the params the bridge sends."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (progn
         (unless (%bridge-pkg)
           (fail "dsmr-mcp/src/lsp/bridge not loaded."))
@@ -353,7 +353,7 @@ Verifies ordering: the mock records all inbound method strings; after the
 bridge-completions call, textDocument/didOpen must appear in the list and
 must come before textDocument/completion."
   (if (not (socket-available-p))
-      (true t)
+      (skip "no loopback TCP listen socket available in this environment; socket bind is denied here")
       (progn
         (unless (%bridge-pkg)
           (fail "dsmr-mcp/src/lsp/bridge not loaded."))
