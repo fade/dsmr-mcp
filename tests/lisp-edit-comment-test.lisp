@@ -69,7 +69,9 @@
   (:import-from #:dsmr-mcp/src/lisp-edit-comment
                 #:edit-comment
                 #:comment-operation-error
-                #:comment-operation-reason)
+                #:comment-operation-reason
+                #:%marker-position
+                #:%markers-in-span)
   (:import-from #:dsmr-mcp/src/validate
                 #:scan-parens
                 #:try-reader-check)
@@ -274,6 +276,76 @@ What sits below the datum comment is the same two definitions, and they are the
 reason the size matters.  Shrink the file by enough and a bound left in the old
 numbering points past them, so the sentence claims coverage over definitions
 the comparison never had in either list.")
+
+(defparameter +licence-header-detached+
+  (format nil ";;;; src/fixture/dispatch.lisp~%~
+;;;; SPDX-License-Identifier: AGPL-3.0-or-later~%~
+;;;; Re-implemented from another project's file (MIT) under AGPL.~%~
+;;;;~%~
+;;;; What the file does, in a paragraph.~%~
+;;;;~%~
+;;;; Key divergences from the project it came out of:~%~
+;;;; the paragraph a caller wants to rewrite.~%~%~
+(in-package :fixture-package)~%~%~
+(defun body () 1)~%")
+  "A file header written the way this project writes them.
+
+Filename, SPDX tag, attribution for incorporated third-party code, then several
+paragraphs of prose.  The paragraphs are separated by bare comment lines rather
+than by blank ones, which is what makes the whole of it a single run: naming any
+paragraph of it resolves to lines 1 to 8, and 30% of the tracked Lisp on this
+machine is shaped this way.
+
+A blank line stands between the header and the first form, so the run is
+free-standing and region mode reaches it.")
+
+(defparameter +licence-header-flush+
+  (format nil ";;;; src/fixture/dispatch.lisp~%~
+;;;; SPDX-License-Identifier: AGPL-3.0-or-later~%~
+;;;; Re-implemented from another project's file (MIT) under AGPL.~%~
+;;;;~%~
+;;;; What the file does, in a paragraph.~%~
+;;;;~%~
+;;;; Key divergences from the project it came out of:~%~
+;;;; the paragraph a caller wants to rewrite.~%~
+(in-package :fixture-package)~%~%~
+(defun body () 1)~%")
+  "The same header with the blank line under it removed.
+
+Substring anchoring sees no region here at all: the run belongs to the
+IN-PACKAGE form below it and only leading mode reaches it.  Both spellings occur
+in real source, so whatever protects the header has to hold on both.")
+
+(defparameter +marker-free-header+
+  (format nil ";;;; src/fixture/plain.lisp~%~
+;;;;~%~
+;;;; What the file does, in a paragraph mentioning a commit, a permit~%~
+;;;; and something transmitted.~%~
+;;;;~%~
+;;;; Key divergences from the module it grew out of:~%~
+;;;; the paragraph a caller wants to rewrite.~%~%~
+(in-package :fixture-package)~%~%~
+(defun body () 1)~%")
+  "+LICENCE-HEADER-DETACHED+ with nothing in it anybody owns.
+
+Same shape, same run boundaries, no licence tag and no attribution.  It is the
+control: an edit here has to go through untouched, or what protects the header
+is a block on editing headers rather than a check on what a header holds.
+
+The prose carries a commit, a permit and something transmitted on purpose.  Each
+of those has the letters of MIT inside it, and a licence check written as a
+case-insensitive substring search refuses all three.")
+
+(defparameter +attribution-without-a-phrase+
+  (format nil "(defun before () 1)~%~%~
+;;; Ported from another project's file (MIT), used here under AGPL.~%~
+;;; Notes on what changed in the port.~%~%~
+(defun after () 2)~%")
+  "An attribution carrying no licence phrase at all.
+
+No SPDX tag, no copyright line, nothing the phrase list can see.  What it does
+carry is somebody else's credit, and the licence names are the only thing in it
+that says so.  This is the shape the token half of the marker set exists for.")
 
 ;;;; -------------------------------------------------------------------------
 ;;;; Run collapsing
@@ -1059,15 +1131,20 @@ than the file had, and it reports the same shortfall whatever the replacement
 said, because the shortfall is the truncated parse rather than the content. That
 is the reading that sends someone looking for a miscomputed span, so the shape
 is pinned here: the form below the header keeps its own line, and the file still
-holds every expression it held before."
+holds every expression it held before.
+
+The replacement carries the header's licence tag because the header has one and
+an edit dropping it is refused.  That is a condition on this test rather than
+its subject: what it is here to pin is the newline, so the tag is carried
+through and the shape under examination is unchanged."
   (with-temp-project-root (session root)
     (true session)
     (let ((path (write-fixture-file root "header.lisp" +header-flush+)))
       (edit-comment (namestring root) (namestring path) "leading" "replace"
                     :form-type "in-package" :form-name "fixture-package"
-                    :content ";;;; One line, carrying no newline of its own.")
+                    :content ";;;; SPDX-License-Identifier: AGPL-3.0-or-later, and no newline.")
       (let ((updated (uiop:read-file-string path)))
-        (is string= (format nil ";;;; One line, carrying no newline of its own.~%~
+        (is string= (format nil ";;;; SPDX-License-Identifier: AGPL-3.0-or-later, and no newline.~%~
 (in-package :fixture-package)~%~%(defun body () 1)~%")
             updated)
         (flet ((expression-count (source)
@@ -1679,3 +1756,308 @@ that quietly moved either one fails here."
                       summary))
         (true (search "counting lines in the file as this edit leaves it"
                       summary))))))
+
+(define-test marker-detection-discriminates-on-what-it-reads
+  "The marker scan before it is driven through the verb, at the level where its
+two rules can be told apart.
+
+Phrases match case-insensitively anywhere, which is how a notice set in capitals
+is caught.  Licence names match case-sensitively and only as whole tokens, which
+is the rule that keeps the scan usable: a case-insensitive substring search for
+MIT refuses every comment mentioning a commit, and a check that fires on
+ordinary prose gets switched off.
+
+Both halves of that trade are pinned here.  The token rule has to find AGPL
+inside a version-suffixed tag, has to find LLGPL without GPL also answering for
+it, and has to find nothing at all in a sentence about commits."
+  (flet ((markers (text) (%markers-in-span text 0 (length text))))
+    ;; Phrases, in the spellings a notice actually arrives in.
+    (is equal '(("SPDX-License-Identifier" . 1))
+        (markers ";;;; SPDX-License-Identifier: CC-PDDC"))
+    (is equal '(("Copyright" . 1)) (markers ";; copyright 2026 somebody"))
+    (is equal '(("All rights reserved" . 1)) (markers ";; ALL RIGHTS RESERVED."))
+    (is equal '(("Licensed under" . 1)) (markers ";; Licensed under the terms below."))
+    ;; A version-suffixed tag still names its licence.
+    (true (assoc "AGPL" (markers ";; under AGPL-3.0-or-later") :test #'string=))
+    ;; LLGPL answers for itself and GPL does not answer for it.
+    (is equal '(("LLGPL" . 1)) (markers ";; under the LLGPL, as it happens"))
+    ;; The control: prose with the letters of a licence name buried in it.
+    (is eq nil (markers ";; a commit, a permit, and something transmitted"))
+    (is eq nil (markers ";; the mit and bsd spellings in lowercase running prose"))
+    ;; The line reported is the line the marker is on rather than the line the
+    ;; span starts on, which is the whole use a caller has for it.
+    (is equal '(("Copyright" . 3))
+        (markers (format nil ";; one~%;; two~%;; Copyright somebody~%")))
+    ;; And the scan is bounded by the span it was given rather than by the file.
+    (let ((text (format nil ";; one~%;; Copyright somebody~%")))
+      (is eq nil (%markers-in-span text 0 (1+ (position #\Newline text)))))
+    ;; The presence test the escape hatch turns on reads the same rules.
+    (true (%marker-position ";;;; SPDX-License-Identifier: AGPL-3.0-or-later"
+                            "SPDX-License-Identifier"))
+    (is eq nil (%marker-position ";; nothing owned here" "Copyright"))))
+
+(define-test licence-header-refuses-a-region-replace-that-drops-it
+  "The measured defect, driven end to end.
+
+A caller names the last paragraph of a file header.  The run is the addressable
+unit, and our headers separate their paragraphs with comment lines rather than
+blank ones, so the substring resolves to the whole header: the filename line,
+the SPDX tag and the attribution for incorporated third-party code, none of
+which the caller named and none of which the replacement carries.
+
+Nothing downstream reports that.  Comment text is not a form, so the comparison
+of everything the file holds outside its comments passes with the tag gone and
+says so in as many words.  The refusal is the only thing between the caller and
+a file with no licence on it.
+
+The span the edit would have covered is asserted before the refusal is, so a
+green here means the header really was in the line of fire rather than that
+something else quietly moved the target."
+  (with-temp-project-root (session root)
+    (true session)
+    ;; Precondition: the paragraph named resolves to the whole header.
+    (let ((regions (%comment-regions (nodes-of +licence-header-detached+)
+                                     +licence-header-detached+)))
+      (is = 1 (length regions))
+      (let ((region (first regions)))
+        (is equal '(1 8) (multiple-value-list (%region-line-range region)))
+        (true (search "SPDX-License-Identifier" (%region-text region)))
+        (true (search "(MIT) under AGPL" (%region-text region)))
+        (true (search "Key divergences" (%region-text region)))))
+    (let* ((path (write-fixture-file root "licensed-header.lisp"
+                                     +licence-header-detached+))
+           (err (error-from
+                 (lambda ()
+                   (edit-comment (namestring root) (namestring path)
+                                 "region" "replace"
+                                 :substring "Key divergences from the project"
+                                 :content (format nil ";;;; Key divergences, rewritten.~%"))))))
+      (true (typep err 'comment-operation-error))
+      (let ((reason (comment-operation-reason err)))
+        ;; Which marker, and the line it is on, both anchored to the fixture
+        ;; rather than written out here.
+        (true (search (format nil "SPDX-License-Identifier on line ~D"
+                              (line-holding +licence-header-detached+
+                                            "SPDX-License-Identifier"))
+                      reason))
+        ;; And what the caller does about it.
+        (true (search "Include that text in content" reason)))
+      ;; The file is byte for byte what it was.
+      (is string= +licence-header-detached+ (uiop:read-file-string path)))))
+
+(define-test licence-header-replace-carrying-the-marker-through-is-allowed
+  "The escape hatch, and the reason there is no override flag.
+
+A caller rewriting a header writes the licence line into the new header, which
+is what a correct rewrite looks like in any case.  Doing that is what permits
+the edit, so the way past the refusal is the same act as doing the job properly,
+and it is self-documenting in the caller's own arguments.
+
+Driven against the file that was refused a moment ago, so what separates the two
+is the content and nothing else."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((path (write-fixture-file root "licensed-header-kept.lisp"
+                                     +licence-header-detached+))
+           (replacement (format nil ";;;; src/fixture/dispatch.lisp~%~
+;;;; SPDX-License-Identifier: AGPL-3.0-or-later~%~
+;;;; Re-implemented from another project's file (MIT) under AGPL.~%~
+;;;;~%~
+;;;; Key divergences, rewritten.~%")))
+      (edit-comment (namestring root) (namestring path) "region" "replace"
+                    :substring "Key divergences from the project"
+                    :content replacement)
+      (let ((written (uiop:read-file-string path)))
+        ;; The notice survived.
+        (true (search ";;;; SPDX-License-Identifier: AGPL-3.0-or-later" written))
+        (true (search "(MIT) under AGPL" written))
+        ;; The edit the caller wanted happened.
+        (true (search "Key divergences, rewritten." written))
+        (false (search "What the file does, in a paragraph." written))
+        ;; And the code below the header is where it was.
+        (true (search "(in-package :fixture-package)" written))
+        (true (search "(defun body () 1)" written))))))
+
+(define-test licence-header-refuses-a-delete-outright
+  "A delete has no content for a marker to survive in, so there is no version of
+it that can be allowed.  It is refused with the reason named, and the caller is
+pointed at the operation that can be permitted."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((path (write-fixture-file root "licensed-header-delete.lisp"
+                                     +licence-header-detached+))
+           (err (error-from
+                 (lambda ()
+                   (edit-comment (namestring root) (namestring path)
+                                 "region" "delete"
+                                 :substring "Key divergences from the project")))))
+      (true (typep err 'comment-operation-error))
+      (let ((reason (comment-operation-reason err)))
+        (true (search "SPDX-License-Identifier on line" reason))
+        (true (search "no replacement text" reason)))
+      (is string= +licence-header-detached+ (uiop:read-file-string path)))))
+
+(define-test attribution-without-a-licence-phrase-is-still-refused
+  "The case the phrase list cannot see.
+
+An attribution for incorporated third-party code often carries no SPDX tag and
+no copyright line: it says where the code came from and under which licence, and
+the licence name is the only marker in it.  Dropping such a line strips somebody
+else's credit, which is why the licence names are in the marker set at all.
+
+This is what the token half of the set buys, so it is driven on its own rather
+than left to the header case, where an SPDX tag would have refused it anyway."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((path (write-fixture-file root "attribution.lisp"
+                                     +attribution-without-a-phrase+))
+           (err (error-from
+                 (lambda ()
+                   (edit-comment (namestring root) (namestring path)
+                                 "region" "replace"
+                                 :substring "Notes on what changed"
+                                 :content (format nil ";;; Rewritten notes.~%"))))))
+      (true (typep err 'comment-operation-error))
+      (let ((reason (comment-operation-reason err)))
+        (true (or (search "MIT on line" reason) (search "AGPL on line" reason))))
+      (is string= +attribution-without-a-phrase+ (uiop:read-file-string path)))))
+
+(define-test marker-free-run-still-edits-normally
+  "The control, and the assertion that says the guard discriminates.
+
+Same header shape, same run boundaries, same paragraph named, nothing in it
+anybody owns.  The edit goes through and the file changes.  Without this a
+refusal on every header would pass every other test in this group, and what had
+shipped would be a block on editing headers rather than a check on what a header
+holds.
+
+The banner case is driven too, since an ordinary comment between two forms is
+what this verb is for and it has to stay reachable, deleting included."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((path (write-fixture-file root "unlicensed-header.lisp"
+                                     +marker-free-header+))
+           (replacement (format nil ";;;; src/fixture/plain.lisp~%~
+;;;;~%~
+;;;; Key divergences, rewritten.~%")))
+      (edit-comment (namestring root) (namestring path) "region" "replace"
+                    :substring "Key divergences from the module"
+                    :content replacement)
+      (let ((written (uiop:read-file-string path)))
+        (true (search "Key divergences, rewritten." written))
+        (false (search "something transmitted" written))
+        (true (search "(defun body () 1)" written))))
+    ;; And deleting a marker-free run is still a delete.
+    (let ((path (write-fixture-file root "plain-banner.lisp"
+                                    +banner-between-forms+)))
+      (edit-comment (namestring root) (namestring path) "region" "delete"
+                    :substring "Descriptor passing.")
+      (false (search "Descriptor passing." (uiop:read-file-string path))))))
+
+(define-test leading-mode-shares-the-licence-exposure
+  "Leading mode reaches the same run by a different name, so it is exposed the
+same way and is covered by the same check.
+
+The header here sits flush on the form below it, which is the ordinary shape of
+a Lisp source file.  Substring anchoring sees no free-standing region in it at
+all: naming the IN-PACKAGE form is the only way in, and it resolves to the whole
+header, licence tag included.  A check written into either way of naming a
+comment would have left this open, which is why it is written against the offset
+the splice settled on instead.
+
+All three arms are driven here rather than inferred from the region case: the
+refusal, the delete, and the escape hatch."
+  (with-temp-project-root (session root)
+    (true session)
+    ;; Precondition: region mode cannot reach this run, so what follows really
+    ;; is testing the other way in.
+    (is = 0 (length (region-texts +licence-header-flush+)))
+    ;; Refused.
+    (let* ((path (write-fixture-file root "flush-header.lisp"
+                                     +licence-header-flush+))
+           (err (error-from
+                 (lambda ()
+                   (edit-comment (namestring root) (namestring path)
+                                 "leading" "replace"
+                                 :form-type "in-package"
+                                 :form-name "fixture-package"
+                                 :content (format nil ";;;; Rewritten header.~%"))))))
+      (true (typep err 'comment-operation-error))
+      (true (search "SPDX-License-Identifier on line" (comment-operation-reason err)))
+      (is string= +licence-header-flush+ (uiop:read-file-string path)))
+    ;; Refused for a delete as well.
+    (let* ((path (write-fixture-file root "flush-header-delete.lisp"
+                                     +licence-header-flush+))
+           (err (error-from
+                 (lambda ()
+                   (edit-comment (namestring root) (namestring path)
+                                 "leading" "delete"
+                                 :form-type "in-package"
+                                 :form-name "fixture-package")))))
+      (true (typep err 'comment-operation-error))
+      (true (search "no replacement text" (comment-operation-reason err)))
+      (is string= +licence-header-flush+ (uiop:read-file-string path)))
+    ;; Allowed when the replacement carries the notice through.
+    (let ((path (write-fixture-file root "flush-header-kept.lisp"
+                                    +licence-header-flush+)))
+      (edit-comment (namestring root) (namestring path) "leading" "replace"
+                    :form-type "in-package" :form-name "fixture-package"
+                    :content (format nil ";;;; src/fixture/dispatch.lisp~%~
+;;;; SPDX-License-Identifier: AGPL-3.0-or-later~%~
+;;;; Re-implemented from another project's file (MIT) under AGPL.~%~
+;;;; Rewritten header.~%"))
+      (let ((written (uiop:read-file-string path)))
+        (true (search ";;;; SPDX-License-Identifier: AGPL-3.0-or-later" written))
+        (true (search "Rewritten header." written))
+        (false (search "Key divergences" written))
+        (true (search "(defun body () 1)" written))))))
+
+(define-test refusal-happens-on-a-dry-run-too
+  "A preview that showed the header being replaced and then refused the apply
+would be worse than no preview at all: a caller reads the preview as the answer.
+The check sits ahead of the dry-run branch, so both paths give the same answer
+and neither writes."
+  (with-temp-project-root (session root)
+    (true session)
+    (let* ((path (write-fixture-file root "dry-licensed.lisp"
+                                     +licence-header-detached+))
+           (err (error-from
+                 (lambda ()
+                   (edit-comment (namestring root) (namestring path)
+                                 "region" "replace"
+                                 :substring "Key divergences from the project"
+                                 :content (format nil ";;;; Rewritten.~%")
+                                 :dry-run t)))))
+      (true (typep err 'comment-operation-error))
+      (true (search "SPDX-License-Identifier on line" (comment-operation-reason err)))
+      (is string= +licence-header-detached+ (uiop:read-file-string path)))))
+
+(define-test verification-sentence-says-what-it-did-not-check
+  "The sentence reporting a successful comparison used to end there, and it read
+as a blanket all-clear on an edit that had just taken a licence tag out of the
+file.  Every word of it was true.  What made it misleading was the omission: it
+named what had been compared and said nothing about the one kind of byte this
+verb is allowed to remove.
+
+So the qualifier is asserted on both sentences that report a comparison, the
+whole-file one and the truncated one, and it is asserted to name comment text
+specifically rather than to be any additional words at all."
+  (with-temp-project-root (session root)
+    ;; Whole-file comparison.
+    (multiple-value-bind (bound written summary)
+        (edit-and-read session root "qualified.lisp" +banner-between-forms+
+                       "Descriptor passing." "replace"
+                       (format nil ";;; Rewritten.~%"))
+      (declare (ignore written))
+      (is eq nil bound)
+      (true (search "Every form in the file was compared" summary))
+      (true (search "Comment text is not a form" summary)))
+    ;; Truncated comparison: the qualifier rides along there too.
+    (multiple-value-bind (bound written summary)
+        (edit-and-read session root "qualified-truncated.lisp"
+                       +definitions-below-a-datum-comment+
+                       "Banner." "replace" (format nil ";; Rewritten.~%"))
+      (declare (ignore written))
+      (true (integerp bound))
+      (true (search "Every form through line" summary))
+      (true (search "Comment text is not a form" summary)))))

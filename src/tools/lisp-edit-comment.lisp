@@ -52,7 +52,10 @@ before anything is written, and the result says how far down the file that \
 proof reached: a file the reader cannot get through, most often because of a \
 #; datum comment, is parsed only as far as that point, and forms below it are \
 not compared. An anchor naming no comment or more than one fails without \
-writing. Use this instead of a plain text edit when changing \
+writing. The whole contiguous run is what gets replaced, and a file header is \
+one run: an edit that would take a licence, copyright or attribution marker out \
+of the file is refused unless content carries that text through, and a delete of \
+such a run is refused outright. Use this instead of a plain text edit when changing \
 comments in Lisp source. Adding a brand new comment is not offered here: \
 lisp-edit-form insert_before already places one relative to a form.")
    (dsmr-mcp/src/tools/base::input-schema
@@ -110,7 +113,9 @@ run's own bytes, and those bytes end after the newline closing the comment's las
 line: when the text does not end in a newline, one is supplied, so the blank line \
 below the comment survives and the comment can still be found by substring \
 afterwards. Line endings are converted to the ones the file already uses. The \
-empty string is spliced exactly as given.")
+empty string is spliced exactly as given. When the comment being replaced carries \
+a licence, copyright or attribution marker, this text has to carry the same marker \
+or the edit is refused.")
                  (dry_run
                   :type :boolean
                   :description "When true, return a preview without writing to disk.")
@@ -140,6 +145,17 @@ previews the exact text that would be written."))
   "Return T when VALUE is a string with at least one character in it."
   (and value (stringp value) (plusp (length value))))
 
+(defparameter *comment-text-uncovered*
+  "Comment text is not a form, so none of that covers the comment bytes this edit \
+removes; the before block below is the whole of them."
+  "The qualifier carried by every sentence reporting a successful comparison.
+
+Without it the sentence reads as a blanket all-clear, and it was read that way
+in the one case where it mattered: a header edit that took an SPDX tag out of a
+file reported that every form had come back unchanged, which was true and told
+the caller nothing about what had just gone.  Saying what the comparison did
+not look at is what stops a true sentence from carrying a false reassurance.")
+
 (defun %verification-line (report)
   "Return the sentence stating what the form comparison actually established.
 
@@ -160,20 +176,24 @@ wrong about which file's lines it was counting, which put the same falsehood
 back on a shrinking edit.  The sentence now says which file it is counting in,
 once, and both mentions of the number in it are covered by that.  A number with
 no file named against it cannot be checked by the person reading it, and that
-is what let the second version through review."
+is what let the second version through review.
+
+Both sentences reporting a comparison end in *COMMENT-TEXT-UNCOVERED*, which
+names the one thing the comparison never looked at."
   (let ((verified (gethash "forms_verified_unchanged" report))
         (through  (gethash "forms_verified_through" report)))
     (cond
       ((not verified)
        "Nothing changed, so there was no comparison to run.")
       ((null through)
-       "Every form in the file was compared against the original and came back unchanged.")
+       (format nil "Every form in the file was compared against the original and ~
+came back unchanged. ~A" *comment-text-uncovered*))
       ((and (integerp through) (plusp through))
        (format nil "Every form through line ~D was compared against the original ~
 and came back unchanged, counting lines in the file as this edit leaves it. The ~
 file does not parse past there, so nothing below line ~D was compared and ~
-nothing is claimed about it."
-               through through))
+nothing is claimed about it. ~A"
+               through through *comment-text-uncovered*))
       (t
        (format nil "The file does not parse at all, so no form in it could be ~
 compared against the original. Only the named comment text was changed.")))))
