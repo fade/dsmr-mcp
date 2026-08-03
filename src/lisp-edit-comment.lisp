@@ -44,6 +44,15 @@
 ;;;; even read, since the only thing available to close it is something already
 ;;;; sitting below the comment.  Every check here runs before the write branch,
 ;;;; so a rejected edit leaves the file exactly as it was.
+;;;;
+;;;; One further refusal is about what the run holds rather than about where
+;;;; it sits.  A run carrying a licence, copyright or attribution marker is not
+;;;; edited unless the replacement carries the same marker through, and is
+;;;; never deleted.  A file header is one run, so naming any paragraph of one
+;;;; reaches the SPDX tag above it, and nothing further down would report the
+;;;; loss: comment text is not a form, so the comparison described above passes
+;;;; with the tag gone.  Keeping the line in the replacement is the whole way
+;;;; past the refusal, which is why there is no flag for it.
 
 (defpackage #:dsmr-mcp/src/lisp-edit-comment
   (:use #:cl)
@@ -102,9 +111,10 @@
   (:documentation "Signalled for expected comment-edit failures: an anchor that
 names no comment region or more than one, replacement text that leaves a
 delimiter open, a run that does not begin its own line and so belongs to the
-code beside it, and a splice whose result no longer holds everything the file
-held outside its comments.  The file is never written when this condition is
-signalled."))
+code beside it, a splice whose result no longer holds everything the file held
+outside its comments, and an edit that would take a licence or copyright marker
+out of the file without carrying it through.  The file is never written when
+this condition is signalled."))
 
 ;;;; -------------------------------------------------------------------------
 ;;;; Splice
@@ -262,6 +272,137 @@ the comment would be re-typed by whatever closes it. Nothing was written."
                              (getf parens :line)
                              (getf parens :column)))))
   t)
+
+(defparameter *licence-phrase-markers*
+  '("SPDX-License-Identifier"
+    "SPDX-FileCopyrightText"
+    "Copyright"
+    "All rights reserved"
+    "Licensed under")
+  "Phrases whose presence in a comment makes that comment a licence notice.
+
+Matched case-insensitively and anywhere in the text, so a notice set in capitals
+counts and so does the word copyrighted.  Each is long enough, and far enough
+from anything ordinary comment prose reaches for, that a match is evidence
+rather than coincidence.")
+
+(defparameter *licence-token-markers*
+  '("MIT" "BSD" "ISC" "MPL" "GPL" "LGPL" "AGPL" "LLGPL" "Apache")
+  "Licence names that identify a notice on their own, with no phrase beside them.
+
+They are here for the attribution line that carries no phrase at all, of the
+shape \"re-implemented from someone else's file (MIT) under AGPL\".  The phrase
+list cannot see such a line, and losing it strips a third party's credit just as
+surely as losing an SPDX tag strips ours.
+
+Matched case-sensitively and only as whole tokens, which is what keeps the list
+usable.  Case-insensitive substring matching would make MIT refuse every comment
+that mentions a commit, a permit, or anything transmitted, and a guard that
+fires on ordinary prose is a guard somebody turns off.  Whole-token matching
+also stops GPL from firing inside LLGPL, which has its own entry here.
+
+What the narrower rule gives up is a lowercase mention of a licence in running
+prose, which is not refused.  That is the intended trade: the notices this guard
+exists for are written the way notices are written.")
+
+(defun %token-marker-p (marker)
+  "Return T when MARKER is matched as a whole token rather than as a phrase."
+  (and (member marker *licence-token-markers* :test #'string=) t))
+
+(defun %delimited-token-at-p (text index token)
+  "Return T when TOKEN sits at INDEX in TEXT with nothing alphanumeric either side.
+
+The characters either side are read out of the whole of TEXT rather than out of
+the span being examined, so AGPL-3.0-or-later answers for AGPL and the commit in
+a sentence answers for nothing."
+  (let ((end (+ index (length token)))
+        (limit (length text)))
+    (and (<= end limit)
+         (string= token text :start2 index :end2 end)
+         (or (zerop index) (not (alphanumericp (char text (1- index)))))
+         (or (= end limit) (not (alphanumericp (char text end)))))))
+
+(defun %marker-position (text marker &optional (start 0) (end (length text)))
+  "Return where MARKER first appears in TEXT between START and END, or NIL.
+
+One function answers for both halves of the check, the bytes going out and the
+text coming in, so a marker cannot be found by one rule and looked for by
+another."
+  (if (%token-marker-p marker)
+      (loop for index = (search marker text :start2 start :end2 end)
+              then (search marker text :start2 (1+ index) :end2 end)
+            while index
+            when (%delimited-token-at-p text index marker)
+              return index)
+      (search marker text :start2 start :end2 end :test #'char-equal)))
+
+(defun %markers-in-span (text start end)
+  "Return the licence markers TEXT carries between START and END.
+
+Each entry pairs the marker with the 1-based line of TEXT its first occurrence
+begins on, in line order, at most one entry per marker.  A caller has to account
+for every distinct marker in any case, and repeating one for each line it
+appears on would bury the others."
+  (let ((found '()))
+    (dolist (marker (append *licence-phrase-markers* *licence-token-markers*))
+      (let ((at (%marker-position text marker start end)))
+        (when at
+          (push (cons marker (%line-at-offset text at)) found))))
+    (stable-sort (nreverse found) #'< :key #'cdr)))
+
+(defun %verify-licence-markers-preserved (original removed-start removed-end
+                                          operation inserted line-start line-end)
+  "Signal COMMENT-OPERATION-ERROR when the edit would drop a licence notice.
+
+The run is the unit this verb edits, and in real source a run holds far more
+than the paragraph a caller names.  Our own file headers put the filename, the
+SPDX tag, an attribution and several paragraphs of prose in one run, separated
+by comment lines rather than by blank ones, so naming any paragraph of such a
+header resolves to the whole of it.  Replacing one paragraph takes the licence
+tag with it, and nothing downstream reports the loss: comment text is not a
+form, so the comparison of everything the file holds outside its comments passes
+with the tag gone and reads as a clean result.
+
+An SPDX tag is read by licence scanners, by inventory tooling and by distribution
+packaging, none of which is ours, and an attribution line is somebody else's
+credit.  Losing either is not a formatting slip.
+
+So the check runs on the caller's own arguments against the span the splice
+resolved, before anything is written, and it refuses in one direction only: a
+replacement carrying the marker through is allowed, one that does not is not.
+Keeping the line in the replacement is the whole escape hatch, and it is why
+there is no flag to override this.  A flag would be reached for by exactly the
+caller who has not read what the run contains, and the defect would be back.  A
+caller genuinely rewriting a header writes the licence line into the new header,
+which is what a correct rewrite looks like in any case.
+
+Deleting is refused outright, since a delete has no replacement text a marker
+could survive in.
+
+The marker has to appear in the replacement, not the same line of it.  A caller
+who keeps one of two copyright lines and drops the other gets through, which is
+the limit of what a check on the caller's arguments can see.  It is the loss of
+the notice altogether that this closes."
+  (let ((markers (%markers-in-span original removed-start removed-end)))
+    (when markers
+      (let ((lost (if (eq operation :replace)
+                      (remove-if (lambda (entry)
+                                   (%marker-position inserted (car entry)))
+                                 markers)
+                      markers)))
+        (when lost
+          (error 'comment-operation-error
+                 :reason
+                 (format nil "the comment run from line ~D to line ~D carries a ~
+licence or copyright marker this edit would remove: ~{~{~A on line ~D~}~^, ~}. ~A ~
+Nothing was written."
+                         line-start line-end
+                         (mapcar (lambda (entry) (list (car entry) (cdr entry)))
+                                 lost)
+                         (if (eq operation :replace)
+                             "The whole contiguous run is what this verb replaces, so a header above the paragraph named goes out with it. Include that text in content and the edit is allowed."
+                             "A delete has no replacement text for it to survive in. Replace the run with content carrying the marker instead."))))))
+    t))
 
 (defun %non-comment-nodes (nodes)
   "Return every node of NODES that is not comment text.
@@ -731,6 +872,12 @@ open, a comment that begins after code on the same line, and a splice whose
 result no longer holds everything the file held outside its comments.  Every
 one of those checks runs before the write branch is reached.
 
+A run carrying a licence, copyright or attribution marker is refused too,
+unless the same marker text appears in CONTENT.  A delete of such a run is
+refused outright.  The run is the unit edited and a file header is one run, so
+naming a paragraph of a header reaches the SPDX tag above it; carrying the tag
+into the replacement is what permits the edit.
+
 A file that already fails to balance or to read is still editable.  The two
 whole-file checks run against the original first, and one the file was already
 failing is skipped rather than charged to the edit, with the fact reported.
@@ -794,6 +941,14 @@ Returns:
       (multiple-value-bind (updated removed-start removed-end inserted)
           (%splice original start end operation-key
                    (if (eq operation-key :delete) "" content))
+        ;; Sited here for the same reason as the check above it: it reads the
+        ;; span the splice actually settled on, so it covers every way of
+        ;; naming a comment and a further way inherits it. It runs before the
+        ;; dry-run branch as well as before the write, so a preview reports the
+        ;; refusal instead of showing a caller a header it is not going to get.
+        (%verify-licence-markers-preserved original removed-start removed-end
+                                          operation-key inserted
+                                          region-start-line region-end-line)
         (let ((would-change (not (string= original updated)))
               (forms-verified nil)
               (forms-verified-through nil)

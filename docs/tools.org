@@ -640,7 +640,10 @@ before anything is written, and the result says how far down the file that
 proof reached: a file the reader cannot get through, most often because of a 
 #; datum comment, is parsed only as far as that point, and forms below it are 
 not compared. An anchor naming no comment or more than one fails without 
-writing. Use this instead of a plain text edit when changing 
+writing. The whole contiguous run is what gets replaced, and a file header is 
+one run: an edit that would take a licence, copyright or attribution marker out 
+of the file is refused unless content carries that text through, and a delete of 
+such a run is refused outright. Use this instead of a plain text edit when changing 
 comments in Lisp source. Adding a brand new comment is not offered here: 
 lisp-edit-form insert_before already places one relative to a form.
 
@@ -648,7 +651,7 @@ lisp-edit-form insert_before already places one relative to a form.
 {
   "properties": {
     "content": {
-      "description": "Replacement comment text, including its own comment \ncharacters. Required for replace; ignored for delete. It replaces the comment \nrun's own bytes, and those bytes end after the newline closing the comment's last \nline: when the text does not end in a newline, one is supplied, so the blank line \nbelow the comment survives and the comment can still be found by substring \nafterwards. Line endings are converted to the ones the file already uses. The \nempty string is spliced exactly as given.",
+      "description": "Replacement comment text, including its own comment \ncharacters. Required for replace; ignored for delete. It replaces the comment \nrun's own bytes, and those bytes end after the newline closing the comment's last \nline: when the text does not end in a newline, one is supplied, so the blank line \nbelow the comment survives and the comment can still be found by substring \nafterwards. Line endings are converted to the ones the file already uses. The \nempty string is spliced exactly as given. When the comment being replaced carries \na licence, copyright or attribution marker, this text has to carry the same marker \nor the edit is refused.",
       "type": "string"
     },
     "dry_run": {
