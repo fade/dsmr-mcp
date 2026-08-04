@@ -29,6 +29,9 @@
            #:*claude-md-template*
            #:*readme-template*
            #:*gitignore-template*
+           #:*mallet-config-template*
+           #:*lint-lisp-template*
+           #:*pre-commit-hook-template*
            #:*prompt-template*
            #:*envrc-template*
            #:*license-template*
@@ -517,6 +520,132 @@ bin/
 .dsmr-slynk.port
 "
   "Template for the generated project's .gitignore.")
+
+;;; ---------------------------------------------------------------------------
+;;; Quality-gate templates: linter config, lint runner, pre-commit hook
+;;;
+;;; These three are one unit. Across the repositories measured on this host the
+;;; linter config and the lint script co-occur exactly, and the hook is what
+;;; makes either of them take effect, so a partial install is a shape that does
+;;; not occur in practice and should not be reported as three separate misses.
+;;; ---------------------------------------------------------------------------
+
+(defparameter *mallet-config-template*
+  "(:mallet-config
+ (:extends :default)
+
+ ;; This is a package-inferred system: each file's defpackage imports the
+ ;; symbols it consumes, and some of those imports exist to be re-exported or
+ ;; used across a package boundary by a sibling package. The linter reads one
+ ;; file at a time and cannot see the cross-package use, so it reports those
+ ;; imports as unused. Keeping them explicit is what documents each file's real
+ ;; dependency surface.
+ (:disable :unused-imported-symbols)
+
+ ;; The gate is new and the code is not. What it reports on a first run is a
+ ;; record of what is already here rather than a claim that any of it is wrong.
+ ;; Holding these categories below the failing threshold keeps every site
+ ;; visible without blocking a commit, which is the only way the record
+ ;; survives: a rule that blocks before the codebase can satisfy it just gets
+ ;; switched off, and switched off it reports nothing at all. Raising them is a
+ ;; deliberate decision to take once the reports have been worked through.
+ (:set-severity :style {{gate-severity}})
+ (:set-severity :cleanliness {{gate-severity}}))
+"
+  "Template for a project's .mallet.lisp linter configuration.
+Carries a {{gate-severity}} placeholder for the severity a newly installed
+gate starts at, which is supplied per project rather than fixed here. The only
+blanket disable is one this project can defend from its own structure; every
+other suppression belongs to the repository that needs it, with its own reason
+written beside it.")
+
+(defparameter *lint-lisp-template*
+  "#!/usr/bin/env bash
+# scripts/lint-lisp.sh: run the mallet linter over this project's Lisp sources.
+#
+# Usage: ./scripts/lint-lisp.sh [file ...]
+#   With no arguments, lints every .lisp file under src/ and tests/.
+#
+# The linter is invoked by absolute path deliberately. A binary named 'mallet'
+# on PATH belongs to an unrelated Java toolkit that happens to share the name,
+# and reaching it instead would either fail in a confusing way or appear to
+# succeed having linted nothing. Set MALLET to override the location.
+#
+# SPDX-License-Identifier: {{spdx}}
+
+set -euo pipefail
+
+MALLET=\"${MALLET:-$HOME/.local/share/mallet/mallet}\"
+PROJECT_ROOT=\"$(cd \"$(dirname \"$0\")/..\" && pwd)\"
+
+if [ ! -x \"$MALLET\" ]; then
+  echo \"lint-lisp: no linter at $MALLET\" >&2
+  echo \"lint-lisp: install it there, or set MALLET to its location.\" >&2
+  exit 127
+fi
+
+cd \"$PROJECT_ROOT\"
+
+if [ \"$#\" -gt 0 ]; then
+  exec \"$MALLET\" \"$@\"
+fi
+
+SOURCES=()
+while IFS= read -r file; do
+  SOURCES+=(\"$file\")
+done < <(find src tests -type f -name '*.lisp' 2>/dev/null | sort)
+
+if [ \"${#SOURCES[@]}\" -eq 0 ]; then
+  echo \"lint-lisp: no .lisp files under src/ or tests/; nothing to lint.\" >&2
+  exit 0
+fi
+
+exec \"$MALLET\" \"${SOURCES[@]}\"
+"
+  "Template for a project's scripts/lint-lisp.sh.
+Runs the linter over src/ and tests/, or over the files named on the command
+line. Exits non-zero when the linter reports a violation at or above its
+failing threshold, which is what lets the pre-commit hook be a gate rather
+than a notification.")
+
+(defparameter *pre-commit-hook-template*
+  "#!/usr/bin/env bash
+# pre-commit: refuse a commit the Lisp linter rejects.
+#
+# This hook lives under the repository's git directory, which is never part of
+# the working tree and never reaches an upstream. That is what makes it safe to
+# install in a repository we do not own: it changes nothing a maintainer sees.
+#
+# It runs the repository's own scripts/lint-lisp.sh and nothing else, with no
+# arguments taken from the commit.
+#
+# Bypass a single commit with: git commit --no-verify
+#
+# SPDX-License-Identifier: {{spdx}}
+
+set -euo pipefail
+
+REPO_ROOT=\"$(git rev-parse --show-toplevel)\"
+LINT=\"$REPO_ROOT/scripts/lint-lisp.sh\"
+
+if [ ! -x \"$LINT\" ]; then
+  echo \"pre-commit: $LINT is missing or not executable.\" >&2
+  echo \"pre-commit: the Lisp gate is NOT running for this commit.\" >&2
+  exit 0
+fi
+
+if ! \"$LINT\"; then
+  echo >&2
+  echo \"pre-commit: the Lisp linter rejected this tree.\" >&2
+  echo \"pre-commit: fix the reports above, or commit with --no-verify.\" >&2
+  exit 1
+fi
+"
+  "Template for a project's pre-commit hook.
+Invokes only the repository's own lint script, with no data interpolated from
+the commit being made. Announces loudly and lets the commit through when the
+lint script is absent: an incompletely installed gate should be visible, not a
+wall that blocks every commit in the repository until someone reinstalls it.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; REPL-driven-development prompt template (D-12)
