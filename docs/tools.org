@@ -1085,6 +1085,55 @@ standby_count, bound_count, max_pool_size, warmup_target, and a workers array.
 }
 #+end_src
 
+* project-doctor
+
+Normalise an existing repository into the project shape without 
+destroying what is there. Assesses by default and writes nothing; repairs, 
+records as debt, or accepts a deviation as deliberate only when a policy says 
+so, and reports every change separately from what was already correct. A 
+repository that cannot be told apart from one of ours is not guessed at: the 
+call returns the question, the origin it found and the answers it accepts, and 
+a second call carries the answer.
+
+#+begin_src json
+{
+  "properties": {
+    "classification": {
+      "description": "The answer to the classification question, when \nthe repository cannot be told apart from one of ours. Supplied by the operator \nand never inferred: guessing that somebody else's software is ours is how our \ntooling ends up tracked in their tree.",
+      "enum": [
+        "ours",
+        "foreign-with-upstream",
+        "foreign-orphan"
+      ],
+      "type": "string"
+    },
+    "dry_run": {
+      "description": "Report what would change and write nothing. The \nreport has the same shape either way.",
+      "type": "boolean"
+    },
+    "path": {
+      "description": "Repository directory, relative to the session \nroot. Defaults to the session root itself. Must resolve inside the session \nroot.",
+      "type": "string"
+    },
+    "policy": {
+      "description": "What to do about each deviation found. Omitted \nmeans assess only, which writes nothing and returns each finding with the \noutcomes it admits.",
+      "enum": [
+        "repair",
+        "record-as-debt",
+        "accept-as-deliberate"
+      ],
+      "type": "string"
+    },
+    "upstream_url": {
+      "description": "The upstream this repository was forked from. \nAnswers the classification question and records the missing remote at the same \ntime. Ignored when an upstream is already recorded.",
+      "type": "string"
+    }
+  },
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
 * project-scaffold
 
 Generate a complete Lisp project skeleton under the session root. 
