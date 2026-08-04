@@ -43,7 +43,11 @@
                 #:shape-item-install-target
                 #:item-disposition
                 #:*shape-catalog*)
-  (:import-from #:dsmr-mcp/src/project-scaffold-core
+  ;; The substitution comes from its own leaf module rather than from the
+  ;; scaffold. The scaffold derives its manifest from this catalog, so a
+  ;; dependency in that direction would close a loop and the system would not
+  ;; build.
+  (:import-from #:dsmr-mcp/src/template-render
                 #:render-template)
   (:import-from #:dsmr-mcp/src/project-scaffold-templates
                 #:*asd-template*

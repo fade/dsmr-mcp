@@ -1,30 +1,37 @@
 ;;;; src/project-scaffold-core.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Pure helpers for project-scaffold (VERB-22): input validation, template
-;;;; rendering, path math, and file manifest construction. No I/O. No worker
-;;;; interaction. This module exists so the effectful layer in
-;;;; project-scaffold.lisp stays thin and the bulk of the logic is testable
-;;;; without a session root, a filesystem, or a running image.
+;;;; Pure helpers for project-scaffold: input validation, path math, and file
+;;;; manifest construction. No I/O. No worker interaction. This module exists
+;;;; so the effectful layer in project-scaffold.lisp stays thin and the bulk of
+;;;; the logic is testable without a session root, a filesystem, or a running
+;;;; image.
+;;;;
+;;;; The manifest is derived from the shape catalog rather than listed here.
+;;;; The catalog is the same definition an existing repository is assessed
+;;;; against, and two lists that agree today drift tomorrow: once they have,
+;;;; a repository can be certified as the right shape while being one the
+;;;; scaffold would not produce, and nothing reports it.
 
 (defpackage #:dsmr-mcp/src/project-scaffold-core
   (:use #:cl)
   (:import-from #:cl-ppcre
-                #:scan
-                #:regex-replace-all)
+                #:scan)
+  (:import-from #:dsmr-mcp/src/template-render
+                #:render-template)
+  (:import-from #:dsmr-mcp/src/project-shape
+                #:shape-item-key
+                #:shape-item-path
+                #:shape-item-generator
+                #:shape-item-emit-on-scaffold-p
+                #:shape-item-install-target)
+  ;; *SHAPE-CATALOG* is declared by project-shape and filled by the catalog data
+  ;; file. Reading it from the catalog package is what makes this module depend
+  ;; on the file that populates it, so the manifest is never derived from an
+  ;; empty list.
+  (:import-from #:dsmr-mcp/src/project-shape-catalog
+                #:*shape-catalog*)
   (:import-from #:dsmr-mcp/src/project-scaffold-templates
-                #:*asd-template*
-                #:*main-lisp-template*
-                #:*main-test-template*
-                #:*build-template*
-                #:*dev-boot-template*
-                #:*agents-md-template*
-                #:*claude-md-template*
-                #:*readme-template*
-                #:*gitignore-template*
-                #:*prompt-template*
-                #:*envrc-template*
-                #:*license-template*
                 #:license-body-for-spdx)
   (:export #:validate-project-name
            #:validate-destination
@@ -126,28 +133,6 @@ value is a string containing no newline (#\\Newline) or carriage return
   value)
 
 ;;; ---------------------------------------------------------------------------
-;;; Template rendering
-;;; ---------------------------------------------------------------------------
-
-(defun render-template (template bindings)
-  "Return TEMPLATE with each '{{key}}' substituted using BINDINGS.
-BINDINGS is an alist of (KEY-STRING . VALUE-STRING). Unknown placeholders
-are left intact. Values are substituted literally; regex metacharacters
-in values (including backslash and dollar sign) are handled safely via
-cl-ppcre's :simple-calls replacement callback."
-  (cl-ppcre:regex-replace-all
-   "\\{\\{([A-Za-z_-][A-Za-z0-9_-]*)\\}\\}"
-   template
-   (lambda (match &rest registers)
-     (declare (ignore match))
-     (let* ((key (first registers))
-            (entry (assoc key bindings :test #'string=)))
-       (if entry
-           (cdr entry)
-           (format nil "{{~A}}" key))))
-   :simple-calls t))
-
-;;; ---------------------------------------------------------------------------
 ;;; Manifest builder
 ;;; ---------------------------------------------------------------------------
 
@@ -156,15 +141,34 @@ cl-ppcre's :simple-calls replacement callback."
 year default for generated LICENSE/.asd content)."
   (format nil "~D" (nth-value 5 (get-decoded-time))))
 
+(defun %item-content (item bindings)
+  "Return the content ITEM's generator produces from BINDINGS.
+
+An item the scaffold is asked to emit but that carries no generator is a
+catalog defect, not a caller mistake, and it is reported as one. Skipping it
+instead would write a project silently short of a file the catalog says it
+has, while the manifest still looked complete."
+  (let ((generator (shape-item-generator item)))
+    (unless generator
+      (error "Shape catalog item ~S is marked for emission but has no generator."
+             (shape-item-key item)))
+    (funcall generator bindings)))
+
 (defun plan-scaffold (&key name description author license copyright year destination)
   "Return an alist of (RELATIVE-PATH . CONTENT) for the scaffold manifest.
 Applies all template substitutions but performs no I/O. Callers are
 responsible for input validation before calling this function;
 plan-scaffold assumes its arguments are already normalized strings.
 
-The full D-17 file set is emitted: <name>.asd, src/main.lisp,
-tests/main-test.lisp, build.sh, scripts/dev-boot.sh, AGENTS.md, CLAUDE.md,
-README.md, .gitignore, LICENSE, prompts/repl-driven-development.md.
+Which files are emitted is not listed here. It is read from the shape catalog,
+which is the same definition an existing repository is assessed against, so
+the set the scaffold writes and the set a repository is expected to have
+cannot drift apart. An item is emitted when it is marked for emission and
+lives in the working tree; an item belonging under the repository's git
+directory is never part of a manifest.
+
+Both an item's path and its content go through template substitution, so the
+catalog can name a file whose name depends on the project.
 
 DESTINATION is accepted for caller symmetry with write-scaffold but is not used
 here: the prompt is copied into the project's own prompts/ dir, so no path back
@@ -187,18 +191,9 @@ to a parent prompts/ directory is computed."
     (let ((bindings-with-rendered-license
            (cons (cons "license-body" (render-template license-body bindings))
                  (remove "license-body" bindings :key #'car :test #'string=))))
-      (let ((render2 (lambda (tpl) (render-template tpl bindings-with-rendered-license))))
-        (list
-         (cons (format nil "~A.asd" name) (funcall render2 *asd-template*))
-         (cons "src/main.lisp"           (funcall render2 *main-lisp-template*))
-         (cons "tests/main-test.lisp"    (funcall render2 *main-test-template*))
-         (cons "build.sh"                (funcall render2 *build-template*))
-         (cons "scripts/dev-boot.sh"     (funcall render2 *dev-boot-template*))
-         (cons "AGENTS.md"               (funcall render2 *agents-md-template*))
-         (cons "CLAUDE.md"               (funcall render2 *claude-md-template*))
-         (cons "README.md"               (funcall render2 *readme-template*))
-         (cons ".gitignore"              (funcall render2 *gitignore-template*))
-         (cons ".envrc"                  (funcall render2 *envrc-template*))
-         (cons "prompts/repl-driven-development.md"
-                                         (funcall render2 *prompt-template*))
-         (cons "LICENSE"                 (funcall render2 *license-template*)))))))
+      (loop for item in *shape-catalog*
+            when (and (shape-item-emit-on-scaffold-p item)
+                      (eq :worktree (shape-item-install-target item)))
+              collect (cons (render-template (shape-item-path item)
+                                             bindings-with-rendered-license)
+                            (%item-content item bindings-with-rendered-license))))))
