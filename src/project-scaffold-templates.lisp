@@ -1,10 +1,11 @@
 ;;;; src/project-scaffold-templates.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Template string constants for project-scaffold (VERB-22).
+;;;; Template string constants for project-scaffold.
 ;;;; Kept in a dedicated module so bulk literal content stays out of the
 ;;;; logic layer. All templates use {{key}} placeholders resolved by
-;;;; render-template in project-scaffold-core.
+;;;; render-template, which lives in its own leaf module because both the
+;;;; scaffold and the shape catalog reach it.
 ;;;;
 ;;;; Placeholders used across templates:
 ;;;;   {{name}}         — project name (kebab-case, e.g. foo-lib)
