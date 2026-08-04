@@ -1112,6 +1112,10 @@ headers. Returns a manifest of created files and next-step commands.
       "description": "Relative parent directory under the session root \nwhere <name>/ is created (default: scaffolds). No leading / or .. segments.",
       "type": "string"
     },
+    "init_git": {
+      "description": "When false, skip repository initialisation. \nDefault: true. A repository is created only when the new project would not sit \ninside an existing one.",
+      "type": "boolean"
+    },
     "license": {
       "description": "SPDX license identifier (default: AGPL-3.0-or-later).",
       "enum": [

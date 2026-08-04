@@ -3,7 +3,7 @@
 ;;;;
 ;;;; MCP tool: emit a full DSMR-discipline Lisp project tree under the
 ;;;; session write-jail. Mode-independent (dispatcher-side). No-root guard
-;;;; at entry — scaffold writes require a session root.
+;;;; at entry: scaffold writes require a session root.
 
 (defpackage #:dsmr-mcp/src/tools/project-scaffold
   (:use #:cl)
@@ -70,12 +70,19 @@ where <name>/ is created (default: scaffolds). No leading / or .. segments.")
                   :description "Copyright year for LICENSE (default: current year).")
                  (overwrite
                   :type :boolean
-                  :description "When true, replace an existing scaffold directory. Default: false."))
+                  :description "When true, replace an existing scaffold directory. Default: false.")
+                 (init-git
+                  :type :boolean
+                  :description "When false, skip repository initialisation. \
+Default: true. A repository is created only when the new project would not sit \
+inside an existing one."))
                 :required ("name"))))
   (:metaclass mcp-tool-class)
   (:documentation "MCP tool: generate a DSMR-discipline Lisp project skeleton.
 Writes an atomic tree under the session root via temp-dir + rename-file.
-No-root guard at entry — call fs-set-project-root first."))
+No-root guard at entry: call fs-set-project-root first.
+Initialises a git repository in the new project unless it would nest inside an
+existing one, and reports which of those happened."))
 
 (c2mop:ensure-finalized (find-class 'project-scaffold-tool))
 
@@ -99,7 +106,13 @@ Call fs-set-project-root first.")))))
            (description (gethash "description" args))
            (destination (gethash "destination" args))
            (year        (gethash "year" args))
-           (overwrite   (gethash "overwrite" args)))
+           (overwrite   (gethash "overwrite" args))
+           ;; Absent means the default, and the default is true. Reading the
+           ;; value alone cannot tell an omitted argument from an explicit
+           ;; false, and those two must not answer the same way.
+           (init-git    (if (nth-value 1 (gethash "init_git" args))
+                            (and (gethash "init_git" args) t)
+                            t)))
       (unless (and name (stringp name))
         (return-from tool-handle
           (result id (make-ht "isError" t
@@ -118,10 +131,12 @@ Call fs-set-project-root first.")))))
                                ;; the scaffold core; pass the raw arg through
                                :year year
                                :destination (or destination "scaffolds")
-                               :overwrite overwrite))
+                               :overwrite overwrite
+                               :init-git init-git))
                  (target-dir  (getf res :target-dir))
                  (relative    (getf res :relative-path))
                  (files       (getf res :files))
+                 (git-init-p  (getf res :git-initialised))
                  (abs-asd     (namestring
                                (merge-pathnames (format nil "~A.asd" name) target-dir)))
                  (next-steps  (vector
@@ -143,12 +158,16 @@ Call fs-set-project-root first.")))))
                                         (namestring relative))
                              "absolute_path" (namestring target-dir)
                              "files" (coerce files 'vector)
+                             "git_initialised" git-init-p
                              "next_steps" next-steps
                              "content"
                              (text-content
-                              (format nil "Scaffolded ~A at ~A (~D files)~%Path: ~A~%~{~A~%~}"
+                              (format nil "Scaffolded ~A at ~A (~D files)~%Path: ~A~%~A~%~{~A~%~}"
                                       name relative (length files)
                                       (namestring target-dir)
+                                      (if git-init-p
+                                          "Initialised a git repository here."
+                                          "No git repository was created here.")
                                       (coerce next-steps 'list))))))
         (invalid-argument-error (e)
           (result id
