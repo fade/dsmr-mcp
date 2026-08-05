@@ -11,15 +11,15 @@
 ;;;; cannot damage a third party's tree however it is called, and the repair
 ;;;; engine that does write is a separate module with its own tests.
 ;;;;
-;;;; What makes the report worth reading is the tiering. A flat requirement that
-;;;; every repository carry every file we like to have would report roughly
-;;;; ninety working third-party repositories on this machine as sick. A list
-;;;; that is mostly false entries hides the true ones, so the tier an item sits
-;;;; in and the profile the repository was classified into together decide
-;;;; whether an absence is a finding at all. Which tiers a profile is held to is
-;;;; read from the catalog. It is not restated here: that answer is provisional,
-;;;; and a second copy would mean revising it required editing two files in two
-;;;; subsystems.
+;;;; What makes the report worth reading is that a repository is only measured
+;;;; against what it is answerable for. A flat requirement that every repository
+;;;; carry every file we like to have would report roughly ninety working
+;;;; third-party repositories on this machine as sick, and a list that is mostly
+;;;; false entries hides the true ones. A repository we do not own is answerable
+;;;; for none of our conventions at all, only for our own apparatus being where
+;;;; we need it and out of its index. Which items a profile is held to is read
+;;;; from the catalog. It is not restated here: two copies would mean a revised
+;;;; answer had to be applied in two files in two subsystems.
 ;;;;
 ;;;; A quality gate is assessed through its group, as one unit. The linter
 ;;;; configuration and the script that runs it never occur apart in the measured
@@ -42,7 +42,6 @@
   (:import-from #:dsmr-mcp/src/project-shape
                 #:shape-item-key
                 #:shape-item-path
-                #:shape-item-tier
                 #:shape-item-group
                 #:shape-item-assertion
                 #:shape-item-match
@@ -50,7 +49,7 @@
                 #:shape-group-items
                 #:*shape-catalog*)
   (:import-from #:dsmr-mcp/src/project-shape-catalog
-                #:assessed-tiers-for-profile
+                #:item-assessed-p
                 #:apparatus-paths-for-profile)
   (:import-from #:dsmr-mcp/src/project-deviation
                 #:missing-shape-item
@@ -150,10 +149,13 @@ of an assessment that never looked at anything."
 ;;; Which items this repository is held to
 ;;; ---------------------------------------------------------------------------
 
-(defun %assessed-items (catalog tiers)
-  "Return the members of CATALOG whose tier is in TIERS, in catalog order."
-  (remove-if-not (lambda (item) (member (shape-item-tier item) tiers))
-                 catalog))
+(defun %assessed-items (catalog profile)
+  "Return the members of CATALOG that PROFILE is held to, in catalog order.
+
+What that comes to is the catalog's to answer and not this module's. The
+question a repository is measured against is part of the shape declaration, and
+restating any of it here would mean a revised answer had to be applied twice."
+  (remove-if-not (lambda (item) (item-assessed-p item profile)) catalog))
 
 (defun %groups-in-order (items)
   "Return the distinct groups named by ITEMS, in first-appearance order."
@@ -259,9 +261,10 @@ unhandled. Whether a tree whose origin is ours but which records no upstream is
 our own project is not inferable from anything on disk, and answering it here
 would be a guess made where nobody can see it. The caller decides whether to ask.
 
-Findings are limited by the profile's assessed tiers, read from the catalog.
-Conveniences are in neither profile's list, so a repository legitimately without
-a build script is never reported for it.
+Which items the profile is held to is read from the catalog. A repository we own
+is measured against its own structure and the quality gate, so one legitimately
+without a build script is never reported for it. A repository we do not own is
+measured against our apparatus alone and never against its own layout.
 
 Grouped items are assessed together and produce at most one finding each.
 Ungrouped items produce one finding each. The local exclude is compared against
@@ -276,7 +279,7 @@ thing wrong with it."
                           :declared-classification declared-classification
                           :upstream-url upstream-url))
          (profile (repo-profile classification))
-         (items (%assessed-items catalog (assessed-tiers-for-profile profile)))
+         (items (%assessed-items catalog profile))
          (deviations '())
          (satisfied '()))
     (dolist (group (%groups-in-order items))

@@ -2,17 +2,19 @@
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
 ;;;; The declared shape of a project of ours: every file, what tier it sits in,
-;;;; which files are our operational apparatus, and which tiers each kind of
-;;;; repository is held to.
+;;;; which files are our operational apparatus, and what each kind of repository
+;;;; is held to.
 ;;;;
-;;;; ⚠ THE ANSWERS IN THIS FILE ARE PROVISIONAL. The tier each item is assigned,
-;;;; the flags saying which items the scaffold writes, and the mapping from a
-;;;; repository's profile to the tiers it is assessed against are all a reading
+;;;; ⚠ MOST OF THE ANSWERS IN THIS FILE ARE PROVISIONAL. The tier each item is
+;;;; assigned and the flags saying which items the scaffold writes are a reading
 ;;;; of what the repositories on this machine actually contain. They are not a
 ;;;; settled ruling, and the reading may be overruled.
 ;;;;
+;;;; The one settled answer is what reaches a repository we do not own, and it is
+;;;; recorded beside the value that carries it further down.
+;;;;
 ;;;; That is why they are here, in a file holding data and nothing else. Changing
-;;;; the answer means editing this file. The item representation, the scaffold,
+;;;; an answer means editing this file. The item representation, the scaffold,
 ;;;; the assessment and every test survive a different answer unchanged.
 ;;;;
 ;;;; What the reading rests on. Two populations were counted. Among ten of our
@@ -40,6 +42,8 @@
                 #:make-shape-item
                 #:shape-item-key
                 #:shape-item-path
+                #:shape-item-tier
+                #:shape-item-apparatus-p
                 #:shape-item-install-target
                 #:item-disposition
                 #:*shape-catalog*)
@@ -69,6 +73,8 @@
            #:catalog-item
            #:*assessed-tiers*
            #:assessed-tiers-for-profile
+           #:*apparatus-assessed-profiles*
+           #:item-assessed-p
            #:apparatus-paths-for-profile
            #:unknown-profile-error
            #:unknown-profile-error-profile))
@@ -304,25 +310,35 @@ item's generator is one place rather than a rendering call repeated per file."
   (find key catalog :key #'shape-item-key))
 
 ;;; ---------------------------------------------------------------------------
-;;; Which tiers each kind of repository is held to
+;;; What each kind of repository is held to
 ;;; ---------------------------------------------------------------------------
 
-;;; ⚠ This mapping is as provisional as the tiers themselves, and it lives here
-;;; rather than beside the assessment for one reason: whether a repository we
-;;; have just adopted from somebody else should be held to our quality gate is
-;;; the same unsettled question as which tier each file belongs in. Split across
-;;; two files in two subsystems, answering that question would mean editing
-;;; both, and the claim that the provisional part is confined to one file would
-;;; be a description of intent rather than a fact about the code.
+;;; What a repository we do not own is held to is settled, and this is where the
+;;; ruling is written down: beyond installing the git-invisible parts of our own
+;;; apparatus, we alter nothing about the structure of somebody else's project.
+;;; Not its layout, not what its files are called, not which directories it keeps
+;;; them in. The tiers each item sits in remain a reading of the repositories on
+;;; this machine and may still be revised; which of them reach a foreign
+;;; repository no longer is.
+;;;
+;;; It lives here rather than beside the assessment so that a different ruling
+;;; costs one file. Split across two subsystems, the claim that the answer is
+;;; confined to one place would be a description of intent rather than a fact
+;;; about the code.
 
 (defvar *assessed-tiers*
   '((:ours . (:invariant :gate))
-    (:foreign . (:invariant)))
-  "The tiers each repository profile is assessed against.
+    (:foreign . ()))
+  "The tiers of a project's own structure each profile is assessed against.
 
-Our own repositories are held to the quality gate. A repository we do not own is
-held only to what makes it a working system, because our conventions are ours
-and a third party's project is not defective for lacking them.
+Our own repositories are held to what makes them a working system and to the
+quality gate. A repository we do not own is held to no tier at all: what its
+sources are called and which directories it keeps them in is its maintainer's
+business, and a tool of ours has no standing to have an opinion about it.
+
+Empty is the whole of the answer for a foreign repository only in this table.
+What we still look for there is our own apparatus, which is selected by
+ITEM-ASSESSED-P below and does not come from a tier.
 
 A DEFVAR rather than a DEFPARAMETER so that an override installed at runtime
 survives reloading the system.")
@@ -337,6 +353,36 @@ from the report for a repository that genuinely is."
     (unless entry
       (error 'unknown-profile-error :profile profile))
     (cdr entry)))
+
+(defvar *apparatus-assessed-profiles* '(:foreign)
+  "The profiles whose assessment includes our own apparatus, whatever tier it is in.
+
+Selected by the flag naming an item as apparatus rather than by the tier it sits
+in, and the difference is not cosmetic. Our apparatus is spread across two tiers,
+so a tier would drop the three convenience items we do install; and a
+non-apparatus item added to a tier later would start being written into trees
+that never asked for it. The flag tracks the one thing the answer turns on.
+
+A DEFVAR for the same reason as the tier table: an override installed at runtime
+survives reloading the system.")
+
+(defun item-assessed-p (item profile)
+  "Return true when ITEM is something PROFILE is held to, else NIL.
+
+The two clauses answer two different questions. An item's tier says whether the
+project's own structure is expected to carry it, which is a claim we are entitled
+to make about our own repositories and about nobody else's. The apparatus flag
+says whether the item is ours, and ours we install and look for wherever we work,
+because they are the reason the tool was pointed at the repository at all.
+
+Signals UNKNOWN-PROFILE-ERROR through the tier lookup for a profile with no
+entry, rather than answering NIL for every item and reporting a misspelled
+profile as a repository in perfect shape."
+  (let ((tiers (assessed-tiers-for-profile profile)))
+    (and (or (member (shape-item-tier item) tiers)
+             (and (member profile *apparatus-assessed-profiles*)
+                  (shape-item-apparatus-p item)))
+         t)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The paths to keep out of a repository's index
