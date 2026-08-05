@@ -346,11 +346,15 @@ and a second run over the repaired repository reports no changes at all.
 
 The second run is what makes the first one's report mean something. A verb that
 listed every item it looked at under changed would pass the first assertion and
-fail here."
+fail here.
+
+One file of ours is put in place before the first call so that already-correct
+has something true to carry on that call as well as on the second."
   (with-fixture-template
     (with-temp-git-repo (root :origin-url +third-party-origin-url+
                               :initial-file "seed" :initial-content "seed")
       (%prepare root)
+      (write-fixture-file root "AGENTS.md" "# already in place")
       (let ((first-run (%call root (%args "policy" "repair"))))
         (false (gethash "isError" first-run) "the repair completed")
         (is equal "foreign-with-upstream" (gethash "classification" first-run))
