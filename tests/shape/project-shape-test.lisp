@@ -10,12 +10,12 @@
 ;;;; hand-picked item, and each is paired with a control that was watched failing
 ;;;; before its green was believed.
 ;;;;
-;;;; The other thing under test is a claim about where a decision lives. The
-;;;; tiers, the scaffold flags and the profile-to-tier mapping are provisional,
-;;;; and the whole value of that being true is that changing them costs one edit
-;;;; to one data file. A test that only reads the mapping cannot tell whether it
-;;;; is still the mapping in force, so the control here changes it and asserts
-;;;; the change is observed.
+;;;; The other thing under test is a claim about where a decision lives. What
+;;;; each kind of repository is held to, the tiers and the scaffold flags are all
+;;;; settled in one data file, and the whole value of that is that a different
+;;;; answer costs one edit. A test that only reads those values cannot tell
+;;;; whether they are still the ones in force, so the control here changes them
+;;;; and asserts the change is observed.
 
 ;; Package evolution guard - delete prior definition on warm reload.
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -44,6 +44,8 @@
                 #:catalog-item
                 #:*assessed-tiers*
                 #:assessed-tiers-for-profile
+                #:*apparatus-assessed-profiles*
+                #:item-assessed-p
                 #:apparatus-paths-for-profile
                 #:unknown-profile-error)
   (:import-from #:dsmr-mcp/src/project-scaffold-core
@@ -202,21 +204,49 @@ worktree at all."
     (is equal '() (apparatus-paths-for-profile :ours)
         "Nothing is excluded in a repository we own.")))
 
-;;; --- the profile-to-tier mapping --------------------------------------------
+;;; --- what each kind of repository is held to --------------------------------
 
-(define-test a-foreign-repository-is-not-held-to-our-quality-gate
-  "A third party's project is not defective for lacking our conventions."
-  (false (member :gate (assessed-tiers-for-profile :foreign)))
-  (true (member :invariant (assessed-tiers-for-profile :foreign))))
+(define-test a-foreign-repository-is-held-to-our-apparatus-and-nothing-else
+  "Beyond installing the git-invisible parts of our own apparatus, we assert
+nothing about a project we do not own.
+
+Both halves matter. That no tier of theirs is assessed is what keeps us out of
+their layout; that every apparatus item is assessed is what still lets the tool
+do the job it was pointed at the repository for. A rule written on the tier
+instead of on the flag would satisfy the first half and silently drop the three
+apparatus items that sit in the convenience tier."
+  (is equal '() (assessed-tiers-for-profile :foreign)
+      "no tier of the project's own structure is assessed")
+  (dolist (item *shape-catalog*)
+    (is eq (and (shape-item-apparatus-p item) t)
+        (item-assessed-p item :foreign)
+        "~S is assessed under the foreign profile exactly when it is ours."
+        (shape-item-key item)))
+  (true (find :convenience (apparatus-items) :key #'shape-item-tier)
+        "and some of our apparatus is in the convenience tier, which is what a
+tier-based rule would have dropped"))
 
 (define-test our-own-repositories-are-held-to-the-quality-gate
+  "A repository of ours is measured against its own structure, which is the
+half of the two-mode rule that would go unnoticed if the foreign side were
+simply switched off everywhere."
   (true (member :gate (assessed-tiers-for-profile :ours)))
-  (true (member :invariant (assessed-tiers-for-profile :ours))))
+  (true (member :invariant (assessed-tiers-for-profile :ours)))
+  (true (item-assessed-p (catalog-item :src-dir) :ours)
+        "their layout is not ours to judge; ours is")
+  (false (item-assessed-p (catalog-item :envrc) :ours)
+        "and a convenience of ours stays advisory in our own tree"))
 
 (define-test an-unmapped-profile-signals-rather-than-assessing-nothing
   "An empty tier list reports every repository as clean, and that report is
-indistinguishable from the report for a repository that genuinely is."
-  (fail (assessed-tiers-for-profile :nonsense) 'unknown-profile-error))
+indistinguishable from the report for a repository that genuinely is.
+
+Asked through the item predicate as well as directly, because that is the way
+the assessment asks and a predicate answering NIL for a profile nobody declared
+would hand back exactly the clean report this refuses to produce."
+  (fail (assessed-tiers-for-profile :nonsense) 'unknown-profile-error)
+  (fail (item-assessed-p (catalog-item :src-dir) :nonsense)
+        'unknown-profile-error))
 
 ;;; --- CONTROLS ---------------------------------------------------------------
 
@@ -291,17 +321,30 @@ than as the typo it is."
                                :assertion :file-exists :match "x")))
     (is eql :fine (shape-item-key item))))
 
-(define-test control-the-profile-to-tier-mapping-is-the-one-in-force
-  "CONTROL for the claim that the provisional answers live in one data file.
+(define-test control-what-a-profile-is-held-to-is-decided-here-and-nowhere-else
+  "CONTROL for the claim that what each kind of repository is held to lives in
+one data file.
 
-Reading the mapping proves only what it says today. This changes it, and asserts
-the change is observed. If the mapping is ever defined a second time outside the
-catalog, that other definition will be the one in force, this binding will not
-reach it, and this assertion is what notices."
-  (is equal '(:invariant) (assessed-tiers-for-profile :foreign))
+Reading the two values proves only what they say today. This changes each of
+them in turn and asserts the change is observed. If either is ever decided a
+second time outside the catalog, that other decision will be the one in force,
+these bindings will not reach it, and this is what notices.
+
+Both are exercised because they fail differently. A tier list that stopped being
+read would let somebody else's layout back into the findings; an apparatus flag
+that stopped being read would take our own files out of them, which reads as a
+repository in perfect shape."
+  (false (item-assessed-p (catalog-item :src-dir) :foreign)
+         "their layout is not assessed")
+  (true (item-assessed-p (catalog-item :envrc) :foreign)
+        "and ours is")
   (let ((*assessed-tiers* '((:ours . (:invariant :gate))
-                            (:foreign . (:invariant :gate)))))
-    (is equal '(:invariant :gate) (assessed-tiers-for-profile :foreign)
-        "A different ruling takes effect by editing this mapping alone."))
-  (is equal '(:invariant) (assessed-tiers-for-profile :foreign)
-      "The mapping is restored when the binding unwinds."))
+                            (:foreign . (:invariant)))))
+    (true (item-assessed-p (catalog-item :src-dir) :foreign)
+          "a different ruling on the tiers takes effect by editing that table alone"))
+  (let ((*apparatus-assessed-profiles* '()))
+    (false (item-assessed-p (catalog-item :envrc) :foreign)
+           "and a different ruling on the apparatus by editing that list alone"))
+  (false (item-assessed-p (catalog-item :src-dir) :foreign)
+         "both are restored when the bindings unwind")
+  (true (item-assessed-p (catalog-item :envrc) :foreign)))

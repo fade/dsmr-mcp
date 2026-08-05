@@ -21,13 +21,10 @@
 ;;;; succeeds, so the only way to tell them apart is to make the write fail and
 ;;;; look at the exclude afterwards.
 ;;;;
-;;;; A foreign repository is held to the quality gate throughout this file,
-;;;; which is not how the catalog maps profiles to tiers by default. The
-;;;; mapping is deliberately provisional, and this is the configuration in
-;;;; which apparatus of ours is written into a worktree we do not own, which is
-;;;; the only configuration in which the leak under test can happen at all. A
-;;;; suite measuring the default mapping would write nothing and pass every
-;;;; never-leak assertion without exercising one of them.
+;;;; Every test here measures the configuration that ships. A suite that reached
+;;;; for an override to put our apparatus into a foreign worktree would prove
+;;;; nothing about what the tool does when somebody runs it, which is the only
+;;;; question these tests are asked.
 
 ;; Package evolution guard - delete prior definition on warm reload.
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -61,7 +58,8 @@
   (:import-from #:dsmr-mcp/src/project-shape-catalog
                 #:catalog-item
                 #:apparatus-paths-for-profile
-                #:*assessed-tiers*)
+                #:*assessed-tiers*
+                #:*apparatus-assessed-profiles*)
   (:import-from #:dsmr-mcp/src/project-exclude
                 #:*exclude-template-path*
                 #:parse-exclude-patterns
@@ -140,18 +138,6 @@ that already points the check elsewhere cannot change what this suite measures."
          (setf (uiop:getenv "DSMR_GIT_EXCLUDE_TEMPLATE") (or ,saved ""))
          (uiop:delete-directory-tree ,dir :validate t :if-does-not-exist :ignore)))))
 
-(defmacro with-gated-foreign-profile (&body body)
-  "Hold a foreign repository to the quality gate for the extent of BODY.
-
-This is the configuration in which our apparatus is written into a worktree
-belonging to somebody else, and therefore the only one in which the leak these
-tests are aimed at can occur. Under the catalog's default mapping a foreign
-repository is held to the invariants alone, nothing of ours would be written,
-and every never-leak assertion here would pass without measuring anything."
-  `(let ((*assessed-tiers* '((:ours . (:invariant :gate))
-                             (:foreign . (:invariant :gate)))))
-     ,@body))
-
 (defmacro with-no-linter ((root) &body body)
   "Run BODY with the quality-gate scanner genuinely unreachable.
 
@@ -222,6 +208,27 @@ reporting nothing here reported nothing at all.")
   (%seed-library root)
   root)
 
+(defun %seed-flat-library (root)
+  "Give ROOT the committed shape of a third-party library with a flat layout.
+
+A system definition and its source at the top level, and neither of the two
+directories our own projects always carry. A large part of the ecosystem ships
+exactly this way, and the difference from the fixture above is what makes a
+repair writing our layout into somebody else's tree observable at all: a fixture
+that arrives already carrying src/ and tests/ satisfies a layout expectation
+before the run starts, so such a repair would have nothing left to write and no
+assertion could catch it."
+  (fixture-commit-file root "example.asd" "(asdf:defsystem \"example\")")
+  (fixture-commit-file root "example.lisp" ";; the whole library, at the top level")
+  root)
+
+(defun %flat-foreign-fixture (root)
+  "Prepare ROOT as a clean, committed, flat-layout foreign repository."
+  (%clear-ambient-ignores root)
+  (%remove-seeded-hook root)
+  (%seed-flat-library root)
+  root)
+
 ;;; ---------------------------------------------------------------------------
 ;;; Reading a run
 ;;; ---------------------------------------------------------------------------
@@ -286,12 +293,16 @@ file survived."
                found))))
     (sort found #'string< :key #'car)))
 
+(defun %paths-in (root)
+  "Return every path under ROOT outside its git directory, as it reads from ROOT."
+  (mapcar #'car (%snapshot root)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; CONTROL 1: nothing of ours reaches the maintainer's git status
 ;;; ---------------------------------------------------------------------------
 
 (define-test control-nothing-of-ours-reaches-the-maintainers-status
-  "CONTROL, and it is the one that matters. V-2.
+  "CONTROL, and it is the one that matters.
 
 The non-empty half comes first, deliberately. An apparatus file written into a
 foreign worktree with the exclude left alone must appear in that maintainer's
@@ -303,31 +314,30 @@ on the same kind of repository, to answer empty.
 The index is checked as well as the status. Present is the correct state for an
 adopted repository; in the index is the leak."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      ;; First: the instrument answering the other way.
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (is equal '() (git-status-porcelain root)
-            "precondition: the fixture starts clean")
-        (write-fixture-file root ".mallet.lisp" ";; linter configuration")
-        (true (git-status-porcelain root)
-              "an apparatus file written with the exclude untouched is visible")
-        (true (find-if (lambda (line) (search ".mallet.lisp" line))
-                       (git-status-porcelain root))
-              "and it is that file the maintainer would see"))
-      ;; Then: the same instrument over a full run, and it must answer empty.
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (let ((report (normalise-repository root :policy :repair)))
-          (true (report-changed report)
-                "the run wrote something, so the emptiness below is about a run"))
-        (is equal '() (git-status-porcelain root)
-            "after a full repair the maintainer sees nothing at all")
-        (dolist (path (apparatus-paths-for-profile :foreign))
-          (false (member path (git-tracked-files root) :test #'string=)
-                 "no apparatus path is in the index"))))))
+    ;; First: the instrument answering the other way.
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (is equal '() (git-status-porcelain root)
+          "precondition: the fixture starts clean")
+      (write-fixture-file root ".mallet.lisp" ";; linter configuration")
+      (true (git-status-porcelain root)
+            "an apparatus file written with the exclude untouched is visible")
+      (true (find-if (lambda (line) (search ".mallet.lisp" line))
+                     (git-status-porcelain root))
+            "and it is that file the maintainer would see"))
+    ;; Then: the same instrument over a full run, and it must answer empty.
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (let ((report (normalise-repository root :policy :repair)))
+        (true (report-changed report)
+              "the run wrote something, so the emptiness below is about a run"))
+      (is equal '() (git-status-porcelain root)
+          "after a full repair the maintainer sees nothing at all")
+      (dolist (path (apparatus-paths-for-profile :foreign))
+        (false (member path (git-tracked-files root) :test #'string=)
+               "no apparatus path is in the index")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CONTROL 2: the exclude is updated before anything is written
@@ -344,62 +354,60 @@ exclude must already carry the apparatus patterns.
 If the ordering were reversed the exclude would still be at its starting state
 here, and this is the only test in the file that would go red."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (false (%has-pattern-p root ".mallet.lisp")
-               "precondition: the exclude does not carry the apparatus pattern")
-        (let ((*repair-writer*
-                (lambda (path content)
-                  (declare (ignore path content))
-                  (error "the write step was replaced and refuses to run"))))
-          (fail (normalise-repository root :policy :repair) 'simple-error
-                "the run dies at the first write"))
-        (true (%has-pattern-p root ".mallet.lisp")
-              "the exclude already carried the apparatus pattern when the write ran")
-        (true (%has-pattern-p root "scripts/lint-lisp.sh")
-              "and every other apparatus path with it")
-        (true (%has-pattern-p root ".gate-baseline.md")
-              "the frozen baseline's path among them, before anything could write it")
-        (false (probe-file (merge-pathnames ".mallet.lisp" root))
-               "and no apparatus file exists, which is what makes the order visible")))))
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (false (%has-pattern-p root ".mallet.lisp")
+             "precondition: the exclude does not carry the apparatus pattern")
+      (let ((*repair-writer*
+              (lambda (path content)
+                (declare (ignore path content))
+                (error "the write step was replaced and refuses to run"))))
+        (fail (normalise-repository root :policy :repair) 'simple-error
+              "the run dies at the first write"))
+      (true (%has-pattern-p root ".mallet.lisp")
+            "the exclude already carried the apparatus pattern when the write ran")
+      (true (%has-pattern-p root "scripts/lint-lisp.sh")
+            "and every other apparatus path with it")
+      (true (%has-pattern-p root ".gate-baseline.md")
+            "the frozen baseline's path among them, before anything could write it")
+      (false (probe-file (merge-pathnames ".mallet.lisp" root))
+             "and no apparatus file exists, which is what makes the order visible"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CONTROL 3: idempotence, with the first run observed changing something
 ;;; ---------------------------------------------------------------------------
 
 (define-test control-a-second-run-changes-nothing-and-the-first-one-did
-  "CONTROL. V-4.
+  "CONTROL.
 
 Both halves in one test. An idempotence assertion over a run that never did
 anything is satisfied by an implementation that does nothing at all, so the
 first run is required to report changes before the second is required to report
 none."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (let ((first (normalise-repository root :policy :repair)))
-          (true (report-changed first)
-                "the first run changed something")
-          (is eq :updated (getf (report-exclude first) :action-taken)
-              "including the local exclude"))
-        (let ((second (normalise-repository root :policy :repair)))
-          (is equal '() (report-changed second)
-              "the second run changed nothing")
-          (is eq :already-present (getf (report-exclude second) :action-taken)
-              "and found the exclude already correct")
-          (true (report-already-correct second)
-                "and says what it found already correct rather than only staying silent"))))))
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (let ((first (normalise-repository root :policy :repair)))
+        (true (report-changed first)
+              "the first run changed something")
+        (is eq :updated (getf (report-exclude first) :action-taken)
+            "including the local exclude"))
+      (let ((second (normalise-repository root :policy :repair)))
+        (is equal '() (report-changed second)
+            "the second run changed nothing")
+        (is eq :already-present (getf (report-exclude second) :action-taken)
+            "and found the exclude already correct")
+        (true (report-already-correct second)
+              "and says what it found already correct rather than only staying silent")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CONTROL 4: nothing pre-existing is overwritten or deleted
 ;;; ---------------------------------------------------------------------------
 
 (define-test control-nothing-pre-existing-is-overwritten-or-deleted
-  "CONTROL. V-5.
+  "CONTROL.
 
 The whole tree is compared before and after, and then the comparison itself is
 put to work: one file is edited by hand and the same comparison must notice. An
@@ -412,41 +420,39 @@ would otherwise write. Without it the tree holds nothing a repair could collide
 with, and the comparison would be equally happy against an implementation that
 overwrites everything it finds."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (write-fixture-file root ".mallet.lisp" ";; the maintainer's own file")
-        (let ((before (%snapshot root)))
-          (true (assoc ".mallet.lisp" before :test #'string=)
-                "precondition: the tree holds a file a repair could collide with")
-          (normalise-repository root :policy :repair)
-          (let ((after (%snapshot root)))
-            (dolist (entry before)
-              (is equal (cdr entry) (cdr (assoc (car entry) after :test #'string=))
-                  "every file present before the run is byte-identical after it"))
-            ;; The comparison, caught noticing.
-            (write-fixture-file root "src/main.lisp" ";; edited by hand")
-            (let ((edited (%snapshot root)))
-              (false (equal (cdr (assoc "src/main.lisp" before :test #'string=))
-                            (cdr (assoc "src/main.lisp" edited :test #'string=)))
-                     "the comparison detects a change when there is one"))))))))
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (write-fixture-file root ".mallet.lisp" ";; the maintainer's own file")
+      (let ((before (%snapshot root)))
+        (true (assoc ".mallet.lisp" before :test #'string=)
+              "precondition: the tree holds a file a repair could collide with")
+        (normalise-repository root :policy :repair)
+        (let ((after (%snapshot root)))
+          (dolist (entry before)
+            (is equal (cdr entry) (cdr (assoc (car entry) after :test #'string=))
+                "every file present before the run is byte-identical after it"))
+          ;; The comparison, caught noticing.
+          (write-fixture-file root "src/main.lisp" ";; edited by hand")
+          (let ((edited (%snapshot root)))
+            (false (equal (cdr (assoc "src/main.lisp" before :test #'string=))
+                          (cdr (assoc "src/main.lisp" edited :test #'string=)))
+                   "the comparison detects a change when there is one")))))))
 
 (define-test an-existing-file-at-an-apparatus-path-survives-the-repair
   "A file the repository already had is never replaced, and the rest of the
 group is still installed around it."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (write-fixture-file root ".mallet.lisp" ";; the maintainer's own file")
-        (normalise-repository root :policy :repair)
-        (is equal ";; the maintainer's own file"
-            (uiop:read-file-string (merge-pathnames ".mallet.lisp" root))
-            "the existing file is untouched")
-        (true (probe-file (merge-pathnames "scripts/lint-lisp.sh" root))
-              "and the parts of the gate that were absent are installed")))))
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (write-fixture-file root ".mallet.lisp" ";; the maintainer's own file")
+      (normalise-repository root :policy :repair)
+      (is equal ";; the maintainer's own file"
+          (uiop:read-file-string (merge-pathnames ".mallet.lisp" root))
+          "the existing file is untouched")
+      (true (probe-file (merge-pathnames "scripts/lint-lisp.sh" root))
+            "and the parts of the gate that were absent are installed"))))
 
 (define-test a-destination-that-already-exists-is-reported-rather-than-replaced
   "An item that is unsatisfied while something already occupies its destination
@@ -455,17 +461,16 @@ is a finding, never a write.
 A directory standing where a file is expected is the case that makes the two
 questions come apart: the assertion is unsatisfied and the path is occupied."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (ensure-directories-exist
-         (uiop:ensure-directory-pathname (merge-pathnames ".mallet.lisp" root)))
-        (let ((report (normalise-repository root :policy :repair)))
-          (true (member :mallet-config (%unresolved-keys report))
-                "the occupied destination is reported unresolved")
-          (false (member :mallet-config (%changed-items report))
-                 "and nothing was written there"))))))
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (ensure-directories-exist
+       (uiop:ensure-directory-pathname (merge-pathnames ".mallet.lisp" root)))
+      (let ((report (normalise-repository root :policy :repair)))
+        (true (member :mallet-config (%unresolved-keys report))
+              "the occupied destination is reported unresolved")
+        (false (member :mallet-config (%changed-items report))
+               "and nothing was written there")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CONTROL 5: the head sha does not move
@@ -482,28 +487,27 @@ The hook is removed before that commit. The run just installed a working quality
 gate, and it refuses the fixture's own source, which is the gate doing its job
 rather than anything to do with the head sha."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (let ((before (git-head-sha root))
-              (report (normalise-repository root :policy :repair)))
-          (is equal before (git-head-sha root)
-              "the run left the head where it found it")
-          (is equal (report-head-sha-before report) (report-head-sha-after report)
-              "and the report says so with both values")
-          ;; The comparison, caught noticing.
-          (%remove-seeded-hook root)
-          (fixture-commit-file root "extra.txt" "x" :message "a commit")
-          (false (equal before (git-head-sha root))
-                 "a commit does move it, so the equality above was measuring"))))))
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (let ((before (git-head-sha root))
+            (report (normalise-repository root :policy :repair)))
+        (is equal before (git-head-sha root)
+            "the run left the head where it found it")
+        (is equal (report-head-sha-before report) (report-head-sha-after report)
+            "and the report says so with both values")
+        ;; The comparison, caught noticing.
+        (%remove-seeded-hook root)
+        (fixture-commit-file root "extra.txt" "x" :message "a commit")
+        (false (equal before (git-head-sha root))
+               "a commit does move it, so the equality above was measuring")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CONTROL 6: the frozen baseline is written, not merely reported
 ;;; ---------------------------------------------------------------------------
 
 (define-test control-the-frozen-baseline-is-written-not-merely-reported
-  "CONTROL. SC-2.
+  "CONTROL.
 
 Absent before and present after, in one test. An existence assertion that was
 never observed failing cannot tell a document that was written from a report
@@ -516,33 +520,32 @@ requirement in one place.
 Takes an explicit branch when no linter is installed rather than relying on a
 skip form to end the test."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (fixture-commit-file root "src/violating.lisp" +violating-source+)
-        (let ((baseline (merge-pathnames ".gate-baseline.md" root)))
-          (false (probe-file baseline)
-                 "precondition: no baseline exists before the run")
-          (if (not (gate-scanner-available-p (linter-path)))
-              (let ((report (normalise-repository root :policy :record-as-debt)))
-                (is eq :not-enumerated
-                    (getf (report-debt-baseline report) :action-taken)
-                    "with no linter installed the debt is not enumerated")
-                (false (probe-file baseline)
-                       "and nothing is written"))
-              (let ((report (normalise-repository root :policy :record-as-debt)))
-                (is eq :created (getf (report-debt-baseline report) :action-taken)
-                    "the run says it created the baseline")
-                (true (probe-file baseline)
-                      "and the file is on disk, which is the part a report cannot fake")
-                (false (member ".gate-baseline.md" (git-tracked-files root)
-                               :test #'string=)
-                       "it is not tracked in a repository we do not own")
-                (is equal '() (git-status-porcelain root)
-                    "and it is invisible to the maintainer")
-                (true (report-recorded-debt report)
-                      "the run reports what it froze"))))))))
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (fixture-commit-file root "src/violating.lisp" +violating-source+)
+      (let ((baseline (merge-pathnames ".gate-baseline.md" root)))
+        (false (probe-file baseline)
+               "precondition: no baseline exists before the run")
+        (if (not (gate-scanner-available-p (linter-path)))
+            (let ((report (normalise-repository root :policy :record-as-debt)))
+              (is eq :not-enumerated
+                  (getf (report-debt-baseline report) :action-taken)
+                  "with no linter installed the debt is not enumerated")
+              (false (probe-file baseline)
+                     "and nothing is written"))
+            (let ((report (normalise-repository root :policy :record-as-debt)))
+              (is eq :created (getf (report-debt-baseline report) :action-taken)
+                  "the run says it created the baseline")
+              (true (probe-file baseline)
+                    "and the file is on disk, which is the part a report cannot fake")
+              (false (member ".gate-baseline.md" (git-tracked-files root)
+                             :test #'string=)
+                     "it is not tracked in a repository we do not own")
+              (is equal '() (git-status-porcelain root)
+                  "and it is invisible to the maintainer")
+              (true (report-recorded-debt report)
+                    "the run reports what it froze")))))))
 
 (define-test the-baseline-names-the-seeded-violation
   "The document describes the repository it was written for.
@@ -550,26 +553,25 @@ skip form to end the test."
 A baseline rendered from a template rather than from a scan would satisfy every
 existence assertion in this file while naming no repository at all."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (fixture-commit-file root "src/violating.lisp" +violating-source+)
-        (if (not (gate-scanner-available-p (linter-path)))
-            (with-no-linter (root)
-              (let ((report (normalise-repository root :policy :record-as-debt)))
-                (is eq :not-enumerated
-                    (getf (report-debt-baseline report) :action-taken)
-                    "with no linter installed there is nothing to name")))
-            (let* ((report (normalise-repository root :policy :record-as-debt))
-                   (text (uiop:read-file-string
-                          (merge-pathnames ".gate-baseline.md" root))))
-              (true (plusp (getf (report-debt-baseline report) :site-count))
-                    "the scan found at least one site")
-              (true (search "violating.lisp" text)
-                    "the baseline names the file the violation is in")
-              (true (search "| src/violating.lisp:" text)
-                    "and gives its position, so a reader can go and look")))))))
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (fixture-commit-file root "src/violating.lisp" +violating-source+)
+      (if (not (gate-scanner-available-p (linter-path)))
+          (with-no-linter (root)
+            (let ((report (normalise-repository root :policy :record-as-debt)))
+              (is eq :not-enumerated
+                  (getf (report-debt-baseline report) :action-taken)
+                  "with no linter installed there is nothing to name")))
+          (let* ((report (normalise-repository root :policy :record-as-debt))
+                 (text (uiop:read-file-string
+                        (merge-pathnames ".gate-baseline.md" root))))
+            (true (plusp (getf (report-debt-baseline report) :site-count))
+                  "the scan found at least one site")
+            (true (search "violating.lisp" text)
+                  "the baseline names the file the violation is in")
+            (true (search "| src/violating.lisp:" text)
+                  "and gives its position, so a reader can go and look"))))))
 
 (define-test a-second-record-as-debt-run-leaves-the-baseline-alone
   "The frozen record is not rewritten.
@@ -578,28 +580,27 @@ A baseline is what was true when the gate went in. Rewriting it on a later run
 destroys the record it exists to be, and makes that run report a change where
 there was none."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (fixture-commit-file root "src/violating.lisp" +violating-source+)
-        (if (not (gate-scanner-available-p (linter-path)))
-            (let ((report (normalise-repository root :policy :record-as-debt)))
-              (is eq :not-enumerated
-                  (getf (report-debt-baseline report) :action-taken)
-                  "with no linter installed there is no baseline to leave alone"))
-            (let ((baseline (merge-pathnames ".gate-baseline.md" root)))
-              (normalise-repository root :policy :record-as-debt)
-              (let ((written (file-write-date baseline))
-                    (text (uiop:read-file-string baseline)))
-                (let ((second (normalise-repository root :policy :record-as-debt)))
-                  (is eq :already-present
-                      (getf (report-debt-baseline second) :action-taken)
-                      "the second run found it already present")
-                  (is = written (file-write-date baseline)
-                      "and did not rewrite it")
-                  (is equal text (uiop:read-file-string baseline)
-                      "its content is unchanged")))))))))
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (fixture-commit-file root "src/violating.lisp" +violating-source+)
+      (if (not (gate-scanner-available-p (linter-path)))
+          (let ((report (normalise-repository root :policy :record-as-debt)))
+            (is eq :not-enumerated
+                (getf (report-debt-baseline report) :action-taken)
+                "with no linter installed there is no baseline to leave alone"))
+          (let ((baseline (merge-pathnames ".gate-baseline.md" root)))
+            (normalise-repository root :policy :record-as-debt)
+            (let ((written (file-write-date baseline))
+                  (text (uiop:read-file-string baseline)))
+              (let ((second (normalise-repository root :policy :record-as-debt)))
+                (is eq :already-present
+                    (getf (report-debt-baseline second) :action-taken)
+                    "the second run found it already present")
+                (is = written (file-write-date baseline)
+                    "and did not rewrite it")
+                (is equal text (uiop:read-file-string baseline)
+                    "its content is unchanged"))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CONTROL 7: an unavailable linter writes no baseline and says so
@@ -613,73 +614,135 @@ while being a false record of a repository nobody scanned, and once written it
 is indistinguishable from an honest empty one. So the scanner is made genuinely
 unreachable, and the run must write nothing and name the reason."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (fixture-commit-file root "src/violating.lisp" +violating-source+)
-        (with-no-linter (root)
-          (false (gate-scanner-available-p (linter-path))
-                 "precondition: the bound path holds no linter")
-          (let ((report (normalise-repository root :policy :record-as-debt)))
-            (is eq :not-enumerated
-                (getf (report-debt-baseline report) :action-taken)
-                "the run says the debt was not enumerated")
-            (false (probe-file (merge-pathnames ".gate-baseline.md" root))
-                   "and no document was written")
-            (true (find-if (lambda (entry)
-                             (search "not enumerated" (getf entry :reason)))
-                           (report-unresolved report))
-                  "an unresolved finding names the reason")))))))
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (fixture-commit-file root "src/violating.lisp" +violating-source+)
+      (with-no-linter (root)
+        (false (gate-scanner-available-p (linter-path))
+               "precondition: the bound path holds no linter")
+        (let ((report (normalise-repository root :policy :record-as-debt)))
+          (is eq :not-enumerated
+              (getf (report-debt-baseline report) :action-taken)
+              "the run says the debt was not enumerated")
+          (false (probe-file (merge-pathnames ".gate-baseline.md" root))
+                 "and no document was written")
+          (true (find-if (lambda (entry)
+                           (search "not enumerated" (getf entry :reason)))
+                         (report-unresolved report))
+                "an unresolved finding names the reason"))))))
+
+;;; ---------------------------------------------------------------------------
+;;; CONTROL 8: a repair writes our apparatus and nothing else
+;;; ---------------------------------------------------------------------------
+
+(define-test control-a-foreign-repair-writes-our-apparatus-and-nothing-else
+  "CONTROL. A repair in a repository we do not own creates files of ours and
+never a file belonging to that project's own layout.
+
+The fixture is flat, and that is the whole point of it. Measured against a
+repository that already carries the directories our own projects have, a repair
+that writes those directories has nothing left to write, and an assertion that
+none appeared passes without ever being aimed at anything.
+
+Every path the run creates is required to be one the exclude covers, which is
+the same statement as the maintainer seeing nothing, made against the tree
+rather than against git's report of it.
+
+The second half puts the answer that held before the ruling back in force and
+requires the same instrument, over the same fixture, to watch a directory of
+ours land in somebody else's tree. Without it the first half is an assertion
+about paths that never appear, which a run that wrote nothing at all satisfies
+just as well."
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%flat-foreign-fixture root)
+      (let ((before (%paths-in root)))
+        (false (member "src/main.lisp" before :test #'string=)
+               "precondition: the fixture carries none of our layout")
+        (normalise-repository root :policy :repair)
+        (let ((written (set-difference (%paths-in root) before :test #'string=)))
+          (true written
+                "the run created something, so the check below has something to read")
+          (dolist (path written)
+            (true (member path (apparatus-paths-for-profile :foreign)
+                          :test #'string=)
+                  "~A is apparatus of ours" path))
+          (false (member "src/main.lisp" written :test #'string=)
+                 "no source directory of ours was written into their tree")
+          (false (member "tests/main-test.lisp" written :test #'string=)
+                 "and no test directory of ours either")))
+      (is equal '() (git-status-porcelain root)
+          "and everything the run created is invisible to the maintainer")))
+  ;; The same instrument, with the answer that held before the ruling in force.
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%flat-foreign-fixture root)
+      (let ((before (%paths-in root)))
+        (let ((*assessed-tiers* '((:ours . (:invariant :gate))
+                                  (:foreign . (:invariant))))
+              (*apparatus-assessed-profiles* '()))
+          (normalise-repository root :policy :repair))
+        (let ((written (set-difference (%paths-in root) before :test #'string=)))
+          (true (member "src/main.lisp" written :test #'string=)
+                "held to somebody else's layout the run does write it, so the
+assertions above were aimed at something that can happen"))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Reporting
 ;;; ---------------------------------------------------------------------------
 
 (define-test a-repair-run-reports-what-it-wrote-and-what-was-already-right
-  "Changed and already-correct are separate lists, and both are populated."
+  "Changed and already-correct are separate lists, and both are populated.
+
+One apparatus file is put in place before the run so that the already-correct
+list has something true to carry. Without it the two lists could be told apart
+only by one of them being empty, which an implementation that never populates
+it satisfies exactly as well."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (let ((report (normalise-repository root :policy :repair)))
-          (is eq :foreign (report-profile report))
-          (true (report-classification report))
-          (true (member :mallet-config (%changed-items report))
-                "the linter configuration was written and reported")
-          (true (member :lint-script (%changed-items report))
-                "the lint script with it")
-          (true (probe-file (merge-pathnames ".git/hooks/pre-commit" root))
-                "and the hook, which lives where no worktree reaches")
-          (true (member :asd-system (report-already-correct report))
-                "the system definition was found already correct")
-          (true (member :src-dir (report-already-correct report))))))))
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (write-fixture-file root "AGENTS.md" "# already in place")
+      (let ((report (normalise-repository root :policy :repair)))
+        (is eq :foreign (report-profile report))
+        (true (report-classification report))
+        (true (member :mallet-config (%changed-items report))
+              "the linter configuration was written and reported")
+        (true (member :lint-script (%changed-items report))
+              "the lint script with it")
+        (true (probe-file (merge-pathnames ".git/hooks/pre-commit" root))
+              "and the hook, which lives where no worktree reaches")
+        (true (member :agents-doc (report-already-correct report))
+              "the file that was already in place is reported as already correct")
+        (false (member :agents-doc (%changed-items report))
+               "and is not also reported as a change")))))
 
 (define-test a-dry-run-writes-nothing-and-still-names-what-would-change
   "The file set and the exclude are identical afterwards, and the report is not."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (let ((before (%snapshot root))
-              (exclude-before (%exclude-patterns-in root)))
-          (let ((report (normalise-repository root :policy :repair :dry-run t)))
-            (true (report-changed report)
-                  "the report names what would change")
-            (true (every (lambda (entry)
-                           (member (getf entry :action-taken)
-                                   '(:would-create :would-update)))
-                         (report-changed report))
-                  "and every entry says it would rather than did")
-            (is eq :would-update (getf (report-exclude report) :action-taken)))
-          (is equal before (%snapshot root)
-              "not one file under the root changed")
-          (is equal exclude-before (%exclude-patterns-in root)
-              "and the exclude is exactly as it was")
-          (false (probe-file (merge-pathnames ".mallet.lisp" root))
-                 "nothing was created"))))))
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (let ((before (%snapshot root))
+            (exclude-before (%exclude-patterns-in root)))
+        (let ((report (normalise-repository root :policy :repair :dry-run t)))
+          (true (report-changed report)
+                "the report names what would change")
+          (true (every (lambda (entry)
+                         (member (getf entry :action-taken)
+                                 '(:would-create :would-update)))
+                       (report-changed report))
+                "and every entry says it would rather than did")
+          (is eq :would-update (getf (report-exclude report) :action-taken)))
+        (is equal before (%snapshot root)
+            "not one file under the root changed")
+        (is equal exclude-before (%exclude-patterns-in root)
+            "and the exclude is exactly as it was")
+        (false (probe-file (merge-pathnames ".mallet.lisp" root))
+               "nothing was created")))))
 
 (define-test with-no-policy-nothing-is-written-and-every-finding-comes-back
   "An unattended run decides nothing.
@@ -687,23 +750,22 @@ unreachable, and the run must write nothing and name the reason."
 Without a policy there is no outcome, because nobody chose one. The findings
 come back with the decisions each of them admits, for the caller to pick from."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (let ((before (%snapshot root))
-              (exclude-before (%exclude-patterns-in root))
-              (report (normalise-repository root)))
-          (is equal '() (report-changed report))
-          (true (report-unresolved report)
-                "every finding comes back")
-          (true (every (lambda (entry) (getf entry :restarts))
-                       (report-unresolved report))
-                "each carrying the decisions it admits")
-          (is equal before (%snapshot root)
-              "and nothing was written")
-          (is equal exclude-before (%exclude-patterns-in root)
-              "not even the exclude"))))))
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (let ((before (%snapshot root))
+            (exclude-before (%exclude-patterns-in root))
+            (report (normalise-repository root)))
+        (is equal '() (report-changed report))
+        (true (report-unresolved report)
+              "every finding comes back")
+        (true (every (lambda (entry) (getf entry :restarts))
+                     (report-unresolved report))
+              "each carrying the decisions it admits")
+        (is equal before (%snapshot root)
+            "and nothing was written")
+        (is equal exclude-before (%exclude-patterns-in root)
+            "not even the exclude")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; A policy that does not apply
@@ -717,45 +779,43 @@ Removing the file from their index is a change to their tracked tree, which is
 the same act, in the other direction, as the leak the finding reports. So the
 run reports it, says what could be decided about it instead, and carries on."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (fixture-commit-file root "CLAUDE.md" "# committed by somebody")
-        (true (member "CLAUDE.md" (git-tracked-files root) :test #'string=)
-              "precondition: it really is in their index")
-        (let* ((report (normalise-repository root :policy :repair))
-               (leak (find-if (lambda (entry)
-                                (typep (getf entry :deviation)
-                                       'foreign-apparatus-tracked))
-                              (report-unresolved report))))
-          (true leak "the leak is reported unresolved")
-          (false (member :repair (getf leak :restarts))
-                 "repair is not among the decisions it admits")
-          (true (member :record-as-debt (getf leak :restarts))
-                "and the decisions that are on offer are named")
-          (true (report-changed report)
-                "the remaining findings were still acted on"))
-        (true (member "CLAUDE.md" (git-tracked-files root) :test #'string=)
-              "the committed file is still tracked")
-        (true (probe-file (merge-pathnames "CLAUDE.md" root))
-              "and still present")))))
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (fixture-commit-file root "CLAUDE.md" "# committed by somebody")
+      (true (member "CLAUDE.md" (git-tracked-files root) :test #'string=)
+            "precondition: it really is in their index")
+      (let* ((report (normalise-repository root :policy :repair))
+             (leak (find-if (lambda (entry)
+                              (typep (getf entry :deviation)
+                                     'foreign-apparatus-tracked))
+                            (report-unresolved report))))
+        (true leak "the leak is reported unresolved")
+        (false (member :repair (getf leak :restarts))
+               "repair is not among the decisions it admits")
+        (true (member :record-as-debt (getf leak :restarts))
+              "and the decisions that are on offer are named")
+        (true (report-changed report)
+              "the remaining findings were still acted on"))
+      (true (member "CLAUDE.md" (git-tracked-files root) :test #'string=)
+            "the committed file is still tracked")
+      (true (probe-file (merge-pathnames "CLAUDE.md" root))
+            "and still present"))))
 
 (define-test acceptance-writes-nothing-and-is-reported-separately
   "A finding judged correct as written is recorded and not acted on."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (let ((before (%snapshot root))
-              (report (normalise-repository root :policy :accept-as-deliberate)))
-          (true (report-accepted report)
-                "the findings are recorded as accepted")
-          (is equal '() (report-changed report)
-              "and none of them is reported as a change")
-          (is equal before (%snapshot root)
-              "nothing under the root was written"))))))
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (let ((before (%snapshot root))
+            (report (normalise-repository root :policy :accept-as-deliberate)))
+        (true (report-accepted report)
+              "the findings are recorded as accepted")
+        (is equal '() (report-changed report)
+            "and none of them is reported as a change")
+        (is equal before (%snapshot root)
+            "nothing under the root was written")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The upstream a fork-then-clone never recorded
@@ -766,20 +826,19 @@ run reports it, says what could be decided about it instead, and carries on."
 told apart from one of our own projects. Supplying the upstream is the repair,
 and it is reported like any other."
   (with-fixture-template ()
-    (with-gated-foreign-profile
-      (with-temp-git-repo (root :origin-url +ours-origin-url+
-                                :initial-file "README.md" :initial-content "x")
-        (%foreign-fixture root)
-        (false (git-remote-url root "upstream")
-               "precondition: there is no upstream")
-        (let ((report (normalise-repository
-                       root :policy :repair
-                            :upstream-url +third-party-upstream-url+)))
-          (true (report-remote-added report)
-                "the run reports the remote it added")
-          (is eq :added (getf (report-remote-added report) :action-taken)))
-        (is equal +third-party-upstream-url+ (git-remote-url root "upstream")
-            "and git can read it back")))))
+    (with-temp-git-repo (root :origin-url +ours-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (false (git-remote-url root "upstream")
+             "precondition: there is no upstream")
+      (let ((report (normalise-repository
+                     root :policy :repair
+                          :upstream-url +third-party-upstream-url+)))
+        (true (report-remote-added report)
+              "the run reports the remote it added")
+        (is eq :added (getf (report-remote-added report) :action-taken)))
+      (is equal +third-party-upstream-url+ (git-remote-url root "upstream")
+          "and git can read it back"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The post-condition, asked directly

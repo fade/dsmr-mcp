@@ -125,9 +125,10 @@ that already points the check elsewhere cannot change what this suite measures."
 (defun %seed-library (root)
   "Give ROOT the shape of a typical working third-party Lisp library.
 
-A system definition, a source directory and a test directory: everything the
-invariant tier asks for, and none of our own conventions. This is the shape that
-must assess clean, because roughly ninety repositories on this machine have it."
+A system definition, a source directory and a test directory: the layout our own
+projects always have, and none of our conventions on top of it. Roughly ninety
+repositories on this machine look like this, and not one of them is answerable
+to us for any part of it."
   (write-fixture-file root "example.asd" "(asdf:defsystem \"example\")")
   (write-fixture-file root "src/main.lisp" ";; source")
   (write-fixture-file root "tests/main-test.lisp" ";; tests")
@@ -139,6 +140,17 @@ must assess clean, because roughly ninety repositories on this machine have it."
   (write-fixture-file root "scripts/lint-lisp.sh" "#!/usr/bin/env bash")
   (write-fixture-file root ".git/hooks/pre-commit" "#!/usr/bin/env bash")
   (write-fixture-file root ".gate-baseline.md" "# baseline")
+  root)
+
+(defun %seed-apparatus (root)
+  "Install every file the catalog names as our own apparatus under ROOT.
+
+A repository we do not own is assessed against these and against nothing else,
+so this is the whole of what it takes for such a repository to report clean."
+  (%seed-quality-gate root)
+  (write-fixture-file root "AGENTS.md" "# notes for an agent")
+  (write-fixture-file root "CLAUDE.md" "# notes for an agent")
+  (write-fixture-file root ".envrc" "# the environment this project wants")
   root)
 
 (defun %clear-ambient-ignores (root)
@@ -222,77 +234,113 @@ happens to share the name as the hook."
 (define-test a-satisfied-repository-reports-nothing-and-says-what-it-checked
   "An empty deviation list arrives with the classification, the profile and the
 items found already correct, so it is distinguishable from an assessment that
-never ran."
+never ran.
+
+The items named are ours. A repository we do not own is never reported on for
+its own layout, so its layout is absent from the satisfied list as well as from
+the findings: silence about it is not a judgement withheld, it is a question
+never asked."
   (with-fixture-template ()
     (with-temp-git-repo (root :origin-url +third-party-origin-url+
                               :initial-file "README.md" :initial-content "x")
       (%seed-library root)
+      (%seed-apparatus root)
       (%seed-clean-exclude root)
       (let ((assessment (assess-repository root)))
         (is equal '() (assessment-deviations assessment))
         (is eq :foreign-with-upstream (assessment-classification assessment))
         (is eq :foreign (assessment-profile assessment))
         (true (assessment-root assessment))
-        (true (member :asd-system (assessment-satisfied assessment)))
-        (true (member :src-dir (assessment-satisfied assessment)))
-        (true (member :tests-dir (assessment-satisfied assessment)))))))
+        (true (member :mallet-config (assessment-satisfied assessment)))
+        (true (member :agents-doc (assessment-satisfied assessment)))
+        (true (member :envrc (assessment-satisfied assessment)))
+        (false (member :src-dir (assessment-satisfied assessment))
+               "their own layout is not among what was checked")
+        (true (item-satisfied-p (catalog-item :src-dir) root)
+              "though it is present, so its absence above is about the question
+asked rather than about the tree")))))
 
 (define-test an-absent-invariant-is-reported
-  "A repository with no source directory is missing something every repository
-of this kind has."
+  "A repository of ours with no source directory is missing something every
+repository of that kind has."
   (with-fixture-template ()
-    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+    (with-temp-git-repo (root :origin-url +ours-origin-url+
                               :initial-file "README.md" :initial-content "x")
       (%seed-library root)
+      (%seed-quality-gate root)
       (%seed-clean-exclude root)
       (uiop:delete-directory-tree (merge-pathnames "src/" root)
                                   :validate t :if-does-not-exist :ignore)
-      (let* ((assessment (assess-repository root))
+      (let* ((assessment (assess-repository root
+                                            :declared-classification :ours))
              (missing (%of-type assessment 'missing-shape-item)))
         (is = 1 (length missing))
         (is equal '(:src-dir) (%keys missing))))))
 
-(define-test a-foreign-repository-is-not-held-to-our-conveniences
-  "A third-party library without a build script is not sick, and reporting it as
-such is the false entry that hides the true ones."
+(define-test a-foreign-repository-is-held-to-none-of-its-own-structure
+  "A third-party library is not sick for lacking a build script, and it is not
+sick for keeping its sources somewhere other than we keep ours. Neither is ours
+to have an opinion about.
+
+The fixture is flat, so every item named below really is absent from it. Run
+against a tree that already carried them, these assertions would be satisfied by
+an assessment holding the strictest opinion imaginable."
   (with-fixture-template ()
     (with-temp-git-repo (root :origin-url +third-party-origin-url+
                               :initial-file "README.md" :initial-content "x")
-      (%seed-library root)
+      (write-fixture-file root "example.asd" "(asdf:defsystem \"example\")")
+      (write-fixture-file root "example.lisp" ";; the whole library")
       (%seed-clean-exclude root)
-      ;; The convenience really is absent, so the assertion below is aimed at
-      ;; something rather than at a file that happens to be there.
+      ;; Each one really is absent, so the assertions below are aimed at
+      ;; something rather than at files that happen to be there.
       (false (item-satisfied-p (catalog-item :build-script) root))
       (false (item-satisfied-p (catalog-item :dev-boot) root))
-      (let ((assessment (assess-repository root)))
-        (false (member :build-script (%keys (assessment-deviations assessment))))
-        (false (member :dev-boot (%keys (assessment-deviations assessment))))
-        (false (member :readme (%keys (assessment-deviations assessment))))))))
+      (false (item-satisfied-p (catalog-item :src-dir) root))
+      (false (item-satisfied-p (catalog-item :tests-dir) root))
+      (let ((keys (%keys (assessment-deviations (assess-repository root)))))
+        (false (member :build-script keys))
+        (false (member :dev-boot keys))
+        (false (member :readme keys))
+        (false (member :src-dir keys)
+               "where they keep their sources is not a finding about them")
+        (false (member :tests-dir keys))
+        (false (member :asd-system keys))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CONTROL: the false-positive flood
 ;;; ---------------------------------------------------------------------------
 
 (define-test control-a-working-third-party-library-produces-no-findings
-  "CONTROL: the most consequential test here. A typical third-party library
-assesses clean, and the same fixture with one invariant removed does not.
+  "CONTROL: the most consequential test here. Three readings of one fixture,
+one file apart each time.
 
-The clean half alone would pass against an assessment that examined nothing, so
-the dirty half runs against the same repository, one file apart. Without the
-pair, an implementation that silently returned no findings at all would look
-identical to a correct one."
+An adopted library with our apparatus in place assesses clean. Take away a
+directory of theirs and it still does, because their layout is not something we
+report on. Take away a file of ours and exactly one finding appears.
+
+The clean reading alone would pass against an assessment that examined nothing,
+and the pair of clean readings alone would pass against one that had merely been
+switched off. The third reading is what proves the instrument was live for the
+first two."
   (with-fixture-template ()
     (with-temp-git-repo (root :origin-url +third-party-origin-url+
                               :initial-file "README.md" :initial-content "x")
       (%seed-library root)
+      (%seed-apparatus root)
       (%seed-clean-exclude root)
       (is equal '() (assessment-deviations (assess-repository root)))
-      ;; One file apart, and the answer must change.
+      ;; Their layout, one directory lighter, and the answer must not change.
       (uiop:delete-directory-tree (merge-pathnames "src/" root)
                                   :validate t :if-does-not-exist :ignore)
+      (false (item-satisfied-p (catalog-item :src-dir) root)
+             "the directory really is gone")
+      (is equal '() (assessment-deviations (assess-repository root))
+          "and a repository we do not own is not reported for it")
+      ;; Ours, one file lighter, and the answer must change.
+      (uiop:delete-file-if-exists (merge-pathnames ".mallet.lisp" root))
       (let ((deviations (assessment-deviations (assess-repository root))))
         (is = 1 (length deviations))
-        (is equal '(:src-dir) (%keys deviations))))))
+        (is equal '(:mallet-config) (%keys deviations))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CONTROL: tracked is not the same as present
