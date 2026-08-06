@@ -18,7 +18,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/tools/restart-process-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/tools/restart-process
                 #:restart-process-tool
                 #:+restart-exit-code+

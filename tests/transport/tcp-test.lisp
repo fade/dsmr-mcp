@@ -8,7 +8,7 @@
 ;;;; suite total read the same whether the transport was exercised or not.
 
 (defpackage #:dsmr-mcp/tests/transport/tcp-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/transport/tcp
                 #:serve-tcp

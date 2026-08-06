@@ -1,7 +1,7 @@
 ;;;; tests/bus/roster-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the per-bus roster: enrolling, departing, the closeable
+;;;; Zebra tests for the per-bus roster: enrolling, departing, the closeable
 ;;;; enrollment gate, the declared leader, and the two read conventions that make
 ;;;; the rest trustworthy.
 ;;;;
@@ -29,7 +29,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/bus/roster-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:roster #:dsmr-mcp/src/bus/roster)
                     (#:agent #:dsmr-mcp/src/bus/agent)
                     (#:envelope #:dsmr-mcp/src/bus/envelope)
@@ -236,8 +236,8 @@
    only ever departs the identity the session resolves for itself, so the roster
    would show one agent as enrolled and departed at once, forever."
   (with-roster (roster-dir state-path)
-    (let ((typed (doubled-id "parachute"))
-          (built (constructed-id "parachute")))
+    (let ((typed (doubled-id "zebra"))
+          (built (constructed-id "zebra")))
       (roster:enroll typed roster-dir state-path)
       (roster:disenroll built roster-dir)
       (is = 1 (length (entry-files roster-dir))

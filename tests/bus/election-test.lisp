@@ -1,7 +1,7 @@
 ;;;; tests/bus/election-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the flock-based broker election and membership.
+;;;; Zebra tests for the flock-based broker election and membership.
 ;;;;
 ;;;; flock is tied to the open file DESCRIPTION, not the process, so two open fds
 ;;;; on the same file genuinely contend within a single process. That lets these
@@ -17,7 +17,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/bus/election-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:e #:dsmr-mcp/src/bus/election)))
 
 (in-package #:dsmr-mcp/tests/bus/election-test)

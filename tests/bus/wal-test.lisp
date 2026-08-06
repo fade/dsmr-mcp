@@ -1,7 +1,7 @@
 ;;;; tests/bus/wal-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the coordination-bus write-ahead log. The properties
+;;;; Zebra tests for the coordination-bus write-ahead log. The properties
 ;;;; under test are the ones a successor broker's correctness rests on: a record
 ;;;; survives a round trip, a clean log replays exactly, and every shape of torn
 ;;;; tail a crash can leave (partial header, short payload, bit-flipped CRC) is
@@ -14,7 +14,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/bus/wal-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/bus/wal
                 #:crc32
                 #:encode-record

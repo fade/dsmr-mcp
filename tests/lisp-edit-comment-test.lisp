@@ -43,7 +43,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/lisp-edit-comment-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/lisp-edit-comment-core
                 #:%comment-regions
                 #:%comment-runs

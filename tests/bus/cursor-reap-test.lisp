@@ -1,7 +1,7 @@
 ;;;; tests/bus/cursor-reap-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the broker's cursor-directory reap. The contract has two
+;;;; Zebra tests for the broker's cursor-directory reap. The contract has two
 ;;;; halves and the second is the load-bearing one: aged ephemeral cursors are
 ;;;; removed, and a stable identity's cursor is not removable at any age.
 ;;;;
@@ -19,7 +19,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/bus/cursor-reap-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:cursor #:dsmr-mcp/src/bus/cursor)
                     (#:envelope #:dsmr-mcp/src/bus/envelope)

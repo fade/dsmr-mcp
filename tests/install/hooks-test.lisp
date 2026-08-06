@@ -1,7 +1,7 @@
 ;;;; tests/install/hooks-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the SessionStart auto-arm hook writer: the pure
+;;;; Zebra tests for the SessionStart auto-arm hook writer: the pure
 ;;;; settings.json transform (idempotency, no-clobber, presence predicate), the
 ;;;; arm-script copy (executable bit, graceful absent-source), the path helper,
 ;;;; and the project-settings write (create + re-parse + already-present). Every
@@ -15,7 +15,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/install/hooks-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/install/hooks
                 #:default-lib-dir

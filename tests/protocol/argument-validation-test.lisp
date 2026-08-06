@@ -9,7 +9,7 @@
 ;;;; -32602 path in src/dispatch.lisp.
 
 (defpackage #:dsmr-mcp/tests/protocol/argument-validation-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/protocol
                 #:process-json-line)

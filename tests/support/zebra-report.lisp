@@ -1,7 +1,7 @@
-;;;; tests/support/parachute-report.lisp
+;;;; tests/support/zebra-report.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; A Parachute report class that reads the raw result vector and makes the
+;;;; A Zebra report class that reads the raw result vector and makes the
 ;;;; counts available as DATA before it makes them available as text.
 ;;;;
 ;;;; The problem it solves: a summary line that renders counts to prose and
@@ -16,24 +16,24 @@
 ;;;; Making them agree would destroy the reason the file exists:
 ;;;;
 ;;;;   The compatibility rule drops exactly TEST-RESULT, quirks included,
-;;;;   because that is what parachute does and the point of the line is that
+;;;;   because that is what zebra does and the point of the line is that
 ;;;;   a reader sees the number they have always seen.
 ;;;;
 ;;;;   The axes rule drops every PARENT-RESULT, because a group or a control
 ;;;;   object is not a check and counting it as one inflates the leaf counts.
 ;;;;
-;;;; Neither rule calls parachute's own helpers. The compatibility numbers are
+;;;; Neither rule calls zebra's own helpers. The compatibility numbers are
 ;;;; derived here, by this file's own walk of the raw vector, so that comparing
-;;;; them against what parachute's reporter PRINTS compares two independent
+;;;; them against what zebra's reporter PRINTS compares two independent
 ;;;; computations rather than one function to itself.
 ;;;;
-;;;; Nothing in a parachute result records why a test failed. Every count in
+;;;; Nothing in a zebra result records why a test failed. Every count in
 ;;;; this file is therefore a property of the recorded data and never a claim
 ;;;; about a cause.
 
-(defpackage #:dsmr-mcp/tests/support/parachute-report
+(defpackage #:dsmr-mcp/tests/support/zebra-report
   (:use #:cl)
-  (:local-nicknames (#:pa #:parachute))
+  (:local-nicknames (#:pa #:zebra))
   (:export #:axis-summary
            #:*controls-are-not-checks*
            #:*uncarried-test-failures-are-failures*
@@ -75,7 +75,7 @@
            #:limit-declared
            #:limit-duration))
 
-(in-package #:dsmr-mcp/tests/support/parachute-report)
+(in-package #:dsmr-mcp/tests/support/zebra-report)
 
 ;;; ------------------------------------------------------------------
 ;;; Selectable semantics
@@ -83,17 +83,17 @@
 ;;; Each deviation is named for what it does and is set independently, so a
 ;;; caller can adopt one without adopting the rest and so each is greppable
 ;;; on its own name. Every one defaults to NIL, and with all three off the
-;;; triple this reporter returns and prints is parachute's own.
+;;; triple this reporter returns and prints is zebra's own.
 
 (defvar *controls-are-not-checks* nil
   "When true, group and control results are excluded from the passed and
-failed counts, leaving only genuine leaf checks. Parachute excludes only
+failed counts, leaving only genuine leaf checks. Zebra excludes only
 test results, so a GROUP or a WITH-FORCED-STATUS form is counted as though
 it were an assertion.")
 
 (defvar *uncarried-test-failures-are-failures* nil
   "When true, a test that failed while no result beneath it carries that
-failure is counted as one failure. Parachute drops every test result from
+failure is counted as one failure. Zebra drops every test result from
 the failed count, so a test that dies before reaching its first assertion
 contributes nothing and the run reports zero failures.
 
@@ -132,7 +132,7 @@ object, no object falls in two of them, and together they sum to TOTAL.
 
 PASSED, FAILED and SKIPPED are the policy view, computed under whichever
 deviations were active. UPSTREAM-PASSED, UPSTREAM-FAILED and
-UPSTREAM-SKIPPED are always parachute's own numbers, whatever the policy,
+UPSTREAM-SKIPPED are always zebra's own numbers, whatever the policy,
 so the two can be compared without running anything twice."
   ;; Partition: leaf results, i.e. anything that is not a parent-result.
   (leaf-passed 0 :type unsigned-byte)
@@ -155,7 +155,7 @@ so the two can be compared without running anything twice."
   (passed 0 :type unsigned-byte)
   (failed 0 :type unsigned-byte)
   (skipped 0 :type unsigned-byte)
-  ;; Parachute's own view, always.
+  ;; Zebra's own view, always.
   (upstream-passed 0 :type unsigned-byte)
   (upstream-failed 0 :type unsigned-byte)
   (upstream-skipped 0 :type unsigned-byte)
@@ -194,7 +194,7 @@ so the two can be compared without running anything twice."
                        ((:skips-are-not-passes skips) *skips-are-not-passes*))
   "Walk REPORT's raw result vector once and return an AXES structure.
 
-Works on any parachute report, not only on AXIS-SUMMARY, so a caller holding
+Works on any zebra report, not only on AXIS-SUMMARY, so a caller holding
 an ordinary PLAIN report can still obtain the numbers as data."
   (let ((axes (make-axes
                :active-deviations
@@ -243,7 +243,7 @@ an ordinary PLAIN report can still obtain the numbers as data."
                         :duration (pa:duration result))
                        (axes-declared-limits axes))))
 
-             ;; Parachute's own triple, derived here rather than borrowed.
+             ;; Zebra's own triple, derived here rather than borrowed.
              ;; The rule below is upstream's whole rule: drop every test
              ;; result from passed and from failed, count skipped raw.
              ;; It filters TEST-RESULT and nothing else, which is not what
@@ -294,18 +294,18 @@ an ordinary PLAIN report can still obtain the numbers as data."
    :uncarried-test-failures-are-failures *uncarried-test-failures-are-failures*
    :skips-are-not-passes *skips-are-not-passes*)
   (:documentation
-   "Parachute report that keeps its counts as data and prints them second.
+   "Zebra report that keeps its counts as data and prints them second.
 
 Adopting it changes nothing an existing gate relies on: with no options set
-the Passed, Failed and Skipped line is parachute's own, so anyone switching
+the Passed, Failed and Skipped line is zebra's own, so anyone switching
 a gate to this class reads the same three numbers they have read for years,
 with the unambiguous axes added beneath them.
 
-Subclasses PLAIN deliberately. PLAIN and QUIET are where parachute contains
+Subclasses PLAIN deliberately. PLAIN and QUIET are where zebra contains
 an error raised inside a test; a report subclassed straight off REPORT lets
 such an error escape and take the rest of the run with it.
 
-Nothing in a parachute result records why a test failed, so no count here
+Nothing in a zebra result records why a test failed, so no count here
 names a cause. The three deviations documented on *CONTROLS-ARE-NOT-CHECKS*,
 *UNCARRIED-TEST-FAILURES-ARE-FAILURES* and *SKIPS-ARE-NOT-PASSES* are
 selected per instance or globally, and govern both the printed triple and
@@ -363,13 +363,13 @@ same shape as any other run rather than signalling on a zero denominator."
           (axes-passed axes) (axes-failed axes) (axes-skipped axes))
   (if (axes-active-deviations axes)
       (format stream ";; Counted under: ~{~(~a~)~^, ~}.~%~
-                      ;; These are not parachute's own numbers; without them the~%~
+                      ;; These are not zebra's own numbers; without them the~%~
                       ;; triple would read ~d / ~d / ~d.~%"
               (axes-active-deviations axes)
               (axes-upstream-passed axes)
               (axes-upstream-failed axes)
               (axes-upstream-skipped axes))
-      (format stream ";; Counted exactly as parachute counts: every test result~%~
+      (format stream ";; Counted exactly as zebra counts: every test result~%~
                       ;; dropped from passed and from failed, skipped counted raw.~%"))
   (format stream "~%;; Axes. Facts about the run, unaffected by the semantics~%~
                   ;; above. Each line counts one kind of object, no object is on~%~
@@ -389,7 +389,7 @@ same shape as any other run rather than signalling on a zero denominator."
                     ;; reported uncompared and no verdict is drawn from them.~%")
     (dolist (observation (axes-declared-limits axes))
       (flet ((seconds (value)
-               ;; Durations are kept as the exact rationals parachute
+               ;; Durations are kept as the exact rationals zebra
                ;; recorded; only this display rounds them.
                (if (realp value) (float value 1d0) value)))
         (format stream "  limit ~10@a   took ~10@a   ~9a ~a~%"
@@ -427,7 +427,7 @@ failure appears once."
     (when (and (plusp (axes-test-failed-uncarried axes))
                (zerop (axes-upstream-failed axes)))
       (format stream "~&;; ~d failure~:p above ~:[are~;is~] invisible in~%~
-                      ;; parachute's own failed count, which reads ~d.~%"
+                      ;; zebra's own failed count, which reads ~d.~%"
               (axes-test-failed-uncarried axes)
               (= 1 (axes-test-failed-uncarried axes))
               (axes-upstream-failed axes)))))

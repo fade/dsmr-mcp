@@ -1,7 +1,7 @@
 ;;;; tests/bus/envelope-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the bus wire format. Two processes that never share
+;;;; Zebra tests for the bus wire format. Two processes that never share
 ;;;; memory — the MCP session and the standalone watcher — both read and write
 ;;;; this format, so the properties pinned here are what make their agreement
 ;;;; possible: the round trip is exact, the payload is transparent to the
@@ -15,7 +15,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/bus/envelope-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:envelope #:dsmr-mcp/src/bus/envelope)
                     (#:wal #:dsmr-mcp/src/bus/wal)))
 

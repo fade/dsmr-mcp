@@ -11,7 +11,7 @@
 ;;;;   - Hermetic timeout: sb-ext:with-timeout boundary respected
 
 (defpackage #:dsmr-mcp/tests/code-intelligence/code-find-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/tests/support/slynk-fixture
                 #:with-temporary-slynk-listener)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers

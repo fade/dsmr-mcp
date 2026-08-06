@@ -10,7 +10,7 @@
 ;;;; tests/attach/repl-eval-attach-test.lisp.
 
 (defpackage #:dsmr-mcp/tests/dispatch/mode-router-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/state
                 #:make-session

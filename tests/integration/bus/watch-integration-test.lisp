@@ -16,7 +16,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/integration/bus/watch-integration-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal)
                     (#:envelope #:dsmr-mcp/src/bus/envelope)))
 

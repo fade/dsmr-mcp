@@ -1,7 +1,7 @@
 ;;;; tests/bus/selector-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for bus state-root derivation.
+;;;; Zebra tests for bus state-root derivation.
 ;;;;
 ;;;; Two properties matter more than the rest. An unnamed bus must land on the
 ;;;; path it has always used, because every running agent, every cursor and every
@@ -22,7 +22,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/bus/selector-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:selector #:dsmr-mcp/src/bus/selector)
                     (#:broker #:dsmr-mcp/src/bus/broker)))
 
