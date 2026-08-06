@@ -55,7 +55,7 @@
   (format *error-output* "~&[build-core] source-registry root: ~A~%" workspace))
 
 ;;; Load the system and the test systems, all compilation chatter on stderr.
-;;; Loading dsmr-mcp/tests and dsmr-mcp/tests/integration puts parachute and
+;;; Loading dsmr-mcp/tests and dsmr-mcp/tests/integration puts zebra and
 ;;; every test leaf in the image, so both `make test` and `make test-integration`
 ;;; can run against the core without any load-system step.
 (dolist (system '("dsmr-mcp" "dsmr-mcp/tests" "dsmr-mcp/tests/integration"))
