@@ -39,6 +39,9 @@
            #:test-result-summary
            #:*parachute-family*
            #:%detect-from-asdf-deps
+           #:%dependency-system-name
+           #:%test-system-siblings
+           #:%test-system-name-p
            #:%parachute-family-package
            #:%resolve-test-packages
            #:%parachute-purge-ghost-suites
@@ -267,6 +270,47 @@ or NIL when NAME is not one of them."
   (and (stringp name)
        (find name *parachute-family* :key #'first :test #'string-equal)))
 
+(defun %dependency-system-name (dep)
+  "Return the system name DEP designates as a string, or NIL when it names none.
+
+ASDF coerces a plain dependency to a lowercase string whether it was written as
+a string, a symbol or a keyword, so the only spellings that survive parsing are
+the compound designators it leaves as lists.  (:version NAME VERSION) carries
+the name second, but (:feature FEATURE NAME) carries it third, behind the
+feature expression.  Reading the second element of a :feature form yields the
+feature rather than the system, so a dependency guarded by a feature named no
+system that could be matched."
+  (let ((name (if (consp dep)
+                  (if (eq (first dep) :feature)
+                      (third dep)
+                      (second dep))
+                  dep)))
+    (typecase name
+      (string name)
+      (symbol (string-downcase (symbol-name name)))
+      (t nil))))
+
+(defun %test-system-name-p (system-name)
+  "True when SYSTEM-NAME already names a test system by the usual conventions."
+  (and (stringp system-name)
+       (some (lambda (suffix)
+               (let ((n (length system-name))
+                     (s (length suffix)))
+                 (and (> n s)
+                      (string-equal suffix system-name :start2 (- n s)))))
+             '("/tests" "/test" "-tests" "-test"))))
+
+(defun %test-system-siblings (system-name)
+  "Return the conventional test-system names beside SYSTEM-NAME, likeliest first.
+
+A library does not depend on its own test system; the dependency runs the other
+way.  Descending through a library's dependencies therefore never reaches the
+system that names the test framework, and someone who asks about the library
+gets no answer at all.  These are the names to consult when that happens."
+  (when (and (stringp system-name) (plusp (length system-name)))
+    (mapcar (lambda (suffix) (concatenate 'string system-name suffix))
+            '("/tests" "/test" "-tests" "-test"))))
+
 (defun %detect-from-asdf-deps (system-name)
   "Walk SYSTEM-NAME's ASDF :depends-on closure (with visited-set deduplication)
 checking for Parachute-family / rove / fiveam system name strings.
@@ -275,12 +319,25 @@ Returns :parachute, :rove, :fiveam, or NIL when none found.
 The second return value is the dependency name that matched.  It tells one
 Parachute-family member from another, which the keyword alone cannot do: both
 \"parachute\" and \"zebra\" report :parachute, and the caller still needs to know
-which package to reach for.
+which package to reach for.  The third is the system that declared it, which
+need not be SYSTEM-NAME.
+
+When SYSTEM-NAME names no framework anywhere beneath it, its conventional test
+siblings are consulted before giving up.  Naming a library is the way a caller
+actually asks for its tests, and a library depends on neither its tests nor
+their framework, so descending alone answers NIL for every well-formed project
+and sends the caller to a fallback that reports success without running a
+recognised suite.
 
 Walks at least 2 levels (the test system plus its direct deps); the visited hash
 prevents cycles and bounds the total work on deeply nested systems."
   (let ((visited (make-hash-table :test #'equal)))
-    (labels ((walk (name)
+    (labels ((framework-named-by (dep-name)
+               (cond
+                ((%parachute-family-system-p dep-name) :parachute)
+                ((string-equal dep-name "rove") :rove)
+                ((string-equal dep-name "fiveam") :fiveam)))
+             (walk (name)
                (when (and (stringp name) (not (gethash name visited)))
                  (setf (gethash name visited) t)
                  (let ((sys (ignore-errors (asdf/system:find-system name nil))))
@@ -289,23 +346,16 @@ prevents cycles and bounds the total work on deeply nested systems."
                             (ignore-errors
                              (asdf/system:system-depends-on sys))))
                        (dolist (dep deps)
-                         (let ((dep-name
-                                (if (consp dep)
-                                    (second dep)
-                                    dep)))
-                           (when (stringp dep-name)
-                             (cond
-                              ((%parachute-family-system-p dep-name)
-                               (return-from %detect-from-asdf-deps
-                                 (values :parachute dep-name)))
-                              ((string-equal dep-name "rove")
-                               (return-from %detect-from-asdf-deps
-                                 (values :rove dep-name)))
-                              ((string-equal dep-name "fiveam")
-                               (return-from %detect-from-asdf-deps
-                                 (values :fiveam dep-name))))
+                         (let ((dep-name (%dependency-system-name dep)))
+                           (when dep-name
+                             (let ((framework (framework-named-by dep-name)))
+                               (when framework
+                                 (return-from %detect-from-asdf-deps
+                                   (values framework dep-name name))))
                              (walk dep-name))))))))))
-      (walk system-name))
+      (walk system-name)
+      (unless (%test-system-name-p system-name)
+        (mapc #'walk (%test-system-siblings system-name))))
     nil))
 
 (defun %parachute-family-package (&optional system-name)
