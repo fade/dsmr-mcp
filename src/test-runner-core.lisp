@@ -40,7 +40,7 @@
                 #:run-tests
                 #:detect-test-framework
                 #:test-result-summary
-                #:%parachute-purge-ghost-suites
+                #:%zebra-purge-ghost-suites
                 #:%rove-purge-ghost-suites
                 #:*test-debug-output*
                 #:*log-hook*
@@ -51,7 +51,7 @@
   (:export #:run-tests
            #:detect-test-framework
            #:test-result-summary
-           #:%parachute-purge-ghost-suites
+           #:%zebra-purge-ghost-suites
            #:%rove-purge-ghost-suites
            #:*test-debug-output*
            #:%build-run-tests-form

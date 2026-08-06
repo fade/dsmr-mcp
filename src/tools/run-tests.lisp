@@ -70,7 +70,7 @@
     :allocation :class
     :initform "Run tests for an ASDF system and return structured results with \
 per-test pass/fail counts and source locations. \
-Supports automatic framework detection (parachute/rove/fiveam) or explicit \
+Supports automatic framework detection (zebra/rove/fiveam) or explicit \
 selection via the framework argument. \
 By default, the test system is reloaded before running so edits from \
 lisp-edit-form become live; pass reload=false to opt out. \
@@ -86,7 +86,7 @@ Requires attached or hermetic mode.")
                   :description "ASDF system name to test (e.g. \"my-project/tests\").")
                  (framework
                   :type :string
-                  :description "Force framework: \"parachute\", \"rove\", \"fiveam\", \
+                  :description "Force framework: \"zebra\", \"rove\", \"fiveam\", \
 or \"auto\" (default: auto-detect from ASDF :depends-on).")
                  (test
                   :type :string
