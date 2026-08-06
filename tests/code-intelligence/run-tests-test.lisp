@@ -29,6 +29,9 @@
   (:import-from #:dsmr-mcp/src/test-runner-engine
                 #:%resolve-test-packages
                 #:%detect-from-asdf-deps
+                #:%dependency-system-name
+                #:%test-system-siblings
+                #:%test-system-name-p
                 #:%parachute-family-package
                 #:*parachute-family*)
   (:import-from #:dsmr-mcp/src/test-runner-core
@@ -157,6 +160,84 @@ widened rather than swapped in for the foreign ones."
       ;; Probe systems are registry-only and must not outlive the test.
       (dolist (probe probes)
         (ignore-errors (asdf:clear-system (first probe)))))))
+
+(define-test detects-framework-declared-by-a-test-sibling
+  "Naming a library resolves the framework its test sibling declares.
+
+This is how the verb is actually invoked: a caller asks for the tests of the
+thing they are working on, which is the library.  A library depends on neither
+its tests nor their framework, so a walk that only descends answers NIL for
+every correctly built project and hands the caller to the ASDF fallback, which
+runs an operation and reports success without ever recognising a suite.  The
+symptom is a run reporting no tests and no failures, which reads as a pass.
+
+The third return value names the system that actually declared the framework,
+so a caller can tell that the answer came from a sibling rather than from the
+name it asked about.  Rove and FiveAM are asserted alongside to prove this
+reaches every framework rather than only the one being renamed."
+  ;; Each library name must itself be free of a test suffix, or the guard that
+  ;; stops a test system being chased for a sibling suppresses the lookup.
+  (let ((probes '(("dsmr-probe-lib-on-zebra"
+                   "dsmr-probe-lib-on-zebra/tests" "zebra")
+                  ("dsmr-probe-lib-on-rove"
+                   "dsmr-probe-lib-on-rove/test" "rove")
+                  ("dsmr-probe-lib-on-fiveam"
+                   "dsmr-probe-lib-on-fiveam-tests" "fiveam"))))
+    (unwind-protect
+         (progn
+           ;; Each library declares ordinary dependencies and says nothing at
+           ;; all about testing; only the sibling names the framework.
+           (dolist (probe probes)
+             (eval `(asdf:defsystem ,(first probe) :depends-on ("alexandria")))
+             (eval `(asdf:defsystem ,(second probe)
+                      :depends-on (,(first probe) ,(third probe)))))
+           (multiple-value-bind (framework matched declared-by)
+               (%detect-from-asdf-deps "dsmr-probe-lib-on-zebra")
+             (is eq :parachute framework)
+             (is string= "zebra" matched)
+             (is string= "dsmr-probe-lib-on-zebra/tests" declared-by))
+           (is eq :rove (%detect-from-asdf-deps "dsmr-probe-lib-on-rove"))
+           (is eq :fiveam (%detect-from-asdf-deps "dsmr-probe-lib-on-fiveam"))
+           ;; The same answers through the public entry point.
+           (is eq :parachute
+               (detect-test-framework "dsmr-probe-lib-on-zebra"))
+           ;; A name that is already a test system is not chased any further.
+           (true (%test-system-name-p "dsmr-mcp/tests"))
+           (true (%test-system-name-p "zebra/test"))
+           (false (%test-system-name-p "dsmr-mcp"))
+           (is equal
+               '("dsmr-mcp/tests" "dsmr-mcp/test"
+                 "dsmr-mcp-tests" "dsmr-mcp-test")
+               (%test-system-siblings "dsmr-mcp")))
+      (dolist (probe probes)
+        (ignore-errors (asdf:clear-system (first probe)))
+        (ignore-errors (asdf:clear-system (second probe)))))))
+
+(define-test dependency-designators-resolve-to-system-names
+  "Every dependency spelling ASDF can hand back resolves to the system name.
+
+ASDF coerces a plain dependency to a lowercase string whatever it was written
+as, so a keyword and a string arrive identically and neither needs special
+handling.  The compound designators are the ones that survive as lists, and
+(:feature FEATURE NAME) puts the system third: reading the second element
+returns the feature, which names no system and matches no framework, so a
+dependency guarded by a feature was invisible to detection."
+  (is string= "zebra" (%dependency-system-name "zebra"))
+  (is string= "zebra" (%dependency-system-name :zebra))
+  (is string= "zebra" (%dependency-system-name '#:zebra))
+  (is string= "zebra" (%dependency-system-name '(:version :zebra "1.0")))
+  (is string= "fiveam" (%dependency-system-name '(:feature :sbcl :fiveam)))
+  (is string= "fiveam" (%dependency-system-name '(:feature (:and :sbcl :unix)
+                                                  "fiveam")))
+  (false (%dependency-system-name 42))
+  ;; End to end: a framework named only behind a feature guard is detected.
+  (let ((probe "dsmr-probe-feature-guarded-suite"))
+    (unwind-protect
+         (progn
+           (eval `(asdf:defsystem ,probe
+                    :depends-on ((:feature :sbcl :fiveam))))
+           (is eq :fiveam (%detect-from-asdf-deps probe)))
+      (ignore-errors (asdf:clear-system probe)))))
 
 (define-test explicit-framework-accepts-parachute-family-names
   "An explicit framework argument naming any Parachute-family system, the
