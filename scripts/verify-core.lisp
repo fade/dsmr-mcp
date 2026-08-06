@@ -136,10 +136,10 @@ against; an image without them is not the artifact the Makefile promises.")
     "DSMR-MCP/SRC/BUS/BROKER"
     "DSMR-MCP/SRC/CODE-CORE"
     "CLOSER-MOP"
-    "PARACHUTE")
+    "ZEBRA")
   "Packages that must exist, spanning every major subsystem plus the two
 foreign libraries the image cannot work without: closer-mop drives the tool
-metaclass and parachute runs the suites.")
+metaclass and zebra runs the suites.")
 
 (defparameter *verify-core-required-verbs*
   '("repl-eval"
