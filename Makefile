@@ -18,7 +18,7 @@ export XDG_CACHE_HOME ?= $(CURDIR)/.ci-cache
 CORE ?= dsmr.core
 
 .PHONY: bridge bus-watch install-bus-watch test test-integration core core-verify test-warm \
-        install-skills check-skills
+        install-skills check-skills install-harness check-harness
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -27,6 +27,15 @@ BINDIR ?= $(PREFIX)/bin
 # the first target and deliberately not the only one; a second agent gets its own
 # directory rather than this one being generalized in place.
 SKILLDIR ?= $(HOME)/.claude/skills
+
+# Where harness artefacts that are not skills are deployed: the status line, and
+# anything else the agent reads from its own configuration root rather than from
+# a project. Same reasoning as SKILLDIR, one level up.
+#
+# These deploy GLOBALLY on purpose. An artefact that identifies a session, or
+# that every session is expected to share, is wrong the moment it is scoped to
+# one project: it cannot reach the others, and a fleet restart cannot widen it.
+AGENTDIR ?= $(HOME)/.claude
 
 ## bridge: build the standalone stdio<->TCP bridge binary.
 ##
@@ -118,6 +127,39 @@ install-skills:
 	  echo "  deployed $$f"; \
 	done
 	@echo "installed into $(SKILLDIR)"
+
+## check-harness: report drift between harness/ and the deployed agent root.
+##
+##   Same contract as check-skills, and the same hazard: a live correction is
+##   usually made to the DEPLOYED copy, so the tracked tree is the stale one
+##   more often than not. Always run this before install-harness, and when it
+##   reports DIFFERS, look before deciding which way to copy.
+check-harness:
+	@status=0; \
+	for f in $$(cd harness && find . -type f | sed 's|^\./||'); do \
+	  if [ ! -f "$(AGENTDIR)/$$f" ]; then \
+	    echo "  NOT DEPLOYED  $$f"; status=1; \
+	  elif ! cmp -s "harness/$$f" "$(AGENTDIR)/$$f"; then \
+	    echo "  DIFFERS       $$f"; status=1; \
+	  fi; \
+	done; \
+	if [ $$status -eq 0 ]; then echo "harness in sync with $(AGENTDIR)"; \
+	else echo "run 'make install-harness' to deploy this tree, or port the other way first"; fi; \
+	exit $$status
+
+## install-harness: deploy harness/ into the agent configuration root.
+##
+##   Reaches every session on the host, not just this project's. The status
+##   line lands immediately for sessions started afterwards; a running session
+##   keeps the one it started with.
+install-harness:
+	@for f in $$(cd harness && find . -type f | sed 's|^\./||'); do \
+	  mkdir -p "$(AGENTDIR)/$$(dirname $$f)"; \
+	  cp -p "harness/$$f" "$(AGENTDIR)/$$f"; \
+	  chmod +x "$(AGENTDIR)/$$f"; \
+	  echo "  deployed $$f"; \
+	done
+	@echo "installed into $(AGENTDIR)"
 
 ## test: fast in-process unit suite (the push hot-path).
 ##
