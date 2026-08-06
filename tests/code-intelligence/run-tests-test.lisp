@@ -27,7 +27,10 @@
   (:import-from #:dsmr-mcp/tests/support/slynk-fixture
                 #:with-temporary-slynk-listener)
   (:import-from #:dsmr-mcp/src/test-runner-engine
-                #:%resolve-test-packages)
+                #:%resolve-test-packages
+                #:%detect-from-asdf-deps
+                #:%parachute-family-package
+                #:*parachute-family*)
   (:import-from #:dsmr-mcp/src/test-runner-core
                 #:detect-test-framework
                 #:%parachute-purge-ghost-suites
@@ -110,6 +113,83 @@ ASDF :depends-on closure, not by loaded-package heuristic. An explicit
   (is eq :parachute (detect-test-framework "dsmr-mcp/tests" nil))
   ;; "auto" framework also triggers auto-detection.
   (is eq :parachute (detect-test-framework "dsmr-mcp/tests" "auto")))
+
+(define-test detects-parachute-family-by-system-name
+  "The ASDF dependency walk recognises every system that provides the Parachute
+API, so a suite built on our renamed fork reaches the Parachute runner instead
+of falling through to the ASDF fallback.  That fallback raises nothing, so an
+unrecognised name shows up as a suite that quietly ran the wrong way rather
+than as a failure.
+
+The second return value names the member that matched, which is what lets the
+runner reach the right package in an image holding more than one.
+
+Rove and FiveAM detection is asserted alongside to prove the family names were
+widened rather than swapped in for the foreign ones."
+  (let ((probes '(("dsmr-probe-suite-on-zebra" "zebra")
+                  ("dsmr-probe-suite-on-parachute" "parachute")
+                  ("dsmr-probe-suite-on-rove" "rove")
+                  ("dsmr-probe-suite-on-fiveam" "fiveam"))))
+    (unwind-protect
+         (progn
+           (dolist (probe probes)
+             (eval `(asdf:defsystem ,(first probe)
+                      :depends-on (,(second probe)))))
+           ;; The renamed fork resolves, and reports which member matched.
+           (multiple-value-bind (framework matched)
+               (%detect-from-asdf-deps "dsmr-probe-suite-on-zebra")
+             (is eq :parachute framework)
+             (is string= "zebra" matched))
+           ;; Parachute resolves as before, and is told apart from the fork.
+           (multiple-value-bind (framework matched)
+               (%detect-from-asdf-deps "dsmr-probe-suite-on-parachute")
+             (is eq :parachute framework)
+             (is string= "parachute" matched))
+           (is eq :rove (%detect-from-asdf-deps "dsmr-probe-suite-on-rove"))
+           (is eq :fiveam (%detect-from-asdf-deps "dsmr-probe-suite-on-fiveam"))
+           ;; The same answers through the public entry point.
+           (is eq :parachute
+               (detect-test-framework "dsmr-probe-suite-on-zebra"))
+           (is eq :parachute
+               (detect-test-framework "dsmr-probe-suite-on-parachute"))
+           (is eq :rove (detect-test-framework "dsmr-probe-suite-on-rove"))
+           (is eq :fiveam (detect-test-framework "dsmr-probe-suite-on-fiveam")))
+      ;; Probe systems are registry-only and must not outlive the test.
+      (dolist (probe probes)
+        (ignore-errors (asdf:clear-system (first probe)))))))
+
+(define-test explicit-framework-accepts-parachute-family-names
+  "An explicit framework argument naming any Parachute-family system, the
+renamed fork included, answers the one keyword the runner dispatches on.
+Without that normalisation the fork's name interns to a keyword no dispatch
+branch handles and the run lands in the ASDF fallback, which reports success.
+
+Foreign framework names must keep interning to their own keyword."
+  (is eq :parachute (detect-test-framework "dsmr-mcp/tests" "zebra"))
+  (is eq :parachute (detect-test-framework "dsmr-mcp/tests" "ZEBRA"))
+  (is eq :parachute (detect-test-framework "dsmr-mcp/tests" "parachute"))
+  (is eq :rove (detect-test-framework "dsmr-mcp/tests" "rove"))
+  (is eq :fiveam (detect-test-framework "dsmr-mcp/tests" "fiveam"))
+  (is eq :parachute (detect-test-framework "dsmr-mcp/tests" "auto")))
+
+(define-test family-package-resolves-to-the-loaded-member
+  "Package resolution returns the family member actually present in the image.
+This suite runs under Parachute, so resolution must land on Parachute's own
+package: recognising the fork must not divert an image that never loaded it.
+
+Both members must remain listed, which is the assertion that fails if one name
+is ever swapped in for the other rather than added alongside it."
+  (is eq (find-package :org.shirakumo.parachute) (%parachute-family-package))
+  (true (find "parachute" *parachute-family*
+              :key #'first :test #'string-equal))
+  (true (find "zebra" *parachute-family*
+              :key #'first :test #'string-equal))
+  ;; Every entry pairs a system name with at least one package name.
+  (true (every (lambda (entry)
+                 (and (stringp (first entry))
+                      (rest entry)
+                      (every #'stringp (rest entry))))
+               *parachute-family*)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; run-tests-parachute-returns-structured-counts
