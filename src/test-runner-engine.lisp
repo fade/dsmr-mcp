@@ -37,6 +37,9 @@
   (:export #:run-tests
            #:detect-test-framework
            #:test-result-summary
+           #:*parachute-family*
+           #:%detect-from-asdf-deps
+           #:%parachute-family-package
            #:%resolve-test-packages
            #:%parachute-purge-ghost-suites
            #:%rove-purge-ghost-suites
@@ -237,58 +240,116 @@ Fields: test_name (required), plus optional description, form, values, reason, s
 ;;; return the first framework whose package happens to be loaded.
 ;;; ---------------------------------------------------------------------------
 
+(defparameter *parachute-family*
+  '(("parachute" "ORG.SHIRAKUMO.PARACHUTE" "PARACHUTE")
+    ("zebra" "ZEBRA"))
+  "Systems providing the Parachute test API, each paired with the package names
+that API may live under, most specific first.
+
+Our fork of Parachute was renamed to zebra and dropped the
+org.shirakumo.parachute package outright, so a suite built on it presents an
+entirely different system name and package while behaving identically.  Both
+must reach the same runner.
+
+Parachute is listed first so an image holding both resolves the way it did
+before zebra existed.  A system whose dependency closure names one of them
+outright is matched on that name instead, so load order never decides which
+API a suite is run through.")
+
+(defvar *active-parachute-package* nil
+  "The Parachute-family package the run in progress was dispatched against.
+%RUN-PARACHUTE-TESTS binds it so the result walkers, which are handed a result
+object and never see a system name, read the same API the run used.")
+
+(defun %parachute-family-system-p (name)
+  "Return the *PARACHUTE-FAMILY* entry the system or framework NAME designates,
+or NIL when NAME is not one of them."
+  (and (stringp name)
+       (find name *parachute-family* :key #'first :test #'string-equal)))
+
 (defun %detect-from-asdf-deps (system-name)
   "Walk SYSTEM-NAME's ASDF :depends-on closure (with visited-set deduplication)
-checking for parachute / rove / fiveam system name strings.
+checking for Parachute-family / rove / fiveam system name strings.
 Returns :parachute, :rove, :fiveam, or NIL when none found.
+
+The second return value is the dependency name that matched.  It tells one
+Parachute-family member from another, which the keyword alone cannot do: both
+\"parachute\" and \"zebra\" report :parachute, and the caller still needs to know
+which package to reach for.
+
 Walks at least 2 levels (the test system plus its direct deps); the visited hash
 prevents cycles and bounds the total work on deeply nested systems."
   (let ((visited (make-hash-table :test #'equal)))
     (labels ((walk (name)
                (when (and (stringp name) (not (gethash name visited)))
                  (setf (gethash name visited) t)
-                 (let ((sys (ignore-errors (asdf:find-system name nil))))
+                 (let ((sys (ignore-errors (asdf/system:find-system name nil))))
                    (when sys
-                     (let ((deps (ignore-errors (asdf:system-depends-on sys))))
+                     (let ((deps
+                            (ignore-errors
+                             (asdf/system:system-depends-on sys))))
                        (dolist (dep deps)
-                         (let ((dep-name (if (consp dep) (second dep) dep)))
+                         (let ((dep-name
+                                (if (consp dep)
+                                    (second dep)
+                                    dep)))
                            (when (stringp dep-name)
                              (cond
-                               ((string-equal dep-name "parachute")
-                                (return-from %detect-from-asdf-deps :parachute))
-                               ((string-equal dep-name "rove")
-                                (return-from %detect-from-asdf-deps :rove))
-                               ((string-equal dep-name "fiveam")
-                                (return-from %detect-from-asdf-deps :fiveam)))
+                              ((%parachute-family-system-p dep-name)
+                               (return-from %detect-from-asdf-deps
+                                 (values :parachute dep-name)))
+                              ((string-equal dep-name "rove")
+                               (return-from %detect-from-asdf-deps
+                                 (values :rove dep-name)))
+                              ((string-equal dep-name "fiveam")
+                               (return-from %detect-from-asdf-deps
+                                 (values :fiveam dep-name))))
                              (walk dep-name))))))))))
       (walk system-name))
     nil))
+
+(defun %parachute-family-package (&optional system-name)
+  "Return the loaded package providing the Parachute test API, or NIL.
+
+Resolution order, strongest evidence first:
+  1. The package the run in progress was dispatched against.
+  2. The package belonging to whichever family system SYSTEM-NAME's dependency
+     closure names, so a zebra suite is not driven through parachute in an
+     image that happens to hold both.
+  3. The first loaded package in *PARACHUTE-FAMILY* order, which leaves a
+     parachute-only image resolving exactly as it did before zebra existed."
+  (flet ((loaded-package (entry) (some #'find-package (rest entry))))
+    (or *active-parachute-package*
+        (and system-name
+             (multiple-value-bind (framework dep-name)
+                 (%detect-from-asdf-deps system-name)
+               (and (eq framework :parachute) dep-name
+                    (let ((entry (%parachute-family-system-p dep-name)))
+                      (and entry (loaded-package entry))))))
+        (some #'loaded-package *parachute-family*))))
 
 (defun detect-test-framework (system-name &optional explicit-framework)
   "Return the test framework keyword for SYSTEM-NAME: :parachute / :rove /
 :fiveam / :asdf.
 
 Detection precedence:
-  1. EXPLICIT-FRAMEWORK arg when non-NIL and not \"auto\" — the caller knows best.
-  2. ASDF :depends-on closure inspection — walk the system's dependency tree
-     looking for parachute / rove / fiveam system names.  Reliable even when
-     multiple frameworks are loaded in the same image.
-  3. Loaded-package heuristic — fall back to find-package.
-  4. :asdf — unknown framework; use ASDF test-op with captured text."
+  1. EXPLICIT-FRAMEWORK arg when non-NIL and not \"auto\", because the caller
+     knows best.  Any Parachute-family system name, \"zebra\" included, answers
+     :parachute, the one keyword the runner dispatches on; without that a
+     caller naming the fork would silently land in the ASDF fallback.
+  2. ASDF :depends-on closure inspection, walking the system's dependency tree
+     for Parachute-family / rove / fiveam system names.  Reliable even when
+     several frameworks are loaded in the same image.
+  3. Loaded-package heuristic, falling back to find-package.
+  4. :asdf, meaning unknown framework; use ASDF test-op with captured text."
   (cond
-    ;; 1. Explicit arg: intern it as a keyword.
-    ((and explicit-framework
-          (not (string-equal explicit-framework "auto")))
-     (intern (string-upcase explicit-framework) :keyword))
-    ;; 2. ASDF :depends-on closure walk.
-    ((and (stringp system-name)
-          (%detect-from-asdf-deps system-name)))
-    ;; 3. Loaded-package heuristic.
-    ((find-package :org.shirakumo.parachute) :parachute)
-    ((find-package :rove)                   :rove)
-    ((find-package :fiveam)                 :fiveam)
-    ;; 4. Unknown — use ASDF test-op text fallback.
-    (t :asdf)))
+   ((and explicit-framework (not (string-equal explicit-framework "auto")))
+    (if (%parachute-family-system-p explicit-framework)
+        :parachute
+        (intern (string-upcase explicit-framework) :keyword)))
+   ((and (stringp system-name) (%detect-from-asdf-deps system-name)))
+   ((%parachute-family-package) :parachute)
+   ((find-package :rove) :rove) ((find-package :fiveam) :fiveam) (t :asdf)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Source Location Lookup
@@ -399,28 +460,35 @@ Returns the standard make-test-result envelope with framework=asdf."
 SYSTEM-NAME before reload. This prevents tests deleted from source from
 haunting subsequent runs.
 
-Uses parachute:remove-all-tests-in-package (the public Parachute API) via
-uiop:symbol-call to avoid a hard compile-time dependency on the parachute
-package. Walks the ASDF :depends-on closure with a visited-set to cover all
-test sub-systems in a package-inferred layout."
-  (let ((visited-systems (make-hash-table :test #'equal)))
+The framework's REMOVE-ALL-TESTS-IN-PACKAGE is looked up at run time rather
+than called by name, so the engine carries no compile-time dependency on the
+framework and works against whichever family member the image holds. Walks the
+ASDF :depends-on closure with a visited-set to cover all test sub-systems in a
+package-inferred layout."
+  (let* ((visited-systems (make-hash-table :test #'equal))
+         (pkg (%parachute-family-package system-name))
+         (remove-sym
+          (and pkg (find-symbol "REMOVE-ALL-TESTS-IN-PACKAGE" pkg)))
+         (remove-fn (and remove-sym (fboundp remove-sym) remove-sym)))
     (labels ((purge-pkg (pkg-name)
-               (when (stringp pkg-name)
-                 (let ((pkg (find-package (string-upcase pkg-name))))
-                   (when pkg
-                     (ignore-errors
-                       (uiop:symbol-call :org.shirakumo.parachute
-                                        :remove-all-tests-in-package pkg))))))
+               (when (and remove-fn (stringp pkg-name))
+                 (let ((target (find-package (string-upcase pkg-name))))
+                   (when target
+                     (ignore-errors (funcall remove-fn target))))))
              (walk-system (name)
                (when (and (stringp name) (not (gethash name visited-systems)))
                  (setf (gethash name visited-systems) t)
                  (purge-pkg name)
-                 (let ((sys (ignore-errors (asdf:find-system name nil))))
+                 (let ((sys (ignore-errors (asdf/system:find-system name nil))))
                    (when sys
-                     (dolist (dep (ignore-errors (asdf:system-depends-on sys)))
-                       (let ((dep-name (if (consp dep) (second dep) dep)))
-                         (when (stringp dep-name)
-                           (walk-system dep-name)))))))))
+                     (dolist
+                         (dep
+                          (ignore-errors (asdf/system:system-depends-on sys)))
+                       (let ((dep-name
+                              (if (consp dep)
+                                  (second dep)
+                                  dep)))
+                         (when (stringp dep-name) (walk-system dep-name)))))))))
       (walk-system system-name))))
 
 (defun %parachute-result-counts (result-obj)
@@ -436,7 +504,7 @@ reachable twice; the EQ visited set counts each result exactly once
     (labels ((count-result (r)
                (unless (gethash r seen)
                  (setf (gethash r seen) t)
-                 (let* ((pkg (find-package :org.shirakumo.parachute))
+                 (let* ((pkg (%parachute-family-package))
                         (status-fn (and pkg (find-symbol "STATUS" pkg)))
                         (results-fn (and pkg (find-symbol "RESULTS" pkg)))
                         (status (and status-fn (ignore-errors (funcall status-fn r))))
@@ -473,7 +541,7 @@ so the surviving entry is the well-named one."
                (when (gethash r seen)
                  (return-from walk))
                (setf (gethash r seen) t)
-               (let* ((pkg (find-package :org.shirakumo.parachute))
+               (let* ((pkg (%parachute-family-package))
                       (status-fn  (and pkg (find-symbol "STATUS" pkg)))
                       (results-fn (and pkg (find-symbol "RESULTS" pkg)))
                       (expr-fn    (and pkg (find-symbol "EXPRESSION" pkg)))
@@ -511,8 +579,9 @@ so the surviving entry is the well-named one."
                               (source (when effective-sym
                                         (%test-source-location effective-sym)))
                               (reason-str (ignore-errors
-                                            (let* ((fmt-fn (find-symbol "FORMAT-RESULT"
-                                                                        :org.shirakumo.parachute))
+                                            (let* ((fmt-fn (and pkg
+                                                                (find-symbol "FORMAT-RESULT"
+                                                                             pkg)))
                                                    (ext-kw (intern "EXTENSIVE" :keyword)))
                                               (and fmt-fn
                                                    (funcall fmt-fn r ext-kw))))))
@@ -526,10 +595,9 @@ so the surviving entry is the well-named one."
 
 (defun %package-has-parachute-tests-p (pkg)
   "True when PKG (a package or NIL) has registered Parachute tests."
-  (let* ((para (find-package :org.shirakumo.parachute))
+  (let* ((para (%parachute-family-package))
          (fn (and para (find-symbol "PACKAGE-TESTS" para))))
-    (and fn pkg
-         (ignore-errors (and (funcall fn pkg) t)))))
+    (and fn pkg (ignore-errors (and (funcall fn pkg) t)))))
 
 (defun %resolve-test-packages (system-name)
   "Resolve SYSTEM-NAME to the list of packages a Parachute run should cover.
@@ -575,11 +643,17 @@ caller."
 
 (defun %run-parachute-tests (system-name)
   "Run tests using Parachute for SYSTEM-NAME and return the uniform envelope.
-Invokes (parachute:test SYSTEM-DESIGNATOR) via dynamic symbol lookup so
-the function works whether the parachute package is called org.shirakumo.parachute
-or parachute."
+The entry point is looked up by symbol rather than called by name, so the
+function works against any Parachute-family member the image holds, whether
+the package is called org.shirakumo.parachute, parachute or zebra.
+
+The resolved package is pinned for the duration of the run.  Package resolution
+and result extraction happen at different points and would otherwise be free to
+disagree in an image holding more than one family member, which would show up
+as an empty run rather than as an error."
   (%log :info "test-runner" "framework" "parachute" "system" system-name)
-  (let* ((pkg (find-package :org.shirakumo.parachute))
+  (let* ((pkg (%parachute-family-package system-name))
+         (*active-parachute-package* pkg)
          (test-fn (and pkg (find-symbol "TEST" pkg)))
          (context-var (and pkg (find-symbol "*CONTEXT*" pkg)))
          (parent-var  (and pkg (find-symbol "*PARENT*" pkg)))
