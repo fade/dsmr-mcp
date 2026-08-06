@@ -372,7 +372,7 @@ fallback. See [[file:installation.org]] for build and install steps.
 The =scaffold-project= skill (copied into =~/.claude/skills/= by the
 installer unless =--no-skill= was passed) stands up a new Common Lisp
 project from the dsmr-mcp skeleton when invoked in an empty directory: a
-package-inferred ASDF system, packages, a Parachute smoke test,
+package-inferred ASDF system, packages, a zebra smoke test,
 delivery-discipline files, and the per-project =.envrc= described above.
 The same generation is reachable directly as the =project-scaffold= MCP
 verb — see the [[file:tools.org][tool reference]] for its schema.

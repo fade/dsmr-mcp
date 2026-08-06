@@ -64,9 +64,9 @@ shows structure and signatures; `name_pattern`/`content_pattern` expand matches.
 Use `clgrep-search` for project-wide text search without loading; use `code-find`
 / `code-find-references` once the system is loaded (faster, precise).
 
-## Testing — Parachute
+## Testing: zebra
 
-Tests use **Parachute** (`define-test`, `true`/`false`/`fail`/`is`), never Rove.
+Tests use **zebra** (`define-test`, `true`/`false`/`fail`/`is`), never Rove.
 `run-tests` returns structured pass/fail counts with per-failure source
 locations — prefer it over `repl-eval + (asdf:test-system ...)`.
 
