@@ -1,7 +1,7 @@
 ;;;; tests/scaffold/project-scaffold-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the project-scaffold verb (VERB-22).
+;;;; Zebra tests for the project-scaffold verb (VERB-22).
 ;;;; Covers: validator accept/reject, manifest rendering, e2e
 ;;;; load-system smoke, write-jail rejection, debris-free failure.
 
@@ -12,7 +12,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/scaffold/project-scaffold-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/project-scaffold-core
                 #:validate-project-name
                 #:validate-destination
@@ -223,7 +223,7 @@ parent-pointing path."
 ;;; --- e2e: write-scaffold + load-system + smoke test (success criterion 1) ---
 
 (define-test scaffold-e2e-load-and-smoke
-  "A fresh scaffold load-systems clean AND its Parachute smoke test passes."
+  "A fresh scaffold load-systems clean AND its Zebra smoke test passes."
   (with-temp-project-root (session root)
     (let* ((result (write-scaffold :session-root root
                                    :name "e2e-smoke"
@@ -251,10 +251,10 @@ parent-pointing path."
              (asdf:load-system "e2e-smoke/tests")
              (let* ((pkg (find-package (string-upcase "e2e-smoke/tests/main-test")))
                     (run-result (when pkg
-                                  (uiop:symbol-call :parachute :test pkg))))
+                                  (uiop:symbol-call :zebra :test pkg))))
                (true pkg "generated test package not loaded")
                (when run-result
-                 (false (uiop:symbol-call :parachute :results-with-status
+                 (false (uiop:symbol-call :zebra :results-with-status
                                           :failed run-result)
                         "generated smoke test reported failures"))))
         (ignore-errors (asdf:clear-system "e2e-smoke/tests/main-test"))

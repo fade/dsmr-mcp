@@ -5,7 +5,7 @@
 ;;;; Tests run entirely with string streams — no sockets, no Slynk.
 
 (defpackage #:dsmr-mcp/tests/notify/notify-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/notify
                 #:null-channel
                 #:tcp-line-channel

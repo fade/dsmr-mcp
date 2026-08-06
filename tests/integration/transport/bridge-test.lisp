@@ -1,12 +1,12 @@
 ;;;; tests/transport/bridge-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute end-to-end tests for the stdio<->TCP bridge binary.
+;;;; Zebra end-to-end tests for the stdio<->TCP bridge binary.
 ;;;;
 ;;;; Every test body sits inside WITH-BRIDGE-BINARY-OR-SKIP so a lane that has
-;;;; not built the binary reports a parachute skip rather than a vacuous pass
+;;;; not built the binary reports a zebra skip rather than a vacuous pass
 ;;;; (or a CI failure). The guard must be a branch, never a bare (skip ...) in
-;;;; front of the body: parachute's SKIP records a skipped result and returns,
+;;;; front of the body: zebra's SKIP records a skipped result and returns,
 ;;;; so a guard written that way runs the body anyway. That is not merely
 ;;;; cosmetic. The body then launches a binary that is not there, unwinds into
 ;;;; cleanup, and waits on a helper thread that nothing will ever wake.
@@ -20,7 +20,7 @@
 ;;;;   (4) bridge-help-exits-zero -- --help short-circuit path
 
 (defpackage #:dsmr-mcp/tests/integration/transport/bridge-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/transport/tcp
                 #:serve-tcp)
   (:import-from #:bordeaux-threads
@@ -92,7 +92,7 @@ for a helper thread is bounded even when the thread itself misbehaves."
 
 (defmacro with-bridge-binary-or-skip (&body body)
   "Evaluate BODY only when bin/dsmr-mcp-bridge is on disk, and otherwise record a
-parachute skip WITHOUT evaluating BODY.
+zebra skip WITHOUT evaluating BODY.
 
 SKIP stands the enclosing test down, so a bare guard would also work. The branch
 is kept because it states the requirement in the code rather than resting on how
@@ -103,7 +103,7 @@ SKIP unwinds: a lane that never built the binary must execute none of the body."
 
 (defmacro with-loopback-listen-or-skip (&body body)
   "Evaluate BODY only when a loopback TCP listen socket can be bound, and
-otherwise record a parachute skip WITHOUT evaluating BODY. A real branch for the
+otherwise record a zebra skip WITHOUT evaluating BODY. A real branch for the
 same reason WITH-BRIDGE-BINARY-OR-SKIP is one."
   `(if (%socket-available-p)
        (progn ,@body)

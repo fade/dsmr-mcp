@@ -13,7 +13,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/fs/lisp-read-file-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/lisp-read-file
                 #:read-file-collapsed)
   (:import-from #:dsmr-mcp/src/state
@@ -105,7 +105,7 @@ footer.  meta reports truncated=t and the correct total_lines."
     (true (gethash "truncated" meta))
     ;; total_lines reflects the full file (more than 3 lines)
     (let ((total (gethash "total_lines" meta)))
-      ;; parachute (is > expected actual): (> 3 total) must be false, so test (> total 3)
+      ;; zebra (is > expected actual): (> 3 total) must be false, so test (> total 3)
       (is > 3 total))))
 
 ;;;; -------------------------------------------------------------------------

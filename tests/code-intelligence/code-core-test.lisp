@@ -15,7 +15,7 @@
 ;;;;   - code-find-definition surfaces symbol-not-found with a hint for absent symbols
 
 (defpackage #:dsmr-mcp/tests/code-intelligence/code-core-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/code-core
                 #:%parse-symbol
                 #:%offset->line

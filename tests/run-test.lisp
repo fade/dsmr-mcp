@@ -6,7 +6,7 @@
 ;;;; enter the blocking :stdio loop.
 
 (defpackage #:dsmr-mcp/tests/run-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/run
                 #:run
                 #:resolve-transport

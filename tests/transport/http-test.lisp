@@ -1,7 +1,7 @@
 ;;;; tests/transport/http-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute integration tests for the Streamable HTTP transport.
+;;;; Zebra integration tests for the Streamable HTTP transport.
 ;;;; Every test body opens with (if (not (http-port-available-p)) (skip ...) ...)
 ;;;; so an environment that denies the bind reports these tests as skipped.
 ;;;; They must never report as passed there: a pass nobody earned makes the
@@ -12,7 +12,7 @@
 ;;;; imports them from here without re-defining them).
 
 (defpackage #:dsmr-mcp/tests/transport/http-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/transport/http
                 #:*http-server-port*
                 #:http-server-running-p

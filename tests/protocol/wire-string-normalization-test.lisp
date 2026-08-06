@@ -13,7 +13,7 @@
 ;;;; base-string.
 
 (defpackage #:dsmr-mcp/tests/protocol/wire-string-normalization-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/wire-strings
                 #:%wire-string-to-character

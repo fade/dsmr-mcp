@@ -6,7 +6,7 @@
 ;;;; Helper tests for schema->json and validate-args are appended at the bottom.
 
 (defpackage #:dsmr-mcp/tests/state/session-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/state
                 #:session
@@ -26,8 +26,8 @@
   (:import-from #:dsmr-mcp/tests/support/scoped-tools
                 #:unregister-tool
                 #:with-scoped-tools)
-  ;; Use :shadowing-import-from so helpers:result wins over parachute:result.
-  ;; parachute:result is a low-level timing accessor unused in these tests.
+  ;; Use :shadowing-import-from so helpers:result wins over zebra:result.
+  ;; zebra:result is a low-level timing accessor unused in these tests.
   (:shadowing-import-from #:dsmr-mcp/src/tools/helpers
                           #:result)
   (:import-from #:dsmr-mcp/src/tools/helpers

@@ -27,7 +27,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/tools/bus-receive-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:agent #:dsmr-mcp/src/bus/agent)
                     (#:zmq #:dsmr-mcp/src/bus/zmq)

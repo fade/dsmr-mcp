@@ -10,9 +10,9 @@
 ;;;; the real run. The scratch package is emptied before and after each use.
 
 (defpackage #:dsmr-mcp/tests/report/axis-summary-test
-  (:use #:cl #:parachute)
-  (:local-nicknames (#:pa #:parachute)
-                    (#:ar #:dsmr-mcp/tests/support/parachute-report)
+  (:use #:cl #:zebra)
+  (:local-nicknames (#:pa #:zebra)
+                    (#:ar #:dsmr-mcp/tests/support/zebra-report)
                     (#:ppcre #:cl-ppcre)))
 
 (in-package #:dsmr-mcp/tests/report/axis-summary-test)
@@ -49,7 +49,7 @@ report and everything it printed."
                 ;; fixture failing on purpose fails the real suite.
                 (let ((pa:*parent* nil)
                       (pa:*context* nil))
-                  ;; A fixture that signals makes parachute warn. That warning
+                  ;; A fixture that signals makes zebra warn. That warning
                   ;; is the fixture working.
                   (handler-bind ((warning #'muffle-warning))
                     (apply #'pa:test *fixture-package* :stream stream report-args)))))
@@ -98,7 +98,7 @@ report and everything it printed."
         (cons "empty run" #'shape-empty)))
 
 (defun printed-triple (output)
-  "The three numbers parachute's own summary printed, read back from its text.
+  "The three numbers zebra's own summary printed, read back from its text.
 Reading the text is the point: one side of the comparison is her formatter,
 the other side is our arithmetic."
   (flet ((number-after (label)
@@ -127,7 +127,7 @@ the other side is our arithmetic."
             "~a: an object appears more than once in the report vector" label)))))
 
 ;;; ------------------------------------------------------------------
-;;; The failure parachute's own summary cannot show
+;;; The failure zebra's own summary cannot show
 
 (define-test a-test-that-dies-before-asserting-is-counted
   ;; The state this class exists to change. Under the default reporter this
@@ -136,7 +136,7 @@ the other side is our arithmetic."
                  (nth-value 1 (run-fixtures #'shape-dies-before-asserting
                                             :report 'pa:plain)))))
     (is equal '(0 0 0) theirs
-        "parachute prints a bare zero triple for a test that died"))
+        "zebra prints a bare zero triple for a test that died"))
   ;; The same run through this reporter, with the deviation selected.
   (multiple-value-bind (report output)
       (run-fixtures #'shape-dies-before-asserting
@@ -150,7 +150,7 @@ the other side is our arithmetic."
     (true (search "tests failed, nothing beneath accounts for it" output))))
 
 (define-test the-deviations-are-off-until-they-are-asked-for
-  ;; A caller who asks for nothing gets parachute's numbers, so adopting the
+  ;; A caller who asks for nothing gets zebra's numbers, so adopting the
   ;; class does not move any figure a gate already reads.
   (multiple-value-bind (report output)
       (run-fixtures #'shape-dies-before-asserting :report 'ar:axis-summary)
@@ -158,7 +158,7 @@ the other side is our arithmetic."
       (is = 0 passed)
       (is = 0 failed)
       (is = 0 skipped))
-    (true (search "Counted exactly as parachute counts" output))
+    (true (search "Counted exactly as zebra counts" output))
     ;; The axis still holds the failure whatever the triple says: the axes
     ;; are facts about the run and no deviation moves them.
     (is = 1 (ar:axes-test-failed-uncarried (ar:axes-of report)))))
@@ -166,8 +166,8 @@ the other side is our arithmetic."
 ;;; ------------------------------------------------------------------
 ;;; Our arithmetic against her formatter
 
-(define-test the-derived-triple-matches-the-one-parachute-prints
-  ;; One side of this comparison is parachute's formatted text, the other is
+(define-test the-derived-triple-matches-the-one-zebra-prints
+  ;; One side of this comparison is zebra's formatted text, the other is
   ;; this reporter's own walk of the raw vector. Nothing calls her counting
   ;; helpers, so the two can disagree, which is the only reason to run it.
   (dolist (entry (list (cons "all pass" #'shape-all-pass)
@@ -188,13 +188,13 @@ the other side is our arithmetic."
             "~a: derived compatibility triple disagrees with the printed one"
             label)))))
 
-(define-test the-time-limit-shape-is-where-the-loaded-parachute-diverges
+(define-test the-time-limit-shape-is-where-the-loaded-zebra-diverges
   ;; The compatibility numbers reproduce upstream, which drops every test
   ;; result from the failed count. The checkout loaded here carries a local
   ;; patch that keeps a test which outlived its limit, so on this one shape
   ;; the printed number and the derived number differ, by design.
   ;;
-  ;; If this test starts failing, the loaded parachute and upstream have
+  ;; If this test starts failing, the loaded zebra and upstream have
   ;; converged. Recheck which semantics the compatibility line should
   ;; reproduce; do not relax the assertion.
   (let* ((theirs (printed-triple
@@ -277,7 +277,7 @@ the other side is our arithmetic."
 ;;; Zero triples that mean different things
 
 (define-test an-empty-run-and-a-run-that-asserted-nothing-are-distinguishable
-  ;; Parachute prints the same three zeroes for both.
+  ;; Zebra prints the same three zeroes for both.
   (is equal
       (printed-triple (nth-value 1 (run-fixtures #'shape-empty :report 'pa:plain)))
       (printed-triple (nth-value 1 (run-fixtures #'shape-asserts-nothing
@@ -330,7 +330,7 @@ the other side is our arithmetic."
 ;;; The deviations, one at a time
 
 (define-test controls-are-not-checks-removes-the-group-leak
-  ;; Parachute drops test results from the leaf counts but not groups or
+  ;; Zebra drops test results from the leaf counts but not groups or
   ;; control objects, so a GROUP form is counted as though it asserted.
   (let ((theirs (ar:axes-of (run-fixtures #'shape-group-wholly-skipped
                                           :report 'ar:axis-summary)))
@@ -362,7 +362,7 @@ the other side is our arithmetic."
     (declare (ignore report))
     (true (search "uncarried-test-failures-are-failures" output))
     (true (search "without them the" output)
-          "the report says what parachute's own numbers would have been")))
+          "the report says what zebra's own numbers would have been")))
 
 (define-test a-dynamic-default-selects-the-same-semantics-as-an-initarg
   (let ((by-initarg (ar:axes-of (run-fixtures #'shape-dies-before-asserting
@@ -378,7 +378,7 @@ the other side is our arithmetic."
 ;;; ------------------------------------------------------------------
 ;;; Counts without a report of our own
 
-(define-test the-counts-can-be-taken-from-any-parachute-report
+(define-test the-counts-can-be-taken-from-any-zebra-report
   ;; A caller already holding a plain report should not have to re-run
   ;; anything to get the numbers as data.
   (let* ((report (run-fixtures #'shape-failing-leaf :report 'pa:plain))

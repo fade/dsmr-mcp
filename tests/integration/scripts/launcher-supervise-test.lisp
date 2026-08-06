@@ -18,7 +18,7 @@
 ;;;; a fresh random state and the temp tree is removed on exit.
 
 (defpackage #:dsmr-mcp/tests/integration/scripts/launcher-supervise-test
-  (:use #:cl #:parachute))
+  (:use #:cl #:zebra))
 
 (in-package #:dsmr-mcp/tests/integration/scripts/launcher-supervise-test)
 

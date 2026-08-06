@@ -1,7 +1,7 @@
 ;;;; tests/clhs/clhs-lookup-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the clhs-lookup verb (VERB-09): section filename
+;;;; Zebra tests for the clhs-lookup verb (VERB-09): section filename
 ;;;; math, section-vs-symbol auto-detection, local content extraction
 ;;;; (guarded on a resolvable HyperSpec), and the fail-closed not-found path.
 ;;;;
@@ -17,7 +17,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/clhs/clhs-lookup-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/clhs
                 #:clhs-lookup
                 #:%section-to-filename
@@ -34,7 +34,7 @@ with or without a spec install, and never reaches the tier-3 network path."
   (and (dsmr-mcp/src/clhs::%resolve-hyperspec-root) t))
 
 (defmacro with-clhs-or-skip (&body body)
-  "Run BODY when a HyperSpec resolves; otherwise emit a Parachute skip."
+  "Run BODY when a HyperSpec resolves; otherwise emit a Zebra skip."
   `(if (%hyperspec-available-p)
        (progn ,@body)
        (skip "no HyperSpec resolvable (DSMR_HYPERSPEC_DIR / $LISP_WORKSPACE/HyperSpec/ both absent)")))

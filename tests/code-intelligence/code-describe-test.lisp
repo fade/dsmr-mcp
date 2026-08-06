@@ -9,7 +9,7 @@
 ;;;;   - Inline: tool-handle with *mode* bound to :inline returns typed mode error
 
 (defpackage #:dsmr-mcp/tests/code-intelligence/code-describe-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/tests/support/slynk-fixture
                 #:with-temporary-slynk-listener)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers

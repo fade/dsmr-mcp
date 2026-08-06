@@ -4,7 +4,7 @@
 ;;;; before the real test suites land in later phases.
 
 (defpackage #:dsmr-mcp/tests/smoke-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/main
                 #:version
                 #:*default-mode*))

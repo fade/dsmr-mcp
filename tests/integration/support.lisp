@@ -17,7 +17,7 @@
 ;;;; A presence check on sbcl + setup.lisp cannot tell these apart: a runner
 ;;;; with Quicklisp installed but the project off the child's source registry
 ;;;; passes the presence check, then the child fails to build — and the test
-;;;; reports a failure instead of the intended skip. Parachute's SKIP records a
+;;;; reports a failure instead of the intended skip. Zebra's SKIP records a
 ;;;; skipped result and then stands the enclosing test down, so a bare
 ;;;; `(unless (spawnable) (skip ...))` guard would also work. The branch below is
 ;;;; kept because it says in the code which side runs, rather than resting on how
@@ -36,7 +36,7 @@
 
 (defpackage #:dsmr-mcp/tests/integration/support
   (:use #:cl)
-  (:import-from #:parachute #:skip)
+  (:import-from #:zebra #:skip)
   (:export #:sbcl-path
            #:quicklisp-setup-path
            #:worker-child-buildable
@@ -153,7 +153,7 @@ load the worker system. Exits 0 on success, 7 on any build/resolution error."
 (defun %foreign-slynk-build-eval-program ()
   "The --eval program a build probe runs to mirror what the cross-process foreign
 children need: load Quicklisp if present, then quickload slynk + alexandria +
-parachute (the wire leaf probes alexandria; the run-tests leaf runs a parachute
+zebra (the wire leaf probes alexandria; the run-tests leaf runs a zebra
 suite). Exits 0 on success, 7 on any resolution error."
   (list
    "--eval" "(require :asdf)"
@@ -162,7 +162,7 @@ suite). Exits 0 on success, 7 on any resolution error."
               "(when (and (probe-file q) (not (find-package :ql))) (load q)))")
    "--eval" (concatenate 'string
               "(handler-case (progn "
-              "(funcall (read-from-string \"ql:quickload\") (list :slynk :alexandria :parachute) :silent t) "
+              "(funcall (read-from-string \"ql:quickload\") (list :slynk :alexandria :zebra) :silent t) "
               "(sb-ext:exit :code 0)) "
               "(error (e) (format *error-output* \"BUILD-PROBE-FAILED: ~A~%\" e) "
               "(sb-ext:exit :code 7)))")))
@@ -228,7 +228,7 @@ hermetic worker system in this environment."
 
 (defun foreign-slynk-child-buildable ()
   "Memoized (values OK-P DETAIL): true iff a fresh child can quickload slynk +
-alexandria + parachute in this environment."
+alexandria + zebra in this environment."
   (%verdict '*foreign-slynk-child-build* #'%foreign-slynk-build-eval-program))
 
 (defun mcp-server-child-buildable ()
@@ -243,7 +243,7 @@ stdio server subprocess."
 
 (defmacro with-worker-child-or-skip (&body body)
   "Evaluate BODY only when a fresh child can build the hermetic worker system
-here; otherwise parachute:skip the enclosing test WITHOUT evaluating BODY. Skips
+here; otherwise zebra:skip the enclosing test WITHOUT evaluating BODY. Skips
 only on a build/resolution failure — a buildable-but-misbehaving child runs BODY
 and is free to fail, which is the regression signal these tests exist to catch."
   (let ((ok (gensym "OK")) (detail (gensym "DETAIL")))
@@ -254,7 +254,7 @@ and is free to fail, which is the regression signal these tests exist to catch."
 
 (defmacro with-foreign-slynk-child-or-skip (&body body)
   "Evaluate BODY only when a fresh child can quickload slynk + alexandria here;
-otherwise parachute:skip the enclosing test WITHOUT evaluating BODY. Skips only
+otherwise zebra:skip the enclosing test WITHOUT evaluating BODY. Skips only
 on a build/resolution failure — once slynk is known buildable, an unreachable
 child (port race, dropped wire) is a genuine failure and is left to fail."
   (let ((ok (gensym "OK")) (detail (gensym "DETAIL")))
@@ -265,7 +265,7 @@ child (port race, dropped wire) is a genuine failure and is left to fail."
 
 (defmacro with-mcp-server-child-or-skip (&body body)
   "Evaluate BODY only when a fresh child can build the full dsmr-mcp system here;
-otherwise parachute:skip the enclosing test WITHOUT evaluating BODY. Skips only on
+otherwise zebra:skip the enclosing test WITHOUT evaluating BODY. Skips only on
 a build/resolution failure — once the server child is known buildable, a spawned
 server that misbehaves is a genuine failure and is left to fail."
   (let ((ok (gensym "OK")) (detail (gensym "DETAIL")))

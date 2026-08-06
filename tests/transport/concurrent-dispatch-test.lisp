@@ -10,7 +10,7 @@
 ;;;; that a later transport plan adds here.
 
 (defpackage #:dsmr-mcp/tests/transport/concurrent-dispatch-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/transport/dispatch-pool
                 #:dispatch-promise
@@ -42,8 +42,8 @@
                 #:mcp-tool-class
                 #:tool-handle
                 #:*tool-classes*)
-  ;; result shadows parachute:result (the mock handler builds a tool result
-  ;; envelope; this package does not use parachute's result symbol).
+  ;; result shadows zebra:result (the mock handler builds a tool result
+  ;; envelope; this package does not use zebra's result symbol).
   (:shadowing-import-from #:dsmr-mcp/src/tools/helpers
                 #:result)
   (:import-from #:dsmr-mcp/src/tools/helpers

@@ -16,7 +16,7 @@
 ;;;;     the same instance the eval returned
 
 (defpackage #:dsmr-mcp/tests/hermetic/inspect-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/hermetic/worker/registry
                 #:make-object-registry
                 #:register-object

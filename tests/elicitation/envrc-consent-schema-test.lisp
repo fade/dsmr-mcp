@@ -24,7 +24,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/elicitation/envrc-consent-schema-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/envrc-init
                 #:envrc-elicitation-schema))
 
