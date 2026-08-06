@@ -34,7 +34,7 @@
    (dsmr-mcp/src/tools/base::description
     :allocation :class
     :initform "Generate a complete Lisp project skeleton under the session root. \
-Emits a package-inferred-system with a mode-dispatching executable, Parachute \
+Emits a package-inferred-system with a mode-dispatching executable, Zebra \
 test suite, build recipe, dev-boot script, dependency-preference agent docs, \
 a copied REPL-development guide, and a selectable license with per-file SPDX \
 headers. Returns a manifest of created files and next-step commands.")
