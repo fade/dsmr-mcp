@@ -79,7 +79,7 @@ jobs:
                --eval '(quicklisp-quickstart:install)'
           # Make every subsequent bare `sbcl` (the `make test` recipe included)
           # load the pinned ASDF, then Quicklisp, so ASDF resolves the test
-          # dependencies (parachute, jzon, log4cl, …) from the dist on demand.
+          # dependencies (jzon, log4cl, …) from the dist on demand.
           {
             printf '%s\n' '(let ((a (merge-pathnames "asdf.lisp" (user-homedir-pathname)))) (when (probe-file a) (load a)))'
             printf '%s\n' '#-quicklisp (let ((q (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file q) (load q)))'
@@ -121,6 +121,16 @@ jobs:
           set -euo pipefail
           git clone --filter=blob:none https://github.com/fade/slynk-client.git vendor/slynk-client
           git -C vendor/slynk-client checkout 67b65da7210b4f9a6e373077373528a4c7bed4b5
+
+      - name: Vendor zebra (not in the Quicklisp dist)
+        # The test framework is not in the dist and the repository is private,
+        # so this clone needs a credential with read access to it. Without one
+        # the step fails here rather than later, where an unresolvable framework
+        # would instead look like a suite that ran and found nothing.
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/fade/zebra.git vendor/zebra
+          git -C vendor/zebra checkout 941ab4d294066ebdb7c2d1bd11d94d245f1d5aa2
 
       - name: Prime dependencies (cold — download dist deps + compile)
         # `make test` uses asdf:load-system, which resolves only systems already
@@ -198,7 +208,7 @@ jobs:
                --eval '(quicklisp-quickstart:install)'
           # Make every subsequent bare `sbcl` (the `make test` recipe included)
           # load the pinned ASDF, then Quicklisp, so ASDF resolves the test
-          # dependencies (parachute, jzon, log4cl, …) from the dist on demand.
+          # dependencies (jzon, log4cl, …) from the dist on demand.
           {
             printf '%s\n' '(let ((a (merge-pathnames "asdf.lisp" (user-homedir-pathname)))) (when (probe-file a) (load a)))'
             printf '%s\n' '#-quicklisp (let ((q (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file q) (load q)))'
@@ -232,6 +242,13 @@ jobs:
           set -euo pipefail
           git clone --filter=blob:none https://github.com/fade/slynk-client.git vendor/slynk-client
           git -C vendor/slynk-client checkout 67b65da7210b4f9a6e373077373528a4c7bed4b5
+
+      - name: Vendor zebra (not in the Quicklisp dist)
+        # Private repository; this clone needs a credential with read access.
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/fade/zebra.git vendor/zebra
+          git -C vendor/zebra checkout 941ab4d294066ebdb7c2d1bd11d94d245f1d5aa2
 
       - name: Prime dependencies (download dist deps + compile)
         # Export the same project-local XDG_CACHE_HOME the Makefile uses so the

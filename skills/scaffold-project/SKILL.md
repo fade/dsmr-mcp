@@ -1,6 +1,6 @@
 ---
 name: scaffold-project
-description: Scaffold a new Common Lisp project from the dsmr-mcp skeleton when run in an empty directory. Generates a package-inferred ASDF system, packages, a Parachute smoke test, and delivery-discipline files via the dsmr-mcp MCP server.
+description: Scaffold a new Common Lisp project from the dsmr-mcp skeleton when run in an empty directory. Generates a package-inferred ASDF system, packages, a zebra smoke test, and delivery-discipline files via the dsmr-mcp MCP server.
 ---
 
 # Scaffold a Common Lisp project
@@ -8,7 +8,7 @@ description: Scaffold a new Common Lisp project from the dsmr-mcp skeleton when 
 Use this skill to generate a fresh, delivery-disciplined Common Lisp
 project skeleton in the current directory. It drives the dsmr-mcp MCP
 server's `project-scaffold` verb, which emits a package-inferred ASDF
-system, a mode-dispatching executable, a Parachute test suite, a build
+system, a mode-dispatching executable, a zebra test suite, a build
 recipe, a dev-boot script, dependency-preference docs, and a license with
 per-file SPDX headers.
 
