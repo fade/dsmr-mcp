@@ -454,13 +454,30 @@ Returns the standard make-test-result envelope with framework=asdf."
                              (vector (make-failure-detail
                                       :test-name system-name
                                       :reason failure-reason))))
+           ;; asdf:test-system reports one bit: whether the perform method
+           ;; signalled.  Nothing here reads the suite's own counts, so a run
+           ;; that completed establishes only that test-op completed, never
+           ;; that any test ran, and never that any test passed.  Reporting
+           ;; that bit as "success" produced a green verdict over a suite
+           ;; whose failures were sitting unread in the captured stdout, so
+           ;; the key is gone and the outcome says what was established.
            (ht (make-ht "passed"      0
                         "failed"      (if success 0 1)
                         "pending"     0
                         "framework"   "asdf"
                         "duration_ms" duration-ms
                         "failed_tests" failed-tests
-                        "success"     success)))
+                        "counts_parsed" nil
+                        "outcome"     (if success "unverified" "failed")
+                        "content"
+                        (text-content
+                         (if success
+                             (format nil "asdf test-op completed for ~A in ~D ms. \
+NO test counts were parsed and this is NOT a pass; the run is unverified. \
+Name the test system (~A/tests) to get counted results."
+                                     system-name duration-ms system-name)
+                             (format nil "asdf test-op FAILED for ~A: ~A"
+                                     system-name failure-reason))))))
       (when (plusp (length stdout))
         (setf (gethash "stdout" ht) stdout))
       (when (plusp (length stderr))
