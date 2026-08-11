@@ -359,9 +359,19 @@ name."
   "Return the test framework keyword for SYSTEM-NAME: :zebra / :rove /
 :fiveam / :asdf.
 
+The second value is the system that DECLARED the framework, which need not be
+SYSTEM-NAME.  Naming a library resolves the framework its test sibling
+declares, and that sibling is the system holding both the framework dependency
+and the suites: loading and running the library instead leaves the framework
+absent and the suites unregistered.  The walk already establishes which system
+declared the framework, so discarding it here and re-deriving it from the
+caller's name later is what sent a correctly detected project to the ASDF
+fallback.  NIL when the answer came from anywhere but the dependency walk.
+
 Detection precedence:
   1. EXPLICIT-FRAMEWORK arg when non-NIL and not \"auto\", because the caller
-     knows best.
+     knows best.  Nothing is walked, so there is no declaring system and the
+     caller's own name is used unchanged.
   2. ASDF :depends-on closure inspection, walking the system's dependency tree
      and its test siblings for zebra / rove / fiveam system names.  Reliable
      even when several frameworks are loaded in the same image.
@@ -369,10 +379,17 @@ Detection precedence:
   4. :asdf, meaning unknown framework; use ASDF test-op with captured text."
   (cond
    ((and explicit-framework (not (string-equal explicit-framework "auto")))
-    (intern (string-upcase explicit-framework) :keyword))
-   ((and (stringp system-name) (%detect-from-asdf-deps system-name)))
-   ((%zebra-package) :zebra)
-   ((find-package :rove) :rove) ((find-package :fiveam) :fiveam) (t :asdf)))
+    (values (intern (string-upcase explicit-framework) :keyword) nil))
+   (t
+    (multiple-value-bind (framework matched declared-by)
+        (when (stringp system-name) (%detect-from-asdf-deps system-name))
+      (declare (ignore matched))
+      (cond
+       (framework (values framework declared-by))
+       ((%zebra-package) (values :zebra nil))
+       ((find-package :rove) (values :rove nil))
+       ((find-package :fiveam) (values :fiveam nil))
+       (t (values :asdf nil)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Source Location Lookup
@@ -1331,24 +1348,36 @@ when FiveAM's expected API symbols cannot be found."
 ;;; loop: edits become live before test execution. reload=false opts out.
 ;;; ---------------------------------------------------------------------------
 
-(defun %ensure-system-loaded (system-name framework)
-  "Purge stale framework test registrations then force-reload SYSTEM-NAME.
+(defun %ensure-system-loaded (system-name framework &optional test-system)
+  "Purge stale framework test registrations then force-reload what the run needs.
 Ghost-purge removes tests that were deleted from source so they cannot haunt
 the subsequent run. ASDF:CLEAR-SYSTEM then ASDF:LOAD-SYSTEM ensures edits
-made via lisp-edit-form are picked up before the run."
-  ;; Ghost-purge: per-framework, before clearing/reloading.
-  (case framework
-    (:zebra (ignore-errors (%zebra-purge-ghost-suites system-name)))
-    (:rove      (ignore-errors (%rove-purge-ghost-suites system-name))))
-  ;; Force-reload: clear ASDF's loaded state then re-load from source.
-  (when (asdf:find-system system-name nil)
-    (let ((asd-src (ignore-errors
-                     (asdf:system-source-file
-                      (asdf:find-system system-name nil)))))
-      (asdf:clear-system system-name)
-      (when asd-src
-        (ignore-errors (asdf:load-asd asd-src)))))
-  (asdf:load-system system-name))
+made via lisp-edit-form are picked up before the run.
+
+TEST-SYSTEM is the system that declared the test framework, when detection
+found one.  It is loaded alongside SYSTEM-NAME because a library depends on
+neither its tests nor their framework: loading only the name the caller asked
+about leaves the framework package absent and the suites unregistered, and
+every backend then degrades to the ASDF fallback.  SYSTEM-NAME is still
+reloaded so an edit to the library is picked up whichever name was asked for."
+  (let ((targets (remove-duplicates (remove nil (list system-name test-system))
+                                    :test #'equal :from-end t)))
+    ;; Ghost-purge: per-framework, before clearing/reloading.  The suites live
+    ;; in the test system, so that is the name the purge has to be given.
+    (let ((suite-system (or test-system system-name)))
+      (case framework
+        (:zebra (ignore-errors (%zebra-purge-ghost-suites suite-system)))
+        (:rove  (ignore-errors (%rove-purge-ghost-suites suite-system)))))
+    ;; Force-reload: clear ASDF's loaded state then re-load from source.
+    (dolist (name targets)
+      (let ((sys (asdf:find-system name nil)))
+        (when sys
+          (let ((asd-src (ignore-errors (asdf:system-source-file sys))))
+            (asdf:clear-system name)
+            (when asd-src
+              (ignore-errors (asdf:load-asd asd-src)))))))
+    (dolist (name targets)
+      (asdf:load-system name))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Main Entry Points
@@ -1374,13 +1403,21 @@ RELOAD — default true; purges stale framework registrations and force-reloads
   (let ((effective-timeout (or timeout-seconds 300)))
     (handler-case
         (%with-timeout (effective-timeout)
-          (let* ((fw (detect-test-framework system-name
-                                            (and framework
-                                                 (if (stringp framework) framework
-                                                     (symbol-name framework)))))
-                 (selective-p (or test tests)))
+          (multiple-value-bind (fw declaring-system)
+              (detect-test-framework system-name
+                                     (and framework
+                                          (if (stringp framework) framework
+                                              (symbol-name framework))))
+            ;; The system the run is actually dispatched against.  Detection
+            ;; may have found the framework on a test sibling, and that
+            ;; sibling is where the suites are registered; running the
+            ;; caller's name instead resolves no suites and falls through to
+            ;; the ASDF fallback, which reports a pass over nothing.
+            (let* ((target (or declaring-system system-name))
+                   (selective-p (or test tests)))
             (%log :info "test-runner" "action" "run-tests"
                        "system" system-name
+                       "target" target
                        "framework" (string-downcase (symbol-name fw))
                        "reload" reload
                        "test" (cond (test (princ-to-string test))
@@ -1388,7 +1425,7 @@ RELOAD — default true; purges stale framework registrations and force-reloads
                                     (t "all")))
             ;; Reload + ghost-purge unless opted out.
             (when reload
-              (handler-case (%ensure-system-loaded system-name fw)
+              (handler-case (%ensure-system-loaded system-name fw declaring-system)
                 (error (load-err)
                   (return-from run-tests
                     (make-test-result
@@ -1402,30 +1439,45 @@ RELOAD — default true; purges stale framework registrations and force-reloads
                                                  system-name)
                             :reason (map 'string #'identity
                                          (princ-to-string load-err)))))))))
-            (case fw
-              (:zebra
-               (%run-zebra-tests system-name))
-              (:rove
-               (if (find-package :rove)
-                   (if selective-p
-                       (let ((selected (if test
-                                           (list (%coerce-test-symbol test))
-                                           (%normalize-tests-arg tests))))
-                         (%run-rove-selected-tests selected))
-                       (%run-rove-tests system-name))
-                   (progn
-                     (%log :warn "test-runner" "message"
-                                "Rove not loaded; falling back to ASDF")
-                     (%run-asdf-fallback system-name))))
-              (:fiveam
-               (if (find-package :fiveam)
-                   (%run-fiveam-tests system-name)
-                   (progn
-                     (%log :warn "test-runner" "message"
-                                "FiveAM not loaded; falling back to ASDF")
-                     (%run-asdf-fallback system-name))))
-              (t
-               (%run-asdf-fallback system-name)))))
+            ;; Each arm returns the result AND the system the counts actually
+            ;; came from, because those two can differ.  A branch that falls
+            ;; back runs the name the caller gave, not the sibling detection
+            ;; preferred, and a run over selected test names ran no system at
+            ;; all.  Deriving the label from TARGET instead of from the arm
+            ;; would let a result name a system nothing touched.
+            (multiple-value-bind (result ran-system)
+                (case fw
+                  (:zebra
+                   (values (%run-zebra-tests target) target))
+                  (:rove
+                   (if (find-package :rove)
+                       (if selective-p
+                           (let ((selected (if test
+                                               (list (%coerce-test-symbol test))
+                                               (%normalize-tests-arg tests))))
+                             (values (%run-rove-selected-tests selected) nil))
+                           (values (%run-rove-tests target) target))
+                       (progn
+                         (%log :warn "test-runner" "message"
+                                    "Rove not loaded; falling back to ASDF")
+                         (values (%run-asdf-fallback system-name) system-name))))
+                  (:fiveam
+                   (if (find-package :fiveam)
+                       (values (%run-fiveam-tests target) target)
+                       (progn
+                         (%log :warn "test-runner" "message"
+                                    "FiveAM not loaded; falling back to ASDF")
+                         (values (%run-asdf-fallback system-name) system-name))))
+                  (t
+                   (values (%run-asdf-fallback system-name) system-name)))
+              ;; Say which system the counts came from whenever it is not the
+              ;; one asked about, so a redirected run is visible rather than
+              ;; silently answering a different question.
+              (when (and (hash-table-p result)
+                         ran-system
+                         (not (equal ran-system system-name)))
+                (setf (gethash "tested_system" result) ran-system))
+              result))))
       #+sbcl
       (sb-ext:timeout ()
         (%log :warn "test-runner.timeout" "system" system-name
