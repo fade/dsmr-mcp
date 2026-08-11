@@ -29,6 +29,7 @@
   (:import-from #:dsmr-mcp/src/test-runner-engine
                 #:%resolve-test-packages
                 #:%detect-from-asdf-deps
+                #:%ensure-system-loaded
                 #:%dependency-system-name
                 #:%test-system-siblings
                 #:%test-system-name-p
@@ -659,3 +660,180 @@ alone once hid a target-resolution crash."
     (let ((summary (gethash "text" (aref (gethash "content" ht) 0))))
       (true (search "REASONS-PROBE-FAILS" summary))
       (true (search "—" summary)))))
+
+;;; ---------------------------------------------------------------------------
+;;; The system a run is dispatched against, and what a result may claim
+;;;
+;;; A library depends on neither its tests nor their framework, so the name a
+;;; caller asks about is usually not the name that has to be loaded and run.
+;;; The tests below pin the three parts of that: detection hands the declaring
+;;; system back, the run uses it, and a result only names a system that was
+;;; actually run.
+;;;
+;;; Probe systems are defined in memory and probe suites live in their own
+;;; packages, so nothing here reaches the project's own counts.  Each test
+;;; asserts the framework it expects to have reached, which is what stops it
+;;; quietly measuring a different path if the dispatch changes under it.
+;;; ---------------------------------------------------------------------------
+
+(defun %probe-suite-package (name)
+  "Make a package called NAME holding one passing and one failing zebra test.
+Read with *PACKAGE* bound so the test names are interned in the probe package
+rather than in this file's."
+  (unless (find-package name)
+    (make-package name :use '("COMMON-LISP")))
+  (let ((*package* (find-package name)))
+    (eval (read-from-string
+           "(progn (zebra:define-test probe-suite-passes (zebra:true t))
+                   (zebra:define-test probe-suite-fails (zebra:is = 1 2)))")))
+  (find-package name))
+
+(define-test detection-carries-the-declaring-system
+  "Detection returns the system that declared the framework alongside the
+framework itself.  The walk establishes it, and discarding it left the runner
+re-deriving a target from the caller's name and reaching the wrong one.
+
+RED when the second value is NIL for a library whose sibling declares the
+framework, which is what the code did before it was carried through.
+
+An explicit framework walks nothing, so it must offer no declaring system.
+RED when anything comes back there: the explicit branch used to end in a call
+to INTERN, whose own second value leaked out as the caller's, so asking for a
+framework by name answered with a symbol-status keyword where a system name
+now belongs."
+  (multiple-value-bind (framework declared-by) (detect-test-framework "dsmr-mcp")
+    (is eq :zebra framework)
+    (is string= "dsmr-mcp/tests" declared-by))
+  (multiple-value-bind (framework declared-by)
+      (detect-test-framework "dsmr-mcp" "zebra")
+    (is eq :zebra framework)
+    (false declared-by)))
+
+(define-test ensure-system-loaded-loads-the-declaring-system
+  "The reload step loads the system that declared the framework, not only the
+one named.  Loading the library alone leaves the framework package absent and
+the suites unregistered, which is what sent a detected project to the fallback.
+
+RED when the declaring system is absent from the loaded set afterwards.
+
+The probes are written to disk rather than defined in memory because the
+reload step clears each system before loading it, and a system with no source
+file cannot be recovered from a clear.  They are two separate primary systems
+in two files: a secondary system sharing its primary's file is not restored,
+because the second read of an already-read file is a no-op within one ASDF
+session and the clear has already removed the definition."
+  (let* ((dir (uiop:ensure-directory-pathname
+               (format nil "~Adsmr-probe-ensure-~D-~D"
+                       (namestring (uiop:temporary-directory))
+                       (get-universal-time)
+                       (sb-posix:getpid))))
+         (lib-name "dsmr-probe-ensure-lib")
+         (test-name "dsmr-probe-ensure-lib-tests"))
+    (uiop:ensure-all-directories-exist (list dir))
+    (unwind-protect
+         (progn
+           (dolist (name (list lib-name test-name))
+             (with-open-file (out (merge-pathnames (format nil "~A.asd" name) dir)
+                                  :direction :output
+                                  :if-exists :supersede
+                                  :if-does-not-exist :create)
+               (format out "(asdf:defsystem ~S)~%" name)))
+           (push dir asdf:*central-registry*)
+           (%ensure-system-loaded lib-name :asdf test-name)
+           (let ((loaded (asdf:already-loaded-systems)))
+             (true (member lib-name loaded :test #'string-equal))
+             (true (member test-name loaded :test #'string-equal))))
+      (setf asdf:*central-registry*
+            (remove dir asdf:*central-registry* :test #'equal))
+      (dolist (name (list lib-name test-name))
+        (ignore-errors (asdf:clear-system name)))
+      (ignore-errors (uiop:delete-directory-tree
+                      dir :validate (lambda (p)
+                                      (search "dsmr-probe-ensure"
+                                              (namestring p))))))))
+
+(define-test library-name-runs-the-suite-its-sibling-holds
+  "Naming a library runs the suite held by its test sibling and says so.
+
+RED when the counts come back as a framework of \"asdf\" with nothing counted,
+which is what a run dispatched against the library itself produces: the
+library resolves no test packages and the run degrades to the ASDF fallback."
+  (dolist (spec '("(asdf:defsystem \"dsmr-probe-runtarget-lib\")"
+                  "(asdf:defsystem \"dsmr-probe-runtarget-lib/tests\"
+                     :depends-on (\"zebra\"))"))
+    (eval (read-from-string spec)))
+  (%probe-suite-package "DSMR-PROBE-RUNTARGET-LIB/TESTS")
+  (unwind-protect
+       (let ((result (run-tests "dsmr-probe-runtarget-lib" :reload nil)))
+         (true (hash-table-p result))
+         ;; The suite was reached, rather than the fallback.
+         (is string= "zebra" (gethash "framework" result))
+         (is = 1 (gethash "passed" result))
+         (is = 1 (gethash "failed" result))
+         ;; And the result says where the counts came from.
+         (is string= "dsmr-probe-runtarget-lib/tests"
+             (gethash "tested_system" result)))
+    (dolist (name '("dsmr-probe-runtarget-lib" "dsmr-probe-runtarget-lib/tests"))
+      (ignore-errors (asdf:clear-system name)))
+    (let ((pkg (find-package "DSMR-PROBE-RUNTARGET-LIB/TESTS")))
+      (when pkg
+        (ignore-errors (uiop:symbol-call :zebra :remove-all-tests-in-package pkg))
+        (ignore-errors (delete-package pkg))))))
+
+(define-test a-result-never-names-a-system-it-did-not-run
+  "A run that falls back to ASDF test-op runs the name the caller gave, so it
+must not be labelled with the sibling detection preferred.  Otherwise a result
+asserts its counts came from a system nothing touched.
+
+RED when tested_system is present on a fallback run, which is what deriving
+the label from the preferred target rather than from the arm that ran gives."
+  ;; The premise is that rove is absent from this image, which is what sends a
+  ;; detected :rove project to the fallback.  Asserting it means this test goes
+  ;; red rather than quietly measuring nothing if rove is ever loaded here.
+  (false (find-package :rove))
+  (dolist (spec '("(asdf:defsystem \"dsmr-probe-unlabelled-lib\")"
+                  "(asdf:defsystem \"dsmr-probe-unlabelled-lib/tests\"
+                     :depends-on (\"rove\"))"))
+    (eval (read-from-string spec)))
+  (unwind-protect
+       (let ((result (run-tests "dsmr-probe-unlabelled-lib" :reload nil)))
+         (true (hash-table-p result))
+         ;; The fallback is the path under test; if this stops holding the
+         ;; assertion below is measuring something else.
+         (is string= "asdf" (gethash "framework" result))
+         (multiple-value-bind (value present)
+             (gethash "tested_system" result)
+           ;; present-p, not the value: an absent key also reads as NIL.
+           (false present)
+           (false value)))
+    (dolist (name '("dsmr-probe-unlabelled-lib" "dsmr-probe-unlabelled-lib/tests"))
+      (ignore-errors (asdf:clear-system name)))))
+
+(define-test asdf-path-reports-unverified-rather-than-success
+  "The ASDF test-op path never reads the suite's output, so a run that
+completed establishes nothing about how many tests ran.  It reports that
+plainly instead of a verdict it cannot support.
+
+RED on all four when the path reports the old shape: a success field set true,
+no outcome, no counts_parsed, and no content block saying it is not a pass."
+  (eval (read-from-string
+         "(asdf:defsystem \"dsmr-probe-unverified\"
+            :perform (asdf:test-op (o c) (declare (ignore o c)) nil))"))
+  (unwind-protect
+       (let ((result (run-tests "dsmr-probe-unverified" :reload nil)))
+         (true (hash-table-p result))
+         (is string= "asdf" (gethash "framework" result))
+         ;; No standalone success verdict is written at all.  present-p,
+         ;; because an absent key and a false one both read as NIL.
+         (multiple-value-bind (value present) (gethash "success" result)
+           (declare (ignore value))
+           (false present))
+         (is string= "unverified" (gethash "outcome" result))
+         (multiple-value-bind (value present) (gethash "counts_parsed" result)
+           (true present)
+           (false value))
+         ;; The client renders the content block, so that is where a caller
+         ;; has to be told the run is not a pass.
+         (let ((text (gethash "text" (aref (gethash "content" result) 0))))
+           (true (search "NOT a pass" text))))
+    (ignore-errors (asdf:clear-system "dsmr-probe-unverified"))))
