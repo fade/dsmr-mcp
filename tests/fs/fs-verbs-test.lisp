@@ -11,7 +11,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/fs/fs-verbs-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/state
                 #:get-tool-instance)
   (:import-from #:dsmr-mcp/src/tools/base

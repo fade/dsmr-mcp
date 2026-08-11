@@ -10,7 +10,7 @@
 ;;;; the full round-trip requires the worker accept loop to be present.
 
 (defpackage #:dsmr-mcp/tests/integration/hermetic/worker-spawn-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/hermetic/worker-client
                 #:+max-json-line-bytes+

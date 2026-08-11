@@ -12,7 +12,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/lisp-edit-form-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/lisp-edit-form
                 #:edit-form
                 #:validate-and-repair-content)

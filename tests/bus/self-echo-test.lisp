@@ -16,7 +16,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/bus/self-echo-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:bus #:dsmr-mcp/src/bus/bus)
                     (#:agent #:dsmr-mcp/src/bus/agent)

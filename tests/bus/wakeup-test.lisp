@@ -1,7 +1,7 @@
 ;;;; tests/bus/wakeup-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the level-triggered wakeup watcher. The contract: a
+;;;; Zebra tests for the level-triggered wakeup watcher. The contract: a
 ;;;; message already pending when the wait begins returns immediately (no lost
 ;;;; wake), a genuinely empty wait times out, a message appended mid-wait wakes
 ;;;; the watcher, and waiting never advances the cursor (observe vs ack stay
@@ -14,7 +14,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/bus/wakeup-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal)
                     (#:cursor #:dsmr-mcp/src/bus/cursor)
                     (#:wakeup #:dsmr-mcp/src/bus/wakeup)))

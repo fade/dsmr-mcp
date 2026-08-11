@@ -7,7 +7,7 @@
 ;;;; result displays as nothing, silently.
 
 (defpackage #:dsmr-mcp/tests/dispatch/result-content-guard-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/state
                 #:make-session

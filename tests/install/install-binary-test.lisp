@@ -1,7 +1,7 @@
 ;;;; tests/install/install-binary-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the installer's watcher-binary placement (%copy-binary).
+;;;; Zebra tests for the installer's watcher-binary placement (%copy-binary).
 ;;;; Both the copy-and-chmod path and the graceful absent-source path are covered
 ;;;; with a stub source and a fresh temp bin-dir, so the operator's real
 ;;;; ~/.local/bin is never touched and the tests do not depend on a built binary.
@@ -13,7 +13,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/install/install-binary-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/install
                 #:%copy-binary
                 #:default-bin-dir))

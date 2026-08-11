@@ -12,7 +12,7 @@
 ;;;; worker pid (scale-out isolation).
 
 (defpackage #:dsmr-mcp/tests/integration/hermetic/pool-affinity-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/hermetic/pool
                 #:initialize-pool #:shutdown-pool
                 #:get-or-assign-worker #:release-session

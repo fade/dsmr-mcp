@@ -24,7 +24,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/integration/hermetic/cancel-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/hermetic/pool
                 #:initialize-pool
                 #:shutdown-pool

@@ -12,7 +12,7 @@
 ;;;; HTTP harness has a single owner.
 
 (defpackage #:dsmr-mcp/tests/transport/transport-parity-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/tests/transport/http-test
                 #:http-port-available-p
                 #:send-http-request)

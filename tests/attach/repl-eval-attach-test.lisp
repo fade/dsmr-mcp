@@ -22,7 +22,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/attach/repl-eval-attach-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/tests/support/slynk-fixture
                 #:with-temporary-slynk-listener)
   (:import-from #:dsmr-mcp/src/attach/dispatch

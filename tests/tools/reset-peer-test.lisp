@@ -26,7 +26,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/tools/reset-peer-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon)
                     (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:agent #:dsmr-mcp/src/bus/agent))

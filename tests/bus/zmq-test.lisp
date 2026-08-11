@@ -1,7 +1,7 @@
 ;;;; tests/bus/zmq-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the ZeroMQ bus transport. In-process round trips over
+;;;; Zebra tests for the ZeroMQ bus transport. In-process round trips over
 ;;;; ipc://: PUSH/PULL (client→broker submit) delivers every part in order;
 ;;;; PUB/SUB (broker→subscriber fan-out) delivers a live message; a quiet socket
 ;;;; returns NIL at its receive timeout rather than blocking. libzmq is a core
@@ -15,7 +15,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/bus/zmq-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:tz #:dsmr-mcp/src/bus/zmq)))
 
 (in-package #:dsmr-mcp/tests/bus/zmq-test)

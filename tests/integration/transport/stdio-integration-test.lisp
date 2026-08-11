@@ -10,7 +10,7 @@
 ;;;; Kept to one or two test cases — subprocess tests are slow and environment-dependent.
 
 (defpackage #:dsmr-mcp/tests/integration/transport/stdio-integration-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/tests/support/json-asserts
                 #:gethash*)

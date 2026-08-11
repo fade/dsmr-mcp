@@ -139,12 +139,12 @@ file-based ICP as a fallback for crash isolation and parallel workers."
 (asdf:defsystem "dsmr-mcp/tests"
   :class :package-inferred-system
   :description "Test suite for dsmr-mcp."
-  :depends-on ("parachute"
+  :depends-on ("zebra"
                "slynk"
                "dsmr-mcp"
                "dsmr-mcp/tests/smoke-test"
                "dsmr-mcp/tests/support/json-asserts"
-               "dsmr-mcp/tests/support/parachute-report"
+               "dsmr-mcp/tests/support/zebra-report"
                "dsmr-mcp/tests/support/slynk-fixture"
                "dsmr-mcp/tests/support/bounded-eval"
                "dsmr-mcp/tests/support/portability-guard"
@@ -250,12 +250,12 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                       (dolist (name test-package-names)
                         (let* ((package (or (find-package (string-upcase name))
                                             (error "Test package ~S not loaded." name)))
-                               (result (uiop:symbol-call :parachute :test package)))
-                          (when (uiop:symbol-call :parachute :results-with-status
+                               (result (uiop:symbol-call :zebra :test package)))
+                          (when (uiop:symbol-call :zebra :results-with-status
                                                   :failed result)
                             (setf any-failed t))))
                       (when any-failed
-                        (error "dsmr-mcp/tests: one or more parachute tests failed.")))))
+                        (error "dsmr-mcp/tests: one or more zebra tests failed.")))))
 
 ;; Slow cross-process integration tests, kept OUT of the fast dsmr-mcp/tests
 ;; umbrella so the inner-loop suite stays quick. Each leaf here spawns a real
@@ -265,7 +265,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
 (asdf:defsystem "dsmr-mcp/tests/integration"
   :class :package-inferred-system
   :description "Slow cross-process integration tests for dsmr-mcp."
-  :depends-on ("parachute"
+  :depends-on ("zebra"
                "com.inuoe.jzon"
                "slynk"
                "dsmr-mcp"
@@ -297,9 +297,9 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                       (dolist (name test-package-names)
                         (let* ((package (or (find-package (string-upcase name))
                                             (error "Test package ~S not loaded." name)))
-                               (result (uiop:symbol-call :parachute :test package)))
-                          (when (uiop:symbol-call :parachute :results-with-status
+                               (result (uiop:symbol-call :zebra :test package)))
+                          (when (uiop:symbol-call :zebra :results-with-status
                                                   :failed result)
                             (setf any-failed t))))
                       (when any-failed
-                        (error "dsmr-mcp/tests/integration: one or more parachute tests failed.")))))
+                        (error "dsmr-mcp/tests/integration: one or more zebra tests failed.")))))

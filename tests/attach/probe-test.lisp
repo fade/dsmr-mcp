@@ -1,7 +1,7 @@
 ;;;; tests/attach/probe-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the Slynk port classifier and identity probe.
+;;;; Zebra tests for the Slynk port classifier and identity probe.
 ;;;;
 ;;;; Network-requiring tests (classify-port against a live Slynk, full
 ;;;; resolve-slynk-target identity flow) live in the cross-process integration
@@ -14,7 +14,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/attach/probe-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/attach/probe
                 #:classify-port
                 #:slynk-handshake-path

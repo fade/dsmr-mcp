@@ -20,7 +20,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/envrc-template/envrc-vars-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/envrc-vars
                 #:declared-value
                 #:declared-p

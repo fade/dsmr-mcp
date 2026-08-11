@@ -22,12 +22,12 @@
 ;;;;
 ;;;; Each scenario spawns a cold-ish child (~10-12s), so this leaf lives under
 ;;;; the SEPARATE dsmr-mcp/tests/integration system, NOT the fast
-;;;; dsmr-mcp/tests umbrella.  It skips cleanly (parachute skip, not fail) when
+;;;; dsmr-mcp/tests umbrella.  It skips cleanly (zebra skip, not fail) when
 ;;;; the environment cannot spawn a server (no sbcl on PATH, no Quicklisp
 ;;;; setup.lisp), so a constrained CI is never red-flagged.
 
 (defpackage #:dsmr-mcp/tests/integration/stdio-elicitation-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/install/config
                 #:canonical-server-entry)

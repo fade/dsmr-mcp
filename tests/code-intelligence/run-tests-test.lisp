@@ -9,31 +9,36 @@
 ;;;;   detect-framework-prefers-asdf-deps      — ASDF :depends-on walk
 ;;;;                                             precedes loaded-package heuristic;
 ;;;;                                             explicit arg is honored.
-;;;;   run-tests-parachute-returns-structured-counts — Parachute extractor
+;;;;   run-tests-zebra-returns-structured-counts — Zebra extractor
 ;;;;                                             produces passed/failed/pending
 ;;;;                                             counts and a failed_tests entry
 ;;;;                                             with source location.
 ;;;;   run-tests-ghost-purge-drops-deleted-test  — a purged test is absent
 ;;;;                                             from the index after
-;;;;                                             %parachute-purge-ghost-suites.
+;;;;                                             %zebra-purge-ghost-suites.
 ;;;;   run-tests-inline-returns-mode-error      — :inline mode returns -32603.
 ;;;;
-;;;; Throwaway Parachute suites used by the extraction and ghost-purge tests are
+;;;; Throwaway Zebra suites used by the extraction and ghost-purge tests are
 ;;;; defined in a dedicated scratch package (dsmr-scratch-runner-tests) so they
 ;;;; never pollute the dsmr-mcp/tests suite's own counts.
 
 (defpackage #:dsmr-mcp/tests/code-intelligence/run-tests-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/tests/support/slynk-fixture
                 #:with-temporary-slynk-listener)
   (:import-from #:dsmr-mcp/src/test-runner-engine
                 #:%resolve-test-packages
                 #:%detect-from-asdf-deps
-                #:%parachute-family-package
-                #:*parachute-family*)
+                #:%dependency-system-name
+                #:%test-system-siblings
+                #:%test-system-name-p
+                #:%zebra-package
+                #:%zebra-system-p
+                #:*zebra-system-name*
+                #:*zebra-package-name*)
   (:import-from #:dsmr-mcp/src/test-runner-core
                 #:detect-test-framework
-                #:%parachute-purge-ghost-suites
+                #:%zebra-purge-ghost-suites
                 #:run-tests
                 #:%build-run-tests-form
                 #:%build-engine-ensure-form
@@ -59,7 +64,7 @@
 (in-package #:dsmr-mcp/tests/code-intelligence/run-tests-test)
 
 ;;; ---------------------------------------------------------------------------
-;;; Scratch package for throwaway Parachute suites
+;;; Scratch package for throwaway Zebra suites
 ;;;
 ;;; All ephemeral test definitions used by the tests in this file live here,
 ;;; not in any dsmr-mcp/tests/... package. This ensures they never affect the
@@ -67,12 +72,12 @@
 ;;; ---------------------------------------------------------------------------
 
 (defpackage #:dsmr-scratch-runner-tests
-  (:use #:cl #:parachute))
+  (:use #:cl #:zebra))
 
 ;;; ---------------------------------------------------------------------------
 ;;; File-defined failing test in the scratch package
 ;;;
-;;; This test is a TOP-LEVEL definition compiled with the file, so Parachute
+;;; This test is a TOP-LEVEL definition compiled with the file, so Zebra
 ;;; can record its source location via sb-introspect. Its deliberate failure
 ;;; lets the source-location code path be exercised by the assertion in
 ;;; run-tests-reports-source-location-for-failure below.
@@ -83,12 +88,12 @@
 
 (in-package #:dsmr-scratch-runner-tests)
 
-(parachute:define-test scratch-file-defined-failing-test-for-source
+(zebra:define-test scratch-file-defined-failing-test-for-source
   :defun t
   "A deliberately failing test whose definition is compiled from this file.
-Parachute records the source location so the run-tests extractor can populate
+Zebra records the source location so the run-tests extractor can populate
 the source{file,line} fields in the failure detail."
-  (parachute:true nil))
+  (zebra:true nil))
 
 (in-package #:dsmr-mcp/tests/code-intelligence/run-tests-test)
 
@@ -96,105 +101,174 @@ the source{file,line} fields in the failure detail."
 ;;; detect-framework-prefers-asdf-deps
 ;;;
 ;;; ASDF :depends-on closure walk must take precedence over the
-;;; loaded-package heuristic. dsmr-mcp/tests depends on parachute via ASDF,
-;;; so detect-test-framework must return :parachute for it even in an image
+;;; loaded-package heuristic. dsmr-mcp/tests depends on zebra via ASDF,
+;;; so detect-test-framework must return :zebra for it even in an image
 ;;; that may also have other test frameworks loaded.
 ;;; ---------------------------------------------------------------------------
 
 (define-test detect-framework-prefers-asdf-deps
-  "detect-test-framework returns :parachute for dsmr-mcp/tests by walking the
+  "detect-test-framework returns :zebra for dsmr-mcp/tests by walking the
 ASDF :depends-on closure, not by loaded-package heuristic. An explicit
 \"rove\" arg overrides auto-detection."
-  ;; ASDF-deps walk: dsmr-mcp/tests directly lists parachute in :depends-on.
-  (is eq :parachute (detect-test-framework "dsmr-mcp/tests"))
+  ;; ASDF-deps walk: dsmr-mcp/tests directly lists zebra in :depends-on.
+  (is eq :zebra (detect-test-framework "dsmr-mcp/tests"))
   ;; Explicit arg takes priority over ASDF-deps walk.
   (is eq :rove (detect-test-framework "dsmr-mcp/tests" "rove"))
   ;; NIL framework triggers auto-detection.
-  (is eq :parachute (detect-test-framework "dsmr-mcp/tests" nil))
+  (is eq :zebra (detect-test-framework "dsmr-mcp/tests" nil))
   ;; "auto" framework also triggers auto-detection.
-  (is eq :parachute (detect-test-framework "dsmr-mcp/tests" "auto")))
+  (is eq :zebra (detect-test-framework "dsmr-mcp/tests" "auto")))
 
-(define-test detects-parachute-family-by-system-name
-  "The ASDF dependency walk recognises every system that provides the Parachute
-API, so a suite built on our renamed fork reaches the Parachute runner instead
-of falling through to the ASDF fallback.  That fallback raises nothing, so an
-unrecognised name shows up as a suite that quietly ran the wrong way rather
-than as a failure.
+(define-test detects-zebra-by-system-name
+  "The ASDF dependency walk recognises the system providing the zebra API, so a
+suite built on it reaches the zebra runner instead of falling through to the
+ASDF fallback.  That fallback raises nothing, so an unrecognised name shows up
+as a suite that quietly ran the wrong way rather than as a failure.
 
-The second return value names the member that matched, which is what lets the
-runner reach the right package in an image holding more than one.
+The second return value names the dependency that matched.
 
-Rove and FiveAM detection is asserted alongside to prove the family names were
-widened rather than swapped in for the foreign ones."
+Rove and FiveAM detection is asserted alongside to prove the foreign framework
+names still resolve to their own keywords."
   (let ((probes '(("dsmr-probe-suite-on-zebra" "zebra")
-                  ("dsmr-probe-suite-on-parachute" "parachute")
                   ("dsmr-probe-suite-on-rove" "rove")
-                  ("dsmr-probe-suite-on-fiveam" "fiveam"))))
+                  ("dsmr-probe-suite-on-fiveam" "fiveam")
+                  ("dsmr-probe-suite-on-removed-framework" "parachute"))))
     (unwind-protect
          (progn
            (dolist (probe probes)
              (eval `(asdf:defsystem ,(first probe)
                       :depends-on (,(second probe)))))
-           ;; The renamed fork resolves, and reports which member matched.
            (multiple-value-bind (framework matched)
                (%detect-from-asdf-deps "dsmr-probe-suite-on-zebra")
-             (is eq :parachute framework)
+             (is eq :zebra framework)
              (is string= "zebra" matched))
-           ;; Parachute resolves as before, and is told apart from the fork.
-           (multiple-value-bind (framework matched)
-               (%detect-from-asdf-deps "dsmr-probe-suite-on-parachute")
-             (is eq :parachute framework)
-             (is string= "parachute" matched))
            (is eq :rove (%detect-from-asdf-deps "dsmr-probe-suite-on-rove"))
            (is eq :fiveam (%detect-from-asdf-deps "dsmr-probe-suite-on-fiveam"))
            ;; The same answers through the public entry point.
-           (is eq :parachute
-               (detect-test-framework "dsmr-probe-suite-on-zebra"))
-           (is eq :parachute
-               (detect-test-framework "dsmr-probe-suite-on-parachute"))
+           (is eq :zebra (detect-test-framework "dsmr-probe-suite-on-zebra"))
            (is eq :rove (detect-test-framework "dsmr-probe-suite-on-rove"))
-           (is eq :fiveam (detect-test-framework "dsmr-probe-suite-on-fiveam")))
+           (is eq :fiveam (detect-test-framework "dsmr-probe-suite-on-fiveam"))
+           ;; The dependency walk no longer recognises the name that was
+           ;; removed.  This is the assertion that fails if the old system
+           ;; name is ever reintroduced as a second way in.
+           (false (%detect-from-asdf-deps "dsmr-probe-suite-on-removed-framework")))
       ;; Probe systems are registry-only and must not outlive the test.
       (dolist (probe probes)
         (ignore-errors (asdf:clear-system (first probe)))))))
 
-(define-test explicit-framework-accepts-parachute-family-names
-  "An explicit framework argument naming any Parachute-family system, the
-renamed fork included, answers the one keyword the runner dispatches on.
-Without that normalisation the fork's name interns to a keyword no dispatch
-branch handles and the run lands in the ASDF fallback, which reports success.
+(define-test detects-framework-declared-by-a-test-sibling
+  "Naming a library resolves the framework its test sibling declares.
 
-Foreign framework names must keep interning to their own keyword."
-  (is eq :parachute (detect-test-framework "dsmr-mcp/tests" "zebra"))
-  (is eq :parachute (detect-test-framework "dsmr-mcp/tests" "ZEBRA"))
-  (is eq :parachute (detect-test-framework "dsmr-mcp/tests" "parachute"))
+This is how the verb is actually invoked: a caller asks for the tests of the
+thing they are working on, which is the library.  A library depends on neither
+its tests nor their framework, so a walk that only descends answers NIL for
+every correctly built project and hands the caller to the ASDF fallback, which
+runs an operation and reports success without ever recognising a suite.  The
+symptom is a run reporting no tests and no failures, which reads as a pass.
+
+The third return value names the system that actually declared the framework,
+so a caller can tell that the answer came from a sibling rather than from the
+name it asked about.  Rove and FiveAM are asserted alongside to prove this
+reaches every framework rather than only the one being renamed."
+  ;; Each library name must itself be free of a test suffix, or the guard that
+  ;; stops a test system being chased for a sibling suppresses the lookup.
+  (let ((probes '(("dsmr-probe-lib-on-zebra"
+                   "dsmr-probe-lib-on-zebra/tests" "zebra")
+                  ("dsmr-probe-lib-on-rove"
+                   "dsmr-probe-lib-on-rove/test" "rove")
+                  ("dsmr-probe-lib-on-fiveam"
+                   "dsmr-probe-lib-on-fiveam-tests" "fiveam"))))
+    (unwind-protect
+         (progn
+           ;; Each library declares ordinary dependencies and says nothing at
+           ;; all about testing; only the sibling names the framework.
+           (dolist (probe probes)
+             (eval `(asdf:defsystem ,(first probe) :depends-on ("alexandria")))
+             (eval `(asdf:defsystem ,(second probe)
+                      :depends-on (,(first probe) ,(third probe)))))
+           (multiple-value-bind (framework matched declared-by)
+               (%detect-from-asdf-deps "dsmr-probe-lib-on-zebra")
+             (is eq :zebra framework)
+             (is string= "zebra" matched)
+             (is string= "dsmr-probe-lib-on-zebra/tests" declared-by))
+           (is eq :rove (%detect-from-asdf-deps "dsmr-probe-lib-on-rove"))
+           (is eq :fiveam (%detect-from-asdf-deps "dsmr-probe-lib-on-fiveam"))
+           ;; The same answers through the public entry point.
+           (is eq :zebra
+               (detect-test-framework "dsmr-probe-lib-on-zebra"))
+           ;; A name that is already a test system is not chased any further.
+           (true (%test-system-name-p "dsmr-mcp/tests"))
+           (true (%test-system-name-p "zebra/test"))
+           (false (%test-system-name-p "dsmr-mcp"))
+           (is equal
+               '("dsmr-mcp/tests" "dsmr-mcp/test"
+                 "dsmr-mcp-tests" "dsmr-mcp-test")
+               (%test-system-siblings "dsmr-mcp")))
+      (dolist (probe probes)
+        (ignore-errors (asdf:clear-system (first probe)))
+        (ignore-errors (asdf:clear-system (second probe)))))))
+
+(define-test dependency-designators-resolve-to-system-names
+  "Every dependency spelling ASDF can hand back resolves to the system name.
+
+ASDF coerces a plain dependency to a lowercase string whatever it was written
+as, so a keyword and a string arrive identically and neither needs special
+handling.  The compound designators are the ones that survive as lists, and
+(:feature FEATURE NAME) puts the system third: reading the second element
+returns the feature, which names no system and matches no framework, so a
+dependency guarded by a feature was invisible to detection."
+  (is string= "zebra" (%dependency-system-name "zebra"))
+  (is string= "zebra" (%dependency-system-name :zebra))
+  (is string= "zebra" (%dependency-system-name '#:zebra))
+  (is string= "zebra" (%dependency-system-name '(:version :zebra "1.0")))
+  (is string= "fiveam" (%dependency-system-name '(:feature :sbcl :fiveam)))
+  (is string= "fiveam" (%dependency-system-name '(:feature (:and :sbcl :unix)
+                                                  "fiveam")))
+  (false (%dependency-system-name 42))
+  ;; End to end: a framework named only behind a feature guard is detected.
+  (let ((probe "dsmr-probe-feature-guarded-suite"))
+    (unwind-protect
+         (progn
+           (eval `(asdf:defsystem ,probe
+                    :depends-on ((:feature :sbcl :fiveam))))
+           (is eq :fiveam (%detect-from-asdf-deps probe)))
+      (ignore-errors (asdf:clear-system probe)))))
+
+(define-test explicit-framework-overrides-detection
+  "An explicit framework argument is taken at face value, because the caller
+knows the suite better than the dependency walk does.
+
+Every supported name must intern to the keyword the runner dispatches on; a
+name that reaches no dispatch branch lands in the ASDF fallback, which reports
+success without running a recognised suite."
+  (is eq :zebra (detect-test-framework "dsmr-mcp/tests" "zebra"))
+  (is eq :zebra (detect-test-framework "dsmr-mcp/tests" "ZEBRA"))
+  (is eq :zebra (detect-test-framework "dsmr-mcp/tests" "zebra"))
   (is eq :rove (detect-test-framework "dsmr-mcp/tests" "rove"))
   (is eq :fiveam (detect-test-framework "dsmr-mcp/tests" "fiveam"))
-  (is eq :parachute (detect-test-framework "dsmr-mcp/tests" "auto")))
+  (is eq :zebra (detect-test-framework "dsmr-mcp/tests" "auto")))
 
-(define-test family-package-resolves-to-the-loaded-member
-  "Package resolution returns the family member actually present in the image.
-This suite runs under Parachute, so resolution must land on Parachute's own
-package: recognising the fork must not divert an image that never loaded it.
+(define-test package-resolution-lands-on-the-loaded-framework
+  "Package resolution returns the framework package present in the image.
 
-Both members must remain listed, which is the assertion that fails if one name
-is ever swapped in for the other rather than added alongside it."
-  (is eq (find-package :org.shirakumo.parachute) (%parachute-family-package))
-  (true (find "parachute" *parachute-family*
-              :key #'first :test #'string-equal))
-  (true (find "zebra" *parachute-family*
-              :key #'first :test #'string-equal))
-  ;; Every entry pairs a system name with at least one package name.
-  (true (every (lambda (entry)
-                 (and (stringp (first entry))
-                      (rest entry)
-                      (every #'stringp (rest entry))))
-               *parachute-family*)))
+The engine looks its entry points up by symbol rather than calling them by
+name, so it carries no compile-time dependency on the framework and this is
+the only place the package is resolved.  Resolving to NIL sends a run to the
+ASDF fallback, which reports success without running a recognised suite."
+  (is eq (find-package :zebra) (%zebra-package))
+  (is string= "ZEBRA" *zebra-package-name*)
+  (is string= "zebra" *zebra-system-name*)
+  (true (%zebra-system-p "zebra"))
+  (true (%zebra-system-p "ZEBRA"))
+  ;; The removed name must not resolve, and must not linger as a package.
+  (false (%zebra-system-p "parachute"))
+  (false (find-package :parachute))
+  (false (find-package :org.shirakumo.parachute)))
 
 ;;; ---------------------------------------------------------------------------
-;;; run-tests-parachute-returns-structured-counts
+;;; run-tests-zebra-returns-structured-counts
 ;;;
-;;; Running a tiny Parachute suite through the core's extractor returns
+;;; Running a tiny Zebra suite through the core's extractor returns
 ;;; the uniform envelope with passed/failed counts and at least one failed_tests
 ;;; entry with a source location (criterion 3).
 ;;;
@@ -202,37 +276,37 @@ is ever swapped in for the other rather than added alongside it."
 ;;; project's own suite results. One test passes; one fails deliberately.
 ;;; ---------------------------------------------------------------------------
 
-(define-test run-tests-parachute-returns-structured-counts
-  "The Parachute extractor produces passed/failed/pending counts and a
+(define-test run-tests-zebra-returns-structured-counts
+  "The Zebra extractor produces passed/failed/pending counts and a
 failed_tests entry with a source location for a deliberately failing test.
 Exercises the uniform envelope and criterion 3 source-location reporting."
   ;; Define a throwaway two-test suite in the scratch package.
   (let* ((scratch-pkg (find-package :dsmr-scratch-runner-tests))
-         (parachute-pkg (find-package :org.shirakumo.parachute))
-         (test-fn (and parachute-pkg (find-symbol "TEST" parachute-pkg)))
-         (results-with-status-fn (and parachute-pkg
-                                      (find-symbol "RESULTS-WITH-STATUS" parachute-pkg)))
-         (remove-fn (and parachute-pkg
-                         (find-symbol "REMOVE-ALL-TESTS-IN-PACKAGE" parachute-pkg))))
-    ;; Parachute is always loaded at this point (test file uses it).
-    (true (and scratch-pkg parachute-pkg test-fn results-with-status-fn))
-    (when (and scratch-pkg parachute-pkg test-fn results-with-status-fn)
+         (zebra-pkg (find-package :zebra))
+         (test-fn (and zebra-pkg (find-symbol "TEST" zebra-pkg)))
+         (results-with-status-fn (and zebra-pkg
+                                      (find-symbol "RESULTS-WITH-STATUS" zebra-pkg)))
+         (remove-fn (and zebra-pkg
+                         (find-symbol "REMOVE-ALL-TESTS-IN-PACKAGE" zebra-pkg))))
+    ;; Zebra is always loaded at this point (test file uses it).
+    (true (and scratch-pkg zebra-pkg test-fn results-with-status-fn))
+    (when (and scratch-pkg zebra-pkg test-fn results-with-status-fn)
       ;; Clean up any previous scratch tests.
       (when remove-fn (ignore-errors (funcall remove-fn scratch-pkg)))
       ;; Define one passing and one failing test in the scratch package.
       (let ((*package* scratch-pkg))
-        (eval '(parachute:define-test scratch-passing-test
-                 (parachute:true t)))
-        (eval '(parachute:define-test scratch-failing-test
-                 (parachute:true nil))))
+        (eval '(zebra:define-test scratch-passing-test
+                 (zebra:true t)))
+        (eval '(zebra:define-test scratch-failing-test
+                 (zebra:true nil))))
       ;; Run the scratch package's tests via the core extractor, bypassing reload
       ;; (these tests are already registered in the image).
       (let ((result (run-tests "dsmr-scratch-runner-tests"
-                               :framework "parachute"
+                               :framework "zebra"
                                :reload nil)))
         (true (hash-table-p result))
-        ;; Framework field must be "parachute".
-        (is string= "parachute" (gethash "framework" result))
+        ;; Framework field must be "zebra".
+        (is string= "zebra" (gethash "framework" result))
         ;; Counts must be non-negative integers.
         (true (integerp (gethash "passed" result)))
         (true (integerp (gethash "failed" result)))
@@ -252,32 +326,32 @@ Exercises the uniform envelope and criterion 3 source-location reporting."
       (when remove-fn (ignore-errors (funcall remove-fn scratch-pkg))))))
 
 (define-test run-tests-reports-source-location-for-failure
-  "The Parachute extractor populates source{file,line} in a failed_tests entry
+  "The Zebra extractor populates source{file,line} in a failed_tests entry
 when the failing test is defined in a real source file (not eval'd at runtime).
 The file-defined scratch test at the top of this file is compiled with :defun t
 so sb-introspect can locate its source."
-  (let* ((parachute-pkg (find-package :org.shirakumo.parachute))
+  (let* ((zebra-pkg (find-package :zebra))
          (scratch-pkg (find-package :dsmr-scratch-runner-tests)))
-    (true (and parachute-pkg scratch-pkg))
-    (when (and parachute-pkg scratch-pkg)
+    (true (and zebra-pkg scratch-pkg))
+    (when (and zebra-pkg scratch-pkg)
       ;; Ensure the file-defined test is registered.  A prior test's cleanup
       ;; may have called remove-all-tests-in-package on the scratch package.
       ;; Re-register using the symbol interned in scratch-pkg (not CL-USER) so
       ;; %test-source-location can find the defun compiled from this file.
-      (let* ((ensure-fn (find-symbol "ENSURE-TEST" parachute-pkg))
+      (let* ((ensure-fn (find-symbol "ENSURE-TEST" zebra-pkg))
              (setf-find-fn (fdefinition
-                             `(setf ,(find-symbol "FIND-TEST" parachute-pkg))))
+                             `(setf ,(find-symbol "FIND-TEST" zebra-pkg))))
              (test-sym (intern "SCRATCH-FILE-DEFINED-FAILING-TEST-FOR-SOURCE" scratch-pkg)))
         (when (and ensure-fn setf-find-fn)
           (let ((test-obj (funcall (fdefinition ensure-fn)
-                                   'parachute:test
+                                   'zebra:test
                                    :name test-sym
                                    :home scratch-pkg
-                                   :tests (list (lambda () (parachute:true nil))))))
+                                   :tests (list (lambda () (zebra:true nil))))))
             (funcall setf-find-fn test-obj test-sym scratch-pkg))))
       ;; Run the scratch suite (reload=nil: the test is registered in-image).
       (let ((result (run-tests "dsmr-scratch-runner-tests"
-                               :framework "parachute"
+                               :framework "zebra"
                                :reload nil)))
         (true (hash-table-p result))
         (let ((failed-tests (gethash "failed_tests" result)))
@@ -309,41 +383,41 @@ so sb-introspect can locate its source."
                     (true (integerp line-val))
                     (true (plusp line-val))))))))
         ;; Clean up scratch tests after the assertion.
-        (let ((remove-fn (find-symbol "REMOVE-ALL-TESTS-IN-PACKAGE" parachute-pkg)))
+        (let ((remove-fn (find-symbol "REMOVE-ALL-TESTS-IN-PACKAGE" zebra-pkg)))
           (when remove-fn
             (ignore-errors (funcall remove-fn scratch-pkg))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; run-tests-ghost-purge-drops-deleted-test
 ;;;
-;;; After registering a Parachute test in the scratch package, calling
-;;; %parachute-purge-ghost-suites must remove all tests from that package's
+;;; After registering a Zebra test in the scratch package, calling
+;;; %zebra-purge-ghost-suites must remove all tests from that package's
 ;;; registry so a subsequent run does not see the purged test.
 ;;; ---------------------------------------------------------------------------
 
 (define-test run-tests-ghost-purge-drops-deleted-test
-  "After %parachute-purge-ghost-suites, a previously-registered test is absent
-from the Parachute test index for that package. This verifies that ghost tests
+  "After %zebra-purge-ghost-suites, a previously-registered test is absent
+from the Zebra test index for that package. This verifies that ghost tests
 cannot haunt results after reload."
   (let* ((scratch-pkg (find-package :dsmr-scratch-runner-tests))
-         (parachute-pkg (find-package :org.shirakumo.parachute))
-         (remove-fn (and parachute-pkg
-                         (find-symbol "REMOVE-ALL-TESTS-IN-PACKAGE" parachute-pkg)))
-         (pkg-tests-fn (and parachute-pkg
-                            (find-symbol "PACKAGE-TESTS" parachute-pkg))))
-    (true (and scratch-pkg parachute-pkg remove-fn pkg-tests-fn))
-    (when (and scratch-pkg parachute-pkg remove-fn pkg-tests-fn)
+         (zebra-pkg (find-package :zebra))
+         (remove-fn (and zebra-pkg
+                         (find-symbol "REMOVE-ALL-TESTS-IN-PACKAGE" zebra-pkg)))
+         (pkg-tests-fn (and zebra-pkg
+                            (find-symbol "PACKAGE-TESTS" zebra-pkg))))
+    (true (and scratch-pkg zebra-pkg remove-fn pkg-tests-fn))
+    (when (and scratch-pkg zebra-pkg remove-fn pkg-tests-fn)
       ;; Clean slate.
       (ignore-errors (funcall remove-fn scratch-pkg))
       ;; Register a ghost test.
       (let ((*package* scratch-pkg))
-        (eval '(parachute:define-test ghost-test-for-purge-test
-                 (parachute:true t))))
+        (eval '(zebra:define-test ghost-test-for-purge-test
+                 (zebra:true t))))
       ;; Confirm the test is registered.
       (let ((tests-before (funcall pkg-tests-fn scratch-pkg)))
         (true (plusp (length tests-before))))
       ;; Purge ghost suites for a fake system name — but call remove-all-tests-in-package
-      ;; directly on the scratch package, which is what %parachute-purge-ghost-suites
+      ;; directly on the scratch package, which is what %zebra-purge-ghost-suites
       ;; ultimately calls. This is the canonical ghost-purge verification.
       (funcall remove-fn scratch-pkg)
       ;; After purge, the package's test index must be empty.
@@ -384,7 +458,7 @@ in-image and recurse until the call-lock deadline fires."
       ;; skipping ASDF reload keeps this test fast and avoids compile noise in
       ;; the test runner's own output.
       (let* ((params (make-ht "system"          "dsmr-scratch-runner-tests"
-                              "framework"       "parachute"
+                              "framework"       "zebra"
                               "reload"          nil
                               "timeout_seconds" 300))
              (result (%dispatch-attach-run-tests repl-tool nil params)))
@@ -520,12 +594,12 @@ would pin an attached image to the first engine it ever loaded."
 through its :depends-on closure to the sub-packages that contain tests,
 constrained to subsystems of the same primary system — a dependency from a
 DIFFERENT primary (even one full of tests) and framework deps like
-parachute are excluded; an unknown system resolves to NIL."
+zebra are excluded; an unknown system resolves to NIL."
   ;; Scratch umbrella: two test-bearing sub-packages, one foreign-primary
-  ;; dep that must be excluded, parachute in :depends-on as in real
+  ;; dep that must be excluded, zebra in :depends-on as in real
   ;; umbrellas. In-memory defsystems are fine — the resolver only READS.
   (dolist (spec '("(asdf:defsystem \"dsmr-scratch-umb/tests\"
-                     :depends-on (\"parachute\"
+                     :depends-on (\"zebra\"
                                   \"dsmr-mcp/tests/state/session-test\"
                                   \"dsmr-scratch-umb/tests/suite-a\"
                                   \"dsmr-scratch-umb/tests/suite-b\"))"
@@ -538,7 +612,7 @@ parachute are excluded; an unknown system resolves to NIL."
       (make-package name :use '("COMMON-LISP")))
     (let ((*package* (find-package name)))
       (eval (read-from-string
-             "(parachute:define-test umb-scratch-probe (parachute:true t))"))))
+             "(zebra:define-test umb-scratch-probe (zebra:true t))"))))
   ;; Umbrella: exactly the two same-primary, test-bearing sub-packages.
   (let ((resolved (%resolve-test-packages "dsmr-scratch-umb/tests")))
     (is = 2 (length resolved))
@@ -566,10 +640,10 @@ alone once hid a target-resolution crash."
     (make-package "DSMR-SCRATCH-REASONS-PROBE" :use '("COMMON-LISP")))
   (let ((*package* (find-package "DSMR-SCRATCH-REASONS-PROBE")))
     (eval (read-from-string
-           "(progn (parachute:define-test reasons-probe-passes (parachute:true t))
-                   (parachute:define-test reasons-probe-fails (parachute:is = 1 2)))")))
+           "(progn (zebra:define-test reasons-probe-passes (zebra:true t))
+                   (zebra:define-test reasons-probe-fails (zebra:is = 1 2)))")))
   (let* ((form (%build-run-tests-form
-                "dsmr-scratch-reasons-probe" "parachute" nil nil 60 nil))
+                "dsmr-scratch-reasons-probe" "zebra" nil nil 60 nil))
          (raw (eval form))
          (ht (dsmr-mcp/src/tools/run-tests::%decode-run-tests-result
               raw "dsmr-scratch-reasons-probe" (get-internal-real-time))))

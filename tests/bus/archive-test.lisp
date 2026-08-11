@@ -1,7 +1,7 @@
 ;;;; tests/bus/archive-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for orderly WAL archival. The contract: a non-empty log
+;;;; Zebra tests for orderly WAL archival. The contract: a non-empty log
 ;;;; rotates to a clean, replayable archive and resets to empty; an empty log is a
 ;;;; no-op; and the last-member gate only fires when no other member holds the
 ;;;; shared lock — so only the genuine last-one-out archives. (A real SIGKILL
@@ -15,7 +15,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/bus/archive-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal)
                     (#:election #:dsmr-mcp/src/bus/election)
                     (#:archive #:dsmr-mcp/src/bus/archive)))
