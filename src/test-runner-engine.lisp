@@ -656,20 +656,72 @@ so the surviving entry is the well-named one."
          (fn (and para (find-symbol "PACKAGE-TESTS" para))))
     (and fn pkg (ignore-errors (and (funcall fn pkg) t)))))
 
+(defun %system-source-packages (system-name)
+  "Return the packages declared by the source files ASDF assigns to SYSTEM-NAME.
+
+A registered Zebra test records only its home PACKAGE. Nothing on the test
+names the system or the file it came from, so a test cannot be traced back to
+a system through Zebra alone. ASDF holds the other half of that link: which
+source files a system owns. Reading the defpackage forms out of those files
+supplies the missing edge, letting a package be attributed to a system without
+either one having to be spelled like the other.
+
+This reads only the components of SYSTEM-NAME itself. It offers candidates and
+enforces no boundary of its own: asked about a foreign system it will happily
+report that system's packages. Callers must decide which systems to ask about."
+  (let ((sys (ignore-errors (asdf:find-system system-name nil)))
+        (packages '()))
+    (labels ((walk (component)
+               (when component
+                 (cond
+                   ((typep component 'asdf:cl-source-file)
+                    (let ((path (ignore-errors
+                                  (asdf:component-pathname component))))
+                      (when (and path (probe-file path))
+                        (dolist (name (%extract-defpackage-names-from-file path))
+                          (let ((pkg (and (stringp name) (find-package name))))
+                            (when pkg (pushnew pkg packages)))))))
+                   ((ignore-errors (asdf:component-children component))
+                    (dolist (child (asdf:component-children component))
+                      (walk child)))))))
+      (when sys (walk sys)))
+    (nreverse packages)))
+
 (defun %resolve-test-packages (system-name)
   "Resolve SYSTEM-NAME to the list of packages a Zebra run should cover.
 
 1:1 fast path: a package named like the system that actually CONTAINS
-registered tests.  Otherwise SYSTEM-NAME is treated as an umbrella (the
+registered tests. Otherwise SYSTEM-NAME is treated as an umbrella (the
 package-inferred norm: \"proj/tests\" has no same-named package; the tests
 live in per-file subsystem packages): walk its :depends-on closure with a
 visited set, keeping only subsystems whose ASDF primary system matches the
-umbrella's — the constraint that keeps foreign dependencies like zebra
-itself, which every test umbrella depends on, out of the run — and map each
-kept subsystem to its same-named package when that package has tests.
+umbrella's, the constraint that keeps foreign dependencies like zebra
+itself, which every test umbrella depends on, out of the run.
 
-Returns NIL when nothing is found; the caller decides the fallback.  This
-resolver only READS system metadata — reload/purge policy stays with the
+Each admitted subsystem is then asked for its packages in two steps, because
+a project is free to name its test packages however it likes:
+
+  1. the same-named package, which is the convention the package-inferred
+     layout follows;
+  2. only when step 1 yields nothing, the packages the subsystem's own ASDF
+     source files declare. This covers any other convention: a dot-separated
+     suite name, a -TEST suffix, a name sharing no spelling with the system.
+
+Step 2 is a fallback rather than an addition, and that ordering is what
+protects auxiliary packages. A subsystem that names a package after itself is
+following the convention, so any OTHER package its files declare is a
+deliberate aside, a quarantined scratch package holding throwaway or
+intentionally failing suites, and must stay out of the run. Only a subsystem
+with no same-named test package has diverged far enough for its other declared
+packages to be the tests the caller meant.
+
+Widening applies to spelling only. Candidates still come exclusively from
+subsystems the primary-system constraint already admitted, so no reachable
+package belongs to a foreign system, and every candidate must still hold
+registered tests to be kept.
+
+Returns NIL when nothing is found; the caller decides the fallback. This
+resolver only READS system metadata; reload/purge policy stays with the
 caller."
   (let ((direct (find-package (string-upcase system-name))))
     (if (%package-has-zebra-tests-p direct)
@@ -678,16 +730,24 @@ caller."
               (visited (make-hash-table :test #'equal))
               (packages '()))
           (when primary
-            (labels ((walk (name)
+            (labels ((keep (pkg)
+                       ;; Returns true when PKG was adopted, which is what tells
+                       ;; the caller whether the fallback is still needed.
+                       (when (and pkg
+                                  (not (member pkg packages))
+                                  (%package-has-zebra-tests-p pkg))
+                         (push pkg packages)
+                         t))
+                     (walk (name)
                        (when (and (stringp name)
                                   (not (gethash name visited))
                                   (equal primary
                                          (ignore-errors
                                            (asdf:primary-system-name name))))
                          (setf (gethash name visited) t)
-                         (let ((pkg (find-package (string-upcase name))))
-                           (when (%package-has-zebra-tests-p pkg)
-                             (push pkg packages)))
+                         (unless (keep (find-package (string-upcase name)))
+                           (dolist (pkg (%system-source-packages name))
+                             (keep pkg)))
                          (let ((sys (ignore-errors (asdf:find-system name nil))))
                            (when sys
                              (dolist (dep (ignore-errors
