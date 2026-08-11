@@ -28,6 +28,7 @@
                 #:with-temporary-slynk-listener)
   (:import-from #:dsmr-mcp/src/test-runner-engine
                 #:%resolve-test-packages
+                #:%system-source-packages
                 #:%detect-from-asdf-deps
                 #:%ensure-system-loaded
                 #:%dependency-system-name
@@ -630,6 +631,99 @@ zebra are excluded; an unknown system resolves to NIL."
               (%resolve-test-packages "dsmr-scratch-umb/tests/suite-a")))
   ;; Unknown system: NIL, so the caller can choose the fallback.
   (false (%resolve-test-packages "dsmr-no-such-system-exists")))
+
+(define-test resolver-finds-divergently-named-test-packages
+  "%resolve-test-packages finds a subsystem's tests by where they are DEFINED,
+not only by what they are called. A project naming its test packages on any
+convention other than the system's own spelling used to resolve to nothing,
+so the run fell through to the ASDF fallback and reported an unverified
+outcome with the framework already correctly detected.
+
+Two behaviours are pinned. First, a subsystem with NO same-named package
+resolves through the defpackage forms in the source files ASDF assigns to it.
+Second, that file-derived lookup is a FALLBACK and not an addition: when a
+subsystem DOES have a same-named test package, any other package its files
+declare is a deliberate aside and stays out. This file relies on exactly that
+second behaviour, quarantining its own throwaway and intentionally failing
+suites in dsmr-scratch-runner-tests, which must never join a project run."
+  (let* ((stamp (format nil "~D" (get-universal-time)))
+         (dir (merge-pathnames (format nil "dsmr-divergent-probe-~A/" stamp)
+                               (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist dir)
+           ;; A file whose declared package shares no spelling with either
+           ;; system name, and a second file declaring both a conventional
+           ;; package and an aside, as this very file does.
+           (with-open-file (s (merge-pathnames "divsuite.lisp" dir)
+                              :direction :output :if-exists :supersede)
+             (write-line "(defpackage #:dsmr-scratch-divergent-suite (:use #:cl))" s))
+           (with-open-file (s (merge-pathnames "leaf.lisp" dir)
+                              :direction :output :if-exists :supersede)
+             (write-line "(defpackage #:dsmr-scratch-divergent/tests/leaf (:use #:cl))" s)
+             (write-line "(defpackage #:dsmr-scratch-divergent-aside (:use #:cl))" s))
+           ;; In-memory defsystems pointing at those real files. The resolver
+           ;; only READS, so nothing here has to be compiled or loaded.
+           (dolist (spec (list
+                          (format nil "(asdf:defsystem \"dsmr-scratch-divergent/tests\"
+                                          :pathname ~S
+                                          :depends-on (\"zebra\"
+                                                       \"dsmr-scratch-divergent/tests/leaf\")
+                                          :components ((:file \"divsuite\")))"
+                                  (namestring dir))
+                          (format nil "(asdf:defsystem \"dsmr-scratch-divergent/tests/leaf\"
+                                          :pathname ~S
+                                          :components ((:file \"leaf\")))"
+                                  (namestring dir))))
+             (eval (read-from-string spec)))
+           ;; Every declared package exists and holds a test, so anything left
+           ;; out is left out by the resolver's boundary, not by absence.
+           (dolist (name '("DSMR-SCRATCH-DIVERGENT-SUITE"
+                           "DSMR-SCRATCH-DIVERGENT/TESTS/LEAF"
+                           "DSMR-SCRATCH-DIVERGENT-ASIDE"))
+             (unless (find-package name)
+               (make-package name :use '("COMMON-LISP")))
+             (let ((*package* (find-package name)))
+               (eval (read-from-string
+                      "(zebra:define-test divergent-scratch-probe (zebra:true t))"))))
+           ;; The files ASDF assigns to a system are what supply the names.
+           (is equal '("DSMR-SCRATCH-DIVERGENT-SUITE")
+               (mapcar #'package-name
+                       (%system-source-packages "dsmr-scratch-divergent/tests")))
+           (let ((resolved (%resolve-test-packages "dsmr-scratch-divergent/tests")))
+             ;; The umbrella's own file names a package on a foreign
+             ;; convention: found where the old name match found nothing.
+             (true (member "DSMR-SCRATCH-DIVERGENT-SUITE" resolved
+                           :key #'package-name :test #'string=))
+             ;; The leaf follows the convention, so its same-named package is
+             ;; taken and the aside beside it in the same file is not.
+             (true (member "DSMR-SCRATCH-DIVERGENT/TESTS/LEAF" resolved
+                           :key #'package-name :test #'string=))
+             (false (member "DSMR-SCRATCH-DIVERGENT-ASIDE" resolved
+                            :key #'package-name :test #'string=))
+             ;; Widening is to spelling only: zebra is in :depends-on as in
+             ;; every real umbrella and stays out on primary-system grounds.
+             (false (member "ZEBRA" resolved
+                            :key #'package-name :test #'string=))
+             (is = 2 (length resolved)))
+           ;; The quarantine this file depends on is still honoured for the
+           ;; project's own suite: the scratch package holding the deliberately
+           ;; failing test must not be swept into a dsmr-mcp/tests run.
+           (false (member "DSMR-SCRATCH-RUNNER-TESTS"
+                          (%resolve-test-packages "dsmr-mcp/tests")
+                          :key #'package-name :test #'string=)))
+      (dolist (name '("dsmr-scratch-divergent/tests"
+                      "dsmr-scratch-divergent/tests/leaf"))
+        (ignore-errors (asdf:clear-system name)))
+      (dolist (name '("DSMR-SCRATCH-DIVERGENT-SUITE"
+                      "DSMR-SCRATCH-DIVERGENT/TESTS/LEAF"
+                      "DSMR-SCRATCH-DIVERGENT-ASIDE"))
+        (let ((pkg (find-package name)))
+          (when pkg
+            (ignore-errors (zebra:remove-all-tests-in-package pkg))
+            (ignore-errors (delete-package pkg)))))
+      (ignore-errors (uiop:delete-directory-tree
+                      dir :validate t :if-does-not-exist :ignore)))))
 
 (define-test failure-reasons-survive-the-injected-form
   "The injected run form carries failure names + reasons (bounded) back to
