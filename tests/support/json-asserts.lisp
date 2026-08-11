@@ -1,7 +1,7 @@
 ;;;; tests/support/json-asserts.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Small jzon-flavoured Parachute helpers for asserting on JSON-RPC
+;;;; Small jzon-flavoured Zebra helpers for asserting on JSON-RPC
 ;;;; hash-table shapes. Every protocol test imports these rather than
 ;;;; hand-rolling gethash walks inline.
 ;;;;

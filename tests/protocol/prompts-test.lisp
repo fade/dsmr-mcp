@@ -9,7 +9,7 @@
 ;;;; stubs prove the capability is advertised and the wire is correct.
 
 (defpackage #:dsmr-mcp/tests/protocol/prompts-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/protocol
                 #:process-json-line)

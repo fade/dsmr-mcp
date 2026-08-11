@@ -6,7 +6,7 @@
 ;;;; with protocolVersion, capabilities (tools + prompts), and serverInfo.
 
 (defpackage #:dsmr-mcp/tests/protocol/handshake-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/protocol
                 #:process-json-line)

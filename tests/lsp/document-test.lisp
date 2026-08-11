@@ -14,7 +14,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/lsp/document-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/tests/support/lsp-mock
                 #:with-lsp-mock-server
                 #:%start-mock-lsp-server

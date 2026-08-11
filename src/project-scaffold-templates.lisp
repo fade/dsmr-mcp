@@ -37,7 +37,7 @@
 (in-package #:dsmr-mcp/src/project-scaffold-templates)
 
 ;;; ---------------------------------------------------------------------------
-;;; .asd template (package-inferred-system; Parachute in tests)
+;;; .asd template (package-inferred-system; Zebra in tests)
 ;;; ---------------------------------------------------------------------------
 
 (defparameter *asd-template*
@@ -55,7 +55,7 @@
 
 (asdf:defsystem \"{{name}}/tests\"
   :class :package-inferred-system
-  :depends-on (\"parachute\"
+  :depends-on (\"zebra\"
                \"{{name}}\"
                \"{{name}}/tests/main-test\")
   :perform (test-op (o c)
@@ -70,16 +70,16 @@
                       (dolist (name test-package-names)
                         (let* ((pkg (or (find-package (string-upcase name))
                                         (error \"Test package ~S not loaded.\" name)))
-                               (result (uiop:symbol-call :parachute :test pkg)))
-                          (when (uiop:symbol-call :parachute :results-with-status
+                               (result (uiop:symbol-call :zebra :test pkg)))
+                          (when (uiop:symbol-call :zebra :results-with-status
                                                   :failed result)
                             (setf any-failed t))))
                       (when any-failed
-                        (error \"{{name}}/tests: one or more parachute tests failed.\")))))
+                        (error \"{{name}}/tests: one or more zebra tests failed.\")))))
 "
   "Template for the generated project's .asd system definition.
-Uses Parachute (not Rove) for the test perform hook, matching the
-package-inferred-system + Parachute convention of dsmr-mcp itself.")
+Uses Zebra (not Rove) for the test perform hook, matching the
+package-inferred-system + Zebra convention of dsmr-mcp itself.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; src/main.lisp template (empty package + mode-dispatching main)
@@ -160,7 +160,7 @@ No :export and no stub defun — the package starts clean so the first
 load-system pins no symbols and there is no package-variance on reload.")
 
 ;;; ---------------------------------------------------------------------------
-;;; tests/main-test.lisp template (Parachute smoke)
+;;; tests/main-test.lisp template (Zebra smoke)
 ;;; ---------------------------------------------------------------------------
 
 (defparameter *main-test-template*
@@ -176,7 +176,7 @@ load-system pins no symbols and there is no package-variance on reload.")
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:{{name}}/tests/main-test
-  (:use #:cl #:parachute))
+  (:use #:cl #:zebra))
 
 (in-package #:{{name}}/tests/main-test)
 
@@ -185,7 +185,7 @@ load-system pins no symbols and there is no package-variance on reload.")
   (true (find-package :{{name}}/src/main)))
 "
   "Template for the generated project's tests/main-test.lisp.
-Uses Parachute (not Rove). The smoke test asserts only package existence
+Uses Zebra (not Rove). The smoke test asserts only package existence
 — it holds no reference to any symbol the empty main package does not
 export, so the generated project loads and tests cleanly out of the box.")
 
@@ -438,7 +438,7 @@ Prefer `com.inuoe.jzon` over `yason` for JSON.
 
 `{{name}}.asd`       ASDF system definition (package-inferred-system)
 `src/main.lisp`      Entry point + CLI dispatch (run/daemon/dev modes)
-`tests/main-test.lisp` Parachute smoke test
+`tests/main-test.lisp` Zebra smoke test
 `scripts/dev-boot.sh`  Dev image launcher (Slynk on SLYNK_PORT)
 `build.sh`           Produce a standalone binary via save-lisp-and-die
 `prompts/`           Agent instruction prompts

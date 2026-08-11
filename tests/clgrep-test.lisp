@@ -1,7 +1,7 @@
 ;;;; tests/clgrep-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute test suite for VERB-08: clgrep-search.
+;;;; Zebra test suite for VERB-08: clgrep-search.
 ;;;; Tests: regex find with form context, .gitignore exclusion, form_types
 ;;;; filtering, and the structural form_pattern mode (D-11).
 
@@ -12,7 +12,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/clgrep-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/tests/support/fs-fixture
                 #:with-temp-project-root
                 #:write-fixture-file)

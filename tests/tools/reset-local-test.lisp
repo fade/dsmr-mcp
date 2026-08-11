@@ -15,7 +15,7 @@
 ;;;; sibling leaf would observe.
 
 (defpackage #:dsmr-mcp/tests/tools/reset-local-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/reset
                 #:reset-local-backends)
   (:import-from #:dsmr-mcp/src/tools/reset-local

@@ -19,7 +19,7 @@
 ;;;; test fast and avoid spawning unnecessary standby workers.
 
 (defpackage #:dsmr-mcp/tests/integration/hermetic/repl-eval-parity-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/hermetic/pool
                 #:initialize-pool #:shutdown-pool

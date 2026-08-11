@@ -15,7 +15,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/envrc-template/envrc-template-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/envrc-template
                 #:envrc-template-path
                 #:read-envrc-template)

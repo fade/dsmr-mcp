@@ -1,7 +1,7 @@
 ;;;; tests/bus/watch-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the cross-agent bus wakeup watcher. The load-bearing
+;;;; Zebra tests for the cross-agent bus wakeup watcher. The load-bearing
 ;;;; properties: the watcher fires on a seq strictly above its arm-time baseline
 ;;;; (so an agent's own just-published message, which is at-or-below the baseline
 ;;;; once it re-arms, never wakes it), it self-recycles to NIL when the idle
@@ -18,7 +18,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/bus/watch-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/bus/wal
                 #:scan
                 #:append-record

@@ -2,7 +2,7 @@
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
 ;;;; The framework engine behind run-tests: detection, ghost purges, the
-;;;; Parachute/Rove/FiveAM extractors, the ASDF text fallback, and the
+;;;; Zebra/Rove/FiveAM extractors, the ASDF text fallback, and the
 ;;;; uniform result envelope.
 ;;;;
 ;;;; DEPENDENCY-FREE BY CONTRACT.  This file is loaded into two very
@@ -37,11 +37,16 @@
   (:export #:run-tests
            #:detect-test-framework
            #:test-result-summary
-           #:*parachute-family*
+           #:*zebra-system-name*
+           #:*zebra-package-name*
            #:%detect-from-asdf-deps
-           #:%parachute-family-package
+           #:%dependency-system-name
+           #:%test-system-siblings
+           #:%test-system-name-p
+           #:%zebra-package
+           #:%zebra-system-p
            #:%resolve-test-packages
-           #:%parachute-purge-ghost-suites
+           #:%zebra-purge-ghost-suites
            #:%rove-purge-ghost-suites
            #:*test-debug-output*
            #:*log-hook*
@@ -134,7 +139,7 @@ Outside of test execution this is a broadcast-stream; output is discarded.")
 ;;; Unified Result Envelope
 ;;;
 ;;; make-test-result builds the standard wire hash-table returned by every
-;;; framework extractor. The shape is identical across Parachute, Rove, and
+;;; framework extractor. The shape is identical across Zebra, Rove, and
 ;;; FiveAM so callers and test assertions can use the same field names.
 ;;; make-failure-detail builds one entry in the failed_tests array.
 ;;; ---------------------------------------------------------------------------
@@ -235,52 +240,92 @@ Fields: test_name (required), plus optional description, form, values, reason, s
 ;;; precedence: explicit arg > ASDF :depends-on closure > loaded-package
 ;;; heuristic. The ASDF-deps walk is preferred over the loaded-package heuristic
 ;;; because a long-lived attached image may have several test frameworks loaded
-;;; simultaneously (e.g., Parachute from dsmr's own suite AND Rove from a
+;;; simultaneously (e.g., Zebra from dsmr's own suite AND Rove from a
 ;;; project under test). Without the ASDF-deps check, the heuristic would always
 ;;; return the first framework whose package happens to be loaded.
 ;;; ---------------------------------------------------------------------------
 
-(defparameter *parachute-family*
-  '(("parachute" "ORG.SHIRAKUMO.PARACHUTE" "PARACHUTE")
-    ("zebra" "ZEBRA"))
-  "Systems providing the Parachute test API, each paired with the package names
-that API may live under, most specific first.
+(defparameter *zebra-system-name* "zebra"
+  "The ASDF system providing the zebra test API.")
 
-Our fork of Parachute was renamed to zebra and dropped the
-org.shirakumo.parachute package outright, so a suite built on it presents an
-entirely different system name and package while behaving identically.  Both
-must reach the same runner.
+(defparameter *zebra-package-name* "ZEBRA"
+  "The package the zebra test API is presented under.")
 
-Parachute is listed first so an image holding both resolves the way it did
-before zebra existed.  A system whose dependency closure names one of them
-outright is matched on that name instead, so load order never decides which
-API a suite is run through.")
-
-(defvar *active-parachute-package* nil
-  "The Parachute-family package the run in progress was dispatched against.
-%RUN-PARACHUTE-TESTS binds it so the result walkers, which are handed a result
+(defvar *active-zebra-package* nil
+  "The zebra package the run in progress was dispatched against.
+%RUN-ZEBRA-TESTS binds it so the result walkers, which are handed a result
 object and never see a system name, read the same API the run used.")
 
-(defun %parachute-family-system-p (name)
-  "Return the *PARACHUTE-FAMILY* entry the system or framework NAME designates,
-or NIL when NAME is not one of them."
+(defun %zebra-system-p (name)
+  "True when NAME designates the system providing the zebra test API."
   (and (stringp name)
-       (find name *parachute-family* :key #'first :test #'string-equal)))
+       (string-equal name *zebra-system-name*)))
+
+(defun %dependency-system-name (dep)
+  "Return the system name DEP designates as a string, or NIL when it names none.
+
+ASDF coerces a plain dependency to a lowercase string whether it was written as
+a string, a symbol or a keyword, so the only spellings that survive parsing are
+the compound designators it leaves as lists.  (:version NAME VERSION) carries
+the name second, but (:feature FEATURE NAME) carries it third, behind the
+feature expression.  Reading the second element of a :feature form yields the
+feature rather than the system, so a dependency guarded by a feature named no
+system that could be matched."
+  (let ((name (if (consp dep)
+                  (if (eq (first dep) :feature)
+                      (third dep)
+                      (second dep))
+                  dep)))
+    (typecase name
+      (string name)
+      (symbol (string-downcase (symbol-name name)))
+      (t nil))))
+
+(defun %test-system-name-p (system-name)
+  "True when SYSTEM-NAME already names a test system by the usual conventions."
+  (and (stringp system-name)
+       (some (lambda (suffix)
+               (let ((n (length system-name))
+                     (s (length suffix)))
+                 (and (> n s)
+                      (string-equal suffix system-name :start2 (- n s)))))
+             '("/tests" "/test" "-tests" "-test"))))
+
+(defun %test-system-siblings (system-name)
+  "Return the conventional test-system names beside SYSTEM-NAME, likeliest first.
+
+A library does not depend on its own test system; the dependency runs the other
+way.  Descending through a library's dependencies therefore never reaches the
+system that names the test framework, and someone who asks about the library
+gets no answer at all.  These are the names to consult when that happens."
+  (when (and (stringp system-name) (plusp (length system-name)))
+    (mapcar (lambda (suffix) (concatenate 'string system-name suffix))
+            '("/tests" "/test" "-tests" "-test"))))
 
 (defun %detect-from-asdf-deps (system-name)
   "Walk SYSTEM-NAME's ASDF :depends-on closure (with visited-set deduplication)
-checking for Parachute-family / rove / fiveam system name strings.
-Returns :parachute, :rove, :fiveam, or NIL when none found.
+checking for zebra / rove / fiveam system name strings.
+Returns :zebra, :rove, :fiveam, or NIL when none found.
 
-The second return value is the dependency name that matched.  It tells one
-Parachute-family member from another, which the keyword alone cannot do: both
-\"parachute\" and \"zebra\" report :parachute, and the caller still needs to know
-which package to reach for.
+The second return value is the dependency name that matched, and the third is
+the system that declared it, which need not be SYSTEM-NAME.
+
+When SYSTEM-NAME names no framework anywhere beneath it, its conventional test
+siblings are consulted before giving up.  Naming a library is the way a caller
+actually asks for its tests, and a library depends on neither its tests nor
+their framework, so descending alone answers NIL for every well-formed project
+and sends the caller to a fallback that reports success without running a
+recognised suite.
 
 Walks at least 2 levels (the test system plus its direct deps); the visited hash
 prevents cycles and bounds the total work on deeply nested systems."
   (let ((visited (make-hash-table :test #'equal)))
-    (labels ((walk (name)
+    (labels ((framework-named-by (dep-name)
+               (cond
+                ((%zebra-system-p dep-name) :zebra)
+                ((string-equal dep-name "rove") :rove)
+                ((string-equal dep-name "fiveam") :fiveam)))
+             (walk (name)
                (when (and (stringp name) (not (gethash name visited)))
                  (setf (gethash name visited) t)
                  (let ((sys (ignore-errors (asdf/system:find-system name nil))))
@@ -289,81 +334,59 @@ prevents cycles and bounds the total work on deeply nested systems."
                             (ignore-errors
                              (asdf/system:system-depends-on sys))))
                        (dolist (dep deps)
-                         (let ((dep-name
-                                (if (consp dep)
-                                    (second dep)
-                                    dep)))
-                           (when (stringp dep-name)
-                             (cond
-                              ((%parachute-family-system-p dep-name)
-                               (return-from %detect-from-asdf-deps
-                                 (values :parachute dep-name)))
-                              ((string-equal dep-name "rove")
-                               (return-from %detect-from-asdf-deps
-                                 (values :rove dep-name)))
-                              ((string-equal dep-name "fiveam")
-                               (return-from %detect-from-asdf-deps
-                                 (values :fiveam dep-name))))
+                         (let ((dep-name (%dependency-system-name dep)))
+                           (when dep-name
+                             (let ((framework (framework-named-by dep-name)))
+                               (when framework
+                                 (return-from %detect-from-asdf-deps
+                                   (values framework dep-name name))))
                              (walk dep-name))))))))))
-      (walk system-name))
+      (walk system-name)
+      (unless (%test-system-name-p system-name)
+        (mapc #'walk (%test-system-siblings system-name))))
     nil))
 
-(defun %parachute-family-package (&optional system-name)
-  "Return the loaded package providing the Parachute test API, or NIL.
+(defun %zebra-package ()
+  "Return the loaded package providing the zebra test API, or NIL.
 
-Resolution order, strongest evidence first:
-  1. The package the run in progress was dispatched against.
-  2. The package belonging to whichever family system SYSTEM-NAME's dependency
-     closure names, so a zebra suite is not driven through parachute in an
-     image that happens to hold both.
-  3. The first loaded package in *PARACHUTE-FAMILY* order, which leaves a
-     parachute-only image resolving exactly as it did before zebra existed."
-  (flet ((loaded-package (entry) (some #'find-package (rest entry))))
-    (or *active-parachute-package*
-        (and system-name
-             (multiple-value-bind (framework dep-name)
-                 (%detect-from-asdf-deps system-name)
-               (and (eq framework :parachute) dep-name
-                    (let ((entry (%parachute-family-system-p dep-name)))
-                      (and entry (loaded-package entry))))))
-        (some #'loaded-package *parachute-family*))))
+The package the run in progress was dispatched against wins, so the result
+walkers read the same API the run used even though they never see a system
+name."
+  (or *active-zebra-package*
+      (find-package *zebra-package-name*)))
 
 (defun detect-test-framework (system-name &optional explicit-framework)
-  "Return the test framework keyword for SYSTEM-NAME: :parachute / :rove /
+  "Return the test framework keyword for SYSTEM-NAME: :zebra / :rove /
 :fiveam / :asdf.
 
 Detection precedence:
   1. EXPLICIT-FRAMEWORK arg when non-NIL and not \"auto\", because the caller
-     knows best.  Any Parachute-family system name, \"zebra\" included, answers
-     :parachute, the one keyword the runner dispatches on; without that a
-     caller naming the fork would silently land in the ASDF fallback.
+     knows best.
   2. ASDF :depends-on closure inspection, walking the system's dependency tree
-     for Parachute-family / rove / fiveam system names.  Reliable even when
-     several frameworks are loaded in the same image.
+     and its test siblings for zebra / rove / fiveam system names.  Reliable
+     even when several frameworks are loaded in the same image.
   3. Loaded-package heuristic, falling back to find-package.
   4. :asdf, meaning unknown framework; use ASDF test-op with captured text."
   (cond
    ((and explicit-framework (not (string-equal explicit-framework "auto")))
-    (if (%parachute-family-system-p explicit-framework)
-        :parachute
-        (intern (string-upcase explicit-framework) :keyword)))
+    (intern (string-upcase explicit-framework) :keyword))
    ((and (stringp system-name) (%detect-from-asdf-deps system-name)))
-   ((%parachute-family-package) :parachute)
+   ((%zebra-package) :zebra)
    ((find-package :rove) :rove) ((find-package :fiveam) :fiveam) (t :asdf)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Source Location Lookup
 ;;;
-;;; Used by Parachute and FiveAM extractors to attach file + line to each
+;;; Used by Zebra and FiveAM extractors to attach file + line to each
 ;;; failed test. sb-introspect:find-definition-sources-by-name looks up the
-;;; defun generated by define-test (Parachute with :defun t, which is default)
+;;; defun generated by define-test (Zebra with :defun t, which is default)
 ;;; or the deftest function (FiveAM). Guard: (symbolp name) — string-named
-;;; Parachute tests do not produce a defun and cannot be located.
+;;; Zebra tests do not produce a defun and cannot be located.
 ;;; ---------------------------------------------------------------------------
 
 (defun %test-source-location (name-symbol)
   "Return (list FILE LINE) for NAME-SYMBOL's :function definition, or NIL.
-Uses sb-introspect to locate the defun generated by define-test (Parachute)
+Uses sb-introspect to locate the defun generated by define-test (Zebra)
 or deftest (FiveAM). Returns NIL when the name is a string rather than a
 symbol — string-named tests do not produce a defun and have no source location."
   (unless (symbolp name-symbol)
@@ -448,25 +471,25 @@ Returns the standard make-test-result envelope with framework=asdf."
       ht)))
 
 ;;; ---------------------------------------------------------------------------
-;;; Parachute Backend
+;;; Zebra Backend
 ;;;
-;;; Net-new (cl-mcp has no Parachute extractor). Walks the test-result tree
-;;; returned by (parachute:test ...) to extract passed/failed/pending counts
+;;; Net-new (cl-mcp has no Zebra extractor). Walks the test-result tree
+;;; returned by (zebra:test ...) to extract passed/failed/pending counts
 ;;; and per-failed-test detail including source locations via sb-introspect.
 ;;; ---------------------------------------------------------------------------
 
-(defun %parachute-purge-ghost-suites (system-name)
-  "Remove Parachute test registrations for all packages associated with
+(defun %zebra-purge-ghost-suites (system-name)
+  "Remove Zebra test registrations for all packages associated with
 SYSTEM-NAME before reload. This prevents tests deleted from source from
 haunting subsequent runs.
 
 The framework's REMOVE-ALL-TESTS-IN-PACKAGE is looked up at run time rather
 than called by name, so the engine carries no compile-time dependency on the
-framework and works against whichever family member the image holds. Walks the
+framework and carries no compile-time dependency on the framework. Walks the
 ASDF :depends-on closure with a visited-set to cover all test sub-systems in a
 package-inferred layout."
   (let* ((visited-systems (make-hash-table :test #'equal))
-         (pkg (%parachute-family-package system-name))
+         (pkg (%zebra-package))
          (remove-sym
           (and pkg (find-symbol "REMOVE-ALL-TESTS-IN-PACKAGE" pkg)))
          (remove-fn (and remove-sym (fboundp remove-sym) remove-sym)))
@@ -491,8 +514,8 @@ package-inferred layout."
                          (when (stringp dep-name) (walk-system dep-name)))))))))
       (walk-system system-name))))
 
-(defun %parachute-result-counts (result-obj)
-  "Walk a Parachute test-result or parent-result tree and return
+(defun %zebra-result-counts (result-obj)
+  "Walk a Zebra test-result or parent-result tree and return
 (values passed failed pending) counts.
 
 A report's RESULTS vector lists every recorded result FLAT while each
@@ -504,7 +527,7 @@ reachable twice; the EQ visited set counts each result exactly once
     (labels ((count-result (r)
                (unless (gethash r seen)
                  (setf (gethash r seen) t)
-                 (let* ((pkg (%parachute-family-package))
+                 (let* ((pkg (%zebra-package))
                         (status-fn (and pkg (find-symbol "STATUS" pkg)))
                         (results-fn (and pkg (find-symbol "RESULTS" pkg)))
                         (status (and status-fn (ignore-errors (funcall status-fn r))))
@@ -522,12 +545,12 @@ reachable twice; the EQ visited set counts each result exactly once
       (count-result result-obj))
     (values passed failed pending)))
 
-(defun %parachute-extract-failures (result-obj)
-  "Walk a Parachute test-result tree and collect failure details for each
+(defun %zebra-extract-failures (result-obj)
+  "Walk a Zebra test-result tree and collect failure details for each
 :failed leaf result.  Returns a list of make-failure-detail hash-tables.
 
 Parent result nodes carry the test name symbol as the NAME of their expression
-(a PARACHUTE:TEST object).  That symbol is propagated down to leaf failures so
+(a ZEBRA:TEST object).  That symbol is propagated down to leaf failures so
 source locations are populated for file-defined tests even when the leaf's own
 expression is an assertion form rather than a test object.
 
@@ -541,7 +564,7 @@ so the surviving entry is the well-named one."
                (when (gethash r seen)
                  (return-from walk))
                (setf (gethash r seen) t)
-               (let* ((pkg (%parachute-family-package))
+               (let* ((pkg (%zebra-package))
                       (status-fn  (and pkg (find-symbol "STATUS" pkg)))
                       (results-fn (and pkg (find-symbol "RESULTS" pkg)))
                       (expr-fn    (and pkg (find-symbol "EXPRESSION" pkg)))
@@ -593,21 +616,21 @@ so the surviving entry is the well-named one."
       (walk result-obj nil))
     (nreverse failures)))
 
-(defun %package-has-parachute-tests-p (pkg)
-  "True when PKG (a package or NIL) has registered Parachute tests."
-  (let* ((para (%parachute-family-package))
+(defun %package-has-zebra-tests-p (pkg)
+  "True when PKG (a package or NIL) has registered Zebra tests."
+  (let* ((para (%zebra-package))
          (fn (and para (find-symbol "PACKAGE-TESTS" para))))
     (and fn pkg (ignore-errors (and (funcall fn pkg) t)))))
 
 (defun %resolve-test-packages (system-name)
-  "Resolve SYSTEM-NAME to the list of packages a Parachute run should cover.
+  "Resolve SYSTEM-NAME to the list of packages a Zebra run should cover.
 
 1:1 fast path: a package named like the system that actually CONTAINS
 registered tests.  Otherwise SYSTEM-NAME is treated as an umbrella (the
 package-inferred norm: \"proj/tests\" has no same-named package; the tests
 live in per-file subsystem packages): walk its :depends-on closure with a
 visited set, keeping only subsystems whose ASDF primary system matches the
-umbrella's — the constraint that keeps foreign dependencies like parachute
+umbrella's — the constraint that keeps foreign dependencies like zebra
 itself, which every test umbrella depends on, out of the run — and map each
 kept subsystem to its same-named package when that package has tests.
 
@@ -615,7 +638,7 @@ Returns NIL when nothing is found; the caller decides the fallback.  This
 resolver only READS system metadata — reload/purge policy stays with the
 caller."
   (let ((direct (find-package (string-upcase system-name))))
-    (if (%package-has-parachute-tests-p direct)
+    (if (%package-has-zebra-tests-p direct)
         (list direct)
         (let ((primary (ignore-errors (asdf:primary-system-name system-name)))
               (visited (make-hash-table :test #'equal))
@@ -629,7 +652,7 @@ caller."
                                            (asdf:primary-system-name name))))
                          (setf (gethash name visited) t)
                          (let ((pkg (find-package (string-upcase name))))
-                           (when (%package-has-parachute-tests-p pkg)
+                           (when (%package-has-zebra-tests-p pkg)
                              (push pkg packages)))
                          (let ((sys (ignore-errors (asdf:find-system name nil))))
                            (when sys
@@ -641,31 +664,30 @@ caller."
               (walk system-name)))
           (nreverse packages)))))
 
-(defun %run-parachute-tests (system-name)
-  "Run tests using Parachute for SYSTEM-NAME and return the uniform envelope.
+(defun %run-zebra-tests (system-name)
+  "Run tests using Zebra for SYSTEM-NAME and return the uniform envelope.
 The entry point is looked up by symbol rather than called by name, so the
-function works against any Parachute-family member the image holds, whether
-the package is called org.shirakumo.parachute, parachute or zebra.
+function carries no compile-time dependency on the framework.
 
 The resolved package is pinned for the duration of the run.  Package resolution
 and result extraction happen at different points and would otherwise be free to
-disagree in an image holding more than one family member, which would show up
+disagree, and a disagreement would show up
 as an empty run rather than as an error."
-  (%log :info "test-runner" "framework" "parachute" "system" system-name)
-  (let* ((pkg (%parachute-family-package system-name))
-         (*active-parachute-package* pkg)
+  (%log :info "test-runner" "framework" "zebra" "system" system-name)
+  (let* ((pkg (%zebra-package))
+         (*active-zebra-package* pkg)
          (test-fn (and pkg (find-symbol "TEST" pkg)))
          (context-var (and pkg (find-symbol "*CONTEXT*" pkg)))
          (parent-var  (and pkg (find-symbol "*PARENT*" pkg)))
          (targets (and test-fn (%resolve-test-packages system-name))))
     (unless test-fn
-      (%log :warn "test-runner" "message" "Parachute not loaded; falling back to ASDF")
-      (return-from %run-parachute-tests (%run-asdf-fallback system-name)))
+      (%log :warn "test-runner" "message" "Zebra not loaded; falling back to ASDF")
+      (return-from %run-zebra-tests (%run-asdf-fallback system-name)))
     (unless targets
       (%log :warn "test-runner" "message"
-            "no Parachute test packages resolve for system; falling back to ASDF"
+            "no Zebra test packages resolve for system; falling back to ASDF"
             "system" system-name)
-      (return-from %run-parachute-tests (%run-asdf-fallback system-name)))
+      (return-from %run-zebra-tests (%run-asdf-fallback system-name)))
     (let ((start-time (get-internal-real-time))
           (stdout-stream (make-string-output-stream))
           (stderr-stream (make-string-output-stream))
@@ -678,7 +700,7 @@ as an empty run rather than as an error."
                 (*test-debug-output* debug-stream)
                 (*standard-input* (make-string-input-stream "")))
             ;; Bind both *CONTEXT* and *PARENT* to NIL so this run's result
-            ;; objects do not register themselves into any outer Parachute context
+            ;; objects do not register themselves into any outer Zebra context
             ;; (e.g. when run-tests is called from inside a define-test body
             ;; during our own test suite). *PARENT* is set by eval-in-context
             ;; :around on parent-result and causes new result objects to attach
@@ -686,7 +708,7 @@ as an empty run rather than as an error."
             (let ((isolation-vars (remove nil (list context-var parent-var))))
               (setf result-obj
                     (progv isolation-vars (make-list (length isolation-vars))
-                      ;; TARGETS is a list of packages; parachute:test on a
+                      ;; TARGETS is a list of packages; zebra:test on a
                       ;; list returns one merged report, so umbrella systems
                       ;; (several sub-packages) and the 1:1 case (singleton)
                       ;; take the same path.
@@ -706,7 +728,7 @@ as an empty run rather than as an error."
                        (list (make-failure-detail
                               :test-name system-name
                               :reason (format nil "Test runner crashed: ~A" run-error)))
-                       :framework :parachute
+                       :framework :zebra
                        :duration duration-ms)))
               (when (plusp (length stdout)) (setf (gethash "stdout" ht) stdout))
               (when (plusp (length stderr)) (setf (gethash "stderr" ht) stderr))
@@ -714,13 +736,13 @@ as an empty run rather than as an error."
               ht)
             ;; Normal path: extract counts + failures from the result tree.
             (multiple-value-bind (passed failed pending)
-                (%parachute-result-counts result-obj)
+                (%zebra-result-counts result-obj)
               (let* ((failures (when (plusp failed)
-                                 (%parachute-extract-failures result-obj)))
+                                 (%zebra-extract-failures result-obj)))
                      (ht (make-test-result
                           :passed passed :failed failed :pending pending
                           :failed-tests failures
-                          :framework :parachute
+                          :framework :zebra
                           :duration duration-ms)))
                 (when (plusp (length stdout)) (setf (gethash "stdout" ht) stdout))
                 (when (plusp (length stderr)) (setf (gethash "stderr" ht) stderr))
@@ -1174,7 +1196,7 @@ Filters string dependencies that have SYSTEM-NAME/ as a prefix."
 ;;;
 ;;; Net-new. Invoked only when (find-package :fiveam) is non-NIL. The ASDF
 ;;; text fallback covers FiveAM's absence. Source locations use sb-introspect
-;;; on the test name symbol (same strategy as Parachute).
+;;; on the test name symbol (same strategy as Zebra).
 ;;; ---------------------------------------------------------------------------
 
 (defun %run-fiveam-tests (system-name)
@@ -1299,7 +1321,7 @@ the subsequent run. ASDF:CLEAR-SYSTEM then ASDF:LOAD-SYSTEM ensures edits
 made via lisp-edit-form are picked up before the run."
   ;; Ghost-purge: per-framework, before clearing/reloading.
   (case framework
-    (:parachute (ignore-errors (%parachute-purge-ghost-suites system-name)))
+    (:zebra (ignore-errors (%zebra-purge-ghost-suites system-name)))
     (:rove      (ignore-errors (%rove-purge-ghost-suites system-name))))
   ;; Force-reload: clear ASDF's loaded state then re-load from source.
   (when (asdf:find-system system-name nil)
@@ -1320,7 +1342,7 @@ made via lisp-edit-form are picked up before the run."
   "Run tests for SYSTEM-NAME using the specified or auto-detected FRAMEWORK.
 Returns a hash-table with structured results (the uniform envelope).
 
-FRAMEWORK — optional string or keyword: \"parachute\", \"rove\", \"fiveam\",
+FRAMEWORK — optional string or keyword: \"zebra\", \"rove\", \"fiveam\",
   \"auto\" (or NIL). When absent or \"auto\", detection uses the ASDF
   :depends-on closure first.
 TEST — optional string: run only this specific test (fully qualified).
@@ -1364,8 +1386,8 @@ RELOAD — default true; purges stale framework registrations and force-reloads
                             :reason (map 'string #'identity
                                          (princ-to-string load-err)))))))))
             (case fw
-              (:parachute
-               (%run-parachute-tests system-name))
+              (:zebra
+               (%run-zebra-tests system-name))
               (:rove
                (if (find-package :rove)
                    (if selective-p

@@ -6,7 +6,7 @@
 ;;;; and per-request correlation fields (session_id, request_id).
 
 (defpackage #:dsmr-mcp/tests/log/log-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/log
                 #:log-event

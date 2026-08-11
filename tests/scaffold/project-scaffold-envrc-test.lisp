@@ -13,7 +13,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/scaffold/project-scaffold-envrc-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/project-scaffold-core
                 #:plan-scaffold))
 

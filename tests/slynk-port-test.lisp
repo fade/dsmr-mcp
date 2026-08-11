@@ -1,7 +1,7 @@
 ;;;; tests/slynk-port-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the per-project Slynk port derivation module.
+;;;; Zebra tests for the per-project Slynk port derivation module.
 ;;;; The properties under test are contractual — they are locked-in on the first
 ;;;; shipped version because the derived value lives in each project's `.envrc`
 ;;;; and must reproduce exactly on a fresh install or after an SBCL upgrade.
@@ -13,7 +13,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/slynk-port-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/slynk-port
                 #:derive-slynk-port
                 #:fnv1a-32

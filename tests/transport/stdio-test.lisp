@@ -7,7 +7,7 @@
 ;;;; the stdout-pollution guard.
 
 (defpackage #:dsmr-mcp/tests/transport/stdio-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/transport/stdio
                 #:serve-streams

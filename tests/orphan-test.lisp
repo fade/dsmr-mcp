@@ -6,7 +6,7 @@
 ;;;; oldest-entry eviction, and concurrent registration under contention.
 
 (defpackage #:dsmr-mcp/tests/orphan-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/orphan
                 #:register-orphan
                 #:orphan-count

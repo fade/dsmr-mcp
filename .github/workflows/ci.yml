@@ -79,7 +79,7 @@ jobs:
                --eval '(quicklisp-quickstart:install)'
           # Make every subsequent bare `sbcl` (the `make test` recipe included)
           # load the pinned ASDF, then Quicklisp, so ASDF resolves the test
-          # dependencies (parachute, jzon, log4cl, …) from the dist on demand.
+          # dependencies (jzon, log4cl, …) from the dist on demand.
           {
             printf '%s\n' '(let ((a (merge-pathnames "asdf.lisp" (user-homedir-pathname)))) (when (probe-file a) (load a)))'
             printf '%s\n' '#-quicklisp (let ((q (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file q) (load q)))'
@@ -121,6 +121,19 @@ jobs:
           set -euo pipefail
           git clone --filter=blob:none https://github.com/fade/slynk-client.git vendor/slynk-client
           git -C vendor/slynk-client checkout 67b65da7210b4f9a6e373077373528a4c7bed4b5
+
+      - name: Vendor zebra (not in the Quicklisp dist)
+        # The test framework is not in the Quicklisp dist, so it is vendored here.
+        # The step fails at the clone rather than later, on purpose: an
+        # unresolvable framework otherwise falls through to a path that reports
+        # success over a suite nothing ever parsed.
+        #
+        # Pinned to a commit rather than a branch so a push upstream cannot change
+        # what this job tested.
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/fade/zebra.git vendor/zebra
+          git -C vendor/zebra checkout b1510600dadeab0bb3a651f1bc355741b6b9aaac
 
       - name: Prime dependencies (cold — download dist deps + compile)
         # `make test` uses asdf:load-system, which resolves only systems already
@@ -198,7 +211,7 @@ jobs:
                --eval '(quicklisp-quickstart:install)'
           # Make every subsequent bare `sbcl` (the `make test` recipe included)
           # load the pinned ASDF, then Quicklisp, so ASDF resolves the test
-          # dependencies (parachute, jzon, log4cl, …) from the dist on demand.
+          # dependencies (jzon, log4cl, …) from the dist on demand.
           {
             printf '%s\n' '(let ((a (merge-pathnames "asdf.lisp" (user-homedir-pathname)))) (when (probe-file a) (load a)))'
             printf '%s\n' '#-quicklisp (let ((q (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file q) (load q)))'
@@ -232,6 +245,13 @@ jobs:
           set -euo pipefail
           git clone --filter=blob:none https://github.com/fade/slynk-client.git vendor/slynk-client
           git -C vendor/slynk-client checkout 67b65da7210b4f9a6e373077373528a4c7bed4b5
+
+      - name: Vendor zebra (not in the Quicklisp dist)
+        # Pinned to a commit, matching the unit-suite job above.
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/fade/zebra.git vendor/zebra
+          git -C vendor/zebra checkout b1510600dadeab0bb3a651f1bc355741b6b9aaac
 
       - name: Prime dependencies (download dist deps + compile)
         # Export the same project-local XDG_CACHE_HOME the Makefile uses so the

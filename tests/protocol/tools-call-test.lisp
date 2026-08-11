@@ -8,7 +8,7 @@
 ;;;; because c2mop:class-prototype does not apply :default-initargs.
 
 (defpackage #:dsmr-mcp/tests/protocol/tools-call-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/protocol
                 #:process-json-line)

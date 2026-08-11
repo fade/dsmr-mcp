@@ -1,7 +1,7 @@
 ;;;; tests/install/defaults-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the installer's site-wide .envrc defaults
+;;;; Zebra tests for the installer's site-wide .envrc defaults
 ;;;; (ENVRC-08..09). The pure render and the non-interactive gates are covered
 ;;;; directly; the write/skip tests bind XDG_CONFIG_HOME to a fresh temp dir for
 ;;;; their dynamic extent so the write target is isolated and cleaned up — the
@@ -14,7 +14,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/install/defaults-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/install/defaults
                 #:render-site-defaults-template
                 #:collect-site-defaults

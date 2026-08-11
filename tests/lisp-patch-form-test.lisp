@@ -12,7 +12,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/lisp-patch-form-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/lisp-patch-form
                 #:patch-form
                 #:patch-operation-error

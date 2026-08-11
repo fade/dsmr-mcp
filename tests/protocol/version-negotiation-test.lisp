@@ -7,7 +7,7 @@
 ;;;; This diverges from cl-mcp which returns -32602.
 
 (defpackage #:dsmr-mcp/tests/protocol/version-negotiation-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/protocol
                 #:process-json-line)

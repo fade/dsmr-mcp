@@ -1,7 +1,7 @@
 ;;;; tests/bus/cursor-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the per-subscriber delivery cursor. The contract: a
+;;;; Zebra tests for the per-subscriber delivery cursor. The contract: a
 ;;;; subscriber receives every record past its cursor exactly once, catch-up after
 ;;;; an absence delivers the backlog, and re-delivery is idempotent so a duplicate
 ;;;; wake never replays a message.
@@ -13,7 +13,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/bus/cursor-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal)
                     (#:cursor #:dsmr-mcp/src/bus/cursor)))
 

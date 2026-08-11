@@ -7,7 +7,7 @@
 ;;;; wrapped in with-serialised-attach-call or with-attach-dispatch.
 
 (defpackage #:dsmr-mcp/tests/attach/call-lock-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/attach/dispatch
                 #:*attach-call-lock*
                 #:*attach-concurrency*

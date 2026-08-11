@@ -1,12 +1,12 @@
 ;;;; tests/install/config-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the installer config core and the Claude IO layer.
+;;;; Zebra tests for the installer config core and the Claude IO layer.
 ;;;; All transforms run on in-memory jzon objects and temp files — the real
 ;;;; ~/.claude.json is never read or written.
 
 (defpackage #:dsmr-mcp/tests/install/config-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/install/config
                 #:canonical-server-entry

@@ -11,7 +11,7 @@
 ;;;; file into the image, version-gated by a content fingerprint.  The
 ;;;; in-process slynk fixture structurally cannot prove that (its image
 ;;;; already carries the engine via ASDF), so this leaf spawns a genuinely
-;;;; foreign SBCL — CL + slynk + parachute only — gives it a tiny UMBRELLA
+;;;; foreign SBCL — CL + slynk + zebra only — gives it a tiny UMBRELLA
 ;;;; test system (no package named like the system; one passing and one
 ;;;; failing test across two sub-suite packages, the package-inferred
 ;;;; norm), and drives the real tool dispatch end to end: bootstrap,
@@ -25,7 +25,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/integration/attach/run-tests-cross-process-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/attach/dispatch
                 #:repl-eval-tool-slynk-conn)
   (:import-from #:dsmr-mcp/src/tools/run-tests
@@ -50,7 +50,7 @@
 ;;; Probe system source
 ;;;
 ;;; The parent writes this file into a temp directory; the child registers an
-;;; in-memory ASDF system over it (:depends-on parachute), so the verb's
+;;; in-memory ASDF system over it (:depends-on zebra), so the verb's
 ;;; default path — ASDF-deps framework detection, ghost-purge, force-reload —
 ;;; runs exactly as it would for a real operator project.  One test passes,
 ;;; one fails deliberately, so the counts prove real extraction rather than
@@ -59,14 +59,14 @@
 
 (defparameter +probe-asd+
   "(defsystem \"dsmr-xproc-runner-probe\"
-  :depends-on (\"parachute\"
+  :depends-on (\"zebra\"
                \"dsmr-xproc-runner-probe/suite-a\"
                \"dsmr-xproc-runner-probe/suite-b\"))
 (defsystem \"dsmr-xproc-runner-probe/suite-a\"
-  :depends-on (\"parachute\")
+  :depends-on (\"zebra\")
   :components ((:file \"suite-a\")))
 (defsystem \"dsmr-xproc-runner-probe/suite-b\"
-  :depends-on (\"parachute\")
+  :depends-on (\"zebra\")
   :components ((:file \"suite-b\")))
 "
   "UMBRELLA system definition: the top system has NO components and no
@@ -76,14 +76,14 @@ subsystems, the package-inferred norm this leaf exists to prove.")
 (defparameter +probe-suite-a+
   "(defpackage #:dsmr-xproc-runner-probe/suite-a (:use #:cl))
 (in-package #:dsmr-xproc-runner-probe/suite-a)
-(parachute:define-test xproc-probe-passes (parachute:true t))
+(zebra:define-test xproc-probe-passes (zebra:true t))
 "
   "First sub-suite: one passing test.")
 
 (defparameter +probe-suite-b+
   "(defpackage #:dsmr-xproc-runner-probe/suite-b (:use #:cl))
 (in-package #:dsmr-xproc-runner-probe/suite-b)
-(parachute:define-test xproc-probe-fails (parachute:is = 1 2))
+(zebra:define-test xproc-probe-fails (zebra:is = 1 2))
 "
   "Second sub-suite: one deliberately failing test, so the merged counts
 and the rendered failure reason are both observable.")
@@ -116,7 +116,7 @@ below is what catches a lost rebind."
       (usocket:socket-close listener))))
 
 (defun %child-eval-forms (port probe-dir)
-  "The --eval program for the foreign image: Quicklisp, slynk + parachute,
+  "The --eval program for the foreign image: Quicklisp, slynk + zebra,
 put PROBE-DIR (which holds probe.asd) on the central registry, start Slynk
 on PORT, block.  Foreign package symbols go through read-from-string so the
 forms READ before their packages exist."
@@ -127,7 +127,7 @@ forms READ before their packages exist."
                          " (user-homedir-pathname))))"
                          " (when (and (probe-file q) (not (find-package :ql)))"
                          " (load q)))")
-   "--eval" "(funcall (read-from-string \"ql:quickload\") (list :slynk :parachute) :silent t)"
+   "--eval" "(funcall (read-from-string \"ql:quickload\") (list :slynk :zebra) :silent t)"
    "--eval" (format nil "(push (pathname ~S) asdf:*central-registry*)"
                     (namestring probe-dir))
    "--eval" (format nil "(funcall (read-from-string \"slynk:create-server\") :port ~D :dont-close t)"
@@ -225,7 +225,7 @@ second call succeeds through the bootstrap's :CURRENT path."
         (false (equal "NETWORK_ERROR" (gethash "error_type" res))
                "run-tests dropped the wire (NETWORK_ERROR)")
         (false (gethash "isError" res) "run-tests returned isError")
-        (is equal "parachute" (gethash "framework" res))
+        (is equal "zebra" (gethash "framework" res))
         ;; Merged counts across the two sub-suites: 1 pass + 1 fail.
         (is = 1 (gethash "passed" res))
         (is = 1 (gethash "failed" res))

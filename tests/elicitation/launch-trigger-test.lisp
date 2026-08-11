@@ -31,7 +31,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/elicitation/launch-trigger-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/envrc-init
                 #:maybe-prompt-and-write-envrc
                 #:lisp-project-without-envrc-p

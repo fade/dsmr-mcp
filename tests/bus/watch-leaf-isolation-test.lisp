@@ -22,7 +22,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/bus/watch-leaf-isolation-test
-  (:use #:cl #:parachute))
+  (:use #:cl #:zebra))
 
 (in-package #:dsmr-mcp/tests/bus/watch-leaf-isolation-test)
 

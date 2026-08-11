@@ -33,7 +33,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/integration/bus/segmentation-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:local-nicknames (#:agent #:dsmr-mcp/src/bus/agent)
                     (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:bus #:dsmr-mcp/src/bus/bus)
