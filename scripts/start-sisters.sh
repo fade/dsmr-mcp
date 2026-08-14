@@ -15,6 +15,10 @@
 # either --leader or a .fleet-leader file sitting beside the repositories. Keep
 # it that way. A fleet's membership and its leader both change, and a name baked
 # in here would outlive both.
+#
+# Each session runs under `direnv exec`, so it comes up with its repository's own
+# environment. See needs_direnv below for why the working directory alone is not
+# enough.
 
 set -euo pipefail
 
@@ -26,6 +30,8 @@ BASE_DIR=$PWD
 EXTRA_ROOT=${LISP_WORKSPACE:-}
 
 CLAUDE_BIN=claude
+DIRENV_BIN=direnv
+USE_DIRENV=1
 PERMISSION_MODE=auto
 KITTY_SOCKET=${KITTY_LISTEN_ON:-}
 ONLY=()
@@ -91,6 +97,10 @@ Launching:
                         Value passed to claude --permission-mode
                         (default: $PERMISSION_MODE)
   -c, --command BIN     Program to run in each tab (default: $CLAUDE_BIN)
+      --no-direnv       Start each session without its repository's .envrc.
+                        The environment a repository's .envrc exports is how its
+                        session finds its own bus identity and its own image, so
+                        only pass this for a fleet that keeps that elsewhere.
   -w, --window          Put the tabs in a new OS window instead of this one
   -t, --to SOCKET       kitty remote control socket, e.g. unix:/tmp/kitty-1234
                         (default: \$KITTY_LISTEN_ON, else auto-discovered)
@@ -140,6 +150,18 @@ contains() {
     return 1
 }
 
+# A repository's .envrc is what makes its session that sister rather than a
+# generic one: the bus identity it answers to and the image it drives are both
+# exported there. direnv loads such a file from a shell hook, and kitty execs the
+# command with no shell in between, so a tab opened in the right directory still
+# comes up with none of it. `direnv exec DIR` reads the file directly, which is
+# the same environment the hook would have produced.
+needs_direnv() {
+    ((USE_DIRENV)) || return 1
+    [[ -e ${1%/}/.envrc ]] || return 1
+    return 0
+}
+
 is_sister_dir() {
     local dir=${1%/}
     [[ -e $dir/.git ]] || return 1
@@ -156,7 +178,7 @@ is_sister_dir() {
 # it is, rather than as a good option used wrongly.
 VALUED_OPTS=(--dir --extra --extra-root --only --exclude --leader --leader-file
              --leader-cmd --worker-cmd --fleet-tag --permission-mode --command --to)
-FLAG_OPTS=(--no-role --no-scan --window --force --list --dry-run --help)
+FLAG_OPTS=(--no-role --no-direnv --no-scan --window --force --list --dry-run --help)
 
 while [[ $# -gt 0 ]]; do
     if [[ $1 == --*=* ]]; then
@@ -180,6 +202,7 @@ while [[ $# -gt 0 ]]; do
         --no-role)             LEADER_CMD=""; WORKER_CMD=""; shift ;;
         -p|--permission-mode)  [[ $# -ge 2 ]] || die "$1 needs a value"; PERMISSION_MODE=$2; shift 2 ;;
         -c|--command)          [[ $# -ge 2 ]] || die "$1 needs a value"; CLAUDE_BIN=$2; shift 2 ;;
+        --no-direnv)           USE_DIRENV=0; shift ;;
         -t|--to)               [[ $# -ge 2 ]] || die "$1 needs a value"; KITTY_SOCKET=$2; shift 2 ;;
         -S|--no-scan)          NO_SCAN=1; shift ;;
         -w|--window)           NEW_WINDOW=1; shift ;;
@@ -337,6 +360,47 @@ fi
 
 command -v kitten >/dev/null || die "kitten not found on PATH"
 
+# An .envrc that was never approved makes `direnv exec` refuse to run the command
+# at all, so the tab would open and die. Check every repository before opening
+# anything: a fleet half up, with the other half's tabs gone by the time anyone
+# looks, is the state that costs an afternoon to understand.
+if ((!DRY_RUN)) && ((USE_DIRENV)); then
+    needs_direnv_any=0
+    for path in "${paths[@]}"; do
+        needs_direnv "$path" && needs_direnv_any=1
+    done
+    if ((needs_direnv_any)) && ! command -v "$DIRENV_BIN" >/dev/null; then
+        die "$DIRENV_BIN not found on PATH, and these repositories carry a .envrc.
+Without it each session starts without its own bus identity and image settings.
+Install direnv, or pass --no-direnv if this fleet keeps that elsewhere."
+    fi
+    # A repository with no .envrc is not an error here, since a fleet may keep its
+    # settings elsewhere, but it is worth saying: nothing distinguishes that
+    # session from any other, so it reaches no bus and drives no image of its own.
+    bare=()
+    for i in "${!names[@]}"; do
+        [[ -e ${paths[i]}/.envrc ]] || bare+=("${names[i]}")
+    done
+    ((${#bare[@]})) &&
+        printf '%s: note: no .envrc, so no environment of their own: %s\n' \
+            "$PROGNAME" "${bare[*]}" >&2
+
+    blocked=()
+    for i in "${!names[@]}"; do
+        needs_direnv "${paths[i]}" || continue
+        "$DIRENV_BIN" exec "${paths[i]}" true >/dev/null 2>&1 || blocked+=("${names[i]}")
+    done
+    if ((${#blocked[@]})); then
+        printf '%s: these repositories have a .envrc that direnv will not load:\n' "$PROGNAME" >&2
+        for name in "${blocked[@]}"; do
+            for i in "${!names[@]}"; do
+                [[ ${names[i]} == "$name" ]] && printf '  direnv allow %s\n' "${paths[i]}" >&2
+            done
+        done
+        die "approve them and run again, or pass --no-direnv to start without them"
+    fi
+fi
+
 kitty_rc() { kitten @ --to "$KITTY_SOCKET" "$@"; }
 
 if ((!DRY_RUN)); then
@@ -380,7 +444,9 @@ for i in "${!names[@]}"; do
         [[ -n $role_prompt && -n $FLEET_TAG ]] && role_prompt="$role_prompt $FLEET_TAG"
     fi
 
-    launch_args+=(-- "$CLAUDE_BIN" --permission-mode "$PERMISSION_MODE")
+    launch_args+=(--)
+    needs_direnv "$path" && launch_args+=("$DIRENV_BIN" exec "$path")
+    launch_args+=("$CLAUDE_BIN" --permission-mode "$PERMISSION_MODE")
     [[ -n $role_prompt ]] && launch_args+=("$role_prompt")
 
     if ((DRY_RUN)); then
