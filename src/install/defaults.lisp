@@ -99,6 +99,11 @@ it is shell syntax, not a render-template target."
              # from this directory read the same variable, so one value here keeps both on~@
              # one bus rather than letting them drift apart while both report success.~@
              export DSMR_BUS_SELECTOR=\"${DSMR_BUS_SELECTOR:-}\"~2%~
+             # Whether this project's agent may publish to one named recipient instead of~@
+             # broadcasting to every participant. On, so this project can answer whoever~@
+             # asked it, by name, from its first run; export DSMR_BUS_DIRECT_ADDRESSING=0~@
+             # before direnv loads to go back to broadcast only.~@
+             export DSMR_BUS_DIRECT_ADDRESSING=\"${DSMR_BUS_DIRECT_ADDRESSING:-1}\"~2%~
              # Sibling projects this one may re-root into (filesystem sandbox whitelist):~@
              ~:[# export DSMR_RELATED_PROJECTS=\"$HOME/SourceCode/lisp/cl-mcp:$HOME/SourceCode/lisp/eve-quant\"~;export DSMR_RELATED_PROJECTS=\"~:*~A\"~]~%"
             ws host port mode related)))
