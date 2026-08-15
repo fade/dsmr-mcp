@@ -46,6 +46,8 @@
            #:%zebra-package
            #:%zebra-system-p
            #:%resolve-test-packages
+           #:%system-declared-test-packages
+           #:%declared-test-packages
            #:%zebra-purge-ghost-suites
            #:%rove-purge-ghost-suites
            #:*test-debug-output*
@@ -687,8 +689,168 @@ report that system's packages. Callers must decide which systems to ask about."
       (when sys (walk sys)))
     (nreverse packages)))
 
+(defun %designated-package (designator)
+  "Return the existing package DESIGNATOR names, or NIL.
+
+Strings and symbols are accepted, which between them cover every spelling a
+system definition is likely to use for a suite: a keyword, an uninterned
+#: name, a plain string. Anything else (a quoted form, a lambda list, a
+number) names no package and yields NIL, which is what lets a caller sift
+suite names out of a call's arguments without knowing the call's shape."
+  (let ((name (typecase designator
+                (string designator)
+                (symbol (and designator (symbol-name designator)))
+                (t nil))))
+    (when name
+      (or (find-package name)
+          (find-package (string-upcase name))))))
+
+(defun %names-zebra-package-p (designator)
+  "True when DESIGNATOR spells the zebra API package.
+Compares by name rather than by package identity, so a declaration can be
+read before zebra itself is loaded."
+  (let ((name (typecase designator
+                (string designator)
+                (symbol (and designator (symbol-name designator)))
+                (t nil))))
+    (and name (string-equal name *zebra-package-name*) t)))
+
+(defun %zebra-suite-designators (form)
+  "Package designators handed to a zebra suite-running call anywhere in FORM.
+
+Two spellings of that call are recognised, both of them ordinary in a system
+definition: the qualified symbol (ZEBRA:TEST ...), and the indirection
+(UIOP:SYMBOL-CALL :ZEBRA :TEST ...) that a definition uses to avoid a
+read-time dependency on a framework it only loads at test time.
+
+Every argument of the call is offered, trailing keyword arguments such as a
+report style included; the caller keeps only those that name a package, so
+an argument list this function does not understand costs nothing."
+  (let ((designators '()))
+    (labels ((zebra-symbol-call-p (x)
+               (and (consp x)
+                    (symbolp (car x))
+                    (car x)
+                    (string= (symbol-name (car x)) "SYMBOL-CALL")
+                    (consp (cdr x))
+                    (consp (cddr x))
+                    (%names-zebra-package-p (second x))
+                    (let ((fn (third x)))
+                      (and (symbolp fn) fn
+                           (string= (symbol-name fn) "TEST")))))
+             (zebra-test-call-p (x)
+               (and (consp x)
+                    (symbolp (car x))
+                    (car x)
+                    (string= (symbol-name (car x)) "TEST")
+                    (let ((home (symbol-package (car x))))
+                      (and home
+                           (string-equal (package-name home)
+                                         *zebra-package-name*)))))
+             (walk (x)
+               (when (consp x)
+                 (cond ((zebra-symbol-call-p x)
+                        (dolist (arg (cdddr x)) (pushnew arg designators)))
+                       ((zebra-test-call-p x)
+                        (dolist (arg (cdr x)) (pushnew arg designators))))
+                 (walk (car x))
+                 (walk (cdr x)))))
+      (walk form))
+    (nreverse designators)))
+
+(defun %defsystem-form-names-p (form system-name)
+  "True when FORM is a DEFSYSTEM whose name is SYSTEM-NAME.
+Both names go through ASDF's own coercion, so the file is free to spell its
+system as a symbol, a keyword or a string."
+  (and (consp form)
+       (symbolp (car form))
+       (car form)
+       (string= (symbol-name (car form)) "DEFSYSTEM")
+       (consp (cdr form))
+       (let ((declared (ignore-errors (asdf:coerce-name (second form))))
+             (wanted   (ignore-errors (asdf:coerce-name system-name))))
+         (and declared wanted (string-equal declared wanted) t))))
+
+(defun %declared-suite-designators (defsystem-form)
+  "Suite designators named by DEFSYSTEM-FORM's TEST-OP perform clauses.
+A definition may carry several perform clauses, and only the TEST-OP ones
+say anything about a test run."
+  (let ((designators '()))
+    (loop for (key value) on (cddr defsystem-form) by #'cddr
+          when (and (keywordp key)
+                    (string= (symbol-name key) "PERFORM")
+                    (consp value)
+                    (symbolp (car value))
+                    (car value)
+                    (string= (symbol-name (car value)) "TEST-OP"))
+            do (dolist (designator (%zebra-suite-designators value))
+                 (pushnew designator designators)))
+    (nreverse designators)))
+
+(defun %system-declared-test-packages (system-name)
+  "Return the packages SYSTEM-NAME's own definition states its test run covers.
+
+ASDF's :perform (test-op ...) is a system's statement of what testing it
+means, written by the people who own the suite. Where it exists it settles
+what spelling conventions can only guess at, so it is worth more than any
+inference drawn from names or from which packages a source file happens to
+declare.
+
+The statement cannot be read back as data: a perform clause becomes a
+compiled method, and a compiled method keeps no lambda expression. It is
+recovered instead from the text of the .asd file ASDF already records as the
+system's source. Reading happens with *READ-EVAL* disabled and *PACKAGE*
+bound to KEYWORD, so an unqualified name in the file interns nowhere new and
+the parse leaves nothing behind in any package of its own.
+
+Returns NIL when the system is unknown, when its source file is gone, when
+the file will not read, or when it simply declares nothing, every one of
+which leaves the caller free to fall back to inference. Whether a named
+package holds any tests is the caller's question, not this one's."
+  (let* ((sys  (ignore-errors (asdf:find-system system-name nil)))
+         (asd  (and sys (ignore-errors (asdf:system-source-file sys))))
+         (path (and asd (ignore-errors (probe-file asd))))
+         (packages '()))
+    (when path
+      (handler-case
+          (with-open-file (stream path :direction :input)
+            (let ((*read-eval* nil)
+                  (*package* (find-package :keyword)))
+              (loop
+                (let ((form (handler-case (read stream nil :eof)
+                              (error () :eof))))
+                  (when (eq form :eof) (return))
+                  (when (%defsystem-form-names-p form system-name)
+                    (dolist (designator (%declared-suite-designators form))
+                      (let ((pkg (%designated-package designator)))
+                        (when pkg (pushnew pkg packages)))))))))
+        (error () nil)))
+    (nreverse packages)))
+
+(defun %declared-test-packages (system-name)
+  "SYSTEM-NAME's declared test packages that actually hold registered tests.
+
+The registration check is what keeps a declaration honest. A suite that has
+since been renamed or moved leaves a declaration pointing at a package with
+nothing in it, and an empty run reported as a pass is the one outcome worse
+than no answer at all. Such a declaration resolves to nothing here and the
+caller falls back to inference, exactly as for a system that declares
+nothing."
+  (remove-if-not #'%package-has-zebra-tests-p
+                 (%system-declared-test-packages system-name)))
+
 (defun %resolve-test-packages (system-name)
   "Resolve SYSTEM-NAME to the list of packages a Zebra run should cover.
+
+Declaration first: when the system's own definition states what its test run
+is, through :perform (test-op ...), that statement is the answer and no
+inference is attempted. A project that has said what its suite is should be
+believed, and only the project can say which of the packages its files
+declare are the suite and which are quarantined beside it. The statement
+must still name a package holding registered tests, so a declaration left
+behind by a rename cannot turn an empty run into a pass.
+
+Everything below applies only to a system that declares nothing.
 
 1:1 fast path: a package named like the system that actually CONTAINS
 registered tests. Otherwise SYSTEM-NAME is treated as an umbrella (the
@@ -698,8 +860,10 @@ visited set, keeping only subsystems whose ASDF primary system matches the
 umbrella's, the constraint that keeps foreign dependencies like zebra
 itself, which every test umbrella depends on, out of the run.
 
-Each admitted subsystem is then asked for its packages in two steps, because
-a project is free to name its test packages however it likes:
+Each admitted subsystem is asked the same question in the same order, since
+a subsystem is as entitled to declare its own test run as the umbrella is.
+Failing a declaration, its packages are sought in two steps, because a
+project is free to name its test packages however it likes:
 
   1. the same-named package, which is the convention the package-inferred
      layout follows;
@@ -715,6 +879,12 @@ intentionally failing suites, and must stay out of the run. Only a subsystem
 with no same-named test package has diverged far enough for its other declared
 packages to be the tests the caller meant.
 
+That guess is defeated by any naming convention it does not share. A system
+spelled with a slash whose package is spelled with a dot has no same-named
+package, so the fallback fires and sweeps in the asides beside the real
+suite. The declaration is the fix for exactly that case: it is stated in the
+file the resolver is already reading, and it costs no guessing at all.
+
 Widening applies to spelling only. Candidates still come exclusively from
 subsystems the primary-system constraint already admitted, so no reachable
 package belongs to a foreign system, and every candidate must still hold
@@ -723,40 +893,48 @@ registered tests to be kept.
 Returns NIL when nothing is found; the caller decides the fallback. This
 resolver only READS system metadata; reload/purge policy stays with the
 caller."
-  (let ((direct (find-package (string-upcase system-name))))
-    (if (%package-has-zebra-tests-p direct)
-        (list direct)
-        (let ((primary (ignore-errors (asdf:primary-system-name system-name)))
-              (visited (make-hash-table :test #'equal))
-              (packages '()))
-          (when primary
-            (labels ((keep (pkg)
-                       ;; Returns true when PKG was adopted, which is what tells
-                       ;; the caller whether the fallback is still needed.
-                       (when (and pkg
-                                  (not (member pkg packages))
-                                  (%package-has-zebra-tests-p pkg))
-                         (push pkg packages)
-                         t))
-                     (walk (name)
-                       (when (and (stringp name)
-                                  (not (gethash name visited))
-                                  (equal primary
-                                         (ignore-errors
-                                           (asdf:primary-system-name name))))
-                         (setf (gethash name visited) t)
-                         (unless (keep (find-package (string-upcase name)))
-                           (dolist (pkg (%system-source-packages name))
-                             (keep pkg)))
-                         (let ((sys (ignore-errors (asdf:find-system name nil))))
-                           (when sys
-                             (dolist (dep (ignore-errors
-                                            (asdf:system-depends-on sys)))
-                               (let ((dep-name (if (consp dep) (second dep) dep)))
-                                 (when (stringp dep-name)
-                                   (walk dep-name)))))))))
-              (walk system-name)))
-          (nreverse packages)))))
+  (let ((declared (%declared-test-packages system-name)))
+    (if declared
+        declared
+        (let ((direct (find-package (string-upcase system-name))))
+          (if (%package-has-zebra-tests-p direct)
+              (list direct)
+              (let ((primary (ignore-errors (asdf:primary-system-name system-name)))
+                    (visited (make-hash-table :test #'equal))
+                    (packages '()))
+                (when primary
+                  (labels ((keep (pkg)
+                             ;; Returns true when PKG was adopted, which is what
+                             ;; tells the caller whether the fallback is still
+                             ;; needed.
+                             (when (and pkg
+                                        (not (member pkg packages))
+                                        (%package-has-zebra-tests-p pkg))
+                               (push pkg packages)
+                               t))
+                           (walk (name)
+                             (when (and (stringp name)
+                                        (not (gethash name visited))
+                                        (equal primary
+                                               (ignore-errors
+                                                 (asdf:primary-system-name name))))
+                               (setf (gethash name visited) t)
+                               (let ((stated (%declared-test-packages name)))
+                                 (if stated
+                                     (mapc #'keep stated)
+                                     (unless (keep (find-package
+                                                    (string-upcase name)))
+                                       (dolist (pkg (%system-source-packages name))
+                                         (keep pkg)))))
+                               (let ((sys (ignore-errors (asdf:find-system name nil))))
+                                 (when sys
+                                   (dolist (dep (ignore-errors
+                                                  (asdf:system-depends-on sys)))
+                                     (let ((dep-name (if (consp dep) (second dep) dep)))
+                                       (when (stringp dep-name)
+                                         (walk dep-name)))))))))
+                    (walk system-name)))
+                (nreverse packages)))))))
 
 (defun %run-zebra-tests (system-name)
   "Run tests using Zebra for SYSTEM-NAME and return the uniform envelope.
