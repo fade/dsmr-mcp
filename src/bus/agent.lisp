@@ -37,6 +37,9 @@
            #:agent-publish #:agent-receive #:agent-receive-detailed
            #:*direct-addressing-enabled* #:direct-addressing-enabled-p
            #:direct-addressing-disabled #:direct-addressing-disabled-addressee
+           #:known-participant-ids #:resolve-recipient
+           #:unresolvable-recipient #:unresolvable-recipient-name
+           #:unresolvable-recipient-matches #:unresolvable-recipient-candidates
            #:delivery #:delivery-author #:delivery-author-id #:delivery-text
            #:agent-status
            #:agent-skip-to-head))
@@ -160,33 +163,181 @@
     instead would put something its sender believed was private in front of the
     entire fleet, and the sender would have no way to tell it had happened."))
 
-(defun agent-publish (agent message &key to)
-  "Put MESSAGE (string) on the bus and return the EXACT broker-assigned seq
-   of this message (an integer, or NIL when it could not be matched within the
-   bound). The message embeds this agent's stable self-id so the agent's OWN
-   receive filters it back out — the agent never gets its own message returned to
-   it, with NO cursor manipulation and so no risk of skipping a foreign message.
-   The correlation-id match (not WAL position) is what disambiguates a concurrent
-   foreign publisher's record. PUBLISH defaults the read-back scan floor to the
-   WAL's current highest seq; that floor only BOUNDS the rescan window — its cost
-   scales with how much bus traffic accrues above the floor while waiting for the
-   id to appear, not with correctness.
+(defun known-participant-ids (paths)
+  "The bus ids the bus at PATHS holds a record of, as (VALUES KNOWN ENROLLED).
 
-   TO names one participant by its full bus id, and only that participant is
-   handed the message. The record still goes to the fleet's own log and every
-   member's cursor still advances over it; what changes is who is shown it. An
-   addressed message is therefore filtered, not private.
+   KNOWN is every identity the bus has any record of at all, deduplicated and
+   sorted; ENROLLED is the subset a leader has written on the roster. Two records
+   are read because neither alone is complete. A cursor file appears the moment a
+   participant subscribes, so it covers everyone that has actually joined,
+   enrolled or not. A roster entry is written by a leader, so it covers an agent
+   listed ahead of its first connect and one that has since left; a departed agent
+   is still an identity that existed, and its cursor is held rather than deleted,
+   so naming it is a message arriving late rather than a name that means nothing.
+
+   The two are returned separately because they answer different questions. What
+   a bare name may resolve to is KNOWN: anything the bus has carried is a real
+   destination. What a refusal should read out is ENROLLED where there is one,
+   because the cursor directory also holds one file per ephemeral subagent session
+   and those names outnumber the fleet's own by a wide margin, so a list drawn
+   from it buries the names an operator could plausibly have meant.
+
+   Nothing here signals. A directory that cannot be scanned contributes nothing
+   and the other still answers, because a refusal caused by an unreadable
+   directory would be indistinguishable from one caused by a name that was
+   genuinely wrong, and the two want opposite responses from the caller."
+  (let ((cursor-ids '())
+        (roster-ids '()))
+    (ignore-errors
+     (dolist (file (uiop:directory-files (broker:bus-paths-cursors-dir paths)))
+       (let ((id (bus:decode-id (file-namestring file))))
+         (when (and id (find #\/ id))
+           (push id cursor-ids)))))
+    (ignore-errors
+     (dolist (entry (roster:members (broker:bus-paths-roster-dir paths)))
+       (let ((id (roster:entry-id entry)))
+         (when (and (stringp id) (find #\/ id))
+           (push id roster-ids)))))
+    (values (sort (remove-duplicates (append cursor-ids roster-ids)
+                                     :test #'string=)
+                  #'string<)
+            (sort (remove-duplicates roster-ids :test #'string=) #'string<))))
+
+(defun %name-listing (ids &key (limit 24))
+  "The bare names in IDS as one readable phrase, deduplicated, sorted and bounded.
+
+   The bound counts what it leaves out rather than dropping it in silence, so a
+   caller reading a short list can tell whether it is the whole set."
+  (let* ((names (sort (remove-duplicates
+                       (loop for id in ids
+                             for name = (nth-value 1 (bus:split-agent-id id))
+                             when (and name (plusp (length name)))
+                               collect name)
+                       :test #'string=)
+                      #'string<))
+         (shown (if (> (length names) limit) (subseq names 0 limit) names))
+         (hidden (- (length names) (length shown))))
+    (cond ((null names) "none")
+          ((plusp hidden) (format nil "~{~A~^, ~}, and ~D more" shown hidden))
+          (t (format nil "~{~A~^, ~}" shown)))))
+
+(define-condition unresolvable-recipient (error)
+  ((name :initarg :name :initform nil :reader unresolvable-recipient-name)
+   (matches :initarg :matches :initform nil
+            :reader unresolvable-recipient-matches)
+   (candidates :initarg :candidates :initform nil
+               :reader unresolvable-recipient-candidates))
+  (:report (lambda (condition stream)
+             (let ((name (unresolvable-recipient-name condition))
+                   (matches (unresolvable-recipient-matches condition)))
+               (if matches
+                   (format stream
+                           "the bare name ~S is held by ~D participants on this ~
+                            bus, so nothing was published and none of them was ~
+                            handed anything: ~{~A~^, ~}. Name the one you mean ~
+                            by its full NAMESPACE/NAME id."
+                           name (length matches) matches)
+                   (format stream
+                           "no participant on this bus answers to the bare name ~
+                            ~S, so nothing was published. Names considered: ~A. ~
+                            Pass a full NAMESPACE/NAME id to address an agent ~
+                            that has not joined yet."
+                           name
+                           (%name-listing
+                            (unresolvable-recipient-candidates condition)))))))
+  (:documentation
+   "Signalled when a bare recipient name cannot be placed on the bus, either
+    because nothing answers to it or because more than one participant does.
+
+    Nothing is published. Refusing is the whole point, and what it replaces is
+    the reason this exists: a bare name qualified with the SENDER's own namespace
+    yields a well-formed id that may belong to no participant at all, addressed
+    delivery then filters the record to that id, and the message is written
+    durably to the log and handed to nobody while the publish reports a sequence
+    number and success. A fleet spans repositories, so the agent a bare name
+    means usually lives under some other project root, and that is exactly the
+    case the old arithmetic got wrong."))
+
+(defun resolve-recipient (agent recipient)
+  "RECIPIENT as the full bus id a message should be addressed to.
+
+   A value carrying a separator is already a full NAMESPACE/NAME id and is passed
+   through exactly as given. That keeps a caller holding a sister's id naming it
+   directly, and keeps an agent that has not joined yet addressable: a caller
+   that spells an identity out in full has said which one it means, and there is
+   nothing left to guess.
+
+   A bare name is resolved against the participants THIS BUS knows, never against
+   the sender's own namespace. Exactly one match is the recipient; none and
+   several both signal UNRESOLVABLE-RECIPIENT, which reads out what it weighed.
+
+   Resolving against the bus is the whole correction. A fleet spans
+   repositories, so the sister a bare name means usually lives under a different
+   project root; joining that name to the SENDER's namespace produced a
+   well-formed id that no participant had ever answered to, and because addressed
+   delivery filters to the named id, every message so addressed was appended to
+   the log and handed to nobody while the publish returned a sequence number.
+
+   Ambiguity is refused rather than settled by preferring the sender's own
+   namespace. Two repositories may each run an agent by the same name and both be
+   reachable on one bus; the sender's neighbour is not reliably the one that was
+   meant, and a tie broken quietly in its favour is how a message to the other
+   one goes missing with nobody told."
+  (if (find #\/ recipient)
+      recipient
+      (multiple-value-bind (known enrolled)
+          (known-participant-ids (agent-paths agent))
+        (let ((matches (remove-if-not
+                        (lambda (id)
+                          (string= recipient
+                                   (nth-value 1 (bus:split-agent-id id))))
+                        known)))
+          (if (= 1 (length matches))
+              (first matches)
+              (error 'unresolvable-recipient
+                     :name recipient
+                     :matches matches
+                     :candidates (or enrolled known)))))))
+
+(defun agent-publish (agent message &key to)
+  "Put MESSAGE (string) on the bus and return (VALUES SEQ RECIPIENT). SEQ is the
+   EXACT broker-assigned seq of this message (an integer, or NIL when it could not
+   be matched within the bound). RECIPIENT is the full bus id the message was
+   addressed to, or NIL for a broadcast. The message embeds this agent's stable
+   self-id so the agent's OWN receive filters it back out, so the agent never gets
+   its own message returned to it, with NO cursor manipulation and so no risk of
+   skipping a foreign message. The correlation-id match (not WAL position) is what
+   disambiguates a concurrent foreign publisher's record. PUBLISH defaults the
+   read-back scan floor to the WAL's current highest seq; that floor only BOUNDS
+   the rescan window: its cost scales with how much bus traffic accrues above the
+   floor while waiting for the id to appear, not with correctness.
+
+   TO names one participant, either by its full NAMESPACE/NAME bus id or by the
+   bare name it answers to on this bus, and only that participant is handed the
+   message. A bare name is placed by RESOLVE-RECIPIENT against the participants
+   the bus knows; one that matches nothing, or matches several, signals
+   UNRESOLVABLE-RECIPIENT and publishes nothing. The id actually addressed comes
+   back as the second value, because a caller reporting who it reached has to
+   report the identity rather than the name it was handed.
+
+   The record still goes to the fleet's own log and every member's cursor still
+   advances over it; what changes is who is shown it. An addressed message is
+   therefore filtered, not private.
 
    Naming a recipient while direct addressing is off signals
-   DIRECT-ADDRESSING-DISABLED and publishes nothing. It does not fall back to a
-   broadcast, because a message its sender believed had one reader arriving in
-   front of the whole fleet is a worse outcome than a refusal the sender can
-   read."
+   DIRECT-ADDRESSING-DISABLED and publishes nothing. That check runs before the
+   name is placed, so the refusal a caller meets in the configuration this project
+   ships is always the one that says how to turn the capability on. Neither
+   refusal falls back to a broadcast, because a message its sender believed had
+   one reader arriving in front of the whole fleet is a worse outcome than a
+   refusal the sender can read."
   (when (and to (not (direct-addressing-enabled-p)))
     (error 'direct-addressing-disabled :addressee to))
-  (bus:publish (agent-client agent) message
-               :self-id (agent-id agent)
-               :to to))
+  (let ((recipient (and to (resolve-recipient agent to))))
+    (values (bus:publish (agent-client agent) message
+                         :self-id (agent-id agent)
+                         :to recipient)
+            recipient)))
 
 (defun agent-receive-detailed (agent &key (timeout-ms 0)
                                          (limit bus:+default-batch-size+))

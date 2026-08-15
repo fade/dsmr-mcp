@@ -361,3 +361,93 @@ while the call reported success."
       (is = 0 (%field (%receive session "agent_id" "named" "timeout_ms" 0)
                       "count")
           "a refused call publishes nothing"))))
+
+(defmacro with-foreign-participant ((var name) &body body)
+  "Bind VAR to a participant joined to the SAME bus under a namespace of its own,
+   standing in for a sister agent living in another repository.
+
+   Its namespace is a fresh temp directory, so it can never collide with the
+   session's own root, and it is disconnected and removed on the way out. This is
+   the shape the defect took in the field: the agent a leader named by bare name
+   lived in a different repository, and qualifying that name with the SENDER's
+   namespace produced an id no participant had ever answered to."
+  (let ((ns (gensym "NS")))
+    `(let* ((,ns (%make-temp-directory))
+            (,var (agent:connect-agent (namestring ,ns) :name ,name)))
+       (unwind-protect (progn ,@body)
+         (ignore-errors (agent:disconnect-agent ,var))
+         (ignore-errors (uiop:delete-directory-tree
+                         ,ns :validate t :if-does-not-exist :ignore))))))
+
+(define-test a-bare-name-reaches-the-participant-that-actually-holds-it
+  "The failure this exists to stop. A sister agent lives in another repository, so
+its namespace is not the sender's. Naming it by the name it answers to has to
+reach it: the recipient a bare name resolves to is decided by who is on the bus,
+never by where the sender happens to live."
+  (with-three-participants (session sender named bystander)
+    (declare (ignore sender named bystander))
+    (with-foreign-participant (sister "boomer")
+      (with-direct-addressing (t)
+        (let ((sent (%publish session "message" "clean up that test suite"
+                              "agent_id" "sender" "to" "boomer")))
+          (true (%field sent "published")
+                "the publish succeeds")
+          (is string= (agent:agent-id sister) (%field sent "to")
+              "and reports the sister's REAL id, not one built from the sender's \
+namespace"))
+        (is equal '("clean up that test suite")
+            (agent:agent-receive sister :timeout-ms 500)
+            "the sister in the other repository is handed the message")))))
+
+(define-test a-bare-name-nobody-answers-to-is-refused-rather-than-published
+  "A bare name that matches no participant this bus has ever carried must not be
+turned into an id and published to. Qualifying it produces a well-formed id with
+no cursor behind it, addressed delivery then filters the record to that id, and
+the message reaches nobody while the reply reports a seq and success.
+
+The refusal names what it considered, so the caller can see the spelling it
+should have used instead of guessing again."
+  (with-three-participants (session sender named bystander)
+    (declare (ignore sender named bystander))
+    (with-direct-addressing (t)
+      (let ((refused (%publish session "message" "into the void"
+                               "agent_id" "sender" "to" "nobody-answers-to-this")))
+        (is string= "unresolvable-recipient" (%error-type refused)
+            "the refusal has a type of its own so a caller can branch on it")
+        (false (%field refused "published")
+               "nothing reports itself as published")
+        (false (integerp (%field refused "seq"))
+               "and no seq comes back, because nothing reached the log")
+        (let ((text (%content-text refused)))
+          (true (search "nobody-answers-to-this" text)
+                "the refusal quotes the name it could not place")
+          (true (search "named" text)
+                "and names the participants it considered")
+          (true (search "bystander" text))))
+      (is = 0 (%field (%receive session "agent_id" "named" "timeout_ms" 0)
+                      "count")
+          "a refused call publishes nothing"))))
+
+(define-test a-bare-name-two-participants-answer-to-is-refused
+  "Two repositories may each run an agent called by the same name, and on one bus
+both are reachable. A bare name then picks out two identities and the verb cannot
+know which was meant, so it refuses and lists both full ids. Silently preferring
+the sender's own namespace is what produced the phantom in the first place."
+  (with-three-participants (session sender named bystander)
+    (declare (ignore sender named bystander))
+    (with-foreign-participant (twin "named")
+      (with-direct-addressing (t)
+        (let ((refused (%publish session "message" "which one of you"
+                                 "agent_id" "sender" "to" "named")))
+          (is string= "unresolvable-recipient" (%error-type refused)
+              "an ambiguous bare name is refused, not resolved by proximity")
+          (false (%field refused "published"))
+          (let ((text (%content-text refused)))
+            (true (search (%qualified session "named") text)
+                  "both candidates are named in full: the one here")
+            (true (search (agent:agent-id twin) text)
+                  "and the one in the other repository")))
+        (is = 0 (%field (%receive session "agent_id" "named" "timeout_ms" 0)
+                        "count")
+            "and neither of them is handed anything")
+        (is equal '() (agent:agent-receive twin :timeout-ms 0))))))
