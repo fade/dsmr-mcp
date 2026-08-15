@@ -47,3 +47,13 @@
     (true (search "SLYNK_PORT" envrc) ".envrc missing SLYNK_PORT")
     (true (search "DSMR_SLYNK_ATTACH" envrc) ".envrc missing DSMR_SLYNK_ATTACH")
     (true (search "LISP_WORKSPACE" envrc) ".envrc missing LISP_WORKSPACE")))
+
+(define-test envrc-declares-direct-addressing
+  "A freshly scaffolded project's .envrc turns direct addressing on, so the
+project's agent can answer one named recipient from its first run instead of
+broadcasting every reply to the whole fleet. The defaulting form is what leaves
+an operator who exports 0 in charge of the setting."
+  (let ((envrc (%manifest-envrc)))
+    (true (search "export DSMR_BUS_DIRECT_ADDRESSING=\"${DSMR_BUS_DIRECT_ADDRESSING:-1}\""
+                  envrc)
+          ".envrc does not declare DSMR_BUS_DIRECT_ADDRESSING in defaulting form")))
