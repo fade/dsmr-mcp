@@ -29,7 +29,7 @@ from the roster still reaches the bus, publishes on it, and receives from it.
 Enrollment records intent; it enforces nothing and proves nothing about who is
 connected. **Never conclude a sister is up because it is on the roster, and never
 conclude it is unreachable because it is not.** Liveness is
-`dsmr-bus-watch --check-live`, run per bus, and nothing else.
+`~/.local/bin/dsmr-bus-watch --check-live`, run per bus, and nothing else.
 
 ## What isolation actually is
 
@@ -154,7 +154,7 @@ same value. The flag exists precisely so the line an operator reads names the bu
 it arms on:
 
 ```
-while true; do dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
+while true; do ~/.local/bin/dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
   --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/ \
   || echo "error:watch-crashed rc=$?"; sleep 1;
 done | grep --line-buffered -E "^(bus|error):"
@@ -163,7 +163,7 @@ done | grep --line-buffered -E "^(bus|error):"
 ⛔ **Print the loop, never the bare watcher.** `--stream` exits 0 on its idle
 window deliberately, because that exit is the self-heal that re-arms a watch
 which has gone silently deaf. The Monitor tool ends a watch when its command
-exits, so a sister handed a bare `dsmr-bus-watch --stream` goes deaf at the first
+exits, so a sister handed a bare `~/.local/bin/dsmr-bus-watch --stream` goes deaf at the first
 idle mark while believing it is armed. The `while true` loop turns that exit into
 a re-arm; the `grep` keeps `recycle:` off the sister's context.
 
@@ -172,7 +172,7 @@ Each sister arms that in **its own session**, through the Monitor tool with
 not an arm. Then it confirms:
 
 ```
-dsmr-bus-watch --check-live --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
+~/.local/bin/dsmr-bus-watch --check-live --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
 ```
 
 and must see **both** `live` **and** `bus=<tag>` before going silent.
