@@ -29,6 +29,8 @@
   (:import-from #:dsmr-mcp/src/test-runner-engine
                 #:%resolve-test-packages
                 #:%system-source-packages
+                #:%system-declared-test-packages
+                #:%declared-test-packages
                 #:%detect-from-asdf-deps
                 #:%ensure-system-loaded
                 #:%dependency-system-name
@@ -718,6 +720,129 @@ suites in dsmr-scratch-runner-tests, which must never join a project run."
       (dolist (name '("DSMR-SCRATCH-DIVERGENT-SUITE"
                       "DSMR-SCRATCH-DIVERGENT/TESTS/LEAF"
                       "DSMR-SCRATCH-DIVERGENT-ASIDE"))
+        (let ((pkg (find-package name)))
+          (when pkg
+            (ignore-errors (zebra:remove-all-tests-in-package pkg))
+            (ignore-errors (delete-package pkg)))))
+      (ignore-errors (uiop:delete-directory-tree
+                      dir :validate t :if-does-not-exist :ignore)))))
+
+(define-test resolver-honours-a-declared-test-suite
+  "A system that states what its test run is, through :perform (test-op ...),
+is believed, and that statement is consulted ahead of any inference drawn
+from names.
+
+The inference it displaces is a guess about spelling. A subsystem naming a
+package after itself is following the convention, so every other package its
+files declare is treated as a deliberate aside and left out. The guess
+collapses when the two spellings differ by convention rather than by intent,
+as when a system named with a slash owns a package named with a dot: nothing
+is named after the system, the file scan fires, and a quarantine package
+sitting beside the real suite joins the run. The verb then reports failures
+the project never counted as its own.
+
+Both halves are pinned here. A declaring system resolves to exactly the
+package it declared. An otherwise identical system over the same file, with
+no declaration, resolves to both packages, which is what shows the excluded
+one was reachable and was excluded rather than merely absent. Both spellings
+of the declaration are read: the qualified call, and the indirection through
+uiop:symbol-call that a definition uses to avoid naming a framework it only
+loads at test time. Finally, a declaration pointing at a package that holds
+no registered tests is not believed either, because an empty run reported as
+a pass is worse than no answer at all, and resolution falls back to inference
+as though nothing had been declared."
+  (let* ((stamp (format nil "~D" (get-universal-time)))
+         (dir (merge-pathnames (format nil "dsmr-declared-probe-~A/" stamp)
+                               (uiop:temporary-directory)))
+         (asd (merge-pathnames "dsmr-scratch-declared.asd" dir))
+         (systems '("dsmr-scratch-declared/tests"
+                    "dsmr-scratch-declared/undeclared"
+                    "dsmr-scratch-declared/qualified"
+                    "dsmr-scratch-declared/stale"))
+         (packages '("DSMR-SCRATCH-DECLARED.SUITE"
+                     "DSMR-SCRATCH-DECLARED.SUBJECT"
+                     "DSMR-SCRATCH-DECLARED.EMPTY")))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist dir)
+           ;; One source file declaring a suite, a quarantined subject beside
+           ;; it, and a package that will hold no tests at all. No package is
+           ;; named after any of the systems below, which is the shape that
+           ;; defeats the name guess.
+           (with-open-file (s (merge-pathnames "suite.lisp" dir)
+                              :direction :output :if-exists :supersede)
+             (write-line "(defpackage #:dsmr-scratch-declared.suite (:use #:cl))" s)
+             (write-line "(defpackage #:dsmr-scratch-declared.subject (:use #:cl))" s)
+             (write-line "(defpackage #:dsmr-scratch-declared.empty (:use #:cl))" s))
+           ;; Four systems over that one file: one declaring its suite, one
+           ;; declaring nothing (the control), one declaring the same suite
+           ;; through the qualified call, one declaring a suite that is empty.
+           ;; A real .asd on disk, because the declaration is recovered from
+           ;; the source file ASDF records for the system.
+           (with-open-file (s asd :direction :output :if-exists :supersede)
+             (write-line "(asdf:defsystem \"dsmr-scratch-declared/tests\"" s)
+             (write-line "  :components ((:file \"suite\"))" s)
+             (write-line "  :perform (test-op (op c)" s)
+             (write-line "             (uiop:symbol-call :zebra :test :dsmr-scratch-declared.suite)))" s)
+             (write-line "(asdf:defsystem \"dsmr-scratch-declared/undeclared\"" s)
+             (write-line "  :components ((:file \"suite\")))" s)
+             (write-line "(asdf:defsystem \"dsmr-scratch-declared/qualified\"" s)
+             (write-line "  :components ((:file \"suite\"))" s)
+             (write-line "  :perform (test-op (op c)" s)
+             (write-line "             (zebra:test :dsmr-scratch-declared.suite :report :quiet)))" s)
+             (write-line "(asdf:defsystem \"dsmr-scratch-declared/stale\"" s)
+             (write-line "  :components ((:file \"suite\"))" s)
+             (write-line "  :perform (test-op (op c)" s)
+             (write-line "             (uiop:symbol-call :zebra :test :dsmr-scratch-declared.empty)))" s))
+           (asdf:load-asd asd)
+           ;; The suite and the subject both hold a test, so anything left out
+           ;; is left out by the resolver, not by absence. The third package
+           ;; deliberately holds none.
+           (dolist (name '("DSMR-SCRATCH-DECLARED.SUITE"
+                           "DSMR-SCRATCH-DECLARED.SUBJECT"))
+             (unless (find-package name)
+               (make-package name :use '("COMMON-LISP")))
+             (let ((*package* (find-package name)))
+               (eval (read-from-string
+                      "(zebra:define-test declared-scratch-probe (zebra:true t))"))))
+           (unless (find-package "DSMR-SCRATCH-DECLARED.EMPTY")
+             (make-package "DSMR-SCRATCH-DECLARED.EMPTY" :use '("COMMON-LISP")))
+           ;; The declaration is read out of the .asd, and it names one package.
+           (is equal '("DSMR-SCRATCH-DECLARED.SUITE")
+               (mapcar #'package-name
+                       (%system-declared-test-packages "dsmr-scratch-declared/tests")))
+           ;; And it settles the run: the aside beside the suite stays out.
+           (is equal '("DSMR-SCRATCH-DECLARED.SUITE")
+               (mapcar #'package-name
+                       (%resolve-test-packages "dsmr-scratch-declared/tests")))
+           ;; The qualified spelling of the same declaration reads the same.
+           (is equal '("DSMR-SCRATCH-DECLARED.SUITE")
+               (mapcar #'package-name
+                       (%resolve-test-packages "dsmr-scratch-declared/qualified")))
+           ;; Control: same file, no declaration. Inference reaches BOTH
+           ;; packages, which is what the declaration is excluding above.
+           (let ((inferred (mapcar #'package-name
+                                   (%resolve-test-packages
+                                    "dsmr-scratch-declared/undeclared"))))
+             (true (member "DSMR-SCRATCH-DECLARED.SUITE" inferred :test #'string=))
+             (true (member "DSMR-SCRATCH-DECLARED.SUBJECT" inferred :test #'string=)))
+           ;; A declaration naming a package with no registered tests is read
+           ;; but not believed, so it cannot pass off an empty run as success.
+           (is equal '("DSMR-SCRATCH-DECLARED.EMPTY")
+               (mapcar #'package-name
+                       (%system-declared-test-packages "dsmr-scratch-declared/stale")))
+           (false (%declared-test-packages "dsmr-scratch-declared/stale"))
+           (let ((fallen-back (mapcar #'package-name
+                                      (%resolve-test-packages
+                                       "dsmr-scratch-declared/stale"))))
+             (true (member "DSMR-SCRATCH-DECLARED.SUITE" fallen-back :test #'string=))
+             (false (member "DSMR-SCRATCH-DECLARED.EMPTY" fallen-back :test #'string=)))
+           ;; A system that declares nothing yields nothing here, which is what
+           ;; keeps every project without a declaration on the old path.
+           (false (%system-declared-test-packages "dsmr-scratch-declared/undeclared")))
+      (dolist (name systems)
+        (ignore-errors (asdf:clear-system name)))
+      (dolist (name packages)
         (let ((pkg (find-package name)))
           (when pkg
             (ignore-errors (zebra:remove-all-tests-in-package pkg))
