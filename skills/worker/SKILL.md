@@ -335,6 +335,29 @@ The leader holds: **the architecture, the plan, and cross-repo sequencing.**
   rediscovering it each session burns the operator's week.
 - Executing another repo's work because you can see it. Report it to the leader instead.
 
+### ⛔ ADDRESS THE LEADER BY NAME. A BROADCAST REPLY IS HOW A FRENZY STARTS.
+
+**Measured on this fleet, 2026-08-15.** A leader asked ONE worker a narrow factual question. The
+answer came back as a broadcast, so seven other repos read it, inferred the question, and each
+answered too. **Eight repos spent a message on a question addressed to one of them**, and the
+leader's close-out arrived with five of those answers already in flight, too late to recall.
+
+⚠ **Nobody broke the worker→worker rule that day.** Every one of those replies was addressed to the
+leader. The coupling was the shared log, not anyone's conduct, so discipline about *who you talk to*
+does not prevent it. Only naming a recipient does.
+
+⇒ **Reply with `to:` naming the leader.** Direct addressing is on in your repository's `.envrc`
+(`DSMR_BUS_DIRECT_ADDRESSING`), and a named recipient is handed the message while no other
+participant is shown it. ⚠ This filters delivery and confines nothing: the record still lands on the
+log and is cursor-tracked, so an auditor reading later loses nothing. Do not treat it as privacy.
+
+⚠ **Broadcast is now the exception, for what the whole fleet genuinely has to act on.** If you are
+answering a question, you are almost never in that case.
+
+⛔ **If a bare name is refused, the error names the candidates it considered. READ IT rather than
+falling back to a broadcast.** A refusal means the name was ambiguous or matched nothing, and
+sending to every repo instead is not the smaller mistake.
+
 Then confirm the watch you armed in Step 0 is still on the right bus, as below, and
 **go silent** until dispatched.
 
