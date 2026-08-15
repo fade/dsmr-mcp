@@ -209,21 +209,18 @@ Red until Wave-3 bridge-code-actions is implemented."
 ;;; ---------------------------------------------------------------------------
 
 (define-test diagnostics-degrades-to-eclector-when-unavailable
-  "When alive-lsp is unreachable, bridge-diagnostics (or its degraded entry
-point degraded-diagnostics) returns a hash-table with degraded=T and
-degraded_reason='lsp-unavailable'.  The messages list uses the Eclector
-paren/reader check.  For an unbalanced-paren form, at least one message
-is returned.
-This test exercises the in-process Eclector path which exists at Wave 0 via
-validate.lisp; only the bridge wrapper is missing."
-  ;; Validate that scan-parens is available (it is, as validate.lisp is loaded).
-  (let ((bad-lisp "(defun foo (x) (+ x 1)"))  ; unbalanced — missing closing )
+  "When alive-lsp is unreachable, degraded-diagnostics returns a hash-table with
+degraded=T and degraded_reason='lsp-unavailable'.  The messages list comes from
+the in-process Eclector paren/reader check, so an unbalanced form still yields
+at least one message.
+The Eclector path is exercised directly first, so a failure says whether the
+check itself broke or only the degraded wrapper around it did."
+  (let ((bad-lisp "(defun foo (x) (+ x 1)"))  ; unbalanced, missing closing )
     ;; Check scan-parens directly to confirm the Eclector path works.
     (let ((paren-result (scan-parens bad-lisp :base-offset 0)))
       (true paren-result)
       ;; scan-parens returns a plist; :ok should be NIL for the unbalanced form.
       (false (getf paren-result :ok)))
-    ;; When the Wave-3 bridge is loaded, verify the full degraded response shape.
     (let ((degraded-sym (%bridge-sym "DEGRADED-DIAGNOSTICS")))
       (if (and degraded-sym (fboundp degraded-sym))
           (let ((result (funcall degraded-sym bad-lisp)))
@@ -231,9 +228,7 @@ validate.lisp; only the bridge wrapper is missing."
             (true (gethash "degraded" result))
             (is equal "lsp-unavailable" (gethash "degraded_reason" result))
             (true (gethash "messages" result)))
-          ;; Wave 0: the bridge doesn't exist yet, so the Eclector part passes
-          ;; but the wrapper assertion is deferred.
-          (true t)))))
+          (fail "DEGRADED-DIAGNOSTICS not defined in dsmr-mcp/src/lsp/bridge.")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; LSP-04: unavailable alive-lsp returns lsp-unavailable error for non-diag verbs

@@ -68,7 +68,7 @@ the bus log either way.
       "type": "string"
     },
     "to": {
-      "description": "Optional recipient, either a full \nNAMESPACE/NAME bus id or a bare name in this project's namespace. Only that one \nparticipant is handed the message; no other member of the bus is shown it. This \nis NOT privacy: the record still travels on the fleet's shared log and any \nmember can read it there, so naming a recipient filters delivery and does not \nconfine the text. Direct addressing is off unless the repository that needs it \nsets DSMR_BUS_DIRECT_ADDRESSING to 1; naming a recipient while it is off \npublishes nothing and returns an error saying so. Omit to broadcast.",
+      "description": "Optional recipient, either a full \nNAMESPACE/NAME bus id or the bare name of a participant already on this bus. A \nbare name is matched against the participants the bus knows, whichever \nrepository they live in, so a sister is named by the name it answers to; a name \nthat matches nothing, or that two participants answer to, publishes nothing and \nreturns an error listing what was considered. Only the named participant is \nhanded the message; no other member of the bus is shown it. This is NOT privacy: \nthe record still travels on the fleet's shared log and any member can read it \nthere, so naming a recipient filters delivery and does not confine the text. \nDirect addressing is off unless the repository that needs it sets \nDSMR_BUS_DIRECT_ADDRESSING to 1; naming a recipient while it is off publishes \nnothing and returns an error saying so. Omit to broadcast.",
       "type": "string"
     }
   },

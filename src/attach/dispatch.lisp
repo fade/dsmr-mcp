@@ -81,11 +81,22 @@
 
 (defparameter *attach-call-lock*
   (bordeaux-threads:make-lock "attach-call-lock")
-  "Process-wide lock serialising attached-mode tool-handle calls.
-Held for the duration of every bounded-slime-eval when *attach-concurrency*
-is :serialised (the default).  Sessions operating in :parallel mode never
-acquire this lock.  Hermetic mode is unaffected; hermetic workers run in
-separate processes and are session-affined.")
+  "Process-wide lock serialising repl-eval's attached dispatch, and only that.
+
+Acquired by with-serialised-attach-call, which is invoked from exactly one
+production site: the with-attach-dispatch wrapper around repl-eval's attached
+dispatch.  So this lock covers repl-eval and nothing else.  Sessions operating
+in :parallel mode never acquire it.
+
+The other tools that evaluate in the attached image (code-describe, code-find,
+code-find-references, inspect-condition, inspect-object, inspect-restart,
+inspect-thread, load-system, run-tests) take the per-session
+repl-eval-tool-call-lock instead.  That is a different guarantee: a per-session
+lock orders one session's round trips on its own connection, and cannot keep
+another session out of the image.
+
+Hermetic mode is unaffected; hermetic workers run in separate processes and are
+session-affined.")
 
 (defparameter *attach-waiters-lock*
   (bordeaux-threads:make-lock "attach-waiters-lock")
@@ -105,13 +116,17 @@ in the unwind-protect cleanup.  Protected by *attach-waiters-lock*.")
 
 (defparameter *attach-concurrency*
   :serialised
-  "Concurrency policy for attached-mode tool calls.
-:SERIALISED (default) — *attach-call-lock* is held around every
-  bounded-slime-eval so concurrent sessions take turns inside the developer's
-  live image, preventing interleaved eval state.
-:PARALLEL — lock is never acquired; concurrent sessions may race inside the
+  "Concurrency policy for repl-eval's attached dispatch.
+:SERIALISED (default): *attach-call-lock* is held around repl-eval's
+  bounded-slime-eval, so concurrent sessions take turns inside the developer's
+  live image and their eval state does not interleave.
+:PARALLEL: the lock is never acquired; concurrent sessions may race inside the
   image.  Only set this when you know the agents are read-mostly and will not
   corrupt shared image state.
+The policy reaches repl-eval only.  Every other attached tool orders its calls
+on its own session's repl-eval-tool-call-lock and is unaffected by this
+setting, so even under :SERIALISED two sessions can be evaluating in the image
+at once as long as neither of them is running repl-eval.
 Set once at startup from DSMR_ATTACH_CONCURRENCY; never toggled at runtime.")
 
 ;;; Concurrency env-var parser ------------------------------------------------
@@ -557,10 +572,17 @@ Otherwise evaluate BODY.
 ID is the JSON-RPC request id. TOOL must be the repl-eval-tool instance.
 PARAMS is the equal-keyed argument hash-table from the tools/call request.
 
-The with-serialised-attach-call wrapper ensures all attached tool calls
-observe *attach-concurrency* policy: sessions serialise through
-*attach-call-lock* by default, giving each session exclusive access to
-the developer's live image for the duration of the eval."
+The with-serialised-attach-call wrapper applies *attach-concurrency* policy to
+the calls that route through this macro, and repl-eval is the only one.  Under
+the default :SERIALISED policy a repl-eval holds *attach-call-lock* for the
+duration of its eval, so no other repl-eval is inside the developer's live
+image at the same time.
+
+Tools that reach the image without going through here order their calls on
+their own session's repl-eval-tool-call-lock, and never enter *attach-waiters*
+or set *attach-holder-session-id*.  The waiter list is therefore a picture of
+the locked path rather than of everyone in the image, and a caller queued
+behind one of those tools gets no queued notification."
   (let ((tool-sym    (gensym "TOOL"))
         (id-sym      (gensym "ID"))
         (params-sym  (gensym "PARAMS"))
