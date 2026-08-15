@@ -55,6 +55,7 @@ variable.
 | =DSMR_RELATED_PROJECTS=        | Colon-separated re-root whitelist for the filesystem sandbox       | unset (nil)      | =src/tools/fs-set-project-root.lisp= |
 | =DSMR_BUS_AGENT=               | Stable [[file:coordination-bus.org][coordination-bus]] identity for this project's main agent | project dir name (via =.envrc=) | =src/tools/bus-helpers.lisp= |
 | =DSMR_BUS_SELECTOR=            | Which [[file:bus-segmentation.org][bus]] this repo joins; unset means the shared host-wide bus | unset (via =.envrc=) | =src/bus/selector.lisp= |
+| =DSMR_BUS_DIRECT_ADDRESSING=   | Lets a publish name one recipient instead of broadcasting          | off in code; =1= via =.envrc= | =src/bus/agent.lisp= |
 | =XDG_STATE_HOME=               | Roots the coordination-bus state directory (=.../dsmr-mcp/bus/=)   | =~/.local/state= | =src/bus/broker.lisp=              |
 | =DSMR_MCP_HOST=                | stdio<->TCP bridge target host (when =--host= is absent)          | =127.0.0.1=      | =scripts/stdio-tcp-bridge.lisp=    |
 | =DSMR_MCP_PORT=                | stdio<->TCP bridge target port (when =--port= is absent)          | from argv        | =scripts/stdio-tcp-bridge.lisp=    |
@@ -119,6 +120,12 @@ export DSMR_BUS_AGENT="${DSMR_BUS_AGENT:-$(basename "$PWD")}"
 # Set it to the fleet tag the leader named to join that fleet's private bus.
 export DSMR_BUS_SELECTOR="${DSMR_BUS_SELECTOR:-}"
 
+# Whether this project's agent may publish to one named recipient instead of
+# broadcasting to every participant. On, so this project can answer whoever
+# asked it, by name, from its first run; export DSMR_BUS_DIRECT_ADDRESSING=0
+# before direnv loads to go back to broadcast only.
+export DSMR_BUS_DIRECT_ADDRESSING="${DSMR_BUS_DIRECT_ADDRESSING:-1}"
+
 # Sibling projects this one may re-root into (filesystem sandbox whitelist):
 # export DSMR_RELATED_PROJECTS="$HOME/SourceCode/lisp/cl-mcp:$HOME/SourceCode/lisp/eve-quant"
 #+end_src
@@ -149,6 +156,18 @@ adding the stanza everywhere puts nobody on anybody else's bus; a fleet moves
 only when its tag is filled in. The MCP session and any watcher armed from this
 directory read the same variable, which is what keeps them on one bus instead of
 drifting apart while both report success.
+
+The =DSMR_BUS_DIRECT_ADDRESSING= line decides whether this repository's agent
+may publish to one named recipient. The capability is off in the code, so a
+repository whose =.envrc= does not carry the line has it off: naming a recipient
+publishes nothing and returns an error. The line ships set to =1= because the
+half-enabled state is the expensive one. A leader can address a worker while the
+worker cannot answer by name, so every answer becomes a broadcast and a question
+put to one repository is answered by all of them. Export
+=DSMR_BUS_DIRECT_ADDRESSING=0= before direnv loads for broadcast only.
+
+⚠ Naming a recipient filters *delivery*, not *readership*. The record still
+travels on the fleet's shared log and any member can read it there.
 
 ⚠ Editing =.envrc= is not enough on its own: run =direnv allow .= afterwards, and
 remember that an MCP server already running keeps the environment it started

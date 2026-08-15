@@ -89,6 +89,25 @@ export DSMR_BUS_AGENT=\"${DSMR_BUS_AGENT:-myproj}\"
   "A repository that collected the slynk region and then the bus region on
 separate visits, so it carries two managed regions.")
 
+(defparameter +pre-direct-addressing-envrc+
+  "export FOO=bar
+
+# >>> dsmr-mcp (added automatically; edit or remove freely) >>>
+export LISP_WORKSPACE=\"${LISP_WORKSPACE:-$HOME/SourceCode/lisp/}\"
+export SLYNK_HOST=\"${SLYNK_HOST:-127.0.0.1}\"
+export SLYNK_PORT=\"${SLYNK_PORT:-4005}\"
+export DSMR_MODE=auto
+export DSMR_SLYNK_ATTACH=\"${SLYNK_HOST}:${SLYNK_PORT}\"
+export DSMR_LOG_LEVEL=info
+export DSMR_BUS_AGENT=\"${DSMR_BUS_AGENT:-myproj}\"
+export DSMR_BUS_SELECTOR=\"${DSMR_BUS_SELECTOR:-}\"
+# <<< dsmr-mcp <<<
+"
+  "A repository carrying the whole stanza as it stood before direct addressing
+was emitted: every variable of the day, in one region. This is the shape ten
+repositories were in when their operator added the flag by hand, and it is the
+shape every repository brought up before today is still in.")
+
 ;;; ---------------------------------------------------------------------------
 ;;; Helpers
 ;;; ---------------------------------------------------------------------------
@@ -299,6 +318,7 @@ export DSMR_SLYNK_ATTACH=\"${SLYNK_HOST}:${SLYNK_PORT}\"
 export DSMR_LOG_LEVEL=info
 export DSMR_BUS_AGENT=\"${DSMR_BUS_AGENT:-agent}\"
 export DSMR_BUS_SELECTOR=\"${DSMR_BUS_SELECTOR:-}\"
+export DSMR_BUS_DIRECT_ADDRESSING=\"${DSMR_BUS_DIRECT_ADDRESSING:-1}\"
 # <<< dsmr-mcp <<<
 "
       (managed-block)
@@ -338,7 +358,8 @@ Slynk image or one bus name."
   "The undeclared set skips what is already declared and keeps table order, so a
 caller folding over it writes the block's own sequence."
   (is equal '("LISP_WORKSPACE" "SLYNK_PORT" "DSMR_MODE" "DSMR_SLYNK_ATTACH"
-              "DSMR_LOG_LEVEL" "DSMR_BUS_AGENT" "DSMR_BUS_SELECTOR")
+              "DSMR_LOG_LEVEL" "DSMR_BUS_AGENT" "DSMR_BUS_SELECTOR"
+              "DSMR_BUS_DIRECT_ADDRESSING")
       (mapcar #'variable-name
               (undeclared-variables "export SLYNK_HOST=1.2.3.4
 "))
@@ -353,7 +374,12 @@ The fleet selector joined the marker set, which is what makes every repository
 already carrying the older stanza incomplete again and therefore reachable by
 the offer. That is deliberate and it is how the selector reaches the fleet: the
 declaration it gains defaults to empty, which is the shared host-wide bus, so
-nobody is moved by receiving it."
+nobody is moved by receiving it.
+
+The direct-addressing flag joined it for the same reason and with the same
+safety. Every repository brought up before the flag was emitted is incomplete
+again and will be offered it once; what it gains lets that repository answer one
+named agent instead of the whole fleet, and cannot move it anywhere."
   (false (setup-complete-p +bare-envrc+)
          "a file with neither marker is not settled")
   (false (setup-complete-p "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
@@ -365,16 +391,25 @@ nobody is moved by receiving it."
 export DSMR_BUS_AGENT=myproj
 ")
          "the stanza as it stood before the selector existed is not settled")
+  (false (setup-complete-p "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+export DSMR_BUS_AGENT=myproj
+export DSMR_BUS_SELECTOR=\"\"
+")
+         "the stanza as it stood before direct addressing existed is not settled")
   (true (setup-complete-p "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 export DSMR_BUS_AGENT=myproj
 export DSMR_BUS_SELECTOR=\"\"
+export DSMR_BUS_DIRECT_ADDRESSING=1
 ")
         "a file carrying every marker is settled")
   (true (setup-complete-p "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 export DSMR_BUS_AGENT=myproj
 export DSMR_BUS_SELECTOR=fulcrum
+export DSMR_BUS_DIRECT_ADDRESSING=0
 ")
-        "a selector naming a fleet is settled exactly as an empty one is"))
+        "a selector naming a fleet, and a flag turned off, are settled exactly as
+the defaults are: the question is whether the operator has been asked, not what
+they answered"))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The fold the append path uses
@@ -403,7 +438,7 @@ rather than needing its own check."
       (is string= complete text "a complete file must not be touched"))))
 
 (define-test the-fold-adds-only-what-is-missing
-  "A file carrying the older slynk region gains the two declarations it lacks
+  "A file carrying the older slynk region gains the three declarations it lacks
 and nothing else: the six it already has are not written a second time."
   (multiple-value-bind (text changed)
       (ensure-managed-declarations +slynk-only-envrc+)
@@ -414,7 +449,56 @@ and nothing else: the six it already has are not written a second time."
         "the bus identity is added exactly once")
     (is = 1 (%count-lines-mentioning "DSMR_BUS_SELECTOR" text)
         "the fleet selector is added exactly once")
-    (is = (+ 2 (length (%lines +slynk-only-envrc+))) (length (%lines text))
-        "exactly the two missing declarations were added")
+    (is = 1 (%count-lines-mentioning "DSMR_BUS_DIRECT_ADDRESSING" text)
+        "the direct-addressing flag is added exactly once")
+    (is = (+ 3 (length (%lines +slynk-only-envrc+))) (length (%lines text))
+        "exactly the three missing declarations were added")
     (true (setup-complete-p text)
           "the file reaches the settled state, so no re-prompt follows")))
+
+(define-test the-fold-adds-direct-addressing-to-a-repository-that-lacks-it
+  "A repository carrying the stanza as it stood before the flag was emitted
+gains exactly one declaration of it, in the defaulting form, inside the region
+it already has. Everything else is left byte for byte as it was.
+
+The consequence of the flag being absent is what this guards: the bus refuses a
+publish that names a recipient, so a worker can be addressed but cannot answer
+by name, and a question aimed at one repository is answered by all of them."
+  (multiple-value-bind (text changed)
+      (ensure-managed-declarations +pre-direct-addressing-envrc+)
+    (true changed "a repository without the flag must gain it")
+    (is = 1 (%count-lines-mentioning "DSMR_BUS_DIRECT_ADDRESSING" text)
+        "the flag is added exactly once")
+    (true (member "export DSMR_BUS_DIRECT_ADDRESSING=\"${DSMR_BUS_DIRECT_ADDRESSING:-1}\""
+                  (%lines text) :test #'string=)
+          "the flag takes the defaulting form, so an exported 0 still wins")
+    (is = (1+ (length (%lines +pre-direct-addressing-envrc+))) (length (%lines text))
+        "exactly one line was added")
+    (is = 1 (length (managed-region-bounds text))
+        "the declaration joined the region already there rather than opening a second one")
+    (true (setup-complete-p text)
+          "the repository reaches the settled state, so no re-prompt follows")))
+
+(define-test a-hand-added-direct-addressing-flag-is-never-copied-again
+  "Ten repositories gained this flag by hand before anything emitted it. A file
+that already declares it is left exactly as its operator wrote it: no second
+copy, and the value they chose is not rewritten.
+
+The fixture's hand-written line sits outside the region and carries a value the
+emitter would never write, which is what makes both halves of the claim visible
+at once. A second fold over the result changes nothing either, so a repair run
+twice over one repository is the same as a repair run once."
+  (let ((hand (concatenate 'string +pre-direct-addressing-envrc+
+                           "export DSMR_BUS_DIRECT_ADDRESSING=0
+")))
+    (multiple-value-bind (text changed) (ensure-managed-declarations hand)
+      (false changed "a file already carrying the flag must report no change")
+      (is string= hand text "the operator's file must not be touched")
+      (is = 1 (%count-lines-mentioning "DSMR_BUS_DIRECT_ADDRESSING" text)
+          "the flag must not be given a second copy")
+      (is string= "0" (declared-value text "DSMR_BUS_DIRECT_ADDRESSING")
+          "the operator's own value must survive"))
+    (let ((once (ensure-managed-declarations +pre-direct-addressing-envrc+)))
+      (multiple-value-bind (twice changed-again) (ensure-managed-declarations once)
+        (false changed-again "a second fold must report no change")
+        (is string= once twice "a second fold must not add a second copy")))))
