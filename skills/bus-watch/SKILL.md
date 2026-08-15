@@ -121,7 +121,7 @@ as its command:
 ```
 Monitor(
   command: 'while true; do
-              { dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
+              { ~/.local/bin/dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
                   --bus <tag> --agent <name> --namespace <absolute-project-root>/ \
                 || echo "error:watch-crashed rc=$?"; } \
               | grep --line-buffered -E "^(bus|error):" || true
@@ -162,6 +162,16 @@ Why each piece:
   like a repo with nothing to say. Inside the loop, a filter that dies costs one
   iteration; `|| true` keeps a non-zero exit from ending the loop as well. Both
   were confirmed by a delivered wake afterwards rather than by a heartbeat.
+- **The path is absolute, never a bare `dsmr-bus-watch`.** Whether the bare name resolves depends
+  on how the session was started: a tool call runs against a snapshot of the shell environment taken
+  at session start, and a session launched by the fleet launcher can carry a much narrower `PATH`
+  than one started from an interactive shell. When it does not resolve, the failure is silent in the
+  worst way — the Monitor reports itself started, the command inside it says `command not found`
+  where nobody is reading, and the agent is deaf with no error anywhere it will look. Measured
+  2026-08-15 on a leader, whose whole fleet was reporting into it at the time.
+- **Run the liveness probe from the same shell that armed.** A probe run anywhere with a richer
+  `PATH` answers for a watcher that was never started. That is also how this was found, by luck: the
+  probe happened to run in the arming shell and said `command not found` rather than `dead`.
 - **`--agent <name>` is a literal, never `"$DSMR_BUS_AGENT"`.** The variable is
   inherited, so a session started by a process that began life in another tree
   arms its watch under that tree's name and listens on its cursor. It answers
@@ -207,7 +217,7 @@ The running watcher refreshes a **heartbeat file** every poll and removes it on
 clean exit, so "am I still listening?" is a cheap local check, not a `ps` grep:
 
 ```
-dsmr-bus-watch --check-live --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
+~/.local/bin/dsmr-bus-watch --check-live --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
 # or with the full id:  --check-live --bus <tag> --agent-id <namespace>/<name>
 ```
 
@@ -272,7 +282,7 @@ bus it uses an `ephemeral` identity, which never advances the main cursor.
 | Start listening (whole session) | Arm the **Monitor tool** (`persistent: true`) with the `--stream` watcher command above. Never a `run_in_background` Bash task. |
 | Woke on `bus:<SEQ>` | `bus-receive` (stable id) → handle → back to work. **No re-arm.** |
 | Woke on `error:…` | inner watcher crashed/missing — read the output file, fix the binary, re-arm the Monitor. |
-| Am I still listening? | `dsmr-bus-watch --check-live --bus <tag> --agent <name> --namespace <absolute-project-root>/`, wanting `live` **and** the right `bus=`, or re-arm the Monitor. |
+| Am I still listening? | `~/.local/bin/dsmr-bus-watch --check-live --bus <tag> --agent <name> --namespace <absolute-project-root>/`, wanting `live` **and** the right `bus=`, or re-arm the Monitor. |
 | Before going silent / parking | run `--check-live` per joined bus; never park on `dead`/`stale`, and never on a `bus=` that is not the one you armed. |
 | Joined to two buses | two Monitors, two `--bus` tags, two `--check-live` runs. One `live` covers one bus. |
 | `--check-live` prints no `bus=` field | stale PATH binary that armed on the shared bus regardless of what you asked. `make install-bus-watch`, then re-arm. |
