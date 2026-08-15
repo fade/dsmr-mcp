@@ -33,6 +33,10 @@ CLAUDE_BIN=claude
 DIRENV_BIN=direnv
 USE_DIRENV=1
 PERMISSION_MODE=auto
+# Seconds to wait between one session starting and the next, drawn fresh for
+# each gap. Both zero starts them as fast as kitty accepts them.
+STAGGER_MIN=3
+STAGGER_MAX=10
 KITTY_SOCKET=${KITTY_LISTEN_ON:-}
 ONLY=()
 EXCLUDE=()
@@ -101,6 +105,13 @@ Launching:
                         The environment a repository's .envrc exports is how its
                         session finds its own bus identity and its own image, so
                         only pass this for a fleet that keeps that elsewhere.
+      --stagger MIN-MAX Seconds to wait between one session starting and the
+                        next, drawn fresh for each gap (default: $STAGGER_MIN-$STAGGER_MAX).
+                        Sessions always start in the declared order, leader
+                        first; this governs only the gap between them. A burst
+                        of simultaneous starts contends on shared per-user
+                        state, and a session that loses that race is not told.
+      --no-stagger      Start them as fast as kitty accepts them
   -w, --window          Put the tabs in a new OS window instead of this one
   -t, --to SOCKET       kitty remote control socket, e.g. unix:/tmp/kitty-1234
                         (default: \$KITTY_LISTEN_ON, else auto-discovered)
@@ -177,8 +188,10 @@ is_sister_dir() {
 # An unrecognised name is left alone so the parser below reports it as the typo
 # it is, rather than as a good option used wrongly.
 VALUED_OPTS=(--dir --extra --extra-root --only --exclude --leader --leader-file
-             --leader-cmd --worker-cmd --fleet-tag --permission-mode --command --to)
-FLAG_OPTS=(--no-role --no-direnv --no-scan --window --force --list --dry-run --help)
+             --leader-cmd --worker-cmd --fleet-tag --permission-mode --command --to
+             --stagger)
+FLAG_OPTS=(--no-role --no-direnv --no-scan --no-stagger --window --force --list
+           --dry-run --help)
 
 while [[ $# -gt 0 ]]; do
     if [[ $1 == --*=* ]]; then
@@ -203,6 +216,14 @@ while [[ $# -gt 0 ]]; do
         -p|--permission-mode)  [[ $# -ge 2 ]] || die "$1 needs a value"; PERMISSION_MODE=$2; shift 2 ;;
         -c|--command)          [[ $# -ge 2 ]] || die "$1 needs a value"; CLAUDE_BIN=$2; shift 2 ;;
         --no-direnv)           USE_DIRENV=0; shift ;;
+        --no-stagger)          STAGGER_MIN=0; STAGGER_MAX=0; shift ;;
+        --stagger)
+            [[ $# -ge 2 ]] || die "$1 needs a value"
+            [[ $2 =~ ^([0-9]+)-([0-9]+)$ ]] || die "--stagger wants MIN-MAX in whole seconds, e.g. 3-10"
+            STAGGER_MIN=${BASH_REMATCH[1]}
+            STAGGER_MAX=${BASH_REMATCH[2]}
+            ((STAGGER_MIN <= STAGGER_MAX)) || die "--stagger minimum $STAGGER_MIN exceeds maximum $STAGGER_MAX"
+            shift 2 ;;
         -t|--to)               [[ $# -ge 2 ]] || die "$1 needs a value"; KITTY_SOCKET=$2; shift 2 ;;
         -S|--no-scan)          NO_SCAN=1; shift ;;
         -w|--window)           NEW_WINDOW=1; shift ;;
@@ -448,6 +469,26 @@ for i in "${!names[@]}"; do
     needs_direnv "$path" && launch_args+=("$DIRENV_BIN" exec "$path")
     launch_args+=("$CLAUDE_BIN" --permission-mode "$PERMISSION_MODE")
     [[ -n $role_prompt ]] && launch_args+=("$role_prompt")
+
+    # Sessions start one at a time with a gap between them, in the declared
+    # order: the leader is up before the workers that report to it. The gap is
+    # what keeps them from arriving as a burst. Eleven sessions starting in the
+    # same second contend on the same per-user state, and the loser of that race
+    # is not told it lost; it comes up looking ordinary. The interval is varied
+    # rather than fixed so the starts do not re-align on whatever period a fixed
+    # one happened to share with something else.
+    #
+    # The gap goes BEFORE each launch after the first, so nothing waits at the
+    # end, and a skipped repository does not spend one.
+    if ((launched > 0 && STAGGER_MAX > 0)); then
+        delay=$((RANDOM % (STAGGER_MAX - STAGGER_MIN + 1) + STAGGER_MIN))
+        if ((DRY_RUN)); then
+            printf '  (wait %ss)\n' "$delay"
+        else
+            printf '  waiting %ss before %s\n' "$delay" "$name"
+            sleep "$delay"
+        fi
+    fi
 
     if ((DRY_RUN)); then
         printf 'kitten @ --to %s %s\n' "$KITTY_SOCKET" "${launch_args[*]}"
