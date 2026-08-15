@@ -149,3 +149,51 @@ shipping the stanza."
     (true (search "export DSMR_BUS_SELECTOR=\"${DSMR_BUS_SELECTOR:-}\"" shipped)
           "the selector's default must be empty, which resolves to the shared
 host-wide bus, so distributing this stanza moves nobody onto a named bus")))
+
+(defun %comment-lines-mentioning (needle text)
+  "Return how many COMMENT lines of TEXT mention NEEDLE. A declaration is not a
+comment, so this counts only the prose a reader of the file would learn from."
+  (count-if (lambda (raw)
+              (let ((line (string-trim '(#\Space #\Tab #\Return) raw)))
+                (and (plusp (length line))
+                     (char= (char line 0) #\#)
+                     (search needle line))))
+            (uiop:split-string text :separator (list #\Newline))))
+
+(define-test every-copy-declares-direct-addressing-defaulting-to-on
+  "All three copies of the emitted text declare the direct-addressing flag
+exactly once, defaulting to 1: the shipped template a new project is copied
+from, the renderer that personalizes it at install time, and the managed block
+appended to a project that already has a .envrc.
+
+Without the flag the bus refuses a publish that names a recipient, so a worker
+can be addressed but cannot answer by name and every answer reaches the whole
+fleet. The defaulting form keeps an operator who exports 0 authoritative.
+
+The comment is asserted too. Whoever reads a fresh project's .envrc has that
+file and nothing else, and a bare variable name tells them neither what it buys
+nor what turning it off would cost."
+  (let ((shipped  (%shipped-template))
+        (rendered (render-site-defaults-template))
+        (emitted  (managed-block))
+        (line "export DSMR_BUS_DIRECT_ADDRESSING=\"${DSMR_BUS_DIRECT_ADDRESSING:-1}\""))
+    (is = 1 (count "DSMR_BUS_DIRECT_ADDRESSING" (%declared-names shipped)
+                   :test #'string=)
+        (format nil "the shipped template must declare the flag exactly ~
+once.~%~A" +lockstep-note+))
+    (is = 1 (count "DSMR_BUS_DIRECT_ADDRESSING" (%declared-names rendered)
+                   :test #'string=)
+        (format nil "the site-defaults renderer must declare the flag exactly ~
+once.~%~A" +lockstep-note+))
+    (is = 1 (count "DSMR_BUS_DIRECT_ADDRESSING" (%declared-names emitted)
+                   :test #'string=)
+        "the managed block must declare the flag exactly once")
+    (true (search line shipped)
+          "the shipped template's flag must take the defaulting form")
+    (true (search line rendered)
+          "the site-defaults renderer's flag must take the defaulting form")
+    (true (search line emitted)
+          "the managed block's flag must take the defaulting form")
+    (true (plusp (%comment-lines-mentioning "DSMR_BUS_DIRECT_ADDRESSING" shipped))
+          "the shipped template must explain the flag in a comment, so a reader
+of a fresh project's .envrc need not go looking through our source")))

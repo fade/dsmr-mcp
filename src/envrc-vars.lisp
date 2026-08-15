@@ -350,6 +350,16 @@ image grabbed it first, so the derived value is what keeps them apart."
     :default (lambda (project-root)
                (declare (ignore project-root))
                "")
+    :setup-marker-p t)
+   (%make-managed-variable
+    :name "DSMR_BUS_DIRECT_ADDRESSING"
+    :comment "# Whether this project's agent may publish to one named recipient instead of
+# broadcasting to every participant. On, so this project can answer whoever
+# asked it, by name, from its first run; export DSMR_BUS_DIRECT_ADDRESSING=0
+# before direnv loads to go back to broadcast only."
+    :default (lambda (project-root)
+               (declare (ignore project-root))
+               "1")
     :setup-marker-p t))
   "Every variable dsmr-mcp declares in a project `.envrc`, in the order the
 managed block writes them. This is the single place a new variable is added: the
