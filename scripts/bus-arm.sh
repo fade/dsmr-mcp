@@ -26,6 +26,11 @@ set -eu
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dsmr-mcp/bus"
 ARM_LOG="$STATE_DIR/watch-arm.log"
 
+# Created here rather than just before the launch: everything below this point may
+# need to report, and under `set -e` a redirect into a missing directory would end
+# the hook instead of logging why.
+mkdir -p "$STATE_DIR"
+
 # Fixed cadence for the prime. Poll fast so a message arriving in the window
 # before the agent arms its Monitor is seen promptly; a modest recycle so a quiet
 # prime self-exits rather than lingering beside the standing watch. Reaction
@@ -48,12 +53,28 @@ esac
 # survives intact. Neither flag is required: with only DSMR_BUS_AGENT set, or with
 # nothing, the watcher degrades to firing on everything and says so on stderr — a
 # no-migration default for every sister repo.
-set -- --namespace "$PROJECT_ROOT"
-if [ -n "${DSMR_BUS_AGENT:-}" ]; then
-    set -- "$@" --agent "$DSMR_BUS_AGENT"
+#
+# The name is checked against the tree before it is used. DSMR_BUS_AGENT arrives
+# from the environment, and an environment is inherited: a process started by
+# something that was itself started elsewhere carries the other tree's name, and
+# nothing along that path corrects it. A watcher armed under a borrowed name
+# reports healthy while listening on somebody else's cursor, which is the one
+# failure a liveness probe cannot see. The tree the session is actually in is the
+# only identity here that cannot be donated by a parent, so on disagreement it
+# wins and the substitution is recorded.
+ROOT_NAME=${PROJECT_ROOT%/}
+ROOT_NAME=${ROOT_NAME##*/}
+AGENT="${DSMR_BUS_AGENT:-}"
+if [ -n "$AGENT" ] && [ -n "$ROOT_NAME" ] && [ "$AGENT" != "$ROOT_NAME" ]; then
+    printf '%s: inherited DSMR_BUS_AGENT=%s does not match the tree at %s; arming as %s instead\n' \
+        "${0##*/}" "$AGENT" "$PROJECT_ROOT" "$ROOT_NAME" >>"$ARM_LOG"
+    AGENT=$ROOT_NAME
 fi
 
-mkdir -p "$STATE_DIR"
+set -- --namespace "$PROJECT_ROOT"
+if [ -n "$AGENT" ]; then
+    set -- "$@" --agent "$AGENT"
+fi
 
 # Detach stdin/stdout so the SessionStart hook does not hang; stderr goes to the
 # arm log rather than /dev/null, because this path cannot report to a session that
