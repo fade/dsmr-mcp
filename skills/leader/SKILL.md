@@ -22,7 +22,28 @@ never-block-silently rule govern everything below.
 
 ---
 
-## Step 1 — Your own repo, and the phase you are operating under
+## Step 0 — Arm your watch NOW, before anything else in this file
+
+⛔ **Go to Step 4, arm one persistent watcher per joined bus with the arm line given there, confirm
+each prints `live` and a `bus=` naming the bus you meant, and come back. Do not read Step 1 first.**
+
+Arming needs the bus name and your own name. It needs no roster, no phase, no repo record, and no
+sister's files. Everything else in this file is slower, and Steps 2 and 3 are much slower: they walk
+the fleet's repositories reading files.
+
+⚠ **A deaf leader is worse than a deaf worker, because everything routes through you.** A sister
+that cannot hear misses its own dispatches. A leader that cannot hear silently discards *the whole
+fleet's* reports, and every sister reads as quiet rather than unheard — which is indistinguishable
+from a fleet with nothing to say.
+
+⚠ Measured 2026-08-15: with arming last, a leader completed a bring-up, held the correct identity,
+and had no watcher at all while ten sisters reported to it. Nothing surfaced this. It was found by a
+person reading a process list. The bus roster does not show it, `bus-status` does not show it, and
+the sisters cannot tell.
+
+⇒ **The ordering is the protection, not a preference.** If becoming reachable is the first act,
+there is no interval in which the fleet can report into a leader that is not listening. If it is the
+last act, every step above it is that interval.
 
 ⛔ **Do this before any analysis of anything.** Re-deriving a plan that already exists is the most
 expensive mistake available and it is invisible while you make it.
