@@ -14,7 +14,27 @@ everything below.
 
 ---
 
-## Step 1 — Resume your own repo, from your own file
+## Step 0 — Arm your watch NOW, before anything else in this file
+
+⛔ **Go to Step 7, arm one watcher per joined bus, prove it with the controls, and come back here.
+Do not read Step 1 first.**
+
+Arming needs two things you already have: the bus name and your own name. It needs no repo record,
+no plan, no permission preflight, no memory store. Everything else in this file is slower than it
+is, and some of it is much slower.
+
+⚠ **Until you have armed, you cannot be reached, and nothing says so.** A sister working through the
+steps below looks identical from outside to a sister that is listening: the tab is open, the process
+is running, the identity is right. Measured 2026-08-15: a sister reached its assigned work without
+arming, ran for eleven minutes, and fell forty messages behind. Nothing reported it. It was found
+because a person happened to look.
+
+⇒ **The ordering is the protection.** If the first thing you do is become reachable, there is no
+window in which you can be handed work while deaf. If arming is last, every step before it is that
+window — and the permission preflight in Step 3 can occupy a whole turn on its own.
+
+⇒ **If a task arrives before you have finished this file, arm first and answer second.** A dispatch
+you can hear is worth more than a preflight you have completed.
 
 ```bash
 cat .planning/PARK.md
@@ -283,6 +303,11 @@ looking rigorous.
 
 ## Step 5 — Announce, in one line
 
+⛔ **Do not announce until your watch is armed and its controls have answered dead.** The
+announcement is what tells the leader you are reachable, so sending it while deaf makes the leader's
+roster wrong in the one direction that costs it something: it will believe a dispatch to you
+arrived. If Step 0 was skipped, arm now, before this line goes out.
+
 ```
 RESUMED <repo> @<short-sha>
 ```
@@ -310,10 +335,14 @@ The leader holds: **the architecture, the plan, and cross-repo sequencing.**
   rediscovering it each session burns the operator's week.
 - Executing another repo's work because you can see it. Report it to the leader instead.
 
-Then arm your watch and prove it is on the right bus, as below, and **go silent**
-until dispatched.
+Then confirm the watch you armed in Step 0 is still on the right bus, as below, and
+**go silent** until dispatched.
 
-## Step 7 - Arm per bus, and prove it is the RIGHT bus, before you go silent
+## Step 7 - Arm per bus, and prove it is the RIGHT bus
+
+⚠ **You should have done this at Step 0, before anything else in this file.** It is written out here
+because this is where the detail belongs, not because this is when to do it. If you are reading it
+for the first time at this point in the run, you have been unreachable for everything above.
 
 ### Which bus are you on?
 
