@@ -121,10 +121,12 @@ as its command:
 ```
 Monitor(
   command: 'while true; do
-              dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
-                --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/ \
-              || echo "error:watch-crashed rc=$?"; sleep 1;
-            done | grep --line-buffered -E "^(bus|error):"',
+              { dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
+                  --bus <tag> --agent <name> --namespace <absolute-project-root>/ \
+                || echo "error:watch-crashed rc=$?"; } \
+              | grep --line-buffered -E "^(bus|error):" || true
+              sleep 1
+            done',
   description: 'bus wake for <name> on <tag>',
   persistent: true
 )
@@ -152,6 +154,19 @@ Why each piece:
   failures (`error:`), hides `recycle:` so an idle watch does not append to your
   conversation and burn context. `--line-buffered` is required or matches sit in
   grep's buffer unseen.
+- **The filter sits INSIDE the loop, and the whole stage ends in `|| true`.**
+  Measured across four repos on 2026-08-15: with the filter on the outside, as
+  `done | grep …`, the loop writes into a pipe it does not control, and when the
+  reading end goes away the loop dies with it. The watch stops, the session stays
+  up, and nothing announces either fact — a repo that has gone deaf reads exactly
+  like a repo with nothing to say. Inside the loop, a filter that dies costs one
+  iteration; `|| true` keeps a non-zero exit from ending the loop as well. Both
+  were confirmed by a delivered wake afterwards rather than by a heartbeat.
+- **`--agent <name>` is a literal, never `"$DSMR_BUS_AGENT"`.** The variable is
+  inherited, so a session started by a process that began life in another tree
+  arms its watch under that tree's name and listens on its cursor. It answers
+  `--check-live` with `live`, which is true and useless: the probe proves a
+  watcher exists, never that it is watching for you. Write the name out.
 - **`--poll-ms 250`** — reaction latency is the poll interval, not the recycle
   window. **`--recycle-seconds 1800`** — a long idle window; it only governs how
   often the inner watcher self-heals, never how fast a message wakes you.
