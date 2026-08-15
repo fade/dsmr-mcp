@@ -369,7 +369,7 @@ Each through the **Monitor tool** with `persistent: true`, each with its own
 `--bus`. See the **bus-watch** skill for why a background Bash task is not an arm.
 
 ```
-while true; do dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
+while true; do ~/.local/bin/dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
   --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace /absolute/path/to/this/repo/; done \
   | grep --line-buffered -E "^(bus|error):"
 ```
@@ -388,7 +388,7 @@ wrong namespace reads that beat and answers `live`. The error confirms itself.
 namespace and require `dead`:
 
 ```
-dsmr-bus-watch --check-live --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace /nonexistent/
+~/.local/bin/dsmr-bus-watch --check-live --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace /nonexistent/
 ```
 
 If that answers `live`, you are reading your own misfiled heartbeat and your real
@@ -397,7 +397,7 @@ arm is somewhere nobody publishes.
 ⛔ **Arm the loop, never the bare watcher.** `--stream` exits 0 on its idle
 window on purpose: that is the self-heal that re-arms a watch which has gone
 silently deaf. Monitor ends a watch when its command exits, so a bare
-`dsmr-bus-watch --stream` leaves you deaf at the first idle mark, believing you
+`~/.local/bin/dsmr-bus-watch --stream` leaves you deaf at the first idle mark, believing you
 are armed, with nothing to notify you. The `while true` loop is what turns that
 exit into a re-arm, and the `grep` keeps `recycle:` lines off your context while
 letting `bus:` and `error:` through.
@@ -407,7 +407,7 @@ One Monitor does not cover two buses. Two joined buses means two Monitors.
 ### Confirm each one, and read the bus field
 
 ```
-dsmr-bus-watch --check-live --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
+~/.local/bin/dsmr-bus-watch --check-live --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
 ```
 
 ⛔ **`live` alone is no longer good enough.** The answer now carries `bus=NAME`,

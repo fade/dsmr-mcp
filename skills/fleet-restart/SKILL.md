@@ -103,7 +103,7 @@ re-announces.
    on: the cursor advances on delivery.
 3. Arm a persistent `--stream` watcher in a Monitor as the standing listener
    (exit-on-event is only the per-turn re-arm after a publish). Then **confirm it
-   with `dsmr-bus-watch --check-live --agent "$DSMR_BUS_AGENT" --namespace
+   with `~/.local/bin/dsmr-bus-watch --check-live --agent "$DSMR_BUS_AGENT" --namespace
    <absolute-project-root>/`**. It must print `live`. Bringing the leader up deaf leaves the
    whole fleet talking to no one.
 4. **Read `.planning/STATE.md` and `.planning/ROADMAP.md` before anything else.** State the phase
@@ -157,7 +157,7 @@ not summarise last session — it is in your files.
   loop is required, not decoration.** `--stream` exits 0 on its idle window as a self-heal, and
   Monitor ends a watch when its command exits, so a bare watcher goes deaf at the first idle mark
   while still reporting armed. See the **bus-watch** skill for the full form. Confirm liveness with
-  `dsmr-bus-watch --check-live --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/`. Require `live` before you
+  `~/.local/bin/dsmr-bus-watch --check-live --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/`. Require `live` before you
   park or report ready, never `dead`/`stale`.
 - Boot: `fs-set-project-root {"path":"."}` → `load-system {"system":"<sys>"}`.
 - Park state: `.planning/PARK.md` per repo. Blocks: `.planning/BLOCKED.md` per repo.

@@ -177,7 +177,7 @@ the bus enforces nothing from it:
   roster is not evidence a worker is unreachable.**
 - An agent that is on the roster may have no session running at all. **Presence on the roster is
   not evidence a worker is connected.**
-- Liveness is `dsmr-bus-watch --check-live`, run **per joined bus**, in the session that armed it.
+- Liveness is `~/.local/bin/dsmr-bus-watch --check-live`, run **per joined bus**, in the session that armed it.
   A sister reports its own; you do not probe it from here.
 
 Enrollment is dynamic, so both of these are normal on a running fleet:
@@ -307,13 +307,13 @@ per joined bus, each with its own `--bus`.** This is the arm line. Use it
 verbatim; do not compose one from memory:
 
 ```
-while true; do dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
+while true; do ~/.local/bin/dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
   --bus <TAG> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/; done \
   | grep --line-buffered -E "^(bus|error):"
 ```
 
 ⛔ **BOTH FLAGS ARE REQUIRED, AND `--recycle-seconds` IS THE ONE THAT MATTERS.**
-A bare `dsmr-bus-watch --stream` goes deaf at the first idle mark while still
+A bare `~/.local/bin/dsmr-bus-watch --stream` goes deaf at the first idle mark while still
 believing it is listening. The idle recycle-EXIT is what re-arms a silently-deaf
 watch; without it, a watcher that goes deaf for any reason STAYS deaf for the
 rest of the session. Do not remove it to make the watcher "keep running".
@@ -330,7 +330,7 @@ absence starts costing something.**
 Then **confirm your own ears** on each of them before you assert control:
 
 ```
-dsmr-bus-watch --check-live --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
+~/.local/bin/dsmr-bus-watch --check-live --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
 ```
 
 ⛔ **`--check-live` CANNOT DETECT A MISSING `--recycle-seconds`.** It answers
