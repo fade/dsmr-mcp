@@ -64,7 +64,9 @@ arguments at all. \
 The response reports the connection epoch after the reset. That is what makes \
 a reset observable to somebody else: a call already in flight when the reset \
 lands sees the epoch move under it and can tell it was reset rather than that \
-it merely failed. Only available in attached mode.")
+it merely failed. When no connection was open, one is opened and the epoch \
+stays where it is, since no call was interrupted. Only available in attached \
+mode.")
    (dsmr-mcp/src/tools/base::input-schema
     :allocation :class
     :initform '(:object :properties () :required ())))
@@ -77,34 +79,51 @@ connection to the attached image. Only available when *mode* is :attached."))
 (c2mop:ensure-finalized (find-class 'attach-reset-tool))
 
 (defun %reset-connection (target host port)
-  "Drop TARGET's cached connection and reopen it against HOST and PORT.
+  "Put TARGET back in touch with the image at HOST and PORT, and say what it took.
 
-Returns (values OUTCOME EPOCH DETAIL), where OUTCOME is one of:
+Returns (values OUTCOME EPOCH DETAIL DROPPED), where OUTCOME is one of:
 
-  :no-connection  nothing was open, so nothing was dropped. The epoch does not
-                  move: a reset that reset nothing must not look like one that
-                  did, or the epoch stops meaning what a reader takes it to mean.
-  :reset          the connection was dropped and a fresh one opened eagerly.
-  :reopen-failed  the drop succeeded and the reopen did not. The cached slot is
-                  empty either way, so the next ordinary call opens on demand;
-                  this outcome costs the session one call and latches nothing.
+  :reset          a connection was open, it was dropped, and a fresh one was
+                  opened in its place. The epoch moved.
+  :reopened       nothing was open, so nothing was dropped, and a connection
+                  was opened. The epoch does not move: a reset that interrupted
+                  nobody must not look like one that did, because the only
+                  reader of that number is a call comparing it against what it
+                  saw at entry.
+  :reopen-failed  the image could not be reached. DROPPED says whether a live
+                  connection was thrown away first.
 
-DETAIL carries the reopen failure's printed condition, and is NIL otherwise.
-The condition is printed inside its own guard because printing a condition that
-names a dead connection can itself signal."
-  (if (null (repl-eval-tool-slynk-conn target))
-      (values :no-connection (repl-eval-tool-connection-epoch target) nil)
-      (progn
-        (drop-connection target :reason "manual-reset")
-        (handler-case
-            (progn
-              (get-or-open-connection target host port)
-              (values :reset (repl-eval-tool-connection-epoch target) nil))
-          (error (e)
-            (values :reopen-failed
-                    (repl-eval-tool-connection-epoch target)
-                    (handler-case (princ-to-string e)
-                      (error () "<unprintable>"))))))))
+Opening in the nothing-was-open case is what makes the verb useful rather than
+merely tidy. A failed call is fail-closed: it empties the cached slot on its way
+out, so by the time somebody has watched a call fail and reached for this verb,
+there is usually nothing left to drop. Measured against a real image stopped
+with SIGSTOP: the failing call reported the wedge and emptied the slot, and a
+reset that only dropped would have done nothing at all for the operator who
+asked for it.
+
+Nothing is recorded on failure. The slot is empty either way, so the next
+ordinary call opens on demand exactly as it always does, and a reset that could
+not reach the image costs the session one call rather than its future.
+
+DETAIL carries the failure's printed condition and is NIL otherwise. The
+condition is printed inside its own guard, because printing one that names a
+dead connection can itself signal."
+  (let ((was-open (and (repl-eval-tool-slynk-conn target) t)))
+    (when was-open
+      (drop-connection target :reason "manual-reset"))
+    (handler-case
+        (progn
+          (get-or-open-connection target host port)
+          (values (if was-open :reset :reopened)
+                  (repl-eval-tool-connection-epoch target)
+                  nil
+                  was-open))
+      (error (e)
+        (values :reopen-failed
+                (repl-eval-tool-connection-epoch target)
+                (handler-case (princ-to-string e)
+                  (error () "<unprintable>"))
+                was-open)))))
 
 (defmethod tool-handle ((tool attach-reset-tool) id args)
   (declare (ignore args))
@@ -133,14 +152,14 @@ names a dead connection can itself signal."
                               "content"
                               (text-content
                                "attach-reset: this session has no image address configured, so there is nothing to reconnect to.")))))
-      (multiple-value-bind (outcome epoch detail)
+      (multiple-value-bind (outcome epoch detail dropped)
           (%reset-connection target host port)
         (case outcome
-          (:no-connection
+          (:reopened
            (result id (make-ht "isError" nil
                                "content"
                                (text-content
-                                "No connection to the image was open, so nothing was reset. The next call opens one.")
+                                (format nil "No connection to the image was open, so nothing was interrupted. A fresh connection is open now and the connection epoch stays at ~D." epoch))
                                "reset" nil
                                "epoch" epoch)))
           (:reset
@@ -155,8 +174,8 @@ names a dead connection can itself signal."
                    (make-ht "isError" t
                             "content"
                             (text-content
-                             (format nil "Connection to the image dropped, and reopening it failed: ~A. Nothing is answering at the image's address. The next call will try again. Connection epoch is now ~D." detail epoch))
-                            "reset" t
+                             (format nil "~:[No connection was open, and opening one failed~;Connection to the image dropped, and reopening it failed~]: ~A. Nothing is answering at the image's address. The next call will try again. Connection epoch is ~D." dropped detail epoch))
+                            "reset" (and dropped t)
                             "epoch" epoch)))
              (setf (gethash "error_type" envelope) "backend_crashed")
              (result id envelope)))

@@ -20,7 +20,9 @@ arguments at all.
 The response reports the connection epoch after the reset. That is what makes 
 a reset observable to somebody else: a call already in flight when the reset 
 lands sees the epoch move under it and can tell it was reset rather than that 
-it merely failed. Only available in attached mode.
+it merely failed. When no connection was open, one is opened and the epoch 
+stays where it is, since no call was interrupted. Only available in attached 
+mode.
 
 #+begin_src json
 {

@@ -37,7 +37,8 @@
   (:import-from #:dsmr-mcp/src/attach/dispatch
                 #:repl-eval-tool-slynk-conn
                 #:repl-eval-tool-connection-epoch)
-  (:import-from #:slynk))
+  (:import-from #:slynk)
+  (:import-from #:usocket))
 
 (in-package #:dsmr-mcp/tests/tools/attach-reset-test)
 
@@ -86,6 +87,25 @@ payload hash-table."
   "True when KEY is present in HT, whatever its value. Absence and a null value
 are different answers and this is what tells them apart."
   (nth-value 1 (gethash key ht)))
+
+(defun port-refuses-connections-p (port)
+  "True when a plain TCP connect to PORT is refused.
+
+A raw socket, and nothing the verb touches. Whether the image is reachable is
+the precondition the reopen-failure case rests on, so reading it with the
+connection machinery under test would make the plant agree with the code by
+construction."
+  (handler-case
+      (let ((s (usocket:socket-connect "127.0.0.1" port :timeout 1)))
+        (usocket:socket-close s)
+        nil)
+    (error () t)))
+
+(defun wait-until-refused (port &key (tries 100))
+  "Poll until PORT refuses connections, and return whether it ever did."
+  (loop repeat tries
+        when (port-refuses-connections-p port) return t
+        do (sleep 0.05)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The reset itself
@@ -153,26 +173,38 @@ the control would pass just as happily against a verb that did nothing at all."
           (release caller-tool)
           (release bystander-tool))))))
 
-(define-test a-reset-with-nothing-open-says-so-and-leaves-the-epoch-alone
-  "With no connection open there is nothing to reset, and the verb says that
-rather than erroring.
+(define-test a-reset-with-nothing-open-opens-one-and-leaves-the-epoch-alone
+  "With no connection open there is nothing to drop, and the verb opens one
+rather than reporting that it had nothing to do.
 
-The epoch must not move here. A reset that reset nothing looking exactly like
-one that dropped a live connection would make the field useless to the caller
-comparing it, which is the only reader the field has."
+That branch is the one an operator actually lands in. A failed call is
+fail-closed: it empties the cached slot on its way out, so by the time somebody
+has watched a call fail and reached for this verb, the connection they wanted
+dropped is already gone. A verb that only dropped would do nothing at all for
+the person who asked.
+
+The epoch must not move here, and that is the discrimination against the branch
+above. Nothing was interrupted, so no call is waiting to be told anything, and a
+reset that interrupted nobody looking exactly like one that dropped a live
+connection would make the field useless to the only reader it has."
   (let ((*mode* :attached))
     (with-listener (port)
       (let* ((session (attached-session "attach-reset-nothing-open" port))
              (tool (get-tool-instance session "repl-eval")))
-        (false (repl-eval-tool-slynk-conn tool) "no connection has been opened")
-        (let ((before (repl-eval-tool-connection-epoch tool))
-              (payload (call-attach-reset session)))
-          (false (gethash "isError" payload) "nothing to reset is not a failure")
-          (false (gethash "reset" payload) "and it reports that it reset nothing")
-          (is = before (repl-eval-tool-connection-epoch tool)
-              "the epoch stays where it was")
-          (is = before (gethash "epoch" payload)
-              "and the reported epoch is that same unmoved value"))))))
+        (unwind-protect
+             (progn
+               (false (repl-eval-tool-slynk-conn tool) "no connection has been opened")
+               (let ((before (repl-eval-tool-connection-epoch tool))
+                     (payload (call-attach-reset session)))
+                 (false (gethash "isError" payload) "nothing to drop is not a failure")
+                 (false (gethash "reset" payload) "and it reports that it interrupted nothing")
+                 (true (repl-eval-tool-slynk-conn tool)
+                       "but a connection is open afterwards, which is what was asked for")
+                 (is = before (repl-eval-tool-connection-epoch tool)
+                     "the epoch stays where it was")
+                 (is = before (gethash "epoch" payload)
+                     "and the reported epoch is that same unmoved value")))
+          (release tool))))))
 
 (define-test a-reset-off-attached-mode-is-refused-and-changes-nothing
   "Outside attached mode the verb refuses, and the refusal is inert.
@@ -241,6 +273,9 @@ session one call rather than its future."
                ;; connection already open stays in the slot, so the drop has
                ;; something real to drop and the reopen has nothing to reach.
                (slynk:stop-server port)
+               (true (wait-until-refused port)
+                     "a raw connect must be refused, or the reopen has something to reach \
+and this proves nothing")
                (let ((payload (call-attach-reset session)))
                  (true (gethash "isError" payload) "a reopen that failed is an error")
                  (true (key-present-p payload "error_type") "and it carries a failure name")
