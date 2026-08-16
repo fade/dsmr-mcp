@@ -52,6 +52,8 @@
   (:import-from #:dsmr-mcp/src/attach/registry
                 #:encode-object-id
                 #:decode-object-id)
+  (:import-from #:dsmr-mcp/src/attach/probe
+                #:probe-image-liveness)
   (:import-from #:slynk-client
                 #:slime-network-error)
   (:import-from #:bordeaux-threads
@@ -61,6 +63,12 @@
            #:repl-eval-tool-slynk-conn
            #:repl-eval-tool-call-lock
            #:repl-eval-tool-connection-epoch
+           #:repl-eval-tool-liveness
+           #:repl-eval-tool-liveness-basis
+           #:repl-eval-tool-last-probe-ms
+           #:repl-eval-tool-liveness-checked-at
+           #:*attach-liveness-probe-interval*
+           #:refresh-attached-liveness
            #:attached-connection
            #:%dispatch-attach
            #:try-eager-connect
@@ -259,6 +267,34 @@ Set by get-or-open-connection; nilled by drop-connection on network error.")
     :initform (bordeaux-threads:make-lock "dsmr-repl-eval-lock")
     :reader repl-eval-tool-call-lock
     :documentation "Serialises concurrent slime-eval calls on this session's connection.")
+   ;; Per-session liveness state, established by an active probe on a
+   ;; connection this session does not otherwise use.  Per-instance, never
+   ;; class-allocated: the attached connection belongs to one session, so
+   ;; sharing this state would let one session's answer be read as the
+   ;; backend's, which is the propagation failure this record exists to avoid.
+   (liveness
+    :initform :unknown
+    :accessor repl-eval-tool-liveness
+    :documentation ":unknown until something has asked the image a question,
+then :healthy, :wedged or :dead.  :unknown is a real state a session sits in
+before its first probe, not a gap to paper over.")
+   (liveness-basis
+    :initform nil
+    :accessor repl-eval-tool-liveness-basis
+    :documentation "How the classification was established: :active-probe, or
+NIL before the first probe.  A value and the way it was obtained are separate
+facts, and a reader that cannot tell them apart cannot judge the value.")
+   (last-probe-ms
+    :initform nil
+    :accessor repl-eval-tool-last-probe-ms
+    :documentation "Round trip of the last probe in milliseconds, or NIL before
+the first probe.")
+   (liveness-checked-at
+    :initform nil
+    :accessor repl-eval-tool-liveness-checked-at
+    :documentation "Universal time the classification was established, or NIL
+before the first probe.  A session that is neither calling nor being asked for
+its status is not probed, so this is what tells a reader how old the answer is.")
    ;; Per-session connection-incarnation epoch counter.
    (connection-epoch
     :initform 0
@@ -296,6 +332,60 @@ when the connect itself fails (from get-or-open-connection)."
              :format-control
              "attach: :slynk-attach config is missing or malformed"))
     (get-or-open-connection tool host port)))
+
+(defparameter *attach-liveness-probe-interval* 30
+  "Seconds a recorded attached liveness classification stays good.
+
+A classification older than this is refreshed the next time the session
+dispatches a call or is asked for its status; a younger one is handed back as
+recorded.  Thirty seconds is short enough that a reader is never shown an
+answer from a different situation and long enough that a session making calls
+in a tight loop pays for at most one probe in thirty.
+
+The refresh rides work that is already happening rather than a timer thread
+per session.  A timer thread would probe sessions nobody is using and its cost
+would multiply with the size of the fleet, which is the direction this project
+grows.  The bound that choice creates is real and belongs in whatever renders
+the classification: a session that is neither calling nor being asked about is
+not being probed, so the recorded time is the reader's only guide to how old
+the answer is.")
+
+(defun refresh-attached-liveness (tool host port)
+  "Refresh TOOL's recorded liveness classification when it has gone stale.
+
+Returns the classification, refreshed by a probe when the recorded one is
+older than *ATTACH-LIVENESS-PROBE-INTERVAL* seconds, and handed back untouched
+when it is younger.  A probe writes all four fields together: the
+classification, that an active probe established it, the round trip and the
+time.
+
+HOST and PORT name the image; they are the session's own attach target,
+already parsed by the caller.  The probe opens and closes its own connection,
+so this is safe to call outside any lock and must not be called inside one.
+
+The refresh is driven from calls the session is already making rather than
+from the state of the connection cache, and the difference decides whether it
+works at all.  A failed call nils the cached connection, so a refresh that ran
+only while a connection was cached would probe a failing session exactly once
+and never again: the first failure would move the session into a state the
+refresh had no arm for, and the classification would stop at whatever that
+first probe happened to see."
+  (let ((checked (repl-eval-tool-liveness-checked-at tool)))
+    (when (and checked
+               (< (- (get-universal-time) checked)
+                  *attach-liveness-probe-interval*))
+      (return-from refresh-attached-liveness (repl-eval-tool-liveness tool)))
+    (multiple-value-bind (classification elapsed-ms)
+        (probe-image-liveness host port)
+      (setf (repl-eval-tool-liveness tool)            classification
+            (repl-eval-tool-liveness-basis tool)      :active-probe
+            (repl-eval-tool-last-probe-ms tool)       elapsed-ms
+            (repl-eval-tool-liveness-checked-at tool) (get-universal-time))
+      (log-event :info "attach.liveness.probed"
+                 "host" host "port" port
+                 "liveness" (string-downcase (symbol-name classification))
+                 "round_trip_ms" elapsed-ms)
+      classification)))
 
 ;;; Error-context hash-table builder ------------------------------------------
 ;;;
@@ -471,6 +561,13 @@ so IDs minted before a drop-connection can be detected as stale."
                    "content"
                    (text-content
                     "attach: :slynk-attach config is missing or malformed."))))
+      ;; Refresh the recorded liveness when it has gone stale.  Deliberately
+      ;; here rather than behind a live cached connection: a failed call nils
+      ;; that cache, so gating on it would probe a failing session once and
+      ;; never again.  Deliberately outside every lock and on the probe's own
+      ;; connection: a session part-way through a long legitimate evaluation
+      ;; must never be reported wedged for being busy.
+      (refresh-attached-liveness tool host port)
       (handler-case
           (let* (;; Acquire lock BEFORE get-or-open-connection so concurrent
                  ;; first-callers cannot both see conn=nil and both open a connection,
