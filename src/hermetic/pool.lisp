@@ -62,6 +62,9 @@
            #:pool-worker-info #:find-session-worker
            #:pool-shutting-down #:pool-capacity-exceeded
            #:pool-spawn-cancelled #:*recovery-threads*
+           #:circuit-breaker-active
+           #:circuit-breaker-active-session-id
+           #:circuit-breaker-active-remaining-seconds
            #:pool-rpc-with-hard-kill))
 
 (in-package #:dsmr-mcp/src/hermetic/pool)
@@ -161,6 +164,28 @@ for *circuit-breaker-cooldown* seconds.")
 During the cooldown window, get-or-assign-worker signals an error
 immediately rather than attempting to spawn a replacement worker.
 After the window expires, the session may spawn a new worker normally.")
+
+(define-condition circuit-breaker-active (error)
+  ((session-id :initarg :session-id
+               :reader circuit-breaker-active-session-id)
+   (remaining-seconds :initarg :remaining-seconds
+                      :reader circuit-breaker-active-remaining-seconds))
+  (:report (lambda (c s)
+             (format s "Circuit breaker active for session ~A; ~Ds remaining in ~
+cooldown. The worker crashed ~D times in ~Ds. Manual reset via release-session."
+                     (circuit-breaker-active-session-id c)
+                     (circuit-breaker-active-remaining-seconds c)
+                     *crash-breaker-threshold*
+                     *crash-breaker-window*)))
+  (:documentation "Signaled when a session's worker has crashed repeatedly enough that
+the pool refuses further calls instead of spawning another replacement.
+
+It lives beside the breaker's own tuning parameters rather than with the other
+pool conditions so its report can read them without a forward reference.
+
+Carries the session and how many seconds of the cooldown remain, so a caller at
+the dispatch boundary can tell the agent how long to wait rather than only that
+something failed."))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Parent hard-kill backstop — dsmr-mcp addition over cl-mcp
@@ -787,7 +812,8 @@ trip within *circuit-breaker-cooldown* seconds and fails fast with an error.
 
 Signals pool-shutting-down if the pool is not running.
 Signals pool-capacity-exceeded if max workers would be exceeded.
-Signals error with 'Circuit breaker' in message during the cooldown window."
+Signals circuit-breaker-active both when the breaker trips and on any later
+call inside the cooldown window; the condition carries the seconds remaining."
   (let ((entry nil) (need-spawn nil) (assigned-from-standby nil)
         (need-reset nil) (old-worker-to-kill nil)
         (circuit-breaker-tripped nil))
@@ -801,10 +827,9 @@ Signals error with 'Circuit breaker' in message during the cooldown window."
                    (< (get-universal-time) (+ trip-time *circuit-breaker-cooldown*)))
           (let ((remaining (- (+ trip-time *circuit-breaker-cooldown*)
                               (get-universal-time))))
-            (error "Circuit breaker active for session ~A; ~As remaining in cooldown. ~
-The worker crashed ~D times in ~Ds. Manual reset via release-session."
-                   session-id (ceiling remaining)
-                   *crash-breaker-threshold* *crash-breaker-window*))))
+            (error 'circuit-breaker-active
+                   :session-id session-id
+                   :remaining-seconds (ceiling remaining)))))
       (setf entry (gethash session-id *affinity-map*))
       (cond
         ;; Path 1: existing bound worker — return immediately
@@ -881,10 +906,9 @@ The worker crashed ~D times in ~Ds. Manual reset via release-session."
                  "threshold" *crash-breaker-threshold*
                  "window_seconds" *crash-breaker-window*
                  "cooldown_seconds" *circuit-breaker-cooldown*)
-      (error "Circuit breaker tripped for session ~A: worker crashed ~D times ~
-within ~Ds. Failing fast for ~Ds. Manual reset via release-session."
-             session-id *crash-breaker-threshold* *crash-breaker-window*
-             *circuit-breaker-cooldown*))
+      (error 'circuit-breaker-active
+             :session-id session-id
+             :remaining-seconds *circuit-breaker-cooldown*))
     (cond
       (assigned-from-standby
        (%schedule-replenish)
