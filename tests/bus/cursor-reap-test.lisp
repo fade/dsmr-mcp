@@ -191,18 +191,29 @@
       (is = 1 (broker:advance-held-cursors paths 9))
       (is = 9 (cursor-seq path)))))
 
-(define-test a-held-cursor-is-still-a-bare-printed-integer
-  "The format did not widen. Every existing reader treats anything that is not a
-   non-negative integer as position zero, silently, so a richer cursor file would
-   not fail against an older reader: it would quietly send that agent back to the
-   start of the log."
+(define-test a-held-cursor-still-leads-with-its-bare-position
+  "The position is still the first thing in the file and still a bare
+   non-negative integer.
+
+   What that protects is the older reader. Every reader of a cursor file takes a
+   single form from it and treats anything that is not a non-negative integer as
+   position zero, silently, so a file it cannot make sense of does not fail
+   against it: it quietly sends that agent back to the start of the log. A file
+   that leads with the position survives such a reader unchanged; one that leads
+   with anything else, or that prints the position inside a larger structure,
+   does not. The file may now carry the generation the position was taken
+   against, after the position, and that is the whole of what it may add here."
   (with-bus-root (paths)
     (let* ((id (stable-id "plain"))
            (path (seed-cursor paths id :seq 1)))
       (record-departure paths id)
       (broker:advance-held-cursors paths 12)
-      (is equal "12" (string-trim '(#\Space #\Newline #\Return)
-                                  (uiop:read-file-string path))))))
+      (let ((text (string-trim '(#\Space #\Newline #\Return)
+                               (uiop:read-file-string path))))
+        (is equal "12" (first (uiop:split-string text :separator " "))
+            "the position leads the file, unadorned"))
+      (is eql 12 (with-open-file (in path) (read in nil nil))
+          "one form off the front is the position itself, not zero"))))
 
 (define-test a-held-cursor-pins-nothing
   "Having tracked the head, a departed agent has nothing pending, so it can never
