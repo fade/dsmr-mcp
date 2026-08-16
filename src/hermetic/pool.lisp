@@ -45,6 +45,7 @@
                 #:worker-last-crash-reason #:worker-last-exit-status
                 #:worker-last-exit-code
                 #:mark-worker-crashed
+                #:worker-ping #:worker-unresponsive
                 #:worker-liveness #:worker-liveness-basis
                 #:worker-last-ping-milliseconds
                 #:worker-consecutive-missed-pings
@@ -158,7 +159,11 @@ scheduler starvation on a loaded host is enough to produce one. Requiring two in
 a row costs one extra tick of detection latency and removes that whole class of
 false wedge. It is the same reasoning that makes the crash breaker count crashes
 inside a window rather than trip on the first one, applied to a probe that has
-none of a crash's recovery cost to weigh on the other side.")
+none of a crash's recovery cost to weigh on the other side.
+
+Reaching this count does two things at once: it establishes :wedged in the
+record and it retires the worker. Nothing hands out a worker that has been
+classified wedged.")
 
 (defvar *shutdown-replenish-wait-seconds* 0.05d0
   "Polling interval (seconds) while waiting for replenish thread shutdown.")
@@ -628,6 +633,59 @@ it with a value it did not measure."
     (setf (worker-last-ping-milliseconds worker) milliseconds))
   classification)
 
+(defun %retire-unresponsive-worker (worker)
+  "Take a worker that has stopped answering out of service.
+
+Reaching *missed-pings-before-wedged* is the point at which a silence stops
+looking like a pause and starts looking like a worker that will never answer
+again. From there the worker goes through the same path a detected crash takes:
+it leaves the standby list, its process is killed, and a replacement is
+scheduled.
+
+This is what keeps the tolerance honest. The probe no longer condemns a worker
+for one silence, and nothing has been loosened about what happens once the
+silence is established. The crash reason is corrected afterwards, because the
+shared path stamps 'process-died' and the whole point of this case is that the
+process had not died.
+
+Costs this thread the length of one kill, which is bounded by the terminate
+grace period. It rides the health monitor's own tick, where that is affordable,
+and only once per worker."
+  (%handle-worker-crash worker)
+  (setf (worker-last-crash-reason worker) "unresponsive"))
+
+(defun %record-missed-ping (worker condition)
+  "Record what a failed liveness probe on WORKER established, if anything.
+
+CONDITION is whatever the probe signalled. It is deliberately not dispatched on:
+the classification turns on whether the process is still there, which is the
+question that separates a worker that has gone from a worker that is present and
+silent, and no condition class answers that as well as looking.
+
+A process that has gone establishes :dead at once. A process that is still
+running counts one more silence, and establishes :wedged only when the count
+reaches *missed-pings-before-wedged*, at which point the worker is retired."
+  (cond
+    ((not (%worker-process-alive-p worker))
+     (%record-liveness worker :dead :active-probe)
+     (log-event :warn "pool.monitor.ping-worker-gone"
+                "worker_id" (worker-id worker)
+                "pid" (worker-pid worker)
+                "error" (princ-to-string condition)))
+    (t
+     (let ((missed (incf (worker-consecutive-missed-pings worker))))
+       (when (>= missed *missed-pings-before-wedged*)
+         (%record-liveness worker :wedged :active-probe)
+         (%retire-unresponsive-worker worker))
+       (log-event :warn "pool.monitor.ping-missed"
+                  "worker_id" (worker-id worker)
+                  "pid" (worker-pid worker)
+                  "consecutive_missed" missed
+                  "threshold" *missed-pings-before-wedged*
+                  "liveness" (string-downcase
+                              (symbol-name (worker-liveness worker)))
+                  "error" (princ-to-string condition))))))
+
 (defun %ping-idle-worker (worker)
   "Ask WORKER a real question and record what the answer established.
 
@@ -648,51 +706,29 @@ reached a conclusion rather than the age of the last attempt. Restamping on
 every tick would make a value that has not been confirmed for a minute look as
 fresh as one confirmed a second ago, which is the whole failure this record
 exists to prevent. Only once *missed-pings-before-wedged* misses have
-accumulated in a row is :wedged established and stamped.
+accumulated in a row is :wedged established and stamped, and only then is the
+worker taken out of service.
+
+That tolerance is why the probe goes through WORKER-PING rather than WORKER-RPC:
+WORKER-RPC ends a worker on its first timeout, which would make the missed-ping
+count unreachable past one and leave a worker retired for a garbage collection
+pause.
 
 A miss from a worker whose process has gone establishes :dead at once: the wedge
 case is an addition to the crash case, never a replacement for it, and a dead
 process must not be reported as merely unresponsive.
 
-Note that a probe expiring also routes through the ordinary crash handling in
-worker-rpc, which closes the stream. That is deliberate: an idle worker that
-will not answer a ping has nothing left to offer a session. The classification
-recorded here says how that was found out, which the worker's own state does
-not.
-
 Returns T when the worker answered."
-  (let ((start (get-internal-real-time)))
-    (handler-case
-        (progn
-          (worker-rpc worker "worker/ping" (make-hash-table :test 'equal)
-                      :timeout *worker-ping-timeout-seconds*)
-          (setf (worker-consecutive-missed-pings worker) 0)
-          (%record-liveness worker :healthy :active-probe
-                            :milliseconds
-                            (round (* 1000 (- (get-internal-real-time) start))
-                                   internal-time-units-per-second))
-          t)
-      (error (e)
-        (cond
-          ((not (%worker-process-alive-p worker))
-           (%record-liveness worker :dead :active-probe)
-           (log-event :warn "pool.monitor.ping-worker-gone"
-                      "worker_id" (worker-id worker)
-                      "pid" (worker-pid worker)
-                      "error" (princ-to-string e)))
-          (t
-           (let ((missed (incf (worker-consecutive-missed-pings worker))))
-             (when (>= missed *missed-pings-before-wedged*)
-               (%record-liveness worker :wedged :active-probe))
-             (log-event :warn "pool.monitor.ping-missed"
-                        "worker_id" (worker-id worker)
-                        "pid" (worker-pid worker)
-                        "consecutive_missed" missed
-                        "threshold" *missed-pings-before-wedged*
-                        "liveness" (string-downcase
-                                    (symbol-name (worker-liveness worker)))
-                        "error" (princ-to-string e)))))
-        nil))))
+  (handler-case
+      (let ((milliseconds (worker-ping worker
+                                       :timeout *worker-ping-timeout-seconds*)))
+        (setf (worker-consecutive-missed-pings worker) 0)
+        (%record-liveness worker :healthy :active-probe
+                          :milliseconds milliseconds)
+        t)
+    (error (e)
+      (%record-missed-ping worker e)
+      nil)))
 
 (defun %infer-bound-worker-liveness (worker)
   "Record what the traffic already reaching a bound WORKER establishes.
