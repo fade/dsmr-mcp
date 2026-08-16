@@ -23,7 +23,9 @@
                 #:parse-slynk-attach)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
+  (:import-from #:usocket)
   (:export #:classify-port
+           #:probe-image-liveness
            #:slynk-handshake-path
            #:read-slynk-handshake
            #:resolve-slynk-target))
@@ -57,6 +59,73 @@ and tight enough not to stall startup badly when a foreign port is occupied."
       (if (eql result 42)
           :live-slynk
           :foreign))))
+
+(defun %release-probe-connection (conn)
+  "Release CONN, a throwaway probe connection, and let its reader thread die.
+
+SLIME-CLOSE is a polite goodbye and nothing more: it sends and returns, and
+the client's event-dispatcher thread stays parked on its read until the peer
+answers.  An image that is not answering never does, so a close on its own
+leaves a thread and a socket behind on every probe.  Measured against a
+listener that accepts and never speaks: twenty probes, twenty threads, twenty
+descriptors, none of them released afterwards.
+
+Shutting the socket down delivers EOF to that parked read, so the dispatcher
+unwinds through its connection-closed path and closes the descriptor as it
+goes.  The two together give a peer that is answering a clean protocol
+farewell and a peer that is not a bounded one.  Shutdown cannot block.
+
+SLYNK-CLIENT does not export its socket reader; this is our fork, so the
+internal reference is stable.  The same reasoning and the same call are in
+the connection-drop path."
+  (ignore-errors (slime-close conn))
+  (ignore-errors (usocket:socket-shutdown (slynk-client::usocket conn) :io))
+  nil)
+
+(defun probe-image-liveness (host port &key (timeout 0.5))
+  "Ask the image at HOST:PORT a real question and return what the answer proves.
+
+Returns two values, the classification and the round trip in milliseconds:
+
+  :healthy  the evaluation returned the expected value.
+  :wedged   the connection was accepted and the evaluation did not return
+            within TIMEOUT.  The image is alive and no longer answering, which
+            a TCP connect on its own reports as healthy forever.
+  :dead     the connection was refused or reset.  Nothing is answering the
+            port at all, which is a different fact and a different repair.
+
+The three are kept apart rather than collapsed into a single failure, because
+a refused socket means the image has gone and a silent socket means it is
+still there holding whatever state the developer built up in it.
+
+TIMEOUT defaults to the value the port classifier already uses.  A loopback
+round trip against an image that is answering is normally well under 70
+milliseconds, so half a second separates a genuine silence from a slow reply
+without stalling the caller.  It is a keyword argument so a caller that knows
+its image is local can tighten it.
+
+The probe opens its own connection with SLIME-CONNECT and closes it again.  It
+never acquires the process-wide lock that serialises attached dispatch, never
+acquires a session's own call lock, and never touches a session's cached
+connection.  That is the whole point of opening a throwaway connection: a probe
+that waits behind the lock real work is holding reports a busy image as a
+wedged one, and a busy image is not a dead one.  Sharing the session's cached
+connection would have the same effect for the same reason."
+  (let ((start (get-internal-real-time)))
+    (flet ((elapsed-ms ()
+             (round (* 1000 (- (get-internal-real-time) start))
+                    internal-time-units-per-second)))
+      (let ((conn (handler-case (slime-connect host port)
+                    (error () nil))))
+        (unless conn
+          (return-from probe-image-liveness (values :dead (elapsed-ms))))
+        (unwind-protect
+             (let ((answered (handler-case
+                                 (eql 42 (bounded-slime-eval '(+ 40 2) conn
+                                                             :timeout timeout))
+                               (error () nil))))
+               (values (if answered :healthy :wedged) (elapsed-ms)))
+          (%release-probe-connection conn))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Project identity probe
