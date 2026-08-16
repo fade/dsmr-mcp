@@ -31,10 +31,14 @@
 
 (defpackage #:dsmr-mcp/src/bus/status
   (:use #:cl)
-  (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker))
+  (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
+                    (#:roster #:dsmr-mcp/src/bus/roster)
+                    (#:election #:dsmr-mcp/src/bus/election))
   (:export #:process-alive-p
            #:parent-pid
-           #:broker-identity))
+           #:broker-identity
+           #:lock-holder-count
+           #:rotation-armed))
 
 (in-package #:dsmr-mcp/src/bus/status)
 
@@ -260,3 +264,214 @@
           "no identity record on this bus names a version"
           "it does not establish anything about the source the broker is serving."
           "a broker starts on this bus and records the version its image reports")))))
+
+;;; ------------------------------------------------- reading the lock table
+;;;
+;;; How many open file descriptions hold a lock on a given file, read without
+;;; taking, converting or opening a lock on that file. The kernel publishes one
+;;; row per open file description, so counting rows counts holders, and two
+;;; descriptors opened by a single process show up as two rows rather than one.
+;;;
+;;; The whole of the difficulty is correlating a row to the file. Measured on
+;;; this machine, and the reason none of this is shorter:
+;;;
+;;;   - The inode column agrees exactly with what a stat of the file reports.
+;;;   - The device column does NOT agree with the device number a stat reports,
+;;;     on the filesystem the real bus roots live on. That filesystem gives each
+;;;     subvolume an anonymous device number which is not the superblock device
+;;;     the kernel prints, and the minor is printed in lowercase hexadecimal
+;;;     besides. Encoding the stat value therefore matches nothing in
+;;;     production while passing every test written against a memory filesystem.
+;;;   - The pid column names the process that CREATED the lock, and the row
+;;;     outlives that process whenever a child inherited the descriptor.
+
+(defun %lock-table-rows ()
+  "(values ROWS READABLE-P) for the kernel's lock table.
+
+   The second value exists because an unreadable table and an empty one are
+   different answers. Reporting the first as a count of zero would say that
+   nothing holds the lock, which is the strongest possible claim, on the
+   strength of having failed to look."
+  (let ((rows (ignore-errors
+               (with-open-file (in "/proc/locks" :if-does-not-exist nil)
+                 (when in
+                   (cons :read
+                         (loop for line = (read-line in nil nil)
+                               while line collect line)))))))
+    (if rows (values (cdr rows) t) (values nil nil))))
+
+(defun %row-tokens (line)
+  "LINE split on runs of whitespace, with empty pieces dropped."
+  (let ((tokens '())
+        (start nil))
+    (dotimes (i (length line))
+      (let ((ch (char line i)))
+        (if (member ch '(#\Space #\Tab))
+            (when start
+              (push (subseq line start i) tokens)
+              (setf start nil))
+            (unless start (setf start i)))))
+    (when start (push (subseq line start) tokens))
+    (nreverse tokens)))
+
+(defun %classify-row (tokens)
+  "(values KIND COLUMN PID) for one row of the lock table.
+
+   KIND is :HOLDER for a row naming a held lock, :WAITER for the indented
+   continuation row printed for a process blocked on one, :BLANK for nothing,
+   and :UNPARSEABLE for a shape this does not recognise.
+
+   A waiter holds nothing, so counting it would inflate the holder count and
+   report a bus as busier than it is. The device and inode columns are located
+   from the END of the row rather than by a fixed index, because the leading
+   columns shift under those continuation rows."
+  (let ((n (length tokens)))
+    (cond ((zerop n) (values :blank nil nil))
+          ((< n 6) (values :unparseable nil nil))
+          ((string= (second tokens) "->") (values :waiter nil nil))
+          (t (let ((column (nth (- n 3) tokens))
+                   (pid (parse-integer (nth (- n 4) tokens) :junk-allowed t)))
+               (if (and column pid (= 2 (count #\: column)))
+                   (values :holder column pid)
+                   (values :unparseable nil nil)))))))
+
+(defun %calibrated-device-column (path)
+  "The device column the lock table prints for files in PATH's directory, or NIL
+   when it cannot be learned.
+
+   Learned rather than computed, for the reason set out above: encoding the
+   device number a stat reports is measurably wrong on the filesystem the real
+   bus roots live on. So a throwaway file is created beside PATH, locked, found
+   in the table by its own inode, and removed. Whatever the filesystem does with
+   device numbers, the answer is the string the kernel actually prints, with no
+   hexadecimal arithmetic anywhere.
+
+   The lock is taken on the throwaway file and on nothing else. PATH itself is
+   never opened here, so calibrating cannot perturb the count that is about to
+   be taken on it, and the throwaway is removed on every way out including an
+   error."
+  (let* ((dir (uiop:pathname-directory-pathname path))
+         (probe (merge-pathnames (format nil "devcal-~D" (random 100000000)) dir))
+         (fd nil))
+    (unwind-protect
+         (ignore-errors
+          (setf fd (election:open-lock probe))
+          (election:lock-shared fd)
+          (let ((inode (sb-posix:stat-ino (sb-posix:stat (namestring probe)))))
+            (multiple-value-bind (rows readable) (%lock-table-rows)
+              (when readable
+                (dolist (line rows)
+                  (multiple-value-bind (kind column) (%classify-row (%row-tokens line))
+                    (when (eq kind :holder)
+                      (let ((cut (position #\: column :from-end t)))
+                        (when (and cut
+                                   (eql inode (parse-integer column :start (1+ cut)
+                                                                    :junk-allowed t)))
+                          (return (subseq column 0 cut)))))))))))
+      (when fd
+        (ignore-errors (election:unlock fd))
+        (ignore-errors (election:close-lock fd)))
+      (ignore-errors (when (probe-file probe) (delete-file probe))))))
+
+(defun lock-holder-count (path)
+  "How many open file descriptions hold a lock on PATH right now, or NIL when
+   the kernel's lock table cannot be read or cannot be correlated to this file.
+
+   One row per open file description, so the row count IS the holder count.
+   That is what the answer turns on: a lock belongs to an open file description
+   rather than to a process or to a path, so two descriptors held by one process
+   are two holders and are visible as two.
+
+   PATH is stat'ed afresh on every call and its inode is never cached across
+   calls. A file deleted and recreated gets a new inode, and a cached one would
+   go on counting for a file that no longer exists, silently.
+
+   A row this does not recognise abandons the whole count rather than being
+   skipped: a count taken from a table whose shape has changed underneath is
+   worth less than no count at all, and a caller that meets NIL falls back to an
+   answer that says it is the weaker one."
+  (let ((inode (ignore-errors (sb-posix:stat-ino (sb-posix:stat (namestring path))))))
+    (when inode
+      (multiple-value-bind (rows readable) (%lock-table-rows)
+        (when readable
+          (let ((device (%calibrated-device-column path)))
+            (when device
+              (let ((wanted (format nil "~A:~D" device inode))
+                    (holders 0))
+                (dolist (line rows holders)
+                  (multiple-value-bind (kind column) (%classify-row (%row-tokens line))
+                    (case kind
+                      (:holder (when (string= column wanted) (incf holders)))
+                      (:unparseable (return nil))
+                      (t nil))))))))))))
+
+(defun rotation-armed (paths)
+  "Whether a member leaving the bus at PATHS right now would seal the log.
+   Returns one stated fact, with the number of holders it counted alongside it.
+
+   The log rotates when the LAST member leaves cleanly, so the question is
+   whether exactly one open file description still holds the membership lock.
+   It is reported as a condition with its basis attached, never left to be
+   worked out from a member count by whoever is reading, because that
+   reconstruction is where a quiet bus was once relayed to a peer fleet as an
+   operational hazard.
+
+   Two things that look like the right implementation are wrong, and both are
+   worth stating because a maintainer will reach for them.
+
+   The upgrade-to-exclusive test in the election leaf must never be called from
+   here. It is the primitive the clean-shutdown path itself uses, so it looks
+   exactly like the answer, and it is: on success it converts the caller's own
+   shared lock to an exclusive one, and there is no downgrade anywhere in this
+   tree. The reader silently becomes the exclusive holder and every subsequent
+   join blocks, invisibly to whoever ran it, because they believed they were
+   reading. Nothing in this function's call path touches it.
+
+   Opening a fresh descriptor on the membership file just to test the lock is
+   wrong differently. A lock belongs to an open file description, not to a
+   process and not to a path, so a new descriptor taken inside a process that
+   already holds one collides with its own and answers `not last` for ever,
+   whatever the real membership is.
+
+   Where the kernel's lock table cannot answer, the advisory roster does, and
+   says so in its own terms. Where neither can, the answer is unknown with the
+   reason. Defaulting to armed or to not armed would both be claims, and one of
+   them is the claim this field exists to stop being made."
+  (let* ((members (broker:bus-paths-members paths))
+         (holders (lock-holder-count members)))
+    (if holders
+        (append
+         (%fact (if (= holders 1) "armed" "not-armed")
+                :establishes
+                (format nil "the kernel's lock table lists ~D open file description~:P holding a lock on this bus's membership file at this instant, and the log is sealed by the last member out"
+                        holders)
+                :does-not-establish
+                "it does not establish that the count still holds a moment later, since a member may join or leave between this read and anything done about it, and it says nothing about whether those holders are healthy, only that they exist. It settles nothing at all about a bus on another host."
+                :basis "active-probe"
+                :red-condition
+                "the holder count moves off one: another member joining makes this not armed, and the departure of every member but one makes it armed")
+         (list :holders holders))
+        (let* ((entries (ignore-errors
+                         (roster:members (broker:bus-paths-roster-dir paths))))
+               (enrolled (count-if (lambda (e) (eq (roster:entry-status e) :enrolled))
+                                   entries)))
+          (append
+           (if (plusp enrolled)
+               (%fact (if (= enrolled 1) "armed" "not-armed")
+                      :establishes
+                      (format nil "the kernel's lock table could not be read or could not be correlated to this bus's membership file, so the answer comes from the advisory roster, which records ~D enrolled agent~:P"
+                              enrolled)
+                      :does-not-establish
+                      "it does not establish that any enrolled agent holds the membership lock, nor that a lock holder is enrolled. The roster is an unenforced record of what agents declared: one that went away without saying so still holds its lock and is counted here as present, and one that joined without ever taking the lock is counted too. This is a materially weaker answer than a count taken from the kernel and is not a substitute for it."
+                      :basis "roster-advisory"
+                      :red-condition
+                      "an agent enrols or is disenrolled, which moves this count with nothing having happened to any lock")
+               (%fact "unknown"
+                      :establishes
+                      "neither mechanism could answer: the kernel's lock table was unreadable or could not be correlated to this bus's membership file, and the advisory roster records no enrolled agent to count instead"
+                      :does-not-establish
+                      "it does not establish that rotation is armed, and it does not establish that it is not. Both of those are claims, and one of them is the claim that turned a quiet bus into a reported hazard."
+                      :basis "passive-inference"
+                      :red-condition
+                      "the kernel's lock table becomes readable and correlatable, or an agent enrols on this bus"))
+           (list :holders nil))))))
