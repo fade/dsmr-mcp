@@ -59,6 +59,12 @@
     (ensure-directories-exist archive)
     (uiop:copy-file wal-path archive)
     (%empty-file wal-path)
+    ;; Last, and only once the seal has actually happened. The generation is how
+    ;; a reader tells "nothing new" from "I am reading against a log that no
+    ;; longer exists", so it has to move exactly when the log it names is
+    ;; replaced. An archive that failed to copy leaves the live log where it was
+    ;; and must leave the generation there too.
+    (wal:bump-generation wal-path)
     archive))
 
 (defun last-member-p (members-fd)
