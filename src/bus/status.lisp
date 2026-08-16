@@ -33,12 +33,18 @@
   (:use #:cl)
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:roster #:dsmr-mcp/src/bus/roster)
+                    (#:cursor #:dsmr-mcp/src/bus/cursor)
+                    (#:wal #:dsmr-mcp/src/bus/wal)
+                    (#:heartbeat #:dsmr-mcp/src/bus/heartbeat)
                     (#:election #:dsmr-mcp/src/bus/election))
   (:export #:process-alive-p
            #:parent-pid
            #:broker-identity
            #:lock-holder-count
-           #:rotation-armed))
+           #:rotation-armed
+           #:cursor-inventory
+           #:identity-visibility
+           #:+default-cursor-fresh-window-seconds+))
 
 (in-package #:dsmr-mcp/src/bus/status)
 
@@ -475,3 +481,207 @@
                       :red-condition
                       "the kernel's lock table becomes readable and correlatable, or an agent enrols on this bus"))
            (list :holders nil))))))
+
+;;; ------------------------------------------------- who holds what, and who reads
+;;;
+;;; Three records describe the participants on a bus and none of them is
+;;; authoritative. The roster says who declared themselves. The cursors say what
+;;; positions exist. The watch beats say something wrote recently. Read
+;;; carefully together they show a great deal; read as a liveness check any one
+;;; of them is wrong, and the ways each is wrong are stated beside the answers
+;;; rather than left for a reader to discover.
+
+(defconstant +default-cursor-fresh-window-seconds+ 300
+  "How recently a cursor must have been written to count as advancing.
+
+   Far wider than the watch heartbeat's window, and for a different reason. A
+   beat is rewritten every poll whatever the traffic, so its freshness is about
+   the watcher. A cursor moves only when a message is delivered, so on a quiet
+   bus every cursor goes stale while every reader is perfectly healthy. The
+   width is what keeps this from reading as a liveness check; the stated bound
+   is what keeps it from being used as one.")
+
+(defun cursor-inventory (paths)
+  "Every cursor on the bus at PATHS: what each one holds, whether it is
+   stranded and how, how old it is, and whether its identity is ephemeral or
+   stable. Returns the rows under a stated fact, with counts beside them.
+
+   The counts are returned rather than left to be taken from the list, because
+   unreaped accumulation is the thing worth seeing and nobody notices the length
+   of a list they did not print. One cursor is written per subagent session, so
+   a directory that has grown into the hundreds is the ordinary way this shows.
+
+   Whether an identity is ephemeral is decided by the predicate the cursor sweep
+   itself decides eligibility with, and by no other rule. If this surface and
+   that sweep ever came to disagree about the word, both would be untrustworthy
+   and neither failure would be visible.
+
+   The head and the log's generation are read once and passed to every row. They
+   are properties of the log rather than of any cursor, and reading them per
+   cursor costs a full pass over the log each time: on the largest live bus that
+   is the difference between an answer and a quarter of a minute of waiting.
+
+   Every file in the cursor directory is listed, including one that does not
+   look like a cursor. A stray file there is worth seeing rather than filtering
+   away, since something put it there."
+  (let* ((dir (broker:bus-paths-cursors-dir paths))
+         (log (broker:bus-paths-wal paths))
+         (files (or (ignore-errors (uiop:directory-files dir)) '()))
+         (head (ignore-errors (wal:scan log)))
+         (generation (ignore-errors (wal:generation log)))
+         (now (get-universal-time))
+         (rows '()))
+    (dolist (file files)
+      (let* ((name (file-namestring file))
+             (sub (cursor:make-subscriber name log file))
+             (written (ignore-errors (file-write-date file))))
+        (multiple-value-bind (position log-head recorded current)
+            (if (and head generation)
+                (cursor:cursor-and-head sub :head head :log-generation generation)
+                (values (ignore-errors (cursor:cursor-value sub)) head nil generation))
+          (push (list :name name
+                      :ephemeral (broker:ephemeral-cursor-name-p name)
+                      :cursor position
+                      :head log-head
+                      :recorded-generation recorded
+                      :log-generation current
+                      :stranded-reason
+                      (when (and head generation)
+                        (ignore-errors
+                         (cursor:stranded-reason sub :head head
+                                                     :log-generation generation)))
+                      :age-seconds (and written (- now written)))
+                rows))))
+    (setf rows (nreverse rows))
+    (list
+     :count
+     (%fact (length rows)
+            :establishes
+            "how many files exist in this bus's cursor directory right now"
+            :does-not-establish
+            "it does not establish how many participants are reading. A cursor outlives the session that wrote it, so this counts positions on record and not agents at work."
+            :basis "durable-record")
+     :ephemeral-count
+     (%fact (count-if (lambda (row) (getf row :ephemeral)) rows)
+            :establishes
+            "how many of those files carry the auto-generated per-process name shape, decided by the same predicate the cursor sweep uses"
+            :does-not-establish
+            "it does not establish how many are eligible to be swept away. Eligibility also requires the file to be old, and dropping that condition would take a live subagent's position the moment a broker restarted."
+            :basis "durable-record")
+     :stranded-count
+     (%fact (count-if (lambda (row) (getf row :stranded-reason)) rows)
+            :establishes
+            "how many of those positions cannot be positions in the log as it now stands, either because they name a record past its end or because they were taken against a log that has since been replaced"
+            :does-not-establish
+            "it does not establish that the rest are sound. A cursor written before generations were recorded names no generation at all, so it cannot be found mismatched, and on a bus whose cursors all predate that this count reports the absence of evidence rather than the absence of the fault."
+            :basis "durable-record")
+     :cursors
+     (%fact rows
+            :establishes
+            "for each file in this bus's cursor directory: the position it holds, the log head and generation it was compared against, why it is stranded if it is, how long since it was last written, and whether its name is ephemeral or stable"
+            :does-not-establish
+            "a row does not establish that the identity it is named for is running, or that the position was written by that identity. A cursor file is a durable position and nothing else, and the two live buses this was read on hold hundreds of them whose sessions ended long ago."
+            :basis "durable-record"))))
+
+(defun identity-visibility (paths &key
+                                    (watch-dir (merge-pathnames
+                                                "watch/" (broker:bus-paths-root paths)))
+                                    (fresh-window-seconds
+                                     +default-cursor-fresh-window-seconds+))
+  "Who is enrolled on the bus at PATHS, who holds a cursor without being
+   enrolled, and what the watch beats say. Returns three stated facts.
+
+   For each enrolled identity: whether it has a cursor, how recently that cursor
+   was written, and whether it recorded leaving. For each cursor with no roster
+   entry: whether the name is an auto-generated per-process one, which is
+   ordinary, or a stable name reading with no enrollment, which is the shape of
+   a participant working under a borrowed identity and is invisible today while
+   it is happening.
+
+   WATCH-DIR defaults to the watch directory under this bus's own root. A caller
+   that knows the bus by name should pass the watch directory that leaf derives
+   for that name, rather than relying on the default agreeing with it.
+
+   Three bounds hold over everything returned here and are attached to the facts
+   they belong to, because each has been trusted further than it goes:
+
+   The roster is advisory and unenforced. An entry establishes that an identity
+   declared itself once, not that any process exists now.
+
+   A cursor's freshness establishes that something advanced that cursor. It does
+   not establish that the intended agent did, and an identity being read under by
+   the wrong process is precisely the case the unenrolled list exists to make
+   visible, so nothing here may claim to have ruled it out.
+
+   A watch beat establishes that a watcher wrote a file recently. It does not
+   establish that the watcher is armed on the right bus, and it cannot detect a
+   missing recycle interval at all. That bound is carried forward as the beat's
+   own limit rather than repaired here."
+  (let* ((entries (or (ignore-errors (roster:members (broker:bus-paths-roster-dir paths)))
+                      '()))
+         (files (or (ignore-errors
+                     (uiop:directory-files (broker:bus-paths-cursors-dir paths)))
+                    '()))
+         (now (get-universal-time))
+         (claimed '())
+         (members '()))
+    (dolist (entry entries)
+      (let* ((id (roster:entry-id entry))
+             (name (and (stringp id)
+                        (file-namestring (broker:cursor-path-for paths id))))
+             (file (and name (find name files :key #'file-namestring :test #'string=)))
+             (written (and file (ignore-errors (file-write-date file))))
+             (age (and written (- now written))))
+        (when name (push name claimed))
+        (push (list :id id
+                    :status (roster:entry-status entry)
+                    :departed-at (roster:entry-departed-at entry)
+                    :cursor-name name
+                    :has-cursor (and file t)
+                    :ephemeral (and name (broker:ephemeral-cursor-name-p name))
+                    :cursor-age-seconds age
+                    :cursor-advanced-recently (and age (<= age fresh-window-seconds)))
+              members)))
+    (let ((members (nreverse members))
+          (unenrolled
+            (loop for file in files
+                  for name = (file-namestring file)
+                  unless (member name claimed :test #'string=)
+                    collect (list :name name
+                                  :kind (if (broker:ephemeral-cursor-name-p name)
+                                            "ephemeral"
+                                            "stable-without-enrollment"))))
+          (beats
+            (loop for entry in entries
+                  for id = (roster:entry-id entry)
+                  when (stringp id)
+                    collect (multiple-value-bind (status age pid)
+                                (heartbeat:beat-liveness
+                                 (heartbeat:beat-path id watch-dir)
+                                 heartbeat:+default-live-window-seconds+)
+                              (list :id id :status status
+                                    :age-seconds age :pid pid)))))
+      (list
+       :members
+       (%fact members
+              :establishes
+              "every identity this bus's roster records, with whether a cursor exists for it, how long since that cursor was written, and whether it recorded leaving"
+              :does-not-establish
+              "it does not establish that any of these identities is running. The roster is advisory and unenforced, so an entry says an identity declared itself and nothing more, and a departed entry keeps its cursor. Nor does a recently written cursor establish that the identity it is named for wrote it: it establishes only that something did."
+              :basis "roster-advisory")
+       :unenrolled
+       (%fact unenrolled
+              :establishes
+              "every cursor on this bus with no roster entry, separated into the auto-generated per-process names and the stable names"
+              :does-not-establish
+              "a stable name here does not establish that anybody is working under a borrowed identity. It establishes that a stable name holds a position on a bus that never enrolled it, which is the shape that case takes and also the shape left behind by an identity that was never enrolled in the first place. Distinguishing the two takes a person, and this makes the question askable rather than answering it."
+              :basis "durable-record"
+              :red-condition
+              "a stable name appears in this list, or one already here starts advancing")
+       :watch-beat
+       (%fact beats
+              :establishes
+              "for each enrolled identity, whether a watch heartbeat file exists for it under this bus's watch directory and how old it is"
+              :does-not-establish
+              "it does not establish that the watcher is armed on THIS bus. The beat says a watcher wrote recently and nothing about which bus it is listening to, and it cannot detect a missing recycle interval at all, so a watch that has gone silently deaf can go on beating. A live beat is therefore weaker evidence than it reads as, and a dead one is the stronger of the two answers."
+              :basis "durable-record")))))
