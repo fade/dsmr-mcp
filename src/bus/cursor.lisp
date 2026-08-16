@@ -242,7 +242,8 @@
 ;;; So the values are also available unclamped, beside the count rather than in
 ;;; place of it. Nothing here changes what is delivered to whom.
 
-(defun cursor-and-head (subscriber)
+(defun cursor-and-head (subscriber &key (head nil head-supplied-p)
+                                        (log-generation nil generation-supplied-p))
   "Where SUBSCRIBER stands, with nothing folded away: (values cursor head
    recorded-generation log-generation).
 
@@ -253,15 +254,25 @@
    has never been rotated since the counter existed.
 
    A caller handed these four can ask any question it needs to. A caller handed
-   a clamped count cannot recover the fact the clamp discarded."
+   a clamped count cannot recover the fact the clamp discarded.
+
+   HEAD and LOG-GENERATION may be supplied by a caller that already holds them.
+   Both are properties of the LOG rather than of this subscriber, and finding
+   the head costs a read of the whole log, so a caller walking every cursor on
+   one bus reads them once and passes them in rather than paying that read
+   hundreds of times for one answer. Left out, they are read here, which is what
+   a caller holding a single subscriber should do. Supplying values taken from
+   some other log is a way to get a wrong answer quietly, so only a caller that
+   read them from THIS subscriber's log may pass them."
   (let ((path (subscriber-cursor-path subscriber))
         (log (subscriber-wal subscriber)))
     (values (cursor-value subscriber)
-            (wal:scan log)
+            (if head-supplied-p head (wal:scan log))
             (%recorded-generation path)
-            (wal:generation log))))
+            (if generation-supplied-p log-generation (wal:generation log)))))
 
-(defun stranded-reason (subscriber)
+(defun stranded-reason (subscriber &key (head nil head-supplied-p)
+                                        (log-generation nil generation-supplied-p))
   "Why SUBSCRIBER cannot be reading the log it thinks it is reading, or NIL when
    its position is a sound one.
 
@@ -281,7 +292,11 @@
    generation being recorded, so nothing is known about which log it belongs to,
    and calling an unknown a disagreement would report every cursor written
    before this existed as stranded."
-  (multiple-value-bind (cursor head recorded current) (cursor-and-head subscriber)
+  (multiple-value-bind (cursor head recorded current)
+      (apply #'cursor-and-head subscriber
+             (append (when head-supplied-p (list :head head))
+                     (when generation-supplied-p
+                       (list :log-generation log-generation))))
     (cond ((> cursor head) :cursor-above-head)
           ((and recorded (/= recorded current)) :generation-mismatch)
           (t nil))))
