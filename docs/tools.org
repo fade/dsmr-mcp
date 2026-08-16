@@ -6,6 +6,30 @@
 # diverge from the schema the server actually advertises and fail the parity
 # test. Regenerate instead of editing.
 
+* attach-reset
+
+Force-drop and reopen this session's connection to the 
+developer's Lisp image, in place and without restarting the server. Use it 
+when the image accepts connections and answers nothing, or when a connection 
+has to be re-established after a fault. In-image state is untouched: this 
+resets the wire, not the image, so definitions and application state built up 
+in the developer's image survive. 
+It affects only the calling session's own connection. No other session's 
+connection is dropped, and no other session can be named: the verb takes no 
+arguments at all. 
+The response reports the connection epoch after the reset. That is what makes 
+a reset observable to somebody else: a call already in flight when the reset 
+lands sees the epoch move under it and can tell it was reset rather than that 
+it merely failed. Only available in attached mode.
+
+#+begin_src json
+{
+  "properties": {},
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
 * bus-leave
 
 Leave a coordination bus cleanly. This agent reads out whatever 
