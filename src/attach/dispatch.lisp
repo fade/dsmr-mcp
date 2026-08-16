@@ -350,7 +350,7 @@ the classification: a session that is neither calling nor being asked about is
 not being probed, so the recorded time is the reader's only guide to how old
 the answer is.")
 
-(defun refresh-attached-liveness (tool host port)
+(defun refresh-attached-liveness (tool host port &key force)
   "Refresh TOOL's recorded liveness classification when it has gone stale.
 
 Returns the classification, refreshed by a probe when the recorded one is
@@ -358,6 +358,11 @@ older than *ATTACH-LIVENESS-PROBE-INTERVAL* seconds, and handed back untouched
 when it is younger.  A probe writes all four fields together: the
 classification, that an active probe established it, the round trip and the
 time.
+
+FORCE probes regardless of how fresh the record is.  It is for the moment a
+call has just failed, when the question is no longer what the image was doing
+half a minute ago but what it is doing now, and the answer decides what the
+caller is told.
 
 HOST and PORT name the image; they are the session's own attach target,
 already parsed by the caller.  The probe opens and closes its own connection,
@@ -371,7 +376,8 @@ and never again: the first failure would move the session into a state the
 refresh had no arm for, and the classification would stop at whatever that
 first probe happened to see."
   (let ((checked (repl-eval-tool-liveness-checked-at tool)))
-    (when (and checked
+    (when (and (not force)
+               checked
                (< (- (get-universal-time) checked)
                   *attach-liveness-probe-interval*))
       (return-from refresh-attached-liveness (repl-eval-tool-liveness tool)))
@@ -530,6 +536,20 @@ drops the dead connection and returns a structured isError envelope; the next
 call reopens on demand. When the connection was nil and reopened successfully,
 prepends a reconnect note to the stdout field.
 
+A failure carries an error_type drawn from the same fixed set the hermetic
+backend uses, so a caller handling backend failure writes one branch and not
+two. backend_wedged is a socket that stayed open while the evaluation did not
+come back; backend_crashed is a socket that was refused or closed, which from
+the caller's position means the same thing in either mode, that the backend
+which was there is gone; backend_reset is the connection having been dropped
+and reopened underneath an in-flight call.
+
+The fourth name the hermetic side uses, the one for a circuit breaker holding
+calls off through a cooldown, is deliberately absent from this file. Nothing
+in attached mode refuses calls for a cooling-off period, so emitting it would
+name a mechanism that does not exist here. Its absence is checkable: a search
+of this file for that name finds nothing, and that is the control.
+
 When register_result is true (the default) and the last form's result is
 inspectable, the response includes a result_object_id encoded as
 epoch:session-id:raw-id. The epoch is the current connection-incarnation epoch
@@ -542,7 +562,15 @@ so IDs minted before a drop-connection can be detected as stale."
          ;; register_result: absent or true => t; explicit jzon false/nil => nil.
          (register-result   (let ((v (gethash "register_result" params :missing)))
                               (if (eq v :missing) t (not (null v)))))
-         (reconnectedp      nil))
+         (reconnectedp      nil)
+         ;; Epoch at entry. A higher one at failure time means somebody else
+         ;; dropped and reopened the connection while this call was in flight,
+         ;; which is a reset rather than a backend that has gone.
+         (entry-epoch       (repl-eval-tool-connection-epoch tool))
+         ;; How far the call got before it failed. A failure at :connect means
+         ;; nothing accepted the socket; a failure at :eval means the socket
+         ;; was open and the evaluation is what did not come back.
+         (failure-stage     :connect))
     ;; Validate code parameter.
     (unless (and (stringp code) (plusp (length code)))
       (return-from %dispatch-attach
@@ -590,6 +618,9 @@ so IDs minted before a drop-connection can be detected as stale."
                        ;; instead of blocking the caller indefinitely.  The
                        ;; +15s margin keeps the client bound from firing
                        ;; before an honest eval of timeout_seconds finishes.
+                       ;; The socket is open from here on, so anything that
+                       ;; fails past this point failed at the evaluation.
+                       (setf failure-stage :eval)
                        (bounded-slime-eval form conn
                                            :timeout (+ timeout-seconds 15))))))
             ;; Destructure the 6-element result tuple from the remote image.
@@ -638,21 +669,73 @@ so IDs minted before a drop-connection can be detected as stale."
                  effective-limit
                  :result-object-id result-object-id))))
         (slime-network-error (e)
-          ;; Fail-closed: nil the cached connection so next call reopens.
-          (drop-connection tool :reason "network-error")
-          ;; Print the condition once into a guarded string, then reuse
-          ;; that string for both the log line and the user-facing
-          ;; payload.  Earlier the format call re-invoked the condition's
-          ;; print-object method, which on a dead connection could itself
-          ;; raise — escaping the handler and surfacing as a top-level
-          ;; error upstack.
-          (let ((msg (handler-case (princ-to-string e)
-                       (error () "<unprintable>"))))
-            (log-event :warn "attach.network-error" "error" msg)
-            (make-ht "isError" t
-                     "content"
-                     (text-content
-                      (format nil "attach: Slynk connection error: ~A" msg)))))))))
+          ;; Classify BEFORE dropping: drop-connection bumps the epoch, and
+          ;; the epoch comparison is what tells a reset apart from a backend
+          ;; that has gone.
+          (let* ((reset-p (> (repl-eval-tool-connection-epoch tool) entry-epoch))
+                 ;; Ask the image directly, now, on a connection this call
+                 ;; never touched.  What it was doing half a minute ago does
+                 ;; not decide what the caller should be told, and the stage
+                 ;; the call reached cannot tell a silent image from a dead
+                 ;; one: the first call after the image is killed fails at the
+                 ;; evaluation, on a socket that was open when the call began.
+                 (probed (refresh-attached-liveness tool host port :force t))
+                 (error-type (cond (reset-p                "backend_reset")
+                                   ((eq probed :wedged)    "backend_wedged")
+                                   ((eq probed :dead)      "backend_crashed")
+                                   ((eq failure-stage :connect) "backend_crashed")
+                                   ;; The image is answering a separate
+                                   ;; connection.  This call did not come
+                                   ;; back, and the backend did not fail;
+                                   ;; naming it a backend failure would be
+                                   ;; the false alarm this probe exists to
+                                   ;; remove.
+                                   (t nil)))
+                 ;; Print the condition once into a guarded string, then reuse
+                 ;; that string for both the log line and the user-facing
+                 ;; payload.  Earlier the format call re-invoked the
+                 ;; condition's print-object method, which on a dead
+                 ;; connection could itself raise, escaping the handler and
+                 ;; surfacing as a top-level error upstack.
+                 (msg (handler-case (princ-to-string e)
+                        (error () "<unprintable>")))
+                 (explanation
+                   (cond
+                     (reset-p
+                      "attach: the connection to the image was dropped and \
+reopened while this call was in flight, so the call was abandoned rather than \
+answered. Retrying is safe.")
+                     ((eq probed :wedged)
+                      "attach: the image accepts connections and answered \
+nothing on a fresh one. This describes the calling session's own connection \
+to the image and establishes nothing about any other session's; the attached \
+connection is a per-session resource, so one session's answer never speaks \
+for a peer.")
+                     ((or (eq probed :dead) (eq failure-stage :connect))
+                      "attach: nothing is answering at the image's address. \
+The image that was there is gone.")
+                     (t
+                      "attach: this call did not come back within its \
+timeout, and a fresh connection to the image was answered straight away, so \
+the image is still running. Nothing here establishes that the backend \
+failed."))))
+            ;; Fail-closed: nil the cached connection so the next call reopens.
+            (drop-connection tool :reason "network-error")
+            (log-event :warn "attach.network-error"
+                       "error_type" (or error-type "none")
+                       "liveness" (string-downcase (symbol-name probed))
+                       "error" msg)
+            ;; The field is added only when a name applies.  A failure the
+            ;; taxonomy has no name for must carry no name, rather than the
+            ;; nearest one.
+            (let ((envelope (make-ht "isError" t
+                                     "content"
+                                     (text-content
+                                      (format nil "~A Slynk connection error: ~A"
+                                              explanation msg)))))
+              (when error-type
+                (setf (gethash "error_type" envelope) error-type))
+              envelope)))))))
 
 ;;; Attach-dispatch gate macro ------------------------------------------------
 ;;;
