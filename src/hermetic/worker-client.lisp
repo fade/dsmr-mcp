@@ -34,7 +34,11 @@
            #:worker-crash-history-pushed-p #:*reaper-threads*
            #:*reaper-threads-lock* #:signal-worker-terminate
            #:worker-last-crash-reason #:worker-last-exit-status
-           #:worker-last-exit-code #:*worker-startup-timeout*))
+           #:worker-last-exit-code #:*worker-startup-timeout*
+           #:worker-liveness #:worker-liveness-basis
+           #:worker-last-ping-milliseconds
+           #:worker-consecutive-missed-pings
+           #:worker-liveness-checked-at))
 
 (in-package #:dsmr-mcp/src/hermetic/worker-client)
 
@@ -92,7 +96,15 @@ Each thread terminates and self-removes after reaping its process.")
   (crash-history-pushed-p nil :type boolean)
   (last-crash-reason nil)
   (last-exit-status nil)
-  (last-exit-code nil))
+  (last-exit-code nil)
+  ;; Liveness, kept beside the worker it describes so a status read never has
+  ;; to correlate two structures. :unknown until something has actually asked
+  ;; the worker a question; the pool's health monitor owns every write here.
+  (liveness :unknown :type keyword)
+  (liveness-basis nil)
+  (last-ping-milliseconds nil)
+  (consecutive-missed-pings 0 :type integer)
+  (liveness-checked-at nil))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Conditions
