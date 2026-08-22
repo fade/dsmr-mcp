@@ -3,6 +3,13 @@
 ;;;;
 ;;;; MCP tool: backend-status.
 ;;;;
+;;;; ATTACH-CALL-AUDIT: does not serialise. The attached branch reads state
+;;;; the connection machinery recorded earlier and puts nothing on the wire,
+;;;; so it has no traffic for another call to interleave with. Taking the
+;;;; per-session call lock would queue this verb behind the very evaluation
+;;;; an operator runs it to ask about, which is the one moment it has to
+;;;; answer.
+;;;;
 ;;;; One verb that answers for whichever backend this server is actually using.
 ;;;; In hermetic mode the backend is a shared pool of worker processes; in
 ;;;; attached mode it is one connection to the developer's own image, belonging
