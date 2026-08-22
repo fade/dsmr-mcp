@@ -32,6 +32,37 @@ mode.
 }
 #+end_src
 
+* backend-status
+
+Report the health of whichever backend this server is using: the 
+hermetic worker pool, or this session's connection to the developer's Lisp 
+image. It answers in both modes, so you do not have to know which one is 
+running before you can ask. 
+In hermetic mode it reports the pool's liveness, the most recent ping round 
+trip, circuit-breaker state with the seconds left in any cooldown, the crash 
+count inside the current window, how many worker incarnations have been issued, 
+and a per-worker breakdown of state, liveness, last ping and missed pings. 
+In attached mode it reports this session's liveness classification, last probe 
+round trip, connection epoch and whether a connection is open. It covers the 
+calling session's own connection only: it says nothing about any other 
+session's connection and nothing about the backend fleet-wide, because the 
+attached connection is a per-session resource while the pool is a shared one. 
+The breaker and crash-history fields are reported as not applicable in attached 
+mode rather than as zero, since a zero would read as a clean measurement where 
+in fact nothing was measured. 
+Every classification comes back with what it establishes, what it does not, how 
+it was obtained and what would flip it, so no value has to be read on trust. 
+This verb answers about the backend. Bus state is a separate subject with its 
+own verb; ask that one instead of expecting this to say how everything is.
+
+#+begin_src json
+{
+  "properties": {},
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
 * bus-leave
 
 Leave a coordination bus cleanly. This agent reads out whatever 
