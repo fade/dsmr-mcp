@@ -192,16 +192,42 @@ that merely reports on the attached connection out of the audit's scope."
                (setf start (1+ position)))
           finally (return nil))))
 
-(defun %reaches-attached-image-p (text)
-  "True when TEXT belongs to a tool that evaluates something in the developer's
-live image: it either names the wire call directly or carries an :attached
-dispatch arm.
+(defparameter +attached-connection-operators+
+  '("bounded-slime-eval" "slime-eval" "attached-connection"
+    "get-or-open-connection" "drop-connection")
+  "The names by which source in this tree takes hold of the attached connection.
 
-Either signal on its own is enough. Naming bounded-slime-eval catches a tool
-whose attached branch is selected some other way, and the :attached arm catches
-a tool that reaches the image through a helper this audit cannot see."
-  (or (search "bounded-slime-eval" text)
-      (%token-delimited-search "(:attached" text)))
+Every one of them either puts traffic on the wire or opens and closes the
+socket that carries it, which is what makes a file's use of the connection
+something another session's use has to be kept away from. Reading a value the
+connection machinery recorded earlier is deliberately not on this list: nothing
+goes out, so there is nothing for another call to interleave with.")
+
+(defun %operates-the-attached-connection-p (text)
+  "True when TEXT takes hold of the attached connection rather than reading
+what the connection machinery recorded about it earlier."
+  (some (lambda (name) (search name text)) +attached-connection-operators+))
+
+(defun %reaches-attached-image-p (text)
+  "True when TEXT belongs to a tool that reaches the developer's live image: it
+names the wire call directly, or carries an :attached dispatch arm, and in
+either case actually takes hold of the connection.
+
+Either of the first two signals on its own puts a file in the frame. Naming
+bounded-slime-eval catches a tool whose attached branch is selected some other
+way, and the :attached arm catches a tool that reaches the image through a
+helper this audit cannot see.
+
+Both are then qualified by whether the file operates the connection at all,
+because the hazard this audit exists for is two calls interleaving their
+traffic on one socket, and a tool that puts nothing on the socket cannot take
+part in it. A status verb reading the liveness classification and the epoch off
+its own session's tool instance is the case in point: it has an :attached arm,
+it names no connection operator, and making it hold the per-session call lock
+would queue it behind the very evaluation an operator is asking it about."
+  (and (or (search "bounded-slime-eval" text)
+           (%token-delimited-search "(:attached" text))
+       (%operates-the-attached-connection-p text)))
 
 (defun %serialises-attach-call-p (text)
   "True when TEXT shows one of the idioms that give a caller exclusive use of
@@ -340,10 +366,33 @@ reported, because a false name in the list makes the real ones easy to miss."
             dir "no-attached-arm.lisp"
             "(defmethod tool-handle ((tool reporting-tool) id args)
   (result id (make-ht \"attached_reset\" (getf outcome :attached-reset))))")
+           (%write-audit-fixture
+            dir "helper-route.lisp"
+            "(defmethod tool-handle ((tool helper-route-tool) id args)
+  (case *mode*
+    (:attached (result id (ask-the-image (attached-connection tool))))))")
+           (%write-audit-fixture
+            dir "reads-recorded-state.lisp"
+            "(defmethod tool-handle ((tool status-tool) id args)
+  (case *mode*
+    (:attached
+     (result id (make-ht \"liveness\" (repl-eval-tool-liveness tool)
+                         \"epoch\" (repl-eval-tool-connection-epoch tool))))))")
            (multiple-value-bind (violations scanned)
                (%unserialised-attach-arms dir)
-             ;; Four fixtures reach the image; the reporting tool does not.
-             (is = 4 scanned)
-             (is = 1 (length violations))
-             (true (search "bare.lisp" (or (first violations) "")))))
+             ;; Five fixtures reach the image. The reporting tool does not, and
+             ;; neither does the status tool: it has an :attached arm and takes
+             ;; hold of no connection, so there is no traffic of its own for
+             ;; another call to interleave with.
+             (is = 5 scanned)
+             (is = 2 (length violations))
+             (true (find-if (lambda (v) (search "bare.lisp" v)) violations)
+                   "the bare eval is reported")
+             ;; Pins the other edge of the narrowing. Without this, exempting a
+             ;; tool that names no connection operator could quietly exempt one
+             ;; that reaches the image through a helper instead.
+             (true (find-if (lambda (v) (search "helper-route.lisp" v)) violations)
+                   "an attached arm reaching the image through a helper is still reported")
+             (false (find-if (lambda (v) (search "reads-recorded-state.lisp" v)) violations)
+                    "an attached arm that only reads recorded state is not reported")))
       (uiop:delete-directory-tree dir :validate t))))
