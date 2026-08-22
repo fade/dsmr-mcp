@@ -1,0 +1,289 @@
+#+title: The repository doctor: adopting a project into the harness
+#+startup: showall
+
+* Read this first
+
+This describes work that is *not merged and not deployed*. It sits on the branch
+=feature/project-adoption-and-shape-normalisation=, 25 commits, and =main= is untouched.
+The prebuilt image was deliberately not rebuilt, because rebuilding installs =dsmr.core= at
+the repository root and every server boots from it: building off an unreviewed branch would
+put unreviewed code in front of every session.
+
+It is also large: *8,248 inserted lines across 30 files*, twelve new source files. That is a
+lot for the problem as stated, and whether it is the right size is a fair question.
+
+Two decisions are open, in /What is unresolved/.
+
+* What the feature is
+
+Adopting a project means putting *our own control surfaces* in place inside a repository,
+so that our tooling can work there. It does *not* mean changing the project.
+
+That distinction is the whole feature, and getting it wrong is the only way this can do real
+harm. The repositories in question are usually dependencies of something we are building.
+They have their own history, their own conventions, an upstream we do not control, and a
+maintainer who never agreed to our habits. Anything of ours that becomes visible in their
+work product, their tracked tree, their git log, anything a maintainer reads, is a defect.
+
+So the feature has two halves that must not be confused:
+
+- *Our control surfaces*, which we install and which are invisible to the project:
+  =.mallet.lisp= (the mallet linter's config), =scripts/lint-lisp.sh=, the =pre-commit= hook,
+  the entries in =.git/info/exclude=, and =.gate-baseline.md= holding the frozen record of
+  pre-existing lint findings. In a repository we do not own, every one of these is present on
+  disk and excluded from version control. The hook is inside =.git/= and so is invisible by
+  construction.
+- *The project's own layout*, which is theirs: the system definition, the source tree, the test
+  tree. We read it. We do not write it.
+
+** The surface
+
+One verb, =project-doctor=. It takes a repository path, an optional classification answer, an
+optional upstream URL, and an optional policy. *With no policy it assesses and writes nothing*,
+and =dry_run= reports the same shape without writing. Repairing a difference, recording it as
+debt, or accepting it as deliberate each require the caller to say so.
+
+** Why a new verb rather than the existing scaffold
+
+The scaffold creates a project from nothing. It takes an =overwrite= argument, and that path
+deletes the target directory tree before writing. So the tool that looks like it could bring an
+under-provisioned repository up to standard is in fact the destructive one, and =overwrite= is
+exactly the argument somebody reaches for when a repository looks incomplete.
+
+Adoption is the opposite operation. It acts on a repository that is not empty, that has history,
+and that we must leave intact.
+
+** The observation that prompted it
+
+Of the ten application repositories under =DeepSkyV2=, seven carry the linter config, the lint
+script and the pre-commit hook, and three do not. The config and the script co-occur exactly:
+no repository has one without the other. The gate was arriving with the scaffold, or not at all.
+
+* The design
+
+** Classification comes first, because guessing is unsafe in one direction
+
+Nothing else can be decided until we know whether a repository is ours. Guessing "ours" is the
+dangerous answer: it is what would let our tooling become tracked content in somebody else's
+project.
+
+There are three terminal answers and one non-answer:
+
+- *ours*
+- *foreign, with a live upstream*
+- *foreign orphan*, which is a legitimate outcome and not a defect. Plenty of unmaintained
+  Common Lisp projects are still solid software, and an absent upstream is not drift to repair.
+- *ambiguous*, which signals and asks rather than defaulting.
+
+The obvious discriminator is wrong, and measurably so. Checking for an =upstream= remote
+misclassifies raw third-party clones as ours, because a clone taken straight from the canonical
+source has its origin pointing at the third party and no upstream remote at all. Ownership of
+=origin= is the necessary test.
+
+Even that is not sufficient, and the residue is not an edge case. Measured across 251
+repositories in =$LISP_WORKSPACE=:
+
+| bucket                                             | count |
+|----------------------------------------------------+-------|
+| origin is third-party, unambiguously foreign       |   161 |
+| origin ours with an upstream, unambiguously a fork  |    22 |
+| *origin ours, no upstream, genuinely ambiguous*    |  *68* |
+
+Among repositories that look like ours, the ambiguous case outnumbers the certain one three to
+one. So asking is the normal path, not a fallback, and the design treats it that way: the verb
+returns the question along with the answers it will accept, and a second call carries the
+decision.
+
+** One definition of shape, read by both the scaffold and the verb
+
+The scaffold used to hold its file set privately, as a list of paths paired with rendered
+content. That answers "write me a new project" and cannot answer "is this project the right
+shape", because rendered content cannot express that a build script is optional or that a test
+must assert on a result object rather than on a printed line.
+
+Both now read a single catalog. Each entry carries what it is, where it installs, whether the
+scaffold emits it, and which group it belongs to. Two lists that agree today drift tomorrow,
+and the drift is invisible until somebody compares them by hand.
+
+** Differences are conditions, and recoveries are named
+
+A difference between a repository and the shape is signalled as a typed condition, not returned
+as a list of filenames. A string cannot be dispatched on, and neither can a path.
+
+Three recoveries are named, reusing the three outcomes this codebase already uses when triaging
+a condition handler rather than coining a parallel set: repair it, record it as debt with the
+diagnosis, or accept it as deliberately different. The distinction between something missing and
+something deliberately different is the difference between a useful report and one that gets
+ignored.
+
+*** The limit that shaped the interface
+
+A restart cannot cross a process boundary. Restarts established while handling one request are
+gone by the time the caller sees the response, so they cannot be offered to a client the way
+they are offered in-image.
+
+The two layers are therefore split. Inside a single call, conditions and restarts work normally.
+Across the wire, the verb takes a policy argument and returns a report; the restart names survive
+as the vocabulary of that argument and that report, and the machinery does not.
+
+** Risk is a severity, not a score
+
+Installing a gate into a repository that already has lint findings must not dump those findings
+as failures. The existing practice already answers this: a rule that blocks before the codebase
+can satisfy it simply gets switched off, so an in-progress rule runs at an informational severity
+and promotion is a separate, deliberate act.
+
+There is no risk score, and not for want of trying to build one. Across our application
+repositories, no ordering of development tempo and author count reproduces the one calibration on
+record: a busier, older, ungated repository comes out *less* urgent than a quieter gated one. A
+number built from those signals would have contradicted the only judgement available, and would
+have been believed precisely because it was a number.
+
+So there is a starting severity, in one place, and a frozen record of what was already there.
+
+** Ordering is the safety property
+
+The entries in =.git/info/exclude= are written *before* anything else is written. If that order
+is reversed, there is an interval in which our files exist in a repository that does not yet
+ignore them.
+
+This is enforced by the ordering of the code and by a check that replaces the write step with one
+that fails, then asserts the exclude entries changed anyway. The broader never-leak check, which
+asserts that nothing of ours appears in the repository's status, *cannot* detect a reversal: it
+reads the repository after the operation finishes, by which time the exclude is correct either
+way. Only the ordering check can see the interval.
+
+* How it is put together
+
+Eleven modules and a request surface, each with one responsibility, layered so that each depends
+only on those above it and on modules that predate this work.
+
+| module                           | responsibility                                                        |
+|----------------------------------+-----------------------------------------------------------------------|
+| =src/git.lisp=                   | typed subprocess access to git; failures signal rather than returning nil |
+| =src/template-render.lisp=       | template substitution, split out to keep the catalog and the scaffold from depending on each other |
+| =src/repo-classify.lisp=         | ours / foreign / orphan / ambiguous, from the remotes                  |
+| =src/project-shape.lisp=         | what a shape entry is, and what may be said about it                   |
+| =src/project-shape-catalog.lisp= | the entries themselves, and which are assessed for which kind of repository |
+| =src/project-exclude.lisp=       | reading the exclude template, merging, and repairing with a backup      |
+| =src/project-deviation.lisp=     | the condition types and the three named recoveries                   |
+| =src/project-assess.lisp=        | read-only: what differs, writing nothing                               |
+| =src/project-gate-scan.lisp=     | running mallet over existing sources to discover pre-existing findings |
+| =src/project-debt.lisp=          | the severity, and rendering the frozen record                          |
+| =src/project-doctor.lisp=        | the engine that applies a policy and reports what it did               |
+| =src/tools/project-doctor.lisp=  | the request surface                                                  |
+
+The scaffold was changed to read the catalog rather than hold its own copy, and to make a new
+project a git repository from the start. That second change matters more than it looks: the
+global git init template already seeds the correct exclude entries into every newly created
+repository, so once the scaffold runs =git init=, the existing provisioning does the writing. No
+exclude list is reimplemented in Lisp.
+
+** Two structural choices worth naming
+
+The distinction between a repository we own and one we do not is carried in the *type* of a
+shape entry rather than checked at each site that writes. Making a wrong state unrepresentable is
+better than detecting it reliably.
+
+The frozen record of pre-existing findings distinguishes *absent* from *empty*. If mallet cannot
+be run, the result is "not enumerated" and nothing is written. A record asserting zero findings
+and a record nobody populated look identical once written, and the written one would be believed.
+
+** How it was verified
+
+Every check was proven able to fail before its success was accepted. Deliberate breaks were
+seeded against each property and watched to go red, then reverted, with the restoring run checked
+for recompilation so that a stale compiled file could not supply a false green.
+
+Assertions that look equivalent frequently are not. Eight of the seeded breaks reddened one
+assertion while a sibling that appeared to test the same thing stayed green, and one break
+reddened nothing at all, because the property is enforced in two places. Two of the checks in
+this suite would be deleted as redundant by anyone who ran a break and read only the pass and
+fail totals.
+
+Fixtures are real git repositories rather than plain directories, because =.git/info/exclude= and
+the hooks directory do not exist otherwise.
+
+At =1ebc1cb=: =make test= reports 3,932 assertions and =make test-integration= reports 273, both
+with no failures and no skips, each judged on the run's result status rather than on the printed
+summary triple, and each read from the command's own exit line. The two are separate commands
+because =make test= does not walk =tests/integration/=. The tool listing renders cold with the new
+request present.
+
+* What is unresolved
+
+** Settled: a repository we do not own is assessed only against our apparatus
+
+For a while this tool wrote =src/main.lisp= and =tests/main-test.lisp= into a third party's tree,
+because a repository we did not own was assessed against the tier holding the project's own
+layout. Driven against =cl-ppcre= that left two untracked entries in *their* status, ours,
+carrying an AGPL licence header into a BSD-2-clause project.
+
+The rule now is: beyond installing the git-invisible components of our own apparatus, this tool
+does not alter the structure of the adopted project in any way. That is encoded on whether a
+catalog entry is apparatus, not on which tier it sits in, because apparatus spans two tiers: a
+tier-based rule would silently drop =AGENTS.md=, =CLAUDE.md= and =.envrc=, and would let a future
+non-apparatus entry added to the gate tier start leaking.
+
+⚠ *The earlier behaviour was a deferred decision, not an inconsistency that slipped through.* The
+value and its docstring agreed with each other, and the comment above them recorded the mapping as
+provisional and named this as unsettled. The reasoning was that a third party's project is not
+defective for lacking our conventions, which is sound as far as it goes; what it did not consider
+is that assessing the layout at all leads to *writing* layout files when they appear to be missing.
+
+*The test suite could not see it*, and the reason is worth keeping: the fixtures committed
+=src/main.lisp= and =tests/main-test.lisp= before the run, so every fixture already satisfied the
+layout expectation on arrival. The never-leak check had therefore only ever watched our own
+apparatus being written, which is excluded by construction, and had never met an ordinary file.
+The fixtures now include a flat library with no =src/= and no =tests/=, and the assertion that a
+repair writes nothing but apparatus was proven to fail against the old behaviour before it was
+believed against the new one.
+
+Verified against a fresh clone of =cl-ppcre=, read from the clone rather than from the tool's own
+report: =git status --porcelain= returns empty, =src/= and =tests/= are absent, no apparatus path
+appears in =git ls-files=, and their HEAD is unmoved. The status probe was proven live by planting
+a file and watching it appear.
+
+** Two decisions
+
+*Whether the scaffold should emit the gate.* Today a new project of ours is created without the
+linter config, the lint script or the hook, and only acquires them if the verb is run afterwards.
+Three flags in the catalog control this.
+
+*What severity the gate starts at in an adopted repository.* One definition, currently
+informational. The stake is concrete: =cl-ppcre= has 93 pre-existing findings across 23 source
+files. At a blocking severity, the first patch to that dependency is refused because of code we
+did not write and are not fixing.
+
+** Outstanding verification
+
+The checks that need a running server on a rebuilt image have not been done, because that needs
+the merge, the rebuild, and a reconnect.
+
+Separately, whether a client rejects a prompt carrying a required field is still untested.
+Nothing in this design depends on the answer, because the classification question crosses the
+wire as an ordinary result answered by an ordinary follow-up call, but it is unverified.
+
+* Was this the right size?
+
+Eleven modules and eight thousand lines is a lot for "put our control surfaces into a dependency",
+and most of the volume is in three places.
+
+Roughly half is tests and fixtures, and that is where the value showed up: every defect the suite
+found was found by a check that had been proven able to fail. The one defect the suite missed is
+the behaviour above, which no check was positioned to see.
+
+The classification module is larger than expected because the obvious discriminator is wrong and
+the ambiguous case turned out to be the common one. That was not knowable in advance.
+
+The part that could reasonably be smaller is the separation between assessment, deviation types,
+debt recording and the engine. Those are four modules that could have been two. They were kept
+apart so that the read-only path provably writes nothing, which is worth something, but it is a
+judgement call and a reasonable person could collapse them.
+
+The finding worth carrying is the one about the layout. For a while this feature wrote into a
+third party's tree, which is the one outcome the whole design exists to prevent, and 3,932 green
+assertions never saw it. The tests could not have found it, because the fixtures were built to
+satisfy the expectation being tested. Driving the real verb against a real repository could, and
+did.
+</content>
