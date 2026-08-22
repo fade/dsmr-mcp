@@ -437,6 +437,28 @@ if ((!FORCE && !DRY_RUN)); then
         sed 's/.*: "//; s/"$//' || true)
 fi
 
+# The PATH a session comes up with.
+#
+# `kitten @ launch` builds the child from the KITTY SERVER's environment, not
+# from this script's, and kitty execs argv with no shell in between, so no rc
+# file runs and nothing rebuilds PATH on the way in. A directory that is on PATH
+# here is therefore not on PATH in the session. Both of the operator's personal
+# bin directories were missing from every sister for exactly this reason, which
+# is what makes an installed tool answer "command not found" and get written up
+# as an upstream packaging fault rather than as a lookup failure.
+#
+# Hand the session an explicit PATH instead: this script's own, with the two
+# directories ENSURED rather than assumed, so a launcher started from a stripped
+# environment still produces a session that can resolve them.
+session_path=$PATH
+for _d in "$HOME/.local/bin" "$HOME/.npm-global/bin"; do
+    case ":$session_path:" in
+        *":$_d:"*) ;;
+        *) session_path="$_d:$session_path" ;;
+    esac
+done
+unset _d
+
 launched=0
 skipped=0
 for i in "${!names[@]}"; do
@@ -455,6 +477,9 @@ for i in "${!names[@]}"; do
     if ((NEW_WINDOW && launched == 0)); then
         launch_args=(launch --type=os-window --tab-title "$name" --cwd "$path")
     fi
+    # Every session is given the PATH computed above. Without it a session
+    # inherits whatever the kitty server happened to start with.
+    launch_args+=(--env "PATH=$session_path")
     # The role prompt. kitty execs argv directly with no shell between, so a
     # leading slash reaches claude literally and resolves as a slash command.
     role_prompt=""
