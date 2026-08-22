@@ -136,7 +136,7 @@ grep -oE '=[a-z0-9-]+=\s*\|' docs/CONSTELLATION.org | tr -d '=| ' | sort -u \
       done
       [ -n "$d" ] || continue
       live=$(git -C "$d" rev-parse HEAD 2>/dev/null)
-      parked=$(awk '/^sha:/{print $2}' "$d/.planning/PARK.md" 2>/dev/null)
+      parked=$(awk '/^sha:/{print $2; exit}' "$d/.planning/PARK.md" 2>/dev/null)
       [ -n "$parked" ] || parked=NO-PARK-FILE
       [ "$live" = "$parked" ] && st=OK || st=MISMATCH
       printf "%-12s %-9s parked=%.12s live=%.12s\n" "$r" "$st" "$parked" "$live"
@@ -147,6 +147,14 @@ grep -oE '=[a-z0-9-]+=\s*\|' docs/CONSTELLATION.org | tr -d '=| ' | sort -u \
 (constellation members) versus repos carrying `.planning/PARK.md` (agent-bearing). Tooling and
 dependency-fork repos legitimately have agents without being members. A repo in one and not the
 other is a FINDING.
+
+⚠ **The `exit` in that `awk` is required, not tidiness.** A `PARK.md` may stack park blocks, each
+with its own `^sha:` line — the current one on top, superseded ones below. Without `exit`, `awk`
+prints every one of them and `parked` becomes a concatenation of shas that can never equal a single
+`HEAD`, so the repo prints **MISMATCH while being perfectly in sync**. Measured on ubik, 2026-08-21:
+two blocks, identical 40-char value, an 80-char comparison string, a false MISMATCH at bring-up.
+⇒ Read the FIRST `sha:` and stop. And note the shape of the failure, which is the general lesson:
+the check's "diverged" and its "I misparsed the file" are the same observation.
 
 ⚠ N is whatever that prints. **It is a measurement, not a constant** — do not carry it forward.
 
