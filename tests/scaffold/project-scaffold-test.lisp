@@ -293,6 +293,31 @@ tell a person to run it fail on their first step" script))))
              "README.md came out executable")
       (ignore-errors (asdf:clear-system "runnable-proj")))))
 
+(define-test scaffold-registers-the-new-system
+  "The scaffold makes its system findable before it claims to have done so, so
+a caller can load it without being told to register it by hand first."
+  (with-temp-project-root (session root)
+    (let* ((result (write-scaffold :session-root root
+                                   :name "registered-proj"
+                                   :description "registration test"
+                                   :author "Tester"
+                                   :license "MIT"
+                                   :copyright "Tester"
+                                   :year "2026"
+                                   :destination "scaffolds"))
+           (target-dir (getf result :target-dir))
+           (found (asdf:find-system "registered-proj" nil)))
+      (unwind-protect
+           (progn
+             (true (member (getf result :registration) '(:source-registry :load-asd))
+                   "write-scaffold did not report how it registered the system")
+             (true found "the new system is not findable after scaffolding")
+             (true (equal (truename (asdf:system-source-file found))
+                          (truename (merge-pathnames "registered-proj.asd"
+                                                     target-dir)))
+                   "find-system resolved a different .asd than the one emitted"))
+        (ignore-errors (asdf:clear-system "registered-proj"))))))
+
 (define-test scaffold-no-debris-on-failure
   "A failed scaffold leaves no .tmp-* debris in the session root (T-11-03)."
   (with-temp-project-root (session root)
