@@ -33,6 +33,27 @@
 
 ;;; D-16: fresh session has no project root ----------------------------------
 
+(defmacro %with-related-projects ((value) &body body)
+  "Run BODY with DSMR_RELATED_PROJECTS bound to VALUE, restoring the previous
+setting -- including its absence -- on any exit."
+  (let ((saved (gensym "SAVED-")))
+    `(let ((,saved (uiop:getenv "DSMR_RELATED_PROJECTS")))
+       (unwind-protect
+            (progn (sb-posix:setenv "DSMR_RELATED_PROJECTS" ,value 1)
+                   ,@body)
+         (if ,saved
+             (sb-posix:setenv "DSMR_RELATED_PROJECTS" ,saved 1)
+             (sb-posix:unsetenv "DSMR_RELATED_PROJECTS"))))))
+
+(defun %reroot-result (session target-namestring)
+  "Ask SESSION's fs-set-project-root tool to adopt TARGET-NAMESTRING without
+human_approved, and return the tool's result hash table."
+  (let* ((tool (get-tool-instance session "fs-set-project-root"))
+         (args (let ((h (make-hash-table :test 'equal)))
+                 (setf (gethash "path" h) target-namestring)
+                 h)))
+    (gethash "result" (tool-handle tool 1 args))))
+
 (define-test fresh-session-has-no-root
   "A freshly created session has NIL as its project root (D-16)."
   (let ((s (make-session :id "test-no-root")))
@@ -208,3 +229,77 @@ arms it."
       (is string= "reroot-permission-required" (gethash "error_type" result))
       (false (session-project-root-just-set-p session)
              "a refused set-root leaves the offer flag disarmed"))))
+
+;;; Whitelist entries are shell-shaped; the target is a directory namestring ---
+
+(define-test whitelist-entry-without-trailing-slash-matches
+  "DSMR_RELATED_PROJECTS is written in shell convention: colon-separated, no
+trailing slashes.  Common Lisp uses the trailing slash to tell a directory
+pathname from a file pathname, and the re-root target is always normalised to a
+directory namestring before the comparison.  An entry must be normalised the
+same way or it can never match, which leaves every re-root falling through to
+the human_approved path."
+  (let ((other (%make-temp-directory)))
+    (unwind-protect
+         (with-temp-project-root (session _root)
+           (let* ((target (namestring (truename other)))
+                  (entry  (string-right-trim "/" target)))
+             (%with-related-projects (entry)
+               (let ((result (%reroot-result session target)))
+                 (false (gethash "isError" result)
+                        "a whitelisted directory named without a trailing slash is accepted")
+                 (is string= target (namestring (session-project-root session)))))))
+      (uiop:delete-directory-tree other :validate t :if-does-not-exist :ignore))))
+
+(define-test whitelist-entry-with-trailing-slash-matches
+  "An entry already written as a directory namestring keeps matching.  Both
+spellings name the same directory, so both must be accepted."
+  (let ((other (%make-temp-directory)))
+    (unwind-protect
+         (with-temp-project-root (session _root)
+           (let ((target (namestring (truename other))))
+             (%with-related-projects (target)
+               (let ((result (%reroot-result session target)))
+                 (false (gethash "isError" result)
+                        "a whitelisted directory named with a trailing slash is accepted")
+                 (is string= target (namestring (session-project-root session)))))))
+      (uiop:delete-directory-tree other :validate t :if-does-not-exist :ignore))))
+
+(define-test whitelist-does-not-cover-sibling-directory
+  "Normalising the entries must not make unrelated directories match.  A sibling
+of a listed directory is not on the list and is still refused."
+  (let ((listed  (%make-temp-directory))
+        (sibling (%make-temp-directory)))
+    (unwind-protect
+         (with-temp-project-root (session root)
+           (let ((entry  (string-right-trim "/" (namestring (truename listed))))
+                 (target (namestring (truename sibling))))
+             (%with-related-projects (entry)
+               (let ((result (%reroot-result session target)))
+                 (true (gethash "isError" result)
+                       "a directory absent from the whitelist is refused")
+                 (is string= "reroot-permission-required" (gethash "error_type" result))
+                 (is equal root (session-project-root session))))))
+      (uiop:delete-directory-tree listed :validate t :if-does-not-exist :ignore)
+      (uiop:delete-directory-tree sibling :validate t :if-does-not-exist :ignore))))
+
+(define-test whitelisted-root-covers-nested-directory
+  "Listing a directory authorises every directory beneath it, at any depth.
+Worktrees are created and destroyed continuously, and the whitelist lives in an
+environment variable that only takes effect when the session is replaced, so an
+exact match would mean a new entry and a restart for every worktree.  Naming the
+parent once has to cover whatever is created under it afterwards."
+  (let ((listed (%make-temp-directory)))
+    (unwind-protect
+         (with-temp-project-root (session _root)
+           (let ((entry (string-right-trim "/" (namestring (truename listed))))
+                 (deep  (uiop:ensure-directory-pathname
+                         (merge-pathnames "worktrees/feature-a/" listed))))
+             (ensure-directories-exist deep)
+             (let ((target (namestring (truename deep))))
+               (%with-related-projects (entry)
+                 (let ((result (%reroot-result session target)))
+                   (false (gethash "isError" result)
+                          "a directory nested under a listed root is accepted")
+                   (is string= target (namestring (session-project-root session))))))))
+      (uiop:delete-directory-tree listed :validate t :if-does-not-exist :ignore))))
