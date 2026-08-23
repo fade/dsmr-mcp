@@ -11,15 +11,22 @@
                 #:mcp-tool #:mcp-tool-class #:tool-handle #:tool-session)
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht #:result #:text-content)
+  (:import-from #:dsmr-mcp/src/tools/status-fields
+                #:reported-field)
   (:import-from #:dsmr-mcp/src/tools/bus-helpers
                 #:session-agent #:bus-label #:identity-summary #:no-project-root)
   (:import-from #:dsmr-mcp/src/bus/bus
                 #:+default-batch-size+)
   (:import-from #:dsmr-mcp/src/bus/selector
                 #:invalid-bus-name)
+  (:import-from #:dsmr-mcp/src/bus/broker
+                #:bus-paths-wal #:cursor-path-for)
+  (:import-from #:dsmr-mcp/src/bus/cursor
+                #:make-subscriber #:cursor-and-head #:stranded-reason)
   (:import-from #:dsmr-mcp/src/bus/agent
                 #:agent-receive-detailed #:agent-id #:agent-name #:agent-namespace
-                #:agent-bus #:delivery-author #:delivery-author-id #:delivery-text
+                #:agent-bus #:agent-paths #:delivery-author #:delivery-author-id
+                #:delivery-text
                 #:agent-stable-p #:agent-skip-to-head #:agent-status))
 
 (in-package #:dsmr-mcp/src/tools/bus-receive)
@@ -38,7 +45,14 @@ default; set timeout_ms to wait that long for the first message. A named agent \
 resumes where it left off across restarts. Every message comes back with the \
 agent that published it in its own author field, and the rendered text labels \
 each message with that author: a body opening with a name is ADDRESSING that \
-agent, not signing as it.")
+agent, not signing as it. \
+Every answer, delivered or empty, also says where this agent's cursor sits in \
+the log it read and what the page bound was spent on, so an empty reply says \
+which kind of empty it is. A caught-up reader and a reader whose recorded \
+position the log no longer holds both receive nothing, and cursor_state is what \
+tells them apart; a page consumed by mail addressed to other participants also \
+delivers nothing, and the page field is what reconciles that with a \
+remaining_pending above zero.")
    (dsmr-mcp/src/tools/base::input-schema
     :allocation :class
     :initform `(:object
@@ -120,27 +134,161 @@ bus that was named."))
   (format nil "[~D/~D] author: ~A~%~A"
           index total (delivery-author d) (delivery-text d)))
 
-(defun %receive-content (a deliveries remaining)
+(defun %standing (a)
+  "Where this caller's durable position sits in the log it is reading, with
+   nothing folded away: (values cursor head recorded-generation log-generation
+   stranded-reason).
+
+   The position is read from the cursor file and the head from the log, through
+   the accessor that returns both as they are. The count of what is deliverable
+   cannot answer this question and is not asked: it reports zero for a caught-up
+   reader and zero for a reader whose position is past the end of the log, which
+   is precisely the pair a caller is trying to tell apart here.
+
+   The head and the log's generation are read once and handed to the strand
+   check, so establishing where a reader stands costs one pass over the log
+   rather than two."
+  (let* ((paths (agent-paths a))
+         (position (make-subscriber (agent-id a)
+                                    (bus-paths-wal paths)
+                                    (cursor-path-for paths (agent-id a)))))
+    (multiple-value-bind (cursor head recorded current)
+        (cursor-and-head position)
+      (values cursor head recorded current
+              (stranded-reason position :head head :log-generation current)))))
+
+(defun %cursor-word (reason)
+  "The one word for a stranded reason, in the vocabulary the bus surface already
+   uses for it, and JSON null when the position is a sound one."
+  (case reason
+    (:cursor-above-head "cursor-above-head")
+    (:generation-mismatch "generation-mismatch")
+    (t 'null)))
+
+(defun %cursor-fields (cursor head recorded current reason &key (moment :read-from))
+  "The cursor-versus-head key/value pairs every receive answer carries, as a flat
+   list ready to splice into make-ht.
+
+   They are here on every call, delivered or empty, sound position or not. A fact
+   that appeared only when something was wrong would make its absence the
+   ordinary case, and its absence is exactly what a broken read looks like.
+
+   The classification is what closes the failure this reports: a reader caught up
+   with its log and a reader holding a position that log no longer has both
+   receive nothing, and until now their two answers were identical.
+
+   MOMENT says which position these values describe, because the two replies this
+   verb sends describe different ones and a reader cannot tell from the numbers.
+   A receive reports the position it READ FROM: that is the only moment at which
+   a position recorded against a replaced log is visible at all, since reading
+   past it rewrites the record against the log in hand. An abandonment reports
+   where it LEFT the reader, because moving the position is the whole intent of
+   that call and reporting the state it just repaired would read as a repair that
+   did not happen."
+  (list
+   "cursor" cursor
+   "head" head
+   "recorded_generation" (or recorded 'null)
+   "log_generation" current
+   "stranded_reason" (%cursor-word reason)
+   "cursor_state"
+   (reported-field (cond (reason "stranded")
+                         ((< cursor head) "behind")
+                         (t "caught-up"))
+                   :establishes
+                   (ecase moment
+                     (:read-from "the position this call read from, compared against the head of the log that position names and the generation that log is on, all three read from disk before anything was delivered")
+                     (:left-at "the position this call left this identity at, compared against the head of the log that position names and the generation that log is on, all three read from disk after the cursor was moved"))
+                   :does-not-establish "an empty delivery establishes that nothing addressed to this identity sits past this position in the log as it stands now. It does not establish that no message was ever published, and it does not establish that this identity is the one a sender addressed: a message naming somebody else is filtered out of what you are shown."
+                   :basis "durable-record"
+                   :red-condition "the position names a record past the end of the log, or names a generation the log has since left behind. Either way what this identity missed is in a log that is no longer being read, and reading on from here delivers the replacement log's traffic instead.")))
+
+(defun %page-fields (limit records-read own-echo elsewhere)
+  "What this call's page bound was spent on, as a flat list ready to splice into
+   make-ht.
+
+   The bound counts records READ, the cursor advances over every record read, and
+   the recipient filter runs afterwards. So a page spent on mail addressed to
+   other participants delivers nothing, advances normally, and leaves a real
+   backlog still counted behind it. Two fleets read the log by hand over that
+   pair of statements, because the answer gave them nothing to reconcile the two
+   with."
+  (list
+   "page"
+   (reported-field (make-ht "limit" limit
+                            "records_read" records-read
+                            "filtered_own_echo" own-echo
+                            "filtered_addressed_elsewhere" elsewhere)
+                   :establishes "how many records this call read past the cursor under its page bound, and how many of those the delivery filter withheld: the ones this caller published itself, and the ones naming another participant"
+                   :does-not-establish "a page spent on other participants' mail does not establish that nothing is waiting. An empty delivery beside a non-zero remaining_pending is the ordinary consequence of a bounded page on a bus carrying addressed traffic, and it is not evidence of a stranded position: a stranded position reports nothing pending at all, so a pending count above zero is positive evidence that the cursor is not past the head. Raising limit past the withheld records delivers what is behind them in one call."
+                   :basis "active-probe")))
+
+(defun %cursor-sentence (cursor head reason)
+  "Where this reader stands, in one sentence for a person.
+
+   The stranded cases say what the state is and what to do about it, because a
+   reader who never opens the payload is exactly the reader this exists for. The
+   sound case still states both numbers: an answer that went quiet whenever
+   nothing was wrong would make silence the ordinary case, and silence is what
+   the broken read looks like."
+  (case reason
+    (:cursor-above-head
+     (format nil "Your position on this bus is ~D and the log's head is ~D. \
+Nothing can sit past the end of a log, so this position will never be delivered \
+anything: the log was replaced while this identity held a place in the one \
+before it. Put the position back inside the log to start receiving again."
+             cursor head))
+    (:generation-mismatch
+     (format nil "Your position on this bus is ~D, taken against a log that has \
+since been replaced, and the head of the log now in place is ~D. The number \
+reads as merely behind and is not: reading on from here delivers the \
+replacement log's traffic, and what was missed is in the sealed log."
+             cursor head))
+    (t (format nil "This call read from position ~D of a log whose head is ~D."
+               cursor head))))
+
+(defun %page-sentence (limit records-read own-echo elsewhere)
+  "What this call's page went on, when some of it went to records the reader is
+   not shown. Empty when everything read was deliverable, since a page with
+   nothing withheld has nothing to reconcile."
+  (let ((withheld (+ own-echo elsewhere)))
+    (if (plusp withheld)
+        (format nil "~%~%This call read ~D record(s) under a limit of ~D, of \
+which ~D addressed to another participant and ~D published by you: your cursor \
+advanced over all of them and none was shown to you. Raise limit to walk past \
+them in one call."
+                records-read limit elsewhere own-echo)
+        "")))
+
+(defun %receive-content (a deliveries remaining cursor head reason
+                         limit records-read own-echo elsewhere)
   "The human-readable text for a receive reply: who the caller is, who wrote each
    message it got, and, when the batch stopped short of the backlog, that more is
    still waiting. A caller told only what it received cannot tell a page from the
    whole queue, and an agent that believes it is caught up when it is not is the
-   starvation this reports away."
+   starvation this reports away.
+
+   Where the reader's position sits is part of the text and not only of the
+   payload. The answer this exists to correct was the words \"No new messages\"
+   standing alone, which read the same to a reader caught up with the bus and to
+   one holding a position the bus no longer has."
   (let ((tail (if (plusp remaining)
                   (format nil "~%~%~D more message(s) still pending. Call \
 bus-receive again to continue."
                           remaining)
-                  "")))
+                  ""))
+        (standing (format nil "~%~%~A" (%cursor-sentence cursor head reason)))
+        (page (%page-sentence limit records-read own-echo elsewhere)))
     (if deliveries
-        (format nil "You are ~A.~%~D message(s):~%~%~{~A~^~%~%~}~A"
+        (format nil "You are ~A.~%~D message(s):~%~%~{~A~^~%~%~}~A~A~A"
                 (identity-summary a) (length deliveries)
                 (let ((total (length deliveries))
                       (index 0))
                   (mapcar (lambda (d) (%message-block (incf index) total d))
                           deliveries))
-                tail)
-        (format nil "You are ~A. No new messages.~A"
-                (identity-summary a) tail))))
+                tail standing page)
+        (format nil "You are ~A. No new messages.~A~A~A"
+                (identity-summary a) tail standing page))))
 
 (defun %invalid-argument (id message)
   "An invalid-argument refusal in the shape every bus-receive guard returns."
@@ -181,37 +329,79 @@ to receive from this session's own bus.")))
                                 :ephemeral ephemeral :bus bus-arg)))
           (if skip-to-head
               ;; Abandonment and receipt are distinct intents. Doing both in one
-              ;; call would make the abandoned count ambiguous — a caller could
+              ;; call would make the abandoned count ambiguous: a caller could
               ;; not tell what it was handed from what it gave up.
+              ;;
+              ;; Where the cursor is left is reported here too. Abandoning is
+              ;; the one call that MOVES the position on purpose, so a caller
+              ;; that has just given up a backlog is owed the same statement of
+              ;; where it now stands as a caller that read one.
               (let ((abandoned (agent-skip-to-head a)))
-                (result id (apply #'make-ht
-                                  "messages" (vector)
-                                  "count" 0
-                                  "abandoned" abandoned
-                                  "content"
-                                  (text-content
-                                   (format nil "You are ~A. Abandoned ~D pending \
-message(s) by skipping to the head of the bus; they will not be delivered."
-                                           (identity-summary a) abandoned))
-                                  (%identity-fields a))))
-              (let* ((deliveries (agent-receive-detailed
-                                  a :timeout-ms timeout
-                                    :limit (or limit +default-batch-size+)))
-                     ;; Read what remains after the delivery rather than
-                     ;; threading a second value down through every cursor, bus
-                     ;; and agent caller: only this boundary wants the figure,
-                     ;; and reading it costs a log scan that materializes no
-                     ;; records.
-                     (remaining (getf (agent-status a) :pending)))
-                (result id (apply #'make-ht
-                                  "messages" (map 'vector #'%message-fields
-                                                  deliveries)
-                                  "count" (length deliveries)
-                                  "remaining_pending" remaining
-                                  "content" (text-content
-                                             (%receive-content a deliveries
-                                                               remaining))
-                                  (%identity-fields a))))))
+                (multiple-value-bind (cursor head recorded current reason)
+                    (%standing a)
+                  (result id (apply #'make-ht
+                                    "messages" (vector)
+                                    "count" 0
+                                    "abandoned" abandoned
+                                    "content"
+                                    (text-content
+                                     (format nil "You are ~A. Abandoned ~D \
+pending message(s) by skipping to the head of the bus; they will not be \
+delivered.~%~%~A"
+                                             (identity-summary a) abandoned
+                                             (%cursor-sentence cursor head
+                                                               reason)))
+                                    (append
+                                     (%cursor-fields cursor head recorded
+                                                     current reason
+                                                     :moment :left-at)
+                                     (%identity-fields a))))))
+              (let ((page (or limit +default-batch-size+)))
+                ;; The position is read BEFORE the delivery, from the cursor
+                ;; file and the log rather than from the count of what is
+                ;; deliverable. Two reasons, and both matter.
+                ;;
+                ;; The count clamps, so it answers zero for a reader caught up
+                ;; and zero for a reader whose position the log no longer holds;
+                ;; sourcing the fact from it would reproduce here the very
+                ;; ambiguity this is added to remove.
+                ;;
+                ;; And the order is the fact's only chance. A delivery advances
+                ;; the cursor over every record it reads and rewrites it against
+                ;; the log in hand, so a position recorded against a log that has
+                ;; since been replaced is repaired by the very call that would
+                ;; have reported it. Read afterwards, that state could never once
+                ;; be seen; read first, the answer says which log the records it
+                ;; is handing over actually came from.
+                (multiple-value-bind (cursor head recorded current reason)
+                    (%standing a)
+                  (multiple-value-bind (deliveries records-read own-echo elsewhere)
+                      (agent-receive-detailed a :timeout-ms timeout :limit page)
+                    ;; Read what remains after the delivery rather than
+                    ;; threading a second value down through every cursor, bus
+                    ;; and agent caller: only this boundary wants the figure,
+                    ;; and reading it costs a log scan that materializes no
+                    ;; records.
+                    (let ((remaining (getf (agent-status a) :pending)))
+                      (result id
+                              (apply #'make-ht
+                                     "messages" (map 'vector #'%message-fields
+                                                     deliveries)
+                                     "count" (length deliveries)
+                                     "remaining_pending" remaining
+                                     "content"
+                                     (text-content
+                                      (%receive-content a deliveries remaining
+                                                        cursor head reason
+                                                        page records-read
+                                                        own-echo
+                                                        elsewhere))
+                                     (append
+                                      (%cursor-fields cursor head recorded
+                                                      current reason)
+                                      (%page-fields page records-read own-echo
+                                                    elsewhere)
+                                      (%identity-fields a))))))))))
       ;; A bus name that cannot become a bus root is refused rather than
       ;; downgraded, so a caller is never quietly handed the shared bus's
       ;; backlog in place of the one it named.
