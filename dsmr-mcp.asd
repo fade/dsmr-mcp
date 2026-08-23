@@ -135,6 +135,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/tools/bus-publish"
                "dsmr-mcp/src/tools/bus-receive"
                "dsmr-mcp/src/tools/bus-status"
+               "dsmr-mcp/src/tools/bus-inspect"
                "dsmr-mcp/src/tools/bus-roster"
                "dsmr-mcp/src/tools/bus-leave"
                "dsmr-mcp/src/bus-listener")

@@ -63,6 +63,49 @@ own verb; ask that one instead of expecting this to say how everything is.
 }
 #+end_src
 
+* bus-inspect
+
+Inspect one coordination bus in depth: which broker is serving 
+it and whether that broker would survive, whether a member leaving right now 
+would seal the log, the log's head and generation and the sealed logs behind 
+it, every recorded position with the ones that cannot be positions in the 
+current log flagged, and which identities are enrolled, which are per-process, 
+and which hold a position on a bus that never enrolled them. 
+Read-only: nothing is published, no cursor is moved and no lock is taken. 
+Every classification comes back with the check that produced it, the nearest 
+wrong conclusion a reader might draw, how the value was obtained and what 
+would flip it, so no value has to be read on trust. 
+Note in particular that a broker reported running has been found holding the 
+election lock and says nothing about which source it is serving, and that the 
+recorded source revision is the source the broker loaded at start and is not 
+compared against the working tree here. 
+This verb answers about the bus. Backend liveness, meaning the worker pool or 
+this session's connection to the developer's image, is a separate subject with 
+its own verb; ask that one instead of expecting this to say how everything is. 
+For a quick peek at whether a broker is up and how many messages are waiting 
+for you, bus-status is the smaller and faster call.
+
+#+begin_src json
+{
+  "properties": {
+    "agent_id": {
+      "description": "Optional stable agent name to inspect under \n(within this project's namespace). Omit to use the session's anonymous default \nagent.",
+      "type": "string"
+    },
+    "bus": {
+      "description": "Optional named bus to inspect. Omit to use this \nsession's bus, which is DSMR_BUS_SELECTOR from the repository's .envrc when \nthat is set and the shared host-wide bus otherwise. A name that cannot become \na bus is refused; the shared bus is never inspected in place of a bus that was \nnamed.",
+      "type": "string"
+    },
+    "ephemeral": {
+      "description": "Set true to force a fresh one-shot ephemeral \nidentity for this subagent, opting out of the project's stable DSMR_BUS_AGENT \nidentity so it never resumes the main agent's cursor.",
+      "type": "boolean"
+    }
+  },
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
 * bus-leave
 
 Leave a coordination bus cleanly. This agent reads out whatever 
