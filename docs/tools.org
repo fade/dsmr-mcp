@@ -558,7 +558,7 @@ resolve paths relative to this root. Re-rooting outside the configured whitelist
 {
   "properties": {
     "human_approved": {
-      "description": "Set to true (by a human, not an agent) to authorize \nre-rooting to a path outside the configured whitelist. An autonomous agent cannot \nself-approve this bypass (D-05).",
+      "description": "Set to true only when the operator has \nexplicitly authorized re-rooting to a path outside the configured whitelist; \nnever set it on your own authority. A re-root outside that whitelist without \nthis flag returns a reroot-permission-required error naming the path.",
       "type": "boolean"
     },
     "path": {
