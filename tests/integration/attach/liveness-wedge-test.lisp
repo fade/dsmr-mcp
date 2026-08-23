@@ -191,7 +191,13 @@ symptom is a real image left running while the suite reports a clean run.
 
 The wait for the child is in two stages, and both are needed: a socket that
 accepts is not yet an image that answers, and a test that started against the
-first would be racing the second."
+first would be racing the second.
+
+One answered evaluation is all the proof I want that the child is up, so the
+poll's own success is the verdict and nothing asks again. Each probe opens a
+fresh connection and gives the evaluation one second, a budget a healthy image
+on a loaded machine can miss; the confirming re-ask this replaced got no retry,
+so one slow answer used to condemn a child that had already proved it was up."
   (let ((log (gensym "LOG-")) (proc (gensym "PROC-")) (tmp (gensym "PORT-")))
     `(let* ((,tmp (free-loopback-port))
             (,log (uiop:tmpize-pathname
@@ -209,10 +215,9 @@ first would be racing the second."
               (loop repeat 240
                     until (socket-answers-p "127.0.0.1" ,port-var)
                     do (sleep 0.25))
-              (loop repeat 160
-                    until (image-answers-p ,port-var)
-                    do (sleep 0.25))
-              (unless (image-answers-p ,port-var)
+              (unless (loop repeat 160
+                            thereis (image-answers-p ,port-var)
+                            do (sleep 0.25))
                 (error "with-stoppable-image: the child never answered on 127.0.0.1:~D~%~
 --- child output tail ---~%~A"
                        ,port-var
