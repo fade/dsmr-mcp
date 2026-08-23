@@ -283,6 +283,32 @@ of a listed directory is not on the list and is still refused."
       (uiop:delete-directory-tree listed :validate t :if-does-not-exist :ignore)
       (uiop:delete-directory-tree sibling :validate t :if-does-not-exist :ignore))))
 
+(define-test whitelist-does-not-cover-prefix-sibling
+  "A sibling whose name merely begins with a listed directory's name is not
+beneath that directory and must still be refused.  This is the case a raw
+string-prefix test gets wrong: the entry arrives in shell convention with no
+trailing slash, so comparing it against the target as it stands accepts anything
+that shares the leading characters.  Spelling both sides as directory
+namestrings first is what lets the slash keep them apart."
+  (let ((parent (%make-temp-directory)))
+    (unwind-protect
+         (with-temp-project-root (session root)
+           (let* ((listed  (ensure-directories-exist
+                            (uiop:ensure-directory-pathname
+                             (merge-pathnames "proj/" parent))))
+                  (sibling (ensure-directories-exist
+                            (uiop:ensure-directory-pathname
+                             (merge-pathnames "projbar/" parent))))
+                  (entry   (string-right-trim "/" (namestring (truename listed))))
+                  (target  (namestring (truename sibling))))
+             (%with-related-projects (entry)
+               (let ((result (%reroot-result session target)))
+                 (true (gethash "isError" result)
+                       "a sibling sharing the listed name's leading characters is refused")
+                 (is string= "reroot-permission-required" (gethash "error_type" result))
+                 (is equal root (session-project-root session))))))
+      (uiop:delete-directory-tree parent :validate t :if-does-not-exist :ignore))))
+
 (define-test whitelisted-root-covers-nested-directory
   "Listing a directory authorises every directory beneath it, at any depth.
 Worktrees are created and destroyed continuously, and the whitelist lives in an
