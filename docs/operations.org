@@ -264,7 +264,14 @@ the field cases.
 
 - *Is it up, and what is waiting?* =bus-status= returns =broker_running= (whether
   any process holds the election lock) and =pending= (this agent's backlog). It
-  consumes nothing.
+  consumes nothing. Both are readings taken at that instant; for the state of the
+  bus itself, see the next item.
+- *What state is the bus in?* =bus-inspect= answers the inventory question,
+  read-only: which broker is serving the bus and against what source, whether a
+  member leaving right now would seal the log, the log's head and generation and
+  the sealed logs behind it, every recorded position with the stranded ones
+  flagged, and which identities are enrolled and reading. Each value states what
+  it establishes and what it does not, so no reading has to be taken on trust.
 - *Backlog not draining.* =bus-receive= with the default non-blocking timeout
   delivers everything past your cursor and advances it. If =bus-status= shows a
   broker but =pending= stays at zero when you expect messages, confirm you are
@@ -276,7 +283,7 @@ the field cases.
 - *Reset a participant.* Delete its cursor file under
   =$XDG_STATE_HOME/dsmr-mcp/bus/cursors/= (or =~/.local/state/dsmr-mcp/bus/cursors/=)
   to re-receive from the start of the current log.
-- *Inspect bus state.* Everything lives under =$XDG_STATE_HOME/dsmr-mcp/bus/= —
+- *Read the bus files directly.* Everything lives under =$XDG_STATE_HOME/dsmr-mcp/bus/=:
   the active =bus.wal=, the =cursors/= directory, the broker's =broker.log=, and
   any rotated =bus.wal.archive-*= logs from clean shutdowns.
 - *Single host only.* The bus is machine-local (=flock= election, =ipc://=

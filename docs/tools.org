@@ -267,8 +267,19 @@ here, and adding one would only dress a convention up as a control.
 
 * bus-status
 
-Report the coordination bus state for this agent: whether a broker 
-is running and how many messages are waiting, without consuming them.
+Report this agent's view of the coordination bus at one moment: 
+whether a broker is running and how many records are waiting for this agent, 
+without consuming them. 
+It is not an inventory of the bus. It does not establish what the broker is, 
+which source that broker is serving or whether it would survive a restart; it 
+does not say which generation of the log this is, which recorded positions are 
+stranded, or which identities are enrolled and reading. bus-inspect answers 
+those, and it is the verb to call when the question is what state the bus is 
+in. 
+The pending figure counts every record past this agent's cursor, and that 
+includes this agent's own publishes, which delivery filters out. The number 
+shown here and the number a receive returns can therefore legitimately differ, 
+and neither of them is wrong.
 
 #+begin_src json
 {
