@@ -124,10 +124,23 @@ Call fs-set-project-root first.")))))
                  (files       (getf res :files))
                  (abs-asd     (namestring
                                (merge-pathnames (format nil "~A.asd" name) target-dir)))
+                 (registration (getf res :registration))
                  (next-steps  (vector
-                               (format nil
-                                       "Auto-registered with ASDF. To re-register: (asdf:load-asd ~S)"
-                                       abs-asd)
+                               ;; Report what registration actually reached. A
+                               ;; project on a configured source-registry tree
+                               ;; is findable from any image on this host; one
+                               ;; outside every tree was registered here alone,
+                               ;; and the caller needs the load-asd line to
+                               ;; reach any other image.
+                               (if (eq registration :source-registry)
+                                   (format nil
+                                           "Registered with ASDF: ~S resolves on the source registry. ~
+In an image that started before this scaffold: (asdf:load-asd ~S)"
+                                           name abs-asd)
+                                   (format nil
+                                           "Registered in this image only: ~S sits outside every configured ~
+ASDF source-registry tree. Elsewhere: (asdf:load-asd ~S)"
+                                           name abs-asd))
                                (format nil
                                        "To load: run load-system with {\"system\": ~S}"
                                        name)
