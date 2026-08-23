@@ -3,9 +3,10 @@
 This is the field runbook for =dsmr-mcp=. When the server misbehaves,
 find the matching failure mode below and follow the
 symptom → cause → check → fix recipe. It documents the health surface
-(=pool-status= and the attached-mode equivalent) and the four failure
-modes that actually happen in the field: cold start, attached-mode
-degradation, the hermetic-worker crash loop, and alive-lsp absence.
+(=backend-status= in either mode, =pool-status= for the hermetic pool)
+and the four failure modes that actually happen in the field: cold
+start, attached-mode degradation, the hermetic-worker crash loop, and
+alive-lsp absence.
 
 #+begin_quote
 *Security note.* None of these recipes ever tell you to relax a control
@@ -103,6 +104,41 @@ cold compile, clear the ASDF output cache first (typically
 
 * Health checks
 
+** =backend-status=: ask this first, in either mode
+
+=backend-status= reports the health of whichever backend this server is
+using, so you do not have to know which one that is before you can ask.
+It takes no arguments.
+
+In hermetic mode it reports pool liveness, the most recent ping round
+trip, circuit-breaker state with the seconds left in any cooldown, the
+crash count inside the current window, how many worker incarnations have
+been issued, and a per-worker breakdown of state, liveness, last ping and
+missed pings. In attached mode it reports this session's liveness
+classification, last probe round trip, connection epoch, and whether a
+connection is open; the breaker and crash-history fields come back marked
+not applicable rather than zero, because a zero would read as a clean
+measurement where nothing was measured at all.
+
+Every classification arrives with what it establishes, what it does not,
+how it was obtained, and what would flip it, so no value has to be read
+on trust. It answers about the backend only. For the state of a
+coordination bus, call =bus-inspect= instead.
+
+** =attach-reset=: reopen this session's connection
+
+=attach-reset= force-drops and reopens the calling session's connection
+to the developer's Lisp image, in place, with no server restart. Reach
+for it when the image accepts connections and answers nothing, or after a
+fault has left the wire unusable. It resets the wire, not the image:
+definitions and application state in the developer's image survive.
+
+It touches only the calling session's own connection and takes no
+arguments, so no other session can be named or dropped. The response
+carries the connection epoch after the reset, which is what makes the
+reset observable to a call that was already in flight. Available in
+attached mode only.
+
 ** =pool-status= — hermetic-mode health verb
 
 =pool-status= is the health surface for hermetic mode. It is an MCP verb
@@ -127,12 +163,18 @@ attached, not hermetic.
 
 ** Attached-mode health
 
-There is no dedicated attached-mode health verb today. This is a known
-gap, recorded here so the release plan or a follow-on can decide whether
-to add one; do not add code to close it as part of this runbook.
-
-The practical equivalent is a trivial =repl-eval= round-trip: evaluate a
-constant and confirm the value comes back.
+=backend-status= is the attached-mode health surface: call it for the
+session's liveness classification, its last probe round trip, and its
+connection epoch. A trivial =repl-eval= round trip (evaluate a constant,
+confirm the value comes back) still works as a coarse confirmation, but
+when the image has stopped answering the round trip just hangs with it.
+=backend-status= separates an image that accepts the connection and no
+longer answers from one that is not listening at all: a different fault
+and a different repair. It classifies =healthy=, =wedged= or =dead=.
+⚠ It does not separate a wedged image from a merely slow one. The probe
+asks a trivial question under a short budget, so an image that answers
+that question quickly and then takes thirty seconds over real work
+reports =healthy=.
 
 #+begin_example
 repl-eval  code: "42"
@@ -169,16 +211,20 @@ dropped mid-call.
   =stdout= is prefixed with a reconnect note warning that in-image state
   may have reset (definitions, packages, and registered object IDs from
   before the drop are gone).
-- *Check.* Confirm the Slynk listener is actually up on the configured
+- *Check.* Call =backend-status= first: it classifies this session's
+  connection and says what that classification does not establish. Then
+  confirm the Slynk listener is actually up on the configured
   address. The target is whatever =DSMR_SLYNK_ATTACH= (or the
   =:slynk-attach= keyword) points at — e.g. =127.0.0.1:4005=. A plain TCP
   probe to that =host:port= tells you whether the listener is accepting
   connections.
 - *Fix.* Bring the listener back up on the configured =host:port= (start
-  Slynk in the host image again), then *re-issue the call* — the
-  dispatcher reconnects on the next request. No server restart is needed;
-  the connection cache self-heals. Expect the one-time reconnect note on
-  the first successful call after recovery.
+  Slynk in the host image again), then *re-issue the call*: the
+  dispatcher reconnects on the next request and the connection cache
+  self-heals, with no server restart. If the listener is up and calls
+  still hang, =attach-reset= drops and reopens the connection in place.
+  Expect the one-time reconnect note on the first successful call after
+  recovery.
 
 * Hermetic-worker crash loop
 
@@ -198,9 +244,12 @@ start failing fast.
   fast for a *60-second cooldown* instead of spawning yet another
   replacement, so a genuinely broken workload (an eval that reliably
   kills the worker) cannot burn the machine down in a tight respawn loop.
-- *Check.* Call =pool-status= (hermetic mode only). Inspect
-  =pool_running=, =bound_count=, and the per-worker =state= entries to see
-  whether the session has a live worker or the breaker has removed it. A
+- *Check.* Call =backend-status= for the breaker state and the seconds
+  left in its cooldown; its =pool.liveness=, =pool.bound_count= and
+  per-worker =state= entries say whether the session still has a live
+  worker or the breaker has removed it. =pool-status= (hermetic mode
+  only) reports the same pool at the top level instead, as
+  =pool_running= and =bound_count=. A
   repeatedly-shrinking =total_workers= for the session, paired with the
   fail-fast error, confirms the crash loop.
 - *Fix.*
