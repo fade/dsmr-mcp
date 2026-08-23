@@ -3,16 +3,18 @@
 ;;;;
 ;;;; MCP tool: set the per-session project root.
 ;;;;
-;;;; D-03: root is session-local state only — no process chdir, no mutation
-;;;;        of *default-pathname-defaults*.
-;;;; D-04: root is re-rootable; one project is writable at a time.
-;;;; D-05: re-root outside the whitelist returns a typed
-;;;;        reroot-permission-required error that is NOT agent-self-serviceable.
-;;;;        human_approved is read ONLY from the inbound args hash via
-;;;;        (gethash "human_approved" args); the dispatcher never defaults it,
-;;;;        never derives it, never sets a fallback binding for it.
-;;;; D-06: does NOT call uiop:chdir and does NOT assign *default-pathname-defaults*.
-;;;; D-13: broad roots (/ /tmp/ /home/ etc.) are rejected before storing.
+;;;; The root is session-local state only: no process chdir, no mutation of
+;;;; *default-pathname-defaults*. It is re-rootable, and exactly one project
+;;;; is writable at a time.
+;;;;
+;;;; A re-root outside the whitelist returns a typed
+;;;; reroot-permission-required error naming the path, unless the call carries
+;;;; human_approved. That flag is read ONLY from the inbound args hash via
+;;;; (gethash "human_approved" args); the dispatcher never defaults it,
+;;;; never derives it, never sets a fallback binding for it, so nothing on
+;;;; this side of the wire turns an unapproved call into an approved one.
+;;;;
+;;;; Broad roots (/ /tmp/ /home/ etc.) are rejected before storing.
 ;;;;
 ;;;; Re-root whitelist source: env var DSMR_RELATED_PROJECTS (colon-separated
 ;;;; absolute paths). When empty or unset, every re-root to a new root
@@ -79,14 +81,16 @@ resolve paths relative to this root. Re-rooting outside the configured whitelist
                   :description "Absolute path to the project root directory.")
                  (human_approved
                   :type :boolean
-                  :description "Set to true (by a human, not an agent) to authorize \
-re-rooting to a path outside the configured whitelist. An autonomous agent cannot \
-self-approve this bypass (D-05)."))
+                  :description "Set to true only when the operator has \
+explicitly authorized re-rooting to a path outside the configured whitelist; \
+never set it on your own authority. A re-root outside that whitelist without \
+this flag returns a reroot-permission-required error naming the path."))
                 :required ("path"))))
   (:metaclass mcp-tool-class)
   (:documentation "MCP tool: set the per-session project root.
 Mode-independent (dispatcher-side). Does not route through attached image
-or hermetic worker. See module docstring for D-03/D-04/D-05/D-06 constraints."))
+or hermetic worker. See the module docstring for the session-root and re-root
+permission constraints."))
 
 ;; Fire metaclass :after immediately so "fs-set-project-root" appears in
 ;; *tool-classes* at load time, not at first instantiation.
@@ -97,11 +101,13 @@ or hermetic worker. See module docstring for D-03/D-04/D-05/D-06 constraints."))
 (defmethod tool-handle ((tool fs-set-project-root-tool) id args)
   (let* ((session      (tool-session tool))
          (path-str     (gethash "path" args))
-         ;; D-05 CRITICAL: human_approved is read ONLY from the inbound args
+         ;; CRITICAL: human_approved is read ONLY from the inbound args
          ;; hash. The dispatcher NEVER defaults, derives, or sets a fallback
-         ;; binding for it. An autonomous agent cannot self-grant the bypass
-         ;; because a prior call without human_approved will have returned a
-         ;; typed reroot-permission-required error.
+         ;; binding for it, so nothing on this side of the wire turns an
+         ;; unapproved call into an approved one. The gate is procedural: a
+         ;; call without human_approved is refused with a typed
+         ;; reroot-permission-required error, and the operator authorizes the
+         ;; retry.
          (human-approved (gethash "human_approved" args))
          (prev-root    (session-project-root session)))
     ;; Validate required arg
@@ -118,7 +124,7 @@ or hermetic worker. See module docstring for D-03/D-04/D-05/D-06 constraints."))
                              abs-requested))
            (new-ns       (namestring new-root))
            (prev-ns      (if prev-root (namestring prev-root) "(not set)")))
-      ;; Reject broad roots (D-13)
+      ;; Reject roots too broad to be a project
       (when (broad-root-p new-root)
         (return-from tool-handle
           (result id (make-ht "isError" t
@@ -136,7 +142,7 @@ to be used as a project root. Choose a specific project directory." new-ns))
                                          (format nil "fs-set-project-root: directory ~A does not exist."
                                                  new-ns))
                               "path" new-ns))))
-      ;; D-05 permission gate: non-whitelisted re-root without human_approved
+      ;; Permission gate: non-whitelisted re-root without human_approved
       (unless (%whitelisted-p new-ns prev-ns)
         (unless human-approved
           (return-from tool-handle
@@ -148,12 +154,13 @@ Call fs-set-project-root with human_approved: true after manual verification." n
                                 "path" new-ns
                                 "previous_root" prev-ns
                                 "requires_human_approval" t)))))
-      ;; D-05: log human_approved override BEFORE mutating the root
+      ;; Log the human_approved override BEFORE mutating the root
       (when (and human-approved (not (%whitelisted-p new-ns prev-ns)))
         (log-event :info "fs.set-project-root.human-approved"
                    "previous_root" prev-ns
                    "new_root" new-ns))
-      ;; D-06: set root on session ONLY — no uiop:chdir, no *default-pathname-defaults*
+      ;; Set the root on the session ONLY: no uiop:chdir, and no assignment
+      ;; to *default-pathname-defaults*.
       (setf (session-project-root session) new-root)
       ;; Mark that THIS dispatch newly established the session root so the
       ;; transport's post-dispatch hook can offer the project `.envrc` on the
@@ -167,9 +174,9 @@ Call fs-set-project-root with human_approved: true after manual verification." n
       (log-event :info "fs.set-project-root"
                  "previous_root" prev-ns
                  "new_root" new-ns)
-      ;; session_root field replaces cl-mcp's "cwd" (D-03: no process chdir;
-      ;; we report the session root, not the OS CWD). Field renamed from "cwd"
-      ;; to "session_root" per D-01 modernize latitude.
+      ;; The session_root field replaces cl-mcp's "cwd": nothing here changes
+      ;; the process working directory, so what we report is the session root
+      ;; and not the OS CWD.
       (result id
               (make-ht "project_root" new-ns
                        "session_root"  new-ns
