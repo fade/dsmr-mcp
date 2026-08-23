@@ -104,6 +104,31 @@ TEMP-DIR must already be inside SESSION-ROOT; this is asserted per-file."
           (uiop:run-program (list "chmod" "+x" (namestring pn))
                             :ignore-error-status t))))))
 
+(defun %register-with-asdf (name abs-asd)
+  "Make the freshly emitted system findable in this image and report how.
+
+A long-running image caches the source registry at its first lookup, so a
+directory created afterwards stays invisible even when it sits squarely on a
+configured tree. Dropping that cache is what makes the new project findable;
+its only cost to the caller is one rescan of the configured trees at the next
+lookup, since loaded code and loaded systems are left alone. A definition
+already recorded under NAME is dropped as well, so the answer below reflects
+what the registry can find rather than what an earlier call left behind.
+
+Returns :SOURCE-REGISTRY when the rescan resolves NAME to this very .asd, which
+also means any other image on this host will find it. Returns :LOAD-ASD when
+the project sits outside every configured tree and had to be registered by
+hand, which reaches no image but this one."
+  (asdf:clear-source-registry)
+  (ignore-errors (asdf:clear-system name))
+  (let* ((found (ignore-errors (asdf:find-system name nil)))
+         (source (and found (ignore-errors
+                             (truename (asdf:system-source-file found))))))
+    (if (and source (equal source (ignore-errors (truename abs-asd))))
+        :source-registry
+        (progn (ignore-errors (asdf:load-asd abs-asd))
+               :load-asd))))
+
 (defun write-scaffold (&key name description author license copyright year
                               destination overwrite session-root)
   "Generate the scaffold project atomically under SESSION-ROOT.
@@ -111,6 +136,7 @@ Returns a plist with:
   :target-dir    (absolute directory pathname)
   :relative-path (namestring relative to session-root)
   :files         (list of relative path strings, in manifest order)
+  :registration  :SOURCE-REGISTRY or :LOAD-ASD, see %register-with-asdf
 
 On any failure, signals INVALID-ARGUMENT-ERROR or propagates the
 underlying error after cleaning up the temp directory (no debris)."
@@ -165,14 +191,14 @@ underlying error after cleaning up the temp directory (no debris)."
                  (uiop:delete-directory-tree target-dir :validate t))
                (rename-file temp-dir target-dir)
                (setf committed t)
-               ;; Auto-register the new system with ASDF
-               (let ((abs-asd (namestring
-                               (merge-pathnames (format nil "~A.asd" name) target-dir))))
-                 (when (probe-file abs-asd)
-                   (ignore-errors (asdf:load-asd abs-asd))))
-               (list :target-dir target-dir
-                     :relative-path (enough-namestring target-dir session-root)
-                     :files (mapcar #'car manifest)))
+               (let* ((abs-asd (namestring
+                                (merge-pathnames (format nil "~A.asd" name) target-dir)))
+                      (registration (when (probe-file abs-asd)
+                                      (%register-with-asdf name abs-asd))))
+                 (list :target-dir target-dir
+                       :relative-path (enough-namestring target-dir session-root)
+                       :files (mapcar #'car manifest)
+                       :registration registration)))
           (unless committed
             (when (uiop:directory-exists-p temp-dir)
               (ignore-errors
