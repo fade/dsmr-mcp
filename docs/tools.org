@@ -190,7 +190,14 @@ default; set timeout_ms to wait that long for the first message. A named agent
 resumes where it left off across restarts. Every message comes back with the 
 agent that published it in its own author field, and the rendered text labels 
 each message with that author: a body opening with a name is ADDRESSING that 
-agent, not signing as it.
+agent, not signing as it. 
+Every answer, delivered or empty, also says where this agent's cursor sits in 
+the log it read and what the page bound was spent on, so an empty reply says 
+which kind of empty it is. A caught-up reader and a reader whose recorded 
+position the log no longer holds both receive nothing, and cursor_state is what 
+tells them apart; a page consumed by mail addressed to other participants also 
+delivers nothing, and the page field is what reconciles that with a 
+remaining_pending above zero.
 
 #+begin_src json
 {
