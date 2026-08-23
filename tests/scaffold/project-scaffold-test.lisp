@@ -261,6 +261,38 @@ parent-pointing path."
         (ignore-errors (asdf:clear-system "e2e-smoke/tests"))
         (ignore-errors (asdf:clear-system "e2e-smoke"))))))
 
+;;; --- the emitted project runs the way its own docs say it does -------------
+
+(defun %executable-file-p (path)
+  "True when PATH carries the execute bit for this process."
+  (zerop (nth-value 2 (uiop:run-program (list "test" "-x" (namestring path))
+                                        :ignore-error-status t))))
+
+(define-test scaffold-emits-runnable-scripts
+  "The scripts the generated README and CLAUDE.md tell a person to run come out
+executable, and ordinary files do not."
+  (with-temp-project-root (session root)
+    (let* ((result (write-scaffold :session-root root
+                                   :name "runnable-proj"
+                                   :description "runnable scripts test"
+                                   :author "Tester"
+                                   :license "MIT"
+                                   :copyright "Tester"
+                                   :year "2026"
+                                   :destination "scaffolds"))
+           (target-dir (getf result :target-dir)))
+      (dolist (script '("build.sh" "scripts/dev-boot.sh"))
+        (let ((path (merge-pathnames script target-dir)))
+          (true (probe-file path) (format nil "~A was not emitted" script))
+          (true (%executable-file-p path)
+                (format nil "~A is not executable, so the emitted docs that ~
+tell a person to run it fail on their first step" script))))
+      ;; The control: an execute bit granted to every file would pass the
+      ;; checks above while saying nothing.
+      (false (%executable-file-p (merge-pathnames "README.md" target-dir))
+             "README.md came out executable")
+      (ignore-errors (asdf:clear-system "runnable-proj")))))
+
 (define-test scaffold-no-debris-on-failure
   "A failed scaffold leaves no .tmp-* debris in the session root (T-11-03)."
   (with-temp-project-root (session root)

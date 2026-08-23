@@ -65,6 +65,19 @@ the error message)."
            :value (namestring dir)
            :reason (format nil "~A resolves outside session root" context))))
 
+(defun %executable-content-p (content)
+  "True when CONTENT begins with a #! line, marking the file as a script.
+
+The execute bit is derived from the file's own first two bytes rather than
+declared in a table of names kept somewhere else. A script added to the
+manifest later cannot then be forgotten, and the mode can never disagree with
+the content it describes. Every shebang-bearing file this scaffold emits is one
+the generated README and CLAUDE.md tell a person to run directly, so at the
+bare process umask those instructions fail on their first step."
+  (and (stringp content)
+       (>= (length content) 2)
+       (string= "#!" content :end2 2)))
+
 (defun %write-plan-to-temp (temp-dir plan session-root)
   "Write all PLAN entries into TEMP-DIR, routing each file through the
 Phase-6 write-jail (ensure-write-path) then write-file-string-atomically.
@@ -83,7 +96,13 @@ TEMP-DIR must already be inside SESSION-ROOT; this is asserted per-file."
                  :field "destination"
                  :value rel-in-temp
                  :reason "file path resolves outside session root"))
-        (write-file-string-atomically pn (cdr entry))))))
+        (write-file-string-atomically pn (cdr entry))
+        (when (%executable-content-p (cdr entry))
+          ;; chmod through run-program rather than sb-posix, matching how the
+          ;; installer sets the execute bit on the binary it copies. A chmod
+          ;; that cannot run must not discard an otherwise complete tree.
+          (uiop:run-program (list "chmod" "+x" (namestring pn))
+                            :ignore-error-status t))))))
 
 (defun write-scaffold (&key name description author license copyright year
                               destination overwrite session-root)
