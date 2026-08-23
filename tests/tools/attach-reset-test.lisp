@@ -3,11 +3,20 @@
 ;;;;
 ;;;; Coverage for the attach-reset verb.
 ;;;;
-;;;; Every test here stands up a real in-process Slynk listener and opens the
-;;;; connection through the production path, so what is reset is a connection
-;;;; the ordinary call path made and what reopens it is the ordinary call path
-;;;; reopening it. A fixture that installed a stand-in object in the cached slot
-;;;; would exercise the bookkeeping and none of the lifecycle.
+;;;; Every test here opens its connection through the production path, so what
+;;;; is reset is a connection the ordinary call path made and what reopens it is
+;;;; the ordinary call path reopening it. A fixture that installed a stand-in
+;;;; object in the cached slot would exercise the bookkeeping and none of the
+;;;; lifecycle.
+;;;;
+;;;; The listener behind that connection is a real in-process Slynk one wherever
+;;;; it has to stay up. The single test that has to take the listener away in
+;;;; the middle owns a plain listening socket instead, because taking a Slynk
+;;;; listener away is a request rather than an act and one that goes unheard
+;;;; leaves the port answering. Opening a connection asks nothing of the far end
+;;;; beyond accepting it, and no test here speaks the protocol over the
+;;;; connection it opens, so the two are the same connection as far as any of
+;;;; this is concerned.
 ;;;;
 ;;;; The assertion that matters most is not the one about the epoch. It is the
 ;;;; two-session control: the verb claims to reach only the calling session's
@@ -37,6 +46,11 @@
   (:import-from #:dsmr-mcp/src/attach/dispatch
                 #:repl-eval-tool-slynk-conn
                 #:repl-eval-tool-connection-epoch)
+  (:import-from #:bordeaux-threads
+                #:make-thread
+                #:make-semaphore
+                #:signal-semaphore
+                #:wait-on-semaphore)
   (:import-from #:slynk)
   (:import-from #:usocket))
 
@@ -53,7 +67,11 @@ it, and stop it again on the way out however BODY leaves.
 :dont-close is set so the listen socket keeps accepting: a reset opens a second
 connection to the same listener, which is the whole shape under test. The stop
 is wrapped so a test that has already stopped the listener on purpose does not
-fail in teardown."
+fail in teardown.
+
+For a test that has to take the listener away again in the middle, use
+with-owned-listener instead. Stopping a Slynk listener on demand is not
+something this fixture can promise."
   (let ((tmp (gensym "PORT-")))
     `(let ((,tmp (slynk:create-server :port 0 :dont-close t)))
        (unwind-protect
@@ -61,6 +79,33 @@ fail in teardown."
               (declare (ignorable ,port-var))
               ,@body)
          (ignore-errors (slynk:stop-server ,tmp))))))
+
+(defmacro with-owned-listener ((port-var socket-var) &body body)
+  "Bind SOCKET-VAR to a listening socket this fixture owns outright, PORT-VAR to
+its port, and close the socket on the way out however BODY leaves.
+
+The tests that need their listener to stay up use a real Slynk one, which is the
+faithful thing to do. This is for the one test that has to take the listener
+away in the middle, and Slynk cannot be relied on for that. Its listeners are
+handed to a sentinel thread asynchronously after create-server has already
+returned, and stop-server does nothing whatsoever to a listener the sentinel is
+not holding: it warns and returns while the port carries on taking connections.
+In a full suite run five listeners in a row went unregistered, and in a cold
+image driven with no settle between them, forty out of forty did.
+
+Owning the socket makes taking it away exact rather than requested: nothing is
+parked in accept on it, so closing it is synchronous and the port refuses from
+the next connect onwards. Nothing is given up by it either. Opening a connection
+asks nothing of the far end beyond accepting it, and these tests never speak the
+protocol over the connection they open. If anything it is the closer likeness,
+since an image that has gone away takes its established connections with it,
+where stopping a Slynk listener leaves them up."
+  `(let* ((,socket-var (usocket:socket-listen "127.0.0.1" 0 :backlog 8))
+          (,port-var (usocket:get-local-port ,socket-var)))
+     (declare (ignorable ,port-var))
+     (unwind-protect
+          (progn ,@body)
+       (ignore-errors (usocket:socket-close ,socket-var)))))
 
 (defun attached-session (id port)
   "Return a session addressed at PORT, with no connection opened yet."
@@ -88,24 +133,77 @@ payload hash-table."
 are different answers and this is what tells them apart."
   (nth-value 1 (gethash key ht)))
 
-(defun port-refuses-connections-p (port)
-  "True when a plain TCP connect to PORT is refused.
+(defun probe-port (port)
+  "Report what a plain TCP connect to PORT on loopback meets, as one of
+:accepting, :refused or :indeterminate. A second value names the reason for an
+indeterminate reading.
 
 A raw socket, and nothing the verb touches. Whether the image is reachable is
 the precondition the reopen-failure case rests on, so reading it with the
 connection machinery under test would make the plant agree with the code by
-construction."
-  (handler-case
-      (let ((s (usocket:socket-connect "127.0.0.1" port :timeout 1)))
-        (usocket:socket-close s)
-        nil)
-    (error () t)))
+construction.
 
-(defun wait-until-refused (port &key (tries 100))
-  "Poll until PORT refuses connections, and return whether it ever did."
-  (loop repeat tries
-        when (port-refuses-connections-p port) return t
-        do (sleep 0.05)))
+The three answers are kept apart deliberately. \"The port refused\" and \"the
+port is still up\" are the two states the fault plant exists to tell apart, and
+a reading that is neither must not be allowed to impersonate either of them.
+
+No :timeout is passed to the connect, and its absence is the point rather than
+an oversight. Measured against ports nothing has ever bound, this usocket
+backend answers a connect carrying :timeout 1 with a timeout condition after a
+full second, and the same connect with no timeout at all with a refusal in
+under twenty milliseconds. The argument that reads as a safety bound is what
+destroys the only signal worth having. The bound is applied from outside
+instead, by letting another thread do the connecting and giving it a deadline
+to answer in, so a connect that never comes back is reported as its own
+outcome rather than borrowing one of the other two."
+  (let ((answer nil)
+        (answered (make-semaphore)))
+    (make-thread
+     (lambda ()
+       (setf answer
+             (handler-case
+                 (let ((socket (usocket:socket-connect "127.0.0.1" port)))
+                   ;; The connect is the reading. A close that misbehaves
+                   ;; afterwards says nothing about whether the port answered.
+                   (ignore-errors (usocket:socket-close socket))
+                   :accepting)
+               (usocket:connection-refused-error () :refused)
+               (error (condition) (cons :indeterminate (type-of condition)))))
+       (signal-semaphore answered))
+     :name "attach-reset test port probe")
+    (cond ((not (wait-on-semaphore answered :timeout 2))
+           (values :indeterminate :no-answer))
+          ((consp answer)
+           (values :indeterminate (cdr answer)))
+          (t
+           (values answer nil)))))
+
+(defun wait-for-refusal (port &key (deadline 5))
+  "Report whether PORT refuses connections, as :refused, :accepting or
+:indeterminate. A second value names the reason behind an indeterminate
+reading.
+
+The caller gets a name rather than a yes or no because the ways of not seeing a
+refusal are different faults and want telling apart. Collapsing them into one
+false leaves a caller unable to say which it hit, and the two read identically
+from where the caller stands.
+
+Only an unsettled reading is waited on. A port that takes a connection is a port
+whose listener is still there, and sitting out a deadline cannot change that: the
+answer is already in, and returning it at once is what lets the caller say the
+plant never took rather than that the backend was slow. It also keeps this from
+filling a listener's accept queue with connections nobody is going to take,
+which is its own way of hanging and was measured doing so."
+  (let ((end (+ (get-internal-real-time)
+                (* deadline internal-time-units-per-second))))
+    (loop
+      (multiple-value-bind (verdict detail) (probe-port port)
+        (case verdict
+          (:refused (return (values :refused nil)))
+          (:accepting (return (values :accepting nil)))
+          (t (when (> (get-internal-real-time) end)
+               (return (values :indeterminate detail)))
+             (sleep 0.05)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The reset itself
@@ -263,19 +361,23 @@ Nothing latches: the session is not marked failed anywhere, so the next ordinary
 call opens on demand exactly as it always does, and a failed reset costs a
 session one call rather than its future."
   (let ((*mode* :attached))
-    (with-listener (port)
+    (with-owned-listener (port listener)
       (let* ((session (attached-session "attach-reset-gone" port))
              (tool (open-connection-for session port))
              (before (repl-eval-tool-connection-epoch tool)))
         (unwind-protect
              (progn
-               ;; Stopping the listener closes the accepting socket while the
-               ;; connection already open stays in the slot, so the drop has
-               ;; something real to drop and the reopen has nothing to reach.
-               (slynk:stop-server port)
-               (true (wait-until-refused port)
-                     "a raw connect must be refused, or the reopen has something to reach \
-and this proves nothing")
+               ;; The listener goes away under a connection the tool is still
+               ;; holding, so the drop has something real to drop and the
+               ;; reopen has nothing to reach.
+               (usocket:socket-close listener)
+               ;; A verdict rather than a yes or no, so a plant that did not
+               ;; take says so in its own words instead of arriving here
+               ;; disguised as a backend that is merely slow to refuse.
+               (multiple-value-bind (verdict detail) (wait-for-refusal port)
+                 (is eq :refused verdict
+                     "a raw connect must be refused, or the reopen has something to reach and this proves nothing; saw ~A~@[ (~A)~]"
+                     verdict detail))
                (let ((payload (call-attach-reset session)))
                  (true (gethash "isError" payload) "a reopen that failed is an error")
                  (true (key-present-p payload "error_type") "and it carries a failure name")
