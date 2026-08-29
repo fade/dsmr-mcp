@@ -424,5 +424,5 @@
           "which names the verb that answers the inventory question")
       (true (search "moment in time" (gethash "reports" supersession))
             "and says what this reply is")
-      (true (search "delivery filters" (gethash "pending" supersession))
-            "and states in its own terms why the pending number can differ from a receive"))))
+      (true (search "can legitimately exceed" (gethash "pending" supersession))
+            "and states in its own terms that the pending number is not bounded by one receive's page. This fires when that sentence is dropped, which is what an equality rewrite would have to do to it. It cannot see an equality claim added beside a sentence left standing, so it is evidence the page bound is still stated and not evidence that nothing contradicts it"))))
