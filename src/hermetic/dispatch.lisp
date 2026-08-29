@@ -9,9 +9,13 @@
 ;;;; structured isError reset notification on the FIRST call after a worker
 ;;;; crash, so the agent gets one clear signal; the next call succeeds.
 ;;;;
-;;;; All pool conditions (pool-shutting-down, pool-capacity-exceeded) and
-;;;; worker-crashed are caught and converted to structured isError / rpc-error
-;;;; responses so the serve loop never sees an unhandled condition.
+;;;; All pool conditions (pool-shutting-down, pool-capacity-exceeded,
+;;;; circuit-breaker-active) and worker-crashed are caught and converted to
+;;;; structured isError / rpc-error responses so the serve loop never sees an
+;;;; unhandled condition. The two a caller can act on carry a machine-readable
+;;;; error_type: backend_crashed says the worker died and the call may simply
+;;;; be retried, circuit_open says the pool is refusing calls for this session
+;;;; and names how many seconds are left before one will be accepted.
 
 (defpackage #:dsmr-mcp/src/hermetic/dispatch
   (:use #:cl)
@@ -25,7 +29,9 @@
                 #:make-ht #:text-content #:result #:rpc-error)
   (:import-from #:dsmr-mcp/src/hermetic/pool
                 #:get-or-assign-worker #:pool-shutting-down
-                #:pool-capacity-exceeded #:pool-rpc-with-hard-kill)
+                #:pool-capacity-exceeded #:pool-rpc-with-hard-kill
+                #:circuit-breaker-active
+                #:circuit-breaker-active-remaining-seconds)
   (:import-from #:dsmr-mcp/src/hermetic/worker-client
                 #:worker-crashed
                 #:check-and-clear-reset-notification
@@ -249,9 +255,24 @@ crash; the object id is no longer valid.")))))
                    "tool" name
                    "reason" (princ-to-string e))
         (result id (make-ht "isError" t
+                            "error_type" "backend_crashed"
                             "content"
                             (text-content
                              (format nil "Worker crashed: ~A" e)))))
+      (circuit-breaker-active (e)
+        (log-event :warn "dispatch.circuit-breaker-active"
+                   "session" *current-session-id*
+                   "tool" name
+                   "remaining_seconds"
+                   (circuit-breaker-active-remaining-seconds e))
+        (result id (make-ht "isError" t
+                            "error_type" "circuit_open"
+                            "content"
+                            (text-content
+                             (format nil "~A Retry in ~D second~:P."
+                                     e
+                                     (circuit-breaker-active-remaining-seconds
+                                      e))))))
       (pool-shutting-down ()
         (rpc-error id -32000 "Worker pool is shutting down"))
       (pool-capacity-exceeded ()

@@ -6,6 +6,106 @@
 # diverge from the schema the server actually advertises and fail the parity
 # test. Regenerate instead of editing.
 
+* attach-reset
+
+Force-drop and reopen this session's connection to the 
+developer's Lisp image, in place and without restarting the server. Use it 
+when the image accepts connections and answers nothing, or when a connection 
+has to be re-established after a fault. In-image state is untouched: this 
+resets the wire, not the image, so definitions and application state built up 
+in the developer's image survive. 
+It affects only the calling session's own connection. No other session's 
+connection is dropped, and no other session can be named: the verb takes no 
+arguments at all. 
+The response reports the connection epoch after the reset. That is what makes 
+a reset observable to somebody else: a call already in flight when the reset 
+lands sees the epoch move under it and can tell it was reset rather than that 
+it merely failed. When no connection was open, one is opened and the epoch 
+stays where it is, since no call was interrupted. Only available in attached 
+mode.
+
+#+begin_src json
+{
+  "properties": {},
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
+* backend-status
+
+Report the health of whichever backend this server is using: the 
+hermetic worker pool, or this session's connection to the developer's Lisp 
+image. It answers in both modes, so you do not have to know which one is 
+running before you can ask. 
+In hermetic mode it reports the pool's liveness, the most recent ping round 
+trip, circuit-breaker state with the seconds left in any cooldown, the crash 
+count inside the current window, how many worker incarnations have been issued, 
+and a per-worker breakdown of state, liveness, last ping and missed pings. 
+In attached mode it reports this session's liveness classification, last probe 
+round trip, connection epoch and whether a connection is open. It covers the 
+calling session's own connection only: it says nothing about any other 
+session's connection and nothing about the backend fleet-wide, because the 
+attached connection is a per-session resource while the pool is a shared one. 
+The breaker and crash-history fields are reported as not applicable in attached 
+mode rather than as zero, since a zero would read as a clean measurement where 
+in fact nothing was measured. 
+Every classification comes back with what it establishes, what it does not, how 
+it was obtained and what would flip it, so no value has to be read on trust. 
+This verb answers about the backend. Bus state is a separate subject with its 
+own verb; ask that one instead of expecting this to say how everything is.
+
+#+begin_src json
+{
+  "properties": {},
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
+* bus-inspect
+
+Inspect one coordination bus in depth: which broker is serving 
+it and whether that broker would survive, whether a member leaving right now 
+would seal the log, the log's head and generation and the sealed logs behind 
+it, every recorded position with the ones that cannot be positions in the 
+current log flagged, and which identities are enrolled, which are per-process, 
+and which hold a position on a bus that never enrolled them. 
+Read-only: nothing is published, no cursor is moved and no lock is taken. 
+Every classification comes back with the check that produced it, the nearest 
+wrong conclusion a reader might draw, how the value was obtained and what 
+would flip it, so no value has to be read on trust. 
+Note in particular that a broker reported running has been found holding the 
+election lock and says nothing about which source it is serving, and that the 
+recorded source revision is the source the broker loaded at start and is not 
+compared against the working tree here. 
+This verb answers about the bus. Backend liveness, meaning the worker pool or 
+this session's connection to the developer's image, is a separate subject with 
+its own verb; ask that one instead of expecting this to say how everything is. 
+For a quick peek at whether a broker is up and how many messages are waiting 
+for you, bus-status is the smaller and faster call.
+
+#+begin_src json
+{
+  "properties": {
+    "agent_id": {
+      "description": "Optional stable agent name to inspect under \n(within this project's namespace). Omit to use the session's anonymous default \nagent.",
+      "type": "string"
+    },
+    "bus": {
+      "description": "Optional named bus to inspect. Omit to use this \nsession's bus, which is DSMR_BUS_SELECTOR from the repository's .envrc when \nthat is set and the shared host-wide bus otherwise. A name that cannot become \na bus is refused; the shared bus is never inspected in place of a bus that was \nnamed.",
+      "type": "string"
+    },
+    "ephemeral": {
+      "description": "Set true to force a fresh one-shot ephemeral \nidentity for this subagent, opting out of the project's stable DSMR_BUS_AGENT \nidentity so it never resumes the main agent's cursor.",
+      "type": "boolean"
+    }
+  },
+  "required": [],
+  "type": "object"
+}
+#+end_src
+
 * bus-leave
 
 Leave a coordination bus cleanly. This agent reads out whatever 
@@ -90,7 +190,14 @@ default; set timeout_ms to wait that long for the first message. A named agent
 resumes where it left off across restarts. Every message comes back with the 
 agent that published it in its own author field, and the rendered text labels 
 each message with that author: a body opening with a name is ADDRESSING that 
-agent, not signing as it.
+agent, not signing as it. 
+Every answer, delivered or empty, also says where this agent's cursor sits in 
+the log it read and what the page bound was spent on, so an empty reply says 
+which kind of empty it is. A caught-up reader and a reader whose recorded 
+position the log no longer holds both receive nothing, and cursor_state is what 
+tells them apart; a page consumed by mail addressed to other participants also 
+delivers nothing, and the page field is what reconciles that with a 
+remaining_pending above zero.
 
 #+begin_src json
 {
@@ -167,8 +274,25 @@ here, and adding one would only dress a convention up as a control.
 
 * bus-status
 
-Report the coordination bus state for this agent: whether a broker 
-is running and how many messages are waiting, without consuming them.
+Report this agent's view of the coordination bus at one moment: 
+whether a broker is running and how many records are waiting for this agent, 
+without consuming them. 
+It is not an inventory of the bus. It does not establish what the broker is, 
+which source that broker is serving or whether it would survive a restart; it 
+does not say which generation of the log this is, which recorded positions are 
+stranded, or which identities are enrolled and reading. bus-inspect answers 
+those, and it is the verb to call when the question is what state the bus is 
+in. 
+The pending figure counts only the kind of record a receive would hand back: 
+nothing this agent published, and nothing addressed to another participant. 
+The count and the delivery path apply the same test, so every record counted 
+here is one a receive will hand over, and nothing else is counted. The figure 
+is not bounded by a page: one receive returns at most its limit, 20 by 
+default, and reports the rest as remaining_pending, so pending can 
+legitimately exceed what a single call hands back. A pending of zero means 
+nothing is deliverable to this agent, which is not the same as an empty log: 
+records past the cursor may be addressed to other participants, or be this 
+agent's own publishes it has not consumed.
 
 #+begin_src json
 {
@@ -440,7 +564,7 @@ resolve paths relative to this root. Re-rooting outside the configured whitelist
 {
   "properties": {
     "human_approved": {
-      "description": "Set to true (by a human, not an agent) to authorize \nre-rooting to a path outside the configured whitelist. An autonomous agent cannot \nself-approve this bypass (D-05).",
+      "description": "Set to true only when the operator has \nexplicitly authorized re-rooting to a path outside the configured whitelist; \nnever set it on your own authority. A re-root outside that whitelist without \nthis flag returns a reroot-permission-required error naming the path.",
       "type": "boolean"
     },
     "path": {

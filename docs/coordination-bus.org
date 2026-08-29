@@ -31,7 +31,15 @@ The bus surface is five tools. Their full input schemas live in the
   immediately with whatever is pending (catch-up); set =timeout_ms= to block that
   long waiting for the first message.
 - =bus-status= — report whether a broker is running and how many messages are
-  waiting for this agent, *without* consuming them. Use it to peek.
+  waiting for this agent, *without* consuming them. Use it to peek. It reports a
+  moment in time, not an inventory: for the state of the bus itself call
+  =bus-inspect=.
+- =bus-inspect= gives the state of one bus in depth, read-only: which broker is
+  serving it and whether it would survive, whether a member leaving right now
+  would seal the log, the log's head and generation and the sealed logs behind
+  it, every recorded position with the stranded ones flagged, and which
+  identities are enrolled and reading. Every value comes back with the check
+  that produced it and what that check does not settle.
 - =bus-roster= - read and change who is enrolled on a bus, who leads it, and
   whether enrollment is open. Operator-managed and *advisory*: nothing on the
   serving path consults it, and an agent absent from it publishes and receives
@@ -41,7 +49,7 @@ The bus surface is five tools. Their full input schemas live in the
   cursor at the head so nothing unread pins the log. Returning later resumes at
   the current head rather than delivering the backlog for the time away.
 
-All five accept the optional identity controls =agent_id= and =ephemeral=,
+All six accept the optional identity controls =agent_id= and =ephemeral=,
 described under [[*Agent identity]] below, and an optional =bus= naming which bus
 to act on for a one-off. Each reports back the bus it acted on, printing
 =default= for the shared host-wide one. A name that cannot become a bus is
@@ -190,6 +198,11 @@ which bus you are actually on]].
 
 - *Is the bus up, and is anything waiting?* Call =bus-status=. =broker_running=
   reflects whether a broker holds the election lock; =pending= is your backlog.
+  Both are readings taken at that instant and neither describes the bus as a
+  whole.
+- *What state is the bus actually in?* Call =bus-inspect=. It is the verb for
+  the inventory question: which broker, against what source, whether rotation is
+  armed, which log this is, which positions are stranded, and who is reading.
 - *Drain the backlog.* =bus-receive= with the default (non-blocking) timeout
   returns everything past your cursor and advances it.
 - *Broker seems stuck.* Kill the broker process; the next participant contending
@@ -456,6 +469,6 @@ and uses the default WAL under =$XDG_STATE_HOME/dsmr-mcp/bus/=.
 
 - [[file:bus-segmentation.org][Bus segmentation]] - giving a fleet a bus of its own, and the operating procedure under =Using a named bus=.
 - [[file:configuration.org::*direnv per-project setup][Configuration → direnv per-project setup]] - where =DSMR_BUS_AGENT= and =DSMR_BUS_SELECTOR= come from.
-- [[file:tools.org][Tool reference]] - full input schemas for =bus-publish=, =bus-receive=, =bus-status=, =bus-roster= and =bus-leave=.
+- [[file:tools.org][Tool reference]] - full input schemas for =bus-publish=, =bus-receive=, =bus-status=, =bus-inspect=, =bus-roster= and =bus-leave=.
 - [[file:architecture.org][Architecture]] — where the bus sits in the module map.
 - [[file:threat-model.org][Threat model]] — the localhost-only trust posture the bus inherits.

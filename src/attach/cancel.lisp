@@ -1,6 +1,12 @@
 ;;;; src/attach/cancel.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
+;;;; ATTACH-CALL-AUDIT: does not serialise. Cancelling puts a real interrupt
+;;;; and a real restart rex on the wire, and it must do so while the call it
+;;;; is cancelling still holds the lock. Waiting for that lock would mean
+;;;; waiting for the eval to finish, which is the single thing cancellation
+;;;; exists to avoid, so this path cannot take it and stay useful.
+;;;;
 ;;;; Cooperative abort of an in-flight attached eval.
 ;;;;
 ;;;; A cancel request drives a headless two-phase Slynk interrupt against a

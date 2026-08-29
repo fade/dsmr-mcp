@@ -21,6 +21,9 @@
 ;;;; and as a detached process in production. BUS-PATHS centralises the on-disk
 ;;;; and socket layout under the bus state directory shared with the facade.
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-posix))
+
 (defpackage #:dsmr-mcp/src/bus/broker
   (:use #:cl)
   (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal)
@@ -38,6 +41,12 @@
            #:bus-paths-submit-endpoint #:bus-paths-pub-endpoint
            #:ensure-bus-dirs #:reap-orphaned-cursors
            #:cursor-path-for #:advance-held-cursors #:age-departed-cursors
+           #:ephemeral-cursor-name-p
+           #:broker-identity-path
+           #:write-broker-identity #:read-broker-identity
+           #:broker-identity-pid #:broker-identity-ppid-at-start
+           #:broker-identity-started-at
+           #:broker-identity-revision #:broker-identity-version
            #:broker #:broker-seq
            #:start-broker #:broker-step #:serve-broker #:stop-broker
            #:custodial-tick
@@ -111,6 +120,155 @@
     (election:lock-shared fd)
     fd))
 
+;;; ------------------------------------------------------- broker identity
+;;;
+;;; Holding the election lock says only that SOME open file description holds
+;;; it. It carries no identity at all, and the kernel's own lock table is barely
+;;; better: it names the pid that created the lock, which outlives that process
+;;; whenever a child inherited the descriptor. Neither can answer "which broker,
+;;; serving which code", so the winning broker writes that down itself.
+;;;
+;;; The record is a file and is therefore stale from the moment it lands. That
+;;; is not a defect to engineer away, it is the property a reader has to be told
+;;; about: the running answer comes from the lock, the identity comes from here,
+;;; and a disagreement between the two is itself worth reporting.
+
+(defun broker-identity-path (paths)
+  "Where the broker serving the bus at PATHS records who it is.
+
+   A sibling of the bus's other state, written once when a broker wins the
+   election and left behind when that broker dies. Its presence is never
+   evidence that a broker is running."
+  (merge-pathnames "broker.identity" (bus-paths-root paths)))
+
+(defun %full-character-string (value)
+  "VALUE as a string of full characters, or VALUE unchanged when it is not a
+   string.
+
+   An all-ASCII string in this implementation is often a base string, and a base
+   string printed readably comes out as an array literal rather than as text. It
+   reads back correctly, so nothing breaks, but a record an operator may open in
+   an editor is worth more than the microsecond the coercion costs."
+  (if (stringp value)
+      (map '(simple-array character (*)) #'identity value)
+      value))
+
+(defun %recorded-version ()
+  "The version string this image reports for itself, or NIL when it has none.
+
+   This is a release version, not a source revision, and the two must not be
+   confused at the point of reporting."
+  (ignore-errors
+   (let ((system (asdf:find-system "dsmr-mcp" nil)))
+     (and system (%full-character-string (asdf:component-version system))))))
+
+(defun %source-revision ()
+  "The source revision the running image was built from, or NIL when the image
+   carries none.
+
+   NIL as things stand: nothing in the build bakes a revision into the image.
+   Kept as one function rather than an inline NIL so an image that later carries
+   one has a single place to answer from, and so the absence is a stated answer
+   rather than an omission.
+
+   Deriving it from the working tree instead would be worse than having none.
+   The tree moves while a broker goes on serving whatever it loaded hours ago,
+   so a revision read at the moment of the question would name code the broker
+   has never run, and it would name it with the confidence of a measurement."
+  nil)
+
+(defun write-broker-identity (paths)
+  "Record who is serving the bus at PATHS and return the recorded plist, or NIL
+   when nothing could be written.
+
+   Carries this process's pid, the parent it had at that moment, the time it
+   started, and what it can say about the source it is serving. The parent is
+   recorded as it was at start deliberately: a broker outlives the process that
+   spawned it and is reparented when that process exits, so the value here and
+   the one the running process reports are two different facts and a reader
+   wants both.
+
+   Written to a temporary file in the same directory and renamed over the
+   target, so a reader never catches the record half-formed. The whole thing is
+   wrapped so a failure to record identity can never stop a broker from serving:
+   a missing record costs one status answer, a broker that refused to start
+   costs the bus."
+  (ignore-errors
+   (let* ((target (broker-identity-path paths))
+          (temp (merge-pathnames (format nil "broker.identity.tmp~D"
+                                         (random 100000000))
+                                 (bus-paths-root paths)))
+          (plist (list :pid (sb-posix:getpid)
+                       :ppid-at-start (sb-posix:getppid)
+                       :started-at (get-universal-time)
+                       :source-revision (%full-character-string (%source-revision))
+                       :version (%recorded-version))))
+     (ensure-directories-exist target)
+     (unwind-protect
+          (progn
+            (with-open-file (out temp :direction :output
+                                      :if-exists :supersede
+                                      :if-does-not-exist :create)
+              (with-standard-io-syntax (prin1 plist out))
+              (finish-output out))
+            (rename-file temp target)
+            (setf temp nil))
+       (when temp (ignore-errors (delete-file temp))))
+     plist)))
+
+(defun read-broker-identity (paths)
+  "The identity record on the bus at PATHS, or NIL when none is readable.
+
+   An absent record and a record naming a process that has since died are
+   different situations and both are reportable, so nothing is decided here.
+   The caller cross-checks: running comes from the lock, and the recorded pid is
+   worth repeating only when a process with that pid still exists.
+
+   *READ-EVAL* is bound off and the read runs in standard syntax. The record
+   sits under a state root other processes can write, so looking at it must not
+   be able to run code, and the parse must not depend on what the calling image
+   has configured its reader to do."
+  (ignore-errors
+   (let ((path (broker-identity-path paths)))
+     (when (probe-file path)
+       (let ((form (with-standard-io-syntax
+                     (let ((*read-eval* nil))
+                       (with-open-file (in path :if-does-not-exist nil)
+                         (and in (read in nil nil)))))))
+         (when (and (listp form)
+                    (let ((len (ignore-errors (list-length form))))
+                      (and len (evenp len))))
+           form))))))
+
+(defun broker-identity-pid (record)
+  "The pid the broker recorded for itself, or NIL when RECORD names none."
+  (getf record :pid))
+
+(defun broker-identity-ppid-at-start (record)
+  "The parent pid the broker had when it started, or NIL when RECORD names none.
+
+   Not the broker's parent now. A broker whose spawning process has since exited
+   is adopted by another, and the difference between this and the live value is
+   how that shows."
+  (getf record :ppid-at-start))
+
+(defun broker-identity-started-at (record)
+  "The universal time the broker recorded starting, or NIL when RECORD names
+   none."
+  (getf record :started-at))
+
+(defun broker-identity-revision (record)
+  "The source revision the broker recorded, or NIL when it recorded none.
+
+   NIL is the ordinary answer while the build bakes no revision into the image.
+   It means unavailable, and a reader must say so rather than substituting the
+   version, which answers a different question."
+  (getf record :source-revision))
+
+(defun broker-identity-version (record)
+  "The version string the broker's image reported for itself, or NIL."
+  (getf record :version))
+
 (defun %ephemeral-name-p (name)
   "True iff NAME is an auto-generated ephemeral agent name — g<digits>-<digits>,
    the shape the envelope leaf builds for an id given no stable name. The match
@@ -140,6 +298,18 @@
     (%ephemeral-name-p (if pos
                            (subseq filename (+ pos (length separator)))
                            filename))))
+
+(defun ephemeral-cursor-name-p (filename)
+  "True iff FILENAME is the cursor file of an auto-generated ephemeral agent.
+
+   The exported name for the predicate the cursor sweep decides eligibility
+   with. There is one rule, it lives in the internal predicate this delegates
+   to, and nothing outside this file may restate it: a surface that shows which
+   identities are ephemeral and a sweep that removes them have to agree, and if
+   they ever drift apart neither is wrong in a way anyone can see. Reap
+   eligibility and identity visibility therefore read the same answer from the
+   same place."
+  (%ephemeral-cursor-name-p filename))
 
 (defun reap-orphaned-cursors (paths &key (max-age-days 7))
   "Delete long-dead ephemeral cursors under PATHS' cursor directory and return
@@ -316,6 +486,10 @@
    learn the next seq, optionally JOIN membership, and bind the intake and
    publisher sockets. Returns a BROKER.
 
+   Also records who won the role, since winning it is the only moment at which
+   that is knowable from inside. A failure to write that record is swallowed:
+   the bus matters more than the answer about the bus.
+
    Also runs both custodial sweeps once on the way up: the ephemeral-cursor reap,
    and the retirement of cursors whose owner recorded leaving long enough ago.
    The broker already owns the cursor directory's lifecycle, and this is the one
@@ -331,6 +505,11 @@
       (block (election:await-broker lock-fd))      ; wait out the incumbent
       (t (election:close-lock lock-fd)
          (return-from start-broker nil)))
+    ;; The role is won here and nowhere else, so this is the only moment at
+    ;; which the identity of the serving broker is knowable. Recorded before
+    ;; any socket is bound, so a bus that fails to come all the way up still
+    ;; says who was holding it.
+    (write-broker-identity paths)
     (let* ((seq (wal:recovery-last-seq (wal:recover (bus-paths-wal paths))))
            (members-fd (when join (join-members paths)))
            (intake (tz:make-intake (bus-paths-submit-endpoint paths)

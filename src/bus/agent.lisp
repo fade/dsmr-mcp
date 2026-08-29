@@ -351,15 +351,30 @@
    reads, so a message and the name attached to it cannot come apart. Resolving
    the rendering here rather than at the tool boundary is deliberate: this is the
    layer that knows the reader's own namespace, and that is what decides whether a
-   sender is shown by bare name or qualified by the project it publishes from."
+   sender is shown by bare name or qualified by the project it publishes from.
+
+   Four values come back: the deliveries, how many records this call READ, and
+   how many of those were withheld for each of the two reasons the filter has:
+   this agent's own publishes echoed back to it, and mail naming somebody else.
+   The counts are taken on the pass that decides delivery, so they describe the
+   batch that was actually handed over; a caller recomputing them from a second
+   read of the log would be answering about whatever the log holds by then.
+
+   Together they separate a page that had nothing on it from a page spent
+   entirely on other participants' mail. Both hand back nothing while the
+   cursor advances normally over everything read, and nothing else in the reply
+   distinguishes them. A caller wanting only the messages takes the first value
+   and is unaffected."
   (let ((records (if (plusp timeout-ms)
                      (bus:await (agent-subscriber agent)
                                 :timeout-ms timeout-ms :limit limit)
                      (bus:poll (agent-subscriber agent) :limit limit)))
         (own (bus:encode-id (agent-id agent)))
         (namespace (agent-namespace agent))
+        (own-echo 0)
+        (addressed-elsewhere 0)
         (out '()))
-    (dolist (record records (nreverse out))
+    (dolist (record records)
       (multiple-value-bind (text cid sid addressee)
           (bus:decode-envelope (wal:record-body-string record))
         (declare (ignore cid))
@@ -372,11 +387,18 @@
         ;; the cursor sits, because a reader that stopped at other people's mail
         ;; would pin the log. The verdict goes through the shared DELIVERABLE-P
         ;; so this filter and the pending count cannot disagree.
-        (when (bus:deliverable-p sid addressee own)
-          (push (%make-delivery :author (bus:author-display sid namespace)
-                                :author-id (bus:decode-id sid)
-                                :text text)
-                out))))))
+        ;;
+        ;; A withheld record is counted under the half that withheld it, which
+        ;; is decided by the same self-id comparison the verdict's first half
+        ;; turns on rather than by a second rule of its own.
+        (cond ((bus:deliverable-p sid addressee own)
+               (push (%make-delivery :author (bus:author-display sid namespace)
+                                     :author-id (bus:decode-id sid)
+                                     :text text)
+                     out))
+              ((not (bus:foreign-self-id-p sid own)) (incf own-echo))
+              (t (incf addressed-elsewhere)))))
+    (values (nreverse out) (length records) own-echo addressed-elsewhere)))
 
 (defun agent-receive (agent &key (timeout-ms 0) (limit bus:+default-batch-size+))
   "Receive messages addressed to the whole bus, or to this agent by name, that it

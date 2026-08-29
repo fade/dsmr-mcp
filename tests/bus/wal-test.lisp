@@ -20,11 +20,14 @@
                 #:encode-record
                 #:append-record
                 #:scan
+                #:generation #:generation-path
                 #:read-records
                 #:make-reader #:read-forward #:reader-offset
                 #:recover
                 #:record-seq #:record-body-string
-                #:recovery-last-seq #:recovery-records #:recovery-truncated-from))
+                #:recovery-last-seq #:recovery-records #:recovery-truncated-from)
+  (:import-from #:dsmr-mcp/src/bus/archive
+                #:archive-wal))
 
 (in-package #:dsmr-mcp/tests/bus/wal-test)
 
@@ -314,3 +317,80 @@
       (append-raw w (subseq full (+ 8 4)))           ; the writer finishes it
       (is equal '(6) (mapcar #'record-seq (read-forward w r)))
       (is equal '(1 2 3 4 5 6) (mapcar #'record-seq (read-records w))))))
+
+;;; the log's generation -------------------------------------------------------
+;;;
+;;; Sealing the log is the only event that makes it a different log. These pin
+;;; that its identity moves exactly then, and the last of them pins the case
+;;; that matters most: a seal that did not happen.
+
+(defmacro with-sealable-wal ((dir wal) &body body)
+  "A fresh temp directory holding an active log, so the log can be sealed into
+   an archive beside it and the whole tree deleted after. A unique name is
+   borrowed from a temp FILE, which is then deleted and recreated as a directory
+   so the path cannot collide across runs."
+  (let ((name (gensym "NAME")))
+    `(let* ((,name (uiop:with-temporary-file (:pathname p :keep t :prefix "dsmr-bus-gen") p))
+            (,dir (progn (ignore-errors (delete-file ,name))
+                         (uiop:ensure-directory-pathname ,name)))
+            (,wal (merge-pathnames "bus.wal" ,dir)))
+       (ensure-directories-exist ,dir)
+       (unwind-protect (progn ,@body)
+         (ignore-errors (uiop:delete-directory-tree
+                         ,dir :validate t :if-does-not-exist :ignore))))))
+
+(define-test a-log-that-has-never-been-sealed-is-generation-zero
+  "An absent generation file is an answer, not a missing one. Every bus already
+   on disk is in exactly this position, and a reader that raised instead of
+   answering would break all of them on the day this shipped."
+  (with-sealable-wal (dir w)
+    (write-good-wal w 3)
+    (false (probe-file (generation-path w)) "no generation file has been written")
+    (is = 0 (generation w))))
+
+(define-test sealing-the-log-advances-the-generation-and-resets-the-head
+  "One seal, one step, and the head back to nothing. Both are asserted together
+   because they are two halves of one event: a generation that moved without the
+   head resetting, or a head that reset without the generation moving, would
+   mean the identity and the log it names had come apart, which is the state
+   every reader of both is being asked to trust cannot arise."
+  (with-sealable-wal (dir w)
+    (write-good-wal w 6)
+    (is = 6 (scan w))
+    (archive-wal w dir :now 1000)
+    (is = 1 (generation w))
+    (is = 0 (scan w))))
+
+(define-test a-second-seal-advances-the-generation-again
+  "The generation counts seals rather than recording that one has happened, so
+   a position recorded two cohorts ago is as plainly not this log's as one
+   recorded during the last."
+  (with-sealable-wal (dir w)
+    (write-good-wal w 2)
+    (archive-wal w dir :now 1000)
+    (loop for s from 1 to 3 do (append-record w s "x"))
+    (archive-wal w dir :now 2000)
+    (is = 2 (generation w))
+    (is = 0 (scan w))))
+
+(define-test a-seal-that-failed-leaves-the-generation-where-it-was
+  "The control on the three above. The identity has to be tied to the seal
+   actually happening rather than merely written near it. An archive that could
+   not be written leaves the log exactly where it was, and every reader holding
+   a position against that log is still reading the right one: telling them
+   otherwise would manufacture the alarm this identity exists to make truthful."
+  (with-sealable-wal (dir w)
+    (let ((sealed (merge-pathnames "sealed/" dir)))
+      (ensure-directories-exist sealed)
+      (write-good-wal w 4)
+      (unwind-protect
+           (progn
+             (uiop:run-program (list "chmod" "500" (uiop:native-namestring sealed)))
+             (is eq :refused
+                 (handler-case (progn (archive-wal w sealed :now 1000) :sealed)
+                   (error () :refused))
+                 "the archive could not be written")
+             (is = 0 (generation w) "so the generation did not move")
+             (is = 4 (scan w) "and the log is still the one readers hold a position against"))
+        (uiop:run-program (list "chmod" "700" (uiop:native-namestring sealed))
+                          :ignore-error-status t)))))

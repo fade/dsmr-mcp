@@ -30,6 +30,8 @@
   (:use #:cl #:zebra)
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:agent #:dsmr-mcp/src/bus/agent)
+                    (#:archive #:dsmr-mcp/src/bus/archive)
+                    (#:cursor #:dsmr-mcp/src/bus/cursor)
                     (#:zmq #:dsmr-mcp/src/bus/zmq)
                     (#:selector #:dsmr-mcp/src/bus/selector)
                     (#:wal #:dsmr-mcp/src/bus/wal))
@@ -507,3 +509,246 @@ unreadable in its output."
     (let ((payload (%call session)))
       (is equal '("on the session bus") (%texts payload)
           "the session's own traffic was never consumed by a refused call"))))
+
+(defun %reader-position (a)
+  "A handle on the durable position A reads from, built the way every reader of
+   a cursor file builds one: over the bus's log and the cursor file named for
+   this identity. It is what the plants below move, and it moves the same file
+   the verb reads."
+  (let ((paths (agent:agent-paths a)))
+    (cursor:make-subscriber (agent:agent-id a)
+                            (broker:bus-paths-wal paths)
+                            (broker:cursor-path-for paths (agent:agent-id a)))))
+
+(defun %seal-the-log (a)
+  "Seal the log under the reader A, which is what a last member leaving a bus
+   does: the active log is copied to an archive beside it, the live log is
+   emptied so the next records number from one again, and the log's generation
+   advances. Every recorded position stays exactly where it was.
+
+   This is the production fault, planted from the filesystem alone: no timing,
+   no subprocess, nothing to race."
+  (let ((paths (agent:agent-paths a)))
+    (archive:archive-wal (broker:bus-paths-wal paths)
+                         (broker:bus-paths-root paths))))
+
+(defun %append-to-the-log (a n)
+  "Append N records to the reader's log directly, numbering on from its head.
+   Traffic published into a log after it was sealed, without a publisher having
+   to be connected for it and without the broker's own numbering coming into
+   it."
+  (let* ((log (broker:bus-paths-wal (agent:agent-paths a)))
+         (head (wal:scan log)))
+    (loop for i from 1 to n
+          do (wal:append-record log (+ head i)
+                                (format nil "published after the seal ~D" i)))))
+
+(defun %write-bare-position (a seq)
+  "Write A's cursor file the way it was written before a generation was recorded
+   beside the position: the position alone and nothing else. Every cursor file
+   on every live bus is this shape, which is why it gets a control of its own."
+  (with-open-file (out (cursor:subscriber-cursor-path (%reader-position a))
+                       :direction :output
+                       :if-exists :supersede
+                       :if-does-not-exist :create)
+    (prin1 seq out))
+  seq)
+
+(defun %state (payload)
+  "The word the reply classifies this reader's position with."
+  (gethash "value" (%field payload "cursor_state")))
+
+(defun %page (payload key)
+  "One of the counts the reply gives for what this call's page bound was spent
+   on."
+  (gethash key (gethash "value" (%field payload "page"))))
+
+(define-test the-two-empty-answers-are-one-count-and-two-different-answers
+  "The whole of what this closes, asserted as a comparison rather than as two
+separate readings. A reader caught up with its bus and a reader holding a
+position its bus no longer has both receive nothing, and until the reply carried
+the position those two answers were identical, byte for byte. They are driven
+here on one bus, one after the other, and compared directly: same count, and not
+the same statement about where the reader stands."
+  (with-bus-session (session)
+    (with-publisher (pub session)
+      (%publish-backlog pub 3))
+    (%call session)                            ; drain, so the reader is current
+    (let ((healthy (%call session)))
+      (is = 0 (%field healthy "count") "a caught-up reader is handed nothing")
+      (is string= "caught-up" (%state healthy))
+      (is = (%field healthy "head") (%field healthy "cursor")
+          "and its position is the head of the log")
+      (is eq 'null (%field healthy "stranded_reason")
+          "with no reason to report, since nothing is wrong")
+      ;; The log is sealed under the reader, which is the one thing that leaves
+      ;; a position no reading of the log can reach.
+      (%seal-the-log (session-agent session))
+      (let ((stranded (%call session)))
+        (is = 0 (%field stranded "count")
+            "the stranded reader is handed nothing either")
+        (is string= "stranded" (%state stranded))
+        (is string= "cursor-above-head" (%field stranded "stranded_reason")
+            "named by the fact that makes the position impossible")
+        (true (> (%field stranded "cursor") (%field stranded "head"))
+              "the position is past the end of the log it names")
+        ;; The comparison, which is the point. One assertion says these two were
+        ;; indistinguishable and are not any more.
+        (is = (%field healthy "count") (%field stranded "count")
+            "the two empties agree on how many messages they carry")
+        (false (string= (%state healthy) (%state stranded))
+               "and disagree on what that empty means")
+        (false (string= (%content-text healthy) (%content-text stranded))
+               "a reader who never parses the payload sees the difference too")
+        (true (search "Nothing can sit past the end of a log"
+                      (%content-text stranded))
+              "and the stranded text says what the state is")))))
+
+(define-test a-position-taken-against-a-replaced-log-is-reported-stranded
+  "The shape a comparison of sequence numbers cannot find. The replacement log
+grows past a position recorded against the log before it, so the position is
+numerically BELOW the head and the two numbers say nothing worse than behind.
+Only the generation carries the fact that the log being read is not the log the
+position came from, and the reply is where a caller finally meets it: the
+records it is handed here are the replacement log's traffic, and what it missed
+is in the archive."
+  (with-bus-session (session)
+    (with-publisher (pub session)
+      (%publish-backlog pub 5))
+    (%call session)                            ; position recorded, generation 0
+    (let ((a (session-agent session)))
+      (%seal-the-log a)
+      (%append-to-the-log a 9))
+    (let ((payload (%call session)))
+      (true (< (%field payload "cursor") (%field payload "head"))
+            "the position is below the head, so the numbers read as behind")
+      (is string= "stranded" (%state payload)
+          "and the answer says it is not merely behind")
+      (is string= "generation-mismatch" (%field payload "stranded_reason"))
+      (false (= (%field payload "recorded_generation")
+                (%field payload "log_generation"))
+             "because the position names a log this bus has since replaced"))))
+
+(define-test a-position-with-no-recorded-generation-is-not-reported-stranded
+  "The control that keeps this from going off everywhere at once. Every cursor
+file written before a generation was recorded says nothing about which log it
+belongs to, and an unknown read as a disagreement would report every stable
+identity on every bus stranded on the day this ships, which is indistinguishable
+from the alarm being wrong."
+  (with-bus-session (session)
+    (with-publisher (pub session)
+      (%publish-backlog pub 6))
+    (let ((a (session-agent session)))
+      (%seal-the-log a)
+      (%append-to-the-log a 9)
+      (%write-bare-position a 4))
+    (let ((payload (%call session)))
+      (is = 4 (%field payload "cursor") "the position still reads")
+      (true (< (%field payload "cursor") (%field payload "head")))
+      (is string= "behind" (%state payload)
+          "a position that names no generation is behind, never stranded")
+      (is eq 'null (%field payload "stranded_reason"))
+      (is eq 'null (%field payload "recorded_generation")
+          "the generation is unknown rather than different"))))
+
+(define-test a-delivered-read-still-carries-everything-it-always-did
+  "The change must not alter delivery. A read that hands messages over comes back
+with every field it came back with before, correct, and with the position beside
+them rather than in place of them."
+  (with-bus-session (session)
+    (with-named-publisher (pub (%own-namespace session) "sister")
+      (%publish-backlog pub 3))
+    (let ((payload (%call session "limit" 2)))
+      (is = 2 (%field payload "count") "the page bound is still honoured")
+      (is equal '("m1" "m2") (%texts payload) "oldest first, bodies intact")
+      (is equal '("sister" "sister") (%authors payload)
+          "the author still travels with each message")
+      (is = 1 (%field payload "remaining_pending")
+          "and the backlog behind the page is still counted")
+      (is string= "default" (%field payload "bus"))
+      (true (search "author: sister" (%content-text payload))
+            "the rendered text is unchanged in what it says about the messages")
+      (is string= "behind" (%state payload)
+          "with the position it read from stated beside them")
+      (is = 3 (%field payload "head"))
+      (is = 0 (%field payload "cursor") "which was the start of the log")
+      (is = 2 (%page payload "records_read")
+          "the page reports what it read")
+      (is = 0 (%page payload "filtered_own_echo"))
+      (is = 0 (%page payload "filtered_addressed_elsewhere")
+          "and nothing was withheld from this reader"))))
+
+(define-test a-page-spent-on-other-participants-mail-delivers-at-a-larger-limit
+  "The second way an empty answer misleads, planted, and the pair is the
+assertion. The page bound counts records READ, the cursor advances over every
+record read, and the recipient filter runs afterwards, so a page filled with
+mail addressed to somebody else delivers nothing, advances normally, and leaves a
+real backlog still counted behind it. Two fleets read the log by hand over
+exactly that pair of statements.
+
+The same bus and the same position answer empty at one limit and deliver at
+another, which is the behaviour neither of them could explain from the reply."
+  (let ((agent:*direct-addressing-enabled* t))
+    (with-bus-session (session)
+      (let ((position (%reader-position (session-agent session))))
+        (with-publisher (pub session)
+          (dotimes (i +default-batch-size+)
+            (agent:agent-publish pub (format nil "for somebody else ~D" i)
+                                 :to "/tmp/another-project/sister"))
+          (agent:agent-publish pub "this one is for the whole bus"))
+        (let ((start (cursor:cursor-value position)))
+          (let ((blocked (%call session)))
+            (is = 0 (%field blocked "count")
+                "a page spent on other participants' mail delivers nothing")
+            (true (plusp (%field blocked "remaining_pending"))
+                  "while a real message is still waiting behind it")
+            (is = +default-batch-size+ (%page blocked "records_read")
+                "the whole page bound went on records this reader was read past")
+            (is = +default-batch-size+
+                (%page blocked "filtered_addressed_elsewhere")
+                "every one of them addressed to another participant")
+            (is = 0 (%page blocked "filtered_own_echo")
+                "and none of them this reader's own publish")
+            (true (search "Raise limit" (%content-text blocked))
+                  "the text names the remedy, not only the payload"))
+          ;; Put the position back where it was, so the second call is the same
+          ;; bus and the same cursor and differs only in the bound it was given.
+          (setf (cursor:cursor-value position) start)
+          (let ((wider (%call session "limit" (+ +default-batch-size+ 5))))
+            (is = 1 (%field wider "count")
+                "the same position delivers once the bound reaches past the block")
+            (is equal '("this one is for the whole bus") (%texts wider))))))))
+
+(define-test a-filtered-page-and-a-stranded-position-cannot-be-read-as-each-other
+  "The two ways an empty answer misleads are mutually exclusive, and asserting it
+in one body is what keeps that true if either classification is later edited. A
+position past the head reports nothing pending, so a pending count above zero is
+positive evidence that the position is not past the head. Nobody worked that out
+unaided, which is why the reply states it and why it is asserted here."
+  (let ((filtered
+          (let ((agent:*direct-addressing-enabled* t))
+            (with-bus-session (session)
+              (with-publisher (pub session)
+                (dotimes (i +default-batch-size+)
+                  (agent:agent-publish pub (format nil "not for you ~D" i)
+                                       :to "/tmp/another-project/sister"))
+                (agent:agent-publish pub "for the whole bus"))
+              (%call session))))
+        (stranded
+          (with-bus-session (session)
+            (with-publisher (pub session)
+              (%publish-backlog pub 3))
+            (%call session)
+            (%seal-the-log (session-agent session))
+            (%call session))))
+    (is = 0 (%field filtered "count") "both answers deliver nothing")
+    (is = 0 (%field stranded "count"))
+    (false (string= "stranded" (%state filtered))
+           "a page consumed by other participants' mail is not a strand")
+    (true (plusp (%field filtered "remaining_pending"))
+          "and it carries a pending count above zero")
+    (is string= "stranded" (%state stranded))
+    (is = 0 (%field stranded "remaining_pending")
+        "while a stranded position reports nothing pending at all")
+    (is = 0 (%page stranded "records_read")
+        "having read nothing, since there is nothing past the end of a log")))

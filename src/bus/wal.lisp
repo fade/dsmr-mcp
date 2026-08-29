@@ -37,6 +37,7 @@
            #:encode-record
            #:append-record
            #:scan
+           #:generation #:generation-path #:bump-generation
            #:read-records
            #:reader #:make-reader #:reset-reader
            #:reader-offset #:reader-anchor #:reader-last-seq
@@ -246,6 +247,78 @@
         (walk-records bytes (lambda (seq ts pstart pend)
                               (declare (ignore seq ts pstart pend))))
       (values last-seq good-bytes records total))))
+
+;;; ------------------------------------------------------ rotation generation
+;;;
+;;; A rotation empties the active log and the next cohort numbers from 1 again.
+;;; Nothing in the log itself records that this happened, so a sequence number
+;;; noted before a rotation cannot be told apart from one noted after: it may sit
+;;; above the new head, or, once the replacement log has grown, coincidentally
+;;; below it, where it reads as merely behind. The generation is the identity
+;;; that makes the two distinguishable, a counter that changes when the log is
+;;; rotated and at no other time, so a reader holding a stale generation knows it
+;;; is reading against a log its position was never recorded against.
+;;;
+;;; It lives in a small file beside the log rather than inside the log's binary
+;;; format, because it is a property of the log's identity rather than of any
+;;; record in it, and because every bus already on disk has to keep working
+;;; untouched.
+
+(defun generation-path (wal-path)
+  "The file holding WAL-PATH's generation, a sibling of the log itself."
+  (merge-pathnames (format nil "~A.generation" (file-namestring wal-path))
+                   (uiop:pathname-directory-pathname wal-path)))
+
+(defun generation (wal-path)
+  "Which generation of the log WAL-PATH currently is.
+
+   A log with no generation file reads 0 rather than signalling. Every bus on
+   disk predates this file, and a missing counter means only that the log has
+   not been rotated since the counter existed, and that is a fact worth
+   reporting rather than a failure worth raising in a reader."
+  (let ((path (generation-path wal-path)))
+    (if (probe-file path)
+        (with-open-file (in path :if-does-not-exist nil)
+          (or (and in (let ((v (read in nil nil)))
+                        (and (integerp v) (>= v 0) v)))
+              0))
+        0)))
+
+(defun %write-generation (wal-path value)
+  "Replace WAL-PATH's generation file with VALUE, atomically.
+
+   The replacement is a temporary file in the same directory renamed over the
+   target, the same swap the cursor writer uses and for the same reason: the
+   file is read by processes other than the one writing it. A reader must see
+   either the old value or the new one. A torn generation file would be worse
+   than none at all, because a reader comparing against garbage reports every
+   cursor on the bus stranded."
+  (let* ((target (generation-path wal-path))
+         (temp (make-pathname :name (format nil "~A.tmp~D"
+                                            (or (pathname-name target) "generation")
+                                            (random 100000000))
+                              :type (pathname-type target)
+                              :defaults target)))
+    (unwind-protect
+         (progn
+           (with-open-file (out temp :direction :output
+                                     :if-exists :supersede
+                                     :if-does-not-exist :create)
+             (prin1 value out)
+             (finish-output out))
+           (rename-file temp target)
+           (setf temp nil))
+      (when temp (ignore-errors (delete-file temp)))))
+  value)
+
+(defun bump-generation (wal-path)
+  "Advance WAL-PATH's generation by one and return the new value.
+
+   Belongs to the act that seals the log and to nothing else. A generation that
+   moved without a rotation would make every cursor recorded against the
+   previous value look stranded; one that failed to move on a rotation leaves
+   the failure this identity exists to catch invisible again."
+  (%write-generation wal-path (1+ (generation wal-path))))
 
 ;;; ------------------------------------------------- incremental tail reads
 ;;;
