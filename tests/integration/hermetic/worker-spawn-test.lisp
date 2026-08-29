@@ -15,6 +15,7 @@
   (:import-from #:dsmr-mcp/src/hermetic/worker-client
                 #:+max-json-line-bytes+
                 #:%read-line-limited
+                #:%read-json-rpc-response
                 #:line-too-long
                 #:spawn-worker
                 #:worker-pid
@@ -84,6 +85,36 @@ limit. Uses a small synthetic limit to avoid allocating 16 MB."
          (got (%read-line-limited stream :eof +max-json-line-bytes+)))
     ;; The carriage return must not appear in the returned string.
     (is string= "hello" got)))
+
+(define-test a-late-answer-to-an-abandoned-request-is-skipped
+  "A reply carrying an id older than the one being waited for is discarded.
+
+A caller that stops waiting leaves its answer in flight. Reading that answer as
+though it belonged to the next request would report the wrong result or condemn
+a channel that is working, so the reader steps over it and keeps going. This is
+what lets a liveness probe give up on one ping and still read the next one
+correctly."
+  (let* ((stale  "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"which\":\"stale\"}}")
+         (wanted "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"which\":\"wanted\"}}")
+         (stream (make-string-input-stream
+                  (concatenate 'string stale (string #\Newline)
+                               wanted (string #\Newline))))
+         (got    (%read-json-rpc-response stream 2 nil)))
+    (true (hash-table-p got))
+    (is string= "wanted" (gethash "which" got))))
+
+(define-test an-answer-to-a-request-never-sent-is-still-a-protocol-error
+  "A reply carrying an id ahead of the one being waited for still fails.
+
+This is the control on the test above. Skipping older replies is a narrow
+allowance with a reason behind it, and if it widened into skipping every
+mismatch the reader would sit quietly on a desynchronised channel forever.
+Nothing can legitimately answer a request that has not been sent, so an id
+ahead of the current one is corruption and is treated as such."
+  (let* ((line   "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}")
+         (stream (make-string-input-stream
+                  (concatenate 'string line (string #\Newline)))))
+    (fail (%read-json-rpc-response stream 2 nil) 'error)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Spawn + handshake integration test

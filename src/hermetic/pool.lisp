@@ -45,6 +45,11 @@
                 #:worker-last-crash-reason #:worker-last-exit-status
                 #:worker-last-exit-code
                 #:mark-worker-crashed
+                #:worker-ping #:worker-unresponsive
+                #:worker-liveness #:worker-liveness-basis
+                #:worker-last-ping-milliseconds
+                #:worker-consecutive-missed-pings
+                #:worker-liveness-checked-at
                 #:*reaper-threads* #:*reaper-threads-lock*
                 #:*worker-startup-timeout*)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
@@ -54,6 +59,8 @@
   (:import-from #:sb-posix)
   (:export #:*worker-pool-warmup* #:*max-pool-size*
            #:*health-check-interval-seconds*
+           #:*worker-ping-timeout-seconds*
+           #:*missed-pings-before-wedged*
            #:*crash-breaker-window* #:*crash-breaker-threshold*
            #:*circuit-breaker-cooldown* #:*circuit-breaker-map*
            #:initialize-pool #:shutdown-pool
@@ -62,6 +69,9 @@
            #:pool-worker-info #:find-session-worker
            #:pool-shutting-down #:pool-capacity-exceeded
            #:pool-spawn-cancelled #:*recovery-threads*
+           #:circuit-breaker-active
+           #:circuit-breaker-active-session-id
+           #:circuit-breaker-active-remaining-seconds
            #:pool-rpc-with-hard-kill))
 
 (in-package #:dsmr-mcp/src/hermetic/pool)
@@ -131,6 +141,30 @@ Default 16; override with DSMR_MAX_POOL_SIZE env var (positive integer).")
 (defvar *health-check-interval-seconds* 10.0d0
   "Seconds between health monitor poll iterations.")
 
+(defparameter *worker-ping-timeout-seconds* 2
+  "Seconds to wait for an idle worker's answer to a liveness ping.
+
+A ping has no work to do: the worker builds a two-entry hash-table and writes
+it back, with no evaluation and no I/O of its own, so a healthy one answers in
+single-digit milliseconds. Two seconds is therefore generous slack against a
+momentarily loaded host rather than a realistic upper bound on the work, and it
+stays far enough under *health-check-interval-seconds* that a slow probe cannot
+still be outstanding when the next tick arrives.")
+
+(defparameter *missed-pings-before-wedged* 2
+  "Consecutive unanswered pings before a live worker is classified :wedged.
+
+One missed ping is cheap and common: a garbage collection pause or a moment of
+scheduler starvation on a loaded host is enough to produce one. Requiring two in
+a row costs one extra tick of detection latency and removes that whole class of
+false wedge. It is the same reasoning that makes the crash breaker count crashes
+inside a window rather than trip on the first one, applied to a probe that has
+none of a crash's recovery cost to weigh on the other side.
+
+Reaching this count does two things at once: it establishes :wedged in the
+record and it retires the worker. Nothing hands out a worker that has been
+classified wedged.")
+
 (defvar *shutdown-replenish-wait-seconds* 0.05d0
   "Polling interval (seconds) while waiting for replenish thread shutdown.")
 
@@ -161,6 +195,28 @@ for *circuit-breaker-cooldown* seconds.")
 During the cooldown window, get-or-assign-worker signals an error
 immediately rather than attempting to spawn a replacement worker.
 After the window expires, the session may spawn a new worker normally.")
+
+(define-condition circuit-breaker-active (error)
+  ((session-id :initarg :session-id
+               :reader circuit-breaker-active-session-id)
+   (remaining-seconds :initarg :remaining-seconds
+                      :reader circuit-breaker-active-remaining-seconds))
+  (:report (lambda (c s)
+             (format s "Circuit breaker active for session ~A; ~Ds remaining in ~
+cooldown. The worker crashed ~D times in ~Ds. Manual reset via release-session."
+                     (circuit-breaker-active-session-id c)
+                     (circuit-breaker-active-remaining-seconds c)
+                     *crash-breaker-threshold*
+                     *crash-breaker-window*)))
+  (:documentation "Signaled when a session's worker has crashed repeatedly enough that
+the pool refuses further calls instead of spawning another replacement.
+
+It lives beside the breaker's own tuning parameters rather than with the other
+pool conditions so its report can read them without a forward reference.
+
+Carries the session and how many seconds of the cooldown remain, so a caller at
+the dispatch boundary can tell the agent how long to wait rather than only that
+something failed."))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Parent hard-kill backstop — dsmr-mcp addition over cl-mcp
@@ -562,6 +618,151 @@ Does not acquire any locks or perform I/O."
     (and process
          (ignore-errors (sb-ext:process-alive-p process)))))
 
+(defun %record-liveness (worker classification basis &key milliseconds)
+  "Write CLASSIFICATION on WORKER, stamped with BASIS and the time it was taken.
+
+Every write to a worker's liveness goes through here so the classification, how
+it was established and when can never drift apart in the record. MILLISECONDS is
+supplied only by a probe that actually timed a round trip; a classification
+reached any other way leaves the previous timing alone rather than overwriting
+it with a value it did not measure."
+  (setf (worker-liveness worker) classification
+        (worker-liveness-basis worker) basis
+        (worker-liveness-checked-at worker) (get-universal-time))
+  (when milliseconds
+    (setf (worker-last-ping-milliseconds worker) milliseconds))
+  classification)
+
+(defun %retire-unresponsive-worker (worker)
+  "Take a worker that has stopped answering out of service.
+
+Reaching *missed-pings-before-wedged* is the point at which a silence stops
+looking like a pause and starts looking like a worker that will never answer
+again. From there the worker goes through the same path a detected crash takes:
+it leaves the standby list, its process is killed, and a replacement is
+scheduled.
+
+This is what keeps the tolerance honest. The probe no longer condemns a worker
+for one silence, and nothing has been loosened about what happens once the
+silence is established. The crash reason is corrected afterwards, because the
+shared path stamps 'process-died' and the whole point of this case is that the
+process had not died.
+
+Costs this thread the length of one kill, which is bounded by the terminate
+grace period. It rides the health monitor's own tick, where that is affordable,
+and only once per worker."
+  (%handle-worker-crash worker)
+  (setf (worker-last-crash-reason worker) "unresponsive"))
+
+(defun %record-missed-ping (worker condition)
+  "Record what a failed liveness probe on WORKER established, if anything.
+
+CONDITION is whatever the probe signalled. It is deliberately not dispatched on:
+the classification turns on whether the process is still there, which is the
+question that separates a worker that has gone from a worker that is present and
+silent, and no condition class answers that as well as looking.
+
+A process that has gone establishes :dead at once. A process that is still
+running counts one more silence, and establishes :wedged only when the count
+reaches *missed-pings-before-wedged*, at which point the worker is retired."
+  (cond
+    ((not (%worker-process-alive-p worker))
+     (%record-liveness worker :dead :active-probe)
+     (log-event :warn "pool.monitor.ping-worker-gone"
+                "worker_id" (worker-id worker)
+                "pid" (worker-pid worker)
+                "error" (princ-to-string condition)))
+    (t
+     (let ((missed (incf (worker-consecutive-missed-pings worker))))
+       (when (>= missed *missed-pings-before-wedged*)
+         (%record-liveness worker :wedged :active-probe)
+         (%retire-unresponsive-worker worker))
+       (log-event :warn "pool.monitor.ping-missed"
+                  "worker_id" (worker-id worker)
+                  "pid" (worker-pid worker)
+                  "consecutive_missed" missed
+                  "threshold" *missed-pings-before-wedged*
+                  "liveness" (string-downcase
+                              (symbol-name (worker-liveness worker)))
+                  "error" (princ-to-string condition))))))
+
+(defun %ping-idle-worker (worker)
+  "Ask WORKER a real question and record what the answer established.
+
+Only ever called for a worker in :standby. A worker mid-eval holds its stream
+lock for the whole call, so probing one would either park this thread on real
+work or expire and report a busy worker as wedged, which is precisely the false
+positive an active probe exists to avoid. A bound worker is already being
+exercised by the call in flight, and that call's own end-of-file and timeout
+paths are the evidence for its turn.
+
+An answer inside *worker-ping-timeout-seconds* establishes :healthy and records
+the round trip it took, clearing the missed count.
+
+A single miss establishes nothing. It counts one miss and leaves the previous
+classification, its basis and the time it was taken exactly where they were, so
+the recorded age of a classification stays the age of the check that actually
+reached a conclusion rather than the age of the last attempt. Restamping on
+every tick would make a value that has not been confirmed for a minute look as
+fresh as one confirmed a second ago, which is the whole failure this record
+exists to prevent. Only once *missed-pings-before-wedged* misses have
+accumulated in a row is :wedged established and stamped, and only then is the
+worker taken out of service.
+
+That tolerance is why the probe goes through WORKER-PING rather than WORKER-RPC:
+WORKER-RPC ends a worker on its first timeout, which would make the missed-ping
+count unreachable past one and leave a worker retired for a garbage collection
+pause.
+
+A miss from a worker whose process has gone establishes :dead at once: the wedge
+case is an addition to the crash case, never a replacement for it, and a dead
+process must not be reported as merely unresponsive.
+
+Returns T when the worker answered."
+  (handler-case
+      (let ((milliseconds (worker-ping worker
+                                       :timeout *worker-ping-timeout-seconds*)))
+        (setf (worker-consecutive-missed-pings worker) 0)
+        (%record-liveness worker :healthy :active-probe
+                          :milliseconds milliseconds)
+        t)
+    (error (e)
+      (%record-missed-ping worker e)
+      nil)))
+
+(defun %infer-bound-worker-liveness (worker)
+  "Record what the traffic already reaching a bound WORKER establishes.
+
+A bound worker is not probed, so there is no round trip to time. What is known
+without asking is that the process is still there and that no call on its
+channel has failed hard enough for the pool to mark it crashed. That is recorded
+as :healthy on a passive-inference basis, and the basis is the whole of the
+honesty here: it says the process is alive and its channel has not failed, and
+it does not say the worker answered anything. A worker wedged inside an
+evaluation reads :healthy here until its own call's timeout fires, which is what
+the timeout is for."
+  (if (%worker-process-alive-p worker)
+      (%record-liveness worker :healthy :passive-inference)
+      (%record-liveness worker :dead :passive-inference)))
+
+(defun %check-worker-liveness (workers)
+  "Establish a liveness classification for every worker in WORKERS on this tick.
+
+Rides the health monitor's existing wake rather than adding a timer of its own,
+so the whole active-probe design costs no extra wake-ups.
+
+The state is read here rather than taken from the caller's snapshot, because a
+standby worker can be assigned to a session in between and only a worker still
+idle at this moment may be pinged. A worker assigned in the remaining instant
+before the ping reaches its stream is the one case this cannot exclude; it costs
+this thread the length of that call and nothing else, since a real call's own
+answer keeps the worker classified healthy either way."
+  (dolist (w workers)
+    (case (worker-state w)
+      (:standby (%ping-idle-worker w))
+      (:bound (%infer-bound-worker-liveness w))
+      (t nil))))
+
 (defun %wait-for-next-health-check ()
   "Wait until the next health check interval, or until shutdown wakes us."
   (bt:with-lock-held (*health-monitor-lock*)
@@ -571,8 +772,14 @@ Does not acquire any locks or perform I/O."
                          :timeout *health-check-interval-seconds*))))
 
 (defun %health-monitor-loop ()
-  "Periodically check all workers via sb-ext:process-alive-p and dispatch
-crash recovery asynchronously. Runs until *pool-running* becomes NIL."
+  "Periodically check all workers and dispatch crash recovery asynchronously.
+Runs until *pool-running* becomes NIL.
+
+Each tick asks two separate questions. Whether the process still exists, which
+catches a crash and is answered by sb-ext:process-alive-p; and whether the
+worker is still answering, which catches a worker that is alive and no longer
+useful and is answered only by sending it a request and timing the reply. The
+second is what %check-worker-liveness runs, for idle workers alone."
   (loop while *pool-running*
         do (%wait-for-next-health-check)
            (when *pool-running*
@@ -613,6 +820,8 @@ crash recovery asynchronously. Runs until *pool-running* becomes NIL."
                                           :name (format nil "pool-recover-~A"
                                                         (worker-id w))))
                                    (push thread *recovery-threads*))))))))
+                   ;; Ask each idle worker a real question and record the answer
+                   (%check-worker-liveness workers)
                    ;; Reap zombie crashed workers
                    (dolist (w workers)
                      (when (eq (worker-state w) :crashed)
@@ -787,7 +996,8 @@ trip within *circuit-breaker-cooldown* seconds and fails fast with an error.
 
 Signals pool-shutting-down if the pool is not running.
 Signals pool-capacity-exceeded if max workers would be exceeded.
-Signals error with 'Circuit breaker' in message during the cooldown window."
+Signals circuit-breaker-active both when the breaker trips and on any later
+call inside the cooldown window; the condition carries the seconds remaining."
   (let ((entry nil) (need-spawn nil) (assigned-from-standby nil)
         (need-reset nil) (old-worker-to-kill nil)
         (circuit-breaker-tripped nil))
@@ -801,10 +1011,9 @@ Signals error with 'Circuit breaker' in message during the cooldown window."
                    (< (get-universal-time) (+ trip-time *circuit-breaker-cooldown*)))
           (let ((remaining (- (+ trip-time *circuit-breaker-cooldown*)
                               (get-universal-time))))
-            (error "Circuit breaker active for session ~A; ~As remaining in cooldown. ~
-The worker crashed ~D times in ~Ds. Manual reset via release-session."
-                   session-id (ceiling remaining)
-                   *crash-breaker-threshold* *crash-breaker-window*))))
+            (error 'circuit-breaker-active
+                   :session-id session-id
+                   :remaining-seconds (ceiling remaining)))))
       (setf entry (gethash session-id *affinity-map*))
       (cond
         ;; Path 1: existing bound worker — return immediately
@@ -881,10 +1090,9 @@ The worker crashed ~D times in ~Ds. Manual reset via release-session."
                  "threshold" *crash-breaker-threshold*
                  "window_seconds" *crash-breaker-window*
                  "cooldown_seconds" *circuit-breaker-cooldown*)
-      (error "Circuit breaker tripped for session ~A: worker crashed ~D times ~
-within ~Ds. Failing fast for ~Ds. Manual reset via release-session."
-             session-id *crash-breaker-threshold* *crash-breaker-window*
-             *circuit-breaker-cooldown*))
+      (error 'circuit-breaker-active
+             :session-id session-id
+             :remaining-seconds *circuit-breaker-cooldown*))
     (cond
       (assigned-from-standby
        (%schedule-replenish)
@@ -983,8 +1191,15 @@ was bound, :placeholder if a spawn was in progress (cancelled)."
 
 (defun pool-worker-info ()
   "Return a vector of worker info hash-tables for inclusion in pool-status output.
-Includes id, session (truncated), tcp_port, pid, state. Omits swank_port
-to prevent unrestricted REPL access bypassing MCP security policies."
+Includes id, session (truncated), tcp_port, pid, state, and the liveness the
+health monitor last established: the classification, how it was established, the
+last ping round trip in milliseconds, how many pings in a row have gone
+unanswered, and the universal time the classification was taken. Omits
+swank_port to prevent unrestricted REPL access bypassing MCP security policies.
+
+The liveness values are raw here on purpose. A reader needs to state what a
+classification does and does not establish before putting it in front of anyone,
+and that rendering belongs to the verb doing the reporting, not to the pool."
   (let ((result (make-array 0 :adjustable t :fill-pointer 0)))
     (bt:with-lock-held (*pool-lock*)
       (dolist (w *all-workers*)
@@ -997,7 +1212,17 @@ to prevent unrestricted REPL access bypassing MCP security policies."
                 (gethash "tcp_port" ht) (worker-tcp-port w)
                 (gethash "pid" ht) (worker-pid w)
                 (gethash "state" ht) (string-downcase
-                                       (symbol-name (worker-state w))))
+                                       (symbol-name (worker-state w)))
+                (gethash "liveness" ht) (string-downcase
+                                          (symbol-name (worker-liveness w)))
+                (gethash "liveness_basis" ht)
+                  (let ((basis (worker-liveness-basis w)))
+                    (and basis (string-downcase (symbol-name basis))))
+                (gethash "last_ping_ms" ht) (worker-last-ping-milliseconds w)
+                (gethash "consecutive_missed_pings" ht)
+                  (worker-consecutive-missed-pings w)
+                (gethash "liveness_checked_at" ht)
+                  (worker-liveness-checked-at w))
           (vector-push-extend ht result))))
     result))
 

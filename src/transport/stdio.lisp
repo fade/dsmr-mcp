@@ -1,6 +1,11 @@
 ;;;; src/transport/stdio.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
+;;;; ATTACH-CALL-AUDIT: does not serialise. The cancellation arm below calls
+;;;; into the attached cancel path, which reaches the image while the call
+;;;; being cancelled holds the lock. The reason is recorded with the
+;;;; machinery itself in src/attach/cancel.lisp.
+;;;;
 ;;;; Stdio transport: reads newline-delimited JSON-RPC from an input stream,
 ;;;; writes one response line per request to the output stream with
 ;;;; force-output, and returns T at EOF.

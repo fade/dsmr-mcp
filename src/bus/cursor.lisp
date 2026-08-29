@@ -43,6 +43,8 @@
            #:cursor-value
            #:deliver-pending
            #:pending-count
+           #:cursor-and-head
+           #:stranded-reason
            #:skip-to-head
            #:ensure-seeded
            #:+default-batch-size+))
@@ -63,6 +65,25 @@
   (wal "" :type (or string pathname))
   (cursor-path "" :type (or string pathname))
   (reader (wal:make-reader) :type wal:reader))
+
+(defun %recorded-generation (path)
+  "The generation of the log the cursor file at PATH was written against, or NIL
+   when the file names none.
+
+   NIL is deliberately not 0. Zero is a real generation, the one a log that has
+   never been rotated is in, while a cursor written before generations were
+   recorded says nothing at all about which log it belongs to. Reading that
+   silence as zero would call every such cursor on the fleet a mismatch at once.
+
+   The generation is the second value in the file, written after the sequence
+   number, so a reader that knows nothing of generations still reads the
+   sequence number it came for and reads it correctly."
+  (when (probe-file path)
+    (with-open-file (in path :if-does-not-exist nil)
+      (when in
+        (read in nil nil)                  ; the sequence number, read elsewhere
+        (let ((generation (read in nil nil)))
+          (and (integerp generation) (>= generation 0) generation))))))
 
 (defun cursor-value (subscriber)
   "The last sequence number SUBSCRIBER has acknowledged (0 if it has never
@@ -85,6 +106,13 @@
   ;; a reader sees either the old value or the new one, never neither. The temp
   ;; name is deliberately obvious so a crash mid-write leaves something no one
   ;; mistakes for a cursor.
+  ;;
+  ;; The generation of the log this position was taken against is written after
+  ;; the sequence number, because a sequence number on its own cannot say which
+  ;; log it belongs to and a rotation makes that the difference between a reader
+  ;; that is behind and one that is reading a log that no longer exists. The
+  ;; sequence number stays first, so anything reading only the leading value
+  ;; still reads the position correctly.
   (let* ((target (subscriber-cursor-path subscriber))
          (temp (make-pathname :name (format nil "~A.tmp~D"
                                             (or (pathname-name target) "cursor")
@@ -96,7 +124,7 @@
            (with-open-file (out temp :direction :output
                                      :if-exists :supersede
                                      :if-does-not-exist :create)
-             (prin1 seq out)
+             (format out "~D ~D" seq (wal:generation (subscriber-wal subscriber)))
              (finish-output out))
            (rename-file temp target)
            (setf temp nil))
@@ -201,3 +229,74 @@
   (unless (probe-file (subscriber-cursor-path subscriber))
     (setf (cursor-value subscriber) (wal:scan (subscriber-wal subscriber))))
   subscriber)
+
+;;; where a subscriber actually stands ----------------------------------------
+;;;
+;;; PENDING-COUNT answers the delivery question and clamps its subtraction at
+;;; zero. That is right for delivery, which cannot hand over a negative number
+;;; of records, and it is also what makes a subscriber sitting above the head
+;;; indistinguishable from one exactly caught up: both answer 0, and the caller
+;;; cannot recover which it had. A bus that had rotated read as quiet for three
+;;; and a half days on exactly that answer.
+;;;
+;;; So the values are also available unclamped, beside the count rather than in
+;;; place of it. Nothing here changes what is delivered to whom.
+
+(defun cursor-and-head (subscriber &key (head nil head-supplied-p)
+                                        (log-generation nil generation-supplied-p))
+  "Where SUBSCRIBER stands, with nothing folded away: (values cursor head
+   recorded-generation log-generation).
+
+   CURSOR and HEAD come back as they are, so a cursor above the head arrives as
+   a value above the head rather than as a zero. RECORDED-GENERATION is the
+   generation the cursor was written against, NIL for a cursor written before
+   generations were recorded. LOG-GENERATION is the log's own, 0 for a log that
+   has never been rotated since the counter existed.
+
+   A caller handed these four can ask any question it needs to. A caller handed
+   a clamped count cannot recover the fact the clamp discarded.
+
+   HEAD and LOG-GENERATION may be supplied by a caller that already holds them.
+   Both are properties of the LOG rather than of this subscriber, and finding
+   the head costs a read of the whole log, so a caller walking every cursor on
+   one bus reads them once and passes them in rather than paying that read
+   hundreds of times for one answer. Left out, they are read here, which is what
+   a caller holding a single subscriber should do. Supplying values taken from
+   some other log is a way to get a wrong answer quietly, so only a caller that
+   read them from THIS subscriber's log may pass them."
+  (let ((path (subscriber-cursor-path subscriber))
+        (log (subscriber-wal subscriber)))
+    (values (cursor-value subscriber)
+            (if head-supplied-p head (wal:scan log))
+            (%recorded-generation path)
+            (if generation-supplied-p log-generation (wal:generation log)))))
+
+(defun stranded-reason (subscriber &key (head nil head-supplied-p)
+                                        (log-generation nil generation-supplied-p))
+  "Why SUBSCRIBER cannot be reading the log it thinks it is reading, or NIL when
+   its position is a sound one.
+
+   Two answers, and they are kept apart because they are found different ways
+   and a caller reporting one of them must not say the other:
+
+     :cursor-above-head    the cursor names a record past the end of the log.
+                           No reading of that log makes this a valid position.
+     :generation-mismatch  the cursor was recorded against a different log from
+                           the one it is being compared against. Its value can
+                           perfectly well be below the head, which is exactly
+                           why comparing sequence numbers cannot find this case:
+                           once the replacement log has grown, a stale position
+                           reads as merely behind.
+
+   A cursor that names no generation is not a mismatch. It predates the
+   generation being recorded, so nothing is known about which log it belongs to,
+   and calling an unknown a disagreement would report every cursor written
+   before this existed as stranded."
+  (multiple-value-bind (cursor head recorded current)
+      (apply #'cursor-and-head subscriber
+             (append (when head-supplied-p (list :head head))
+                     (when generation-supplied-p
+                       (list :log-generation log-generation))))
+    (cond ((> cursor head) :cursor-above-head)
+          ((and recorded (/= recorded current)) :generation-mismatch)
+          (t nil))))

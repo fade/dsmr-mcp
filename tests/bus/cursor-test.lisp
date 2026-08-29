@@ -15,7 +15,8 @@
 (defpackage #:dsmr-mcp/tests/bus/cursor-test
   (:use #:cl #:zebra)
   (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal)
-                    (#:cursor #:dsmr-mcp/src/bus/cursor)))
+                    (#:cursor #:dsmr-mcp/src/bus/cursor)
+                    (#:archive #:dsmr-mcp/src/bus/archive)))
 
 (in-package #:dsmr-mcp/tests/bus/cursor-test)
 
@@ -245,3 +246,114 @@
         (mapcar #'wal:record-seq (cursor:deliver-pending s :limit nil))
         "everything above the cursor in the new log is delivered")
     (is = 9 (cursor:cursor-value s))))
+
+;;; positions that cannot be right ---------------------------------------------
+;;;
+;;; Sealing the log empties it and the next cohort numbers from 1 again, while
+;;; every stable identity keeps the position it held. The count of what is
+;;; deliverable clamps at zero, so that position reads as nothing pending, which
+;;; is what a whole constellation read as an idle bus for three and a half days.
+;;; The plants below are the two shapes it takes, both pure filesystem setup: no
+;;; timing, no subprocess, nothing to race.
+
+(defmacro with-sealable-sub ((var dir) &body body)
+  "Like WITH-SUB, but the log and the cursor live in a temp directory of their
+   own, so the log can be sealed into an archive beside it and the whole tree
+   deleted after."
+  (let ((name (gensym "NAME")))
+    `(let* ((,name (uiop:with-temporary-file (:pathname p :keep t :prefix "dsmr-bus-strand") p))
+            (,dir (progn (ignore-errors (delete-file ,name))
+                         (uiop:ensure-directory-pathname ,name))))
+       (ensure-directories-exist ,dir)
+       (let ((,var (cursor:make-subscriber "sub-1"
+                                           (merge-pathnames "bus.wal" ,dir)
+                                           (merge-pathnames "sub-1.cursor" ,dir))))
+         (unwind-protect (progn ,@body)
+           (ignore-errors (uiop:delete-directory-tree
+                           ,dir :validate t :if-does-not-exist :ignore)))))))
+
+(defun write-bare-cursor (subscriber seq)
+  "Write SUBSCRIBER's cursor the way it was written before a generation was
+   recorded beside the position: the position alone and nothing else. Every
+   cursor file on the fleet is this shape."
+  (with-open-file (out (cursor:subscriber-cursor-path subscriber)
+                       :direction :output
+                       :if-exists :supersede
+                       :if-does-not-exist :create)
+    (prin1 seq out))
+  seq)
+
+(define-test a-position-left-above-the-head-is-stranded
+  "The production shape, planted. The log is sealed, the next cohort numbers
+   from 1, and a stable identity still holds the position it had before, far
+   above the new head. The count answers 0, and that answer is asserted here
+   rather than corrected: it is what a leader read as an idle bus while nothing
+   was reaching it. What has changed is that the same position now also reaches
+   a caller as it is, and a caller asking whether it is sound is told that it is
+   not, and why."
+  (with-sealable-sub (s dir)
+    (publish s 8)
+    (cursor:deliver-pending s :limit nil)
+    (archive:archive-wal (cursor:subscriber-wal s) dir :now 1000)
+    (publish s 2)
+    (setf (cursor:cursor-value s) 260)
+    (is = 0 (cursor:pending-count s)
+        "the count still says nothing is pending, exactly as it did on the live bus")
+    (multiple-value-bind (cursor head) (cursor:cursor-and-head s)
+      (is = 260 cursor)
+      (is = 2 head)
+      (true (> cursor head) "and the pair reaches a caller unclamped"))
+    (is eq :cursor-above-head (cursor:stranded-reason s))))
+
+(define-test a-position-below-the-head-of-a-log-it-never-read-is-stranded
+  "The shape a comparison of sequence numbers cannot find. The replacement log
+   grows past a position recorded against the log before it, so the position is
+   numerically BELOW the head and the two numbers say nothing worse than behind.
+   The count agrees with them, and is asserted here saying so. Only the
+   generation carries the fact that the log being counted against is not the log
+   the position came from."
+  (with-sealable-sub (s dir)
+    (publish s 20)
+    (cursor:deliver-pending s :limit 3)
+    (archive:archive-wal (cursor:subscriber-wal s) dir :now 1000)
+    (publish s 9)
+    (multiple-value-bind (cursor head) (cursor:cursor-and-head s)
+      (is = 3 cursor)
+      (is = 9 head)
+      (true (< cursor head) "the position is below the head, so it reads as behind"))
+    (is = 6 (cursor:pending-count s) "and the count says merely behind")
+    (is eq :generation-mismatch (cursor:stranded-reason s))))
+
+(define-test a-position-taken-against-the-log-being-read-is-not-stranded
+  "The control on both plants. Without it the answer could be stranded to
+   everything and the two above would pass exactly as they do. A reader in step
+   with its log is sound, is not sound once the log has been sealed under it,
+   and is sound again the moment its position is put back to the start of the
+   log that replaced it, which is the repair that recovered the live buses."
+  (with-sealable-sub (s dir)
+    (publish s 10)
+    (cursor:deliver-pending s :limit 4)
+    (is = 4 (cursor:cursor-value s))
+    (is eq nil (cursor:stranded-reason s))
+    (archive:archive-wal (cursor:subscriber-wal s) dir :now 1000)
+    (publish s 6)
+    (is eq :generation-mismatch (cursor:stranded-reason s)
+        "sealed under it, the same position is not sound")
+    (setf (cursor:cursor-value s) 0)
+    (is eq nil (cursor:stranded-reason s) "and the repair makes it sound again")
+    (is = 6 (cursor:pending-count s) "with the whole replacement log owed to it")))
+
+(define-test a-cursor-that-names-no-generation-is-not-stranded
+  "The control that keeps this from going off everywhere at once. Every cursor
+   file on the fleet was written before a generation was recorded, so its
+   generation is unknown rather than different. An unknown read as a
+   disagreement would report every stable identity on every bus stranded on the
+   day this shipped, which is indistinguishable from the alarm being wrong."
+  (with-sealable-sub (s dir)
+    (publish s 6)
+    (archive:archive-wal (cursor:subscriber-wal s) dir :now 1000)
+    (publish s 9)
+    (write-bare-cursor s 4)
+    (is = 4 (cursor:cursor-value s) "the position still reads")
+    (is = 5 (cursor:pending-count s) "and delivery still knows what is owed")
+    (is eq nil (cursor:stranded-reason s))))

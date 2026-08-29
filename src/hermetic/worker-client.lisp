@@ -23,6 +23,8 @@
   (:import-from #:sb-posix)
   (:import-from #:uiop)
   (:export #:worker #:make-worker #:spawn-worker #:worker-rpc
+           #:worker-ping #:worker-unresponsive
+           #:worker-unresponsive-worker #:worker-unresponsive-seconds
            #:worker-rpc-error #:worker-tcp-port #:worker-swank-port
            #:worker-pid #:worker-state #:worker-session-id #:worker-id
            #:worker-needs-reset-notification #:worker-stream-lock
@@ -34,7 +36,11 @@
            #:worker-crash-history-pushed-p #:*reaper-threads*
            #:*reaper-threads-lock* #:signal-worker-terminate
            #:worker-last-crash-reason #:worker-last-exit-status
-           #:worker-last-exit-code #:*worker-startup-timeout*))
+           #:worker-last-exit-code #:*worker-startup-timeout*
+           #:worker-liveness #:worker-liveness-basis
+           #:worker-last-ping-milliseconds
+           #:worker-consecutive-missed-pings
+           #:worker-liveness-checked-at))
 
 (in-package #:dsmr-mcp/src/hermetic/worker-client)
 
@@ -92,7 +98,15 @@ Each thread terminates and self-removes after reaping its process.")
   (crash-history-pushed-p nil :type boolean)
   (last-crash-reason nil)
   (last-exit-status nil)
-  (last-exit-code nil))
+  (last-exit-code nil)
+  ;; Liveness, kept beside the worker it describes so a status read never has
+  ;; to correlate two structures. :unknown until something has actually asked
+  ;; the worker a question; the pool's health monitor owns every write here.
+  (liveness :unknown :type keyword)
+  (liveness-basis nil)
+  (last-ping-milliseconds nil)
+  (consecutive-missed-pings 0 :type integer)
+  (liveness-checked-at nil))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Conditions
@@ -127,6 +141,24 @@ Each thread terminates and self-removes after reaping its process.")
   (:documentation "Legitimate JSON-RPC error response from a worker handler.
 Distinct from protocol errors (parse failure, ID mismatch) which
 indicate stream corruption and require marking the worker crashed."))
+
+(define-condition worker-unresponsive (error)
+  ((worker :initarg :worker :reader worker-unresponsive-worker)
+   (seconds :initarg :seconds :reader worker-unresponsive-seconds))
+  (:report (lambda (c s)
+             (format s "Worker ~A (PID ~A) left a liveness ping unanswered for ~As. ~
+Its channel was left open and it was left in service; only a run of unanswered ~
+pings retires it."
+                     (worker-id (worker-unresponsive-worker c))
+                     (worker-pid (worker-unresponsive-worker c))
+                     (worker-unresponsive-seconds c))))
+  (:documentation "A liveness ping went unanswered within its deadline.
+
+Distinct from WORKER-CRASHED, and the distinction is the whole point: crashed
+means the channel is gone and the worker with it, while this means the worker
+did not answer in time and nothing has been concluded from that yet. One silence
+is the ordinary shape of a garbage collection pause. The caller decides how many
+in a row stop looking like a pause."))
 
 (define-condition line-too-long (error)
   ((limit :initarg :limit :reader line-too-long-limit))
@@ -376,27 +408,42 @@ which causes IO-TIMEOUT on any subsequent read (cl-mcp PR #67 bug)."
 When TIMEOUT is non-NIL, signals SB-EXT:TIMEOUT after that many seconds.
 Returns the parsed JSON hash-table on success.
 Signals WORKER-RPC-ERROR for legitimate JSON-RPC error responses.
-Signals SIMPLE-ERROR for protocol-level failures (parse errors, ID mismatches)."
+Signals SIMPLE-ERROR for protocol-level failures (parse errors, ID mismatches).
+
+A response whose id is LOWER than ID is the late answer to an earlier request
+whose caller already stopped waiting. It is discarded and the read continues,
+because it is not evidence of corruption: it is evidence the worker is behind,
+which is a different fact and one a caller may want to survive. Without this,
+any caller that ever gives up waiting poisons the channel for the next one, and
+a worker that catches up is condemned for answering late.
+
+A response whose id is at or above ID has no such explanation. Nothing on this
+channel can legitimately answer a request that has not been sent, so that
+remains a protocol error and still condemns the stream."
   (flet ((do-read ()
-           (let ((line (%read-line-limited stream nil +max-json-line-bytes+)))
-             (unless line
-               (error 'end-of-file :stream stream))
-             (let ((json (com.inuoe.jzon:parse line)))
-               (unless (hash-table-p json)
-                 (error "Invalid JSON-RPC response: not an object"))
-               ;; Verify ID matches
-               (let ((resp-id (gethash "id" json)))
-                 (unless (eql resp-id id)
-                   (error "JSON-RPC response ID mismatch: expected ~A, got ~A"
-                          id resp-id)))
-               ;; Check for error — signal typed condition for worker errors
-               (let ((err (gethash "error" json)))
-                 (when err
-                   (error 'worker-rpc-error
-                          :code (gethash "code" err)
-                          :message (gethash "message" err))))
-               ;; Return the result
-               (gethash "result" json)))))
+           (loop
+             (let ((line (%read-line-limited stream nil +max-json-line-bytes+)))
+               (unless line
+                 (error 'end-of-file :stream stream))
+               (let ((json (com.inuoe.jzon:parse line)))
+                 (unless (hash-table-p json)
+                   (error "Invalid JSON-RPC response: not an object"))
+                 (let ((resp-id (gethash "id" json)))
+                   (cond
+                     ;; Late answer to an abandoned request; drop it and keep reading.
+                     ((and (integerp resp-id) (integerp id) (< resp-id id)))
+                     ((not (eql resp-id id))
+                      (error "JSON-RPC response ID mismatch: expected ~A, got ~A"
+                             id resp-id))
+                     (t
+                      ;; Check for error: signal a typed condition for worker errors
+                      (let ((err (gethash "error" json)))
+                        (when err
+                          (error 'worker-rpc-error
+                                 :code (gethash "code" err)
+                                 :message (gethash "message" err))))
+                      ;; Return the result
+                      (return (gethash "result" json))))))))))
     (if timeout
         (sb-ext:with-timeout timeout
           (do-read))
@@ -642,6 +689,56 @@ the worker handler. These are re-signaled without marking the worker crashed."
           ;; Mark worker as crashed since the stream is desynchronized.
           (%mark-worker-crashed worker
                                 (format nil "protocol-error: ~A" e))
+          (error 'worker-crashed :worker worker
+                 :reason (format nil "protocol-error: ~A" e)))))))
+
+(defun worker-ping (worker &key timeout)
+  "Ask WORKER the liveness question and return the round trip in milliseconds.
+
+WORKER-RPC treats a timeout as a crash, and for a general call that is right:
+the caller has given up on an answer that may still be in flight, so the channel
+can no longer be trusted. A probe cannot afford that verdict. A single missed
+ping is the ordinary shape of a garbage collection pause, and retiring an idle
+worker for one buys nothing and costs a respawn.
+
+So this leaves the late answer to be handled rather than feared:
+%READ-JSON-RPC-RESPONSE discards answers older than the request it is waiting
+for, which is what lets a worker that catches up be read correctly on the next
+probe instead of being condemned for answering late.
+
+Signals WORKER-UNRESPONSIVE when no answer arrives within TIMEOUT seconds,
+leaving the worker's state, stream and socket exactly as they were so the caller
+decides what a run of silences means.
+
+Signals WORKER-CRASHED for the failures that admit no second opinion: a channel
+already closed, an end of file, a stream error, or an answer that cannot be
+parsed. Those mark the worker crashed here, as WORKER-RPC does."
+  (bt:with-lock-held ((worker-stream-lock worker))
+    (unless (worker-stream worker)
+      (error 'worker-crashed :worker worker :reason "already-dead"))
+    (let ((id (incf (worker-request-counter worker)))
+          (start (get-internal-real-time)))
+      (handler-case
+          (progn
+            (%send-json-rpc (worker-stream worker) id "worker/ping"
+                            (make-hash-table :test 'equal))
+            (%read-json-rpc-response (worker-stream worker) id timeout)
+            (round (* 1000 (- (get-internal-real-time) start))
+                   internal-time-units-per-second))
+        (sb-ext:timeout ()
+          (error 'worker-unresponsive :worker worker :seconds timeout))
+        (end-of-file ()
+          (%mark-worker-crashed worker "eof")
+          (error 'worker-crashed :worker worker :reason "eof"))
+        (stream-error ()
+          (%mark-worker-crashed worker "stream-error")
+          (error 'worker-crashed :worker worker :reason "stream-error"))
+        (worker-rpc-error (e)
+          ;; The worker answered, badly. That is still an answer, so it is
+          ;; re-signalled without condemning the channel.
+          (error e))
+        (error (e)
+          (%mark-worker-crashed worker (format nil "protocol-error: ~A" e))
           (error 'worker-crashed :worker worker
                  :reason (format nil "protocol-error: ~A" e)))))))
 

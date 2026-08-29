@@ -25,8 +25,25 @@
     :allocation :class :initform "bus-status")
    (dsmr-mcp/src/tools/base::description
     :allocation :class
-    :initform "Report the coordination bus state for this agent: whether a broker \
-is running and how many messages are waiting, without consuming them.")
+    :initform "Report this agent's view of the coordination bus at one moment: \
+whether a broker is running and how many records are waiting for this agent, \
+without consuming them. \
+It is not an inventory of the bus. It does not establish what the broker is, \
+which source that broker is serving or whether it would survive a restart; it \
+does not say which generation of the log this is, which recorded positions are \
+stranded, or which identities are enrolled and reading. bus-inspect answers \
+those, and it is the verb to call when the question is what state the bus is \
+in. \
+The pending figure counts only the kind of record a receive would hand back: \
+nothing this agent published, and nothing addressed to another participant. \
+The count and the delivery path apply the same test, so every record counted \
+here is one a receive will hand over, and nothing else is counted. The figure \
+is not bounded by a page: one receive returns at most its limit, 20 by \
+default, and reports the rest as remaining_pending, so pending can \
+legitimately exceed what a single call hands back. A pending of zero means \
+nothing is deliverable to this agent, which is not the same as an empty log: \
+records past the cursor may be addressed to other participants, or be this \
+agent's own publishes it has not consumed.")
    (dsmr-mcp/src/tools/base::input-schema
     :allocation :class
     :initform '(:object
@@ -49,7 +66,15 @@ become a bus is refused; the shared bus is never reported on in place of a bus \
 that was named."))
                 :required ())))
   (:metaclass mcp-tool-class)
-  (:documentation "MCP tool: report coordination-bus status for this agent."))
+  (:documentation "MCP tool: report coordination-bus status for this agent.
+
+Superseded by bus-inspect and kept answering. What it measures is unchanged and
+every field it has ever returned is still returned, because the harm was never
+in the measurement: it was in a familiar name being read as an inventory of the
+bus when it reports a moment in time. So the verb now says what it means and
+names where the fuller answer lives, in the response as well as in the tool
+list, since a caller relaying an answer onward carries the reply and not the
+description."))
 
 (defun %watcher-line (status age)
   "One human-readable clause about this agent's wakeup watcher, appended to the
@@ -97,6 +122,14 @@ string naming a bus. Omit it to report on this session's own bus.")))))
                               "live_watcher" (and live-watcher t)
                               "watcher_status" watcher-status
                               "watcher_age_seconds" (or watcher-age 'null)
+                              ;; Built fresh on each call rather than held in a
+                              ;; constant, so nothing a caller does to the object
+                              ;; it was handed can reach the next caller.
+                              "superseded_by"
+                              (make-ht
+                               "verb" "bus-inspect"
+                               "reports" "This reply is a moment in time: a broker is or is not holding the election lock, and this agent has this many records past its cursor. It is not an inventory of the bus, and it establishes nothing about which source the broker is serving, which generation of the log this is, which recorded positions are stranded, or who else is reading. bus-inspect answers those."
+                               "pending" "The pending number counts only the kind of record a receive would hand back: nothing this agent published, and nothing addressed to another participant. The count and the delivery path apply the same test, so every record counted here is one a receive will hand over, and nothing else is counted. The number is not bounded by a page: one receive returns at most its limit, 20 by default, and reports the rest as remaining_pending, so pending can legitimately exceed what a single call returns. Zero pending means nothing is deliverable to this agent, not that the log is empty: records past the cursor may be addressed to other participants, or be this agent's own publishes it has not consumed.")
                               "content" (text-content
                                          (format nil "You are ~A. Bus ~A is ~A: ~D message(s) pending. ~A"
                                                  (identity-summary a)
