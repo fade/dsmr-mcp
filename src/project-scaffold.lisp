@@ -65,6 +65,19 @@ the error message)."
            :value (namestring dir)
            :reason (format nil "~A resolves outside session root" context))))
 
+(defun %executable-content-p (content)
+  "True when CONTENT begins with a #! line, marking the file as a script.
+
+The execute bit is derived from the file's own first two bytes rather than
+declared in a table of names kept somewhere else. A script added to the
+manifest later cannot then be forgotten, and the mode can never disagree with
+the content it describes. Every shebang-bearing file this scaffold emits is one
+the generated README and CLAUDE.md tell a person to run directly, so at the
+bare process umask those instructions fail on their first step."
+  (and (stringp content)
+       (>= (length content) 2)
+       (string= "#!" content :end2 2)))
+
 (defun %write-plan-to-temp (temp-dir plan session-root)
   "Write all PLAN entries into TEMP-DIR, routing each file through the
 Phase-6 write-jail (ensure-write-path) then write-file-string-atomically.
@@ -83,7 +96,38 @@ TEMP-DIR must already be inside SESSION-ROOT; this is asserted per-file."
                  :field "destination"
                  :value rel-in-temp
                  :reason "file path resolves outside session root"))
-        (write-file-string-atomically pn (cdr entry))))))
+        (write-file-string-atomically pn (cdr entry))
+        (when (%executable-content-p (cdr entry))
+          ;; chmod through run-program rather than sb-posix, matching how the
+          ;; installer sets the execute bit on the binary it copies. A chmod
+          ;; that cannot run must not discard an otherwise complete tree.
+          (uiop:run-program (list "chmod" "+x" (namestring pn))
+                            :ignore-error-status t))))))
+
+(defun %register-with-asdf (name abs-asd)
+  "Make the freshly emitted system findable in this image and report how.
+
+A long-running image caches the source registry at its first lookup, so a
+directory created afterwards stays invisible even when it sits squarely on a
+configured tree. Dropping that cache is what makes the new project findable;
+its only cost to the caller is one rescan of the configured trees at the next
+lookup, since loaded code and loaded systems are left alone. A definition
+already recorded under NAME is dropped as well, so the answer below reflects
+what the registry can find rather than what an earlier call left behind.
+
+Returns :SOURCE-REGISTRY when the rescan resolves NAME to this very .asd, which
+also means any other image on this host will find it. Returns :LOAD-ASD when
+the project sits outside every configured tree and had to be registered by
+hand, which reaches no image but this one."
+  (asdf:clear-source-registry)
+  (ignore-errors (asdf:clear-system name))
+  (let* ((found (ignore-errors (asdf:find-system name nil)))
+         (source (and found (ignore-errors
+                             (truename (asdf:system-source-file found))))))
+    (if (and source (equal source (ignore-errors (truename abs-asd))))
+        :source-registry
+        (progn (ignore-errors (asdf:load-asd abs-asd))
+               :load-asd))))
 
 (defun write-scaffold (&key name description author license copyright year
                               destination overwrite session-root)
@@ -92,6 +136,7 @@ Returns a plist with:
   :target-dir    (absolute directory pathname)
   :relative-path (namestring relative to session-root)
   :files         (list of relative path strings, in manifest order)
+  :registration  :SOURCE-REGISTRY or :LOAD-ASD, see %register-with-asdf
 
 On any failure, signals INVALID-ARGUMENT-ERROR or propagates the
 underlying error after cleaning up the temp directory (no debris)."
@@ -146,14 +191,14 @@ underlying error after cleaning up the temp directory (no debris)."
                  (uiop:delete-directory-tree target-dir :validate t))
                (rename-file temp-dir target-dir)
                (setf committed t)
-               ;; Auto-register the new system with ASDF
-               (let ((abs-asd (namestring
-                               (merge-pathnames (format nil "~A.asd" name) target-dir))))
-                 (when (probe-file abs-asd)
-                   (ignore-errors (asdf:load-asd abs-asd))))
-               (list :target-dir target-dir
-                     :relative-path (enough-namestring target-dir session-root)
-                     :files (mapcar #'car manifest)))
+               (let* ((abs-asd (namestring
+                                (merge-pathnames (format nil "~A.asd" name) target-dir)))
+                      (registration (when (probe-file abs-asd)
+                                      (%register-with-asdf name abs-asd))))
+                 (list :target-dir target-dir
+                       :relative-path (enough-namestring target-dir session-root)
+                       :files (mapcar #'car manifest)
+                       :registration registration)))
           (unless committed
             (when (uiop:directory-exists-p temp-dir)
               (ignore-errors

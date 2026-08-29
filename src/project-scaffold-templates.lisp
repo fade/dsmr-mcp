@@ -94,7 +94,10 @@ package-inferred-system + Zebra convention of dsmr-mcp itself.")
 ;;;; and in additional src/*.lisp files.
 
 (defpackage #:{{name}}/src/main
-  (:use #:cl))
+  (:use #:cl)
+  ;; MAIN is the project's entry point: build.sh names it as the saved
+  ;; image's toplevel, so it has to be reachable from outside this package.
+  (:export #:main))
 
 (in-package #:{{name}}/src/main)
 
@@ -155,9 +158,10 @@ package-inferred-system + Zebra convention of dsmr-mcp itself.")
   0)
 "
   "Template for the generated project's src/main.lisp.
-Ships an empty package + mode-dispatching main (run/daemon/dev).
-No :export and no stub defun — the package starts clean so the first
-load-system pins no symbols and there is no package-variance on reload.")
+Ships a mode-dispatching main (run/daemon/dev) as the package's one
+exported symbol, which is what build.sh hands save-lisp-and-die as the
+toplevel. Nothing else is exported and there are no stub defuns, so a
+reload pins no further symbols and there is no package-variance.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; tests/main-test.lisp template (Zebra smoke)
@@ -185,9 +189,9 @@ load-system pins no symbols and there is no package-variance on reload.")
   (true (find-package :{{name}}/src/main)))
 "
   "Template for the generated project's tests/main-test.lisp.
-Uses Zebra (not Rove). The smoke test asserts only package existence
-— it holds no reference to any symbol the empty main package does not
-export, so the generated project loads and tests cleanly out of the box.")
+Uses Zebra (not Rove). The smoke test asserts only package existence,
+so it holds no reference to a symbol the main package does not export
+and the generated project loads and tests cleanly out of the box.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; build script template (sb-ext:save-lisp-and-die, D-09)
@@ -216,6 +220,7 @@ mkdir -p \"$(dirname \"$OUTPUT\")\"
 
 sbcl --noinform \\
      --no-userinit \\
+     --disable-debugger \\
      --eval \"(require :asdf)\" \\
      --eval \"(when (probe-file \\\"$QUICKLISP_SETUP\\\") (load \\\"$QUICKLISP_SETUP\\\"))\" \\
      --eval \"(push \\\"$LISP_WORKSPACE/\\\" asdf:*central-registry*)\" \\
@@ -225,6 +230,11 @@ sbcl --noinform \\
                :toplevel #'{{name}}/src/main:main
                :executable t
                :compression t)\"
+
+if [ ! -f \"$OUTPUT\" ]; then
+  echo \"ERROR: no binary at $OUTPUT; the build did not produce one\" >&2
+  exit 1
+fi
 
 echo \"Built: $OUTPUT\"
 "
