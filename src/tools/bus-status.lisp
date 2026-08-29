@@ -34,10 +34,16 @@ does not say which generation of the log this is, which recorded positions are \
 stranded, or which identities are enrolled and reading. bus-inspect answers \
 those, and it is the verb to call when the question is what state the bus is \
 in. \
-The pending figure counts every record past this agent's cursor, and that \
-includes this agent's own publishes, which delivery filters out. The number \
-shown here and the number a receive returns can therefore legitimately differ, \
-and neither of them is wrong.")
+The pending figure counts only the kind of record a receive would hand back: \
+nothing this agent published, and nothing addressed to another participant. \
+The count and the delivery path apply the same test, so every record counted \
+here is one a receive will hand over, and nothing else is counted. The figure \
+is not bounded by a page: one receive returns at most its limit, 20 by \
+default, and reports the rest as remaining_pending, so pending can \
+legitimately exceed what a single call hands back. A pending of zero means \
+nothing is deliverable to this agent, which is not the same as an empty log: \
+records past the cursor may be addressed to other participants, or be this \
+agent's own publishes it has not consumed.")
    (dsmr-mcp/src/tools/base::input-schema
     :allocation :class
     :initform '(:object
@@ -123,7 +129,7 @@ string naming a bus. Omit it to report on this session's own bus.")))))
                               (make-ht
                                "verb" "bus-inspect"
                                "reports" "This reply is a moment in time: a broker is or is not holding the election lock, and this agent has this many records past its cursor. It is not an inventory of the bus, and it establishes nothing about which source the broker is serving, which generation of the log this is, which recorded positions are stranded, or who else is reading. bus-inspect answers those."
-                               "pending" "The pending number counts every record past this agent's cursor, and that includes records this agent published itself, which delivery filters out. So this number and the count a receive returns can legitimately differ, and neither of them is wrong.")
+                               "pending" "The pending number counts only the kind of record a receive would hand back: nothing this agent published, and nothing addressed to another participant. The count and the delivery path apply the same test, so every record counted here is one a receive will hand over, and nothing else is counted. The number is not bounded by a page: one receive returns at most its limit, 20 by default, and reports the rest as remaining_pending, so pending can legitimately exceed what a single call returns. Zero pending means nothing is deliverable to this agent, not that the log is empty: records past the cursor may be addressed to other participants, or be this agent's own publishes it has not consumed.")
                               "content" (text-content
                                          (format nil "You are ~A. Bus ~A is ~A: ~D message(s) pending. ~A"
                                                  (identity-summary a)
