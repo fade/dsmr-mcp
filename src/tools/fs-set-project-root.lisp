@@ -43,17 +43,42 @@
 
 ;;; Whitelist helper --------------------------------------------------------
 
+(defun %as-directory-namestring (path-string)
+  "Return PATH-STRING spelled as a directory namestring, ending in a slash.
+DSMR_RELATED_PROJECTS is written in shell convention, which leaves the trailing
+slash off, while the re-root target reaches the gate as a Common Lisp directory
+namestring, which always carries one. Bringing both sides to the same spelling
+is what lets them be compared at all, and it is also what keeps a sibling whose
+name merely begins with a listed directory's name from matching."
+  (namestring (uiop:ensure-directory-pathname path-string)))
+
 (defun %related-projects-whitelist ()
-  "Return a list of absolute namestrings from DSMR_RELATED_PROJECTS env var.
-Colon-separated. Empty string or unset returns NIL (empty whitelist)."
+  "Return the directories named by DSMR_RELATED_PROJECTS as directory
+namestrings. Colon-separated. Empty string or unset returns NIL (empty
+whitelist)."
   (let ((env (uiop:getenv "DSMR_RELATED_PROJECTS")))
     (when (and env (plusp (length env)))
-      (remove "" (uiop:split-string env :separator ":") :test #'string=))))
+      (mapcar #'%as-directory-namestring
+              (remove "" (uiop:split-string env :separator ":") :test #'string=)))))
+
+(defun %covered-by-p (target-namestring entry-namestring)
+  "Return T when TARGET-NAMESTRING names ENTRY-NAMESTRING itself or a directory
+beneath it at any depth. Both arguments must already end in a slash."
+  (let ((n (length entry-namestring)))
+    (and (>= (length target-namestring) n)
+         (string= entry-namestring target-namestring :end2 n))))
 
 (defun %whitelisted-p (target-namestring current-root-namestring)
-  "Return T when TARGET-NAMESTRING is the current root or is on the whitelist."
+  "Return T when TARGET-NAMESTRING is the current root, or is a whitelisted
+directory, or lies beneath one. Naming a directory authorises everything under
+it because worktrees are created and destroyed continuously and the whitelist
+only takes effect when the session is replaced: an exact match would mean a new
+entry and a restart for every worktree."
   (or (string= target-namestring current-root-namestring)
-      (member target-namestring (%related-projects-whitelist) :test #'string=)))
+      (let ((target (%as-directory-namestring target-namestring)))
+        (and (some (lambda (entry) (%covered-by-p target entry))
+                   (%related-projects-whitelist))
+             t))))
 
 ;;; Tool class --------------------------------------------------------------
 
