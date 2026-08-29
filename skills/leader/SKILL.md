@@ -136,10 +136,16 @@ grep -oE '=[a-z0-9-]+=\s*\|' docs/CONSTELLATION.org | tr -d '=| ' | sort -u \
       done
       [ -n "$d" ] || continue
       live=$(git -C "$d" rev-parse HEAD 2>/dev/null)
+      n=$(grep -c '^sha:' "$d/.planning/PARK.md" 2>/dev/null) || n=0
       parked=$(awk '/^sha:/{print $2; exit}' "$d/.planning/PARK.md" 2>/dev/null)
-      [ -n "$parked" ] || parked=NO-PARK-FILE
-      [ "$live" = "$parked" ] && st=OK || st=MISMATCH
-      printf "%-12s %-9s parked=%.12s live=%.12s\n" "$r" "$st" "$parked" "$live"
+      if   [ "$n" -eq 0 ];      then st=NO-PARK-FILE; parked=NO-PARK-FILE
+      elif [ "$n" -gt 1 ];      then st=SCHEMA
+      else case "$live" in
+             "$parked"*) st=OK ;;          # prefix: a park sha is often ABBREVIATED
+             *)          st=MISMATCH ;;
+           esac
+      fi
+      printf "%-12s %-12s parked=%.12s live=%.12s\n" "$r" "$st" "$parked" "$live"
     done
 ```
 
@@ -148,13 +154,58 @@ grep -oE '=[a-z0-9-]+=\s*\|' docs/CONSTELLATION.org | tr -d '=| ' | sort -u \
 dependency-fork repos legitimately have agents without being members. A repo in one and not the
 other is a FINDING.
 
-⚠ **The `exit` in that `awk` is required, not tidiness.** A `PARK.md` may stack park blocks, each
-with its own `^sha:` line — the current one on top, superseded ones below. Without `exit`, `awk`
-prints every one of them and `parked` becomes a concatenation of shas that can never equal a single
-`HEAD`, so the repo prints **MISMATCH while being perfectly in sync**. Measured on ubik, 2026-08-21:
-two blocks, identical 40-char value, an 80-char comparison string, a false MISMATCH at bring-up.
-⇒ Read the FIRST `sha:` and stop. And note the shape of the failure, which is the general lesson:
-the check's "diverged" and its "I misparsed the file" are the same observation.
+### ⛔ EXACTLY ONE `^sha:` AT COLUMN 0. More than one is a SCHEMA defect, never divergence.
+
+⚠ **A `PARK.md` may stack park blocks, each with its own `^sha:` line, and this breaks the check in
+three different ways — two of which read as a repository that has diverged.** Bare `awk '/^sha:/'`
+prints every one of them, so `parked` becomes a concatenation that can never equal a single `HEAD`
+(measured on ubik, 2026-08-21: two blocks, identical 40-char value, an 80-char comparison string, a
+false MISMATCH at bring-up). Taking one sha fixes that and opens the next hole, because **which** one
+is right depends on which end the repo appends to, and both orderings exist:
+
+| the file stacks | read-FIRST gives | read-LAST gives |
+|---|---|---|
+| newest first | the live park ✓ | the oldest park ✗ |
+| oldest first | the oldest park ✗ | the live park ✓ |
+
+⇒ **This is why the rule is the schema and not the read.** Any position rule is right in half the
+repositories and silently wrong in the other half, and it fails in the direction that looks exactly
+like real divergence. ⚠ **It cannot fire while nothing has moved**, because every sha in a stacked
+file is then the same and both rules pass; it fires on the first park taken after `HEAD` advances,
+which is precisely when a bring-up is deciding whether to STOP.
+
+**The rule: one canonical `sha:` at column 0, in the live header block at the top. Historical bands
+are indented prose beneath, so appending one never stacks a second.** The loop above counts first
+and reports `SCHEMA` rather than guessing, and the standalone check is one line:
+
+```bash
+test "$(grep -c '^sha:' PARK.md)" -eq 1   # >1 is a SCHEMA defect in the file, NOT a diverged repo
+```
+
+⚠ **Compare by PREFIX, never with `=`, and this is a third way the same check goes wrong.** A
+`PARK.md` may record the sha abbreviated (`4ac35aa`) while `git rev-parse HEAD` always returns the
+full 40 characters, so string equality reports **MISMATCH on a repo that is exactly in sync**.
+Measured on dsmr-mcp, 2026-08-23, against a park written the same evening. It stays invisible in any
+fleet whose repos happen to record full shas — which is why the loop above was wrong for months
+without anyone seeing it.
+
+⛔ **`SCHEMA` is a repair task for that repo's owner, and it is NOT a STOP.** Do not reconcile a
+repo against `HEAD` on a file the check could not read; fix the file, then re-run. Never reach into
+another repo to do it — hand it to the owner.
+
+⛔ **AND THE ONE THAT CATCHES A LEADER: when you find yourself special-casing a SHARED check so
+that one repo passes, the check is wrong, not the repo.** The abbreviated-sha defect above was met
+head-on by a peer leader the same day and routed around with a local prefix fallback in their own
+copy of the loop, printing a soft `OK-short` for the offending repo. It read as a formatting quirk
+of one file. ⚠ **The workaround is what stopped it being seen: a local fix removes the symptom and
+the evidence together**, and the finding then has to be rediscovered by somebody without the clue.
+⇒ A one-repo exception to a fleet-wide rule is a finding to raise, never a branch to add.
+
+⚠ **The general lesson, which outlived all three wrong answers: the check's "diverged" and its "I
+misparsed the file" are the same observation.** Each fix here passed the case in front of the person
+who wrote it and shipped, and a half-correct fix propagates faster than a wrong one for exactly that
+reason. ⇒ Construct the case that is NOT in front of you: append a simulated next park to a scratch
+copy and confirm the check still answers correctly, and confirm it can answer no as well as yes.
 
 ⚠ N is whatever that prints. **It is a measurement, not a constant** — do not carry it forward.
 
@@ -285,8 +336,23 @@ a worker's edits, and it will refuse your attempt to write the config that fixes
 Do not reformulate the call and do not route it through another tool. ⚠ Never propose turning the
 prompt back on as the remedy: that converts every classifier coin-flip into an operator interrupt,
 which is precisely what auto mode plus the bus exists to prevent (operator, 2026-08-02). The remedy
-is a `permissions.allow` entry, which bypasses the classifier deterministically, backed by a real
-gate underneath such as the server's own root whitelist.
+is a `permissions.allow` entry, which is necessary and is the first thing to reach for, backed by a
+real gate underneath such as the server's own root whitelist.
+
+⚠ **TWO GATES SIT IN FRONT OF A CALL AND THIS FILE USED TO CONFLATE THEM.** The **configured** gate
+is the allow rules, and a matching rule satisfies it by pattern match. The **classifier** is a
+separate per-call model judgment ahead of it, and no entry you write reaches that one. ⇒ An allow
+entry is reliable against the gate it addresses and settles nothing about the other. It is the fix;
+it is not a guarantee of passage.
+
+⚠ **An allowlisted call has still been refused, twice on record**, in different repositories with
+different verbs and the entry provably in place for weeks: `bus-receive` on 2026-08-03 and
+`git push` on 2026-08-06, neither observer aware of the other. ⛔ **WHICH gate refused was never
+established, and do not repeat either story as though it were.** Two candidate shapes were recorded
+and neither was distinguished: a reload window while a settings file was being written, which is
+configured-side, and the classifier judging the call in its context, which is not. ⇒ **A refused
+allowlisted call is not evidence the allowlist is broken and not a reason to hunt for config.** Say
+what was refused, note that the entry exists, and try once more before treating it as a block.
 
 ⚠ **A denial mid-session is not evidence anything regressed.** Check the binary version and the
 settings mtimes once, say so, and stop hunting. The variance is the design, not a fault.
