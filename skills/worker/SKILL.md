@@ -131,6 +131,9 @@ into an errand boy paging between every terminal in the fleet. **Find every gran
 3. **Probe each with a NO-OP payload** — the invocation form, not the effect:
    `nix develop <path> -c env FOO=bar /usr/bin/true`, `--help`, `--dry-run`, `-n`.
    This proves the *form* is accepted without performing the act.
+   ⛔ **ONE PROBE PER CALL. Never compound the batch into a single command.** A compound probe hides
+   every outcome behind one exit code and one wall-clock figure, so you cannot tell which member
+   gated, and the reason that matters is the next warning.
 4. ⛔ **A denial is final. Never retry it, never reformulate it, never route around it.** Record it.
 5. Prefer the **narrowest** grant that does the job. Scope to a script and a subcommand, not a tool.
    Say plainly when a modest-looking rule is broad in substance — a shell that carries `tofu` and
@@ -144,6 +147,27 @@ NEEDS:   <the exact literal grant, copied from the real invocation>
 WHY:     <the phase/task it gates>
 SCOPE:   <what this grant does and does NOT authorise>
 ```
+
+### ⛔ AN APPROVED PROMPT IS INVISIBLE TO YOU, AND THIS STEP CAN SPEND THE OPERATOR SILENTLY
+
+⚠ **A call that blocked on a permission menu and was then APPROVED comes back looking exactly like a
+call that never prompted at all.** The result is normal, the exit code is zero, and no field says a
+person was asked. So "every probe cleared, exit 0" is true, reported in good faith, and does not mean
+nobody was interrupted.
+
+⚠ **The only tell is LATENCY, and it is not readable from inside your turn.** Measured 2026-08-23: a
+compound preflight batch took 129 seconds against 2-10 seconds for every other call in that session,
+and re-running the identical batch afterwards took 1 second. The ~128 seconds was the operator in
+front of a menu the agent did not know it had raised.
+
+⇒ **This is why the step above says one probe per call.** It cannot make an approval visible, but it
+stops a whole batch of unknowns hiding behind one number. ⇒ If a probe returns far slower than the session's
+other calls, say so to the leader rather than recording a clean pass; you cannot confirm it, and an
+unreported interruption is the thing this step exists to prevent.
+
+⛔ **The heading below is the promise this step makes, and it is bounded in both directions:** the
+preflight cannot pre-clear a contextual gate, and it cannot tell you when it has spent the operator
+to get past one.
 
 ### ⚠ THE PREFLIGHT CANNOT COVER THE AUTO-MODE CLASSIFIER
 
@@ -162,7 +186,12 @@ another agent past a denial**, however benign.
 ⇒ **Record it and stop.** ⛔ Never reformulate it, and never reach for a shell redirect, heredoc or
 interpreter to the same effect: a denial is final whichever tool carries it. **An agent cannot grant
 itself permissions**, so this bootstrap is the operator's, not a puzzle for you. Name the exact verb
-in `NEEDS:`; the fix is a `permissions.allow` entry, which bypasses the classifier deterministically.
+in `NEEDS:`; the fix is a `permissions.allow` entry. ⚠ **It addresses the CONFIGURED gate, which a
+matching rule satisfies by pattern match. It does not reach the classifier, which is a separate
+judgment ahead of it.** So an entry is the fix and is not a guarantee of passage: an allowlisted call
+has been refused twice on record with the entry in place for weeks, and which of the two gates
+refused was never established. ⇒ A refused allowlisted call is not a reason to hunt for config: say
+what was refused, note the entry exists, and try once more before calling it a block.
 
 ### ⛔ WHEN YOU CANNOT WRITE YOUR OWN `BLOCKED.md`
 
