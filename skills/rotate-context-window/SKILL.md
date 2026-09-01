@@ -48,7 +48,9 @@ Run these probes in parallel (one Bash call per cheap group is fine):
 **Project state**
 - `ls .planning/` if present
 - `head -80 .planning/STATE.md` then `tail -30 .planning/STATE.md` if present
-- `ls .planning/todos/pending/ 2>/dev/null | head -10`
+- `ls .planning/todos/pending/ 2>/dev/null` in FULL, and its count.
+  ⛔ Never `head` this listing. It is the mechanism for not losing notes,
+  so a silent truncation defeats the only thing it is for.
 - `ls .planning/phases/ 2>/dev/null | tail -5` to identify the active phase
 - If `<active-phase>/README.md` exists, `head -40` of it
 
@@ -168,10 +170,21 @@ Skip the section entirely if none present.
 
 **Stashes:** list or "none".
 
-## Open follow-ups not yet captured as todos
-Things flagged in conversation that haven't reached
-`.planning/todos/pending/` yet. Lose these on rotation if not written
-down here.
+## Open follow-ups: write them to todos/pending NOW, then list them
+
+⛔ **This is a conversion step, not a holding pen.** Anything flagged in
+conversation that has not reached `.planning/todos/pending/` gets written
+there as a file BEFORE this handoff is finished. Then list the filenames
+below, one line each: `filename - what it is`.
+
+⚠ **Prose in a handoff is volatile by construction.** A note left here as
+prose survives only if the next rotation re-types it, and the one after
+that, and every one after that. It reads as recorded for the whole time it
+is decaying, which is why nobody notices until it is gone.
+
+⇒ **The test: if this instance vanished mid-sentence, would the note still
+exist as a file?** If not, it is not recorded, however carefully it is
+written here.
 
 ## Failed paths / dead-ends from this session
 What I tried that didn't work, so the new instance doesn't repeat the
@@ -183,10 +196,12 @@ Exact paths in the order to read them. Limit to 5; the new instance
 should be oriented after this list, not after fishing.
 
 1. `.planning/STATE.md` (head 80 + tail 30)
-2. `<active phase>/README.md` if applicable
-3. <coordinator file if present>
-4. <staged commit/PR body if applicable>
-5. <one more if needed>
+2. `.planning/todos/pending/` in full. STANDING ENTRY, not a slot to spend:
+   these are the notes this session was asked to keep, and a note nobody
+   reads was never kept.
+3. `<active phase>/README.md` if applicable
+4. <coordinator file if present>
+5. <staged commit/PR body if applicable>
 
 ## First action for the new instance
 Concrete. "Run /gsd-resume-work" or "Continue the active thread by
