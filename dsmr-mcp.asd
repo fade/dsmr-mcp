@@ -256,14 +256,50 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                                (and (stringp dep)
                                     (uiop:string-prefix-p "dsmr-mcp/tests/" dep)))
                              (asdf:system-depends-on c)))
-                           (any-failed nil))
+                           (any-failed nil)
+                           (executed 0)
+                           ;; Resolved at run time on purpose: ASDF reads this file
+                           ;; before zebra is loaded, so the class cannot be named
+                           ;; literally here.
+                           (test-result-class (uiop:find-symbol* :test-result :zebra)))
+                      ;; A filter that selects no package at all is a wiring fault, not a
+                      ;; verdict on the code: nothing ran, so nothing was judged.
+                      (when (null test-package-names)
+                        (error "dsmr-mcp/tests: no test packages were selected. Nothing ~
+                                in this system's dependencies carries the ~
+                                dsmr-mcp/tests/ prefix the filter looks for, so no test ~
+                                ran and no code was judged. This is a wiring fault: ~
+                                check that the test systems are still listed as ~
+                                dependencies under that prefix."))
                       (dolist (name test-package-names)
                         (let* ((package (or (find-package (string-upcase name))
                                             (error "Test package ~S not loaded." name)))
                                (result (uiop:symbol-call :zebra :test package)))
+                          ;; Count the test results this run produced. One exists only
+                          ;; because the runner reached that test, so this counts
+                          ;; invocations and never registrations. Counting the objects
+                          ;; rather than summing terminal statuses also sees a test that
+                          ;; ran and ended carrying no status at all. The vector holds
+                          ;; the individual checks too, so it has to be filtered: its
+                          ;; raw length is not a test count.
+                          (incf executed
+                                (count-if (lambda (r) (typep r test-result-class))
+                                          (uiop:symbol-call :zebra :results result)))
                           (when (uiop:symbol-call :zebra :results-with-status
                                                   :failed result)
                             (setf any-failed t))))
+                      ;; A package holding no tests answers exactly as a package whose
+                      ;; tests all passed, so a failures-only check reads an empty run
+                      ;; as a green one. Nothing above tells those apart; this does.
+                      (when (zerop executed)
+                        (error "dsmr-mcp/tests: no test bodies ran. All ~D test ~
+                                package~:P resolved and were visited, and not one of ~
+                                them produced a single test result, so the absence of ~
+                                failures proves nothing. The packages were found, which ~
+                                makes this a runner fault rather than the wiring fault ~
+                                reported when no package is selected at all: check that ~
+                                the tests inside them are still registered."
+                               (length test-package-names)))
                       (when any-failed
                         (error "dsmr-mcp/tests: one or more zebra tests failed.")))))
 
