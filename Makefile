@@ -18,7 +18,7 @@ export XDG_CACHE_HOME ?= $(CURDIR)/.ci-cache
 CORE ?= dsmr.core
 
 .PHONY: bridge bus-watch install-bus-watch test test-integration core core-verify test-warm \
-        install-skills check-skills install-harness check-harness
+        install-skills check-skills install-harness check-harness install-sisters check-sisters
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -84,6 +84,35 @@ install-bus-watch: bus-watch
 	@mv -f "$(BINDIR)/.dsmr-bus-watch.tmp" "$(BINDIR)/dsmr-bus-watch"
 	@echo "installed $(BINDIR)/dsmr-bus-watch"
 	@echo "running watchers keep the previous image until each is re-armed"
+
+## install-sisters: publish the fleet bring-up wrapper onto PATH.
+##
+##   The operator starts a fleet by name from his own shell, so the copy under
+##   $(BINDIR) is the one that actually runs; this tree is where it is
+##   maintained. Keeping it here rather than loose in $$HOME means a fleet's
+##   invocation is reviewed and versioned like anything else, and a wrong
+##   --extra is caught in a diff instead of by a sister's silence.
+##   Install atomically for the same reason as the watcher: a half-written
+##   wrapper brings up a partial fleet that looks like a whole one.
+install-sisters:
+	@mkdir -p "$(BINDIR)"
+	@cp scripts/sisters.sh "$(BINDIR)/.sisters.sh.tmp"
+	@chmod 755 "$(BINDIR)/.sisters.sh.tmp"
+	@mv -f "$(BINDIR)/.sisters.sh.tmp" "$(BINDIR)/sisters.sh"
+	@echo "installed $(BINDIR)/sisters.sh"
+	@command -v sisters.sh >/dev/null 2>&1 \
+	  || echo "NOTE: $(BINDIR) is not on this shell's PATH, so 'sisters.sh' will not resolve by name"
+
+## check-sisters: report whether the deployed wrapper matches this tree.
+##
+##   Never edits. The deployed copy is what a bring-up runs, so a tree edited
+##   without a deploy is a fix nobody is getting; a deployed copy edited in
+##   place is a fix this tree will overwrite.
+check-sisters:
+	@if [ ! -f "$(BINDIR)/sisters.sh" ]; then echo "NOT DEPLOYED: $(BINDIR)/sisters.sh"; \
+	elif cmp -s scripts/sisters.sh "$(BINDIR)/sisters.sh"; then echo "match: $(BINDIR)/sisters.sh"; \
+	else echo "DIFFERS: $(BINDIR)/sisters.sh"; diff -u "$(BINDIR)/sisters.sh" scripts/sisters.sh | head -40; \
+	     echo "run 'make install-sisters' to deploy this tree, or port the other way first"; fi
 
 ## check-skills: report where the deployed skills differ from this tree.
 ##
