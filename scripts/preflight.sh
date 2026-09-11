@@ -8,8 +8,9 @@
 # live HEAD, every watcher answered `live` on the right bus. Thirteen agents
 # came up and not one of them could publish a message, edit a line of Lisp or
 # run a test, because the MCP server was not registered on the host and the
-# prebuilt core had been built on a different machine. It took four agents
-# measuring independently to see it, and the first diagnosis was wrong.
+# prebuilt core had been built on a different machine. It took independent
+# measurements from several directions to see it at all, and the first diagnosis
+# was wrong.
 #
 # The lesson is not that provisioning was missing. It is that a first run on an
 # unprovisioned host SUCCEEDS INTO a fleet that cannot act, and nothing in the
