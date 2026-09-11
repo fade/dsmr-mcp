@@ -68,7 +68,27 @@ attribution_glyph() {
       return 0
     fi
   done
-  # No licence file. Before treating the tree as ours, ask whether we adopted it:
+  # No licence file, but a system definition may declare one. That is a positive
+  # statement by the project about itself, so it outranks the inference below it.
+  # Without this tier a project with an AGPL .asd and no LICENSE lands on the
+  # default and is right by accident, which reads identical to being right on
+  # purpose until the day the default changes or the project is adopted.
+  # find rather than a glob: an unmatched *.asd is an ERROR under zsh, not an
+  # empty list, and it aborts this function mid-way so it returns no mark at all.
+  # A caller then compares against an empty string and every message looks
+  # correct. Measured on a repository that carries no system definition.
+  local decl
+  decl=$(find "$root" -maxdepth 1 -name '*.asd' -exec grep -ihm1 ':license' {} + 2>/dev/null | head -1)
+  if [ -n "$decl" ]; then
+    if printf '%s' "$decl" | grep -qiE 'agpl|affero'; then
+      printf 'copyleft'
+    else
+      printf 'copyright'
+    fi
+    return 0
+  fi
+
+  # Still nothing said outright. Before treating the tree as ours, ask whether we adopted it:
   # the fork-upstream then clone-our-fork procedure leaves a second remote behind,
   # and a project that arrived that way keeps the licence it came with whether or
   # not this checkout carries the file. Getting this wrong is not cosmetic; it
