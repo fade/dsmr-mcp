@@ -26,6 +26,13 @@ set -euo pipefail
 # override it when running against a clone somewhere else.
 LAUNCHER=${DSMR_START_SISTERS:-~/SourceCode/lisp/dsmr-mcp/scripts/start-sisters.sh}
 
+# The host check runs before anything starts. A fleet brought up on a host that
+# was never provisioned does not fail: it comes up healthy-looking and unable to
+# act, and it took four agents measuring separately to notice. Set
+# DSMR_SKIP_PREFLIGHT=1 to launch anyway; the hatch is here because a check that
+# can block the only entry point must be one you can get past.
+PREFLIGHT=${DSMR_PREFLIGHT:-~/SourceCode/lisp/dsmr-mcp/scripts/preflight.sh}
+
 usage() {
     cat >&2 <<'USAGE_EOF'
 sisters.sh: name the fleet to start, by its leader.
@@ -62,6 +69,12 @@ case $leader in
         # disk exactly or the launcher dies naming it.
         FLEET_DIR=~/SourceCode/lisp/DeepSkyV2
         args=(--extra zebra,Whistler,sbcl --exclude meta-bridge --stagger 3-10)
+        # Named for the host check, which needs to know whose .envrc consent to
+        # verify. The scanned members are added below; these are the ones that
+        # live outside FLEET_DIR and so cannot be found by looking.
+        MEMBERS=(zebra Whistler sbcl)
+        SCAN_MEMBERS=1
+        EXCLUDE_MEMBER=meta-bridge
         ;;
     dsmr-mcp)
         # The --no-scan here is required and is not a tuning choice. This
@@ -71,6 +84,13 @@ case $leader in
         # labels every one a worker. Membership is declared below, never found.
         FLEET_DIR=~/SourceCode/lisp
         args=(--no-scan --extra dsmr-mcp,mallet,boomer,xxx-pure-tls --stagger 3-10)
+        # Membership is declared, never found, for the same reason --no-scan is
+        # set: this directory holds a dozen non-members that carry .git and
+        # .planning too. Consenting to their .envrc files would be exactly the
+        # blanket trust the host check is written to avoid.
+        MEMBERS=(dsmr-mcp mallet boomer xxx-pure-tls)
+        SCAN_MEMBERS=0
+        EXCLUDE_MEMBER=
         ;;
     '')
         usage
@@ -95,6 +115,33 @@ args+=(--leader "$leader")
 if (($# > 1)); then
     args+=(--dry-run)
     printf 'sisters.sh: DRY RUN of fleet %s, nothing will be started\n\n' "$leader"
+fi
+
+# A scanning fleet's members are whatever sits in its curated directory, so the
+# host check is handed the same set the launcher will start rather than a second
+# list that can drift from it.
+if ((SCAN_MEMBERS)); then
+    for d in "$FLEET_DIR"/*/; do
+        n=$(basename "$d")
+        [[ -d $d/.git && $n != "$EXCLUDE_MEMBER" ]] && MEMBERS+=("$n")
+    done
+fi
+
+if [[ -x $PREFLIGHT && ${DSMR_SKIP_PREFLIGHT:-0} != 1 ]]; then
+    preflight_args=(--fleet-dir "$FLEET_DIR")
+    for n in "${MEMBERS[@]}"; do preflight_args+=(--repo "$n"); done
+    # A dry run inspects and never changes anything, host included.
+    (($# > 1)) && preflight_args+=(--check-only)
+    if ! "$PREFLIGHT" "${preflight_args[@]}"; then
+        printf '\nsisters.sh: host check failed, so fleet %s was NOT started.\n' "$leader" >&2
+        printf 'Clear the items above, or set DSMR_SKIP_PREFLIGHT=1 to launch anyway.\n' >&2
+        exit 1
+    fi
+    printf '\n'
+elif [[ ${DSMR_SKIP_PREFLIGHT:-0} == 1 ]]; then
+    printf 'sisters.sh: host check SKIPPED by DSMR_SKIP_PREFLIGHT=1\n\n' >&2
+else
+    printf 'sisters.sh: no host check at %s; starting unchecked\n\n' "$PREFLIGHT" >&2
 fi
 
 cd -- "$FLEET_DIR"

@@ -18,10 +18,16 @@ export XDG_CACHE_HOME ?= $(CURDIR)/.ci-cache
 CORE ?= dsmr.core
 
 .PHONY: bridge bus-watch install-bus-watch test test-integration core core-verify test-warm \
-        install-skills check-skills install-harness check-harness install-sisters check-sisters
+        install-skills check-skills install-harness check-harness install-sisters check-sisters \
+        preflight check-preflight self-test-preflight
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
+
+# Where this site's Lisp checkouts live, and therefore where a fleet's member
+# repositories are resolved from. The environment wins so a clone elsewhere
+# needs no edit here.
+WORKSPACE ?= $(or $(LISP_WORKSPACE),$(HOME)/SourceCode/lisp)
 
 # Where the harness skills are deployed for the agent that reads them. Claude is
 # the first target and deliberately not the only one; a second agent gets its own
@@ -84,6 +90,38 @@ install-bus-watch: bus-watch
 	@mv -f "$(BINDIR)/.dsmr-bus-watch.tmp" "$(BINDIR)/dsmr-bus-watch"
 	@echo "installed $(BINDIR)/dsmr-bus-watch"
 	@echo "running watchers keep the previous image until each is re-armed"
+
+## preflight: check this host can run a fleet, establishing what is safe to.
+##
+##   Registers the MCP server if it is absent, consents to the named repos'
+##   .envrc files, and verifies the prebuilt core actually boots here. Anything
+##   needing root, and anything that takes minutes, is reported with a remedy
+##   instead of being run: a check that rebuilt the core on every launch would
+##   ship whatever branch happens to be checked out to the whole fleet.
+##
+##   `sisters.sh` runs this before it starts anything and refuses to launch on a
+##   non-zero answer. Run it by hand to provision a new host, or to find out why
+##   a launch was refused.
+##
+##   Name the repos to check with REPOS: make preflight REPOS="mallet boomer"
+preflight:
+	@./scripts/preflight.sh --fleet-dir "$(WORKSPACE)" \
+	   $(foreach r,$(REPOS),--repo $(r))
+
+## check-preflight: the same checks, changing nothing. Reports and exits.
+check-preflight:
+	@./scripts/preflight.sh --check-only --fleet-dir "$(WORKSPACE)" \
+	   $(foreach r,$(REPOS),--repo $(r))
+
+## self-test-preflight: prove every host check can report red.
+##
+##   A checker that cannot fail reports the same clean answer whether the host
+##   is healthy or the check itself is broken. This plants each failing
+##   condition and asserts the matching check notices it. It caught a real
+##   defect on its first run, so it earns its place rather than decorating the
+##   suite.
+self-test-preflight:
+	@./scripts/preflight.sh --self-test
 
 ## install-sisters: publish the fleet bring-up wrapper onto PATH.
 ##
