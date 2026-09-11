@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Reject a commit message that carries work-product-boundary tells.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$DIR/dsmr-workproduct-lint.sh"
+run_lint msg "$1"
+exit $?
