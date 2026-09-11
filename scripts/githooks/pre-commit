@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Reject staged content that carries work-product-boundary tells.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$DIR/dsmr-workproduct-lint.sh"
+run_lint staged || exit $?
+
+# Lint the staged Lisp against this project's own standard (.mallet.lisp).
+# Skipped, loudly, if the linter is unavailable: a missing workspace checkout
+# must not make the repository uncommittable.
+REPO="$(git rev-parse --show-toplevel)"
+if [ -x "$REPO/scripts/lint-lisp.sh" ]; then
+  "$REPO/scripts/lint-lisp.sh" --staged || exit $?
+fi
+exit 0

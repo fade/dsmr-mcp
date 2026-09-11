@@ -19,7 +19,7 @@ CORE ?= dsmr.core
 
 .PHONY: bridge bus-watch install-bus-watch test test-integration core core-verify test-warm \
         install-skills check-skills install-harness check-harness install-sisters check-sisters \
-        preflight check-preflight self-test-preflight
+        preflight check-preflight self-test-preflight install-hooks check-hooks
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -122,6 +122,53 @@ check-preflight:
 ##   suite.
 self-test-preflight:
 	@./scripts/preflight.sh --self-test
+
+## install-hooks: install this tree's git hooks into a repository.
+##
+##   Defaults to this repository; pass REPO=<path> to install elsewhere.
+##
+##   The hooks used to exist ONLY as copies under .git/hooks in fifteen
+##   repositories, tracked by nothing and installed by nothing. They gate every
+##   commit in both fleets, so an edit to one copy was invisible everywhere else
+##   and there was no origin to diff against. pre-commit had already drifted into
+##   three variants before anyone looked.
+##
+##   Install atomically: a half-written hook makes a repository uncommittable.
+install-hooks:
+	@set -e; \
+	target="$(if $(REPO),$(REPO),$(CURDIR))"; \
+	dest="$$target/.git/hooks"; \
+	test -d "$$dest" || { echo "not a git repository: $$target" >&2; exit 1; }; \
+	for f in dsmr-workproduct-lint.sh commit-msg pre-commit; do \
+	  cp "scripts/githooks/$$f" "$$dest/.$$f.tmp"; \
+	  chmod 755 "$$dest/.$$f.tmp"; \
+	  mv -f "$$dest/.$$f.tmp" "$$dest/$$f"; \
+	done; \
+	echo "installed hooks into $$dest"
+
+## check-hooks: report where a deployed hook differs from this tree.
+##
+##   Never edits. Checks the SHARED files across every repository in the
+##   workspace that carries them, because those are meant to be identical
+##   everywhere and a difference is drift. pre-commit is checked for this
+##   repository only: it legitimately varies, since not every project runs a
+##   Lisp linter.
+check-hooks:
+	@status=0; \
+	for f in dsmr-workproduct-lint.sh commit-msg; do \
+	  for d in $(WORKSPACE)/*/.git/hooks $(WORKSPACE)/*/*/.git/hooks; do \
+	    test -f "$$d/$$f" || continue; \
+	    repo=$$(cd "$$d/../.." && basename "$$PWD"); \
+	    if ! cmp -s "scripts/githooks/$$f" "$$d/$$f"; then \
+	      echo "  DIFFERS  $$repo  $$f"; status=1; \
+	    fi; \
+	  done; \
+	done; \
+	if cmp -s scripts/githooks/pre-commit .git/hooks/pre-commit; then :; \
+	else echo "  DIFFERS  dsmr-mcp  pre-commit"; status=1; fi; \
+	if [ $$status = 0 ]; then echo "hooks in sync across the workspace"; \
+	else echo "run 'make install-hooks REPO=<path>' to deploy this tree, or port the other way first"; fi; \
+	exit $$status
 
 ## install-sisters: publish the fleet bring-up wrapper onto PATH.
 ##
