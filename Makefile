@@ -133,13 +133,20 @@ self-test-preflight:
 ##   and there was no origin to diff against. pre-commit had already drifted into
 ##   three variants before anyone looked.
 ##
+##   HOOKS names which files to install; it defaults to all of them. Pass the
+##   two shared ones when installing into a repository that is not mine:
+##   pre-commit legitimately varies per project (not everything runs a Lisp
+##   linter), and replacing a deliberate local variant is not the same act as
+##   delivering a shared fix.
+##
 ##   Install atomically: a half-written hook makes a repository uncommittable.
+HOOKS ?= dsmr-workproduct-lint.sh commit-msg pre-commit
 install-hooks:
 	@set -e; \
 	target="$(if $(REPO),$(REPO),$(CURDIR))"; \
 	dest="$$target/.git/hooks"; \
 	test -d "$$dest" || { echo "not a git repository: $$target" >&2; exit 1; }; \
-	for f in dsmr-workproduct-lint.sh commit-msg pre-commit; do \
+	for f in $(HOOKS); do \
 	  cp "scripts/githooks/$$f" "$$dest/.$$f.tmp"; \
 	  chmod 755 "$$dest/.$$f.tmp"; \
 	  mv -f "$$dest/.$$f.tmp" "$$dest/$$f"; \
