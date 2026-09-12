@@ -18,10 +18,16 @@ export XDG_CACHE_HOME ?= $(CURDIR)/.ci-cache
 CORE ?= dsmr.core
 
 .PHONY: bridge bus-watch install-bus-watch test test-integration core core-verify test-warm \
-        install-skills check-skills install-harness check-harness
+        install-skills check-skills install-harness check-harness install-sisters check-sisters \
+        preflight check-preflight self-test-preflight install-hooks check-hooks
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
+
+# Where this site's Lisp checkouts live, and therefore where a fleet's member
+# repositories are resolved from. The environment wins so a clone elsewhere
+# needs no edit here.
+WORKSPACE ?= $(or $(LISP_WORKSPACE),$(HOME)/SourceCode/lisp)
 
 # Where the harness skills are deployed for the agent that reads them. Claude is
 # the first target and deliberately not the only one; a second agent gets its own
@@ -84,6 +90,121 @@ install-bus-watch: bus-watch
 	@mv -f "$(BINDIR)/.dsmr-bus-watch.tmp" "$(BINDIR)/dsmr-bus-watch"
 	@echo "installed $(BINDIR)/dsmr-bus-watch"
 	@echo "running watchers keep the previous image until each is re-armed"
+
+## preflight: check this host can run a fleet, establishing what is safe to.
+##
+##   Registers the MCP server if it is absent, consents to the named repos'
+##   .envrc files, and verifies the prebuilt core actually boots here. Anything
+##   needing root, and anything that takes minutes, is reported with a remedy
+##   instead of being run: a check that rebuilt the core on every launch would
+##   ship whatever branch happens to be checked out to the whole fleet.
+##
+##   `sisters.sh` runs this before it starts anything and refuses to launch on a
+##   non-zero answer. Run it by hand to provision a new host, or to find out why
+##   a launch was refused.
+##
+##   Name the repos to check with REPOS: make preflight REPOS="mallet boomer"
+preflight:
+	@./scripts/preflight.sh --fleet-dir "$(WORKSPACE)" \
+	   $(foreach r,$(REPOS),--repo $(r))
+
+## check-preflight: the same checks, changing nothing. Reports and exits.
+check-preflight:
+	@./scripts/preflight.sh --check-only --fleet-dir "$(WORKSPACE)" \
+	   $(foreach r,$(REPOS),--repo $(r))
+
+## self-test-preflight: prove every host check can report red.
+##
+##   A checker that cannot fail reports the same clean answer whether the host
+##   is healthy or the check itself is broken. This plants each failing
+##   condition and asserts the matching check notices it. It caught a real
+##   defect on its first run, so it earns its place rather than decorating the
+##   suite.
+self-test-preflight:
+	@./scripts/preflight.sh --self-test
+
+## install-hooks: install this tree's git hooks into a repository.
+##
+##   Defaults to this repository; pass REPO=<path> to install elsewhere.
+##
+##   The hooks used to exist ONLY as copies under .git/hooks in fifteen
+##   repositories, tracked by nothing and installed by nothing. They gate every
+##   commit in both fleets, so an edit to one copy was invisible everywhere else
+##   and there was no origin to diff against. pre-commit had already drifted into
+##   three variants before anyone looked.
+##
+##   HOOKS names which files to install; it defaults to all of them. Pass the
+##   two shared ones when installing into a repository that is not mine:
+##   pre-commit legitimately varies per project (not everything runs a Lisp
+##   linter), and replacing a deliberate local variant is not the same act as
+##   delivering a shared fix.
+##
+##   Install atomically: a half-written hook makes a repository uncommittable.
+HOOKS ?= dsmr-workproduct-lint.sh commit-msg pre-commit
+install-hooks:
+	@set -e; \
+	target="$(if $(REPO),$(REPO),$(CURDIR))"; \
+	dest="$$target/.git/hooks"; \
+	test -d "$$dest" || { echo "not a git repository: $$target" >&2; exit 1; }; \
+	for f in $(HOOKS); do \
+	  cp "scripts/githooks/$$f" "$$dest/.$$f.tmp"; \
+	  chmod 755 "$$dest/.$$f.tmp"; \
+	  mv -f "$$dest/.$$f.tmp" "$$dest/$$f"; \
+	done; \
+	echo "installed hooks into $$dest"
+
+## check-hooks: report where a deployed hook differs from this tree.
+##
+##   Never edits. Checks the SHARED files across every repository in the
+##   workspace that carries them, because those are meant to be identical
+##   everywhere and a difference is drift. pre-commit is checked for this
+##   repository only: it legitimately varies, since not every project runs a
+##   Lisp linter.
+check-hooks:
+	@status=0; \
+	for f in dsmr-workproduct-lint.sh commit-msg; do \
+	  for d in $(WORKSPACE)/*/.git/hooks $(WORKSPACE)/*/*/.git/hooks; do \
+	    test -f "$$d/$$f" || continue; \
+	    repo=$$(cd "$$d/../.." && basename "$$PWD"); \
+	    if ! cmp -s "scripts/githooks/$$f" "$$d/$$f"; then \
+	      echo "  DIFFERS  $$repo  $$f"; status=1; \
+	    fi; \
+	  done; \
+	done; \
+	if cmp -s scripts/githooks/pre-commit .git/hooks/pre-commit; then :; \
+	else echo "  DIFFERS  dsmr-mcp  pre-commit"; status=1; fi; \
+	if [ $$status = 0 ]; then echo "hooks in sync across the workspace"; \
+	else echo "run 'make install-hooks REPO=<path>' to deploy this tree, or port the other way first"; fi; \
+	exit $$status
+
+## install-sisters: publish the fleet bring-up wrapper onto PATH.
+##
+##   The operator starts a fleet by name from his own shell, so the copy under
+##   $(BINDIR) is the one that actually runs; this tree is where it is
+##   maintained. Keeping it here rather than loose in $$HOME means a fleet's
+##   invocation is reviewed and versioned like anything else, and a wrong
+##   --extra is caught in a diff instead of by a sister's silence.
+##   Install atomically for the same reason as the watcher: a half-written
+##   wrapper brings up a partial fleet that looks like a whole one.
+install-sisters:
+	@mkdir -p "$(BINDIR)"
+	@cp scripts/sisters.sh "$(BINDIR)/.sisters.sh.tmp"
+	@chmod 755 "$(BINDIR)/.sisters.sh.tmp"
+	@mv -f "$(BINDIR)/.sisters.sh.tmp" "$(BINDIR)/sisters.sh"
+	@echo "installed $(BINDIR)/sisters.sh"
+	@command -v sisters.sh >/dev/null 2>&1 \
+	  || echo "NOTE: $(BINDIR) is not on this shell's PATH, so 'sisters.sh' will not resolve by name"
+
+## check-sisters: report whether the deployed wrapper matches this tree.
+##
+##   Never edits. The deployed copy is what a bring-up runs, so a tree edited
+##   without a deploy is a fix nobody is getting; a deployed copy edited in
+##   place is a fix this tree will overwrite.
+check-sisters:
+	@if [ ! -f "$(BINDIR)/sisters.sh" ]; then echo "NOT DEPLOYED: $(BINDIR)/sisters.sh"; \
+	elif cmp -s scripts/sisters.sh "$(BINDIR)/sisters.sh"; then echo "match: $(BINDIR)/sisters.sh"; \
+	else echo "DIFFERS: $(BINDIR)/sisters.sh"; diff -u "$(BINDIR)/sisters.sh" scripts/sisters.sh | head -40; \
+	     echo "run 'make install-sisters' to deploy this tree, or port the other way first"; fi
 
 ## check-skills: report where the deployed skills differ from this tree.
 ##
