@@ -40,7 +40,8 @@
                     (#:cursor #:dsmr-mcp/src/bus/cursor)
                     (#:wal #:dsmr-mcp/src/bus/wal)
                     (#:archive #:dsmr-mcp/src/bus/archive)
-                    (#:roster #:dsmr-mcp/src/bus/roster)))
+                    (#:roster #:dsmr-mcp/src/bus/roster)
+                    (#:heartbeat #:dsmr-mcp/src/bus/heartbeat)))
 
 (in-package #:dsmr-mcp/tests/bus/status-test)
 
@@ -122,6 +123,10 @@
 
 (defun row-named (rows name)
   (find name rows :key (lambda (row) (getf row :name)) :test #'string=))
+
+(defun beat-row (beats id)
+  "The beat row reported for ID, or NIL when the aggregator did not report one."
+  (find id beats :key (lambda (row) (getf row :id)) :test #'string=))
 
 (defun mentions (needle text)
   "True when TEXT states NEEDLE. Used to assert that a bound is present, never to
@@ -417,3 +422,59 @@
         (is equal "durable-record" (getf unenrolled :basis))
         (true (mentions "does not establish" (getf beats :does-not-establish))
               "and a watch beat carries its own limit rather than reading as liveness")))))
+
+(define-test a-stable-cursor-holder-with-no-roster-entry-still-reports-its-watch-beat
+  "The arm-and-go convention: a fleet may join a bus and arm its watches without
+   anybody writing a roster. Asking the roster who exists then reports no beats
+   at all, which reads exactly like every participant being dead, and that is the
+   answer an operator acts on. So the beats are taken over what the BUS knows,
+   which is the roster and the stable cursor holders together.
+
+   Both directions in one fixture. The stable holder's live beat has to appear
+   with an empty roster, and the ephemeral session's beat has to stay out: there
+   is one of those per subagent session, and listing them buries the fleet's own
+   names, which is the reason the roster was being asked in the first place."
+  (with-scratch-bus (paths)
+    (let ((log (broker:bus-paths-wal paths))
+          (watch-dir (merge-pathnames "watch/" (broker:bus-paths-root paths))))
+      (publish-records log 5)
+      (setf (cursor:cursor-value (subscriber-for paths "probe/arm-and-go")) 3)
+      (setf (cursor:cursor-value (subscriber-for paths "probe/g900-1")) 3)
+      (heartbeat:write-beat (heartbeat:beat-path "probe/arm-and-go" watch-dir)
+                            :mode :event :baseline 0 :poll-ms 250)
+      (heartbeat:write-beat (heartbeat:beat-path "probe/g900-1" watch-dir)
+                            :mode :event :baseline 0 :poll-ms 250)
+      (let* ((visibility (status:identity-visibility paths :watch-dir watch-dir))
+             (beats (getf (getf visibility :watch-beat) :value))
+             (armed (beat-row beats "probe/arm-and-go")))
+        (is = 0 (length (getf (getf visibility :members) :value))
+            "nobody is enrolled, which is the state this has to answer under")
+        (true armed
+              "a stable cursor holder's beat is reported with no roster entry")
+        (is eq :live (getf armed :status))
+        (is = (sb-posix:getpid) (getf armed :pid)
+            "and it carries the pid the beat file names")
+        (false (beat-row beats "probe/g900-1")
+               "an ephemeral session's beat stays out, so the fleet's own names are not buried")))))
+
+(define-test an-enrolled-identity-reports-its-beat-and-a-missing-one-reads-dead
+  "The control. Enrolment is still what puts an identity in this list, present
+   beat or not, and a live beat still reads apart from an absent one. An answer
+   that had swapped the roster for the cursor directory would lose the enrolled
+   identity that has never taken a position, and that identity is the one whose
+   silence is worth seeing."
+  (with-scratch-bus (paths)
+    (let ((roster-dir (broker:bus-paths-roster-dir paths))
+          (state (broker:bus-paths-roster-state paths))
+          (watch-dir (merge-pathnames "watch/" (broker:bus-paths-root paths))))
+      (roster:enroll "probe/beating" roster-dir state)
+      (roster:enroll "probe/silent" roster-dir state)
+      (heartbeat:write-beat (heartbeat:beat-path "probe/beating" watch-dir)
+                            :mode :event :baseline 0 :poll-ms 250)
+      (let* ((visibility (status:identity-visibility paths :watch-dir watch-dir))
+             (beats (getf (getf visibility :watch-beat) :value)))
+        (is = 2 (length beats))
+        (is eq :live (getf (beat-row beats "probe/beating") :status))
+        (is eq :dead (getf (beat-row beats "probe/silent") :status)
+            "an enrolled identity with no beat file is still listed, reading dead")
+        (is eq nil (getf (beat-row beats "probe/silent") :pid))))))

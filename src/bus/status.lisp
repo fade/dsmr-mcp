@@ -34,6 +34,7 @@
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:roster #:dsmr-mcp/src/bus/roster)
                     (#:cursor #:dsmr-mcp/src/bus/cursor)
+                    (#:envelope #:dsmr-mcp/src/bus/envelope)
                     (#:wal #:dsmr-mcp/src/bus/wal)
                     (#:heartbeat #:dsmr-mcp/src/bus/heartbeat)
                     (#:election #:dsmr-mcp/src/bus/election))
@@ -583,6 +584,36 @@
             "a row does not establish that the identity it is named for is running, or that the position was written by that identity. A cursor file is a durable position and nothing else, and the two live buses this was read on hold hundreds of them whose sessions ended long ago."
             :basis "durable-record"))))
 
+(defun %watched-identities (entries files)
+  "The identities whose watch beat is worth reading, from roster ENTRIES and
+   cursor FILES together, deduplicated and sorted.
+
+   Two records because neither alone covers the bus. The roster names an agent
+   listed ahead of its first connect and one that has since left, so it is the
+   only record of an identity that never took a position. A cursor file appears
+   the moment a participant subscribes, so it is the only record on a bus whose
+   fleet armed and went to work without anybody writing a roster, which is an
+   ordinary convention and not a misconfiguration. Asking the roster alone there
+   returns nothing, and nothing is byte-identical to every participant being
+   dead: the one answer an operator acts on.
+
+   Ephemeral cursor names are left out. There is one per subagent session and
+   they outnumber a fleet's own names by a wide margin, so including them buries
+   the identities the question was about.
+
+   Sorted so the list does not churn between two reads of an unchanged bus, which
+   is what lets a difference between them mean something."
+  (let ((ids '()))
+    (dolist (entry entries)
+      (let ((id (roster:entry-id entry)))
+        (when (stringp id) (push id ids))))
+    (dolist (file files)
+      (let ((name (file-namestring file)))
+        (unless (broker:ephemeral-cursor-name-p name)
+          (let ((id (envelope:decode-id name)))
+            (when (stringp id) (push id ids))))))
+    (sort (remove-duplicates ids :test #'string=) #'string<)))
+
 (defun identity-visibility (paths &key
                                     (watch-dir (merge-pathnames
                                                 "watch/" (broker:bus-paths-root paths)))
@@ -652,15 +683,13 @@
                                             "ephemeral"
                                             "stable-without-enrollment"))))
           (beats
-            (loop for entry in entries
-                  for id = (roster:entry-id entry)
-                  when (stringp id)
-                    collect (multiple-value-bind (status age pid)
-                                (heartbeat:beat-liveness
-                                 (heartbeat:beat-path id watch-dir)
-                                 heartbeat:+default-live-window-seconds+)
-                              (list :id id :status status
-                                    :age-seconds age :pid pid)))))
+            (loop for id in (%watched-identities entries files)
+                  collect (multiple-value-bind (status age pid)
+                              (heartbeat:beat-liveness
+                               (heartbeat:beat-path id watch-dir)
+                               heartbeat:+default-live-window-seconds+)
+                            (list :id id :status status
+                                  :age-seconds age :pid pid)))))
       (list
        :members
        (%fact members
@@ -681,7 +710,7 @@
        :watch-beat
        (%fact beats
               :establishes
-              "for each enrolled identity, whether a watch heartbeat file exists for it under this bus's watch directory and how old it is"
+              "for every identity this bus holds a record of, which is its roster's entries together with the stable cursor holders, whether a watch heartbeat file exists for it under this bus's watch directory and how old it is. Both records are read because neither alone covers the bus: a fleet may arm its watches and go to work without anybody writing a roster, which is an ordinary convention, and asking the roster alone there returns nothing while an empty answer is byte-identical to every participant being dead. Cursors carrying an auto-generated ephemeral name are left out, so this list is shorter than the cursor inventory by that many: there is one per subagent session, and they would bury the names the question was about"
               :does-not-establish
               "it does not establish that the watcher is armed on THIS bus. The beat says a watcher wrote recently and nothing about which bus it is listening to, and it cannot detect a missing recycle interval at all, so a watch that has gone silently deaf can go on beating. A live beat is therefore weaker evidence than it reads as, and a dead one is the stronger of the two answers."
               :basis "durable-record")))))
