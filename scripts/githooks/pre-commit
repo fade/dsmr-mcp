@@ -14,13 +14,22 @@ run_lint staged || exit $?
 # So it is off unless a repository opts in:
 #   git config --bool dsmr.codelint.enabled true
 #
-# A repository that opts in but has no linter checked out is left committable:
-# a missing workspace checkout must not make the tree uncommittable. That skip
-# is silent, because a warning on every commit in every such repository teaches
-# the reader to ignore the one that matters.
+# Two ways the linter can be unavailable, and they deserve different answers.
+# A repository that never opted in is silent: a message on every commit in every
+# such repository teaches the reader to ignore the one that matters. A
+# repository that DID opt in and then finds no linter behind the wrapper (exit
+# 127) is expecting its source to be checked, so it is told, on stderr, and the
+# commit still goes through. A missing workspace checkout must not make a tree
+# uncommittable.
 REPO="$(git rev-parse --show-toplevel)"
 if [ "$(git config --bool --get dsmr.codelint.enabled 2>/dev/null)" = "true" ] \
    && [ -x "$REPO/scripts/lint-lisp.sh" ]; then
-  "$REPO/scripts/lint-lisp.sh" --staged || exit $?
+  "$REPO/scripts/lint-lisp.sh" --staged
+  lint_status=$?
+  if [ "$lint_status" -eq 127 ]; then
+    echo "pre-commit: the Lisp linter is not installed; code lint skipped." >&2
+  elif [ "$lint_status" -ne 0 ]; then
+    exit "$lint_status"
+  fi
 fi
 exit 0
