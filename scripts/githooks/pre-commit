@@ -4,11 +4,23 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$DIR/dsmr-workproduct-lint.sh"
 run_lint staged || exit $?
 
-# Lint the staged Lisp against this project's own standard (.mallet.lisp).
-# Skipped, loudly, if the linter is unavailable: a missing workspace checkout
-# must not make the repository uncommittable.
+# Code linting is a different decision from the work-product gate above, and
+# the two are deliberately not wired together. The gate above keeps our marks,
+# our AI tells and our coordination vocabulary out of a repository, including
+# repositories we did not start, so it runs everywhere. This step imposes our
+# source style instead, which on a codebase we adopted rather than started is a
+# judgment for the person who owns the relationship with that codebase.
+#
+# So it is off unless a repository opts in:
+#   git config --bool dsmr.codelint.enabled true
+#
+# A repository that opts in but has no linter checked out is left committable:
+# a missing workspace checkout must not make the tree uncommittable. That skip
+# is silent, because a warning on every commit in every such repository teaches
+# the reader to ignore the one that matters.
 REPO="$(git rev-parse --show-toplevel)"
-if [ -x "$REPO/scripts/lint-lisp.sh" ]; then
+if [ "$(git config --bool --get dsmr.codelint.enabled 2>/dev/null)" = "true" ] \
+   && [ -x "$REPO/scripts/lint-lisp.sh" ]; then
   "$REPO/scripts/lint-lisp.sh" --staged || exit $?
 fi
 exit 0
