@@ -58,7 +58,7 @@ leader=${1-}
 case $leader in
     valis)
         # DeepSkyV2 is a curated directory: everything in it is a member, so
-        # scanning it is safe. boomer, zebra and xxx-pure-tls live outside it.
+        # scanning it is safe. boomer and xxx-pure-tls live outside it.
         #
         # Whistler joined 2026-09-05 and is spelled with a CAPITAL W. That is
         # the whole reason it took this long to arrive: it is named in
@@ -68,11 +68,11 @@ case $leader in
         # against $LISP_WORKSPACE, so the case here must match the directory on
         # disk exactly or the launcher dies naming it.
         FLEET_DIR=~/SourceCode/lisp/DeepSkyV2
-        args=(--extra zebra,Whistler --exclude meta-bridge --stagger 3-10)
+        args=(--extra Whistler --exclude meta-bridge --stagger 3-10)
         # Named for the host check, which needs to know whose .envrc consent to
         # verify. The scanned members are added below; these are the ones that
         # live outside FLEET_DIR and so cannot be found by looking.
-        MEMBERS=(zebra Whistler)
+        MEMBERS=(Whistler)
         SCAN_MEMBERS=1
         EXCLUDE_MEMBER=meta-bridge
         ;;
@@ -83,12 +83,12 @@ case $leader in
         # .planning too, so a scan of this directory proposes all of them and
         # labels every one a worker. Membership is declared below, never found.
         FLEET_DIR=~/SourceCode/lisp
-        args=(--no-scan --extra dsmr-mcp,mallet,boomer,xxx-pure-tls,sbcl --stagger 3-10)
+        args=(--no-scan --extra dsmr-mcp,mallet,boomer,xxx-pure-tls,sbcl,zebra --stagger 3-10)
         # Membership is declared, never found, for the same reason --no-scan is
         # set: this directory holds a dozen non-members that carry .git and
         # .planning too. Consenting to their .envrc files would be exactly the
         # blanket trust the host check is written to avoid.
-        MEMBERS=(dsmr-mcp mallet boomer xxx-pure-tls sbcl)
+        MEMBERS=(dsmr-mcp mallet boomer xxx-pure-tls sbcl zebra)
         SCAN_MEMBERS=0
         EXCLUDE_MEMBER=
         ;;
