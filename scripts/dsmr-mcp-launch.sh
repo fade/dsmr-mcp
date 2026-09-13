@@ -79,10 +79,19 @@ RESTART_EXIT_CODE="${DSMR_RESTART_EXIT_CODE:-75}"
 # the exit status and decide whether to relaunch. Freshness is re-checked on
 # every call, so a core rebuilt while the previous instance ran is picked up on
 # the next relaunch.
+#
+# setsid puts the server in its own session with no controlling terminal. SBCL
+# opens /dev/tty when one exists, on a descriptor of its own that no stream
+# rebinding reaches, so a library writing to the terminal rather than to a
+# stream lands in the operator's session and overwrites whatever is there.
+# Redirecting stdout and stderr does not close that route; removing the
+# terminal does. `-w` waits for the server and returns its exit status, which
+# the relaunch loop below reads.
+SETSID="$(command -v setsid || true)"
 run_server() {
   if core_is_fresh; then
     log "core fresh; booting from image"
-    "$SBCL" --core "$CORE" --noinform --disable-debugger --no-userinit \
+    ${SETSID:+"$SETSID" -w} "$SBCL" --core "$CORE" --noinform --disable-debugger --no-userinit \
          --eval '(dsmr-mcp:run :transport :stdio)'
   else
     log "core stale/absent; source-loading now, regenerating in background"
@@ -90,7 +99,7 @@ run_server() {
     # Fallback: compile from source with stdout kept clean (matches the
     # installer's hardened launcher — *debug-io*/*trace-output* carry the
     # SLYNK loader banner).
-    "$SBCL" --noinform --disable-debugger --no-userinit \
+    ${SETSID:+"$SETSID" -w} "$SBCL" --noinform --disable-debugger --no-userinit \
          --eval '(require :asdf)' \
          --eval '(let ((s (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file s) (let ((*standard-output* *error-output*)) (load s))))' \
          --eval '(push (or (let ((w (uiop:getenv "LISP_WORKSPACE"))) (when (and w (not (uiop:string-prefix-p "~" w))) w)) (namestring (merge-pathnames #P"SourceCode/lisp/" (user-homedir-pathname)))) asdf:*central-registry*)' \
