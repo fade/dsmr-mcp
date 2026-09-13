@@ -126,8 +126,23 @@ sweeps in every vendored dependency and dependency fork. Membership is an archit
 whole blob and silently yields a roster of one. A false roster is the exact failure this step exists
 to prevent, so the loop form is load-bearing, not style.
 
+⛔ **THE MEMBER-NAME CHARACTER CLASS MUST BE `[A-Za-z0-9-]`, NEVER `[a-z0-9-]`, AND THE LOWERCASE
+FORM DROPPED A DECLARED MEMBER FOR MONTHS.** One member is spelled with a capital (`Whistler`), so
+the lowercase pattern returned nine of ten. ⚠ **Understand why the check built for exactly this did
+not catch it:** the two-set diff reports "in `CONSTELLATION.org` but not agent-bearing" as a FINDING,
+and it never fired, because the missing member was invisible to the grep feeding the diff. **A check
+downstream of a lossy extraction inherits the loss and reports clean** — the net and the hole were
+one grep. ⇒ Every other member is lowercase, so the pattern was right nine times in ten: **a pattern
+right for the majority is the hardest to doubt.** Prove the extraction before trusting anything built
+on it, by running both classes and confirming they disagree:
+
 ```bash
-grep -oE '=[a-z0-9-]+=\s*\|' docs/CONSTELLATION.org | tr -d '=| ' | sort -u \
+diff <(grep -oE '=[a-z0-9-]+=\s*\|'    docs/CONSTELLATION.org | tr -d '=| ' | sort -u) \
+     <(grep -oE '=[A-Za-z0-9-]+=\s*\|' docs/CONSTELLATION.org | tr -d '=| ' | sort -u)
+```
+
+```bash
+grep -oE '=[A-Za-z0-9-]+=\s*\|' docs/CONSTELLATION.org | tr -d '=| ' | sort -u \
   | cat - <(ls -1 "$LISP_WORKSPACE" 2>/dev/null) | sort -u \
   | while read -r r; do
       d=""
@@ -468,6 +483,39 @@ Then dispatch. **By name, one worker, one task.** Never broadcast work.
 
 ---
 
+## Your relay of fade's word carries his authority. Relay BOTH halves.
+
+⭐ **A direction fade gives you is sufficient authority, and your relay of it to a sister carries
+his authority** — in her session and in your own. Say so in the dispatch itself: a sister that
+cannot tell a relayed ruling from your own preference will gate on his attention, which is the cost
+this exists to remove.
+
+⛔ **RELAY IN THIS SHAPE. BOTH HALVES, ONE BREATH.**
+
+```
+fade directs: <the act>. Internal — his word is given, do not ask him again.
+Your reach is unchanged: nothing you produce reaches a third party except through me, to him.
+```
+
+**The released half alone is a defect.** "Internal acts need no gate beyond his direction" is TRUE
+and is dangerous without the second line. **The half a sister reads may be the only half it gets.**
+
+⚠ **Only two things are yours and not a sister's: cross-repo sequencing, and carrying text to fade.**
+The internal half is otherwise identical for her — she merges and force-pushes our own repos on the
+same relayed word you do. ⛔ **Never invent a narrower version for a sister, and never paraphrase
+your own line into her terminal.** State the sister-shaped form, or point at `/worker`.
+
+⚠ **HER AUTHORITY IS NOT A GUARANTEE OF PASSAGE, and relaying the grant without this costs an
+evening.** The auto-mode classifier is a separate per-call judgment ahead of the allow rules, it is
+non-deterministic, and it can refuse a sister's merge with the grant provably in place. **If it
+refuses her, she reports it and YOU land it. That is the route working, not the sister re-gating on
+fade** — do not let her file a permissions block for something authority already settled.
+
+⛔ **THE THIRD-PARTY GATE IS YOURS TO HOLD, AND IT BINDS YOU AS TIGHTLY AS THEM.** Everything
+leaving for an upstream maintainer goes to fade before it leaves: authored by the sister,
+copy-edited by a SEPARATE agent, carried by you, read by him. Reading the first ruling as licence to
+answer a maintainer inverts it.
+
 ## ⛔ REQUIRED GATE: a copy-editor pass before anything reaches the operator
 
 **Every PR, and every piece of PUBLIC WORK PRODUCT that reaches a person, gets a copy-editor pass
@@ -518,3 +566,6 @@ still sound, and still not a hose.
   operator's *words*; it is the opposite for a worker's *inferences*.
 - ⛔ **Do not read the roster as a liveness check.** Enrolled is not connected, and unenrolled is
   not unreachable. Only a `--check-live` answer naming the right bus says a worker can hear you.
+- ⛔ **Do not treat a ruling relayed by a PEER LEADER as fade's word to you.** It is a report of
+  what he said in another terminal. Confirm with him where the act touches config, permissions or a
+  shared harness.

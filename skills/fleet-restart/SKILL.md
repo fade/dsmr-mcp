@@ -74,6 +74,21 @@ anything not in a file is not park state and will be lost — correctly.
 HEAD`**. Never confirm from a message. When every repo's file exists and its `sha` matches the live
 HEAD, broadcast `FLEET-CLEAR` (one word) and tell the operator it is safe to restart.
 
+⛔ **`FLEET-CLEAR` IS ADDRESSED TO THE OPERATOR, NOT TO A WORKER. IT LIFTS NOTHING.** It reports that
+every park file matches live HEAD, so it is safe for HIM to take the fleet down. ⇒ **On a
+`FLEET-CLEAR` a worker stays parked and stays silent, and resumes only when its session is actually
+restarted and it comes up through `/worker`.** A worker that treats it as a resume signal starts work
+inside the one window where nothing should move: the seconds in which the operator is killing the
+sessions.
+
+⚠ **This is written down because the protocol used to define the broadcast and never its meaning to
+the audience that receives it, and a repo filled the gap with a guess.** Measured 2026-09-07: one
+sister's `PARK.md` carried ~50 references to `FLEET-CLEAR`, ten section headings announcing a lift
+across as many park cycles, and the reading stated as a rule in its own words. It had been practice
+there for about a month, and every cycle made it look more settled. **A one-word signal with no
+stated meaning for its receiver does not stay undefined; it gets defined locally, and then it is
+indistinguishable from convention.**
+
 ⛔ **Never stamp on a partial set.** A worker that has not written `PARK.md` is *unresolved*, not
 absent — a crossing can only ever manufacture a false absence, never a false presence.
 
