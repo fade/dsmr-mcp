@@ -17,7 +17,12 @@
 (defpackage #:dsmr-mcp/src/bus/envelope
   (:use #:cl)
   (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal))
-  (:export #:encode-id
+  (:export #:malformed-agent-id
+           #:malformed-agent-id-id
+           #:malformed-agent-id-reason
+           #:malformed-agent-id-detail
+           #:validate-agent-id
+           #:encode-id
            #:decode-id
            #:split-agent-id
            #:author-display
@@ -67,6 +72,75 @@
     (if (string= base "")
         leaf
         (concatenate 'string base "/" leaf))))
+
+;;; ------------------------------------------------------- id validation
+
+(define-condition malformed-agent-id (error)
+  ((id :initarg :id :initform nil :reader malformed-agent-id-id)
+   (reason :initarg :reason :initform :malformed :reader malformed-agent-id-reason)
+   (detail :initarg :detail :initform nil :reader malformed-agent-id-detail))
+  (:report (lambda (condition stream)
+             (format stream "dsmr-mcp bus: refusing the agent id ~S. ~A"
+                     (malformed-agent-id-id condition)
+                     (or (malformed-agent-id-detail condition)
+                         "The id does not name an agent."))))
+  (:documentation
+   "Signalled when a string offered as a bus agent id cannot be one.
+
+    Distinct from every other error a caller might see on the same call, so a
+    caller can tell a refused id from a bus that would not open. REASON carries
+    a keyword to branch on; DETAIL carries the sentence a person reads.
+
+    Signalled before anything is named from the id, so a caller that sees this
+    knows no cursor, roster entry or heartbeat was left behind."))
+
+(defun %control-character-p (character)
+  "True for a character no legitimate agent id can carry: the C0 controls below
+   the space, and DEL. Everything at or above the space is left alone, including
+   the quote, the angle bracket, the space itself and every non-ASCII character,
+   because a project root may legitimately contain all of them and the namespace
+   half of an id IS a project root."
+  (let ((code (char-code character)))
+    (or (< code 32) (= code 127))))
+
+(defun validate-agent-id (id)
+  "Return ID when it can name an agent on the bus, or signal MALFORMED-AGENT-ID
+   saying why it cannot.
+
+   Two things are refused, and the narrowness is the point. An id carrying a
+   control character is refused because such an id is never something a caller
+   assembled from a project root and a name: it is a fragment of something else
+   that arrived where an id was expected. An id that is empty, or is nothing but
+   separators, is refused because it names no agent at all.
+
+   Everything else is accepted deliberately. A stricter alphabet would be easy
+   to write and would reject real ids the first time someone works in a
+   directory whose name carries a space or an accented letter.
+
+   The reason an id is worth checking at all, when the encoder downstream cannot
+   fail, is that the artefacts an id names are never revisited. A cursor comes
+   into existence through the act of reading and nothing later revokes it, and
+   the sweep that clears abandoned cursors deliberately spares anything carrying
+   a stable name. An id accepted once is therefore an id kept forever, and it
+   goes on to take part in deciding who a message is for."
+  (unless (stringp id)
+    (error 'malformed-agent-id :id id :reason :not-a-string
+                               :detail "An agent id must be a string."))
+  (when (zerop (length id))
+    (error 'malformed-agent-id :id id :reason :empty
+                               :detail "An agent id must not be empty."))
+  (when (zerop (length (string-trim "/" id)))
+    (error 'malformed-agent-id
+           :id id :reason :no-name
+           :detail "An id of nothing but separators names no agent."))
+  (let ((bad (find-if #'%control-character-p id)))
+    (when bad
+      (error 'malformed-agent-id
+             :id id :reason :control-character
+             :detail (format nil "It carries the control character with code ~
+                                  ~D (#x~2,'0X); an agent id may carry none."
+                             (char-code bad) (char-code bad)))))
+  id)
 
 (defun encode-id (id)
   "Percent-encode ID into a single filesystem-safe token for a cursor filename.
