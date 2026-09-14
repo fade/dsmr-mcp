@@ -31,6 +31,11 @@
   (:import-from #:dsmr-mcp/src/bus/cursor
                 #:+default-batch-size+)
   (:import-from #:dsmr-mcp/src/bus/envelope
+                #:malformed-agent-id
+                #:malformed-agent-id-id
+                #:malformed-agent-id-reason
+                #:malformed-agent-id-detail
+                #:validate-agent-id
                 #:encode-id
                 #:decode-id
                 #:split-agent-id
@@ -50,6 +55,9 @@
            #:poll-count-foreign #:await
            #:skip-to-head #:+default-batch-size+
            #:agent-id #:encode-id #:decode-id
+           #:malformed-agent-id #:malformed-agent-id-id
+           #:malformed-agent-id-reason #:malformed-agent-id-detail
+           #:validate-agent-id
            #:split-agent-id #:author-display
            #:decode-envelope #:delivered-body-string
            #:foreign-self-id-p #:foreign-record-p
@@ -190,7 +198,19 @@
    rather than lazily on the first read because a caller may connect long before
    it reads — the background restart listener joins at server startup and then
    polls on its own cadence — and an unseeded cursor would spend that whole gap
-   looking like a participant owed the entire log."
+   looking like a participant owed the entire log.
+
+   ID is checked before anything at all is named from it, and a malformed one is
+   refused with MALFORMED-AGENT-ID rather than opened. The check has to sit here
+   and not further down because this is where a cursor comes into existence, and
+   nothing later takes one away: the sweep that clears abandoned cursors spares
+   every name that is not ephemeral, so a cursor minted from a malformed id
+   would be preserved by the same guard that protects a real agent's dormant
+   one. The encoder cannot refuse it either: it is total by construction, since
+   its job is to survive any project root, so an unchecked id becomes a
+   permanent filename and then goes on to take part in resolving who a message
+   is for."
+  (validate-agent-id id)
   (broker:ensure-bus-dirs paths)
   (let ((cursor-path (merge-pathnames (encode-id id) (broker:bus-paths-cursors-dir paths))))
     (%make-subscriber
