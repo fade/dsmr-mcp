@@ -478,3 +478,45 @@
         (is eq :dead (getf (beat-row beats "probe/silent") :status)
             "an enrolled identity with no beat file is still listed, reading dead")
         (is eq nil (getf (beat-row beats "probe/silent") :pid))))))
+
+(define-test a-broker-this-process-launched-reads-as-starting-and-not-as-absent
+  "The field is driven both ways inside one fixture, because the failure being
+   guarded is a field that answers the same word whatever the world is doing.
+   The same bus reads not-running before anything is launched and starting
+   afterwards, off one unchanged election lock, which is exactly the distinction
+   the lock alone cannot make.
+
+   The launch is stubbed. A real one boots an image and loads source before it
+   contends for the role, and that gap is the subject here, not something to sit
+   through."
+  (with-scratch-bus (paths)
+    (let ((before (getf (status:broker-identity paths) :running))
+          (real (fdefinition 'broker:spawn-broker))
+          (launched 0))
+      (is equal "not-running" (getf before :value)
+          "a bus nobody has launched anything for reads as not running")
+      (is equal "active-probe" (getf before :basis)
+          "on the strength of the lock probe alone")
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'broker:spawn-broker)
+                   (lambda (p &key (block t))
+                     (declare (ignore p block))
+                     (incf launched)
+                     nil))
+             (is eq :spawned (broker:ensure-broker paths)
+                 "ensuring a broker on an unserved bus launches one"))
+        (setf (fdefinition 'broker:spawn-broker) real))
+      (is = 1 launched "and launches it exactly once")
+      (let ((after (getf (status:broker-identity paths) :running)))
+        (is equal "starting" (getf after :value)
+            "which the same unchanged lock now reads as starting")
+        (is equal "passive-inference" (getf after :basis)
+            "labelled as inference, because nothing was probed about the broker itself")
+        (true (search "does not establish that the broker will take the role"
+                      (getf after :does-not-establish))
+              "and the field says outright that it does not promise the broker arrives")
+        (true (search "died on the way up" (getf after :does-not-establish))
+              "naming the case that reads identically")
+        (true (stringp (getf after :red-condition))
+              "with the condition that would flip it stated")))))

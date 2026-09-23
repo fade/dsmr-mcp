@@ -51,7 +51,8 @@
            #:start-broker #:broker-step #:serve-broker #:stop-broker
            #:custodial-tick
            #:join-members
-           #:broker-running-p #:broker-main #:spawn-broker #:ensure-broker))
+           #:broker-running-p #:broker-main #:spawn-broker #:ensure-broker
+           #:broker-spawned-here-p))
 
 (in-package #:dsmr-mcp/src/bus/broker)
 
@@ -643,10 +644,47 @@
                        :output (merge-pathnames "broker.log" (bus-paths-root paths))
                        :error-output :output))
 
+(defvar *brokers-spawned-here*
+  (make-hash-table :test #'equal :synchronized t)
+  "The bus roots this process has launched a broker for, keyed by namestring.
+
+   Process-local and deliberately so. It is a record of something this image
+   did, not a claim about the host, and it is never written to disk: another
+   session's spawn is not this session's knowledge, and a file would outlive
+   the truth of it.
+
+   Entries are never removed. Once a broker takes the role the lock is the
+   better answer and this one stops being consulted, and a broker that failed
+   to take it leaves a bus this process did launch something for, which is
+   still the honest account of why the lock is free.")
+
+(defun %note-broker-spawned (paths)
+  "Remember that this process launched a broker for the bus at PATHS."
+  (setf (gethash (namestring (bus-paths-root paths)) *brokers-spawned-here*) t)
+  (values))
+
+(defun broker-spawned-here-p (paths)
+  "True when this process launched a broker for the bus at PATHS.
+
+   Says nothing about whether that broker is serving, or is even still alive.
+   It answers the one question a lock probe cannot: whether a free lock means
+   nobody is coming, or means the process asking is the one that started what
+   has not arrived yet."
+  (and (gethash (namestring (bus-paths-root paths)) *brokers-spawned-here*) t))
+
 (defun ensure-broker (paths)
   "Make sure a broker is serving the bus at PATHS. Returns :EXISTS if one already
    holds the role, or :SPAWNED after launching one. The spawned process self-
-   elects, so a lost startup race just exits cleanly rather than double-serving."
+   elects, so a lost startup race just exits cleanly rather than double-serving.
+
+   A spawn is remembered against the bus root, because the launch and the role
+   are separated by a long gap: the child boots an image and loads its source
+   before it reaches the election, and for that whole stretch the lock is free.
+   A caller probing the lock in that window sees exactly what a dead bus looks
+   like, and the memory of having launched one is the only thing that tells the
+   two apart."
   (if (broker-running-p paths)
       :exists
-      (progn (spawn-broker paths :block nil) :spawned)))
+      (progn (spawn-broker paths :block nil)
+             (%note-broker-spawned paths)
+             :spawned)))

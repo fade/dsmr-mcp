@@ -132,6 +132,15 @@
    recorded pid is repeated only when a process with that pid actually exists,
    since a pid is reused after its process exits.
 
+   A free lock has two meanings and they are reported apart. Nobody is serving
+   this bus is one of them. The other is that a broker is on its way up: a
+   spawned broker boots an image and loads its source before it reaches the
+   election, and for that whole stretch the lock is free and the bus is fine.
+   Starting is claimed only when this process is the one that launched it, which
+   is the single case where this reader knows something the lock cannot tell it.
+   It is a weaker claim than running and is labelled as such: nothing here
+   establishes that the broker will arrive.
+
    The parent is read live from the running process. The record carries the
    parent the broker had at start, and the two are reported side by side because
    a difference between them is the reparenting: the process that spawned the
@@ -142,7 +151,9 @@
    brokers recording themselves, reports running or not from the lock and
    reports each identity field as unavailable with the reason. It does not
    report zeros."
-  (let* ((running (broker:broker-running-p paths))
+  (let* ((state (cond ((broker:broker-running-p paths) :running)
+                      ((broker:broker-spawned-here-p paths) :starting)
+                      (t :not-running)))
          (record (broker:read-broker-identity paths))
          (recorded-pid (broker:broker-identity-pid record))
          (live (and recorded-pid (process-alive-p recorded-pid)))
@@ -151,16 +162,34 @@
          (version (broker:broker-identity-version record)))
     (list
      :running
-     (%fact (if running "running" "not-running")
-            :establishes
-            (if running
-                "a non-blocking attempt to take this bus's election lock found it already held"
-                "a non-blocking attempt to take this bus's election lock found it free, and released it again immediately")
-            :does-not-establish
-            "it does not establish which process holds the lock, nor that the holder is serving. A lock belongs to an open file description, so a child that inherited a dead broker's descriptor keeps this answering running. It is also racy against a broker in the act of starting."
-            :basis "active-probe"
-            :red-condition
-            "the last open file description holding the election lock is closed, which happens when the broker and every process that inherited its descriptor have exited")
+     (ecase state
+       (:running
+        (%fact "running"
+               :establishes
+               "a non-blocking attempt to take this bus's election lock found it already held"
+               :does-not-establish
+               "it does not establish which process holds the lock, nor that the holder is serving. A lock belongs to an open file description, so a child that inherited a dead broker's descriptor keeps this answering running."
+               :basis "active-probe"
+               :red-condition
+               "the last open file description holding the election lock is closed, which happens when the broker and every process that inherited its descriptor have exited"))
+       (:starting
+        (%fact "starting"
+               :establishes
+               "this process launched a broker for this bus, and a non-blocking attempt to take the election lock found it free"
+               :does-not-establish
+               "it does not establish that the broker will take the role. One was launched and has not taken it yet, and that is the whole of the claim. A broker that died on the way up reads exactly like one still climbing, and it goes on reading that way until the process that launched it exits."
+               :basis "passive-inference"
+               :red-condition
+               "the launched broker takes the election lock, which turns this into running, or this process exits and with it the only record that anything was launched"))
+       (:not-running
+        (%fact "not-running"
+               :establishes
+               "a non-blocking attempt to take this bus's election lock found it free and released it again immediately, and nothing in this process launched a broker for this bus"
+               :does-not-establish
+               "it does not establish that no broker is coming. Another process may have spawned one that has not reached the election, and this reader has no way to see that; it knows only about launches of its own."
+               :basis "active-probe"
+               :red-condition
+               "a broker takes this bus's election lock, or this process launches one")))
 
      :pid
      (cond

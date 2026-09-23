@@ -122,6 +122,7 @@
                      do (sleep 0.05))
                (let ((st (agent:agent-status sub)))
                  (is eq t (getf st :broker-running))
+                 (is eq :running (getf st :broker-state))
                  (is = 1 (getf st :pending)))
                ;; still pending — status did not consume it
                (is = 1 (length (agent:agent-receive sub :timeout-ms 1000))))
@@ -582,3 +583,48 @@
                  (agent:disconnect-agent here)
                  (agent:disconnect-agent there)))))
       (ignore-errors (uiop:delete-directory-tree state-root :validate t)))))
+
+(define-test a-bus-nobody-here-started-reports-not-running
+  "A free election lock on a bus this process never launched anything for is the
+   one case where down is the whole truth, and it still reads that way."
+  (with-bus (paths)
+    (let ((a (agent:connect-agent "/proj" :name "s" :paths paths
+                                          :ensure-broker nil)))
+      (unwind-protect
+           (let ((st (agent:agent-status a)))
+             (is eq :not-running (getf st :broker-state))
+             (is eq nil (getf st :broker-running)
+                 "the lock is free, and the old field still says so")
+             (is eq nil (getf st :broker-spawned-here)
+                 "and nothing here launched a broker for this bus"))
+        (agent:disconnect-agent a)))))
+
+(define-test a-bus-this-session-launched-reports-starting-rather-than-down
+  "The defect this exists to catch: a session joins a bus, launches the broker
+   itself, and then reports the bus as dead for as long as its own child takes
+   to reach the election. The launch is stubbed because the real one boots an
+   image and loads source before it competes for the role, which is the gap
+   being tested and is far too long to sit through here."
+  (with-bus (paths)
+    (let ((launched '())
+          (real (fdefinition 'broker:spawn-broker)))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'broker:spawn-broker)
+                   (lambda (p &key (block t))
+                     (declare (ignore block))
+                     (push p launched)
+                     nil))
+             (let ((a (agent:connect-agent "/proj" :name "s" :paths paths)))
+               (unwind-protect
+                    (let ((st (agent:agent-status a)))
+                      (is = 1 (length launched)
+                          "joining a bus with no broker launches one")
+                      (is eq :starting (getf st :broker-state)
+                          "and the bus reads as starting, not as down")
+                      (is eq nil (getf st :broker-running)
+                          "while the election lock is still free, which is what the older field reports and why it was never enough on its own")
+                      (is eq t (getf st :broker-spawned-here)
+                          "and the reply says whose broker it is waiting on"))
+                 (agent:disconnect-agent a))))
+        (setf (fdefinition 'broker:spawn-broker) real)))))
