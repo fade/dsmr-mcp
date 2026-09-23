@@ -42,12 +42,13 @@
            #:unresolvable-recipient-matches #:unresolvable-recipient-candidates
            #:delivery #:delivery-author #:delivery-author-id #:delivery-text
            #:agent-status
+           #:agent-broker-state #:agent-spawned-broker-p
            #:agent-skip-to-head))
 
 (in-package #:dsmr-mcp/src/bus/agent)
 
 (defstruct (agent (:constructor %make-agent))
-  id namespace stable bus paths client subscriber)
+  id namespace stable bus paths client subscriber spawned-broker)
 
 (defstruct (delivery (:constructor %make-delivery))
   "One message handed to a reader, with the agent that published it attached.
@@ -79,10 +80,18 @@
    PATHS overrides the derivation outright and is how a test points a participant
    at a bus root of its own choosing; supplying it makes BUS purely descriptive.
    Unless ENSURE-BROKER is nil, a detached broker is spawned if none is running
-   on the resolved bus. Returns an AGENT handle."
-  (let ((paths (or paths (broker:make-bus-paths (selector:bus-root bus)))))
-    (broker:ensure-bus-dirs paths)
-    (when ensure-broker (broker:ensure-broker paths))
+   on the resolved bus.
+
+   Whether that spawn happened is kept on the handle, because it is the
+   difference between a bus nobody is serving and a bus whose broker this very
+   session launched a moment ago. Without it a status read taken in that window
+   calls its own child a dead bus. Returns an AGENT handle."
+  (let* ((paths (or paths (broker:make-bus-paths (selector:bus-root bus))))
+         (spawned (progn (broker:ensure-bus-dirs paths)
+                         (when ensure-broker
+                           (multiple-value-bind (outcome process)
+                               (broker:ensure-broker paths)
+                             (and (eq :spawned outcome) (or process t)))))))
     (let ((id (bus:agent-id namespace :name name)))
       (%make-agent
        :id id
@@ -90,6 +99,7 @@
        :stable (and name t)
        :bus bus
        :paths paths
+       :spawned-broker spawned
        :client (bus:connect-client paths)
        :subscriber (bus:subscribe paths id :feed-timeout-ms feed-timeout-ms)))))
 
@@ -431,11 +441,55 @@
    on the record."
   (bus:skip-to-head (agent-subscriber agent)))
 
+(defun agent-spawned-broker-p (agent)
+  "True when joining the bus on this handle launched the broker, rather than
+   finding one already serving.
+
+   A fact about the join and not about the broker: it stays true after that
+   broker has taken the role, and after one that never took it has died.
+   Whether anything is still on its way up is AGENT-BROKER-STATE's question."
+  (and (agent-spawned-broker agent) t))
+
+(defun agent-broker-state (agent)
+  "Where this agent's bus stands on having a broker: :RUNNING, :STARTING or
+   :NOT-RUNNING.
+
+   The election lock settles :RUNNING and nothing else does. What the lock cannot
+   settle is what a free lock means, and the two answers are far apart: nobody is
+   serving this bus, or a broker is on its way up and has not reached the
+   election yet. A launched broker has to come up, recover the log and bind its
+   sockets before it competes for the role, and where the checkout carries no
+   prebuilt image it builds the broker from source first, which is tens of
+   seconds. For that whole stretch a bus being brought up looks exactly like a
+   dead one.
+
+   This session's own record of having launched one closes that gap. :STARTING is
+   claimed only where a free lock is both expected and temporary: a broker this
+   image launched for this bus is still running, and has not taken the lock yet.
+   A broker that died on the way up was never going to arrive and reports
+   :NOT-RUNNING as soon as its process is gone, so the softer answer expires on
+   its own with no interval to choose.
+
+   The question is asked of the image rather than of this handle, because a
+   second participant joining a bus a sibling just started deserves the same
+   answer as the one that started it. What the handle knows, and reports through
+   AGENT-SPAWNED-BROKER-P, is whether this particular join is what launched it."
+  (cond ((broker:broker-running-p (agent-paths agent)) :running)
+        ((broker:broker-spawned-here-p (agent-paths agent)) :starting)
+        (t :not-running)))
+
 (defun agent-status (agent)
   "A snapshot of this agent's view of the bus: its own identity (full id, the name
    within the namespace, the namespace, and whether the identity is stable),
-   whether a broker is live, how many messages are waiting for it right now, and
-   whether a wakeup watcher is currently listening on its behalf.
+   where the bus stands on having a broker, how many messages are waiting for it
+   right now, and whether a wakeup watcher is currently listening on its behalf.
+
+   BROKER-STATE is the three-way answer from AGENT-BROKER-STATE and is the one to
+   read. BROKER-RUNNING is kept beside it and is true only for :RUNNING, so a
+   caller that asks the old question gets the old answer: the election lock is
+   held. BROKER-SPAWNED-HERE says whether joining on this handle is what launched
+   the broker, which is what separates a bus coming up from a bus nobody is
+   serving.
 
    PENDING is the self-aware count: only the records delivery would actually
    return, never this agent's own un-consumed publishes and never mail addressed
@@ -454,7 +508,8 @@
    instead reports every watch on a named bus as dead, while the pending count and
    broker state beside it stay correct, so the disagreement looks like a broken
    watch rather than a misread path."
-  (let ((own (bus:encode-id (agent-id agent))))
+  (let ((own (bus:encode-id (agent-id agent)))
+        (broker-state (agent-broker-state agent)))
     (multiple-value-bind (wstatus wage)
         (heartbeat:beat-liveness
          (heartbeat:beat-path (agent-id agent)
@@ -464,7 +519,9 @@
             :name (agent-name agent)
             :namespace (agent-namespace agent)
             :stable (agent-stable-p agent)
-            :broker-running (broker:broker-running-p (agent-paths agent))
+            :broker-state broker-state
+            :broker-running (eq :running broker-state)
+            :broker-spawned-here (agent-spawned-broker-p agent)
             :pending (bus:poll-count-foreign (agent-subscriber agent) own)
             :live-watcher (eq wstatus :live)
             :watcher-status (string-downcase (symbol-name wstatus))

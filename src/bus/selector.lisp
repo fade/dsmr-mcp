@@ -67,14 +67,23 @@
 
 (defparameter *reserved-bus-names*
   '("default" "cursors" "watch" "roster" "members"
-    "bus.wal" "broker.lock" "submit.ipc" "pub.ipc" "." "..")
+    "bus.wal" "bus.wal.generation" "broker.lock"
+    "broker.identity" "broker.log"
+    "submit.ipc" "pub.ipc" "." "..")
   "Names a bus may not take, compared case-insensitively.
 
    A named root is a directory created inside the bus root, beside the entries
    the unnamed bus already writes there, so any of these would land on top of
-   live bus state. \"default\" is reserved for a different reason: the watcher
-   prints bus=default when no name is set, so a bus actually called default
-   would be unreadable in that output.")
+   live bus state. The list covers every name the bus writes in that directory:
+   the write-ahead log and its generation marker, the election and membership
+   files, the socket endpoints, the cursor and watch and roster directories, and
+   the broker's identity record and log. A name that is merely unlikely is still
+   a name somebody eventually picks, and the collision destroys live state
+   instead of reporting a conflict.
+
+   \"default\" is reserved for a different reason: the watcher prints
+   bus=default when no name is set, so a bus actually called default would be
+   unreadable in that output.")
 
 ;;; ---------------------------------------------------------------- condition
 

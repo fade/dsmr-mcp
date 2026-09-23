@@ -85,6 +85,19 @@ description."))
     ((equal status "stale") (format nil "Watcher: stale (age ~Ds) — may have stopped listening." age))
     (t "Watcher: DEAD — nothing listening.")))
 
+(defun %broker-line (label state)
+  "One sentence about where the bus called LABEL stands on having a broker.
+
+   The three states are kept apart in the text because the reader acts on the
+   text. A bus whose broker this session has just launched is not down, and
+   calling it down has already sent a reader off to report a dead fleet while
+   the fleet was coming up in front of them."
+  (case state
+    (:running (format nil "Bus ~A is up." label))
+    (:starting (format nil "Bus ~A is starting: this session launched its broker ~
+                            and it has not taken the role yet." label))
+    (t (format nil "Bus ~A is down (no broker)." label))))
+
 (c2mop:ensure-finalized (find-class 'bus-status-tool))
 
 (defmethod tool-handle ((tool bus-status-tool) id args)
@@ -106,6 +119,7 @@ string naming a bus. Omit it to report on this session's own bus.")))))
                                  :ephemeral ephemeral :bus bus-arg))
                (st (agent-status a))
                (label (bus-label (agent-bus a)))
+               (broker-state (getf st :broker-state))
                (running (getf st :broker-running))
                (pending (getf st :pending))
                (aid (getf st :id))
@@ -113,6 +127,8 @@ string naming a bus. Omit it to report on this session's own bus.")))))
                (watcher-age (getf st :watcher-age-seconds))
                (live-watcher (getf st :live-watcher)))
           (result id (make-ht "broker_running" (and running t)
+                              "broker_state" (string-downcase (symbol-name broker-state))
+                              "broker_spawned_here" (and (getf st :broker-spawned-here) t)
                               "pending" pending
                               "bus" label
                               "agent_id" aid
@@ -128,13 +144,12 @@ string naming a bus. Omit it to report on this session's own bus.")))))
                               "superseded_by"
                               (make-ht
                                "verb" "bus-inspect"
-                               "reports" "This reply is a moment in time: a broker is or is not holding the election lock, and this agent has this many records past its cursor. It is not an inventory of the bus, and it establishes nothing about which source the broker is serving, which generation of the log this is, which recorded positions are stranded, or who else is reading. bus-inspect answers those."
+                               "reports" "This reply is a moment in time: a broker is holding the election lock, or this session launched one that has not taken it yet, or neither, and this agent has this many records past its cursor. Starting is the weakest of the three and says only that a broker was launched here; it does not say one will arrive. It is not an inventory of the bus, and it establishes nothing about which source the broker is serving, which generation of the log this is, which recorded positions are stranded, or who else is reading. bus-inspect answers those."
                                "pending" "The pending number counts only the kind of record a receive would hand back: nothing this agent published, and nothing addressed to another participant. The count and the delivery path apply the same test, so every record counted here is one a receive will hand over, and nothing else is counted. The number is not bounded by a page: one receive returns at most its limit, 20 by default, and reports the rest as remaining_pending, so pending can legitimately exceed what a single call returns. Zero pending means nothing is deliverable to this agent, not that the log is empty: records past the cursor may be addressed to other participants, or be this agent's own publishes it has not consumed.")
                               "content" (text-content
-                                         (format nil "You are ~A. Bus ~A is ~A: ~D message(s) pending. ~A"
+                                         (format nil "You are ~A. ~A ~D message(s) pending. ~A"
                                                  (identity-summary a)
-                                                 label
-                                                 (if running "up" "down (no broker)")
+                                                 (%broker-line label broker-state)
                                                  pending
                                                  (%watcher-line watcher-status watcher-age))))))
       ;; A bus name that cannot become a bus root is refused rather than

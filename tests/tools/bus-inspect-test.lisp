@@ -396,6 +396,15 @@
    promise made when that verb was kept was that nothing was taken away, and a
    test that asserts one field at a time cannot see a field that vanished.")
 
+(defparameter +status-fields-added-since+
+  '("broker_spawned_here" "broker_state")
+  "Every key the status verb has grown since, named so an addition stays a
+   decision.
+
+   The check below is an equality, so a field appearing here is the only way a
+   new key passes. That is the point: nothing may be dropped, and nothing may
+   arrive unnoticed.")
+
 (define-test the-superseded-verb-still-returns-everything-it-returned-before
   "Supersession changed what the verb says about itself and nothing about what
    it answers. A caller written against the old reply keeps working."
@@ -406,11 +415,12 @@
       (dolist (key +status-fields-before-supersession+)
         (true (nth-value 1 (gethash key payload))
               (format nil "~A is still returned" key)))
-      (is equal (sort (copy-list (cons "superseded_by"
-                                       +status-fields-before-supersession+))
+      (is equal (sort (append (list "superseded_by")
+                              (copy-list +status-fields-before-supersession+)
+                              (copy-list +status-fields-added-since+))
                       #'string<)
           (keys-of payload)
-          "and the reply is the old field set plus the successor, with nothing else added or dropped")
+          "and the reply is the old field set plus the successor and the fields named as added since, with nothing else added or dropped")
       (is = 0 (gethash "pending" payload)
           "the pending count is still a plain number a caller can read"))))
 

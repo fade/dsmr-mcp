@@ -47,11 +47,13 @@
            #:broker-identity-pid #:broker-identity-ppid-at-start
            #:broker-identity-started-at
            #:broker-identity-revision #:broker-identity-version
+           #:broker-identity-image #:broker-identity-image-written
            #:broker #:broker-seq
            #:start-broker #:broker-step #:serve-broker #:stop-broker
            #:custodial-tick
            #:join-members
-           #:broker-running-p #:broker-main #:spawn-broker #:ensure-broker))
+           #:broker-running-p #:broker-main #:spawn-broker #:ensure-broker
+           #:broker-spawned-here-p))
 
 (in-package #:dsmr-mcp/src/bus/broker)
 
@@ -177,12 +179,42 @@
    has never run, and it would name it with the confidence of a measurement."
   nil)
 
+(defun %booted-image ()
+  "The image file this process booted from, as a namestring, or NIL when it
+   cannot be read.
+
+   Measured from the running process rather than passed in by whoever launched
+   it. SB-EXT:*CORE-PATHNAME* is the image SBCL actually started from, so a
+   broker can state its own provenance without cooperation from its spawner and
+   without a flag that could be wrong. It is resolved to a true name because the
+   value reflects the command line as written, and a path with a relative
+   segment in it names the file without identifying it.
+
+   It also separates the two ways a broker is brought up at no extra cost. The
+   stock system image means a process that built the broker from source and is
+   serving what the tree said at that moment. The project's own image means a
+   process serving a build, frozen at whatever the tree said when it was made.
+
+   Widened to full characters for the same reason the source revision is. A
+   pathname comes back as a base string, and a base string written under
+   standard syntax prints as an array literal rather than as text, which leaves
+   the record readable by machine and unreadable by a person opening the file."
+  (ignore-errors
+    (let ((core sb-ext:*core-pathname*))
+      (and core
+           (%full-character-string
+            (namestring (or (ignore-errors (truename core)) core)))))))
+
 (defun write-broker-identity (paths)
   "Record who is serving the bus at PATHS and return the recorded plist, or NIL
    when nothing could be written.
 
    Carries this process's pid, the parent it had at that moment, the time it
-   started, and what it can say about the source it is serving. The parent is
+   started, what it can say about the source it is serving, and which image it
+   booted from and when that image was written. The image is what keeps a broker
+   from serving a frozen build invisibly: a reader can see that the process came
+   up from a prebuilt image and how old that image is, which is the question
+   behind every retire-and-restart. The parent is
    recorded as it was at start deliberately: a broker outlives the process that
    spawned it and is reparented when that process exits, so the value here and
    the one the running process reports are two different facts and a reader
@@ -198,11 +230,15 @@
           (temp (merge-pathnames (format nil "broker.identity.tmp~D"
                                          (random 100000000))
                                  (bus-paths-root paths)))
+          (image (%booted-image))
           (plist (list :pid (sb-posix:getpid)
                        :ppid-at-start (sb-posix:getppid)
                        :started-at (get-universal-time)
                        :source-revision (%full-character-string (%source-revision))
-                       :version (%recorded-version))))
+                       :version (%recorded-version)
+                       :image image
+                       :image-written (and image
+                                           (ignore-errors (file-write-date image))))))
      (ensure-directories-exist target)
      (unwind-protect
           (progn
@@ -268,6 +304,15 @@
 (defun broker-identity-version (record)
   "The version string the broker's image reported for itself, or NIL."
   (getf record :version))
+
+(defun broker-identity-image (record)
+  "The image file the broker booted from, or NIL when RECORD names none."
+  (getf record :image))
+
+(defun broker-identity-image-written (record)
+  "The universal time the broker's image file was last written, or NIL when
+   RECORD names none."
+  (getf record :image-written))
 
 (defun %ephemeral-name-p (name)
   "True iff NAME is an auto-generated ephemeral agent name — g<digits>-<digits>,
@@ -620,19 +665,56 @@
       (stop-broker br :archive t))
     (uiop:quit 0)))
 
+(defun %prebuilt-image-path ()
+  "The prebuilt image beside this project's source, as a namestring, or NIL when
+   the checkout has none.
+
+   Probed at spawn time rather than remembered, because the image is rebuilt
+   under a running fleet and a path cached at load time would name a file that
+   has since been replaced or removed."
+  (ignore-errors
+    (let ((core (probe-file (merge-pathnames
+                             "dsmr.core"
+                             (asdf:system-source-directory "dsmr-mcp")))))
+      (and core (namestring core)))))
+
 (defun %broker-spawn-args (root &key (block t))
-  "The sbcl command line for a detached broker process. Loads only the broker
-   subsystem (lighter than the full server) plus its pzmq dependency."
-  (let ((sbcl (or (uiop:getenv "SBCL") "sbcl"))
-        (project (namestring (asdf:system-source-directory "dsmr-mcp")))
-        (ql (namestring (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))))
-    (list sbcl "--non-interactive" "--disable-debugger"
-          "--eval" (format nil "(when (probe-file ~S) (load ~S))" ql ql)
-          "--eval" (format nil "(asdf:initialize-source-registry '(:source-registry (:directory ~S) :inherit-configuration))"
-                           project)
-          "--eval" "(funcall (read-from-string \"ql:quickload\") \"dsmr-mcp/src/bus/broker\" :silent t)"
-          "--eval" (format nil "(funcall (read-from-string \"dsmr-mcp/src/bus/broker:broker-main\") ~S :block ~:[nil~;t~])"
-                           (namestring (uiop:ensure-directory-pathname root)) block))))
+  "The sbcl command line for a detached broker process.
+
+   A prebuilt image beside the source is used when there is one, because the
+   alternative is measured in tens of seconds: booting plain sbcl and building
+   the broker subsystem from source takes 22 to 33 seconds on this host against
+   0.03 for the image, and every one of those seconds is time the bus has no
+   broker and a caller asking after it learns nothing useful. Without the image
+   the source path is emitted exactly as before, so a checkout that was never
+   built still brings a bus up.
+
+   The image path carries fewer flags than the source path and each one earns
+   its place. Errors are made fatal rather than interactive, since a broker that
+   stops in a debugger nobody is attached to is a bus that hangs instead of
+   failing. The user's init file is skipped: it loads a development environment
+   into what is meant to be a frozen image, which cost 0.7 seconds and a
+   quickload of slynk when measured. Nothing asks the process to quit, because
+   BROKER-MAIN exits on its own and does so on SIGTERM too.
+
+   The SBCL environment override still chooses the binary. An image and the
+   binary that saved it are a pair, so pointing that variable at a different
+   build is a refusal to start rather than a silent fallback."
+  (let* ((sbcl (or (uiop:getenv "SBCL") "sbcl"))
+         (core (%prebuilt-image-path))
+         (start (format nil "(funcall (read-from-string \"dsmr-mcp/src/bus/broker:broker-main\") ~S :block ~:[nil~;t~])"
+                        (namestring (uiop:ensure-directory-pathname root)) block)))
+    (if core
+        (list sbcl "--core" core "--noinform" "--no-userinit" "--disable-debugger"
+              "--eval" start)
+        (let ((project (namestring (asdf:system-source-directory "dsmr-mcp")))
+              (ql (namestring (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))))
+          (list sbcl "--non-interactive" "--disable-debugger"
+                "--eval" (format nil "(when (probe-file ~S) (load ~S))" ql ql)
+                "--eval" (format nil "(asdf:initialize-source-registry '(:source-registry (:directory ~S) :inherit-configuration))"
+                                 project)
+                "--eval" "(funcall (read-from-string \"ql:quickload\") \"dsmr-mcp/src/bus/broker\" :silent t)"
+                "--eval" start)))))
 
 (defun spawn-broker (paths &key (block t))
   "Launch a detached broker process serving the bus at PATHS, logging to
@@ -643,10 +725,60 @@
                        :output (merge-pathnames "broker.log" (bus-paths-root paths))
                        :error-output :output))
 
+(defvar *brokers-spawned-here*
+  (make-hash-table :test #'equal :synchronized t)
+  "The broker processes this image has launched, keyed by bus root namestring.
+
+   Process-local and deliberately so. It is a record of something this image
+   did, not a claim about the host, and it is never written to disk: another
+   session's spawn is not this session's knowledge, and a file would outlive the
+   truth of it.
+
+   The value is the launched process itself rather than a flag, which is what
+   lets the answer expire on its own. A broker on its way up and a broker that
+   died on the way up are indistinguishable from the election lock, and they are
+   told apart here by asking whether the process is still running.")
+
+(defun %note-broker-spawned (paths process)
+  "Remember PROCESS as the broker this image launched for the bus at PATHS."
+  (setf (gethash (namestring (bus-paths-root paths)) *brokers-spawned-here*)
+        process)
+  process)
+
+(defun broker-spawned-here-p (paths)
+  "True when this image launched a broker for the bus at PATHS and that process
+   is still running.
+
+   Says nothing about whether the broker is serving, or will ever serve. It
+   answers the one question a lock probe cannot: whether a free lock means
+   nobody is coming, or means the process asking is the one that started what
+   has not arrived yet.
+
+   Liveness rather than a timeout is what keeps the answer honest as it ages. A
+   broker that dies before reaching the election IS down, and once its process
+   is gone this says so, with no interval to choose and nothing to tune. The
+   alternative wants a number for how long a broker may take to come up, and
+   that number is not measurable from here: too short and a slow start is
+   reported as a dead bus, which is the failure this exists to prevent."
+  (let ((process (gethash (namestring (bus-paths-root paths))
+                          *brokers-spawned-here*)))
+    (and process
+         (ignore-errors (uiop:process-alive-p process))
+         t)))
+
 (defun ensure-broker (paths)
   "Make sure a broker is serving the bus at PATHS. Returns :EXISTS if one already
-   holds the role, or :SPAWNED after launching one. The spawned process self-
-   elects, so a lost startup race just exits cleanly rather than double-serving."
+   holds the role, or :SPAWNED after launching one, and as a second value the
+   process launched. The spawned process self-elects, so a lost startup race
+   just exits cleanly rather than double-serving.
+
+   A spawn is remembered against the bus root, because the launch and the role
+   are separated by a gap: the child has to come up and win the election before
+   it takes the lock, and for that stretch the lock is free. A caller probing
+   the lock in that window sees exactly what a dead bus looks like, and the
+   launched process is what tells the two apart, both while it is climbing and
+   once it has died without arriving."
   (if (broker-running-p paths)
-      :exists
-      (progn (spawn-broker paths :block nil) :spawned)))
+      (values :exists nil)
+      (values :spawned
+              (%note-broker-spawned paths (spawn-broker paths :block nil)))))

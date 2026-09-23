@@ -179,13 +179,16 @@ line"))
   "Every entry the bus already writes into its root, plus the dot names and the
    word the watcher prints for an unset bus."
   (dolist (name '("default" "cursors" "watch" "roster" "members"
-                  "bus.wal" "broker.lock" "submit.ipc" "pub.ipc" "." ".."))
+                  "bus.wal" "bus.wal.generation" "broker.lock"
+                  "broker.identity" "broker.log"
+                  "submit.ipc" "pub.ipc" "." ".."))
     (fail (selector:validate-bus-name name) selector:invalid-bus-name)
     (fail (selector:bus-root name) selector:invalid-bus-name)))
 
 (define-test reserved-names-are-refused-case-insensitively
   "The filesystem may or may not fold case; the refusal does not depend on it."
-  (dolist (name '("Default" "CURSORS" "Members" "Bus.WAL"))
+  (dolist (name '("Default" "CURSORS" "Members" "Bus.WAL"
+                  "Broker.Identity" "BROKER.LOG" "Bus.Wal.Generation"))
     (fail (selector:validate-bus-name name) selector:invalid-bus-name)))
 
 ;;; -------------------------------------------------------- path-length bound

@@ -132,6 +132,17 @@
    recorded pid is repeated only when a process with that pid actually exists,
    since a pid is reused after its process exits.
 
+   A free lock has two meanings and they are reported apart. Nobody is serving
+   this bus is one of them. The other is that a broker is on its way up, which
+   this reader can say only when this process is the one that launched it and
+   that process is still alive. Starting is a weaker claim than running and is
+   labelled as such: nothing here establishes that the broker will arrive, only
+   that something which might is still running.
+
+   The image the broker booted from is reported beside the source it recorded,
+   because a broker started from a prebuilt image serves whatever that image
+   froze. Nothing here compares the two, which is exactly why both are stated.
+
    The parent is read live from the running process. The record carries the
    parent the broker had at start, and the two are reported side by side because
    a difference between them is the reparenting: the process that spawned the
@@ -142,25 +153,47 @@
    brokers recording themselves, reports running or not from the lock and
    reports each identity field as unavailable with the reason. It does not
    report zeros."
-  (let* ((running (broker:broker-running-p paths))
+  (let* ((state (cond ((broker:broker-running-p paths) :running)
+                      ((broker:broker-spawned-here-p paths) :starting)
+                      (t :not-running)))
          (record (broker:read-broker-identity paths))
          (recorded-pid (broker:broker-identity-pid record))
          (live (and recorded-pid (process-alive-p recorded-pid)))
          (started (broker:broker-identity-started-at record))
          (revision (broker:broker-identity-revision record))
-         (version (broker:broker-identity-version record)))
+         (version (broker:broker-identity-version record))
+         (image (broker:broker-identity-image record))
+         (image-written (broker:broker-identity-image-written record)))
     (list
      :running
-     (%fact (if running "running" "not-running")
-            :establishes
-            (if running
-                "a non-blocking attempt to take this bus's election lock found it already held"
-                "a non-blocking attempt to take this bus's election lock found it free, and released it again immediately")
-            :does-not-establish
-            "it does not establish which process holds the lock, nor that the holder is serving. A lock belongs to an open file description, so a child that inherited a dead broker's descriptor keeps this answering running. It is also racy against a broker in the act of starting."
-            :basis "active-probe"
-            :red-condition
-            "the last open file description holding the election lock is closed, which happens when the broker and every process that inherited its descriptor have exited")
+     (ecase state
+       (:running
+        (%fact "running"
+               :establishes
+               "a non-blocking attempt to take this bus's election lock found it already held"
+               :does-not-establish
+               "it does not establish which process holds the lock, nor that the holder is serving. A lock belongs to an open file description, so a child that inherited a dead broker's descriptor keeps this answering running."
+               :basis "active-probe"
+               :red-condition
+               "the last open file description holding the election lock is closed, which happens when the broker and every process that inherited its descriptor have exited"))
+       (:starting
+        (%fact "starting"
+               :establishes
+               "this process launched a broker for this bus, that process is running now, and a non-blocking attempt to take the election lock found it free"
+               :does-not-establish
+               "it does not establish that the broker will take the role. One was launched, it is still alive, and it has not taken the role yet, and that is the whole of the claim. A process that comes up and never reaches the election reads exactly like one still climbing, for as long as it lives."
+               :basis "passive-inference"
+               :red-condition
+               "the launched broker takes the election lock, which turns this into running, or that process exits without having taken it, which turns this into not-running"))
+       (:not-running
+        (%fact "not-running"
+               :establishes
+               "a non-blocking attempt to take this bus's election lock found it free and released it again immediately, and no broker this process launched for this bus is still running"
+               :does-not-establish
+               "it does not establish that no broker is coming. Another process may have spawned one that has not reached the election, and this reader has no way to see that; it knows only about launches of its own."
+               :basis "active-probe"
+               :red-condition
+               "a broker takes this bus's election lock, or this process launches one")))
 
      :pid
      (cond
@@ -270,7 +303,37 @@
          (%unavailable
           "no identity record on this bus names a version"
           "it does not establish anything about the source the broker is serving."
-          "a broker starts on this bus and records the version its image reports")))))
+          "a broker starts on this bus and records the version its image reports"))
+
+     :image
+     (if image
+         (%fact image
+                :establishes
+                "the broker read this path from the running process as the image it booted from, and recorded it at start"
+                :does-not-establish
+                "it does not establish that the image agrees with the working tree. Nothing here compares the two. A prebuilt image is frozen at the moment it was made, so a broker on one built before a source change serves the old code and reports exactly as cleanly as one built after it. A broker on the stock system image built its code from source at start and is a different case, which is why the path is reported rather than a yes or no."
+                :basis "durable-record"
+                :red-condition
+                "a broker starts from a different image and records a different path")
+         (%unavailable
+          "no identity record on this bus names the image its broker booted from"
+          "it does not establish that the broker is serving current code, and it does not establish that it is not. A bus whose broker started before brokers recorded their image has none, and serves normally."
+          "a broker starts on this bus and records the image it booted from"))
+
+     :image-written
+     (if image-written
+         (%fact image-written
+                :establishes
+                "the file at the recorded image path carried this write time when the broker read it at start"
+                :does-not-establish
+                "it does not establish how old the code in that image is. It is the time the file was written, so an image rebuilt from unchanged source reads as new, and it says nothing about which source went into it. It also describes the file as it was at start: the image may have been rebuilt underneath a broker that is still serving the copy it mapped."
+                :basis "durable-record"
+                :red-condition
+                "a broker starts from an image file carrying a different write time")
+         (%unavailable
+          "no identity record on this bus names a write time for its broker's image"
+          "it does not establish that the image is old, or new; nothing was recorded either way."
+          "a broker starts on this bus and records when its image was written")))))
 
 ;;; ------------------------------------------------- reading the lock table
 ;;;
