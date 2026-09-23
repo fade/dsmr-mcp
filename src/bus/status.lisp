@@ -134,9 +134,10 @@
 
    A free lock has two meanings and they are reported apart. Nobody is serving
    this bus is one of them. The other is that a broker is on its way up, which
-   this reader can say only when this process is the one that launched it.
-   Starting is a weaker claim than running and is labelled as such: nothing here
-   establishes that the broker will arrive.
+   this reader can say only when this process is the one that launched it and
+   that process is still alive. Starting is a weaker claim than running and is
+   labelled as such: nothing here establishes that the broker will arrive, only
+   that something which might is still running.
 
    The image the broker booted from is reported beside the source it recorded,
    because a broker started from a prebuilt image serves whatever that image
@@ -178,16 +179,16 @@
        (:starting
         (%fact "starting"
                :establishes
-               "this process launched a broker for this bus, and a non-blocking attempt to take the election lock found it free"
+               "this process launched a broker for this bus, that process is running now, and a non-blocking attempt to take the election lock found it free"
                :does-not-establish
-               "it does not establish that the broker will take the role. One was launched and has not taken it yet, and that is the whole of the claim. A broker that died on the way up reads exactly like one still climbing, and it goes on reading that way until the process that launched it exits."
+               "it does not establish that the broker will take the role. One was launched, it is still alive, and it has not taken the role yet, and that is the whole of the claim. A process that comes up and never reaches the election reads exactly like one still climbing, for as long as it lives."
                :basis "passive-inference"
                :red-condition
-               "the launched broker takes the election lock, which turns this into running, or this process exits and with it the only record that anything was launched"))
+               "the launched broker takes the election lock, which turns this into running, or that process exits without having taken it, which turns this into not-running"))
        (:not-running
         (%fact "not-running"
                :establishes
-               "a non-blocking attempt to take this bus's election lock found it free and released it again immediately, and nothing in this process launched a broker for this bus"
+               "a non-blocking attempt to take this bus's election lock found it free and released it again immediately, and no broker this process launched for this bus is still running"
                :does-not-establish
                "it does not establish that no broker is coming. Another process may have spawned one that has not reached the election, and this reader has no way to see that; it knows only about launches of its own."
                :basis "active-probe"

@@ -480,19 +480,20 @@
         (is eq nil (getf (beat-row beats "probe/silent") :pid))))))
 
 (define-test a-broker-this-process-launched-reads-as-starting-and-not-as-absent
-  "The field is driven both ways inside one fixture, because the failure being
+  "The field is driven three ways inside one fixture, because the failure being
    guarded is a field that answers the same word whatever the world is doing.
-   The same bus reads not-running before anything is launched and starting
-   afterwards, off one unchanged election lock, which is exactly the distinction
-   the lock alone cannot make.
+   One unchanged election lock reads not-running before anything is launched,
+   starting while the launched process is alive, and not-running again once that
+   process has gone without taking the role. The lock alone makes none of those
+   distinctions.
 
-   The launch is stubbed. A real one boots an image and loads source before it
-   contends for the role, and that gap is the subject here, not something to sit
-   through."
+   The launch is stubbed with an ordinary process. What the reading turns on is
+   whether something this image started is still running, so a process that
+   stays up and one that exits at once are the two cases worth planting."
   (with-scratch-bus (paths)
     (let ((before (getf (status:broker-identity paths) :running))
           (real (fdefinition 'broker:spawn-broker))
-          (launched 0))
+          (processes '()))
       (is equal "not-running" (getf before :value)
           "a bus nobody has launched anything for reads as not running")
       (is equal "active-probe" (getf before :basis)
@@ -502,21 +503,30 @@
              (setf (fdefinition 'broker:spawn-broker)
                    (lambda (p &key (block t))
                      (declare (ignore p block))
-                     (incf launched)
-                     nil))
+                     (let ((process (uiop:launch-program '("sleep" "30"))))
+                       (push process processes)
+                       process)))
              (is eq :spawned (broker:ensure-broker paths)
-                 "ensuring a broker on an unserved bus launches one"))
-        (setf (fdefinition 'broker:spawn-broker) real))
-      (is = 1 launched "and launches it exactly once")
-      (let ((after (getf (status:broker-identity paths) :running)))
-        (is equal "starting" (getf after :value)
-            "which the same unchanged lock now reads as starting")
-        (is equal "passive-inference" (getf after :basis)
-            "labelled as inference, because nothing was probed about the broker itself")
-        (true (search "does not establish that the broker will take the role"
-                      (getf after :does-not-establish))
-              "and the field says outright that it does not promise the broker arrives")
-        (true (search "died on the way up" (getf after :does-not-establish))
-              "naming the case that reads identically")
-        (true (stringp (getf after :red-condition))
-              "with the condition that would flip it stated")))))
+                 "ensuring a broker on an unserved bus launches one")
+             (is = 1 (length processes) "and launches it exactly once")
+             (let ((during (getf (status:broker-identity paths) :running)))
+               (is equal "starting" (getf during :value)
+                   "which the same unchanged lock now reads as starting")
+               (is equal "passive-inference" (getf during :basis)
+                   "labelled as inference, because nothing was probed about the broker itself")
+               (true (search "does not establish that the broker will take the role"
+                             (getf during :does-not-establish))
+                     "and the field says outright that it does not promise the broker arrives")
+               (true (stringp (getf during :red-condition))
+                     "with the conditions that would flip it stated"))
+             (ignore-errors (uiop:terminate-process (first processes)))
+             (ignore-errors (uiop:wait-process (first processes)))
+             (let ((after (getf (status:broker-identity paths) :running)))
+               (is equal "not-running" (getf after :value)
+                   "and once that process is gone without the lock being taken, the bus reads as not running again")
+               (is equal "active-probe" (getf after :basis)
+                   "back on the strength of the probe, with nothing left to infer from")))
+        (setf (fdefinition 'broker:spawn-broker) real)
+        (dolist (p processes)
+          (ignore-errors (uiop:terminate-process p))
+          (ignore-errors (uiop:wait-process p)))))))

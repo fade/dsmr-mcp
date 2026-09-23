@@ -602,9 +602,9 @@
 (define-test a-bus-this-session-launched-reports-starting-rather-than-down
   "The defect this exists to catch: a session joins a bus, launches the broker
    itself, and then reports the bus as dead for as long as its own child takes
-   to reach the election. The launch is stubbed because the real one boots an
-   image and loads source before it competes for the role, which is the gap
-   being tested and is far too long to sit through here."
+   to reach the election. The launch is stubbed with a process that simply
+   stays alive, because what the reading turns on is that something this image
+   started is still running, not what that something does."
   (with-bus (paths)
     (let ((launched '())
           (real (fdefinition 'broker:spawn-broker)))
@@ -612,9 +612,10 @@
            (progn
              (setf (fdefinition 'broker:spawn-broker)
                    (lambda (p &key (block t))
-                     (declare (ignore block))
-                     (push p launched)
-                     nil))
+                     (declare (ignore p block))
+                     (let ((process (uiop:launch-program '("sleep" "30"))))
+                       (push process launched)
+                       process)))
              (let ((a (agent:connect-agent "/proj" :name "s" :paths paths)))
                (unwind-protect
                     (let ((st (agent:agent-status a)))
@@ -627,4 +628,41 @@
                       (is eq t (getf st :broker-spawned-here)
                           "and the reply says whose broker it is waiting on"))
                  (agent:disconnect-agent a))))
-        (setf (fdefinition 'broker:spawn-broker) real)))))
+        (setf (fdefinition 'broker:spawn-broker) real)
+        (dolist (p launched)
+          (ignore-errors (uiop:terminate-process p))
+          (ignore-errors (uiop:wait-process p)))))))
+
+(define-test a-broker-that-died-on-the-way-up-stops-reading-as-starting
+  "Starting expires by itself. The launched process here exits without ever
+   taking the role, which is what a broker that dies on the way up does, and the
+   bus goes back to reading as down because that is what it is. Nothing waits
+   out an interval: the answer changes when the process does."
+  (with-bus (paths)
+    (let ((launched '())
+          (real (fdefinition 'broker:spawn-broker)))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'broker:spawn-broker)
+                   (lambda (p &key (block t))
+                     (declare (ignore p block))
+                     (let ((process (uiop:launch-program '("true"))))
+                       (push process launched)
+                       process)))
+             (let ((a (agent:connect-agent "/proj" :name "s" :paths paths)))
+               (unwind-protect
+                    (progn
+                      (is = 1 (length launched) "a broker was launched")
+                      (loop repeat 100
+                            while (uiop:process-alive-p (first launched))
+                            do (sleep 0.02))
+                      (false (uiop:process-alive-p (first launched))
+                             "and it exited without taking the role")
+                      (let ((st (agent:agent-status a)))
+                        (is eq :not-running (getf st :broker-state)
+                            "so the bus reads as not running, which is the truth about a broker that will never arrive")
+                        (is eq t (getf st :broker-spawned-here)
+                            "while the handle still says this join is what launched it, because that remains a fact about the join")))
+                 (agent:disconnect-agent a))))
+        (setf (fdefinition 'broker:spawn-broker) real)
+        (dolist (p launched) (ignore-errors (uiop:wait-process p)))))))

@@ -88,8 +88,10 @@
    calls its own child a dead bus. Returns an AGENT handle."
   (let* ((paths (or paths (broker:make-bus-paths (selector:bus-root bus))))
          (spawned (progn (broker:ensure-bus-dirs paths)
-                         (and ensure-broker
-                              (eq :spawned (broker:ensure-broker paths))))))
+                         (when ensure-broker
+                           (multiple-value-bind (outcome process)
+                               (broker:ensure-broker paths)
+                             (and (eq :spawned outcome) (or process t)))))))
     (let ((id (bus:agent-id namespace :name name)))
       (%make-agent
        :id id
@@ -441,7 +443,11 @@
 
 (defun agent-spawned-broker-p (agent)
   "True when joining the bus on this handle launched the broker, rather than
-   finding one already serving."
+   finding one already serving.
+
+   A fact about the join and not about the broker: it stays true after that
+   broker has taken the role, and after one that never took it has died.
+   Whether anything is still on its way up is AGENT-BROKER-STATE's question."
   (and (agent-spawned-broker agent) t))
 
 (defun agent-broker-state (agent)
@@ -458,19 +464,18 @@
    dead one.
 
    This session's own record of having launched one closes that gap. :STARTING is
-   claimed only where a free lock is both expected and temporary: this process
-   spawned a broker for this bus and the lock has not been taken yet. A bus
-   nobody here started still reports :NOT-RUNNING, because nothing observed would
-   make a softer answer true.
+   claimed only where a free lock is both expected and temporary: a broker this
+   image launched for this bus is still running, and has not taken the lock yet.
+   A broker that died on the way up was never going to arrive and reports
+   :NOT-RUNNING as soon as its process is gone, so the softer answer expires on
+   its own with no interval to choose.
 
-   It is a state, not a promise. A broker that dies on the way up leaves this
-   answering :STARTING until the process that launched it exits, which is the
-   price of the reading and is cheaper than a session reporting its own child as
-   a dead fleet."
+   The question is asked of the image rather than of this handle, because a
+   second participant joining a bus a sibling just started deserves the same
+   answer as the one that started it. What the handle knows, and reports through
+   AGENT-SPAWNED-BROKER-P, is whether this particular join is what launched it."
   (cond ((broker:broker-running-p (agent-paths agent)) :running)
-        ((or (agent-spawned-broker-p agent)
-             (broker:broker-spawned-here-p (agent-paths agent)))
-         :starting)
+        ((broker:broker-spawned-here-p (agent-paths agent)) :starting)
         (t :not-running)))
 
 (defun agent-status (agent)

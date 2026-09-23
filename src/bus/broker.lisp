@@ -727,45 +727,58 @@
 
 (defvar *brokers-spawned-here*
   (make-hash-table :test #'equal :synchronized t)
-  "The bus roots this process has launched a broker for, keyed by namestring.
+  "The broker processes this image has launched, keyed by bus root namestring.
 
    Process-local and deliberately so. It is a record of something this image
    did, not a claim about the host, and it is never written to disk: another
-   session's spawn is not this session's knowledge, and a file would outlive
-   the truth of it.
+   session's spawn is not this session's knowledge, and a file would outlive the
+   truth of it.
 
-   Entries are never removed. Once a broker takes the role the lock is the
-   better answer and this one stops being consulted, and a broker that failed
-   to take it leaves a bus this process did launch something for, which is
-   still the honest account of why the lock is free.")
+   The value is the launched process itself rather than a flag, which is what
+   lets the answer expire on its own. A broker on its way up and a broker that
+   died on the way up are indistinguishable from the election lock, and they are
+   told apart here by asking whether the process is still running.")
 
-(defun %note-broker-spawned (paths)
-  "Remember that this process launched a broker for the bus at PATHS."
-  (setf (gethash (namestring (bus-paths-root paths)) *brokers-spawned-here*) t)
-  (values))
+(defun %note-broker-spawned (paths process)
+  "Remember PROCESS as the broker this image launched for the bus at PATHS."
+  (setf (gethash (namestring (bus-paths-root paths)) *brokers-spawned-here*)
+        process)
+  process)
 
 (defun broker-spawned-here-p (paths)
-  "True when this process launched a broker for the bus at PATHS.
+  "True when this image launched a broker for the bus at PATHS and that process
+   is still running.
 
-   Says nothing about whether that broker is serving, or is even still alive.
-   It answers the one question a lock probe cannot: whether a free lock means
+   Says nothing about whether the broker is serving, or will ever serve. It
+   answers the one question a lock probe cannot: whether a free lock means
    nobody is coming, or means the process asking is the one that started what
-   has not arrived yet."
-  (and (gethash (namestring (bus-paths-root paths)) *brokers-spawned-here*) t))
+   has not arrived yet.
+
+   Liveness rather than a timeout is what keeps the answer honest as it ages. A
+   broker that dies before reaching the election IS down, and once its process
+   is gone this says so, with no interval to choose and nothing to tune. The
+   alternative wants a number for how long a broker may take to come up, and
+   that number is not measurable from here: too short and a slow start is
+   reported as a dead bus, which is the failure this exists to prevent."
+  (let ((process (gethash (namestring (bus-paths-root paths))
+                          *brokers-spawned-here*)))
+    (and process
+         (ignore-errors (uiop:process-alive-p process))
+         t)))
 
 (defun ensure-broker (paths)
   "Make sure a broker is serving the bus at PATHS. Returns :EXISTS if one already
-   holds the role, or :SPAWNED after launching one. The spawned process self-
-   elects, so a lost startup race just exits cleanly rather than double-serving.
+   holds the role, or :SPAWNED after launching one, and as a second value the
+   process launched. The spawned process self-elects, so a lost startup race
+   just exits cleanly rather than double-serving.
 
    A spawn is remembered against the bus root, because the launch and the role
-   are separated by a long gap: the child boots an image and loads its source
-   before it reaches the election, and for that whole stretch the lock is free.
-   A caller probing the lock in that window sees exactly what a dead bus looks
-   like, and the memory of having launched one is the only thing that tells the
-   two apart."
+   are separated by a gap: the child has to come up and win the election before
+   it takes the lock, and for that stretch the lock is free. A caller probing
+   the lock in that window sees exactly what a dead bus looks like, and the
+   launched process is what tells the two apart, both while it is climbing and
+   once it has died without arriving."
   (if (broker-running-p paths)
-      :exists
-      (progn (spawn-broker paths :block nil)
-             (%note-broker-spawned paths)
-             :spawned)))
+      (values :exists nil)
+      (values :spawned
+              (%note-broker-spawned paths (spawn-broker paths :block nil)))))
