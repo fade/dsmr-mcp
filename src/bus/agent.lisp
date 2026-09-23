@@ -84,8 +84,8 @@
 
    Whether that spawn happened is kept on the handle, because it is the
    difference between a bus nobody is serving and a bus whose broker this very
-   session launched a moment ago. Without it every status this agent reports for
-   the next half-minute calls its own child a dead bus. Returns an AGENT handle."
+   session launched a moment ago. Without it a status read taken in that window
+   calls its own child a dead bus. Returns an AGENT handle."
   (let* ((paths (or paths (broker:make-bus-paths (selector:bus-root bus))))
          (spawned (progn (broker:ensure-bus-dirs paths)
                          (and ensure-broker
@@ -451,9 +451,11 @@
    The election lock settles :RUNNING and nothing else does. What the lock cannot
    settle is what a free lock means, and the two answers are far apart: nobody is
    serving this bus, or a broker is on its way up and has not reached the
-   election yet. A spawned broker boots an image and loads its source before it
-   competes for the role, tens of seconds on this host, and for that whole
-   stretch a bus being brought up looks exactly like a dead one.
+   election yet. A launched broker has to come up, recover the log and bind its
+   sockets before it competes for the role, and where the checkout carries no
+   prebuilt image it builds the broker from source first, which is tens of
+   seconds. For that whole stretch a bus being brought up looks exactly like a
+   dead one.
 
    This session's own record of having launched one closes that gap. :STARTING is
    claimed only where a free lock is both expected and temporary: this process

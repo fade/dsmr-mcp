@@ -133,13 +133,14 @@
    since a pid is reused after its process exits.
 
    A free lock has two meanings and they are reported apart. Nobody is serving
-   this bus is one of them. The other is that a broker is on its way up: a
-   spawned broker boots an image and loads its source before it reaches the
-   election, and for that whole stretch the lock is free and the bus is fine.
-   Starting is claimed only when this process is the one that launched it, which
-   is the single case where this reader knows something the lock cannot tell it.
-   It is a weaker claim than running and is labelled as such: nothing here
+   this bus is one of them. The other is that a broker is on its way up, which
+   this reader can say only when this process is the one that launched it.
+   Starting is a weaker claim than running and is labelled as such: nothing here
    establishes that the broker will arrive.
+
+   The image the broker booted from is reported beside the source it recorded,
+   because a broker started from a prebuilt image serves whatever that image
+   froze. Nothing here compares the two, which is exactly why both are stated.
 
    The parent is read live from the running process. The record carries the
    parent the broker had at start, and the two are reported side by side because
@@ -159,7 +160,9 @@
          (live (and recorded-pid (process-alive-p recorded-pid)))
          (started (broker:broker-identity-started-at record))
          (revision (broker:broker-identity-revision record))
-         (version (broker:broker-identity-version record)))
+         (version (broker:broker-identity-version record))
+         (image (broker:broker-identity-image record))
+         (image-written (broker:broker-identity-image-written record)))
     (list
      :running
      (ecase state
@@ -299,7 +302,37 @@
          (%unavailable
           "no identity record on this bus names a version"
           "it does not establish anything about the source the broker is serving."
-          "a broker starts on this bus and records the version its image reports")))))
+          "a broker starts on this bus and records the version its image reports"))
+
+     :image
+     (if image
+         (%fact image
+                :establishes
+                "the broker read this path from the running process as the image it booted from, and recorded it at start"
+                :does-not-establish
+                "it does not establish that the image agrees with the working tree. Nothing here compares the two. A prebuilt image is frozen at the moment it was made, so a broker on one built before a source change serves the old code and reports exactly as cleanly as one built after it. A broker on the stock system image built its code from source at start and is a different case, which is why the path is reported rather than a yes or no."
+                :basis "durable-record"
+                :red-condition
+                "a broker starts from a different image and records a different path")
+         (%unavailable
+          "no identity record on this bus names the image its broker booted from"
+          "it does not establish that the broker is serving current code, and it does not establish that it is not. A bus whose broker started before brokers recorded their image has none, and serves normally."
+          "a broker starts on this bus and records the image it booted from"))
+
+     :image-written
+     (if image-written
+         (%fact image-written
+                :establishes
+                "the file at the recorded image path carried this write time when the broker read it at start"
+                :does-not-establish
+                "it does not establish how old the code in that image is. It is the time the file was written, so an image rebuilt from unchanged source reads as new, and it says nothing about which source went into it. It also describes the file as it was at start: the image may have been rebuilt underneath a broker that is still serving the copy it mapped."
+                :basis "durable-record"
+                :red-condition
+                "a broker starts from an image file carrying a different write time")
+         (%unavailable
+          "no identity record on this bus names a write time for its broker's image"
+          "it does not establish that the image is old, or new; nothing was recorded either way."
+          "a broker starts on this bus and records when its image was written")))))
 
 ;;; ------------------------------------------------- reading the lock table
 ;;;
