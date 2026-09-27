@@ -52,6 +52,7 @@ LIST_ONLY=0
 FORCE=0
 NEW_WINDOW=0
 NO_SCAN=0
+SESSION_LOG_DIR=""
 
 usage() {
     cat <<EOF
@@ -116,6 +117,11 @@ Launching:
   -t, --to SOCKET       kitty remote control socket, e.g. unix:/tmp/kitty-1234
                         (default: \$KITTY_LISTEN_ON, else auto-discovered)
   -f, --force           Open a tab even if one with that title already exists
+      --session-log DIR Record each session's terminal from its first byte to
+                        DIR/NAME.typescript, with timing in DIR/NAME.timing.
+                        Anything a session prints before claude takes over the
+                        screen is otherwise gone the moment it is cleared.
+                        Replay one with: scriptreplay -T NAME.timing NAME.typescript
 
 Reporting:
   -l, --list            List the sisters that would be used, then exit
@@ -189,7 +195,7 @@ is_sister_dir() {
 # it is, rather than as a good option used wrongly.
 VALUED_OPTS=(--dir --extra --extra-root --only --exclude --leader --leader-file
              --leader-cmd --worker-cmd --fleet-tag --permission-mode --command --to
-             --stagger)
+             --stagger --session-log)
 FLAG_OPTS=(--no-role --no-direnv --no-scan --no-stagger --window --force --list
            --dry-run --help)
 
@@ -216,6 +222,7 @@ while [[ $# -gt 0 ]]; do
         -p|--permission-mode)  [[ $# -ge 2 ]] || die "$1 needs a value"; PERMISSION_MODE=$2; shift 2 ;;
         -c|--command)          [[ $# -ge 2 ]] || die "$1 needs a value"; CLAUDE_BIN=$2; shift 2 ;;
         --no-direnv)           USE_DIRENV=0; shift ;;
+        --session-log)         [[ $# -ge 2 ]] || die "$1 needs a value"; SESSION_LOG_DIR=$2; shift 2 ;;
         --no-stagger)          STAGGER_MIN=0; STAGGER_MAX=0; shift ;;
         --stagger)
             [[ $# -ge 2 ]] || die "$1 needs a value"
@@ -381,6 +388,18 @@ fi
 
 command -v kitten >/dev/null || die "kitten not found on PATH"
 
+# A missing recorder costs the log, never the bring-up: the fleet still starts,
+# and you are told plainly that this run was not recorded.
+SCRIPT_BIN=""
+if [[ -n $SESSION_LOG_DIR ]]; then
+    if SCRIPT_BIN=$(command -v script); then
+        ((DRY_RUN)) || mkdir -p -- "$SESSION_LOG_DIR"
+    else
+        printf '%s: script(1) not found, so these sessions will NOT be recorded\n' "$PROGNAME" >&2
+        SESSION_LOG_DIR=""
+    fi
+fi
+
 # An .envrc that was never approved makes `direnv exec` refuse to run the command
 # at all, so the tab would open and die. Check every repository before opening
 # anything: a fleet half up, with the other half's tabs gone by the time anyone
@@ -491,6 +510,13 @@ for i in "${!names[@]}"; do
     fi
 
     launch_args+=(--)
+    # The recorder wraps everything else, direnv included, so what direnv says
+    # on the way in is captured along with the session.
+    if [[ -n $SESSION_LOG_DIR ]]; then
+        launch_args+=("$SCRIPT_BIN" --quiet --flush --return
+                      --log-timing "$SESSION_LOG_DIR/$name.timing"
+                      --log-out "$SESSION_LOG_DIR/$name.typescript" --)
+    fi
     needs_direnv "$path" && launch_args+=("$DIRENV_BIN" exec "$path")
     launch_args+=("$CLAUDE_BIN" --permission-mode "$PERMISSION_MODE")
     [[ -n $role_prompt ]] && launch_args+=("$role_prompt")

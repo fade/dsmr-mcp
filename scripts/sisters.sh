@@ -130,6 +130,25 @@ if ((SCAN_MEMBERS)); then
     done
 fi
 
+# A real start is recorded: this script's own output, host check included, goes
+# to sisters.log, and each session's terminal is recorded beside it from its
+# first byte. A session that prints an error and then clears the screen leaves
+# nothing behind otherwise. A dry run starts nothing and records nothing.
+#
+# Each run gets its own directory and only the newest KEEP of them are kept per
+# fleet, because a session is recorded for as long as it runs.
+if (($# == 1)); then
+    LOG_ROOT=${DSMR_BRINGUP_LOG_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/dsmr-mcp/bringup}
+    LOG_DIR=$LOG_ROOT/$leader-$(date -u +%Y%m%dT%H%M%SZ)
+    mkdir -p -- "$LOG_DIR"
+    KEEP=${DSMR_BRINGUP_LOG_KEEP:-10}
+    find "$LOG_ROOT" -mindepth 1 -maxdepth 1 -type d -name "$leader-*" -print0 |
+        sort -z -r | tail -z -n +"$((KEEP + 1))" | xargs -0 -r rm -rf --
+    exec > >(tee -a "$LOG_DIR/sisters.log") 2>&1
+    printf 'sisters.sh: recording this bring-up in %s\n\n' "$LOG_DIR"
+    args+=(--session-log "$LOG_DIR")
+fi
+
 if [[ -x $PREFLIGHT && ${DSMR_SKIP_PREFLIGHT:-0} != 1 ]]; then
     preflight_args=(--fleet-dir "$FLEET_DIR")
     for n in "${MEMBERS[@]}"; do preflight_args+=(--repo "$n"); done
@@ -156,4 +175,6 @@ cd -- "$FLEET_DIR"
 if (($# == 1)); then
     printf '\nRead the lines above for "skip": a skipped repository did NOT start.\n'
     printf 'Then confirm the fleet by rollcall, not by counting tabs.\n'
+    printf '\nThis bring-up is recorded in %s\n' "$LOG_DIR"
+    printf 'Replay a session with: scriptreplay -T NAME.timing NAME.typescript\n'
 fi
