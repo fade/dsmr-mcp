@@ -67,12 +67,15 @@ case $leader in
         # bring-up and the roster read as complete. Bare --extra names resolve
         # against $LISP_WORKSPACE, so the case here must match the directory on
         # disk exactly or the launcher dies naming it.
+        #
+        # cl-kademlia lives in $LISP_WORKSPACE for the same reason and is named
+        # here for the same reason: the scan of FLEET_DIR cannot see it.
         FLEET_DIR=~/SourceCode/lisp/DeepSkyV2
-        args=(--extra Whistler --exclude meta-bridge --stagger 3-10)
+        args=(--extra Whistler,cl-kademlia --exclude meta-bridge --stagger 3-10)
         # Named for the host check, which needs to know whose .envrc consent to
         # verify. The scanned members are added below; these are the ones that
         # live outside FLEET_DIR and so cannot be found by looking.
-        MEMBERS=(Whistler)
+        MEMBERS=(Whistler cl-kademlia)
         SCAN_MEMBERS=1
         EXCLUDE_MEMBER=meta-bridge
         ;;
