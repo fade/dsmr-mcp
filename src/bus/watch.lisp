@@ -44,6 +44,13 @@
 ;;;; filter, fires on anything new, and says so on stderr. That is the whole of
 ;;;; the pre-identity behavior, kept working and made visible.
 
+;; The detached mode claims its pid file with a POSIX record lock and signals
+;; the watcher it reaps, and both are reached through sb-posix. The heartbeat
+;; leaf already requires it; requiring it here too keeps this file honest about
+;; what it uses rather than relying on load order.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-posix))
+
 (defpackage #:dsmr-bus-watch/src/bus/watch
   (:use #:cl)
   (:local-nicknames (#:envelope #:dsmr-mcp/src/bus/envelope)
@@ -595,6 +602,39 @@ Options:
                        how fresh a heartbeat must be to count as live under
                        --check-live (default 5). A live watch refreshes every
                        poll, so this need only exceed --poll-ms with some slack.
+  --detach             make sure a detached streaming watcher is running for the
+                       resolved identity and bus, then exit. Launch it once per
+                       session: it runs in its own session with stdin from
+                       /dev/null, survives the shell that started it, re-arms
+                       itself in place at every idle recycle, and appends its
+                       wake lines to
+                         $XDG_STATE_HOME/dsmr-mcp/watch/<bus>--<agent>.log
+                       beside a pid file of the same stem. Running it again while
+                       that watcher is up starts nothing. Prints
+                         detached pid=<pid> bus=<name> log=<path>
+                       (`running` in place of `detached` when one was already
+                       up) and then `monitor: <command>`, the tail to run under
+                       a persistent monitor. Exits 0, 1 when a watcher under the
+                       same name belongs to another namespace or the child did
+                       not come up, 2 when no identity resolves. The other watch
+                       flags (--poll-ms, --recycle-seconds, --wal, ...) pass
+                       through to the detached watcher.
+  --reap               stop the detached watcher for the resolved identity and
+                       bus, signalling its whole process group with SIGTERM and
+                       then SIGKILL after a grace period, and confirm the pid is
+                       gone. Prints one line per watcher (`reaped pid=<pid>
+                       bus=<name> signal=term|kill`, `none bus=<name>`,
+                       `survived pid=<pid> bus=<name>`, or `foreign ...` for a
+                       watcher under the same name in another namespace, which
+                       is left running) and exits 0 when none is left, 1
+                       otherwise.
+  --all-buses          with --reap, stop this agent's detached watchers on every
+                       bus rather than only the resolved one.
+  --stall-seconds N    end the watch with status 75 when its poll loop has not
+                       come round for N seconds, never less than ten poll
+                       intervals (default 120; 0 disables). A watch wedged on a
+                       write to a pipe nobody drains is otherwise alive and deaf
+                       for good.
   -h, --help           print this help and exit
 
 An unknown flag, or a flag with an unparseable value, is reported on STDERR and
@@ -612,6 +652,9 @@ While a watch runs it refreshes a heartbeat file every poll and removes it on
 clean exit; a dead watch leaves no fresh beat. --check-live reads that beat so a
 dead watch is distinguishable from a live one — the gap this closes is that a
 watch which stopped listening otherwise exits identically to one that never fired.
+
+SIGTERM ends a watch at once with status 143, removing its heartbeat and, for a
+detached watcher, its pid file.
 ")
 
 (defun %usage (&optional (stream *error-output*))
@@ -638,6 +681,11 @@ watch which stopped listening otherwise exits identically to one that never fire
   (recycle-seconds 600)
   (check-p nil)
   (live-window-seconds 5)
+  (detach-p nil)
+  (detached-child-p nil)
+  (reap-p nil)
+  (all-buses-p nil)
+  (stall-seconds 120)
   (help-p nil))
 
 (defun %parse-nonneg (string flag)
@@ -687,6 +735,18 @@ watch which stopped listening otherwise exits identically to one that never fire
                   (setf (opt-stream-p opts) t))
                  ((string= arg "--check-live")
                   (setf (opt-check-p opts) t))
+                 ((string= arg "--detach")
+                  (setf (opt-detach-p opts) t))
+                 ((string= arg "--detached-child")
+                  (setf (opt-detached-child-p opts) t
+                        (opt-stream-p opts) t))
+                 ((string= arg "--reap")
+                  (setf (opt-reap-p opts) t))
+                 ((string= arg "--all-buses")
+                  (setf (opt-all-buses-p opts) t))
+                 ((string= arg "--stall-seconds")
+                  (setf (opt-stall-seconds opts)
+                        (next-nonneg "--stall-seconds" (opt-stall-seconds opts))))
                  ((string= arg "--wal")
                   (setf (opt-wal opts) (or (next-value "--wal") (opt-wal opts))))
                  ((string= arg "--agent")
@@ -913,15 +973,500 @@ watch which stopped listening otherwise exits identically to one that never fire
         (force-output *standard-output*)
         (uiop:quit (if (eq status :live) 0 1)))))
 
+;;; ------------------------------------------------------ termination and stalls
+;;;
+;;; A watcher can wedge in one place: a write of a wake line to STDOUT. When the
+;;; monitor on the other end of that pipe stops reading but something still holds
+;;; the read end open, the pipe fills and the write blocks in the kernel for good.
+;;; Everything else stops with it. The recycle deadline is checked after the emit
+;;; returns, so it is never reached, and the heartbeat stops advancing. SBCL's
+;;; stock SIGTERM handler then makes matters worse: it exits by unwinding and
+;;; flushing the standard streams, and the flush blocks on the same full pipe, so
+;;; the process sits in the kernel ignoring the signal and only SIGKILL removes it.
+;;;
+;;; I handle both ends of that here. SIGTERM exits at once without touching the
+;;; output streams, and a watchdog thread ends a watch whose poll loop has not
+;;; come round for longer than any healthy poll can take. Both remove the files a
+;;; clean exit would have removed, so a liveness probe answers `dead` rather than
+;;; reading a beat left behind by a process that is gone.
+
+(defvar *last-poll-time* 0
+  "Internal real time at which the poll loop last came round. Written by the
+   poll thunk on the main thread and read by the stall watchdog.")
+
+(defvar *cleanup-paths* '()
+  "Files a watch removes however it ends: its heartbeat, and in detached mode its
+   pid file. Held here rather than in an UNWIND-PROTECT because the two exits
+   that matter most, SIGTERM and a stall, do not unwind.")
+
+(defun %note-poll ()
+  "Record that the poll loop came round just now."
+  (setf *last-poll-time* (get-internal-real-time)))
+
+(defun %emergency-cleanup ()
+  "Remove every file in *CLEANUP-PATHS*. Best-effort and silent: this runs on the
+   way out of a signal handler or a stalled process, where there is nobody left
+   to report a failure to and no stream that is safe to write on."
+  (dolist (path *cleanup-paths*)
+    (ignore-errors (when (probe-file path) (delete-file path)))))
+
+(defun %install-termination-handler ()
+  "Make SIGTERM end this process promptly, whatever it is doing.
+
+   The exit is an abort exit: no unwinding and no flush of the standard streams.
+   A graceful exit flushes STDOUT, and a STDOUT that is a full pipe nobody reads
+   is exactly the state in which a watcher most needs to be stopped. Every wake
+   line is already flushed as it is written, so aborting loses nothing. The exit
+   status is 143, the conventional one for a process ended by SIGTERM."
+  (sb-sys:enable-interrupt
+   sb-posix:sigterm
+   (lambda (signo context info)
+     (declare (ignore signo context info))
+     (%emergency-cleanup)
+     (sb-ext:exit :code 143 :abort t))))
+
+(defun %effective-stall-seconds (stall-seconds poll-ms)
+  "How long the poll loop may go without coming round before the watch counts as
+   wedged, or 0 when the watchdog is off. Never less than ten poll intervals, so
+   a slow cadence cannot read as a stall."
+  (if (zerop stall-seconds)
+      0
+      (max stall-seconds (ceiling (* 10 poll-ms) 1000))))
+
+(defun %stalled-p (now last stall-seconds)
+  "True when more than STALL-SECONDS separate LAST from NOW, both in internal
+   real time units."
+  (> (- now last) (* stall-seconds internal-time-units-per-second)))
+
+(defun %start-stall-watchdog (stall-seconds)
+  "Start a thread that ends this process with status 75 once the poll loop has
+   not come round for STALL-SECONDS. Does nothing when STALL-SECONDS is 0.
+
+   A wedged watch is worse than a dead one, because it holds its place: a live
+   pid, and for a detached watcher a pid file, that stop anything from starting
+   in its stead. Ending it turns silent deafness into an absence that a probe
+   reports and a re-arm repairs. The thread writes nothing on the way out, since
+   the stream the watch wedged on may be the only one it has."
+  (when (plusp stall-seconds)
+    (%note-poll)
+    (sb-thread:make-thread
+     (lambda ()
+       (loop
+         (sleep (max 0.2 (min 5 (/ stall-seconds 4))))
+         (when (%stalled-p (get-internal-real-time) *last-poll-time* stall-seconds)
+           (%emergency-cleanup)
+           (sb-ext:exit :code 75 :abort t))))
+     :name "dsmr-bus-watch stall watchdog")))
+
+;;; ----------------------------------------------------------- detached watchers
+;;;
+;;; A watcher run under a harness monitor lives exactly as long as the monitor
+;;; does, and every re-arm of the monitor is a fresh launch the harness may refuse.
+;;; A detached watcher is launched once per session instead. It runs in its own
+;;; session with no terminal, writes its wake lines to a log file, and re-arms
+;;; itself in place at each recycle, so the monitor becomes a plain tail of that
+;;; log and re-arming it launches nothing new.
+;;;
+;;; The pid file is claimed with a POSIX record lock that the detached watcher
+;;; holds for its whole life. The kernel drops the lock when the process dies,
+;;; however it dies, so the lock rather than the pid written in the file is what
+;;; says a watcher is running, and a pid recycled onto some other process after a
+;;; crash can never be mistaken for one.
+
+(defun %state-home ()
+  "$XDG_STATE_HOME as a directory, falling back to ~/.local/state/."
+  (let ((xdg (uiop:getenv "XDG_STATE_HOME")))
+    (if (and xdg (plusp (length xdg)))
+        (uiop:ensure-directory-pathname xdg)
+        (merge-pathnames ".local/state/" (user-homedir-pathname)))))
+
+(defun %detach-dir ()
+  "Where detached watchers keep their logs and pid files: dsmr-mcp/watch/ under
+   the state home. One directory for every bus, so a single tail over
+   *--<agent>.log follows an agent on all the buses it has joined."
+  (merge-pathnames "dsmr-mcp/watch/" (%state-home)))
+
+(defun %agent-name (self-id)
+  "The name part of the full bus id SELF-ID."
+  (nth-value 1 (envelope:split-agent-id self-id)))
+
+(defun %detach-stem (bus agent-name)
+  "The file stem for the detached watcher of AGENT-NAME on BUS:
+   <bus>--<agent>, with `default` standing for the unnamed bus."
+  (format nil "~A--~A" (%field-token (or bus "default")) (%field-token agent-name)))
+
+(defun %detach-file (stem type)
+  "The file STEM.TYPE in the detach directory, built from a native namestring so
+   nothing in an agent name can be read as a wildcard."
+  (uiop:parse-native-namestring
+   (concatenate 'string (uiop:native-namestring (%detach-dir)) stem "." type)))
+
+(defun %whole-file-lock (type)
+  "A lock record of TYPE covering the whole file."
+  (make-instance 'sb-posix:flock :type type :whence sb-posix:seek-set
+                                 :start 0 :len 0))
+
+(defun %lock-holder (path)
+  "The pid of the process holding the watcher lock on PATH, or NIL when nobody
+   holds it or PATH does not exist.
+
+   Never call this from the process that holds the lock. POSIX drops a process's
+   record locks on a file when it closes ANY descriptor for that file, and this
+   opens and closes one."
+  (let ((fd (ignore-errors (sb-posix:open (uiop:native-namestring path)
+                                          sb-posix:o-rdonly))))
+    (when fd
+      (unwind-protect
+           (ignore-errors
+            (let ((lock (%whole-file-lock sb-posix:f-wrlck)))
+              (sb-posix:fcntl fd sb-posix:f-getlk lock)
+              (unless (= (sb-posix:flock-type lock) sb-posix:f-unlck)
+                (sb-posix:flock-pid lock))))
+        (ignore-errors (sb-posix:close fd))))))
+
+(defun %pid-file-contents (path)
+  "The pid and the full bus id recorded in the pid file at PATH, as two values,
+   either of them NIL when absent. A file holding a bare pid, as a watcher
+   launched by hand from a shell writes, yields that pid and no id."
+  (let ((lines (ignore-errors (uiop:read-file-lines path))))
+    (values (and (first lines)
+                 (ignore-errors (parse-integer (first lines) :junk-allowed t)))
+            (let ((id (second lines)))
+              (and id (plusp (length id)) id)))))
+
+(defun %proc-file (pid name)
+  "The text of /proc/PID/NAME, or NIL where there is no such file."
+  (ignore-errors
+   (uiop:read-file-string (format nil "/proc/~D/~A" pid name))))
+
+(defun %pid-alive-p (pid)
+  "True when a process PID exists and is not a zombie. A process owned by another
+   user still counts: it exists, and it is not ours to reuse the slot of."
+  (and (handler-case (progn (sb-posix:kill pid 0) t)
+         (sb-posix:syscall-error (e)
+           (/= (sb-posix:syscall-errno e) sb-posix:esrch)))
+       (let ((stat (%proc-file pid "stat")))
+         ;; The state letter follows the parenthesised command name.
+         (not (and stat
+                   (let ((close (position #\) stat :from-end t)))
+                     (and close
+                          (< (+ close 2) (length stat))
+                          (char= (char stat (+ close 2)) #\Z))))))))
+
+(defun %looks-like-watcher-p (pid)
+  "True when PID's command line names this binary, or when there is no /proc to
+   ask. Only consulted for a pid file nobody holds a lock on, where the recorded
+   pid may since have been handed to some unrelated process."
+  (if (probe-file "/proc/self/")
+      (let ((cmdline (%proc-file pid "cmdline")))
+        (and cmdline (search "dsmr-bus-watch" cmdline) t))
+      t))
+
+(defun %live-detached-pid (pid-path)
+  "The pid of the detached watcher behind PID-PATH, or NIL when none is running.
+
+   The lock holder answers first. A pid file with no lock on it still counts when
+   its pid is alive and is plainly a watcher, which is how a watcher loop started
+   by hand from a shell shows up; leaving that one out would let --detach start a
+   second watcher beside it."
+  (or (%lock-holder pid-path)
+      (let ((pid (%pid-file-contents pid-path)))
+        (and pid (%pid-alive-p pid) (%looks-like-watcher-p pid) pid))))
+
+(defvar *pid-file-stream* nil
+  "The open stream on the pid file this detached watcher has claimed. Held for the
+   life of the process: closing it would drop the lock.")
+
+(defun %claim-pid-file (path self-id)
+  "Take the watcher lock on PATH for this process and record our pid and SELF-ID
+   in it. Returns true on success and NIL when another watcher already holds it,
+   or when the file names a live watcher started by hand that holds no lock.
+
+   The descriptor stays open for the life of the process, because the lock goes
+   with it. The contents are written through that same descriptor for the same
+   reason: POSIX drops a process's record locks on a file as soon as it closes
+   any descriptor for it, so the recorded pid is read before the lock is taken
+   and nothing opens the file again afterwards."
+  (ensure-directories-exist path)
+  (let ((recorded (%pid-file-contents path)))
+    (unless (and recorded (/= recorded (sb-posix:getpid))
+                 (%pid-alive-p recorded) (%looks-like-watcher-p recorded)
+                 (null (%lock-holder path)))
+      (let ((fd (sb-posix:open (uiop:native-namestring path)
+                               (logior sb-posix:o-creat sb-posix:o-rdwr) #o644)))
+        (handler-case
+            (progn
+              (sb-posix:fcntl fd sb-posix:f-setlk
+                              (%whole-file-lock sb-posix:f-wrlck))
+              (sb-posix:ftruncate fd 0)
+              (let ((stream (sb-sys:make-fd-stream fd :input t :output t
+                                                      :external-format :utf-8
+                                                      :buffering :full)))
+                (format stream "~D~%~A~%" (sb-posix:getpid) self-id)
+                (finish-output stream)
+                (setf *pid-file-stream* stream))
+              t)
+          (error ()
+            (ignore-errors (sb-posix:close fd))
+            nil))))))
+
+(defun %shell-quote (string)
+  "STRING quoted for a POSIX shell."
+  (with-output-to-string (out)
+    (write-char #\' out)
+    (loop for ch across string
+          do (if (char= ch #\')
+                 (write-string "'\\''" out)
+                 (write-char ch out)))
+    (write-char #\' out)))
+
+(defun %monitor-command (log-path)
+  "The command a harness monitor runs to follow LOG-PATH: new lines only, still
+   following when the file is replaced, filtered to the wake and error lines."
+  (format nil "tail -q -n0 -F ~A | grep --line-buffered -E '^(bus|error):'"
+          (%shell-quote (uiop:native-namestring log-path))))
+
+(defun %find-on-path (program)
+  "The full path of PROGRAM on $PATH, or NIL."
+  (dolist (dir (uiop:split-string (or (uiop:getenv "PATH") "") :separator ":"))
+    (when (plusp (length dir))
+      (let ((candidate (probe-file (concatenate 'string
+                                                (string-right-trim "/" dir)
+                                                "/" program))))
+        (when candidate (return (uiop:native-namestring candidate)))))))
+
+(defun %child-args (args bus self-id)
+  "The argument list for the detached child: ARGS without --detach, plus the bus
+   and the full identity this parent resolved.
+
+   Passing both explicitly is what frees the child from the parent's working
+   directory and environment. It runs from / and outlives the shell that started
+   it, so anything it inferred there would be inferred from the wrong place."
+  (append (remove "--detach" args :test #'string=)
+          (list "--detached-child" "--agent-id" self-id)
+          (and bus (list "--bus" bus))))
+
+(defun %spawn-detached (args log-path)
+  "Start this binary with ARGS in its own session, appending its output to
+   LOG-PATH, with stdin from /dev/null and / as its working directory. Returns
+   without waiting.
+
+   setsid(1) supplies the new session where it is installed, so the watcher has
+   no controlling terminal and nothing reaches it when the harness session ends.
+   Where it is not, the child still gets its own process group, which is what
+   --reap signals."
+  (let ((self (uiop:native-namestring sb-ext:*runtime-pathname*))
+        (setsid (%find-on-path "setsid")))
+    (ensure-directories-exist log-path)
+    (sb-ext:run-program (or setsid self)
+                        (if setsid (cons self args) args)
+                        :input nil
+                        :output (uiop:native-namestring log-path)
+                        :if-output-exists :append
+                        :error :output
+                        :directory "/"
+                        :wait nil)))
+
+(defun %detach (bus self-id args)
+  "Make sure a detached watcher is running for SELF-ID on BUS and print where to
+   follow it, then exit.
+
+   Idempotent. With a watcher already running for this identity, this reports it
+   and starts nothing, so running it on every bring-up is safe. A watcher running
+   under the same name for a DIFFERENT namespace is reported as a conflict and
+   left alone: it belongs to another agent.
+
+   Prints two lines on STDOUT, `running` in place of `detached` when a watcher
+   was already up:
+
+     detached pid=<pid> bus=<bus> log=<path>
+     monitor: <command>
+
+   and exits 0. Exits 1 on a conflict or when the child failed to come up, and 2
+   when no identity resolves, since a detached watcher is keyed on one."
+  (unless self-id
+    (%warn "--detach needs a resolved identity (pass --agent with --namespace, or ~
+            --agent-id); a detached watcher is keyed on it.")
+    (uiop:quit 2))
+  (let* ((stem (%detach-stem bus (%agent-name self-id)))
+         (log-path (%detach-file stem "log"))
+         (pid-path (%detach-file stem "pid"))
+         (label (or bus "default")))
+    (flet ((report (verb pid)
+             (format *standard-output* "~A pid=~D bus=~A log=~A~%monitor: ~A~%"
+                     verb pid label (uiop:native-namestring log-path)
+                     (%monitor-command log-path))
+             (force-output *standard-output*)
+             (uiop:quit 0)))
+      (let ((running (%live-detached-pid pid-path)))
+        (when running
+          (let ((recorded (nth-value 1 (%pid-file-contents pid-path))))
+            (when (and recorded (string/= recorded self-id))
+              (%warn "a detached watcher (pid ~D) already runs as ~A on bus ~A; ~
+                      not starting a second one under the same name"
+                     running recorded label)
+              (uiop:quit 1)))
+          (report "running" running)))
+      (%spawn-detached (%child-args args bus self-id) log-path)
+      (loop repeat 100
+            do (let ((pid (%lock-holder pid-path)))
+                 (when pid (report "detached" pid)))
+               (sleep 0.1))
+      (%warn "the detached watcher did not come up within 10s; see ~A"
+             (uiop:native-namestring log-path))
+      (uiop:quit 1))))
+
+(defun %run-detached (opts wal-path cursors-dir self-id first-baseline on-poll)
+  "The detached watcher's own loop: stream, and at every idle recycle re-arm in
+   place. Never returns.
+
+   Each cycle arms afresh from the agent's durable cursor, exactly as a watcher
+   relaunched by a monitor would, so a message the agent has not yet drained is
+   announced again at the next re-arm rather than depending on the one line that
+   first announced it having been seen. A cycle that fails is reported and
+   retried after a pause, because giving up would leave the agent deaf with its
+   pid file gone and nothing to say why. The same failure is put on STDOUT as an
+   `error:` line only once, so a persistent fault does not wake the agent every
+   few seconds."
+  (let ((baseline first-baseline)
+        (last-error nil))
+    (loop
+      (handler-case
+          (let ((cursor (watch-stream wal-path baseline
+                                      :poll-ms (opt-poll-ms opts)
+                                      :recycle-seconds (opt-recycle-seconds opts)
+                                      :self-id self-id
+                                      :on-poll on-poll)))
+            (setf last-error nil)
+            (%warn "recycle: idle window elapsed; re-arming in place")
+            (setf baseline (or (%cursor-baseline self-id wal-path cursors-dir)
+                               cursor)))
+        (error (e)
+          (let ((text (princ-to-string e)))
+            (%warn "watch cycle failed: ~A; re-arming in 5s" text)
+            (unless (equal text last-error)
+              (format *standard-output* "error: detached watcher: ~A~%"
+                      (substitute #\Space #\Newline text))
+              (force-output *standard-output*))
+            (setf last-error text))
+          (%note-poll)
+          (sleep 5)
+          (setf baseline (or (ignore-errors
+                              (%cursor-baseline self-id wal-path cursors-dir))
+                             baseline)))))))
+
+(defun %reap-one (pid-path bus self-id &key (grace-seconds 3))
+  "Stop the detached watcher behind PID-PATH and print one line saying what
+   happened. Returns true when no watcher is left running there.
+
+   The whole process group is signalled when the watcher leads one, which is
+   what takes down a hand-started shell loop along with the watcher inside it.
+   SIGTERM comes first, then SIGKILL after GRACE-SECONDS, and the answer is
+   decided by whether the pid is actually gone, not by which signal was sent.
+
+   A watcher recorded under a different full id is left running and reported:
+   it shares the name but belongs to an agent in another namespace."
+  (let ((label (or bus "default"))
+        (pid (%live-detached-pid pid-path))
+        (recorded (nth-value 1 (%pid-file-contents pid-path))))
+    (labels ((say (control &rest args)
+               (format *standard-output* "~?~%" control args)
+               (force-output *standard-output*))
+             (group-empty-p (pgid)
+               (handler-case (progn (sb-posix:kill (- pgid) 0) nil)
+                 (sb-posix:syscall-error () t)))
+             (gone-p (group-p)
+               (and (not (%pid-alive-p pid))
+                    (or (not group-p) (group-empty-p pid))))
+             (send (target signal)
+               (handler-case (progn (sb-posix:kill target signal) t)
+                 (sb-posix:syscall-error () nil)))
+             (await (group-p tenths)
+               (loop repeat tenths
+                     until (gone-p group-p)
+                     do (sleep 0.1))
+               (gone-p group-p)))
+      (cond
+        ((null pid)
+         (ignore-errors (when (probe-file pid-path) (delete-file pid-path)))
+         (say "none bus=~A" label)
+         t)
+        ((and recorded self-id (string/= recorded self-id))
+         (say "foreign pid=~D bus=~A id=~A" pid label recorded)
+         nil)
+        (t
+         (let* ((group-p (eql (ignore-errors (sb-posix:getpgid pid)) pid))
+                (target (if group-p (- pid) pid))
+                (how "term"))
+           (send target sb-posix:sigterm)
+           (unless (await group-p (* 10 grace-seconds))
+             (setf how "kill")
+             (send target sb-posix:sigkill)
+             (await group-p 20))
+           (cond ((gone-p group-p)
+                  (ignore-errors
+                   (when (probe-file pid-path) (delete-file pid-path)))
+                  (say "reaped pid=~D bus=~A signal=~A" pid label how)
+                  t)
+                 (t
+                  (say "survived pid=~D bus=~A" pid label)
+                  nil))))))))
+
+(defun %reap-targets (bus agent-name all-buses-p)
+  "The pid files --reap acts on, each paired with the bus it belongs to: the one
+   for AGENT-NAME on BUS, or with ALL-BUSES-P every pid file in the detach
+   directory that belongs to AGENT-NAME."
+  (if all-buses-p
+      (let ((suffix (concatenate 'string "--" (%field-token agent-name))))
+        (loop for path in (directory (merge-pathnames
+                                      (make-pathname :name :wild :type "pid")
+                                      (%detach-dir)))
+              for stem = (pathname-name path)
+              when (and (> (length stem) (length suffix))
+                        (string= suffix stem
+                                 :start2 (- (length stem) (length suffix))))
+                collect (let ((token (subseq stem 0 (- (length stem)
+                                                       (length suffix)))))
+                          (cons path (if (string= token "default") nil token)))))
+      (list (cons (%detach-file (%detach-stem bus agent-name) "pid") bus))))
+
+(defun %reap (opts bus self-id)
+  "Stop this agent's detached watcher on BUS, or with --all-buses on every bus,
+   then exit 0 when none is left running and 1 otherwise. For use at park, so a
+   parked agent leaves nothing listening under its name.
+
+   Prints one line per pid file: `reaped pid=<pid> bus=<bus> signal=term|kill`,
+   `none bus=<bus>`, `survived pid=<pid> bus=<bus>`, or `foreign pid=<pid>
+   bus=<bus> id=<id>` for a watcher that shares the name but not the namespace."
+  (unless self-id
+    (%warn "--reap needs a resolved identity (pass --agent with --namespace, or ~
+            --agent-id).")
+    (uiop:quit 2))
+  (let ((targets (%reap-targets bus (%agent-name self-id) (opt-all-buses-p opts)))
+        (clean t))
+    (if (null targets)
+        (format *standard-output* "none bus=*~%")
+        (dolist (target targets)
+          (unless (%reap-one (car target) (cdr target) self-id)
+            (setf clean nil))))
+    (force-output *standard-output*)
+    (uiop:quit (if clean 0 1))))
+
 (defun main ()
   "Entry point. Parse argv, resolve who this watch is for, arm a baseline, and
-   watch — or, under --check-live, report the running watch's heartbeat and exit
+   watch; or, under --check-live, report the running watch's heartbeat and exit
    without watching. Signal lines go to *standard-output*; usage, diagnostics,
    and errors go to *error-output*. Exit 0 on a fired/recycled watch or a live
    heartbeat, 1 on a stale/absent heartbeat, 2 on a liveness probe with no
-   resolvable identity, 64 on an unrecoverable failure. A bad flag is not one,
-   and neither is an unresolvable identity for a watch; an unusable bus name is,
+   resolvable identity, 64 on an unrecoverable failure, 75 when the watch
+   wedged, and 143 on SIGTERM. A bad flag is not an unrecoverable failure, and
+   neither is an unresolvable identity for a watch; an unusable bus name is,
    because the alternative is a watch armed on a bus nobody is talking on.
+
+   --detach and --reap start and stop a detached watcher and exit; neither
+   watches in this process. The detached watcher itself runs this same entry
+   point with --detached-child, claims its pid file before anything else, and
+   then streams and re-arms in place for as long as it lives.
 
    Which bus this watch arms on is resolved first, and every default path below
    hangs off it: the write-ahead log it reads, the cursor it arms from, and the
@@ -929,14 +1474,16 @@ watch which stopped listening otherwise exits identically to one that never fire
    wins, so the overrides an operator already uses keep working.
 
    The heartbeat is written under the watch's own identity: while the watch runs
-   it refreshes a beat file every poll, and an UNWIND-PROTECT removes that file
-   on fire, recycle, AND error, so an absent beat means `not running` and a
-   stale one means `died without unwinding`. With no identity resolved there is
-   no stable key to write a beat under, so the watch runs without one — liveness
-   observability is the one thing that requires the identity the healthy fleet
-   already uses, and --check-live says so rather than pretending otherwise."
+   it refreshes a beat file every poll, and it is removed on fire, recycle,
+   error, SIGTERM and a stall, so an absent beat means `not running` and a stale
+   one means `died without cleaning up`. A detached watcher keeps its beat across
+   its in-place re-arms, so a probe never catches it between cycles and reads
+   `dead`. With no identity resolved there is no stable key to write a beat
+   under, so the watch runs without one; --check-live says so rather than
+   pretending otherwise."
   (handler-case
-      (let ((opts (%parse-args (uiop:command-line-arguments))))
+      (let* ((args (uiop:command-line-arguments))
+             (opts (%parse-args args)))
         (when (opt-help-p opts)
           (%usage)
           (uiop:quit 0))
@@ -952,28 +1499,53 @@ watch which stopped listening otherwise exits identically to one that never fire
                (beat-path (and self-id (heartbeat:beat-path self-id watch-dir))))
           (when (opt-check-p opts)
             (%check-live self-id beat-path (opt-live-window-seconds opts) bus))
+          (when (opt-reap-p opts)
+            (%reap opts bus self-id))
+          (when (and (opt-detach-p opts) (not (opt-detached-child-p opts)))
+            (%detach bus self-id args))
+          (%install-termination-handler)
+          (when (opt-detached-child-p opts)
+            (ignore-errors (sb-posix:setsid))
+            (sb-sys:enable-interrupt sb-posix:sighup :ignore)
+            (let ((pid-path (%detach-file (%detach-stem bus (%agent-name self-id))
+                                          "pid")))
+              (unless (%claim-pid-file pid-path self-id)
+                (%warn "another detached watcher already holds ~A; exiting"
+                       (uiop:native-namestring pid-path))
+                (uiop:quit 0))
+              (push pid-path *cleanup-paths*)
+              (%warn "detached watcher pid ~D armed for ~A on bus ~A"
+                     (sb-posix:getpid) self-id (or bus "default"))))
+          (when beat-path (push beat-path *cleanup-paths*))
           (let* ((baseline (%resolve-baseline opts self-id wal-path cursors-dir))
                  (poll-ms (opt-poll-ms opts))
                  (recycle-seconds (opt-recycle-seconds opts))
                  (mode (if (opt-stream-p opts) :stream :event)))
+            (%start-stall-watchdog
+             (%effective-stall-seconds (opt-stall-seconds opts) poll-ms))
             (flet ((beat ()
+                     (%note-poll)
                      (when beat-path
                        (heartbeat:write-beat beat-path :mode mode :baseline baseline
                                                        :poll-ms poll-ms))))
               (unwind-protect
-                   (if (opt-stream-p opts)
-                       (progn
-                         (watch-stream wal-path baseline
-                                       :poll-ms poll-ms :recycle-seconds recycle-seconds
-                                       :self-id self-id :on-poll #'beat)
-                         (%warn "recycle: idle window elapsed; exiting for supervised re-arm"))
-                       (let ((fired (watch-until-foreign wal-path baseline
-                                                         :poll-ms poll-ms
-                                                         :recycle-seconds recycle-seconds
-                                                         :self-id self-id
-                                                         :on-poll #'beat)))
-                         (if fired (%signal-seq fired) (%signal-recycle))))
-                (when beat-path (heartbeat:remove-beat beat-path))))
+                   (cond
+                     ((opt-detached-child-p opts)
+                      (%run-detached opts wal-path cursors-dir self-id baseline
+                                     #'beat))
+                     ((opt-stream-p opts)
+                      (watch-stream wal-path baseline
+                                    :poll-ms poll-ms :recycle-seconds recycle-seconds
+                                    :self-id self-id :on-poll #'beat)
+                      (%warn "recycle: idle window elapsed; exiting for supervised re-arm"))
+                     (t
+                      (let ((fired (watch-until-foreign wal-path baseline
+                                                        :poll-ms poll-ms
+                                                        :recycle-seconds recycle-seconds
+                                                        :self-id self-id
+                                                        :on-poll #'beat)))
+                        (if fired (%signal-seq fired) (%signal-recycle)))))
+                (%emergency-cleanup)))
             (uiop:quit 0))))
     (error (e)
       (format *error-output* "dsmr-bus-watch: ~A~%" e)
