@@ -64,17 +64,12 @@ written:   <ISO-8601>
      outside git: no diff, no revert), always leave a pointer, and move content **by line range
      rather than retyping it** so rulings stay byte-exact.
 
-4. **Reap your detached bus watcher**, on every bus you joined:
-
-```
-~/.local/bin/dsmr-bus-watch --reap --all-buses --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
-```
-
-   ⛔ **The detached watcher OUTLIVES the session.** That is what lets it survive the Monitor's
-   30-minute expiry, and it is also why a restart does not stop it: an unreaped watcher is a
-   listener nobody reads, still answering `--check-live` with `live` for an agent that is gone.
-   It exits 0 only when nothing of yours is left. On exit 1 (`survived …` or `foreign …`), put
-   that in `PARK.md`'s `blocked:` line instead of parking on it silently.
+4. **Leave your detached bus watcher RUNNING. PARK DOES NOT REAP** (operator ruling, 2026-09-30).
+   The watcher outlives the session by design: at bring-up, `--detach` answers `running` and adopts
+   it, and the new session re-arms only its background `--wake`. While you are down it answers
+   `--check-live` with `live … readers=0` — running, nobody listening — which is what parked
+   means; the bus holds your mail on your cursor. ⛔ Do not run `--reap` here. `--reap` is for an
+   agent LEAVING the fleet (`bus-leave`, disenrollment) or retiring a host; see **bus-watch**.
 
 5. Send the leader **exactly one line**: `PARKED <repo> @<short-sha>`
 
@@ -129,17 +124,21 @@ re-announces.
    5–10 until `remaining_pending` reads 0. If a receive errors, read the spill file before moving
    on: the cursor advances on delivery.
 3. Arm the standing listener: `~/.local/bin/dsmr-bus-watch --detach --bus <TAG> --agent
-   "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/` **once**, then a persistent Monitor
-   tailing the log it names (re-armed, tail only, on each 30-minute expiry; see **bus-watch**).
+   <your-name> --namespace <absolute-project-root>/` **once** (expect `running`: the watcher
+   survived the park and is adopted), then the background Bash (`run_in_background`) wake,
+   `~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <your-name> --namespace
+   <absolute-project-root>/`, re-armed only after each wake (drain, re-arm; see **bus-watch**).
    Then **confirm it with `~/.local/bin/dsmr-bus-watch --check-live --bus <TAG> --agent
-   "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/`**. It must print `live` and
-   `bus=<TAG>`. Bringing the leader up deaf leaves the
+   <your-name> --namespace <absolute-project-root>/`**. It must print `live`, `bus=<TAG>` and
+   `readers=1` or more. Bringing the leader up deaf leaves the
    whole fleet talking to no one.
 4. **Read `.planning/STATE.md` and `.planning/ROADMAP.md` before anything else.** State the phase
    number you are resuming under.
 5. Expect a quiet bus. Workers are not up. Do not block on them.
 6. As each worker checks in, confirm its live HEAD against its `PARK.md`. **A mismatch is a STOP —
-   reconcile before any work.**
+   reconcile before any work.** Then run the reader check for it (`--check-live --bus <TAG>
+   --agent <sister> --namespace <sister-root>/`; see **leader**). `readers=0` once it has
+   announced is a deaf sister: surface it to the operator, who must type in its terminal.
 7. Collect every `BLOCKED.md` across the fleet into your first reply to the operator.
 
 ### Worker
@@ -149,9 +148,10 @@ re-announces.
 3. Read **your own** `.planning/PARK.md`. Check out its `branch`; confirm `git rev-parse HEAD`
    equals its `sha`. **Mismatch ⇒ stop and report; do not work.**
 4. Send **one line**: `RESUMED <repo> @<short-sha>`
-5. Arm your watch (`--detach` once, then the Monitor tailing its log) and **confirm it with
-   `--check-live` (must print `live` and your `bus=`) before going silent.** **Go silent.** Await dispatch by
-   name. A worker that goes silent on a `dead`/`stale` watch is deaf to its own
+5. Arm your watch (`--detach` once, which adopts the watcher your park left running, then the
+   background `--wake`) and **confirm it with `--check-live` (must print `live`, your `bus=`, and
+   `readers=1` or more) before going silent.** **Go silent.** Await dispatch by
+   name. A worker that goes silent on a `dead`/`stale` or `readers=0` watch is deaf to its own
    dispatch, and no one learns until the operator notices the wait.
 
 ⛔ **Bring-up is the checklist above and nothing else.** Do not explore the tooling, do not report
@@ -181,18 +181,23 @@ not summarise last session — it is in your files.
   identity is `valis`. ⚠ `bus-status` is a **timestamp, not an inventory** — it counts your own
   publishes while delivery filters them, so never reconcile a drain against it; page on
   `remaining_pending`.
-- Watch: `~/.local/bin/dsmr-bus-watch --detach --bus <TAG> --agent "$DSMR_BUS_AGENT" --namespace
-  <absolute-project-root>/` once per session, then a persistent Monitor over `tail -q -n0 -F
-  ~/.local/state/dsmr-mcp/watch/<TAG>--<agent>.log | grep --line-buffered -E "^(bus|error):"` is
-  the standing listener; re-arm only the tail when the Monitor expires at 30 minutes. The re-arm
-  used to be a fresh watcher launch the permission classifier could refuse, which is how agents
-  went deaf on 2026-09-29; now it is a read-only tail. ⛔ **The recycle is required, not
-  decoration.** `--stream` exits 0 on its idle window as a self-heal, and Monitor ends a watch
-  when its command exits, so a bare watcher goes deaf at the first idle mark while still reporting
-  armed. `--detach` carries that recycle itself; the `while true … --stream --recycle-seconds 1800`
-  loop is a fallback only when `--detach` is unavailable (`make install-bus-watch` first). See the
-  **bus-watch** skill for the full form. Reap with `--reap --all-buses` at park. Confirm liveness with
-  `~/.local/bin/dsmr-bus-watch --check-live --bus <TAG> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/`. Require `live` before you
-  report ready, never `dead`/`stale`.
+- Watch: `~/.local/bin/dsmr-bus-watch --detach --bus <TAG> --agent <name> --namespace
+  <absolute-project-root>/` once per session per bus (answers `detached` or `running`), then the
+  standing listener is a background Bash (`run_in_background`) command,
+  `~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <name> --namespace
+  <absolute-project-root>/`, which exits on the next message; drain every bus, then re-arm the
+  same line. On `nowatcher` (exit 1) re-run `--detach`, then re-arm. The literal path matches the
+  narrow Bash allow rule, which resolves before the classifier. ⛔ **Not the Monitor:** Monitor
+  allow rules are dropped in auto mode (it runs through the shell) and it expires every 30
+  minutes, so each re-arm faced the classifier and an outage left agents deaf with their watcher
+  live (2026-09-29, established 2026-09-30). ⛔ **The recycle is required, not decoration.**
+  `--stream` exits 0 on its idle window as a self-heal, so a bare watcher goes deaf at the first
+  idle mark while still reporting armed. `--detach` carries that recycle itself; the `while true
+  … --stream --recycle-seconds 1800` Monitor loop is a last-resort fallback only for a binary
+  without `--wake` (`make install-bus-watch` first). See the **bus-watch** skill for the full form.
+  **Park does not reap**; `--reap --all-buses` is for leaving the fleet or retiring a host.
+  Confirm liveness with `~/.local/bin/dsmr-bus-watch --check-live --bus <TAG> --agent <name>
+  --namespace <absolute-project-root>/`. Require `live`, the right `bus=` and `readers=1` or more
+  before you report ready, never `dead`/`stale`/`readers=0`.
 - Boot: `fs-set-project-root {"path":"."}` → `load-system {"system":"<sys>"}`.
 - Park state: `.planning/PARK.md` per repo. Blocks: `.planning/BLOCKED.md` per repo.

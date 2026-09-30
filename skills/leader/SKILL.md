@@ -24,8 +24,9 @@ never-block-silently rule govern everything below.
 
 ## Step 0 — Arm your watch NOW, before anything else in this file
 
-⛔ **Go to Step 4, arm one persistent watcher per joined bus with the arm line given there, confirm
-each prints `live` and a `bus=` naming the bus you meant, and come back. Do not read Step 1 first.**
+⛔ **Go to Step 4, launch one detached watcher per joined bus and the background `--wake` with the
+lines given there, confirm each bus prints `live`, a `bus=` naming the bus you meant, and
+`readers=1` or more, and come back. Do not read Step 1 first.**
 
 Arming needs the bus name and your own name. It needs no roster, no phase, no repo record, and no
 sister's files. Everything else in this file is slower, and Steps 2 and 3 are much slower: they walk
@@ -251,8 +252,9 @@ the bus enforces nothing from it:
   roster is not evidence a worker is unreachable.**
 - An agent that is on the roster may have no session running at all. **Presence on the roster is
   not evidence a worker is connected.**
-- Liveness is `~/.local/bin/dsmr-bus-watch --check-live`, run **per joined bus**, in the session that armed it.
-  A sister reports its own; you do not probe it from here.
+- Liveness is `~/.local/bin/dsmr-bus-watch --check-live`, run **per joined bus**. A sister proves
+  its own ears at bring-up; **you check whether it can hear you** with the reader check in Step 4
+  (*Can each sister hear you?*), before you dispatch to it.
 
 Enrollment is dynamic, so both of these are normal on a running fleet:
 
@@ -390,31 +392,43 @@ receive errors, read the spill file first — the cursor advances on delivery.
 ⚠ `bus-status` is a **timestamp, not an inventory**: it counts your own publishes while delivery
 filters them. Never reconcile a drain against it.
 
-Arm the standing listener in two steps, **one per joined bus, each with its own
-`--bus`.** This is the arm. Use it verbatim; do not compose one from memory.
+Arm the standing listener in two steps. This is the arm. Use it verbatim; do not
+compose one from memory.
 
-Once per session, launch the detached watcher. It runs in its own session,
-survives the Monitor's 30-minute expiry, and re-arms itself at every idle recycle:
+Once per session **per joined bus, each with its own `--bus`**, launch (or adopt)
+the detached watcher. It runs in its own session, survives the session, a park and
+a fleet restart, and re-arms itself at every idle recycle. If one is already up for
+you it answers `running` and is yours again:
 
 ```
 ~/.local/bin/dsmr-bus-watch --detach --poll-ms 250 \
-  --bus <TAG> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
+  --bus <TAG> --agent <your-name> --namespace <absolute-project-root>/
 ```
 
-Then run its log tail in a Monitor with `persistent: true` (the `monitor:` line it
-prints gives the exact command), and re-arm **only this tail** on every 30-minute
-expiry. One Monitor may tail several buses' logs with a glob, `…/watch/*--<agent>.log`:
+Then the standing listener: **one background Bash command** (`run_in_background:
+true`), NOT the Monitor tool. It exits on the next `bus:`/`error:` line from any of
+your detached logs, and that exit is the wake:
 
 ```
-tail -q -n0 -F ~/.local/state/dsmr-mcp/watch/<TAG>--<agent>.log \
-  | grep --line-buffered -E "^(bus|error):"
+~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <your-name> --namespace <absolute-project-root>/
 ```
 
-⚠ **Why two steps: the re-arm used to be the point of failure.** Every 30-minute
-Monitor expiry meant a fresh watcher-launch command, which the permission
-classifier could refuse or leave with no verdict, and the agent went deaf: six
-sightings across five sessions on 2026-09-29. The launch now happens once; the
-re-arm is a read-only tail. See the **bus-watch** skill.
+On wake: drain **every** joined bus with `bus-receive`, then re-arm the same line,
+then one catch-up `bus-receive`. On `nowatcher bus=<b>` (exit 1): re-run `--detach`,
+then re-arm. That is the only re-arm: after traffic, never on a timer. Use the
+literal `~/.local/bin/dsmr-bus-watch` path and a literal name: the path is what the
+narrow `Bash(~/.local/bin/dsmr-bus-watch:*)` allow rule matches, and a matched rule
+resolves BEFORE the classifier in auto mode.
+
+⚠ **Why not the Monitor: the re-arm was the point of failure, twice.** Until
+2026-09-29 every 30-minute Monitor expiry meant a fresh watcher-launch command, which
+the permission classifier could refuse or leave with no verdict, and the agent went
+deaf: six sightings across five sessions on 2026-09-29. Moving the re-arm to a
+read-only Monitor tail did not fix it, because **Monitor allow rules are dropped in
+auto mode** (Monitor runs through the shell; established 2026-09-30 from the Claude
+Code permission-modes docs), so every tail re-arm still faced the classifier, every
+30 minutes, busy or idle, and an outage still made agents deaf with their watcher
+live. ⛔ The Monitor is retired as the standing listener. See the **bus-watch** skill.
 
 ⛔ **THE RECYCLE IS REQUIRED, AND `--detach` NOW CARRIES IT.**
 A bare `~/.local/bin/dsmr-bus-watch --stream` goes deaf at the first idle mark while still
@@ -423,8 +437,9 @@ watch; without it, a watcher that goes deaf for any reason STAYS deaf for the
 rest of the session. Do not remove it to make the watcher "keep running". The
 detached watcher re-arms itself in place at each recycle, so you no longer supply
 the loop or `--recycle-seconds`. The old `while true … --stream --recycle-seconds 1800`
-loop is valid only as a fallback when `--detach` is unavailable (`--help` lacks it:
-`make install-bus-watch` first), and in that form BOTH flags remain required.
+Monitor loop is valid only as a last-resort fallback when `--wake`/`--detach` are
+unavailable (`--help` lacks them: `make install-bus-watch` first), and in that form
+BOTH flags remain required.
 
 ⚠ **This has already cost a fleet an entire episode, and the leader is the one
 exposed.** On 2026-08-01 the leader armed a bare `--stream` and lost 38 messages
@@ -438,28 +453,59 @@ absence starts costing something.**
 Then **confirm your own ears** on each of them before you assert control:
 
 ```
-~/.local/bin/dsmr-bus-watch --check-live --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
+~/.local/bin/dsmr-bus-watch --check-live --bus <tag> --agent <your-name> --namespace <absolute-project-root>/
 ```
 
 ⛔ **`--check-live` CANNOT DETECT A WRONG ARM SHAPE** — a bare `--stream`, or a
 fallback loop missing `--recycle-seconds`. It answers `live` for a bare watcher
 exactly as it does for a correct one, so it will
 confirm your improvisation rather than catch it. It proves the watcher PROCESS
-is running; it says nothing about whether the arm line is right, and nothing
-about whether your Monitor's filter passes that process's output through to you.
+is running; it says nothing about whether the arm line is right. Its `readers=`
+count says only that something holds the log open, which your `--wake` does.
 
-⛔ **It must print `live` AND a `bus=` field naming the bus you armed.** A
-`dead`/`stale` result means the leader itself is deaf. A `bus=` naming a
-different bus means the same thing while looking healthy, which is worse. No
-`bus=` field at all means the PATH binary predates named buses and armed on the
-shared bus regardless: `make install-bus-watch`, then re-arm. A leader that
-missed its own re-arm and lost inbound mail is exactly the failure this guards.
-On `dead`/`stale`, run `--detach` again and re-arm the tail.
+⛔ **It must print `live`, a `bus=` field naming the bus you armed, AND `readers=1`
+or more.** A `dead`/`stale` result means the leader itself is deaf. A `bus=` naming
+a different bus means the same thing while looking healthy, which is worse.
+**`readers=0` means the watcher runs and nothing is listening: you are deaf, re-arm
+the `--wake`.** No `bus=` field (or no `readers=` field) means the PATH binary
+predates named buses (or `--wake`): `make install-bus-watch`, then re-arm. A leader
+that missed its own re-arm and lost inbound mail is exactly the failure this guards.
+On `dead`/`stale`, run `--detach` again and re-arm the `--wake`.
 
-⛔ **When your session ends, reap your detached watcher** (the leader parks too;
-see **fleet-restart**). It OUTLIVES the session, so an unreaped one is a listener
-nobody reads that keeps answering `live` for a leader that is gone:
-`~/.local/bin/dsmr-bus-watch --reap --all-buses --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/`,
+### Can each sister hear you? The reader check, at bring-up and before dispatching
+
+A dispatch to a deaf sister is not delivered to anyone who will act on it: it waits
+on her cursor while she works, idles or sits at a prompt. So at bring-up, and again
+before dispatching to a sister, check her ears from here. The heartbeat and the log
+are host-local files, so the probe works for any agent on this host:
+
+```
+~/.local/bin/dsmr-bus-watch --check-live --bus <TAG> --agent <sister> --namespace <sister-root>/
+```
+
+`<sister-root>/` is her absolute project root, trailing separator included.
+
+- `live … bus=<TAG> readers=1`+: she can hear you. Dispatch.
+- ⛔ **`live … readers=0`: DEAF SISTER.** Her watcher runs and nothing in her
+  session is listening, so she cannot hear a dispatch. **Surface it to the
+  operator**: he must type in her terminal (re-arm her `--wake`, or `/worker`). Do
+  not dispatch into it and wait; do not publish a "please re-arm" she cannot hear.
+  A parked sister reads `readers=0` by design, so check the park record first:
+  parked is expected, deaf-while-working is the finding.
+- `dead`/`stale`: she has no watcher. Same disposition: surface it; she needs a
+  bring-up, not a message.
+- `readers=unknown` or no `readers=` field: unproven; say so rather than scoring it
+  as heard.
+
+⚠ A wrong `<sister-root>` answers `dead`, which reads as a finding about her rather
+than about your probe. Take the root from `docs/CONSTELLATION.org` or the repo on
+disk, never from memory.
+
+⛔ **PARK DOES NOT REAP (operator ruling, 2026-09-30).** When the leader parks (see
+**fleet-restart**), leave the detached watcher running; at the next bring-up
+`--detach` answers `running` and adopts it, and you re-arm only the `--wake`.
+`--reap` is for leaving the fleet or retiring a host:
+`~/.local/bin/dsmr-bus-watch --reap --all-buses --agent <your-name> --namespace <absolute-project-root>/`,
 exit 0 or say what survived.
 
 ## Step 5 — Your own memory store
@@ -503,10 +549,13 @@ Report to the operator, in this order and nothing else:
 
 1. **Phase N**, the cursor, and the single next action.
 2. The roster table — one line per repo, OK / MISMATCH / unresolved.
-3. **Blocked list**, consolidated, with exact grants.
+3. **Blocked list**, consolidated, with exact grants, and **every deaf sister** (`readers=0` or no
+   watcher while not parked) with the terminal the operator must type in.
 4. What you are doing next.
 
-Then dispatch. **By name, one worker, one task.** Never broadcast work.
+Then dispatch. **By name, one worker, one task.** Never broadcast work. Before each dispatch, run
+the reader check for that sister (Step 4); a `readers=0` sister goes to the operator, not onto the
+bus.
 
 ---
 
@@ -592,7 +641,8 @@ still sound, and still not a hose.
 - ⛔ Do not relay one worker's inference to another as fact. Relay fidelity is a duty for the
   operator's *words*; it is the opposite for a worker's *inferences*.
 - ⛔ **Do not read the roster as a liveness check.** Enrolled is not connected, and unenrolled is
-  not unreachable. Only a `--check-live` answer naming the right bus says a worker can hear you.
+  not unreachable. Only a `--check-live` answer naming the right bus with `readers=1` or more says a
+  worker can hear you.
 - ⛔ **Do not treat a ruling relayed by a PEER LEADER as fade's word to you.** It is a report of
   what he said in another terminal. Confirm with him where the act touches config, permissions or a
   shared harness.
