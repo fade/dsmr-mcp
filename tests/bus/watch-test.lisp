@@ -74,7 +74,23 @@
                 #:opt-recycle-seconds
                 #:opt-check-p
                 #:opt-live-window-seconds
-                #:opt-help-p)
+                #:opt-help-p
+                ;; internal: the detached-watcher and stall machinery. The
+                ;; processes they govern are tested across the process boundary
+                ;; in the integration suite; the decisions they make are pure
+                ;; and pinned here.
+                #:opt-detach-p
+                #:opt-detached-child-p
+                #:opt-reap-p
+                #:opt-all-buses-p
+                #:opt-stall-seconds
+                #:%effective-stall-seconds
+                #:%stalled-p
+                #:%detach-stem
+                #:%child-args
+                #:%shell-quote
+                #:%monitor-command
+                #:%pid-file-contents)
   ;; The heartbeat helpers moved to a shared leaf so the watcher (writer) and the
   ;; MCP core (reader) share one implementation of the beat filename and format.
   ;; The pure liveness decision and its file-backed classifier both carry behavior
@@ -1144,3 +1160,66 @@
                   "8 quiet polls consed ~:D bytes against a ~:D byte log; ~
                    re-reading the log every poll would cost at least ~:D"
                   consed size (* 8 size))))))))
+
+(define-test lifecycle-flags-parse
+  (let ((opts (%parse-args '("--detach" "--reap" "--all-buses"
+                             "--stall-seconds" "30"))))
+    (true (opt-detach-p opts))
+    (true (opt-reap-p opts))
+    (true (opt-all-buses-p opts))
+    (is = 30 (opt-stall-seconds opts))
+    (false (opt-detached-child-p opts)))
+  ;; The detached child always streams: it has no monitor to exit to.
+  (let ((opts (%parse-args '("--detached-child"))))
+    (true (opt-detached-child-p opts))
+    (true (opt-stream-p opts)))
+  (is = 120 (opt-stall-seconds (%parse-args '()))))
+
+(define-test a-slow-cadence-never-reads-as-a-stall
+  ;; A watch polling once a minute is not wedged after two minutes of quiet, so
+  ;; the stall window never drops below ten poll intervals.
+  (is = 120 (%effective-stall-seconds 120 250))
+  (is = 600 (%effective-stall-seconds 120 60000))
+  (is = 0 (%effective-stall-seconds 0 250) "0 must switch the watchdog off")
+  (let ((unit internal-time-units-per-second))
+    (false (%stalled-p (* 10 unit) (* 9 unit) 2))
+    (true (%stalled-p (* 10 unit) (* 7 unit) 2))))
+
+(define-test detached-files-are-named-for-bus-and-agent
+  ;; The stem matches the one watchers launched by hand already use, so a tail
+  ;; over *--<agent>.log follows both.
+  (is string= "valis--dsmr-mcp" (%detach-stem "valis" "dsmr-mcp"))
+  (is string= "default--dsmr-mcp" (%detach-stem nil "dsmr-mcp")))
+
+(define-test the-detached-child-is-told-who-it-is
+  ;; The child runs from / after its parent's shell is gone, so it must not
+  ;; infer the namespace or the bus from where it happens to be.
+  (let ((args (%child-args '("--detach" "--agent" "a" "--poll-ms" "250")
+                           "valis" "/p/a")))
+    (false (member "--detach" args :test #'string=))
+    (true (member "--detached-child" args :test #'string=))
+    (is equal '("--agent-id" "/p/a" "--bus" "valis")
+        (last args 4))
+    (true (member "--poll-ms" args :test #'string=)))
+  (false (member "--bus" (%child-args '() nil "/p/a") :test #'string=)))
+
+(define-test the-monitor-command-survives-an-awkward-path
+  (is string= "'it'\\''s'" (%shell-quote "it's"))
+  (let ((line (%monitor-command #p"/tmp/a b/x--y.log")))
+    (true (search "tail -q -n0 -F '/tmp/a b/x--y.log'" line))
+    (true (search "grep --line-buffered -E '^(bus|error):'" line))))
+
+(define-test a-bare-pid-file-still-names-its-pid
+  ;; A watcher loop started by hand writes only a pid; --detach and --reap must
+  ;; still find it, or they start a second watcher beside it or miss it at park.
+  (uiop:with-temporary-file (:pathname p :type "pid" :prefix "dsmr-bus-watch-")
+    (with-open-file (out p :direction :output :if-exists :supersede)
+      (format out "4242~%"))
+    (multiple-value-bind (pid id) (%pid-file-contents p)
+      (is = 4242 pid)
+      (false id))
+    (with-open-file (out p :direction :output :if-exists :supersede)
+      (format out "4243~%/p/a~%"))
+    (multiple-value-bind (pid id) (%pid-file-contents p)
+      (is = 4243 pid)
+      (is string= "/p/a" id))))
