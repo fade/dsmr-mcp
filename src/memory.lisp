@@ -217,17 +217,263 @@ recurse. A missing store yields no pages."
               (nreverse skipped)
               (length (ignore-errors (uiop:subdirectories dir)))))))
 
+;;; ---------------------------------------------------------------------------
+;;; Frontmatter
+;;;
+;;; The reader is line oriented and deliberately lenient. Real pages carry
+;;; plain values with an embedded ": " or a "#", which a strict YAML parser
+;;; rejects or truncates, and a page with broken frontmatter must still be
+;;; readable as body. It never signals.
+;;; ---------------------------------------------------------------------------
+
+(defparameter *frontmatter-scan-limit* 200
+  "How many lines to look through for the closing delimiter before deciding
+the page has no frontmatter.")
+
+(defun %split-lines (text)
+  "Split TEXT into a list of lines, dropping a trailing carriage return from
+each. A final newline does not produce an extra empty line."
+  (let ((lines '())
+        (start 0)
+        (len (length text)))
+    (loop for pos = (position #\Newline text :start start)
+          while pos
+          do (push (subseq text start pos) lines)
+             (setf start (1+ pos)))
+    (when (< start len)
+      (push (subseq text start) lines))
+    (mapcar (lambda (line)
+              (if (and (plusp (length line))
+                       (char= #\Return (char line (1- (length line)))))
+                  (subseq line 0 (1- (length line)))
+                  line))
+            (nreverse lines))))
+
+(defun %trim (string)
+  "STRING without surrounding spaces and tabs."
+  (string-trim '(#\Space #\Tab) string))
+
+(defun %unquote-double (string)
+  "The value of the double-quoted scalar STRING, which starts with a quote.
+Handles the escapes real pages use; an unknown escape is kept as written and
+a missing closing quote takes the rest of the line."
+  (with-output-to-string (out)
+    (let ((i 1)
+          (len (length string)))
+      (loop while (< i len)
+            do (let ((c (char string i)))
+                 (cond ((char= c #\")
+                        (return))
+                       ((and (char= c #\\) (< (1+ i) len))
+                        (let ((next (char string (1+ i))))
+                          (incf i 2)
+                          (case next
+                            (#\n (write-char #\Newline out))
+                            (#\t (write-char #\Tab out))
+                            (#\r (write-char #\Return out))
+                            ((#\" #\\ #\/) (write-char next out))
+                            (#\u
+                             (let ((code (and (<= (+ i 4) len)
+                                              (parse-integer string :start i :end (+ i 4)
+                                                                    :radix 16 :junk-allowed t))))
+                               (if code
+                                   (progn (write-char (code-char code) out)
+                                          (incf i 4))
+                                   (write-string "\\u" out))))
+                            (t (write-char #\\ out)
+                               (write-char next out)))))
+                       (t (write-char c out)
+                          (incf i))))))))
+
+(defun %unquote-single (string)
+  "The value of the single-quoted scalar STRING, which starts with a quote.
+A doubled quote stands for one quote; a missing closing quote takes the rest."
+  (with-output-to-string (out)
+    (let ((i 1)
+          (len (length string)))
+      (loop while (< i len)
+            do (let ((c (char string i)))
+                 (cond ((and (char= c #\') (< (1+ i) len)
+                             (char= #\' (char string (1+ i))))
+                        (write-char #\' out)
+                        (incf i 2))
+                       ((char= c #\')
+                        (return))
+                       (t (write-char c out)
+                          (incf i))))))))
+
+(defun %scalar-value (raw)
+  "The string value of the scalar text RAW, or NIL when it is empty. Quoted
+scalars are unquoted; a plain scalar is taken whole, with no comment
+stripping, because real values contain a # that is part of the text."
+  (let ((s (and raw (%trim raw))))
+    (cond ((or (null s) (zerop (length s))) nil)
+          ((char= #\" (char s 0)) (%unquote-double s))
+          ((char= #\' (char s 0)) (%unquote-single s))
+          (t s))))
+
+(defun %parse-flow-list (raw)
+  "The items of the flow sequence RAW, written [a, b], as a list of strings."
+  (let* ((s (%trim raw))
+         (close (position #\] s :from-end t))
+         (inner (subseq s 1 (or close (length s)))))
+    (remove nil (mapcar #'%scalar-value (split "," inner)))))
+
+(defun %item-line-p (trimmed)
+  "True when TRIMMED is a block sequence item such as - value."
+  (or (string= "-" trimmed)
+      (and (> (length trimmed) 1) (string= "- " trimmed :end2 2))))
+
+(defun %parse-entries (lines)
+  "Read frontmatter LINES into a list of entries (KEY KIND DATA). KIND is
+:SCALAR with the raw value text, :SEQ with a list of raw item texts, :MAP with
+an alist of subkey to raw value text, or :EMPTY for a key with nothing under
+it. A key with an empty value opens a block one level deep; lines that fit no
+shape are ignored."
+  (let ((entries '())
+        (open nil))
+    (dolist (line lines (nreverse entries))
+      (let ((trimmed (%trim line)))
+        (cond
+          ((zerop (length trimmed)))
+          ((and open
+                (%item-line-p trimmed)
+                (member (second open) '(:empty :seq)))
+           (setf (second open) :seq)
+           (setf (third open) (append (third open) (list (subseq trimmed 1)))))
+          ((member (char line 0) '(#\Space #\Tab))
+           (let ((colon (position #\: trimmed)))
+             (when (and open colon (plusp colon)
+                        (member (second open) '(:empty :map)))
+               (setf (second open) :map)
+               (push (cons (%trim (subseq trimmed 0 colon))
+                           (subseq trimmed (1+ colon)))
+                     (third open)))))
+          ((char= #\# (char line 0)))
+          (t
+           (let ((colon (position #\: line)))
+             (setf open nil)
+             (when (and colon (plusp colon))
+               (let* ((key (%trim (subseq line 0 colon)))
+                      (rest (subseq line (1+ colon)))
+                      (entry (if (zerop (length (%trim rest)))
+                                 (list key :empty nil)
+                                 (list key :scalar rest))))
+                 (push entry entries)
+                 (when (eq :empty (second entry))
+                   (setf open entry)))))))))))
+
+(defun %entry (key entries)
+  "The last entry for KEY in ENTRIES, or NIL."
+  (find key entries :key #'first :test #'string= :from-end t))
+
+(defun %entry-string (key entries)
+  "The string value of the scalar entry for KEY, or NIL."
+  (let ((entry (%entry key entries)))
+    (and entry (eq :scalar (second entry)) (%scalar-value (third entry)))))
+
+(defun %status-from-raw (raw)
+  "A status list from the raw scalar text RAW: a flow list gives its items, a
+single value gives a one-element list. Values are kept exactly as written,
+because a value this reader does not know must still reach whoever reads the
+result."
+  (let ((s (and raw (%trim raw))))
+    (cond ((or (null s) (zerop (length s))) nil)
+          ((char= #\[ (char s 0)) (%parse-flow-list s))
+          (t (let ((value (%scalar-value s)))
+               (and value (list value)))))))
+
+(defun %entries-status (entries)
+  "The status list from ENTRIES: the top-level status key first, falling back
+to a status key inside the metadata block."
+  (let ((top (%entry "status" entries))
+        (metadata (%entry "metadata" entries)))
+    (cond ((and top (eq :scalar (second top)))
+           (%status-from-raw (third top)))
+          ((and top (eq :seq (second top)))
+           (remove nil (mapcar #'%scalar-value (third top))))
+          ((and metadata (eq :map (second metadata)))
+           (%status-from-raw
+            (cdr (assoc "status" (third metadata) :test #'string=)))))))
+
 (defun parse-frontmatter (text)
-  (declare (ignore text))
-  (values nil 1))
+  "Read the frontmatter of page TEXT. Returns two values: a plist
+(:FRONTMATTER-P :NAME :DESCRIPTION :STATUS :STATUS-REASON :UPDATED) and the
+1-based line number of the first body line. Frontmatter exists only when line
+1 is --- and a closing --- or ... follows within the scan limit; otherwise the
+whole text is body. STATUS is a list of the values exactly as written, or NIL
+when the page states none. The harness's own metadata block is read for a
+status fallback only; its modified time is the harness's write time, not the
+author's update time, so it is not reported as UPDATED. Never signals."
+  (flet ((no-frontmatter ()
+           (values (list :frontmatter-p nil :name nil :description nil
+                         :status nil :status-reason nil :updated nil)
+                   1)))
+    (handler-case
+        (let* ((lines (%split-lines text))
+               (delimiter-p (lambda (line)
+                              (member (string-right-trim '(#\Space #\Tab) line)
+                                      '("---" "...") :test #'string=)))
+               (close (and lines
+                           (string= "---" (string-right-trim '(#\Space #\Tab)
+                                                             (first lines)))
+                           (position-if delimiter-p lines
+                                        :start 1
+                                        :end (min (length lines)
+                                                  (1+ *frontmatter-scan-limit*))))))
+          (if (null close)
+              (no-frontmatter)
+              (let ((entries (%parse-entries (subseq lines 1 close))))
+                (values (list :frontmatter-p t
+                              :name (%entry-string "name" entries)
+                              :description (%entry-string "description" entries)
+                              :status (%entries-status entries)
+                              :status-reason (%entry-string "status_reason" entries)
+                              :updated (%entry-string "updated" entries))
+                        (+ close 2)))))
+      (error () (no-frontmatter)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Pages
+;;; ---------------------------------------------------------------------------
 
 (defstruct (memory-page (:conc-name page-))
+  "One memory page as read from disk. LINES holds every line of the file,
+frontmatter included, so a line number counts from the top of the file and an
+agent can open the file at it. BODY-START is the 1-based first body line."
   file store name description status status-reason updated lines body-start)
 
 (defun read-memory-page (path store-name &key (max-chars 262144))
-  (declare (ignore path store-name max-chars))
-  (values nil nil))
+  "Read the page at PATH, which belongs to the store STORE-NAME. Returns two
+values: a MEMORY-PAGE, or NIL when the file cannot be read, and true when the
+read stopped at MAX-CHARS characters. Invalid UTF-8 is replaced rather than
+refused, and the size cap keeps one oversized page from stalling a search.
+The name falls back to the filename stem."
+  (handler-case
+      (with-open-file (in path :external-format '(:utf-8 :replacement #\?))
+        (let* ((buffer (make-string max-chars))
+               (count (read-sequence buffer in))
+               (capped (and (= count max-chars)
+                            (peek-char nil in nil nil)
+                            t))
+               (text (subseq buffer 0 count)))
+          (multiple-value-bind (plist body-start) (parse-frontmatter text)
+            (values (make-memory-page
+                     :file path
+                     :store store-name
+                     :name (or (getf plist :name) (pathname-name path))
+                     :description (getf plist :description)
+                     :status (getf plist :status)
+                     :status-reason (getf plist :status-reason)
+                     :updated (getf plist :updated)
+                     :lines (coerce (%split-lines text) 'simple-vector)
+                     :body-start body-start)
+                    capped))))
+    (error () (values nil nil))))
 
 (defun retired-status-p (status-list)
-  (declare (ignore status-list))
-  nil)
+  "True when STATUS-LIST holds obsolete, superseded or refuted in any letter
+case: the values that say a page should no longer be relied on."
+  (some (lambda (status)
+          (member status '("obsolete" "superseded" "refuted") :test #'string-equal))
+        status-list))
