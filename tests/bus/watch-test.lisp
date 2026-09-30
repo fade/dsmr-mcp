@@ -90,7 +90,18 @@
                 #:%child-args
                 #:%shell-quote
                 #:%monitor-command
-                #:%pid-file-contents)
+                #:%pid-file-contents
+                ;; internal: the log follower behind --wake and the reader
+                ;; count behind --check-live. Both are decisions about files
+                ;; that the test image can make and check directly; the
+                ;; binary's use of them is covered in the integration suite.
+                #:opt-wake-p
+                #:make-follower
+                #:fol-stream
+                #:%follow-open
+                #:%follow-lines
+                #:%wake-wait
+                #:%log-readers)
   ;; The heartbeat helpers moved to a shared leaf so the watcher (writer) and the
   ;; MCP core (reader) share one implementation of the beat filename and format.
   ;; The pure liveness decision and its file-backed classifier both carry behavior
@@ -1223,3 +1234,172 @@
     (multiple-value-bind (pid id) (%pid-file-contents p)
       (is = 4243 pid)
       (is string= "/p/a" id))))
+
+;;; waking on a detached log ------------------------------------------------------
+
+(defun append-log-line (path text)
+  "Append TEXT and a newline to the log at PATH, creating it when absent."
+  (with-open-file (out path :direction :output :if-exists :append
+                            :if-does-not-exist :create)
+    (write-line text out)))
+
+(defun call-with-temp-logs (count thunk)
+  "Call THUNK with COUNT fresh, empty log paths, and remove them afterwards."
+  (let ((paths (loop repeat count
+                     collect (uiop:with-temporary-file
+                                 (:pathname p :keep t :type "log"
+                                  :prefix "dsmr-bus-watch-wake-")
+                               p))))
+    (unwind-protect (apply thunk paths)
+      (dolist (p paths) (ignore-errors (delete-file p))))))
+
+(defun append-later (path text &optional (delay 0.3))
+  "Append TEXT to the log at PATH from another thread after DELAY seconds."
+  (sb-thread:make-thread (lambda () (sleep delay) (append-log-line path text))
+                         :name "wake test writer"))
+
+(define-test a-wake-returns-the-next-line-and-never-an-old-one
+  ;; The agent re-arms after every drain, so a line it has already acted on
+  ;; must never wake it a second time.
+  (call-with-temp-logs
+   1 (lambda (log)
+       (append-log-line log "bus:1 from=old")
+       (append-log-line log "error: an old fault")
+       (append-later log "bus:2 from=new")
+       (multiple-value-bind (outcome line bus)
+           (%wake-wait (list (list "dt" log nil)) 20
+                       :watcher-alive-p (constantly t) :deadline-ms 5000)
+         (is eq :event outcome)
+         (is equal "bus:2 from=new" line)
+         (is equal "dt" bus)))))
+
+(define-test a-wake-skips-lines-that-are-not-events
+  ;; The watcher's stderr lands in the same log; its diagnostics must not wake.
+  (call-with-temp-logs
+   1 (lambda (log)
+       (append-log-line log "bus:1")
+       (append-later log "dsmr-bus-watch: recycle: idle window elapsed" 0.1)
+       (append-later log "error: detached watcher: fault" 0.4)
+       (multiple-value-bind (outcome line)
+           (%wake-wait (list (list nil log nil)) 20
+                       :watcher-alive-p (constantly t) :deadline-ms 5000)
+         (is eq :event outcome)
+         (is equal "error: detached watcher: fault" line)))))
+
+(define-test a-wake-with-no-watcher-says-so-instead-of-waiting
+  ;; A log nothing writes to would hold the wait for ever. The deadline here is
+  ;; only a backstop for the test: the answer must come before it.
+  (call-with-temp-logs
+   2 (lambda (a b)
+       (let ((started (get-internal-real-time)))
+         (multiple-value-bind (outcome line bus)
+             (%wake-wait (list (list "one" a "a.pid") (list "two" b "b.pid")) 20
+                         :watcher-alive-p (lambda (pid-path)
+                                            (string= pid-path "a.pid"))
+                         :deadline-ms 3000)
+           (is eq :no-watcher outcome)
+           (false line)
+           (is equal "two" bus "the answer must name the bus with no watcher"))
+         (true (< (- (get-internal-real-time) started)
+                  internal-time-units-per-second)
+               "a missing watcher was not reported at once")))))
+
+(define-test a-wake-notices-its-watcher-stopping-while-it-waits
+  (call-with-temp-logs
+   1 (lambda (log)
+       (let ((alive t))
+         (sb-thread:make-thread (lambda () (sleep 0.3) (setf alive nil)))
+         (multiple-value-bind (outcome line bus)
+             (%wake-wait (list (list "dt" log nil)) 20
+                         :watcher-alive-p (lambda (pid-path)
+                                            (declare (ignore pid-path))
+                                            alive)
+                         :deadline-ms 3000)
+           (declare (ignore line))
+           (is eq :no-watcher outcome)
+           (is equal "dt" bus))))))
+
+(define-test a-wake-over-several-logs-returns-from-whichever-gets-a-line
+  (call-with-temp-logs
+   3 (lambda (a b c)
+       (dolist (log (list a b c)) (append-log-line log "bus:1 from=old"))
+       (append-later b "bus:7 from=sister")
+       (multiple-value-bind (outcome line bus)
+           (%wake-wait (list (list "one" a nil) (list "two" b nil)
+                             (list nil c nil))
+                       20 :watcher-alive-p (constantly t) :deadline-ms 5000)
+         (is eq :event outcome)
+         (is equal "bus:7 from=sister" line)
+         (is equal "two" bus)))))
+
+(define-test a-followed-log-survives-truncation-and-replacement
+  ;; A half-written line at the arm is not an event, a truncated log is read
+  ;; again from the top, and a log replaced under its name is finished first and
+  ;; then followed into the new file.
+  (call-with-temp-logs
+   2 (lambda (log replacement)
+       (with-open-file (out log :direction :output :if-exists :supersede)
+         (write-string "bus:1 half" out))
+       (let ((fol (make-follower :path log)))
+         (%follow-open fol t)
+         (is equal '() (%follow-lines fol))
+         (with-open-file (out log :direction :output :if-exists :append)
+           (format out "-written~%bus:2~%"))
+         (is equal '("bus:2") (%follow-lines fol)
+             "the tail of a line begun before the arm came back as a line")
+         (with-open-file (out log :direction :io :if-exists :overwrite)
+           (sb-posix:ftruncate (sb-sys:fd-stream-fd out) 0))
+         (append-log-line log "bus:3")
+         (is equal '("bus:3") (%follow-lines fol) "a truncated log went unread")
+         (append-log-line replacement "bus:5")
+         (append-log-line log "bus:4")
+         (rename-file replacement log)
+         (is equal '("bus:4" "bus:5") (%follow-lines fol)
+             "a replaced log was not finished and then followed")
+         (let ((stream (fol-stream fol)))
+           (when stream (close stream)))))))
+
+(define-test the-reader-count-sees-a-tail-and-not-a-writer
+  ;; readers=0 beside a live watcher is how a deaf agent is spotted, so a writer
+  ;; must never count and a follower always must.
+  (call-with-temp-logs
+   1 (lambda (log)
+       (append-log-line log "bus:1")
+       (if (eq :unknown (%log-readers log))
+           (skip "no /proc on this host; the reader count answers unknown")
+           (let ((path (uiop:native-namestring log))
+                 (tail nil)
+                 (writer nil))
+             (unwind-protect
+                  (progn
+                    (is eql 0 (%log-readers log))
+                    (setf writer (sb-ext:run-program
+                                  "/bin/sh"
+                                  (list "-c" (format nil "exec sleep 30 >> '~A'" path))
+                                  :wait nil))
+                    (setf tail (sb-ext:run-program "tail" (list "-f" path)
+                                                   :search t :wait nil
+                                                   :output nil))
+                    (sleep 0.3)
+                    (is eql 1 (%log-readers log) "the tail was not counted, or the writer was")
+                    (is eql 0 (%log-readers log (list (sb-ext:process-pid tail)))
+                        "an excluded pid was still counted")
+                    (sb-ext:process-kill tail sb-posix:sigterm)
+                    (sb-ext:process-wait tail)
+                    (setf tail nil)
+                    (is eql 0 (%log-readers log)))
+               (dolist (p (list tail writer))
+                 (when (and p (sb-ext:process-alive-p p))
+                   (sb-ext:process-kill p sb-posix:sigkill)
+                   (sb-ext:process-wait p)))))))))
+
+(define-test the-liveness-line-appends-its-reader-count-last
+  ;; Fields already on the line keep their places, so a probe parsing it by
+  ;; position is unaffected.
+  (is string= "live pid=42 age_s=1 bus=dt readers=0"
+      (%liveness-line :live 1 42 "dt" 0))
+  (is string= "stale pid=42 age_s=9 bus=default readers=2"
+      (%liveness-line :stale 9 42 nil 2))
+  (is string= "dead bus=dt readers=unknown"
+      (%liveness-line :dead nil nil "dt" :unknown))
+  (true (opt-wake-p (%parse-args '("--wake")))))
