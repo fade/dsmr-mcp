@@ -24,7 +24,16 @@
                 #:repository-root
                 #:project-store-directory
                 #:memory-page-path
-                #:list-store-pages)
+                #:list-store-pages
+                #:parse-frontmatter
+                #:read-memory-page
+                #:page-store
+                #:page-name
+                #:page-description
+                #:page-status
+                #:page-lines
+                #:page-body-start
+                #:retired-status-p)
   (:import-from #:dsmr-mcp/src/project-root
                 #:allowed-read-path)
   (:import-from #:dsmr-mcp/tests/support/fs-fixture
@@ -211,3 +220,131 @@ through their own check only."
     (let ((session-root (%dir tmp "proj/"))
           (page (write-fixture-file tmp "projects/s/memory/a.md" "a")))
       (false (allowed-read-path page session-root)))))
+
+;;; frontmatter ---------------------------------------------------------------
+
+(defun %page (&rest lines)
+  "Join LINES into page text, each line ending in a newline."
+  (format nil "~{~A~%~}" lines))
+
+(defparameter *frontmatter-rows*
+  (list
+   (list "nested metadata block with a trailing space after the key"
+         (%page "---" "name: fleet" "description: \"a quoted one\"" "metadata: "
+                "  type: project" "  modified: 2026-08-30T18:25:10.000Z" "---" "" "Body")
+         '(:frontmatter-p t :name "fleet" :description "a quoted one"
+           :status nil :updated nil)
+         8)
+   (list "double-quoted escapes"
+         (%page "---"
+                "description: \"say \\\"hi\\\" \\\\ a\\nb\\tc \\/ \\u00e9\""
+                "---" "Body")
+         (list :description (format nil "say \"hi\" \\ a~%b~Cc / ~C"
+                                    #\Tab (code-char 233)))
+         4)
+   (list "single-quoted doubling"
+         (%page "---" "description: 'it''s fine'" "---" "Body")
+         '(:description "it's fine")
+         4)
+   (list "plain value holding a colon and space"
+         (%page "---" "description: a: b" "---" "Body")
+         '(:description "a: b")
+         4)
+   (list "plain value holding a hash"
+         (%page "---" "description: see #42" "---" "Body")
+         '(:description "see #42")
+         4)
+   (list "block list status"
+         (%page "---" "status:" "  - superseded" "  - disputed" "---" "Body")
+         '(:status ("superseded" "disputed"))
+         6)
+   (list "scalar status"
+         (%page "---" "status: obsolete" "---" "Body")
+         '(:status ("obsolete"))
+         4)
+   (list "flow list status"
+         (%page "---" "status: [provisional, disputed]" "---" "Body")
+         '(:status ("provisional" "disputed"))
+         4)
+   (list "status inside the metadata block"
+         (%page "---" "name: n" "metadata:" "  status: refuted" "---" "Body")
+         '(:status ("refuted"))
+         6)
+   (list "unrecognised status kept verbatim"
+         (%page "---" "status: banana" "---" "Body")
+         '(:status ("banana"))
+         4)
+   (list "status reason and update time"
+         (%page "---" "status: superseded" "status_reason: Replaced by x."
+                "updated: '2026-09-29T21:15:00Z'" "---" "Body")
+         '(:status ("superseded") :status-reason "Replaced by x."
+           :updated "2026-09-29T21:15:00Z")
+         6)
+   (list "unterminated frontmatter"
+         (%page "---" "name: x" "body text")
+         '(:frontmatter-p nil :name nil :status nil)
+         1)
+   (list "no frontmatter"
+         (%page "# Title" "text")
+         '(:frontmatter-p nil :status nil)
+         1)
+   (list "frontmatter that is not valid YAML"
+         (%page "---" "name: [unclosed" "\"stray" "---" "Body")
+         '(:frontmatter-p t :name "[unclosed" :status nil)
+         5))
+  "Rows of (label page-text expected-plist-subset expected-body-start).")
+
+(define-test frontmatter-reads-real-shapes
+  "Every frontmatter shape found on real pages parses leniently: status comes
+from the top level or the metadata block as a verbatim list, plain values are
+kept whole, and a missing or broken block leaves the whole file as body. A
+page without a status never reports one, and never the word current."
+  (dolist (row *frontmatter-rows*)
+    (destructuring-bind (label text expected body-start) row
+      (multiple-value-bind (plist start) (parse-frontmatter text)
+        (loop for (key value) on expected by #'cddr
+              do (is equal value (getf plist key) "~A: ~S" label key))
+        (is eql body-start start "~A: body start" label)
+        (unless (getf expected :status)
+          (false (find "current"
+                       (loop for value in plist
+                             when (stringp value) collect value
+                             when (consp value) append value)
+                       :test #'equalp)
+                 "~A: no invented status" label))))))
+
+(define-test read-memory-page-line-numbers
+  "Page lines cover the whole file, so the body start indexes the first body
+line; the name falls back to the filename stem; an oversized page is read up
+to the cap and says so."
+  (with-memory-fixture (tmp)
+    (let ((path (write-fixture-file tmp "projects/s/memory/stem.md"
+                                    (%page "---" "description: d" "---"
+                                           "First body line" "second"))))
+      (multiple-value-bind (page capped) (read-memory-page path "s")
+        (true page)
+        (false capped)
+        (is = 4 (page-body-start page))
+        (is string= "First body line" (aref (page-lines page) (1- (page-body-start page))))
+        (is = 5 (length (page-lines page)))
+        (is string= "stem" (page-name page))
+        (is string= "d" (page-description page))
+        (is string= "s" (page-store page))
+        (false (page-status page))))
+    (let ((big (write-fixture-file tmp "projects/s/memory/big.md"
+                                   (make-string 1000 :initial-element #\x))))
+      (multiple-value-bind (page capped) (read-memory-page big "s" :max-chars 100)
+        (true page)
+        (true capped)))
+    (false (read-memory-page (merge-pathnames "projects/s/memory/absent.md" tmp) "s"))))
+
+(define-test retired-status-recognised
+  "Obsolete, superseded and refuted retire a page in any letter case; the
+provisional and disputed values, no status, and an unknown value do not."
+  (true (retired-status-p '("obsolete")))
+  (true (retired-status-p '("Superseded")))
+  (true (retired-status-p '("disputed" "REFUTED")))
+  (false (retired-status-p '("provisional")))
+  (false (retired-status-p '("disputed")))
+  (false (retired-status-p nil))
+  (false (retired-status-p '("banana"))))

@@ -18,7 +18,21 @@
            #:repository-root
            #:project-store-directory
            #:memory-page-path
-           #:list-store-pages))
+           #:list-store-pages
+           #:parse-frontmatter
+           #:read-memory-page
+           #:memory-page
+           #:memory-page-p
+           #:page-file
+           #:page-store
+           #:page-name
+           #:page-description
+           #:page-status
+           #:page-status-reason
+           #:page-updated
+           #:page-lines
+           #:page-body-start
+           #:retired-status-p))
 
 (in-package #:dsmr-mcp/src/memory)
 
@@ -202,3 +216,18 @@ recurse. A missing store yields no pages."
       (values (mapcar #'cdr (sort pages #'string< :key #'car))
               (nreverse skipped)
               (length (ignore-errors (uiop:subdirectories dir)))))))
+
+(defun parse-frontmatter (text)
+  (declare (ignore text))
+  (values nil 1))
+
+(defstruct (memory-page (:conc-name page-))
+  file store name description status status-reason updated lines body-start)
+
+(defun read-memory-page (path store-name &key (max-chars 262144))
+  (declare (ignore path store-name max-chars))
+  (values nil nil))
+
+(defun retired-status-p (status-list)
+  (declare (ignore status-list))
+  nil)
