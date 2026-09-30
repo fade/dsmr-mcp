@@ -598,6 +598,12 @@ Options:
                        the resolved bus on every answer, printing `default` for
                        the shared host-wide one, so a watcher that is live on
                        the wrong bus is readable rather than invisible.
+                       The live, stale and dead lines end with ` readers=<n>`:
+                       how many processes other than the watcher hold its
+                       detached log open for reading (`readers=unknown` where
+                       /proc cannot say). `live ... readers=0` means the
+                       watcher is listening and nothing is following its log,
+                       so the agent it serves cannot hear it.
   --live-window-seconds N
                        how fresh a heartbeat must be to count as live under
                        --check-live (default 5). A live watch refreshes every
@@ -628,8 +634,24 @@ Options:
                        watcher under the same name in another namespace, which
                        is left running) and exits 0 when none is left, 1
                        otherwise.
+  --wake               do not watch; wait for the next `bus:` or `error:` line
+                       to reach the detached log for the resolved identity and
+                       bus, print that line to STDOUT exactly as the watcher
+                       wrote it, and exit 0. Lines already in the log are never
+                       reported; a log that is rotated or truncated is followed
+                       onto its new contents. Run it as a background command
+                       with no time limit and run it again after each drain.
+                       While it waits it holds the log open, so it counts as a
+                       reader under --check-live. When no detached watcher is
+                       running for a bus it would wait on, at the start or
+                       while waiting, it prints `nowatcher bus=<name>` and exits
+                       1, so start one with --detach and wake again. Exits 2
+                       when no identity resolves, 143 on SIGTERM.
   --all-buses          with --reap, stop this agent's detached watchers on every
-                       bus rather than only the resolved one.
+                       bus rather than only the resolved one. With --wake, wait
+                       on the log of every detached watcher this agent has a
+                       pid file for and return the first line any of them gets
+                       (`nowatcher bus=*` when it has none).
   --stall-seconds N    end the watch with status 75 when its poll loop has not
                        come round for N seconds, never less than ten poll
                        intervals (default 120; 0 disables). A watch wedged on a
@@ -685,6 +707,7 @@ detached watcher, its pid file.
   (detached-child-p nil)
   (reap-p nil)
   (all-buses-p nil)
+  (wake-p nil)
   (stall-seconds 120)
   (help-p nil))
 
@@ -744,6 +767,8 @@ detached watcher, its pid file.
                   (setf (opt-reap-p opts) t))
                  ((string= arg "--all-buses")
                   (setf (opt-all-buses-p opts) t))
+                 ((string= arg "--wake")
+                  (setf (opt-wake-p opts) t))
                  ((string= arg "--stall-seconds")
                   (setf (opt-stall-seconds opts)
                         (next-nonneg "--stall-seconds" (opt-stall-seconds opts))))
@@ -918,7 +943,7 @@ detached watcher, its pid file.
                   filter on this agent's own publishes."))
         (%last-seq wal-path))))
 
-(defun %liveness-line (status age pid bus)
+(defun %liveness-line (status age pid bus &optional readers)
   "The one status line --check-live prints for STATUS, as a string with no
    trailing newline. Pure: it prints nothing and exits nothing, so the answer
    can be read directly rather than inferred from a process.
@@ -931,14 +956,28 @@ detached watcher, its pid file.
    unambiguous as a literal because the bus refuses it as a name, so the word
    can only ever mean the unnamed bus.
 
+   READERS, when given, is appended last as `readers=<n>`, or `readers=unknown`
+   for :UNKNOWN: how many processes other than the watcher hold its detached log
+   open for reading. It goes after every existing field so a reader parsing the
+   line by position keeps working. `live ... readers=0` is the answer that
+   matters: the watcher is listening and nothing is following what it writes, so
+   the agent it serves cannot hear it.
+
    The `unknown` answer deliberately has no case here. It is printed when no
    identity resolves, and a bus name printed beside an unresolved identity would
    read as a probe that found something."
-  (let ((label (or bus "default")))
-    (ecase status
-      (:live  (format nil "live pid=~A age_s=~A bus=~A" (or pid "?") age label))
-      (:stale (format nil "stale pid=~A age_s=~A bus=~A" (or pid "?") age label))
-      (:dead  (format nil "dead bus=~A" label)))))
+  (let ((label (or bus "default"))
+        (suffix (if readers
+                    (format nil " readers=~A"
+                            (if (eq readers :unknown) "unknown" readers))
+                    "")))
+    (concatenate
+     'string
+     (ecase status
+       (:live  (format nil "live pid=~A age_s=~A bus=~A" (or pid "?") age label))
+       (:stale (format nil "stale pid=~A age_s=~A bus=~A" (or pid "?") age label))
+       (:dead  (format nil "dead bus=~A" label)))
+     suffix)))
 
 (defun %check-live (self-id beat-path window-seconds &optional bus)
   "Report the liveness of the watch for SELF-ID on BUS from its heartbeat, then
@@ -958,7 +997,13 @@ detached watcher, its pid file.
 
    BEAT-PATH is derived from BUS, so an agent joined to several buses runs one
    probe per bus and each answers about its own watch. The bus on the line is
-   what makes those answers tellable apart."
+   what makes those answers tellable apart.
+
+   The line ends with the reader count for this identity's detached log on BUS
+   (see %LOG-READERS). A watcher that is live is only half of an agent that can
+   hear: the other half is whatever follows the log, and that half is the one
+   the harness has to keep re-arming. The watcher itself is left out of the
+   count."
   (if (null self-id)
       (progn
         (%warn "--check-live needs a resolved identity (pass --agent or ~
@@ -969,7 +1014,13 @@ detached watcher, its pid file.
         (uiop:quit 2))
       (multiple-value-bind (status age pid)
           (heartbeat:beat-liveness beat-path window-seconds)
-        (format *standard-output* "~A~%" (%liveness-line status age pid bus))
+        (let* ((stem (%detach-stem bus (%agent-name self-id)))
+               (watcher (%live-detached-pid (%detach-file stem "pid")))
+               (readers (%log-readers (%detach-file stem "log")
+                                      (remove-if-not #'integerp
+                                                     (list pid watcher)))))
+          (format *standard-output* "~A~%"
+                  (%liveness-line status age pid bus readers)))
         (force-output *standard-output*)
         (uiop:quit (if (eq status :live) 0 1)))))
 
@@ -1452,6 +1503,255 @@ detached watcher, its pid file.
     (force-output *standard-output*)
     (uiop:quit (if clean 0 1))))
 
+;;; ------------------------------------------------------------- waking on a log
+;;;
+;;; The detached watcher keeps listening on its own, but an agent only hears it
+;;; through whatever the harness runs to follow its log, and that follower has to
+;;; be re-armed by the harness every time it lapses. A re-arm the harness refuses
+;;; leaves the watcher live and the agent deaf, and nothing about the watcher
+;;; shows it. --wake is the follower as a one-shot: it blocks until the next event
+;;; line reaches the log, prints it and exits, so the agent can run it as a
+;;; background command with no time limit and run it again after each drain.
+;;;
+;;; While it waits it holds the log open for reading, exactly as a tail does. That
+;;; is what the reader count on --check-live looks for: a log that the watcher is
+;;; writing and nobody is reading belongs to an agent that can no longer hear it.
+
+(defun %directory-entries (dir)
+  "The names in the directory DIR, without . and .., or NIL when it cannot be
+   opened."
+  (let ((handle (ignore-errors (sb-posix:opendir dir))))
+    (when handle
+      (unwind-protect
+           (loop for entry = (sb-posix:readdir handle)
+                 until (sb-alien:null-alien entry)
+                 for name = (sb-posix:dirent-name entry)
+                 unless (member name '("." "..") :test #'string=)
+                   collect name)
+        (sb-posix:closedir handle)))))
+
+(defun %fd-opened-for-reading-p (pid fd)
+  "True unless /proc/PID/fdinfo/FD says descriptor FD was opened write-only. An
+   fdinfo that cannot be read or parsed counts as reading, since a reader missed
+   here would report an agent deaf that is not."
+  (let* ((info (%proc-file pid (format nil "fdinfo/~A" fd)))
+         (start (and info (search "flags:" info)))
+         (flags (and start
+                     (ignore-errors
+                      (parse-integer info :start (+ start 6) :radix 8
+                                          :junk-allowed t)))))
+    (or (null flags)
+        (/= (logand flags 3) sb-posix:o-wronly))))
+
+(defun %log-readers (log-path &optional exclude-pids)
+  "How many processes, other than this one and those in EXCLUDE-PIDS, hold
+   LOG-PATH open for reading; or :UNKNOWN where there is no /proc to ask.
+
+   A log that does not exist has no readers, so that answers 0. Processes whose
+   descriptors this user may not look at are passed over: they belong to another
+   user, and an agent's follower runs as the agent. A descriptor opened
+   write-only is not a reader, which is what keeps the watcher's own output, and
+   anything else appending to the log, out of the count."
+  (if (not (probe-file "/proc/self/fd/"))
+      :unknown
+      (let ((target (ignore-errors (uiop:native-namestring (truename log-path))))
+            (self (sb-posix:getpid))
+            (count 0))
+        (when target
+          (dolist (name (%directory-entries "/proc"))
+            (let ((pid (and (every #'digit-char-p name) (parse-integer name))))
+              (when (and pid (/= pid self) (not (member pid exclude-pids)))
+                (let ((fd-dir (format nil "/proc/~D/fd" pid)))
+                  (when (some (lambda (fd)
+                                (and (equal target
+                                            (ignore-errors
+                                             (sb-posix:readlink
+                                              (format nil "~A/~A" fd-dir fd))))
+                                     (%fd-opened-for-reading-p pid fd)))
+                              (%directory-entries fd-dir))
+                    (incf count)))))))
+        count)))
+
+(defstruct (follower (:conc-name fol-))
+  "One log being followed for --wake: where it lives, the stream held open on
+   it, how far it has been read, which file that stream is on, and the bytes of
+   a line not yet finished."
+  (path nil)
+  (stream nil)
+  (pos 0)
+  (ino nil)
+  (dev nil)
+  (partial (make-array 0 :element-type '(unsigned-byte 8)
+                         :adjustable t :fill-pointer 0))
+  (skip-p nil))
+
+(defun %follow-open (fol from-end-p)
+  "Open FOL's file and hold it. With FROM-END-P, reading starts at the current
+   end, and a file that ends partway through a line has the rest of that line
+   discarded when it arrives; otherwise reading starts at the top. Returns the
+   stream, or NIL when the file cannot be opened."
+  (let ((stream (ignore-errors
+                 (open (fol-path fol) :element-type '(unsigned-byte 8)))))
+    (when stream
+      (let* ((stat (sb-posix:fstat (sb-sys:fd-stream-fd stream)))
+             (size (sb-posix:stat-size stat)))
+        (setf (fol-stream fol) stream
+              (fol-ino fol) (sb-posix:stat-ino stat)
+              (fol-dev fol) (sb-posix:stat-dev stat)
+              (fill-pointer (fol-partial fol)) 0
+              (fol-skip-p fol) nil
+              (fol-pos fol) 0)
+        (when (and from-end-p (plusp size))
+          (file-position stream (1- size))
+          (setf (fol-skip-p fol) (/= (read-byte stream) 10)
+                (fol-pos fol) size))))
+    stream))
+
+(defun %follow-drain (fol)
+  "The complete lines appended to FOL's open file since the last look, oldest
+   first. A file that has shrunk below the read position was truncated, and is
+   read again from the top."
+  (let* ((stream (fol-stream fol))
+         (size (sb-posix:stat-size (sb-posix:fstat (sb-sys:fd-stream-fd stream))))
+         (partial (fol-partial fol))
+         (lines '()))
+    (when (< size (fol-pos fol))
+      (setf (fol-pos fol) 0
+            (fill-pointer partial) 0
+            (fol-skip-p fol) nil))
+    (when (> size (fol-pos fol))
+      (let ((buffer (make-array (- size (fol-pos fol))
+                                :element-type '(unsigned-byte 8))))
+        (file-position stream (fol-pos fol))
+        (let ((n (read-sequence buffer stream)))
+          (incf (fol-pos fol) n)
+          (dotimes (i n)
+            (let ((byte (aref buffer i)))
+              (if (= byte 10)
+                  (progn
+                    (if (fol-skip-p fol)
+                        (setf (fol-skip-p fol) nil)
+                        (push (sb-ext:octets-to-string
+                               (coerce partial '(simple-array (unsigned-byte 8) (*)))
+                               :external-format '(:utf-8 :replacement #\?))
+                              lines))
+                    (setf (fill-pointer partial) 0))
+                  (vector-push-extend byte partial)))))))
+    (nreverse lines)))
+
+(defun %follow-lines (fol)
+  "The complete lines appended to the log FOL follows since the last look,
+   oldest first.
+
+   A log that did not exist yet is opened from the top once it appears, since
+   everything in it is new. A log replaced under the same name, as a rotation
+   does, is read to its end first and then left for the new file, which is also
+   read from the top."
+  (let ((lines '()))
+    (when (or (fol-stream fol) (%follow-open fol nil))
+      (setf lines (%follow-drain fol))
+      (let ((now (ignore-errors (sb-posix:stat (uiop:native-namestring
+                                                 (fol-path fol))))))
+        (when (and now (or (/= (sb-posix:stat-ino now) (fol-ino fol))
+                           (/= (sb-posix:stat-dev now) (fol-dev fol))))
+          (ignore-errors (close (fol-stream fol)))
+          (setf (fol-stream fol) nil)
+          (when (%follow-open fol nil)
+            (setf lines (append lines (%follow-drain fol)))))))
+    lines))
+
+(defun %event-line-p (line)
+  "True when LINE is one a woken agent acts on: a wake or an error. The same
+   lines the monitor command filters for."
+  (or (eql 0 (search "bus:" line)) (eql 0 (search "error:" line))))
+
+(defun %wake-wait (targets poll-ms
+                   &key (watcher-alive-p (lambda (pid-path)
+                                           (and (%live-detached-pid pid-path) t)))
+                        deadline-ms)
+  "Wait for the next event line in any of TARGETS and return (values :event
+   line bus), or (values :no-watcher nil bus) naming the first bus whose
+   detached watcher is not running. Each target is a list (bus log-path
+   pid-path). DEADLINE-MS, when given, is a limit in milliseconds after which
+   this returns :timeout; the command itself waits without one.
+
+   Every log is read from its end as it stands when this starts, so a line
+   already there is never reported again. A watcher that is not running is
+   reported at once, and again if it stops while this waits: a wait on a log
+   nothing will ever write to again never ends, and the agent running it would
+   be as deaf as one running nothing."
+  (flet ((dead-bus ()
+           (loop for (bus nil pid-path) in targets
+                 unless (funcall watcher-alive-p pid-path)
+                   return (values t bus))))
+    (multiple-value-bind (dead bus) (dead-bus)
+      (when dead (return-from %wake-wait (values :no-watcher nil bus))))
+    (let ((followers (loop for (bus log-path) in targets
+                           collect (let ((fol (make-follower :path log-path)))
+                                     (%follow-open fol t)
+                                     (cons bus fol))))
+          (sleep-s (/ (max poll-ms 1) 1000.0))
+          (limit (and deadline-ms (+ (now-ms) deadline-ms))))
+      (unwind-protect
+           (loop
+             (loop for (bus . fol) in followers
+                   do (let ((line (find-if #'%event-line-p (%follow-lines fol))))
+                        (when line
+                          (return-from %wake-wait (values :event line bus)))))
+             (multiple-value-bind (dead bus) (dead-bus)
+               (when dead (return-from %wake-wait (values :no-watcher nil bus))))
+             (when (and limit (>= (now-ms) limit))
+               (return-from %wake-wait (values :timeout nil nil)))
+             (sleep sleep-s))
+        (dolist (entry followers)
+          (let ((stream (fol-stream (cdr entry))))
+            (when stream (ignore-errors (close stream)))))))))
+
+(defun %wake-targets (bus agent-name all-buses-p)
+  "What --wake waits on, as (bus log-path pid-path) lists: the detached log for
+   AGENT-NAME on BUS, or with ALL-BUSES-P the log of every detached watcher this
+   agent has a pid file for. A bus whose watcher was reaped has no pid file and
+   is left out, so a bus the agent has left cannot hold the wait hostage."
+  (if all-buses-p
+      (loop for (pid-path . target-bus) in (%reap-targets bus agent-name t)
+            collect (list target-bus
+                          (make-pathname :type "log" :defaults pid-path)
+                          pid-path))
+      (let ((stem (%detach-stem bus agent-name)))
+        (list (list bus (%detach-file stem "log") (%detach-file stem "pid"))))))
+
+(defun %wake (opts bus self-id)
+  "Block until the next event line reaches this agent's detached log, print it
+   and exit 0. With --all-buses, whichever of the agent's logs gets one first.
+
+   When a bus asked for has no detached watcher running, prints
+   `nowatcher bus=<bus>` and exits 1 straight away, so the agent starts one
+   with --detach instead of waiting on a log nothing writes to. Exits 2 when no
+   identity resolves, and 143 on SIGTERM."
+  (unless self-id
+    (%warn "--wake needs a resolved identity (pass --agent with --namespace, or ~
+            --agent-id); the detached log is keyed on it.")
+    (uiop:quit 2))
+  (%install-termination-handler)
+  (let ((targets (%wake-targets bus (%agent-name self-id) (opt-all-buses-p opts))))
+    (flet ((no-watcher (label)
+             (%warn "no detached watcher is running for ~A on bus ~A; start one ~
+                     with --detach, then wake again"
+                    self-id label)
+             (format *standard-output* "nowatcher bus=~A~%" label)
+             (force-output *standard-output*)
+             (uiop:quit 1)))
+      (when (null targets)
+        (no-watcher "*"))
+      (multiple-value-bind (outcome line which)
+          (%wake-wait targets (opt-poll-ms opts))
+        (if (eq outcome :event)
+            (progn
+              (format *standard-output* "~A~%" line)
+              (force-output *standard-output*)
+              (uiop:quit 0))
+            (no-watcher (or which "default")))))))
+
 (defun main ()
   "Entry point. Parse argv, resolve who this watch is for, arm a baseline, and
    watch; or, under --check-live, report the running watch's heartbeat and exit
@@ -1466,7 +1766,9 @@ detached watcher, its pid file.
    --detach and --reap start and stop a detached watcher and exit; neither
    watches in this process. The detached watcher itself runs this same entry
    point with --detached-child, claims its pid file before anything else, and
-   then streams and re-arms in place for as long as it lives.
+   then streams and re-arms in place for as long as it lives. --wake follows
+   that watcher's log until its next event line and exits, and writes no
+   heartbeat of its own, since the beat it would write is the watcher's.
 
    Which bus this watch arms on is resolved first, and every default path below
    hangs off it: the write-ahead log it reads, the cursor it arms from, and the
@@ -1501,6 +1803,8 @@ detached watcher, its pid file.
             (%check-live self-id beat-path (opt-live-window-seconds opts) bus))
           (when (opt-reap-p opts)
             (%reap opts bus self-id))
+          (when (opt-wake-p opts)
+            (%wake opts bus self-id))
           (when (and (opt-detach-p opts) (not (opt-detached-child-p opts)))
             (%detach bus self-id args))
           (%install-termination-handler)
