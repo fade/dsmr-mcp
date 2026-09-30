@@ -330,3 +330,160 @@
               (ignore-errors (sb-posix:kill (uiop:process-info-pid p)
                                             sb-posix:sigkill)))
             (ignore-errors (delete-file wal)))))))
+
+;;; waking and readers ---------------------------------------------------------
+
+(defun launch-in (state bin &rest args)
+  "Start BIN with ARGS under the state root STATE, as RUN-IN would, and return
+   the process without waiting. Its STDOUT is a stream the test reads."
+  (uiop:launch-program (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR"
+                                     (format nil "XDG_STATE_HOME=~A"
+                                             (uiop:native-namestring state))
+                                     (uiop:native-namestring bin))
+                               args)
+                       :output :stream :error-output nil :input nil))
+
+(defun bus-wal (state bus)
+  "The write-ahead log for BUS under the state root STATE, its directory made."
+  (let ((wal (merge-pathnames (format nil "dsmr-mcp/bus/~A/bus.wal" bus) state)))
+    (ensure-directories-exist wal)
+    wal))
+
+(defun await-log-text (log text &optional (seconds 5))
+  "True once the file LOG contains TEXT, waiting up to SECONDS."
+  (loop repeat (* 10 seconds)
+        thereis (search text (or (ignore-errors (uiop:read-file-string log)) ""))
+        do (sleep 0.1)))
+
+(defun stop-process (process)
+  "SIGKILL PROCESS if it is still running, and reap it."
+  (when (uiop:process-alive-p process)
+    (ignore-errors (sb-posix:kill (uiop:process-info-pid process) sb-posix:sigkill)))
+  (ignore-errors (uiop:wait-process process)))
+
+(defun finish-and-read (process seconds)
+  "Wait up to SECONDS for PROCESS to exit, then return (values exit-code
+   first-line). The exit code is NIL when it had to be killed. It is stopped
+   before its output is read, so a process that never exits cannot hold the
+   read, and the suite, open for good."
+  (let ((code (await-exit process seconds)))
+    (stop-process process)
+    (values code (read-line (uiop:process-info-output process) nil ""))))
+
+(define-test wake-exits-at-once-when-no-watcher-runs
+  "With no detached watcher there is nothing to wake on, and waiting would leave
+   the agent deaf for good; the answer must come straight back, naming the bus."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (multiple-value-bind (out err code)
+              (apply #'run-in state bin "--wake" (identity-args))
+            (is = 1 code "--wake with no watcher: ~A" err)
+            (is string= (format nil "nowatcher bus=~A" *bus*) out))
+          (multiple-value-bind (out err code)
+              (apply #'run-in state bin "--wake" "--all-buses" (identity-args))
+            (declare (ignore err))
+            (is = 1 code)
+            (is string= "nowatcher bus=*" out))))))
+
+(define-test wake-prints-the-next-wake-line-and-not-an-old-one
+  "A wake armed after a line reached the log must return the NEXT line, since
+   the agent has already drained the one before it."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((wal (bus-wal state *bus*))
+                (log (detach-file state "log")))
+            (wal:append-record wal 1 "an old message")
+            (true (await-log-text log "bus:1") "the first wake never reached the log")
+            (let ((wake (apply #'launch-in state bin "--wake" "--poll-ms" "50"
+                               (identity-args))))
+              (unwind-protect
+                   (progn
+                     (sleep 0.5)
+                     (true (uiop:process-alive-p wake) "--wake returned on an old line")
+                     (wal:append-record wal 2 "a new message")
+                     (multiple-value-bind (code line) (finish-and-read wake 5)
+                       (is eql 0 code "--wake did not return on a new line")
+                       (true (eql 0 (search "bus:2" line))
+                             "expected the new wake line, got ~S" line)))
+                (stop-process wake))))))))
+
+(define-test wake-over-all-buses-returns-from-whichever-bus-speaks
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (let ((who (list "--agent" *agent* "--namespace" *namespace*)))
+            (apply #'run-in state bin "--detach" "--poll-ms" "50" "--bus" *bus* who)
+            (apply #'run-in state bin "--detach" "--poll-ms" "50" "--bus" "dt2" who)
+            (let ((wake (apply #'launch-in state bin "--wake" "--all-buses"
+                               "--poll-ms" "50" who)))
+              (unwind-protect
+                   (progn
+                     (sleep 0.5)
+                     (wal:append-record (bus-wal state "dt2") 1 "on the second bus")
+                     (multiple-value-bind (code line) (finish-and-read wake 5)
+                       (is eql 0 code "--wake --all-buses did not return")
+                       (true (eql 0 (search "bus:1" line)) "got ~S" line)))
+                (stop-process wake))))))))
+
+(define-test wake-ends-on-sigterm-and-when-its-watcher-is-reaped
+  "A waiting wake must stop when told to, and must not outlive the watcher it
+   was following: a wait on a log nothing writes to again never ends."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((wake (apply #'launch-in state bin "--wake" "--poll-ms" "50"
+                             (identity-args))))
+            (unwind-protect
+                 (progn
+                   (sleep 0.5)
+                   (sb-posix:kill (uiop:process-info-pid wake) sb-posix:sigterm)
+                   (is eql 143 (await-exit wake 3) "--wake did not end on SIGTERM"))
+              (stop-process wake)))
+          (let ((wake (apply #'launch-in state bin "--wake" "--poll-ms" "50"
+                             (identity-args))))
+            (unwind-protect
+                 (progn
+                   (sleep 0.5)
+                   (apply #'run-in state bin "--reap" (identity-args))
+                   (multiple-value-bind (code line) (finish-and-read wake 5)
+                     (is eql 1 code "--wake kept waiting after its watcher was reaped")
+                     (is string= (format nil "nowatcher bus=~A" *bus*) line)))
+              (stop-process wake)))))))
+
+(define-test check-live-counts-the-readers-of-the-detached-log
+  "`live ... readers=0` is how a leader spots an agent whose watcher is up and
+   whose follower is gone, so nobody reading must count 0 and a tail must count."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "100" (identity-args))
+          (sleep 0.5)
+          (flet ((readers ()
+                   (field "readers" (apply #'run-in state bin "--check-live"
+                                           (identity-args)))))
+            (is equal "0" (readers) "the watcher's own output counted as a reader")
+            (let ((tail (uiop:launch-program
+                         (list "tail" "-f" (uiop:native-namestring
+                                            (detach-file state "log")))
+                         :output nil :error-output nil :input nil)))
+              (unwind-protect
+                   (progn
+                     (sleep 0.3)
+                     (is equal "1" (readers) "a tail on the log was not counted"))
+                (stop-process tail)))
+            (is equal "0" (readers) "a reader that has gone was still counted")
+            (let ((wake (apply #'launch-in state bin "--wake" (identity-args))))
+              (unwind-protect
+                   (progn
+                     (sleep 0.5)
+                     (is equal "1" (readers) "a waiting --wake was not counted"))
+                (stop-process wake))))))))
