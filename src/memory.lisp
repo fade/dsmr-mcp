@@ -10,6 +10,7 @@
   (:import-from #:cl-ppcre
                 #:split
                 #:scan
+                #:all-matches
                 #:create-scanner
                 #:quote-meta-chars)
   (:import-from #:dsmr-mcp/src/log
@@ -574,6 +575,71 @@ description or body."
                (or (some #'hit metadata) (some #'hit body))))
            scanners)))
 
+(defun %page-tier (page scanners)
+  "0 when every one of SCANNERS matches PAGE's filename, name or
+description, 1 when at least one does, 2 when none does."
+  (let* ((metadata (%metadata-texts page))
+         (matched (count-if (lambda (scanner)
+                              (some (lambda (text) (scan scanner text)) metadata))
+                            scanners)))
+    (cond ((= matched (length scanners)) 0)
+          ((plusp matched) 1)
+          (t 2))))
+
+(defun %body-hit-count (page scanners)
+  "The number of matches of SCANNERS over PAGE's body lines. Frontmatter is
+not counted, because the tier already accounts for it."
+  (loop for (nil . text) in (%body-lines page)
+        sum (loop for scanner in scanners
+                  sum (floor (length (all-matches scanner text)) 2))))
+
+(defparameter *excerpt-line-limit* 240
+  "The longest excerpt line returned; longer lines are cut to this length.")
+
+(defun %excerpts (page scanners context lines-per-page)
+  "Excerpts from PAGE's body: the first LINES-PER-PAGE lines matching any of
+SCANNERS, each with CONTEXT body lines either side. Overlapping windows merge
+into one run with no line repeated. Each excerpt is a plist (:LINE n :TEXT s
+:MATCH bool), where n counts from the top of the file so an agent can open
+the file at that line, and MATCH marks the selected matching lines."
+  (let* ((body (%body-lines page))
+         (first-line (page-body-start page))
+         (last-line (+ first-line (length body) -1))
+         (matching (loop for (n . text) in body
+                         when (some (lambda (scanner) (scan scanner text)) scanners)
+                           collect n into found
+                         until (>= (length found) lines-per-page)
+                         finally (return found)))
+         (shown (sort (remove-duplicates
+                       (loop for m in matching
+                             nconc (loop for n from (max first-line (- m context))
+                                           to (min last-line (+ m context))
+                                         collect n)))
+                      #'<))
+         (lines (page-lines page)))
+    (mapcar (lambda (n)
+              (let ((text (svref lines (1- n))))
+                (list :line n
+                      :text (if (> (length text) *excerpt-line-limit*)
+                                (subseq text 0 *excerpt-line-limit*)
+                                text)
+                      :match (and (member n matching) t))))
+            shown)))
+
+(defun %hit< (a b)
+  "True when hit A ranks ahead of hit B: lower tier first, then more body
+hits, then store name and filename ascending so the order is repeatable.
+Status plays no part, because ranking a retired page lower would push it
+past the limit and hide it by another route."
+  (let ((ta (hit-tier a)) (tb (hit-tier b))
+        (ha (hit-body-hits a)) (hb (hit-body-hits b))
+        (sa (page-store (hit-page a))) (sb (page-store (hit-page b))))
+    (cond ((/= ta tb) (< ta tb))
+          ((/= ha hb) (> ha hb))
+          ((string/= sa sb) (string< sa sb))
+          (t (string< (file-namestring (page-file (hit-page a)))
+                      (file-namestring (page-file (hit-page b))))))))
+
 (defun search-memory (query &key (scope "project") session-root regex hide-retired
                               (limit 20) (offset 0) (context 1) (lines-per-page 3))
   "Search memory pages for QUERY and return a MEMORY-SEARCH-OUTCOME.
@@ -582,12 +648,17 @@ filename, name, description or body, ignoring case. Terms are literal unless
 REGEX is true, and a malformed regular expression signals the regex
 library's syntax error. SCOPE project searches the store derived from
 SESSION-ROOT, which must then be given; scope all searches every store.
-LIMIT is clamped to 1..100, OFFSET to at least 0 and CONTEXT to 0..5. A
-missing store is not an error: it shows in the coverage with :EXISTS NIL."
-  (declare (ignorable hide-retired lines-per-page))
+Hits are ranked by metadata tier, then body hits, then store and filename,
+and then sliced by OFFSET and LIMIT; TOTAL counts every match before the
+slice. Retired pages are returned and flagged unless HIDE-RETIRED is true,
+in which case they are dropped before counting and the number dropped is
+reported as :HIDDEN-RETIRED. LIMIT is clamped to 1..100, OFFSET to at least
+0 and CONTEXT to 0..5. A missing store is not an error: it shows in the
+coverage with :EXISTS NIL."
   (let* ((limit (max 1 (min 100 limit)))
          (offset (max 0 offset))
          (context (max 0 (min 5 context)))
+         (lines-per-page (max 1 lines-per-page))
          (scanners (%term-scanners (%query-terms query) regex))
          (stores (%resolve-stores scope session-root))
          (projects-dir (projects-directory))
@@ -597,7 +668,6 @@ missing store is not an error: it shows in the coverage with :EXISTS NIL."
          (capped 0)
          (subdirectories 0)
          (matches '()))
-    (declare (ignorable context))
     (flet ((skip (reason count)
              (let ((cell (assoc reason skipped)))
                (if cell
@@ -618,18 +688,30 @@ missing store is not an error: it shows in the coverage with :EXISTS NIL."
                              (t (incf scanned)
                                 (when cappedp (incf capped))
                                 (when (and scanners (%page-matches-p page scanners))
-                                  (push (make-memory-hit :page page) matches)))))))))
-      (let* ((ranked (nreverse matches))
-             (total (length ranked)))
+                                  (push (make-memory-hit
+                                         :page page
+                                         :tier (%page-tier page scanners)
+                                         :body-hits (%body-hit-count page scanners)
+                                         :excerpts (%excerpts page scanners context
+                                                              lines-per-page)
+                                         :retired (and (retired-status-p
+                                                        (page-status page))
+                                                       t))
+                                        matches)))))))))
+      (let* ((shown (if hide-retired (remove-if #'hit-retired matches) matches))
+             (hidden (- (length matches) (length shown)))
+             (ranked (stable-sort (copy-list shown) #'%hit<))
+             (total (length ranked))
+             (slice (subseq ranked (min offset total) (min total (+ offset limit)))))
         (log-event :debug "memory.search"
                    "scope" (string-downcase scope)
                    "stores" (length stores)
                    "scanned" scanned
                    "matches" total)
         (make-memory-search-outcome
-         :hits ranked
+         :hits slice
          :total total
-         :limited nil
+         :limited (< (length slice) total)
          :coverage (list :scope (string-downcase scope)
                          :config-dir (namestring (claude-config-dir))
                          :projects-dir (and projects-dir (namestring projects-dir))
@@ -638,6 +720,6 @@ missing store is not an error: it shows in the coverage with :EXISTS NIL."
                          :pages-skipped skipped
                          :pages-capped capped
                          :subdirectories-not-searched subdirectories
-                         :hidden-retired 0
+                         :hidden-retired hidden
                          :limit limit
                          :offset offset))))))
