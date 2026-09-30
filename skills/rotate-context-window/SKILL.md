@@ -96,15 +96,17 @@ these, skip — there is no bus to rejoin.
   downtime are NOT lost; the returning instance drains them.
 - Note the `dsmr-bus-watch` wakeup watch. The watcher itself is
   launched with `--detach` and OUTLIVES this instance, so do NOT reap it
-  for a rotation; what dies with this instance is the Monitor tailing its
+  for a rotation (nor for a park; `--reap` is only for leaving the fleet).
+  What dies with this instance is the background `--wake` waiting on its
   log, and that MUST be re-armed on the other side. Record the exact
   `--detach` flags in use (bus, agent, namespace, e.g. `--poll-ms 250`)
-  and the log path it printed, so the successor re-runs the same
-  `--detach` (which answers `running` for the watcher already up) and
-  tails the same log. If the watch was armed the old way (a `while true
-  … --stream --recycle-seconds …` loop inside the Monitor, used only when
-  the binary lacks `--detach`), record those flags instead; that form does
-  die with this instance.
+  and the `--wake` line, so the successor re-runs the same `--detach`
+  (which answers `running` for the watcher already up) and re-arms the
+  same `--wake`. If the watch was armed an older way (a Monitor tail of
+  the log, or a `while true … --stream --recycle-seconds …` loop inside
+  a Monitor, used only when the binary lacks `--wake`/`--detach`), record
+  that instead; the successor moves to the `--wake` form where the binary
+  supports it.
 - Drain the cursor now (`bus-receive` until empty) so the handoff is
   written from a known-clean bus state, and note the active coordination
   thread (who leads, who is mid-task, what gates the next step).
@@ -133,13 +135,16 @@ moment it does and siblings may be waiting.
 - Sequence: `bus-receive` (drain everything that landed during the
   downtime — read it) → then **re-arm the wakeup watch LAST**:
   `~/.local/bin/dsmr-bus-watch --detach <arm flags from probe>` (idempotent;
-  **omit `--after`**), then a persistent **Monitor** (never
-  `run_in_background`) over the `monitor:` tail line it prints, then a
-  catch-up `bus-receive`. Confirm with `--check-live` (`live` and the right
-  `bus=`). See the **bus-watch** skill.
-- Steady-state thereafter: on each `bus:<SEQ>` wake, drain → act →
-  publish. No per-wake re-arm; re-arm only the Monitor's tail when it
-  expires at 30 minutes. Only surface on a real `bus:<SEQ>` message.
+  **omit `--after`**; expect `running`), then the standing listener as a
+  **background Bash** command (`run_in_background`, NOT the Monitor tool):
+  `~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <agent> --namespace <root>/`,
+  then a catch-up `bus-receive`. Confirm with `--check-live` (`live`, the
+  right `bus=`, and `readers=1` or more; `readers=0` means deaf, re-arm
+  the `--wake`). See the **bus-watch** skill.
+- Steady-state thereafter: when the `--wake` exits with `bus:<SEQ>`,
+  drain every bus → re-arm the same `--wake` line → act → publish. On
+  `nowatcher` (exit 1) re-run `--detach`, then re-arm. No timer re-arm:
+  the `--wake` has no expiry. Only surface on a real `bus:<SEQ>` message.
 - **Process restart:** restart the Claude **client** for context but keep
   the bus MCP server (dsmr-mcp) UP to preserve the live bus + cursors.
   The bus WAL is durable, so even an MCP restart recovers — but only

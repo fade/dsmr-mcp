@@ -154,41 +154,51 @@ same value. The flag exists precisely so the line an operator reads names the bu
 it arms on:
 
 ```
-# once per session: launch the detached watcher (idempotent)
+# once per session per bus: launch (or adopt) the detached watcher (idempotent)
 ~/.local/bin/dsmr-bus-watch --detach --poll-ms 250 \
-  --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
+  --bus <tag> --agent <sister-name> --namespace <absolute-project-root>/
 
-# the Monitor command, re-armed on every 30-minute expiry
-tail -q -n0 -F ~/.local/state/dsmr-mcp/watch/<tag>--<agent>.log \
-  | grep --line-buffered -E "^(bus|error):"
+# the standing listener: a BACKGROUND Bash command (run_in_background), re-armed after each wake
+~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <sister-name> --namespace <absolute-project-root>/
 ```
 
-⛔ **Print both steps, and never a bare `--stream` watcher.** `--stream` exits 0 on
-its idle window deliberately, because that exit is the self-heal that re-arms a
-watch which has gone silently deaf. `--detach` now carries that recycle itself: the
-detached watcher re-arms in place and survives the Monitor's 30-minute expiry, so
-the Monitor only ever tails its log, and a re-arm is a read-only `tail` rather than
-a fresh watcher launch the permission classifier can refuse (six sightings across
-five sessions on 2026-09-29). A sister handed a bare
-`~/.local/bin/dsmr-bus-watch --stream` still goes deaf at the first idle mark while
-believing it is armed. The old `while true` loop around `--stream` is a fallback
-only for a binary whose `--help` lacks `--detach`; the fix for that is
-`make install-bus-watch`. See the **bus-watch** skill for the fallback form.
+⛔ **Print both steps, and never a bare `--stream` watcher or a Monitor tail.**
+`--stream` exits 0 on its idle window deliberately, because that exit is the
+self-heal that re-arms a watch which has gone silently deaf. `--detach` carries
+that recycle itself: the detached watcher re-arms in place and outlives the
+session. `--wake` is one-shot: it exits on the next message, the harness wakes
+the sister on that exit, and she drains every bus and re-arms the same line
+(`nowatcher`, exit 1, means re-run `--detach` first). Keep the literal
+`~/.local/bin/...` path: it matches the narrow Bash allow rule, which resolves
+before the classifier in auto mode. The Monitor tail this step used to print is
+retired: Monitor allow rules are dropped in auto mode (it runs through the
+shell) and it expires every 30 minutes, so each re-arm faced the classifier, and
+during an outage agents went deaf with their watcher still live (six sightings
+across five sessions on 2026-09-29, cause established 2026-09-30). A sister
+handed a bare `~/.local/bin/dsmr-bus-watch --stream` still goes deaf at the
+first idle mark while believing it is armed. The old `while true` loop around
+`--stream` is a last-resort fallback only for a binary whose `--help` lacks
+`--wake`; the fix for that is `make install-bus-watch`. See the **bus-watch**
+skill for the fallback form.
 
-Each sister arms that in **its own session**, the tail through the Monitor tool
-with `persistent: true`. See the **bus-watch** skill for why a background Bash
-task is not an arm. Then it confirms:
+Each sister arms that in **its own session**; a background command wakes only
+the session that started it. Then it confirms:
 
 ```
-~/.local/bin/dsmr-bus-watch --check-live --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
+~/.local/bin/dsmr-bus-watch --check-live --bus <tag> --agent <sister-name> --namespace <absolute-project-root>/
 ```
 
-and must see **both** `live` **and** `bus=<tag>` before going silent.
+and must see `live`, `bus=<tag>` **and** `readers=1` or more before going
+silent. `readers=0` means the watcher runs and nothing in her session is
+listening: deaf. The leader can run the same probe with the sister's name and
+root to check she can hear before dispatching (see **leader**).
 
-The detached watcher outlives the session, so a participant leaving the fleet or
-parking reaps it: `~/.local/bin/dsmr-bus-watch --reap --all-buses --agent
-"$DSMR_BUS_AGENT" --namespace <absolute-project-root>/`, exit 0. An unreaped one is
-a listener nobody reads, and it keeps answering `live`.
+The detached watcher outlives the session, and **a park does not reap it**
+(operator ruling, 2026-09-30): at the next bring-up `--detach` adopts it. A
+participant **leaving the fleet** reaps it: `~/.local/bin/dsmr-bus-watch --reap
+--all-buses --agent <sister-name> --namespace <absolute-project-root>/`, exit 0.
+An unreaped watcher for an agent that has left is a listener nobody reads, and
+it keeps answering `live`.
 
 ## Step 5 - Close enrollment, and know what that means
 
@@ -240,8 +250,8 @@ findings to a project it is not a member of.
 | Assemble a fleet | validate names, `declare-leader`, `enroll` per sister, print the `.envrc` value and the arm line, `close-enrollment` |
 | A name is refused | fix the name. Never shorten it to fit; a truncated socket path is a different bus |
 | Add a sister to a running fleet | `open-enrollment` if shut, `enroll`, hand it the tag, have it arm and confirm `bus=<tag>` |
-| Remove one | the sister runs `bus-leave`; the leader records it with `disenroll` |
-| "Is this sister connected?" | `--check-live --bus <tag>` in that sister's session. **Not** the roster |
+| Remove one | the sister runs `bus-leave` and `--reap`s her watcher; the leader records it with `disenroll` |
+| "Is this sister connected?" | `--check-live --bus <tag> --agent <sister> --namespace <sister-root>/`, wanting `live` and `readers=1`+ (`readers=0` = deaf: the operator types in her terminal). **Not** the roster |
 | Enroll came back `enrolled: false` | the gate is shut. That agent still uses the bus; nothing failed |
 | Sister says `live` with no `bus=` field | its `dsmr-bus-watch` binary predates named buses and armed on the shared bus. `make install-bus-watch`, then re-arm |
 | Two fleets on one machine | two tags, two declared leaders, two closed gates. There is no further guard and none is coming |
