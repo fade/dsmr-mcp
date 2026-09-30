@@ -21,6 +21,7 @@
                 #:store-name-for
                 #:project-store-directory
                 #:search-memory
+                #:memory-search-aborted
                 #:outcome-hits
                 #:outcome-total
                 #:outcome-limited
@@ -198,6 +199,44 @@ signals the regex library's syntax error to the caller."
     (fail (search-memory "(" :session-root repo :regex t)
         cl-ppcre:ppcre-syntax-error)))
 
+(defun %abort-within (seconds thunk)
+  "Call THUNK under an outer guard of SECONDS. Returns :ABORTED when it
+signals MEMORY-SEARCH-ABORTED, :WEDGED when the guard fires first, and
+:RETURNED when it returns normally. The guard keeps a regression from hanging
+the suite."
+  (handler-case
+      (sb-ext:with-timeout seconds
+        (funcall thunk)
+        :returned)
+    (memory-search-aborted () :aborted)
+    (sb-ext:timeout () :wedged)))
+
+(define-test backtracking-regex-is-stopped-by-the-time-limit
+  "A pattern that backtracks without end on an ordinary line stops at the
+time limit with MEMORY-SEARCH-ABORTED, instead of holding the caller."
+  (with-search-fixture (tmp repo store)
+    (%plant tmp store "prose.md" :name "prose"
+            :body (format nil "~{~A~^ ~} !~%" (loop repeat 30 collect "word")))
+    (let ((started (get-internal-real-time)))
+      (is eq :aborted
+          (%abort-within 30 (lambda ()
+                              (search-memory "^(\\w+\\s?)*$" :session-root repo
+                                                             :regex t :time-limit 1))))
+      (true (< (/ (- (get-internal-real-time) started) internal-time-units-per-second)
+               10)
+            "stopped close to the limit"))))
+
+(define-test stack-exhaustion-is-a-clean-abort
+  "A pattern whose matcher recurses once per character exhausts the stack on
+a long line; the search reports MEMORY-SEARCH-ABORTED rather than letting a
+storage condition escape."
+  (with-search-fixture (tmp repo store)
+    (%plant tmp store "long.md" :name "long"
+            :body (format nil "~A!~%" (make-string 200000 :initial-element #\a)))
+    (is eq :aborted
+        (%abort-within 30 (lambda ()
+                            (search-memory "(a|ab)*$" :session-root repo :regex t))))))
+
 ;;; coverage ------------------------------------------------------------------
 
 (define-test missing-project-store-is-reported
@@ -355,6 +394,19 @@ status: active
            (excerpt (find t (hit-excerpts hit) :key (lambda (e) (getf e :match)))))
       (is = 240 (length (getf excerpt :text))))))
 
+(define-test cut-excerpt-keeps-the-match
+  "When the match sits past the cut on a long line, the 240-character
+excerpt moves along the line so the match is still shown."
+  (with-search-fixture (tmp repo store)
+    (%plant tmp store "late.md" :name "late"
+            :body (format nil "~Aneedle~A~%"
+                          (make-string 600 :initial-element #\x)
+                          (make-string 400 :initial-element #\y)))
+    (let* ((hit (first (outcome-hits (search-memory "needle" :session-root repo))))
+           (excerpt (find t (hit-excerpts hit) :key (lambda (e) (getf e :match)))))
+      (is = 240 (length (getf excerpt :text)))
+      (true (search "needle" (getf excerpt :text))))))
+
 ;;; retired pages -------------------------------------------------------------
 
 (defun %plant-retired-pair (tmp store)
@@ -413,6 +465,28 @@ coverage says how many were hidden."
       (false (page-status (hit-page new)))
       (false (hit-retired new)))))
 
+(define-test retired-page-with-comment-or-mark-is-hidden
+  "A retired status followed by a comment, and a page saved with a byte order
+mark, are both recognised as retired and left out by HIDE-RETIRED."
+  (with-search-fixture (tmp repo store)
+    (write-fixture-file tmp (format nil "projects/~A/memory/commented.md" store)
+                        "---
+status: superseded  # replaced by current.md
+---
+a needle
+")
+    (write-fixture-file tmp (format nil "projects/~A/memory/marked.md" store)
+                        (format nil "~C---~%name: marked~%status: refuted~%---~%a needle~%"
+                                (code-char #xFEFF)))
+    (%plant tmp store "current.md" :name "current" :body "a needle
+")
+    (let ((all (search-memory "needle" :session-root repo)))
+      (is equal '("refuted") (page-status (hit-page (%hit-named all "marked.md"))))
+      (is equal '("superseded") (page-status (hit-page (%hit-named all "commented.md")))))
+    (let ((outcome (search-memory "needle" :session-root repo :hide-retired t)))
+      (is equal '("current.md") (%hit-files outcome))
+      (is = 2 (%coverage outcome :hidden-retired)))))
+
 ;;; pagination ----------------------------------------------------------------
 
 (define-test limit-and-offset-slice-after-ranking
@@ -435,3 +509,25 @@ LIMITED says matches were left out. LIMIT is clamped to 1..100."
       (is = 1 (%coverage outcome :limit))
       (is = 1 (length (outcome-hits outcome))))
     (is = 0 (%coverage (search-memory "needle" :session-root repo :offset -3) :offset))))
+
+(define-test last-page-and-past-end-are-not-limited
+  "The final page, and an offset at or past the end, report nothing more to
+fetch, so a client paging on LIMITED stops."
+  (with-search-fixture (tmp repo store)
+    (loop for file in '("a.md" "b.md" "c.md" "d.md" "e.md")
+          do (%plant tmp store file :name "p" :body "needle
+"))
+    (let ((first-page (search-memory "needle" :session-root repo :limit 2)))
+      (is = 2 (length (outcome-hits first-page)))
+      (true (outcome-limited first-page)))
+    (let ((last-page (search-memory "needle" :session-root repo :limit 2 :offset 4)))
+      (is = 1 (length (outcome-hits last-page)))
+      (false (outcome-limited last-page)))
+    (let ((exact-end (search-memory "needle" :session-root repo :limit 3 :offset 2)))
+      (is = 3 (length (outcome-hits exact-end)))
+      (false (outcome-limited exact-end)))
+    (dolist (offset '(5 9))
+      (let ((past (search-memory "needle" :session-root repo :limit 2 :offset offset)))
+        (is = 0 (length (outcome-hits past)))
+        (is = 5 (outcome-total past))
+        (false (outcome-limited past))))))

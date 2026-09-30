@@ -195,6 +195,17 @@ refused; a regular page resolves to its truename."
       (true (memory-page-path
              (write-fixture-file tmp "projects/s/memory/ok.md" "x") projects)))))
 
+(define-test special-file-is-not-a-page
+  "A named pipe named like a page is refused before anything opens it, since
+reading one blocks until a writer appears."
+  (with-memory-fixture (tmp)
+    (let ((projects (%dir tmp "projects/"))
+          (fifo (merge-pathnames "projects/s/memory/pipe.md" tmp)))
+      (ensure-directories-exist fifo)
+      (uiop:run-program (list "mkfifo" (uiop:native-namestring fifo)))
+      (true (probe-file fifo) "the pipe exists")
+      (false (memory-page-path fifo projects)))))
+
 (define-test list-store-pages-reports-exclusions
   "Listing a store skips the index and non-markdown files, counts them by
 reason, and counts subdirectories it did not search."
@@ -212,6 +223,18 @@ reason, and counts subdirectories it did not search."
         (is eql 1 (cdr (assoc :index skipped)))
         (is eql 1 (cdr (assoc :not-markdown skipped)))
         (is eql 1 subdirs)))))
+
+(define-test link-to-index-is-the-index
+  "A page that is a link to MEMORY.md is skipped as the index, not listed."
+  (with-memory-fixture (tmp)
+    (let ((projects (%dir tmp "projects/"))
+          (store (%dir tmp "projects/s/memory/")))
+      (write-fixture-file store "MEMORY.md" "- index")
+      (write-fixture-file store "a.md" "a")
+      (%symlink (merge-pathnames "MEMORY.md" store) (merge-pathnames "note.md" store))
+      (multiple-value-bind (pages skipped) (list-store-pages store projects)
+        (is equal '("a.md") (mapcar #'file-namestring pages))
+        (is eql 2 (cdr (assoc :index skipped)))))))
 
 (define-test read-jail-is-not-widened
   "The general read allow-list still refuses a memory page: memory reads go
@@ -280,6 +303,31 @@ through their own check only."
          '(:status ("superseded") :status-reason "Replaced by x."
            :updated "2026-09-29T21:15:00Z")
          6)
+   (list "scalar status with a trailing comment"
+         (%page "---" "status: superseded  # replaced by new-rule.md" "---" "Body")
+         '(:status ("superseded"))
+         4)
+   (list "block list status items with trailing comments"
+         (%page "---" "status:" "  - superseded # see b" "  - disputed	# tab" "---" "Body")
+         '(:status ("superseded" "disputed"))
+         6)
+   (list "flow list status with a trailing comment"
+         (%page "---" "status: [refuted, disputed] # both" "---" "Body")
+         '(:status ("refuted" "disputed"))
+         4)
+   (list "quoted status keeps a hash"
+         (%page "---" "status: \"odd #value\"" "---" "Body")
+         '(:status ("odd #value"))
+         4)
+   (list "empty quoted status is no status"
+         (%page "---" "name: \"\"" "status: \"\"" "---" "Body")
+         '(:frontmatter-p t :name nil :status nil)
+         5)
+   (list "byte order mark before the opening delimiter"
+         (format nil "~C~A" (code-char #xFEFF)
+                 (%page "---" "name: marked" "status: refuted" "---" "Body"))
+         '(:frontmatter-p t :name "marked" :status ("refuted"))
+         5)
    (list "unterminated frontmatter"
          (%page "---" "name: x" "body text")
          '(:frontmatter-p nil :name nil :status nil)

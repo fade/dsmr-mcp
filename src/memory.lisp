@@ -15,6 +15,7 @@
                 #:quote-meta-chars)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
+  (:import-from #:sb-posix)
   (:export #:*claude-config-dir*
            #:claude-config-dir
            #:projects-directory
@@ -38,6 +39,9 @@
            #:page-body-start
            #:retired-status-p
            #:search-memory
+           #:*search-time-limit*
+           #:memory-search-aborted
+           #:search-abort-reason
            #:memory-search-outcome
            #:memory-search-outcome-p
            #:outcome-hits
@@ -181,6 +185,13 @@ cached, because the config dir and the stores can change during a session."
 ;;; Read confinement
 ;;; ---------------------------------------------------------------------------
 
+(defun %regular-file-p (path)
+  "True when PATH, already resolved, is a regular file. A named pipe or a
+device node named like a page would block the read that follows, so anything
+but a regular file is refused."
+  (ignore-errors
+   (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:stat (uiop:native-namestring path))))))
+
 (defun memory-page-path (file projects-dir)
   "The resolved pathname of FILE when it is a memory page, else NIL.
 A memory page is a regular file of type exactly md sitting directly inside
@@ -194,6 +205,7 @@ purpose: memory stores are readable here and nowhere else."
     (when (and resolved root
                (pathname-name resolved)
                (not (ignore-errors (uiop:directory-exists-p resolved)))
+               (%regular-file-p resolved)
                (equal "md" (pathname-type resolved))
                (uiop:subpathp resolved root))
       (let ((below (nthcdr (length (pathname-directory root))
@@ -205,11 +217,11 @@ purpose: memory stores are readable here and nowhere else."
 (defun list-store-pages (store-dir projects-dir)
   "List the readable pages directly inside STORE-DIR. Returns three values:
 the resolved page pathnames sorted by filename; an alist from skip reason to
-count, the reasons being :INDEX (MEMORY.md, which the harness already loads
-every session), :NOT-MARKDOWN (type not exactly md, such as a .md.bak copy)
-and :OUTSIDE-STORE (refused by MEMORY-PAGE-PATH); and the number of
-subdirectories left unsearched. Stores are flat, so the listing does not
-recurse. A missing store yields no pages."
+count, the reasons being :INDEX (MEMORY.md, or a link that resolves to it,
+which the harness already loads every session), :NOT-MARKDOWN (type not
+exactly md, such as a .md.bak copy) and :OUTSIDE-STORE (refused by
+MEMORY-PAGE-PATH); and the number of subdirectories left unsearched. Stores
+are flat, so the listing does not recurse. A missing store yields no pages."
   (let ((dir (%safe-truename (uiop:ensure-directory-pathname store-dir)))
         (pages '())
         (skipped '()))
@@ -228,9 +240,10 @@ recurse. A missing store yields no pages."
                (skip :not-markdown))
               (t
                (let ((page (memory-page-path file projects-dir)))
-                 (if page
-                     (push (cons (file-namestring file) page) pages)
-                     (skip :outside-store))))))
+                 (cond ((null page) (skip :outside-store))
+                       ;; A link to the index is still the index.
+                       ((equal "MEMORY" (pathname-name page)) (skip :index))
+                       (t (push (cons (file-namestring file) page) pages)))))))
       (values (mapcar #'cdr (sort pages #'string< :key #'car))
               (nreverse skipped)
               (length (ignore-errors (uiop:subdirectories dir)))))))
@@ -322,13 +335,15 @@ A doubled quote stands for one quote; a missing closing quote takes the rest."
 
 (defun %scalar-value (raw)
   "The string value of the scalar text RAW, or NIL when it is empty. Quoted
-scalars are unquoted; a plain scalar is taken whole, with no comment
-stripping, because real values contain a # that is part of the text."
-  (let ((s (and raw (%trim raw))))
-    (cond ((or (null s) (zerop (length s))) nil)
-          ((char= #\" (char s 0)) (%unquote-double s))
-          ((char= #\' (char s 0)) (%unquote-single s))
-          (t s))))
+scalars are unquoted, and an empty quoted value such as \"\" is no value at
+all; a plain scalar is taken whole, with no comment stripping, because real
+values contain a # that is part of the text."
+  (let* ((s (and raw (%trim raw)))
+         (value (cond ((or (null s) (zerop (length s))) nil)
+                      ((char= #\" (char s 0)) (%unquote-double s))
+                      ((char= #\' (char s 0)) (%unquote-single s))
+                      (t s))))
+    (and value (plusp (length value)) value)))
 
 (defun %parse-flow-list (raw)
   "The items of the flow sequence RAW, written [a, b], as a list of strings."
@@ -390,15 +405,35 @@ shape are ignored."
   (let ((entry (%entry key entries)))
     (and entry (eq :scalar (second entry)) (%scalar-value (third entry)))))
 
+(defun %strip-comment (string)
+  "STRING without a trailing YAML comment: from the first # that starts the
+text or follows a space or tab. A # inside a word is kept."
+  (let ((hash (loop for i from 0 below (length string)
+                    when (and (char= #\# (char string i))
+                              (or (zerop i)
+                                  (member (char string (1- i)) '(#\Space #\Tab))))
+                      return i)))
+    (if hash (subseq string 0 hash) string)))
+
+(defun %status-scalar (raw)
+  "The status value in the scalar text RAW, or NIL. A plain value loses a
+trailing comment, which the lenient reading of free text keeps, because a
+status is a single word and a comment after it must not stop it being
+recognised."
+  (let ((s (and raw (%trim raw))))
+    (cond ((or (null s) (zerop (length s))) nil)
+          ((member (char s 0) '(#\" #\')) (%scalar-value s))
+          (t (%scalar-value (%strip-comment s))))))
+
 (defun %status-from-raw (raw)
   "A status list from the raw scalar text RAW: a flow list gives its items, a
 single value gives a one-element list. Values are kept exactly as written,
-because a value this reader does not know must still reach whoever reads the
-result."
+apart from a trailing comment, because a value this reader does not know must
+still reach whoever reads the result."
   (let ((s (and raw (%trim raw))))
     (cond ((or (null s) (zerop (length s))) nil)
-          ((char= #\[ (char s 0)) (%parse-flow-list s))
-          (t (let ((value (%scalar-value s)))
+          ((char= #\[ (char s 0)) (%parse-flow-list (%strip-comment s)))
+          (t (let ((value (%status-scalar s)))
                (and value (list value)))))))
 
 (defun %entries-status (entries)
@@ -409,26 +444,35 @@ to a status key inside the metadata block."
     (cond ((and top (eq :scalar (second top)))
            (%status-from-raw (third top)))
           ((and top (eq :seq (second top)))
-           (remove nil (mapcar #'%scalar-value (third top))))
+           (remove nil (mapcar #'%status-scalar (third top))))
           ((and metadata (eq :map (second metadata)))
            (%status-from-raw
             (cdr (assoc "status" (third metadata) :test #'string=)))))))
+
+(defun %strip-bom (text)
+  "TEXT without a leading byte order mark. The UTF-8 decoder keeps it as a
+character, and left in place it hides the opening delimiter."
+  (if (and (plusp (length text))
+           (char= (char text 0) (code-char #xFEFF)))
+      (subseq text 1)
+      text))
 
 (defun parse-frontmatter (text)
   "Read the frontmatter of page TEXT. Returns two values: a plist
 (:FRONTMATTER-P :NAME :DESCRIPTION :STATUS :STATUS-REASON :UPDATED) and the
 1-based line number of the first body line. Frontmatter exists only when line
-1 is --- and a closing --- or ... follows within the scan limit; otherwise the
-whole text is body. STATUS is a list of the values exactly as written, or NIL
-when the page states none. The harness's own metadata block is read for a
-status fallback only; its modified time is the harness's write time, not the
-author's update time, so it is not reported as UPDATED. Never signals."
+1 is ---, after any byte order mark, and a closing --- or ... follows within
+the scan limit; otherwise the whole text is body. STATUS is a list of the
+values exactly as written, or NIL when the page states none. The harness's
+own metadata block is read for a status fallback only; its modified time is
+the harness's write time, not the author's update time, so it is not reported
+as UPDATED. Never signals."
   (flet ((no-frontmatter ()
            (values (list :frontmatter-p nil :name nil :description nil
                          :status nil :status-reason nil :updated nil)
                    1)))
     (handler-case
-        (let* ((lines (%split-lines text))
+        (let* ((lines (%split-lines (%strip-bom text)))
                (delimiter-p (lambda (line)
                               (member (string-right-trim '(#\Space #\Tab) line)
                                       '("---" "...") :test #'string=)))
@@ -458,7 +502,8 @@ author's update time, so it is not reported as UPDATED. Never signals."
 (defstruct (memory-page (:conc-name page-))
   "One memory page as read from disk. LINES holds every line of the file,
 frontmatter included, so a line number counts from the top of the file and an
-agent can open the file at it. BODY-START is the 1-based first body line."
+agent can open the file at it; a search clears it on the pages it returns once
+their excerpts are taken. BODY-START is the 1-based first body line."
   file store name description status status-reason updated lines body-start)
 
 (defun read-memory-page (path store-name &key (max-chars 262144))
@@ -466,15 +511,19 @@ agent can open the file at it. BODY-START is the 1-based first body line."
 values: a MEMORY-PAGE, or NIL when the file cannot be read, and true when the
 read stopped at MAX-CHARS characters. Invalid UTF-8 is replaced rather than
 refused, and the size cap keeps one oversized page from stalling a search.
-The name falls back to the filename stem."
+The buffer is sized to the file, since a UTF-8 file never decodes to more
+characters than it has bytes, so a small page costs only its own size. The
+name falls back to the filename stem."
   (handler-case
       (with-open-file (in path :external-format '(:utf-8 :replacement #\?))
-        (let* ((buffer (make-string max-chars))
+        (let* ((buffer (make-string (max 0 (min max-chars (file-length in)))))
                (count (read-sequence buffer in))
-               (capped (and (= count max-chars)
+               (capped (and (= count (length buffer))
                             (peek-char nil in nil nil)
                             t))
-               (text (subseq buffer 0 count)))
+               (text (%strip-bom (if (= count (length buffer))
+                                     buffer
+                                     (subseq buffer 0 count)))))
           (multiple-value-bind (plist body-start) (parse-frontmatter text)
             (values (make-memory-page
                      :file path
@@ -515,8 +564,8 @@ RETIRED is true when the page's status says it should no longer be relied on."
 
 (defstruct (memory-search-outcome (:conc-name outcome-))
   "The result of a search. HITS is the ranked slice asked for, TOTAL the
-number of matching pages before slicing, LIMITED true when matches were left
-out of the slice, and COVERAGE a plist recording what was searched."
+number of matching pages before slicing, LIMITED true when matches lie beyond
+the end of the slice, and COVERAGE a plist recording what was searched."
   hits total limited coverage)
 
 (defun %query-terms (query)
@@ -552,79 +601,84 @@ store name."
        (list (cons (car (last (butlast (pathname-directory dir)))) dir))))
     (t (error "Unknown memory search scope ~S; expected project or all." scope))))
 
-(defun %body-lines (page)
-  "The body lines of PAGE as a list of (line-number . text), numbered from the
-top of the file."
-  (loop with lines = (page-lines page)
-        for index from (1- (page-body-start page)) below (length lines)
-        collect (cons (1+ index) (svref lines index))))
-
 (defun %metadata-texts (page)
   "The filename, name and description of PAGE, where present."
   (remove nil (list (file-namestring (page-file page))
                     (page-name page)
                     (page-description page))))
 
-(defun %page-matches-p (page scanners)
-  "True when every one of SCANNERS matches PAGE's filename, name,
-description or body."
-  (let ((metadata (%metadata-texts page))
-        (body (mapcar #'cdr (%body-lines page))))
-    (every (lambda (scanner)
-             (flet ((hit (text) (scan scanner text)))
-               (or (some #'hit metadata) (some #'hit body))))
-           scanners)))
-
-(defun %page-tier (page scanners)
-  "0 when every one of SCANNERS matches PAGE's filename, name or
-description, 1 when at least one does, 2 when none does."
-  (let* ((metadata (%metadata-texts page))
-         (matched (count-if (lambda (scanner)
-                              (some (lambda (text) (scan scanner text)) metadata))
-                            scanners)))
-    (cond ((= matched (length scanners)) 0)
-          ((plusp matched) 1)
-          (t 2))))
-
-(defun %body-hit-count (page scanners)
-  "The number of matches of SCANNERS over PAGE's body lines. Frontmatter is
-not counted, because the tier already accounts for it."
-  (loop for (nil . text) in (%body-lines page)
-        sum (loop for scanner in scanners
-                  sum (floor (length (all-matches scanner text)) 2))))
-
 (defparameter *excerpt-line-limit* 240
   "The longest excerpt line returned; longer lines are cut to this length.")
 
-(defun %excerpts (page scanners context lines-per-page)
-  "Excerpts from PAGE's body: the first LINES-PER-PAGE lines matching any of
-SCANNERS, each with CONTEXT body lines either side. Overlapping windows merge
-into one run with no line repeated. Each excerpt is a plist (:LINE n :TEXT s
-:MATCH bool), where n counts from the top of the file so an agent can open
-the file at that line, and MATCH marks the selected matching lines."
-  (let* ((body (%body-lines page))
+(defun %excerpt-text (text start)
+  "TEXT cut to at most *EXCERPT-LINE-LIMIT* characters. START is where the
+first match on the line begins, or NIL for a context line; when the match
+would fall past the cut, the window slides along the line so the match stays
+in view."
+  (let ((limit *excerpt-line-limit*)
+        (len (length text)))
+    (if (<= len limit)
+        text
+        (let ((from (if start
+                        (min (- len limit) (max 0 (- start 40)))
+                        0)))
+          (subseq text from (+ from limit))))))
+
+(defun %match-page (page scanners context lines-per-page)
+  "The MEMORY-HIT for PAGE when every one of SCANNERS matches its filename,
+name, description or body, else NIL. Each body line is scanned once per
+scanner, and that one pass yields the match test, the body hit count and the
+excerpts, so an expensive pattern costs one scan of the page, not several.
+The tier is 0 when every scanner matches the metadata, 1 when some do and 2
+when none does. Excerpts are the first LINES-PER-PAGE matching body lines,
+each with CONTEXT body lines either side; overlapping windows merge into one
+run with no line repeated. Each excerpt is a plist (:LINE n :TEXT s :MATCH
+bool), where n counts from the top of the file so an agent can open the file
+at that line, and MATCH marks the selected matching lines."
+  (let* ((metadata (%metadata-texts page))
+         (lines (page-lines page))
          (first-line (page-body-start page))
-         (last-line (+ first-line (length body) -1))
-         (matching (loop for (n . text) in body
-                         when (some (lambda (scanner) (scan scanner text)) scanners)
-                           collect n into found
-                         until (>= (length found) lines-per-page)
-                         finally (return found)))
-         (shown (sort (remove-duplicates
-                       (loop for m in matching
-                             nconc (loop for n from (max first-line (- m context))
-                                           to (min last-line (+ m context))
-                                         collect n)))
-                      #'<))
-         (lines (page-lines page)))
-    (mapcar (lambda (n)
-              (let ((text (svref lines (1- n))))
-                (list :line n
-                      :text (if (> (length text) *excerpt-line-limit*)
-                                (subseq text 0 *excerpt-line-limit*)
-                                text)
-                      :match (and (member n matching) t))))
-            shown)))
+         (last-line (length lines))
+         (in-metadata (mapcar (lambda (scanner)
+                                (and (some (lambda (text) (scan scanner text)) metadata) t))
+                              scanners))
+         (in-body (make-list (length scanners) :initial-element nil))
+         (body-hits 0)
+         (matching '()))
+    (loop for index from (1- first-line) below last-line
+          for text = (svref lines index)
+          do (let ((start nil))
+               (loop for scanner in scanners
+                     for cell on in-body
+                     do (let ((found (all-matches scanner text)))
+                          (when found
+                            (setf (car cell) t)
+                            (incf body-hits (floor (length found) 2))
+                            (setf start (if start (min start (first found)) (first found))))))
+               (when (and start (< (length matching) lines-per-page))
+                 (push (cons (1+ index) start) matching))))
+    (when (every (lambda (meta body) (or meta body)) in-metadata in-body)
+      (let* ((matched (count t in-metadata))
+             (matching (nreverse matching))
+             (shown (sort (remove-duplicates
+                           (loop for (m) in matching
+                                 nconc (loop for n from (max first-line (- m context))
+                                               to (min last-line (+ m context))
+                                             collect n)))
+                          #'<)))
+        (make-memory-hit
+         :page page
+         :tier (cond ((= matched (length scanners)) 0)
+                     ((plusp matched) 1)
+                     (t 2))
+         :body-hits body-hits
+         :excerpts (mapcar (lambda (n)
+                             (let ((start (cdr (assoc n matching))))
+                               (list :line n
+                                     :text (%excerpt-text (svref lines (1- n)) start)
+                                     :match (and start t))))
+                           shown)
+         :retired (and (retired-status-p (page-status page)) t))))))
 
 (defun %hit< (a b)
   "True when hit A ranks ahead of hit B: lower tier first, then more body
@@ -640,8 +694,54 @@ past the limit and hide it by another route."
           (t (string< (file-namestring (page-file (hit-page a)))
                       (file-namestring (page-file (hit-page b))))))))
 
+(defparameter *search-time-limit* 10
+  "Seconds a search may run before it stops with MEMORY-SEARCH-ABORTED. The
+verb runs where the server reads requests, so while a search runs nothing
+else is read; this bounds how long a pattern that backtracks without end, or a
+very broad search, can hold the session.")
+
+(define-condition memory-search-aborted (error)
+  ((reason :initarg :reason :reader search-abort-reason))
+  (:report (lambda (condition stream)
+             (format stream "the search stopped because ~A"
+                     (search-abort-reason condition))))
+  (:documentation "Signalled when a search runs past its time limit or
+exhausts the stack or heap. REASON says which, in words a caller can act on."))
+
+(define-condition search-deadline-reached (serious-condition)
+  ()
+  (:documentation "Signalled into a searching thread when its time runs out.
+It is deliberately not an ERROR, so the handlers that turn an unreadable page
+into a skipped one cannot swallow it and let the search run on."))
+
+(defun %call-with-deadline (seconds thunk)
+  "Call THUNK and return its values, signalling MEMORY-SEARCH-ABORTED instead
+when it runs longer than SECONDS or exhausts the stack or heap. A regular
+expression can backtrack without end inside a single match, so the bound
+interrupts the running match rather than being checked between pages. NIL or
+a non-positive SECONDS means no time limit."
+  (let ((timer (sb-ext:make-timer (lambda () (error 'search-deadline-reached))
+                                  :name "memory-search deadline"
+                                  :thread sb-thread:*current-thread*)))
+    (handler-case
+        (unwind-protect
+             (progn
+               (when (and seconds (plusp seconds))
+                 (sb-ext:schedule-timer timer seconds))
+               (funcall thunk))
+          (sb-ext:unschedule-timer timer))
+      (search-deadline-reached ()
+        (error 'memory-search-aborted
+               :reason (format nil "it ran longer than ~A second~:P; narrow the ~
+terms, simplify the pattern or search one project" seconds)))
+      (storage-condition ()
+        (error 'memory-search-aborted
+               :reason (format nil "it ran out of stack or memory, which a ~
+regular expression that backtracks deeply can cause; simplify the pattern"))))))
+
 (defun search-memory (query &key (scope "project") session-root regex hide-retired
-                              (limit 20) (offset 0) (context 1) (lines-per-page 3))
+                              (limit 20) (offset 0) (context 1) (lines-per-page 3)
+                              (time-limit *search-time-limit*))
   "Search memory pages for QUERY and return a MEMORY-SEARCH-OUTCOME.
 QUERY is split on whitespace and a page matches when every term matches its
 filename, name, description or body, ignoring case. Terms are literal unless
@@ -650,11 +750,13 @@ library's syntax error. SCOPE project searches the store derived from
 SESSION-ROOT, which must then be given; scope all searches every store.
 Hits are ranked by metadata tier, then body hits, then store and filename,
 and then sliced by OFFSET and LIMIT; TOTAL counts every match before the
-slice. Retired pages are returned and flagged unless HIDE-RETIRED is true,
-in which case they are dropped before counting and the number dropped is
-reported as :HIDDEN-RETIRED. LIMIT is clamped to 1..100, OFFSET to at least
-0 and CONTEXT to 0..5. A missing store is not an error: it shows in the
-coverage with :EXISTS NIL."
+slice, and LIMITED is true only when matches lie beyond the slice. Retired
+pages are returned and flagged unless HIDE-RETIRED is true, in which case
+they are dropped before counting and the number dropped is reported as
+:HIDDEN-RETIRED. LIMIT is clamped to 1..100, OFFSET to at least 0 and
+CONTEXT to 0..5. A missing store is not an error: it shows in the coverage
+with :EXISTS NIL. A search that runs longer than TIME-LIMIT seconds, or
+exhausts the stack or heap, signals MEMORY-SEARCH-ABORTED."
   (let* ((limit (max 1 (min 100 limit)))
          (offset (max 0 offset))
          (context (max 0 (min 5 context)))
@@ -673,36 +775,37 @@ coverage with :EXISTS NIL."
                (if cell
                    (incf (cdr cell) count)
                    (setf skipped (append skipped (list (cons reason count))))))))
-      (loop for (name . dir) in stores
-            for exists = (and (ignore-errors (uiop:directory-exists-p dir)) t)
-            do (push (list :name name :path (namestring dir) :exists exists)
-                     store-records)
-               (when exists
-                 (multiple-value-bind (pages skips subdirs)
-                     (list-store-pages dir projects-dir)
-                   (incf subdirectories subdirs)
-                   (loop for (reason . count) in skips do (skip reason count))
-                   (dolist (path pages)
-                     (multiple-value-bind (page cappedp) (read-memory-page path name)
-                       (cond ((null page) (skip :unreadable 1))
-                             (t (incf scanned)
-                                (when cappedp (incf capped))
-                                (when (and scanners (%page-matches-p page scanners))
-                                  (push (make-memory-hit
-                                         :page page
-                                         :tier (%page-tier page scanners)
-                                         :body-hits (%body-hit-count page scanners)
-                                         :excerpts (%excerpts page scanners context
-                                                              lines-per-page)
-                                         :retired (and (retired-status-p
-                                                        (page-status page))
-                                                       t))
-                                        matches)))))))))
+      (%call-with-deadline
+       time-limit
+       (lambda ()
+         (loop for (name . dir) in stores
+               for exists = (and (ignore-errors (uiop:directory-exists-p dir)) t)
+               do (push (list :name name :path (namestring dir) :exists exists)
+                        store-records)
+                  (when exists
+                    (multiple-value-bind (pages skips subdirs)
+                        (list-store-pages dir projects-dir)
+                      (incf subdirectories subdirs)
+                      (loop for (reason . count) in skips do (skip reason count))
+                      (dolist (path pages)
+                        (multiple-value-bind (page cappedp) (read-memory-page path name)
+                          (cond ((null page) (skip :unreadable 1))
+                                (t (incf scanned)
+                                   (when cappedp (incf capped))
+                                   (let ((hit (and scanners
+                                                   (%match-page page scanners context
+                                                                lines-per-page))))
+                                     (when hit
+                                       ;; The excerpts are taken, so the page's
+                                       ;; full text need not live until the slice.
+                                       (setf (page-lines page) nil)
+                                       (push hit matches))))))))))))
       (let* ((shown (if hide-retired (remove-if #'hit-retired matches) matches))
              (hidden (- (length matches) (length shown)))
              (ranked (stable-sort (copy-list shown) #'%hit<))
              (total (length ranked))
-             (slice (subseq ranked (min offset total) (min total (+ offset limit)))))
+             (start (min offset total))
+             (slice (subseq ranked start (min total (+ offset limit)))))
         (log-event :debug "memory.search"
                    "scope" (string-downcase scope)
                    "stores" (length stores)
@@ -711,7 +814,7 @@ coverage with :EXISTS NIL."
         (make-memory-search-outcome
          :hits slice
          :total total
-         :limited (< (length slice) total)
+         :limited (< (+ start (length slice)) total)
          :coverage (list :scope (string-downcase scope)
                          :config-dir (namestring (claude-config-dir))
                          :projects-dir (and projects-dir (namestring projects-dir))
