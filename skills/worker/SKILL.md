@@ -444,14 +444,30 @@ one, you have one.
 
 ### Arm one watcher per joined bus
 
-Each through the **Monitor tool** with `persistent: true`, each with its own
-`--bus`. See the **bus-watch** skill for why a background Bash task is not an arm.
+Two steps per bus, each with its own `--bus`. Launch the detached watcher **once
+per session**; it survives the Monitor's 30-minute expiry and re-arms itself at
+every recycle:
 
 ```
-while true; do ~/.local/bin/dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
-  --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace /absolute/path/to/this/repo/; done \
+~/.local/bin/dsmr-bus-watch --detach --poll-ms 250 \
+  --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace /absolute/path/to/this/repo/
+```
+
+Then tail the log it names (its `monitor:` line gives the exact command) through
+the **Monitor tool** with `persistent: true`, and re-arm **only this tail** each
+time the Monitor expires:
+
+```
+tail -q -n0 -F ~/.local/state/dsmr-mcp/watch/<tag>--<agent>.log \
   | grep --line-buffered -E "^(bus|error):"
 ```
+
+One Monitor may tail several buses' logs with a glob, `…/watch/*--<agent>.log`.
+See the **bus-watch** skill for why a background Bash task is not an arm, and for
+why the re-arm is now a read-only tail: every 30-minute re-arm used to be a fresh
+watcher launch the permission classifier could refuse, and agents went deaf that
+way. Pre-clear both commands, and `--reap` below, with the rest of your
+permissions.
 
 ⛔ **`--namespace` takes the ABSOLUTE PROJECT ROOT, not the repository's name.**
 Run `pwd -P` and paste that, with its trailing separator. `c3po/` is a name;
@@ -473,15 +489,18 @@ namespace and require `dead`:
 If that answers `live`, you are reading your own misfiled heartbeat and your real
 arm is somewhere nobody publishes.
 
-⛔ **Arm the loop, never the bare watcher.** `--stream` exits 0 on its idle
-window on purpose: that is the self-heal that re-arms a watch which has gone
-silently deaf. Monitor ends a watch when its command exits, so a bare
-`~/.local/bin/dsmr-bus-watch --stream` leaves you deaf at the first idle mark, believing you
-are armed, with nothing to notify you. The `while true` loop is what turns that
-exit into a re-arm, and the `grep` keeps `recycle:` lines off your context while
-letting `bus:` and `error:` through.
+⛔ **Never arm the bare watcher.** `--stream` exits 0 on its idle window on
+purpose: that is the self-heal that re-arms a watch which has gone silently deaf.
+Monitor ends a watch when its command exits, so a bare
+`~/.local/bin/dsmr-bus-watch --stream` leaves you deaf at the first idle mark,
+believing you are armed, with nothing to notify you. `--detach` now carries that
+recycle itself, re-arming in place. The old `while true` loop around `--stream` is
+valid only as a fallback when `--detach` is unavailable: if `--help` lacks
+`--detach`, run `make install-bus-watch` from the dsmr-mcp checkout first, and
+take the fallback form from the **bus-watch** skill only if that is impossible.
 
-One Monitor does not cover two buses. Two joined buses means two Monitors.
+One watcher does not cover two buses. Two joined buses means two `--detach` runs
+(one Monitor may tail both logs).
 
 ### Confirm each one, and read the bus field
 
@@ -495,7 +514,8 @@ on the wrong bus has a fresh heartbeat, answers `live`, and never fires: it is d
 in exactly the way that used to be invisible, which is why the field was added.
 
 - `live ... bus=<your tag>`: you are listening to the right bus. Go silent.
-- `live ... bus=<something else>`: **you are deaf.** Re-arm with the right tag.
+- `live ... bus=<something else>`: **you are deaf.** Re-arm with the right tag,
+  and `--reap --bus <wrong tag>` the stray watcher so it stops answering `live`.
 - `bus=default`: you are on the shared host-wide bus. Correct only if that is
   where you were told to be. No bus can be named `default`, so this label is never
   ambiguous.
@@ -504,12 +524,26 @@ in exactly the way that used to be invisible, which is why the field was added.
   `make install-bus-watch` from the dsmr-mcp checkout, then re-arm. The binary and
   the MCP core deploy separately, so a current server is no evidence of a current
   watcher.
-- `dead` / `stale`: nothing is listening. Re-arm the Monitor.
+- `dead` / `stale`: nothing is listening. Run `--detach` again, then re-arm the
+  tail.
 - exit 64: the bus name itself was refused. Fix the name; nothing was armed.
 
 Going silent on a dead, stale or wrong-bus watch is going deaf. A dispatch by name
 will never reach you and nobody learns until the operator notices the wait. Never
 park deaf: the right `live`, on every joined bus, and then silence.
+
+⛔ **When your session is ending, reap the detached watcher.** That means a
+fleet-restart park (see **fleet-restart**) or leaving the fleet, not a `BLOCKED`
+park inside a live session, which must stay reachable. The watcher OUTLIVES your
+session, so an unreaped one is a listener nobody reads, still answering `live` for
+an agent that is gone. After your last drain and before the `PARKED` line:
+
+```
+~/.local/bin/dsmr-bus-watch --reap --all-buses --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
+```
+
+Exit 0 means nothing of yours is left. Exit 1 (`survived` or `foreign`) is said in
+your park record, never parked on silently.
 
 ⛔ **Do not use the roster as proof you are connected.** Being enrolled is not
 being reachable, and being unenrolled does not stop you reaching the bus. The

@@ -1,15 +1,16 @@
 ---
 name: bus-watch
-description: "Stay reachable on the dsmr-mcp coordination bus without polling: arm ONE persistent Monitor over the streaming watcher per joined bus, and each new message wakes you. Use when you need to listen for bus messages in the background, wake on a bus event, or stay attached across a session (lead or sister). Covers the Monitor-tool arm (the real wake), naming the bus with --bus, draining on wake, the stable-identity rule, and the --check-live liveness probe that names which bus it answered for. Companion to fleet and fleet-restart."
+description: "Stay reachable on the dsmr-mcp coordination bus without polling: launch ONE detached watcher per joined bus once per session, tail its log under a persistent Monitor, and each new message wakes you. Use when you need to listen for bus messages in the background, wake on a bus event, or stay attached across a session (lead or sister). Covers the detach-then-tail arm (the real wake), reaping the watcher at park, naming the bus with --bus, draining on wake, the stable-identity rule, and the --check-live liveness probe that names which bus it answered for. Companion to fleet and fleet-restart."
 ---
 
 # /bus-watch
 
 How a fleet agent stays reachable on the durable dsmr-mcp coordination bus
-**without polling and without a re-arm dance** — arm one persistent watcher
-through the **Monitor tool** at bring-up, and every new message wakes you.
+**without polling** — launch one detached watcher per joined bus at bring-up,
+tail its log through the **Monitor tool**, and every new message wakes you.
 
-Arm it once per session. There is no per-turn re-arm to remember.
+Launch the watcher once per session. The only re-arm is the Monitor's tail after
+its 30-minute expiry, and that is a read-only command. Reap the watcher at park.
 
 ## Read this first: the one mistake that made watches go deaf
 
@@ -32,8 +33,10 @@ Same watcher, different harness primitive. Use the Monitor.
 `dsmr-bus-watch` (on `PATH` at `~/.local/bin/dsmr-bus-watch`) watches the bus
 write-ahead log. In `--stream` mode it prints one `bus:<SEQ>` line per poll that
 turned up anything new for you, carrying the highest such seq, and keeps running;
-on an idle window it prints `recycle:` and exits (the outer loop restarts it).
-Signal goes to stdout; diagnostics to stderr.
+on an idle window it prints `recycle:` and exits (a supervisor restarts it).
+Signal goes to stdout; diagnostics to stderr. With `--detach` it becomes its own
+supervisor: it runs detached, re-arms itself in place at each recycle, and writes
+its signal lines to a per-(bus, agent) log file that the Monitor tails.
 
 ⚠ **A line means CHECK THE BUS, not "one message with this seq is waiting."**
 `bus-receive` drains everything pending in a single call, so when several records
@@ -60,9 +63,8 @@ With an identity resolved:
 
 - The watcher **arms at your durable cursor**, not the log head — so a message
   that landed between a drain and this arm still fires, and **when the streaming
-  watcher recycles and the loop restarts it, it re-arms at your advanced cursor
-  and replays nothing.** Cursor-based arming is exactly what makes the persistent
-  loop idempotent. Without an identity it arms at the head, wakes on your own
+  watcher recycles and re-arms, it re-arms at your advanced cursor and replays
+  nothing.** Cursor-based arming is exactly what makes the recycle idempotent. Without an identity it arms at the head, wakes on your own
   publishes, replays on every restart, and has no keyed heartbeat for
   `--check-live`.
 - It **ignores your own publishes** — arming and publishing happen in any order.
@@ -98,8 +100,9 @@ in exactly the way that used to be invisible, and the field exists to make it
 visible. `bus=default` is what the shared bus prints; no bus can be named
 `default`, so the word is unambiguous.
 
-**One watcher per joined bus.** An agent joined to two buses arms two Monitors,
-each with its own `--bus`, and confirms each one separately. Each keeps its own
+**One watcher per joined bus.** An agent joined to two buses launches two
+detached watchers, each with its own `--bus`, and confirms each one separately
+(one Monitor may tail both logs, or one Monitor per bus). Each keeps its own
 heartbeat under its own bus root, so the liveness answers do not collide and each
 one is about the bus it names.
 
@@ -113,55 +116,85 @@ the shared bus, and answers `--check-live` with **no `bus=` field at all**. Trea
 missing `bus=` field as proof of a stale binary, not as an answer. A stale watcher
 binary once made six sisters' reports unscoreable.
 
-## Arm it — one persistent Monitor at bring-up
+## Arm it — launch the watcher once, tail its log under a Monitor
 
-Call the **Monitor tool** (not a background Bash task) with the streaming watcher
-as its command:
+The arm is **two steps per joined bus**, and they have different lifetimes.
+
+**Step 1 — once per session: launch the detached watcher.**
+
+```
+~/.local/bin/dsmr-bus-watch --detach --poll-ms 250 \
+  --bus <tag> --agent <name> --namespace <absolute-project-root>/
+```
+
+It makes sure exactly one detached streaming watcher runs for that (bus, agent),
+in its own session with stdin from `/dev/null`, so it survives the shell that
+started it **and the Monitor's 30-minute expiry**. It re-arms itself in place at
+every idle recycle — the recycle-EXIT self-heal still happens, the detached
+process carries it instead of a `while true` loop. It appends its `bus:` and
+`error:` lines to `$XDG_STATE_HOME/dsmr-mcp/watch/<bus>--<agent>.log` (default
+`~/.local/state/dsmr-mcp/watch/…`) with a pid file beside it. It is
+**idempotent**: run it again while the watcher is up and it starts nothing.
+
+It prints two lines:
+
+```
+detached pid=<pid> bus=<name> log=<path>      # or `running pid=…` when one was already up
+monitor: tail -q -n0 -F <path> | grep --line-buffered -E '^(bus|error):'
+```
+
+Exit 1 means a watcher under the same name belongs to **another namespace** or the
+child did not come up; exit 2 means no identity resolved. Neither armed anything
+for you. The pass-through flags (`--poll-ms`, `--recycle-seconds`, …) reach the
+detached watcher.
+
+**Step 2 — the Monitor, re-armed on every 30-minute expiry: tail the log.**
 
 ```
 Monitor(
-  command: 'while true; do
-              { ~/.local/bin/dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
-                  --bus <tag> --agent <name> --namespace <absolute-project-root>/ \
-                || echo "error:watch-crashed rc=$?"; } \
-              | grep --line-buffered -E "^(bus|error):" || true
-              sleep 1
-            done',
+  command: 'tail -q -n0 -F ~/.local/state/dsmr-mcp/watch/<tag>--<name>.log \
+              | grep --line-buffered -E "^(bus|error):"',
   description: 'bus wake for <name> on <tag>',
   persistent: true
 )
 ```
 
-Drop `--bus <tag>` only when you are deliberately on the shared host-wide bus.
-Spelling it out on a named bus is worth the characters: it puts the bus in the
-Monitor's description and in the line an operator reads, so an arm on the wrong
-bus is a visible mistake rather than an invisible one. Arm one of these **per
-joined bus**, each with its own tag and its own description.
+Use the exact `monitor:` line step 1 printed if it differs from this. One Monitor
+may tail several buses' logs at once with a glob, `…/watch/*--<name>.log`; one
+Monitor per bus is equally fine and keeps the description naming the bus.
+
+⚠ **The Monitor expires at 30 minutes regardless of `persistent: true`.** Before
+the detached watcher existed, every expiry meant re-launching the watcher itself,
+and that re-launch was a fresh command the permission classifier could refuse or
+leave without a verdict: six sightings across five sessions on 2026-09-29, each
+one an agent gone deaf. **Re-arming is now a read-only `tail` of a log file**,
+which is why it is expected to pass the classifier more reliably. That
+expectation rests on a few samples, not a measurement — if a tail re-arm is
+refused, it is still a refusal: say so, do not assume it cannot happen. The
+watcher itself keeps running through the gap and nothing is lost: it re-announces
+anything you have not drained at its next re-arm, and your durable cursor holds
+the rest.
+
+Drop `--bus <tag>` only when you are deliberately on the shared host-wide bus
+(its log stem is `default--<name>`). Spelling it out on a named bus is worth the
+characters: it puts the bus in the Monitor's description and in the line an
+operator reads, so an arm on the wrong bus is a visible mistake rather than an
+invisible one.
 
 Why each piece:
 
-- **`persistent: true`** — the watch lives for the session. This is what removes
-  the re-arm discipline entirely: you arm once, here, and never again this
-  session.
-- **`while true; … ; done`** — correct *because* the Monitor consumes each line.
-  When `--stream` exits on its idle recycle, the loop relaunches it and the
-  Monitor keeps listening. (This same loop was fatal under `run_in_background`,
-  which only fires on exit — that never comes.)
-- **`|| echo "error:…"; sleep 1`** — coverage and throttle. A crash surfaces as
-  an `error:` notification instead of silence, and the `sleep` stops a missing
-  binary from hot-spinning.
+- **`--detach` launched once, never per re-arm** — the watcher launch is the
+  command the classifier used to refuse; now it happens once, at bring-up, when
+  you are present to handle a refusal.
+- **`tail -q -n0 -F`** — `-F` follows the log across the watcher re-creating it;
+  `-n0` starts at the end so a re-arm does not replay old wakes into your
+  context. A wake that landed in the gap between Monitors is not lost: the
+  watcher arms from your durable cursor at each recycle and announces it again,
+  and a catch-up `bus-receive` after re-arming closes the gap at once.
 - **`grep --line-buffered -E "^(bus|error):"`** — passes the wakes (`bus:`) and
-  failures (`error:`), hides `recycle:` so an idle watch does not append to your
-  conversation and burn context. `--line-buffered` is required or matches sit in
-  grep's buffer unseen.
-- **The filter sits INSIDE the loop, and the whole stage ends in `|| true`.**
-  Measured across four repos on 2026-08-15: with the filter on the outside, as
-  `done | grep …`, the loop writes into a pipe it does not control, and when the
-  reading end goes away the loop dies with it. The watch stops, the session stays
-  up, and nothing announces either fact — a repo that has gone deaf reads exactly
-  like a repo with nothing to say. Inside the loop, a filter that dies costs one
-  iteration; `|| true` keeps a non-zero exit from ending the loop as well. Both
-  were confirmed by a delivered wake afterwards rather than by a heartbeat.
+  failures (`error:`), hides anything else. `--line-buffered` is required or
+  matches sit in grep's buffer unseen. A persistent fault is written as one
+  `error:` line, not one per retry, so it does not wake you every few seconds.
 - **The path is absolute, never a bare `dsmr-bus-watch`.** Whether the bare name resolves depends
   on how the session was started: a tool call runs against a snapshot of the shell environment taken
   at session start, and a session launched by the fleet launcher can carry a much narrower `PATH`
@@ -178,12 +211,79 @@ Why each piece:
   `--check-live` with `live`, which is true and useless: the probe proves a
   watcher exists, never that it is watching for you. Write the name out.
 - **`--poll-ms 250`** — reaction latency is the poll interval, not the recycle
-  window. **`--recycle-seconds 1800`** — a long idle window; it only governs how
-  often the inner watcher self-heals, never how fast a message wakes you.
+  window. The recycle window only governs how often the watcher self-heals,
+  never how fast a message wakes you.
+- **`--stall-seconds N` (default 120)** — a watcher whose poll loop stops cycling
+  exits with status 75, so a wedged watcher reads as `dead`/`stale` rather than
+  alive and deaf. SIGTERM ends a watcher at once.
+
+### Fallback: the bare `--stream` loop, only when `--detach` is unavailable
+
+If `~/.local/bin/dsmr-bus-watch --help` lacks `--detach`, the PATH binary is old:
+`make install-bus-watch` from the dsmr-mcp checkout, then arm as above. Only if
+that is impossible, arm the old supervised stream directly in the Monitor:
+
+```
+Monitor(
+  command: 'while true; do
+              { ~/.local/bin/dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
+                  --bus <tag> --agent <name> --namespace <absolute-project-root>/ \
+                || echo "error:watch-crashed rc=$?"; } \
+              | grep --line-buffered -E "^(bus|error):" || true
+              sleep 1
+            done',
+  description: 'bus wake for <name> on <tag>',
+  persistent: true
+)
+```
+
+The lessons that shaped this form still hold for it, and `--detach` now carries
+them internally:
+
+- **The `while true` loop and `--recycle-seconds` are required, not decoration.**
+  `--stream` exits 0 on its idle window as the self-heal that re-arms a watch
+  gone silently deaf; a bare `--stream` goes deaf at the first idle mark while
+  still reporting armed. (This same loop was fatal under `run_in_background`,
+  which only fires on exit — that never comes.)
+- **`|| echo "error:…"; sleep 1`** — a crash surfaces as an `error:` notification
+  instead of silence, and the `sleep` stops a missing binary from hot-spinning.
+- **The filter sits INSIDE the loop, and the whole stage ends in `|| true`.**
+  Measured across four repos on 2026-08-15: with the filter on the outside, as
+  `done | grep …`, the loop writes into a pipe it does not control, and when the
+  reading end goes away the loop dies with it. The watch stops, the session stays
+  up, and nothing announces either fact — a repo that has gone deaf reads exactly
+  like a repo with nothing to say. Inside the loop, a filter that dies costs one
+  iteration; `|| true` keeps a non-zero exit from ending the loop as well. Both
+  were confirmed by a delivered wake afterwards rather than by a heartbeat.
+- ⚠ **This form dies with the Monitor.** Every 30-minute expiry needs the whole
+  launch command again, which is exactly the re-arm the classifier refused on
+  2026-09-29. Treat it as a stopgap until the binary is current.
 
 **Each agent arms in its OWN session** — a Monitor wakes only the session that
 started it. Substitute `<project-root>/` for your real root; keep the trailing
 slash.
+
+## Park: reap the detached watcher
+
+⛔ **The detached watcher OUTLIVES the session.** That is its purpose, and it is
+also why it must be stopped deliberately: an unreaped watcher is a listener
+nobody reads, holding a heartbeat that answers `live` for an agent that is gone.
+At park, after your last drain:
+
+```
+~/.local/bin/dsmr-bus-watch --reap --all-buses --agent <name> --namespace <absolute-project-root>/
+```
+
+It sends SIGTERM to each watcher's process group, SIGKILL after 3 s, verifies the
+pid is gone and removes the pid file. One line per watcher: `reaped pid=… bus=…
+signal=term|kill`, `none bus=…`, `survived pid=… bus=…`, or `foreign …` for a
+watcher under your name in another namespace, which it leaves running. **Exit 0
+only when nothing of yours is left**; exit 1 means something survived — say so in
+the park record rather than parking on it. Drop `--all-buses` and pass `--bus` to
+reap one bus only.
+
+A context rotation is not a park: the successor re-runs `--detach`, which answers
+`running` for the watcher already up, and re-arms only the tail.
 
 ## When it wakes you (each `bus:<SEQ>` notification)
 
@@ -204,12 +304,15 @@ slash.
 2. **Handle** what you received — confirm a sister's SHA, act on a request, relay
    to the operator. Publish any replies now.
 
-3. **Do NOT re-arm.** The persistent Monitor is still listening. There is no
-   per-turn arm step — that whole ritual is gone. Just go back to work.
+3. **Do NOT re-arm.** The Monitor is still tailing and the detached watcher is
+   still running. There is no per-wake arm step — that whole ritual is gone.
+   Just go back to work. The one re-arm left is the Monitor's tail when it
+   expires at 30 minutes; the watcher itself is never re-launched for that.
 
-An `error:` notification means the inner watcher crashed or is missing: check the
-Monitor's output file (Read) and its stderr, fix the binary if needed, and
-re-arm the Monitor.
+An `error:` notification means the detached watcher hit a fault (it retries on
+its own and writes the same fault once): run `--check-live`, and if it answers
+`dead`/`stale` run `--detach` again, then re-arm the tail. If the binary is
+missing or stale, `make install-bus-watch` first.
 
 ## Is your watch actually alive? — the liveness probe
 
@@ -224,10 +327,11 @@ clean exit, so "am I still listening?" is a cheap local check, not a `ps` grep:
 - `live pid=<pid> age_s=<n> bus=<name>` (exit 0): a watcher is listening for you
   now, **on the bus it names**. Check that name against the bus you meant to arm.
 - `dead bus=<name>` (exit 1): no heartbeat on that bus, nothing listening.
-  **Re-arm the Monitor.**
+  **Run `--detach` again, then re-arm the tail.**
 - `stale pid=<pid> age_s=<n> bus=<name>` (exit 1): heartbeat not refreshed within
-  `--live-window-seconds` (default 5), so the watcher wedged or was killed.
-  **Re-arm the Monitor.**
+  `--live-window-seconds` (default 5), so the watcher wedged or was killed (a
+  wedged one ends itself after `--stall-seconds`). **Run `--detach` again, then
+  re-arm the tail.**
 - `unknown` (exit 2): no identity resolved; pass the same `--agent`/`--namespace`
   you armed with. This answer carries no bus, deliberately: a bus printed beside an
   unresolved identity would read as a probe that found something.
@@ -241,9 +345,8 @@ Run it **once per joined bus**, with that bus's tag. A single `live` says nothin
 about the other bus.
 
 The Monitor surfaces the inner watcher's crashes itself (the `error:` line), but
-`--check-live` is the cheap assertion to run **before you go silent / park** — a
-parked agent with pending mail and no listener is the invisible state this
-closes — and **whenever a reply you expected never woke you.** It reads the
+`--check-live` is the cheap assertion to run **before you go silent** — an
+agent with pending mail and no listener is the invisible state this closes — and **whenever a reply you expected never woke you.** It reads the
 heartbeat only; it never consumes a message or touches your cursor.
 
 ## On bring-up (rejoin, then arm)
@@ -253,14 +356,16 @@ heartbeat only; it never consumes a message or touches your cursor.
    watcher is already live for you (`live_watcher`).
 2. `bus-receive` (stable `agent_id`) — drain catch-up, repeating while
    `remaining_pending` is non-zero.
-3. **Arm the persistent Monitor** as above, once per joined bus.
+3. **Arm**: `--detach` once per joined bus, then the Monitor tailing each log.
+   A `bus-receive` right after the tail is up closes any gap between the two.
 4. `--check-live` per bus. `live` **with the `bus=` field naming the bus you
    armed** means you are actually listening to it. `dead`/`stale`/`unknown`, a bus
    field naming a different bus, or no bus field at all, all mean you rejoined
    blind. Fix it before you report ready.
 
 A SessionStart hook may prime a one-shot watcher before turn one; it does not
-replace this — the persistent Monitor is your standing listener.
+replace this — the detached watcher plus the Monitor's tail is your standing
+listener.
 
 ## Watch and receive under your STABLE identity
 
@@ -279,12 +384,15 @@ bus it uses an `ephemeral` identity, which never advances the main cursor.
 
 | Situation | Do |
 |---|---|
-| Start listening (whole session) | Arm the **Monitor tool** (`persistent: true`) with the `--stream` watcher command above. Never a `run_in_background` Bash task. |
+| Start listening (whole session) | `--detach` once per joined bus, then the **Monitor tool** (`persistent: true`) tailing the log it names. Never a `run_in_background` Bash task. |
+| Monitor expired (30 min) | re-arm the **tail** only. Never re-launch the watcher for this; `--detach` is for bring-up and for a `dead` watcher. |
+| Parking | last drain, then `--reap --all-buses --agent <name> --namespace <root>/`; exit 0, or say what survived. |
+| `--help` lacks `--detach` | stale PATH binary. `make install-bus-watch`; the bare `--stream` loop is the fallback only if that is impossible. |
 | Woke on `bus:<SEQ>` | `bus-receive` (stable id) → handle → back to work. **No re-arm.** |
-| Woke on `error:…` | inner watcher crashed/missing — read the output file, fix the binary, re-arm the Monitor. |
-| Am I still listening? | `~/.local/bin/dsmr-bus-watch --check-live --bus <tag> --agent <name> --namespace <absolute-project-root>/`, wanting `live` **and** the right `bus=`, or re-arm the Monitor. |
-| Before going silent / parking | run `--check-live` per joined bus; never park on `dead`/`stale`, and never on a `bus=` that is not the one you armed. |
-| Joined to two buses | two Monitors, two `--bus` tags, two `--check-live` runs. One `live` covers one bus. |
+| Woke on `error:…` | the detached watcher hit a fault — `--check-live`; on `dead`/`stale` run `--detach` again and re-arm the tail. |
+| Am I still listening? | `~/.local/bin/dsmr-bus-watch --check-live --bus <tag> --agent <name> --namespace <absolute-project-root>/`, wanting `live` **and** the right `bus=`, or `--detach` again and re-arm the tail. |
+| Before going silent | run `--check-live` per joined bus; never go silent on `dead`/`stale`, and never on a `bus=` that is not the one you armed. |
+| Joined to two buses | two `--detach` runs, two `--bus` tags, two `--check-live` runs (one Monitor may glob both logs). One `live` covers one bus. |
 | `--check-live` prints no `bus=` field | stale PATH binary that armed on the shared bus regardless of what you asked. `make install-bus-watch`, then re-arm. |
 | `--bus` exits 64 | the name is refused (over 32 chars, a character outside `A-Z a-z 0-9 - _ .`, a reserved name, or a socket path too long). Fix the name; never shorten it to fit. |
 | Large backlog | `bus-receive` with `limit` 5–10, page on `remaining_pending`. |

@@ -154,28 +154,41 @@ same value. The flag exists precisely so the line an operator reads names the bu
 it arms on:
 
 ```
-while true; do ~/.local/bin/dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
-  --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/ \
-  || echo "error:watch-crashed rc=$?"; sleep 1;
-done | grep --line-buffered -E "^(bus|error):"
+# once per session: launch the detached watcher (idempotent)
+~/.local/bin/dsmr-bus-watch --detach --poll-ms 250 \
+  --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
+
+# the Monitor command, re-armed on every 30-minute expiry
+tail -q -n0 -F ~/.local/state/dsmr-mcp/watch/<tag>--<agent>.log \
+  | grep --line-buffered -E "^(bus|error):"
 ```
 
-⛔ **Print the loop, never the bare watcher.** `--stream` exits 0 on its idle
-window deliberately, because that exit is the self-heal that re-arms a watch
-which has gone silently deaf. The Monitor tool ends a watch when its command
-exits, so a sister handed a bare `~/.local/bin/dsmr-bus-watch --stream` goes deaf at the first
-idle mark while believing it is armed. The `while true` loop turns that exit into
-a re-arm; the `grep` keeps `recycle:` off the sister's context.
+⛔ **Print both steps, and never a bare `--stream` watcher.** `--stream` exits 0 on
+its idle window deliberately, because that exit is the self-heal that re-arms a
+watch which has gone silently deaf. `--detach` now carries that recycle itself: the
+detached watcher re-arms in place and survives the Monitor's 30-minute expiry, so
+the Monitor only ever tails its log, and a re-arm is a read-only `tail` rather than
+a fresh watcher launch the permission classifier can refuse (six sightings across
+five sessions on 2026-09-29). A sister handed a bare
+`~/.local/bin/dsmr-bus-watch --stream` still goes deaf at the first idle mark while
+believing it is armed. The old `while true` loop around `--stream` is a fallback
+only for a binary whose `--help` lacks `--detach`; the fix for that is
+`make install-bus-watch`. See the **bus-watch** skill for the fallback form.
 
-Each sister arms that in **its own session**, through the Monitor tool with
-`persistent: true`. See the **bus-watch** skill for why a background Bash task is
-not an arm. Then it confirms:
+Each sister arms that in **its own session**, the tail through the Monitor tool
+with `persistent: true`. See the **bus-watch** skill for why a background Bash
+task is not an arm. Then it confirms:
 
 ```
 ~/.local/bin/dsmr-bus-watch --check-live --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
 ```
 
 and must see **both** `live` **and** `bus=<tag>` before going silent.
+
+The detached watcher outlives the session, so a participant leaving the fleet or
+parking reaps it: `~/.local/bin/dsmr-bus-watch --reap --all-buses --agent
+"$DSMR_BUS_AGENT" --namespace <absolute-project-root>/`, exit 0. An unreaped one is
+a listener nobody reads, and it keeps answering `live`.
 
 ## Step 5 - Close enrollment, and know what that means
 
