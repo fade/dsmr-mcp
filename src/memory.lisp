@@ -8,7 +8,10 @@
 (defpackage #:dsmr-mcp/src/memory
   (:use #:cl)
   (:import-from #:cl-ppcre
-                #:split)
+                #:split
+                #:scan
+                #:create-scanner
+                #:quote-meta-chars)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
   (:export #:*claude-config-dir*
@@ -32,7 +35,21 @@
            #:page-updated
            #:page-lines
            #:page-body-start
-           #:retired-status-p))
+           #:retired-status-p
+           #:search-memory
+           #:memory-search-outcome
+           #:memory-search-outcome-p
+           #:outcome-hits
+           #:outcome-total
+           #:outcome-limited
+           #:outcome-coverage
+           #:memory-hit
+           #:memory-hit-p
+           #:hit-page
+           #:hit-tier
+           #:hit-body-hits
+           #:hit-excerpts
+           #:hit-retired))
 
 (in-package #:dsmr-mcp/src/memory)
 
@@ -477,3 +494,150 @@ case: the values that say a page should no longer be relied on."
   (some (lambda (status)
           (member status '("obsolete" "superseded" "refuted") :test #'string-equal))
         status-list))
+
+;;; ---------------------------------------------------------------------------
+;;; Search
+;;;
+;;; Everything here only reads. A search walks every page of every store in
+;;; scope, because ranking needs every match before the result is sliced, and
+;;; it records what it read so an empty answer can be told apart from a store
+;;; that does not exist.
+;;; ---------------------------------------------------------------------------
+
+(defstruct (memory-hit (:conc-name hit-))
+  "One page that matched a search. TIER is 0 when every term matches the
+filename, name or description, 1 when at least one does, and 2 when only the
+body matches. BODY-HITS counts matches over body lines. EXCERPTS is a list of
+plists (:LINE n :TEXT s :MATCH bool) numbered from the top of the file.
+RETIRED is true when the page's status says it should no longer be relied on."
+  page tier body-hits excerpts retired)
+
+(defstruct (memory-search-outcome (:conc-name outcome-))
+  "The result of a search. HITS is the ranked slice asked for, TOTAL the
+number of matching pages before slicing, LIMITED true when matches were left
+out of the slice, and COVERAGE a plist recording what was searched."
+  hits total limited coverage)
+
+(defun %query-terms (query)
+  "The whitespace-separated terms of QUERY, empty ones dropped."
+  (remove "" (split "\\s+" (or query "")) :test #'string=))
+
+(defun %term-scanners (terms regex)
+  "A case-insensitive scanner for each of TERMS. Without REGEX each term is
+matched literally. A malformed regular expression signals the regex
+library's syntax error, which reaches the caller unchanged."
+  (mapcar (lambda (term)
+            (create-scanner (if regex term (quote-meta-chars term))
+                            :case-insensitive-mode t))
+          terms))
+
+(defun %resolve-stores (scope session-root)
+  "The stores SCOPE covers, as a list of (name . directory). Scope project
+gives the one store derived from SESSION-ROOT, whether or not it exists.
+Scope all gives every existing <projects>/*/memory/ directory, sorted by
+store name."
+  (cond
+    ((string-equal scope "all")
+     (let ((projects (projects-directory)))
+       (sort (loop for sub in (and projects (ignore-errors (uiop:subdirectories projects)))
+                   for memory = (%safe-truename (merge-pathnames "memory/" sub))
+                   when (and memory (ignore-errors (uiop:directory-exists-p memory)))
+                     collect (cons (car (last (pathname-directory sub))) memory))
+             #'string< :key #'car)))
+    ((string-equal scope "project")
+     (unless session-root
+       (error "A project-scope memory search needs a session root."))
+     (let ((dir (project-store-directory session-root)))
+       (list (cons (car (last (butlast (pathname-directory dir)))) dir))))
+    (t (error "Unknown memory search scope ~S; expected project or all." scope))))
+
+(defun %body-lines (page)
+  "The body lines of PAGE as a list of (line-number . text), numbered from the
+top of the file."
+  (loop with lines = (page-lines page)
+        for index from (1- (page-body-start page)) below (length lines)
+        collect (cons (1+ index) (svref lines index))))
+
+(defun %metadata-texts (page)
+  "The filename, name and description of PAGE, where present."
+  (remove nil (list (file-namestring (page-file page))
+                    (page-name page)
+                    (page-description page))))
+
+(defun %page-matches-p (page scanners)
+  "True when every one of SCANNERS matches PAGE's filename, name,
+description or body."
+  (let ((metadata (%metadata-texts page))
+        (body (mapcar #'cdr (%body-lines page))))
+    (every (lambda (scanner)
+             (flet ((hit (text) (scan scanner text)))
+               (or (some #'hit metadata) (some #'hit body))))
+           scanners)))
+
+(defun search-memory (query &key (scope "project") session-root regex hide-retired
+                              (limit 20) (offset 0) (context 1) (lines-per-page 3))
+  "Search memory pages for QUERY and return a MEMORY-SEARCH-OUTCOME.
+QUERY is split on whitespace and a page matches when every term matches its
+filename, name, description or body, ignoring case. Terms are literal unless
+REGEX is true, and a malformed regular expression signals the regex
+library's syntax error. SCOPE project searches the store derived from
+SESSION-ROOT, which must then be given; scope all searches every store.
+LIMIT is clamped to 1..100, OFFSET to at least 0 and CONTEXT to 0..5. A
+missing store is not an error: it shows in the coverage with :EXISTS NIL."
+  (declare (ignorable hide-retired lines-per-page))
+  (let* ((limit (max 1 (min 100 limit)))
+         (offset (max 0 offset))
+         (context (max 0 (min 5 context)))
+         (scanners (%term-scanners (%query-terms query) regex))
+         (stores (%resolve-stores scope session-root))
+         (projects-dir (projects-directory))
+         (store-records '())
+         (skipped '())
+         (scanned 0)
+         (capped 0)
+         (subdirectories 0)
+         (matches '()))
+    (declare (ignorable context))
+    (flet ((skip (reason count)
+             (let ((cell (assoc reason skipped)))
+               (if cell
+                   (incf (cdr cell) count)
+                   (setf skipped (append skipped (list (cons reason count))))))))
+      (loop for (name . dir) in stores
+            for exists = (and (ignore-errors (uiop:directory-exists-p dir)) t)
+            do (push (list :name name :path (namestring dir) :exists exists)
+                     store-records)
+               (when exists
+                 (multiple-value-bind (pages skips subdirs)
+                     (list-store-pages dir projects-dir)
+                   (incf subdirectories subdirs)
+                   (loop for (reason . count) in skips do (skip reason count))
+                   (dolist (path pages)
+                     (multiple-value-bind (page cappedp) (read-memory-page path name)
+                       (cond ((null page) (skip :unreadable 1))
+                             (t (incf scanned)
+                                (when cappedp (incf capped))
+                                (when (and scanners (%page-matches-p page scanners))
+                                  (push (make-memory-hit :page page) matches)))))))))
+      (let* ((ranked (nreverse matches))
+             (total (length ranked)))
+        (log-event :debug "memory.search"
+                   "scope" (string-downcase scope)
+                   "stores" (length stores)
+                   "scanned" scanned
+                   "matches" total)
+        (make-memory-search-outcome
+         :hits ranked
+         :total total
+         :limited nil
+         :coverage (list :scope (string-downcase scope)
+                         :config-dir (namestring (claude-config-dir))
+                         :projects-dir (and projects-dir (namestring projects-dir))
+                         :stores (nreverse store-records)
+                         :pages-scanned scanned
+                         :pages-skipped skipped
+                         :pages-capped capped
+                         :subdirectories-not-searched subdirectories
+                         :hidden-retired 0
+                         :limit limit
+                         :offset offset))))))
