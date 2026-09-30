@@ -143,14 +143,25 @@ changed."
   (true (gethash "memory-search" *tool-classes*)))
 
 (define-test no-root-default-scope-errors
-  "The default scope needs a project root; scope all does not."
+  "The default scope needs a project root, and the refusal does not point a
+rootless caller at another scope."
   (with-tool-fixture (tmp repo store)
     (let ((payload (%call nil "query" "x")))
       (is eq t (gethash "isError" payload))
-      (is string= "project-root-not-set" (gethash "error_type" payload)))
-    (let ((payload (%call nil "query" "x" "scope" "all")))
-      (false (gethash "isError" payload))
-      (is string= "all" (gethash "scope" (gethash "coverage" payload))))))
+      (is string= "project-root-not-set" (gethash "error_type" payload))
+      (false (search "scope all" (%content-text payload))))))
+
+(define-test scope-all-needs-a-root
+  "Scope all reads other projects' stores, so a rootless session is refused
+with the same error the default scope gives, and nothing is searched."
+  (with-tool-fixture (tmp repo store)
+    (%plant tmp "-other-store" "theirs.md" :name "theirs" :body "a planted term
+")
+    (let ((payload (%call nil "query" "planted" "scope" "all")))
+      (is eq t (gethash "isError" payload))
+      (is string= "project-root-not-set" (gethash "error_type" payload))
+      (false (gethash "results" payload))
+      (false (search "theirs" (%content-text payload))))))
 
 (define-test blank-query-is-invalid
   "A query of only whitespace is an argument error, not an empty search."
@@ -277,7 +288,7 @@ invents one for it."
 ")
     (%plant tmp "-other-store" "theirs.md" :name "theirs" :body "a planted term
 ")
-    (let ((payload (%call nil "query" "planted" "scope" "all")))
+    (let ((payload (%call repo "query" "planted" "scope" "all")))
       (is = 2 (length (%results payload)))
       (is equal (sort (list store "-other-store") #'string<)
           (sort (mapcar (lambda (r) (gethash "store" r)) (%results payload))

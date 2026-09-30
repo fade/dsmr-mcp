@@ -134,13 +134,13 @@ matching page in another store is not returned."
       (is string= "all" (%coverage outcome :scope))
       (is = 2 (length (%coverage outcome :stores))))))
 
-(define-test scope-all-needs-no-root
-  "Scope all needs no session root."
+(define-test scope-all-needs-a-root
+  "Scope all with no session root signals, as scope project does, rather
+than reading every project's store for a caller with no project."
   (with-search-fixture (tmp repo store)
     (%plant tmp "-other-store" "theirs.md" :name "theirs" :body "a planted term
 ")
-    (is equal '("theirs.md")
-        (%hit-files (search-memory "planted" :scope "all")))))
+    (fail (search-memory "planted" :scope "all") error)))
 
 (define-test project-scope-needs-a-root
   "Scope project with no session root signals rather than guessing a store."
