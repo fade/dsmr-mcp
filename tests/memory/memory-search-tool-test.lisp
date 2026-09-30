@@ -28,6 +28,7 @@
                 #:get-tool-instance)
   (:import-from #:dsmr-mcp/src/memory
                 #:*claude-config-dir*
+                #:*search-time-limit*
                 #:store-name-for)
   (:import-from #:dsmr-mcp/tests/support/fs-fixture
                 #:write-fixture-file))
@@ -158,6 +159,14 @@ changed."
       (is eq t (gethash "isError" payload))
       (is string= "invalid-argument" (gethash "error_type" payload)))))
 
+(define-test scope-matches-the-enum-exactly
+  "The verb accepts the scope values exactly as the schema lists them, so a
+direct call and a call over the wire agree on what is refused."
+  (with-tool-fixture (tmp repo store)
+    (let ((payload (%call repo "query" "x" "scope" "All")))
+      (is eq t (gethash "isError" payload))
+      (is string= "invalid-argument" (gethash "error_type" payload)))))
+
 (define-test bad-regex-is-invalid
   "A malformed regular expression is the caller's mistake, reported as an
 argument error rather than a failed search."
@@ -167,6 +176,45 @@ argument error rather than a failed search."
     (let ((payload (%call repo "query" "(" "regex" t)))
       (is eq t (gethash "isError" payload))
       (is string= "invalid-argument" (gethash "error_type" payload)))))
+
+(define-test backtracking-regex-is-a-search-error
+  "A pattern that backtracks without end returns a search-error once the time
+limit passes, and the session answers the next call. The outer guard keeps a
+regression from hanging the suite."
+  (with-tool-fixture (tmp repo store)
+    (%plant tmp store "prose.md" :name "prose"
+            :body (format nil "~{~A~^ ~} !~%" (loop repeat 30 collect "word")))
+    (let ((payload (handler-case
+                       (sb-ext:with-timeout 30
+                         (let ((*search-time-limit* 1))
+                           (%call repo "query" "^(\\w+\\s?)*$" "regex" t)))
+                     (sb-ext:timeout () :wedged))))
+      (true (hash-table-p payload) "the call returned")
+      (when (hash-table-p payload)
+        (is eq t (gethash "isError" payload))
+        (is string= "search-error" (gethash "error_type" payload))
+        (true (search "second" (%content-text payload)))))
+    (is = 1 (gethash "count" (%call repo "query" "prose")))))
+
+(define-test last-page-offers-no-more
+  "The final page and an offset past the end neither set limited nor tell
+the caller to pass another offset."
+  (with-tool-fixture (tmp repo store)
+    (loop for file in '("a.md" "b.md" "c.md")
+          do (%plant tmp store file :name "p" :body "needle
+"))
+    (let ((first-page (%call repo "query" "needle" "limit" 2)))
+      (is eq t (gethash "limited" first-page))
+      (true (search "pass offset 2 for more" (%content-text first-page))))
+    (let ((last-page (%call repo "query" "needle" "limit" 2 "offset" 2)))
+      (is = 1 (gethash "count" last-page))
+      (false (gethash "limited" last-page))
+      (false (search "for more" (%content-text last-page))))
+    (let ((past (%call repo "query" "needle" "limit" 2 "offset" 7)))
+      (is = 0 (gethash "count" past))
+      (false (gethash "limited" past))
+      (false (search "for more" (%content-text past)))
+      (true (search "past the last" (%content-text past))))))
 
 ;;; status visibility ---------------------------------------------------------
 
