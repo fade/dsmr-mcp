@@ -249,3 +249,189 @@ left unsearched."
       (is = 1 (%coverage outcome :subdirectories-not-searched))
       (is = 3 (outcome-total outcome))
       (false (outcome-limited outcome)))))
+
+;;; ranking -------------------------------------------------------------------
+
+(defun %repeat-lines (text count)
+  "COUNT lines each holding TEXT."
+  (with-output-to-string (out)
+    (dotimes (i count) (format out "~A~%" text))))
+
+(define-test metadata-match-outranks-body-hits
+  "A page matching every term in its filename, name or description ranks
+ahead of a page matching only in its body, however many body hits that page
+has."
+  (with-search-fixture (tmp repo store)
+    (%plant tmp store "a.md" :name "a" :description "about the needle" :body "x
+")
+    (%plant tmp store "b.md" :name "b" :body (%repeat-lines "a needle" 10))
+    (let* ((outcome (search-memory "needle" :session-root repo))
+           (hits (outcome-hits outcome)))
+      (is equal '("a.md" "b.md") (%hit-files outcome))
+      (is = 0 (hit-tier (first hits)))
+      (is = 2 (hit-tier (second hits)))
+      (is = 10 (hit-body-hits (second hits))))))
+
+(define-test partial-metadata-match-is-middle-tier
+  "A page where only some terms match its metadata sits between a full
+metadata match and a body-only match."
+  (with-search-fixture (tmp repo store)
+    (%plant tmp store "full.md" :name "full" :description "needle and thread" :body "x
+")
+    (%plant tmp store "part.md" :name "part" :description "needle" :body "thread
+")
+    (%plant tmp store "body.md" :name "body" :body "needle thread
+")
+    (let ((outcome (search-memory "needle thread" :session-root repo)))
+      (is equal '("full.md" "part.md" "body.md") (%hit-files outcome))
+      (is equal '(0 1 2) (mapcar #'hit-tier (outcome-hits outcome))))))
+
+(define-test tier-then-hits-then-store-then-file
+  "Within a tier, pages order by body hits descending, then by store name and
+filename ascending, so the order is the same on every run."
+  (with-search-fixture (tmp repo store)
+    (%plant tmp store "p1.md" :name "p1" :body (%repeat-lines "needle" 1))
+    (%plant tmp store "p2.md" :name "p2" :body (%repeat-lines "needle" 3))
+    (%plant tmp store "p0.md" :name "p0" :body (%repeat-lines "needle" 1))
+    (%plant tmp "-aaa" "z.md" :name "z" :body (%repeat-lines "needle" 1))
+    (let ((outcome (search-memory "needle" :scope "all")))
+      (is equal '("p2.md" "z.md" "p0.md" "p1.md") (%hit-files outcome))
+      (is equal '(3 1 1 1) (mapcar #'hit-body-hits (outcome-hits outcome))))))
+
+;;; excerpts ------------------------------------------------------------------
+
+(defun %excerpt-summary (hit)
+  "HIT's excerpts as a list of (line . match)."
+  (mapcar (lambda (e) (cons (getf e :line) (getf e :match)))
+          (hit-excerpts hit)))
+
+(defun %hit-named (outcome file)
+  "The hit in OUTCOME whose page filename is FILE."
+  (find file (outcome-hits outcome)
+        :key (lambda (hit) (file-namestring (page-file (hit-page hit))))
+        :test #'string=))
+
+(define-test excerpts-carry-file-absolute-lines
+  "Excerpt line numbers count from the top of the file, frontmatter included,
+with CONTEXT lines either side of each match, overlapping windows merged, and
+at most LINES-PER-PAGE matching lines per page."
+  (with-search-fixture (tmp repo store)
+    (let ((front "---
+name: e
+description: d
+updated: 2026-01-01
+status: active
+---
+"))
+      (write-fixture-file tmp (format nil "projects/~A/memory/e.md" store)
+                          (format nil "~Aone~%two~%the needle~%four~%five~%" front))
+      (write-fixture-file tmp (format nil "projects/~A/memory/m.md" store)
+                          (format nil "~Aneedle a~%needle b~%three~%" front))
+      (write-fixture-file tmp (format nil "projects/~A/memory/many.md" store)
+                          (format nil "~A~A" front (%repeat-lines "needle" 5)))
+      (let ((outcome (search-memory "needle" :session-root repo)))
+        (is equal '((8) (9 . t) (10))
+            (%excerpt-summary (%hit-named outcome "e.md")))
+        (is string= "the needle"
+            (getf (second (hit-excerpts (%hit-named outcome "e.md"))) :text))
+        (is equal '((7 . t) (8 . t) (9))
+            (%excerpt-summary (%hit-named outcome "m.md")))
+        (is = 3 (count-if #'cdr (%excerpt-summary (%hit-named outcome "many.md")))))
+      (is equal '((9 . t))
+          (%excerpt-summary
+           (%hit-named (search-memory "needle" :session-root repo :context 0) "e.md")))
+      (is = 1 (count-if #'cdr
+                        (%excerpt-summary
+                         (%hit-named (search-memory "needle" :session-root repo
+                                                             :lines-per-page 1)
+                                     "many.md")))))))
+
+(define-test long-lines-are-truncated
+  "An excerpt line longer than 240 characters is cut to 240."
+  (with-search-fixture (tmp repo store)
+    (%plant tmp store "long.md" :name "long"
+            :body (format nil "needle~A~%" (make-string 994 :initial-element #\x)))
+    (let* ((hit (first (outcome-hits (search-memory "needle" :session-root repo))))
+           (excerpt (find t (hit-excerpts hit) :key (lambda (e) (getf e :match)))))
+      (is = 240 (length (getf excerpt :text))))))
+
+;;; retired pages -------------------------------------------------------------
+
+(defun %plant-retired-pair (tmp store)
+  "Plant a superseded page a-old.md and an otherwise identical page b-new.md
+with no status in STORE. Filename order puts a-old.md first, so any demotion
+of the retired page shows as a change of order."
+  (write-fixture-file tmp (format nil "projects/~A/memory/a-old.md" store)
+                      "---
+name: old
+status: superseded
+status_reason: replaced by b-new
+updated: 2026-09-01
+---
+a needle
+")
+  (write-fixture-file tmp (format nil "projects/~A/memory/b-new.md" store)
+                      "---
+name: new
+---
+a needle
+"))
+
+(define-test retired-page-shown-and-flagged
+  "A superseded page is returned by default, flagged retired, carries its
+status, reason and update date, and ranks exactly where it would with no
+status."
+  (with-search-fixture (tmp repo store)
+    (%plant-retired-pair tmp store)
+    (let* ((outcome (search-memory "needle" :session-root repo))
+           (old (first (outcome-hits outcome)))
+           (new (second (outcome-hits outcome))))
+      (is equal '("a-old.md" "b-new.md") (%hit-files outcome))
+      (true (hit-retired old))
+      (is equal '("superseded") (page-status (hit-page old)))
+      (is string= "replaced by b-new" (page-status-reason (hit-page old)))
+      (is string= "2026-09-01" (page-updated (hit-page old)))
+      (is = (hit-tier new) (hit-tier old))
+      (is = (hit-body-hits new) (hit-body-hits old))
+      (is = 0 (%coverage outcome :hidden-retired)))))
+
+(define-test hide-retired-excludes-and-counts
+  "Hiding retired pages removes them from the hits and the total, and the
+coverage says how many were hidden."
+  (with-search-fixture (tmp repo store)
+    (%plant-retired-pair tmp store)
+    (let ((outcome (search-memory "needle" :session-root repo :hide-retired t)))
+      (is equal '("b-new.md") (%hit-files outcome))
+      (is = 1 (outcome-total outcome))
+      (is = 1 (%coverage outcome :hidden-retired)))))
+
+(define-test status-less-page-has-no-status
+  "A page that states no status carries none and is not flagged retired."
+  (with-search-fixture (tmp repo store)
+    (%plant-retired-pair tmp store)
+    (let ((new (%hit-named (search-memory "needle" :session-root repo) "b-new.md")))
+      (false (page-status (hit-page new)))
+      (false (hit-retired new)))))
+
+;;; pagination ----------------------------------------------------------------
+
+(define-test limit-and-offset-slice-after-ranking
+  "LIMIT and OFFSET slice the ranked list; TOTAL counts every match and
+LIMITED says matches were left out. LIMIT is clamped to 1..100."
+  (with-search-fixture (tmp repo store)
+    ;; Filenames run opposite to rank, so slicing before ranking would show.
+    (loop for file in '("a.md" "b.md" "c.md" "d.md" "e.md")
+          for hits from 1
+          do (%plant tmp store file :name "p" :body (%repeat-lines "needle" hits)))
+    (let ((outcome (search-memory "needle" :session-root repo :limit 2 :offset 2)))
+      (is equal '("c.md" "b.md") (%hit-files outcome))
+      (is = 5 (outcome-total outcome))
+      (true (outcome-limited outcome)))
+    (let ((outcome (search-memory "needle" :session-root repo)))
+      (is equal '("e.md" "d.md" "c.md" "b.md" "a.md") (%hit-files outcome))
+      (false (outcome-limited outcome)))
+    (is = 100 (%coverage (search-memory "needle" :session-root repo :limit 500) :limit))
+    (let ((outcome (search-memory "needle" :session-root repo :limit 0)))
+      (is = 1 (%coverage outcome :limit))
+      (is = 1 (length (outcome-hits outcome))))
+    (is = 0 (%coverage (search-memory "needle" :session-root repo :offset -3) :offset))))
