@@ -390,22 +390,41 @@ receive errors, read the spill file first — the cursor advances on delivery.
 ⚠ `bus-status` is a **timestamp, not an inventory**: it counts your own publishes while delivery
 filters them. Never reconcile a drain against it.
 
-Arm a persistent `--stream` watcher in a Monitor — that is the standing
-listener; exit-on-event is only for the per-turn re-arm after a publish. **One
-per joined bus, each with its own `--bus`.** This is the arm line. Use it
-verbatim; do not compose one from memory:
+Arm the standing listener in two steps, **one per joined bus, each with its own
+`--bus`.** This is the arm. Use it verbatim; do not compose one from memory.
+
+Once per session, launch the detached watcher. It runs in its own session,
+survives the Monitor's 30-minute expiry, and re-arms itself at every idle recycle:
 
 ```
-while true; do ~/.local/bin/dsmr-bus-watch --stream --poll-ms 250 --recycle-seconds 1800 \
-  --bus <TAG> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/; done \
+~/.local/bin/dsmr-bus-watch --detach --poll-ms 250 \
+  --bus <TAG> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
+```
+
+Then run its log tail in a Monitor with `persistent: true` (the `monitor:` line it
+prints gives the exact command), and re-arm **only this tail** on every 30-minute
+expiry. One Monitor may tail several buses' logs with a glob, `…/watch/*--<agent>.log`:
+
+```
+tail -q -n0 -F ~/.local/state/dsmr-mcp/watch/<TAG>--<agent>.log \
   | grep --line-buffered -E "^(bus|error):"
 ```
 
-⛔ **BOTH FLAGS ARE REQUIRED, AND `--recycle-seconds` IS THE ONE THAT MATTERS.**
+⚠ **Why two steps: the re-arm used to be the point of failure.** Every 30-minute
+Monitor expiry meant a fresh watcher-launch command, which the permission
+classifier could refuse or leave with no verdict, and the agent went deaf: six
+sightings across five sessions on 2026-09-29. The launch now happens once; the
+re-arm is a read-only tail. See the **bus-watch** skill.
+
+⛔ **THE RECYCLE IS REQUIRED, AND `--detach` NOW CARRIES IT.**
 A bare `~/.local/bin/dsmr-bus-watch --stream` goes deaf at the first idle mark while still
 believing it is listening. The idle recycle-EXIT is what re-arms a silently-deaf
 watch; without it, a watcher that goes deaf for any reason STAYS deaf for the
-rest of the session. Do not remove it to make the watcher "keep running".
+rest of the session. Do not remove it to make the watcher "keep running". The
+detached watcher re-arms itself in place at each recycle, so you no longer supply
+the loop or `--recycle-seconds`. The old `while true … --stream --recycle-seconds 1800`
+loop is valid only as a fallback when `--detach` is unavailable (`--help` lacks it:
+`make install-bus-watch` first), and in that form BOTH flags remain required.
 
 ⚠ **This has already cost a fleet an entire episode, and the leader is the one
 exposed.** On 2026-08-01 the leader armed a bare `--stream` and lost 38 messages
@@ -422,8 +441,9 @@ Then **confirm your own ears** on each of them before you assert control:
 ~/.local/bin/dsmr-bus-watch --check-live --bus <tag> --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/
 ```
 
-⛔ **`--check-live` CANNOT DETECT A MISSING `--recycle-seconds`.** It answers
-`live` for a bare watcher exactly as it does for a correct one, so it will
+⛔ **`--check-live` CANNOT DETECT A WRONG ARM SHAPE** — a bare `--stream`, or a
+fallback loop missing `--recycle-seconds`. It answers `live` for a bare watcher
+exactly as it does for a correct one, so it will
 confirm your improvisation rather than catch it. It proves the watcher PROCESS
 is running; it says nothing about whether the arm line is right, and nothing
 about whether your Monitor's filter passes that process's output through to you.
@@ -434,6 +454,13 @@ different bus means the same thing while looking healthy, which is worse. No
 `bus=` field at all means the PATH binary predates named buses and armed on the
 shared bus regardless: `make install-bus-watch`, then re-arm. A leader that
 missed its own re-arm and lost inbound mail is exactly the failure this guards.
+On `dead`/`stale`, run `--detach` again and re-arm the tail.
+
+⛔ **When your session ends, reap your detached watcher** (the leader parks too;
+see **fleet-restart**). It OUTLIVES the session, so an unreaped one is a listener
+nobody reads that keeps answering `live` for a leader that is gone:
+`~/.local/bin/dsmr-bus-watch --reap --all-buses --agent "$DSMR_BUS_AGENT" --namespace <absolute-project-root>/`,
+exit 0 or say what survived.
 
 ## Step 5 — Your own memory store
 

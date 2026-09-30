@@ -94,10 +94,17 @@ these, skip — there is no bus to rejoin.
   namespace, and the pending count. The cursor is server-side and
   **persists across a client restart** — messages posted during the
   downtime are NOT lost; the returning instance drains them.
-- Note the `dsmr-bus-watch` wakeup watch as the one background process
-  that MUST be re-armed on the other side (it dies with this instance).
-  Record the exact arm flags in use (e.g. `--poll-ms 250
-  --recycle-seconds 600`) so cadence carries over.
+- Note the `dsmr-bus-watch` wakeup watch. The watcher itself is
+  launched with `--detach` and OUTLIVES this instance, so do NOT reap it
+  for a rotation; what dies with this instance is the Monitor tailing its
+  log, and that MUST be re-armed on the other side. Record the exact
+  `--detach` flags in use (bus, agent, namespace, e.g. `--poll-ms 250`)
+  and the log path it printed, so the successor re-runs the same
+  `--detach` (which answers `running` for the watcher already up) and
+  tails the same log. If the watch was armed the old way (a `while true
+  … --stream --recycle-seconds …` loop inside the Monitor, used only when
+  the binary lacks `--detach`), record those flags instead; that form does
+  die with this instance.
 - Drain the cursor now (`bus-receive` until empty) so the handoff is
   written from a known-clean bus state, and note the active coordination
   thread (who leads, who is mid-task, what gates the next step).
@@ -125,12 +132,14 @@ moment it does and siblings may be waiting.
   during the gap was lost.
 - Sequence: `bus-receive` (drain everything that landed during the
   downtime — read it) → then **re-arm the wakeup watch LAST**:
-  `dsmr-bus-watch <arm flags from probe>` (run_in_background; **omit
-  `--after`**; do a catch-up `bus-receive` immediately before arming;
-  arm strictly after any publish).
-- Steady-state loop thereafter: drain → act → publish → catch-up drain →
-  re-arm. A bare `recycle:` heartbeat wake = **re-arm silently** (no
-  operator-facing output); only surface on a real `bus:<SEQ>` message.
+  `~/.local/bin/dsmr-bus-watch --detach <arm flags from probe>` (idempotent;
+  **omit `--after`**), then a persistent **Monitor** (never
+  `run_in_background`) over the `monitor:` tail line it prints, then a
+  catch-up `bus-receive`. Confirm with `--check-live` (`live` and the right
+  `bus=`). See the **bus-watch** skill.
+- Steady-state thereafter: on each `bus:<SEQ>` wake, drain → act →
+  publish. No per-wake re-arm; re-arm only the Monitor's tail when it
+  expires at 30 minutes. Only surface on a real `bus:<SEQ>` message.
 - **Process restart:** restart the Claude **client** for context but keep
   the bus MCP server (dsmr-mcp) UP to preserve the live bus + cursors.
   The bus WAL is durable, so even an MCP restart recovers — but only
