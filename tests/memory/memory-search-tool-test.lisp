@@ -334,7 +334,7 @@ text say that nothing was searched."
     (%plant tmp "-other-store" "theirs.md" :name "theirs" :body "a planted term
 ")
     (let ((before (%tree-snapshot tmp)))
-      (%call nil "query" "planted" "scope" "all")
+      (is = 2 (gethash "count" (%call repo "query" "planted" "scope" "all")))
       (is equal before (%tree-snapshot tmp)))))
 
 (define-test no-value-key-in-response

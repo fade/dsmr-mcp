@@ -585,21 +585,21 @@ library's syntax error, which reaches the caller unchanged."
   "The stores SCOPE covers, as a list of (name . directory). Scope project
 gives the one store derived from SESSION-ROOT, whether or not it exists.
 Scope all gives every existing <projects>/*/memory/ directory, sorted by
-store name."
-  (cond
-    ((string-equal scope "all")
-     (let ((projects (projects-directory)))
-       (sort (loop for sub in (and projects (ignore-errors (uiop:subdirectories projects)))
-                   for memory = (%safe-truename (merge-pathnames "memory/" sub))
-                   when (and memory (ignore-errors (uiop:directory-exists-p memory)))
-                     collect (cons (car (last (pathname-directory sub))) memory))
-             #'string< :key #'car)))
-    ((string-equal scope "project")
-     (unless session-root
-       (error "A project-scope memory search needs a session root."))
-     (let ((dir (project-store-directory session-root)))
-       (list (cons (car (last (butlast (pathname-directory dir)))) dir))))
-    (t (error "Unknown memory search scope ~S; expected project or all." scope))))
+store name. Both scopes need SESSION-ROOT: scope all reads other projects'
+memory, which a caller with no project of its own is not given."
+  (unless (or (string-equal scope "all") (string-equal scope "project"))
+    (error "Unknown memory search scope ~S; expected project or all." scope))
+  (unless session-root
+    (error "A memory search needs a session root, whatever its scope."))
+  (if (string-equal scope "all")
+      (let ((projects (projects-directory)))
+        (sort (loop for sub in (and projects (ignore-errors (uiop:subdirectories projects)))
+                    for memory = (%safe-truename (merge-pathnames "memory/" sub))
+                    when (and memory (ignore-errors (uiop:directory-exists-p memory)))
+                      collect (cons (car (last (pathname-directory sub))) memory))
+              #'string< :key #'car))
+      (let ((dir (project-store-directory session-root)))
+        (list (cons (car (last (butlast (pathname-directory dir)))) dir)))))
 
 (defun %metadata-texts (page)
   "The filename, name and description of PAGE, where present."
@@ -747,7 +747,8 @@ QUERY is split on whitespace and a page matches when every term matches its
 filename, name, description or body, ignoring case. Terms are literal unless
 REGEX is true, and a malformed regular expression signals the regex
 library's syntax error. SCOPE project searches the store derived from
-SESSION-ROOT, which must then be given; scope all searches every store.
+SESSION-ROOT and scope all searches every store; both signal an error when
+SESSION-ROOT is not given.
 Hits are ranked by metadata tier, then body hits, then store and filename,
 and then sliced by OFFSET and LIMIT; TOTAL counts every match before the
 slice, and LIMITED is true only when matches lie beyond the slice. Retired

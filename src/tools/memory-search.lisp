@@ -53,7 +53,8 @@
 term must match a page's filename, name, description or body, ignoring case; set regex \
 to true to treat the terms as regular expressions. By default you search the memory \
 store of the current project; set scope to all to search every project's store, and \
-each result then names its store. Each result gives the page file, name, description, \
+each result then names its store. Both scopes need a project root, so call \
+fs-set-project-root first. Each result gives the page file, name, description, \
 its status fields when the page has any, and numbered matching lines with context, \
 best matches first. A retired page (superseded, refuted or obsolete) is returned and \
 marked with its status rather than hidden, unless you set hide_retired. The index \
@@ -73,8 +74,8 @@ matches when every term matches.")
                  (scope
                   :type :string
                   :enum ("project" "all")
-                  :description "project searches the current project's store and needs \
-a project root; all searches every store (default: project).")
+                  :description "project searches the current project's store; all \
+searches every store. Both need a project root (default: project).")
                  (regex
                   :type :boolean
                   :description "Treat each term as a regular expression (default: false).")
@@ -235,13 +236,13 @@ empty answer is never read as a completed search."
     (unless (member scope '("project" "all") :test #'equal)
       (return-from tool-handle
         (%error-result id "invalid-argument" "scope must be project or all.")))
-    ;; Only the project scope derives its store from the root; scope all
-    ;; reads every store and works in a rootless session.
-    (when (and (string= scope "project") (null root))
+    ;; Both scopes need a root. Scope all reads every project's memory, so a
+    ;; caller with no project, such as a rootless loopback HTTP session, must
+    ;; not reach other projects' stores through it.
+    (when (null root)
       (return-from tool-handle
         (%error-result id "project-root-not-set"
-                       "no project root set. Call fs-set-project-root first, \
-or pass scope all to search every store.")))
+                       "no project root set. Call fs-set-project-root first.")))
     (unless (and (stringp query)
                  (plusp (length (string-trim '(#\Space #\Tab #\Newline #\Return) query))))
       (return-from tool-handle

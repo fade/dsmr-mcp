@@ -333,7 +333,7 @@ filename ascending, so the order is the same on every run."
     (%plant tmp store "p2.md" :name "p2" :body (%repeat-lines "needle" 3))
     (%plant tmp store "p0.md" :name "p0" :body (%repeat-lines "needle" 1))
     (%plant tmp "-aaa" "z.md" :name "z" :body (%repeat-lines "needle" 1))
-    (let ((outcome (search-memory "needle" :scope "all")))
+    (let ((outcome (search-memory "needle" :scope "all" :session-root repo)))
       (is equal '("p2.md" "z.md" "p0.md" "p1.md") (%hit-files outcome))
       (is equal '(3 1 1 1) (mapcar #'hit-body-hits (outcome-hits outcome))))))
 
