@@ -413,9 +413,12 @@ your detached logs, and that exit is the wake:
 ~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <your-name> --namespace <absolute-project-root>/
 ```
 
-On wake: drain **every** joined bus with `bus-receive`, then re-arm the same line,
-then one catch-up `bus-receive`. On `nowatcher bus=<b>` (exit 1): re-run `--detach`,
-then re-arm. That is the only re-arm: after traffic, never on a timer. Use the
+Launch it with `timeout: 7200000`; the 30-minute default kills it first.
+On wake, an `idle wake-seconds=<N>` line included: drain **every** joined bus with
+`bus-receive`, then re-arm the same line, then one catch-up `bus-receive`. On
+`nowatcher bus=<b>` (exit 1): re-run `--detach`, then re-arm. ⛔ **The watch is
+permanent** (operator, 2026-10-01): a quiet bus is normal, and a runner kill at the
+time limit is a wake too, so drain and re-arm whatever its note says. Use the
 literal `~/.local/bin/dsmr-bus-watch` path and a literal name: the path is what the
 narrow `Bash(~/.local/bin/dsmr-bus-watch:*)` allow rule matches, and a matched rule
 resolves BEFORE the classifier in auto mode.

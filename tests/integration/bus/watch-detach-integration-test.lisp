@@ -431,6 +431,23 @@
                        (true (eql 0 (search "bus:1" line)) "got ~S" line)))
                 (stop-process wake))))))))
 
+(define-test a-quiet-wake-ends-idle-and-exits-zero
+  "A wake on a silent bus must end on its own with `idle` and exit 0, so the
+   agent's background runner sees a completion it re-arms from, never a wait it
+   kills at its ceiling."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((wake (apply #'launch-in state bin "--wake" "--wake-seconds" "1"
+                             "--poll-ms" "50" (identity-args))))
+            (unwind-protect
+                 (multiple-value-bind (code line) (finish-and-read wake 6)
+                   (is eql 0 code "a quiet --wake did not end with exit 0")
+                   (is string= "idle wake-seconds=1" line))
+              (stop-process wake)))))))
+
 (define-test wake-ends-on-sigterm-and-when-its-watcher-is-reaped
   "A waiting wake must stop when told to, and must not outlive the watcher it
    was following: a wait on a log nothing writes to again never ends."
