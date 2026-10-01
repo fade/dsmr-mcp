@@ -28,7 +28,12 @@
 
 (defpackage #:dsmr-mcp/tests/integration/bus/watch-detach-integration-test
   (:use #:cl #:zebra)
-  (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal)))
+  (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal))
+  ;; The file names come from the watcher's own stem functions, so these cases
+  ;; look where the binary writes and can never drift from it.
+  (:import-from #:dsmr-bus-watch/src/bus/watch
+                #:%detach-stem
+                #:%legacy-detach-stem))
 
 (in-package #:dsmr-mcp/tests/integration/bus/watch-detach-integration-test)
 
@@ -74,8 +79,18 @@
 (defun identity-args ()
   (list "--bus" *bus* "--agent" *agent* "--namespace" *namespace*))
 
-(defun detach-file (state type)
-  (merge-pathnames (format nil "dsmr-mcp/watch/~A--~A.~A" *bus* *agent* type) state))
+(defun full-id (&optional (namespace *namespace*) (agent *agent*))
+  "The full bus id of AGENT under NAMESPACE, joined with one separator."
+  (format nil "~A/~A" (string-right-trim "/" namespace) agent))
+
+(defun detach-file (state type &key (namespace *namespace*) (agent *agent*) legacy)
+  "The detached watcher's file of TYPE for AGENT under NAMESPACE on *BUS*, under
+   the state root STATE. With LEGACY, the file under the older name-only stem."
+  (merge-pathnames (format nil "dsmr-mcp/watch/~A.~A"
+                           (funcall (if legacy #'%legacy-detach-stem #'%detach-stem)
+                                    *bus* (full-id namespace agent))
+                           type)
+                   state))
 
 (defun field (key line)
   "The value of KEY=... in LINE, or NIL."
@@ -504,3 +519,114 @@
                      (sleep 0.5)
                      (is equal "1" (readers) "a waiting --wake was not counted"))
                 (stop-process wake))))))))
+
+(define-test same-name-in-two-namespaces-keeps-separate-logs-and-readers
+  "Two agents of one name in different namespaces are two agents: each gets its
+   own watcher and log, and a reader of one is never counted for the other."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (let ((ns-a "/tmp/ns-a/")
+                (ns-b "/tmp/ns-b/")
+                (name "x"))
+            (flet ((who (ns)
+                     (list "--bus" *bus* "--agent" name "--namespace" ns))
+                   (log-of (ns)
+                     (detach-file state "log" :namespace ns :agent name)))
+              (flet ((readers (ns)
+                       (field "readers" (apply #'run-in state bin "--check-live"
+                                               (who ns)))))
+                (unwind-protect
+                     (progn
+                       (dolist (ns (list ns-a ns-b))
+                         (multiple-value-bind (out err code)
+                             (apply #'run-in state bin "--detach" "--poll-ms" "100"
+                                    (who ns))
+                           (is = 0 code "--detach for ~A failed: ~A ~A" ns out err)))
+                       (sleep 0.5)
+                       (false (equal (log-of ns-a) (log-of ns-b)))
+                       (true (probe-file (log-of ns-a)))
+                       (true (probe-file (log-of ns-b)))
+                       (let ((tail (uiop:launch-program
+                                    (list "tail" "-f"
+                                          (uiop:native-namestring (log-of ns-a)))
+                                    :output nil :error-output nil :input nil)))
+                         (unwind-protect
+                              (progn
+                                (sleep 0.3)
+                                (is equal "1" (readers ns-a)
+                                    "the tail on ns-a's log was not counted")
+                                (is equal "0" (readers ns-b)
+                                    "ns-a's reader was counted for ns-b"))
+                           (stop-process tail))))
+                  (dolist (ns (list ns-a ns-b))
+                    (ignore-errors (apply #'run-in state bin "--reap" (who ns))))))))))))
+
+(define-test check-live-accepts-a-doubled-separator
+  "A doubled separator names the same agent, so a healthy agent probed with one
+   must read live, not dead."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "100" (identity-args))
+          (sleep 0.5)
+          (dolist (who (list (list "--agent-id"
+                                   (format nil "~A/~A" *namespace* *agent*))
+                             (list "--agent" *agent*
+                                   "--namespace" (format nil "~A/" *namespace*))))
+            (multiple-value-bind (live err code)
+                (apply #'run-in state bin "--check-live" "--bus" *bus* who)
+              (declare (ignore err))
+              (is = 0 code "~S read ~S" who live)
+              (true (eql 0 (search "live pid=" live)) "~S read ~S" who live)))))))
+
+(define-test a-watcher-under-the-old-file-names-is-adopted
+  "A watcher an earlier build started is still writing under the old name-only
+   files, and the agent it serves must keep hearing it until the next restart.
+   Renaming a running watcher's files stands in for that build honestly: its
+   record lock and its open log both follow the inode across rename(2)."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (let* ((out (apply #'run-in state bin "--detach" "--poll-ms" "100"
+                             (identity-args)))
+                 (pid (parse-integer (field "pid" out)))
+                 (old-pid (detach-file state "pid" :legacy t))
+                 (old-log (detach-file state "log" :legacy t)))
+            (flet ((move (type legacy-path)
+                     (sb-posix:rename (uiop:native-namestring (detach-file state type))
+                                      (uiop:native-namestring legacy-path))))
+              (move "pid" old-pid)
+              (move "log" old-log))
+            (sleep 0.3)
+            (multiple-value-bind (live err code)
+                (apply #'run-in state bin "--check-live" (identity-args))
+              (declare (ignore err))
+              (is = 0 code)
+              (true (eql 0 (search (format nil "live pid=~D " pid) live))
+                    "the adopted watcher did not read live: ~S" live))
+            (multiple-value-bind (again err code)
+                (apply #'run-in state bin "--detach" (identity-args))
+              (is = 0 code "--detach beside an adopted watcher failed: ~A" err)
+              (true (eql 0 (search (format nil "running pid=~D " pid) again))
+                    "--detach did not report the adopted watcher: ~S" again)
+              (is equal (uiop:native-namestring old-log)
+                  (field "log" (first (uiop:split-string
+                                       again :separator '(#\Newline))))))
+            (is = 1 (length (directory (merge-pathnames "dsmr-mcp/watch/*.pid" state)))
+                "--detach started a second watcher beside the adopted one")
+            (multiple-value-bind (idle err code)
+                (apply #'run-in state bin "--wake" "--wake-seconds" "1"
+                       "--poll-ms" "50" (identity-args))
+              (declare (ignore err))
+              (is = 0 code)
+              (is string= "idle wake-seconds=1" idle))
+            (multiple-value-bind (reaped err code)
+                (apply #'run-in state bin "--reap" (identity-args))
+              (declare (ignore err))
+              (is = 0 code)
+              (true (search (format nil "reaped pid=~D" pid) reaped) "~A" reaped))
+            (false (alive-p pid)))))))
