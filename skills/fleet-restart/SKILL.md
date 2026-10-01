@@ -125,7 +125,8 @@ re-announces.
    on: the cursor advances on delivery.
 3. Arm the standing listener: `~/.local/bin/dsmr-bus-watch --detach --bus <TAG> --agent
    <your-name> --namespace <absolute-project-root>/` **once** (expect `running`: the watcher
-   survived the park and is adopted), then the background Bash (`run_in_background`) wake,
+   survived the park and is adopted), then the background Bash (`run_in_background`,
+   `timeout: 7200000`) wake,
    `~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <your-name> --namespace
    <absolute-project-root>/`, re-armed only after each wake (drain, re-arm; see **bus-watch**).
    Then **confirm it with `~/.local/bin/dsmr-bus-watch --check-live --bus <TAG> --agent
@@ -183,7 +184,7 @@ not summarise last session — it is in your files.
   `remaining_pending`.
 - Watch: `~/.local/bin/dsmr-bus-watch --detach --bus <TAG> --agent <name> --namespace
   <absolute-project-root>/` once per session per bus (answers `detached` or `running`), then the
-  standing listener is a background Bash (`run_in_background`) command,
+  standing listener is a background Bash (`run_in_background`, `timeout: 7200000`) command,
   `~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <name> --namespace
   <absolute-project-root>/`, which exits on the next message; drain every bus, then re-arm the
   same line. On `nowatcher` (exit 1) re-run `--detach`, then re-arm. The literal path matches the

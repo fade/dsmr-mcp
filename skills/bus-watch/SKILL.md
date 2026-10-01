@@ -176,9 +176,17 @@ Neither armed anything for you. The pass-through flags (`--poll-ms`,
 Bash(
   command: '~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <name> --namespace <absolute-project-root>/',
   description: 'bus wake for <name>',
-  run_in_background: true
+  run_in_background: true,
+  timeout: 7200000
 )
 ```
+
+⛔ **`timeout: 7200000` is required.** The background default is 30 minutes, under
+the 110-minute idle return below, so without it the runner kills the wait first
+and tells you not to restart it. **The watch is permanent (operator ruling,
+2026-10-01): long silence is normal, and nothing about a quiet bus is a reason to
+stop listening.** If a kill ever does arrive, treat it as a wake anyway: drain,
+then re-arm.
 
 `--wake` waits for the next `bus:` or `error:` line to reach your detached
 log(s), prints it exactly as the watcher wrote it, and **exits 0**. The harness
@@ -187,6 +195,10 @@ detached watcher you have a pid file for and returns the first line any of them
 gets, so one `--wake` covers every joined bus; `--bus <tag>` in its place waits
 on one. Other exits:
 
+- **`idle wake-seconds=<N>` and exit 0**: nothing arrived in N seconds (default
+  6600, set with `--wake-seconds`). This is a wake like any other: drain every
+  joined bus, then re-arm. It exists so the wait ends inside the runner's
+  two-hour ceiling and re-arming stays the ordinary path.
 - **`nowatcher bus=<name>` and exit 1** (`bus=*` under `--all-buses` when you
   have none): no live detached watcher to wait on, at the start or while
   waiting. Run step 1 (`--detach`) again, then re-arm the `--wake`.

@@ -158,7 +158,8 @@ it arms on:
 ~/.local/bin/dsmr-bus-watch --detach --poll-ms 250 \
   --bus <tag> --agent <sister-name> --namespace <absolute-project-root>/
 
-# the standing listener: a BACKGROUND Bash command (run_in_background), re-armed after each wake
+# the standing listener: a BACKGROUND Bash command (run_in_background, timeout 7200000),
+# re-armed after each wake, an `idle` line included
 ~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <sister-name> --namespace <absolute-project-root>/
 ```
 

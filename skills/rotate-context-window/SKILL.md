@@ -136,7 +136,7 @@ moment it does and siblings may be waiting.
   downtime — read it) → then **re-arm the wakeup watch LAST**:
   `~/.local/bin/dsmr-bus-watch --detach <arm flags from probe>` (idempotent;
   **omit `--after`**; expect `running`), then the standing listener as a
-  **background Bash** command (`run_in_background`, NOT the Monitor tool):
+  **background Bash** command (`run_in_background`, `timeout: 7200000`, NOT the Monitor tool):
   `~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <agent> --namespace <root>/`,
   then a catch-up `bus-receive`. Confirm with `--check-live` (`live`, the
   right `bus=`, and `readers=1` or more; `readers=0` means deaf, re-arm
