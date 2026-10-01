@@ -55,22 +55,65 @@
                             (asdf:system-source-directory "dsmr-mcp"))))
     (when (probe-file p) p)))
 
+(defun stub-dir (state)
+  "The directory under the state root STATE holding the stub notify-send."
+  (merge-pathnames "stub-bin/" state))
+
+(defun notify-calls-file (state)
+  "The file the stub notify-send under STATE appends each call to."
+  (merge-pathnames "notify-calls" state))
+
+(defun install-notify-stub (state)
+  "Write a stub notify-send into STATE's stub directory that appends its
+   arguments, one call per line, to the calls file and does nothing else.
+
+   Every watcher these cases start finds the stub first on its PATH, so no case
+   can put a real notification on the developer's desktop."
+  (let ((stub (merge-pathnames "notify-send" (stub-dir state))))
+    (ensure-directories-exist stub)
+    (with-open-file (out stub :direction :output :if-exists :supersede)
+      (format out "#!/bin/sh~%printf '%s\\n' \"$*\" >> '~A'~%"
+              (uiop:native-namestring (notify-calls-file state))))
+    (sb-posix:chmod (uiop:native-namestring stub) #o755)
+    stub))
+
+(defun notify-calls (state)
+  "Every call the stub notify-send under STATE has received, one string each."
+  (or (ignore-errors (uiop:read-file-lines (notify-calls-file state))) '()))
+
+(defvar *watcher-path* nil
+  "When set, the whole PATH a watcher is run with. When NIL, the stub directory
+   under the case's state root is put in front of the inherited PATH.")
+
+(defun watcher-env (state)
+  "The environment assignments a watcher under STATE runs with: the private
+   state root, and a PATH that finds the stub notify-send first."
+  (list (format nil "XDG_STATE_HOME=~A" (uiop:native-namestring state))
+        (format nil "PATH=~A"
+                (or *watcher-path*
+                    (format nil "~A:~A"
+                            (string-right-trim "/" (uiop:native-namestring
+                                                    (stub-dir state)))
+                            (or (uiop:getenv "PATH") ""))))))
+
 (defun fresh-state-home ()
-  "A new, empty state root directly under /tmp. Kept short on purpose: the bus
-   refuses a state root whose derived socket path would pass 107 characters."
+  "A new, empty state root directly under /tmp, holding a stub notify-send.
+   Kept short on purpose: the bus refuses a state root whose derived socket path
+   would pass 107 characters."
   (let* ((suffix (let ((*random-state* (make-random-state t)))
                    (format nil "~36R" (random (expt 36 8)))))
          (dir (pathname (format nil "/tmp/dbw-~A/" suffix))))
     (ensure-directories-exist dir)
+    (install-notify-stub dir)
     dir))
 
 (defun run-in (state bin &rest args)
   "Run BIN with ARGS under the state root STATE, with no ambient bus identity or
-   bus selector, and return (values stdout stderr exit-code)."
-  (uiop:run-program (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR"
-                                  (format nil "XDG_STATE_HOME=~A"
-                                          (uiop:native-namestring state))
-                                  (uiop:native-namestring bin))
+   bus selector and the stub notify-send first on PATH, and return (values
+   stdout stderr exit-code)."
+  (uiop:run-program (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR")
+                            (watcher-env state)
+                            (list (uiop:native-namestring bin))
                             args)
                     :output '(:string :stripped t)
                     :error-output '(:string :stripped t)
@@ -351,10 +394,9 @@
 (defun launch-in (state bin &rest args)
   "Start BIN with ARGS under the state root STATE, as RUN-IN would, and return
    the process without waiting. Its STDOUT is a stream the test reads."
-  (uiop:launch-program (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR"
-                                     (format nil "XDG_STATE_HOME=~A"
-                                             (uiop:native-namestring state))
-                                     (uiop:native-namestring bin))
+  (uiop:launch-program (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR")
+                               (watcher-env state)
+                               (list (uiop:native-namestring bin))
                                args)
                        :output :stream :error-output nil :input nil))
 
@@ -630,3 +672,145 @@
               (is = 0 code)
               (true (search (format nil "reaped pid=~D" pid) reaped) "~A" reaped))
             (false (alive-p pid)))))))
+
+;;; unheard mail ---------------------------------------------------------------
+
+(defun await (seconds predicate)
+  "True once PREDICATE returns true, checking every tenth of a second for up to
+   SECONDS."
+  (loop repeat (* 10 seconds)
+        thereis (funcall predicate)
+        do (sleep 0.1)))
+
+(defun detach-deafness-watcher (state bin)
+  "Start a detached watcher under STATE that raises the deafness alarm after two
+   seconds of unheard mail, and give it time to arm."
+  (multiple-value-bind (out err code)
+      (apply #'run-in state bin "--detach" "--poll-ms" "50" "--deaf-seconds" "2"
+             (identity-args))
+    (declare (ignore out))
+    (is = 0 code "--detach failed: ~A" err))
+  (sleep 0.5))
+
+(defun follow-log (state)
+  "Start a tail following the detached log under STATE, the way an agent's
+   listener holds it, and return the process."
+  (uiop:launch-program (list "tail" "-f" (uiop:native-namestring
+                                          (detach-file state "log")))
+                       :output nil :error-output nil :input nil))
+
+(define-test unheard-mail-notifies-once-and-leaves-a-marker
+  "Mail that reaches the log while nothing follows it, and stays unread past the
+   threshold, must tell the operator once, naming the agent, the bus and the
+   repository, and leave a marker the leader can read."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (detach-deafness-watcher state bin)
+          (wal:append-record (bus-wal state *bus*) 1 "nobody is listening")
+          (sleep 0.5)
+          (is = 0 (length (notify-calls state)) "notified before the threshold")
+          (true (await 8 (lambda () (notify-calls state)))
+                "no notification after the line sat unheard")
+          (sleep 1)
+          (let ((calls (notify-calls state)))
+            (is = 1 (length calls) "expected one notification, got ~S" calls)
+            (let ((call (first calls)))
+              (true (search "--urgency=critical" call) "~S" call)
+              (true (search (format nil "~A cannot hear the bus" *agent*) call) "~S" call)
+              (true (search (format nil "bus ~A:" *bus*) call) "~S" call)
+              (true (search (string-right-trim "/" *namespace*) call) "~S" call)))
+          (let ((marker (detach-file state "deaf")))
+            (true (probe-file marker) "no deafness marker beside the pid file")
+            (true (eql 0 (search "since=" (or (ignore-errors
+                                               (uiop:read-file-string marker))
+                                              "")))
+                  "the marker does not say since when"))))))
+
+(define-test a-second-unheard-line-does-not-notify-again
+  "One episode is one notification, however much more mail arrives unheard."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (detach-deafness-watcher state bin)
+          (let ((wal (bus-wal state *bus*)))
+            (wal:append-record wal 1 "first, unheard")
+            (true (await 8 (lambda () (notify-calls state))) "never notified")
+            (wal:append-record wal 2 "second, still unheard")
+            (sleep 4)
+            (is = 1 (length (notify-calls state))
+                "a second unheard line notified again"))))))
+
+(define-test a-reader-clears-the-deaf-marker
+  "Once something follows the log again the agent is heard, and the marker the
+   leader reads must go."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (detach-deafness-watcher state bin)
+          (wal:append-record (bus-wal state *bus*) 1 "unheard for now")
+          (let ((marker (detach-file state "deaf")))
+            (true (await 8 (lambda () (probe-file marker))) "no marker was written")
+            (let ((tail (follow-log state)))
+              (unwind-protect
+                   (true (await 5 (lambda () (not (probe-file marker))))
+                         "the marker stayed with a reader on the log")
+                (stop-process tail))))))))
+
+(define-test mail-with-a-reader-never-notifies
+  "Mail written while the log is being followed was heard, so nothing is raised
+   however long it is since."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (detach-deafness-watcher state bin)
+          (let ((tail (follow-log state)))
+            (unwind-protect
+                 (progn
+                   (sleep 0.5)
+                   (wal:append-record (bus-wal state *bus*) 1 "heard as it lands")
+                   (sleep 6)
+                   (is = 0 (length (notify-calls state))
+                       "mail with a reader on the log raised the alarm")
+                   (false (probe-file (detach-file state "deaf"))))
+              (stop-process tail)))))))
+
+(define-test a-quiet-bus-never-notifies
+  "Nothing following the log is the normal state between turns; with no mail
+   written there is nothing unheard and nothing to raise."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (detach-deafness-watcher state bin)
+          (sleep 6)
+          (is = 0 (length (notify-calls state)) "a quiet bus raised the alarm")
+          (false (probe-file (detach-file state "deaf")))))))
+
+(define-test a-missing-notify-send-still-leaves-the-marker
+  "Without notify-send the leader must still see the episode, the log must say
+   why no notification went out, and the watch must carry on."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (let* ((empty (merge-pathnames "empty-bin/" state))
+                 (*watcher-path* (string-right-trim
+                                  "/" (uiop:native-namestring
+                                       (ensure-directories-exist empty)))))
+            (detach-deafness-watcher state bin)
+            (wal:append-record (bus-wal state *bus*) 1 "unheard, and no desktop")
+            (true (await 8 (lambda () (probe-file (detach-file state "deaf"))))
+                  "no marker without notify-send")
+            (true (await-log-text (detach-file state "log")
+                                  "notify-send is not on PATH")
+                  "the log does not say why nobody was notified")
+            (is = 0 (length (notify-calls state)))
+            (multiple-value-bind (live err code)
+                (apply #'run-in state bin "--check-live" (identity-args))
+              (declare (ignore err))
+              (is = 0 code "the watcher did not stay live: ~S" live)))))))

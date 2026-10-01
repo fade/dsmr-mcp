@@ -114,7 +114,10 @@
                 #:make-deaf-state
                 #:deaf-state-unheard-since
                 #:deaf-state-latched
-                #:%deaf-step)
+                #:%deaf-step
+                #:%notify-text
+                #:%notify-environment
+                #:opt-deaf-seconds)
   ;; The heartbeat helpers moved to a shared leaf so the watcher (writer) and the
   ;; MCP core (reader) share one implementation of the beat filename and format.
   ;; The pure liveness decision and its file-backed classifier both carry behavior
@@ -1613,3 +1616,29 @@
     (is eq :none action)
     (false (deaf-state-unheard-since state))
     (false (deaf-state-latched state))))
+
+(define-test the-deaf-notification-names-agent-bus-and-repository
+  (multiple-value-bind (summary body) (%notify-text "/home/x/repo/runciter" "dt" 600)
+    (is string= "runciter cannot hear the bus" summary)
+    (is string= "bus dt: mail has waited unread for 10 min. Type in /home/x/repo." body))
+  ;; Nothing in a name can start a line of its own in the notification.
+  (multiple-value-bind (summary body)
+      (%notify-text (format nil "/a~Cb/x y" (code-char 10)) nil 60)
+    (is string= "x_y cannot hear the bus" summary)
+    (is string= "bus default: mail has waited unread for 1 min. Type in /a_b." body)))
+
+(define-test the-notification-finds-the-desktop-when-detached-from-it
+  ;; A session bus already named is left alone; a missing or empty one is
+  ;; supplied from the per-user socket.
+  (is equal '("A=1" "DBUS_SESSION_BUS_ADDRESS=x")
+      (%notify-environment '("A=1" "DBUS_SESSION_BUS_ADDRESS=x") 1000))
+  (is equal '("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus" "A=1")
+      (%notify-environment '("A=1") 1000))
+  (is equal '("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/7/bus")
+      (%notify-environment '("DBUS_SESSION_BUS_ADDRESS=") 7)))
+
+(define-test deaf-seconds-flag-parses
+  (is eql 600 (opt-deaf-seconds (%parse-args '())))
+  (is eql 2 (opt-deaf-seconds (%parse-args '("--deaf-seconds" "2"))))
+  (is eql 0 (opt-deaf-seconds (%parse-args '("--deaf-seconds" "0"))))
+  (is eql 600 (opt-deaf-seconds (%parse-args '("--deaf-seconds" "soon")))))

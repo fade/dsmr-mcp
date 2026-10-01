@@ -660,6 +660,17 @@ Options:
   --wake-seconds N     how long --wake waits before returning `idle` (default
                        6600, under the two-hour limit of a background command;
                        0 waits with no limit).
+  --deaf-seconds N     how long a wake line may sit unheard in a detached
+                       watcher's log before the watcher raises the deafness
+                       alarm (default 600; 0 turns the alarm off). A line
+                       counts as unheard when nothing was following the log as
+                       it was written and nothing has followed it since. The
+                       alarm is one desktop notification through notify-send,
+                       naming the agent, the bus and the repository to type
+                       in, plus a `.deaf` file beside the watcher's pid file.
+                       It is raised
+                       once per episode and cleared when the agent is heard
+                       again. A quiet bus never raises it.
   --all-buses          with --reap, stop this agent's detached watchers on every
                        bus rather than only the resolved one. With --wake, wait
                        on the log of every detached watcher this agent has a
@@ -722,6 +733,7 @@ detached watcher, its pid file.
   (all-buses-p nil)
   (wake-p nil)
   (wake-seconds 6600)
+  (deaf-seconds 600)
   (stall-seconds 120)
   (help-p nil))
 
@@ -786,6 +798,9 @@ detached watcher, its pid file.
                  ((string= arg "--wake-seconds")
                   (setf (opt-wake-seconds opts)
                         (next-nonneg "--wake-seconds" (opt-wake-seconds opts))))
+                 ((string= arg "--deaf-seconds")
+                  (setf (opt-deaf-seconds opts)
+                        (next-nonneg "--deaf-seconds" (opt-deaf-seconds opts))))
                  ((string= arg "--stall-seconds")
                   (setf (opt-stall-seconds opts)
                         (next-nonneg "--stall-seconds" (opt-stall-seconds opts))))
@@ -1482,7 +1497,11 @@ detached watcher, its pid file.
    retried after a pause, because giving up would leave the agent deaf with its
    pid file gone and nothing to say why. The same failure is put on STDOUT as an
    `error:` line only once, so a persistent fault does not wake the agent every
-   few seconds."
+   few seconds.
+
+   Every wake or error line written here is also noted for the deafness alarm,
+   along with whether anything was following the log to hear it (see
+   %NOTE-SIGNAL-LINE)."
   (let ((baseline first-baseline)
         (last-error nil))
     (loop
@@ -1491,7 +1510,10 @@ detached watcher, its pid file.
                                       :poll-ms (opt-poll-ms opts)
                                       :recycle-seconds (opt-recycle-seconds opts)
                                       :self-id self-id
-                                      :on-poll on-poll)))
+                                      :on-poll on-poll
+                                      :emit (lambda (seq froms tos)
+                                              (%signal-seq seq froms tos)
+                                              (%note-signal-line)))))
             (setf last-error nil)
             (%warn "recycle: idle window elapsed; re-arming in place")
             (setf baseline (or (%cursor-baseline self-id wal-path cursors-dir)
@@ -1502,7 +1524,8 @@ detached watcher, its pid file.
             (unless (equal text last-error)
               (format *standard-output* "error: detached watcher: ~A~%"
                       (substitute #\Space #\Newline text))
-              (force-output *standard-output*))
+              (force-output *standard-output*)
+              (%note-signal-line))
             (setf last-error text))
           (%note-poll)
           (sleep 5)
@@ -1752,6 +1775,213 @@ detached watcher, its pid file.
              (values (make-deaf-state :unheard-since since :latched t) :raise)
              (values (make-deaf-state :unheard-since since :latched latched)
                      :none)))))))
+
+(defun %unix-time (&optional (universal-time (get-universal-time)))
+  "UNIVERSAL-TIME, by default now, as seconds since the Unix epoch: the form a
+   shell, `date` and a marker file's reader all expect."
+  (- universal-time 2208988800))
+
+(defstruct (deaf-watch (:conc-name dw-))
+  "What the detached watcher needs to watch for its own deafness: whose log it
+   is (SELF-ID on BUS), the file stem its pid file, log and markers share, and
+   how long a line may sit unheard (THRESHOLD seconds)."
+  self-id bus stem threshold)
+
+(defvar *deaf-watch* nil
+  "The deaf-watch of this detached watcher, or NIL when the alarm is off, which
+   it is in every mode other than the detached watcher itself.")
+
+(defvar *deaf-state* (make-deaf-state)
+  "Where this watcher's current deafness episode stands; see %DEAF-STEP.")
+
+(defvar *deaf-last-sample* nil
+  "Internal real time of the last deafness sample, which is taken at most once
+   a second however fast the poll loop runs.")
+
+(defvar *deaf-last-warning* nil
+  "The text of the last sampler fault reported, so a fault that persists is
+   reported once rather than every second.")
+
+(defvar *notify-processes* '()
+  "Notification processes started and not yet seen to exit.")
+
+(defun %notify-text (self-id bus elapsed-seconds)
+  "The summary and body of the deafness notification, as two values.
+
+   The agent name and the bus pass through %FIELD-TOKEN, and every control
+   character in the namespace becomes an underscore, so no name can forge a
+   line of its own in the text."
+  (multiple-value-bind (namespace name) (envelope:split-agent-id self-id)
+    (values (format nil "~A cannot hear the bus" (%field-token (or name self-id)))
+            (format nil "bus ~A: mail has waited unread for ~D min. Type in ~A."
+                    (%field-token (or bus "default"))
+                    (round elapsed-seconds 60)
+                    (map 'string
+                         (lambda (ch)
+                           (if (or (char< ch #\Space) (char= ch (code-char 127)))
+                               #\_
+                               ch))
+                         (or namespace ""))))))
+
+(defun %notify-environment (environment uid)
+  "ENVIRONMENT (a list of NAME=VALUE strings) for the notification process:
+   unchanged when it names a D-Bus session bus, and otherwise with the per-user
+   session bus for UID added. A watcher detached from a desktop session may have
+   lost the variable, and notify-send cannot reach the desktop without it."
+  (if (find-if (lambda (entry)
+                 (let ((prefix "DBUS_SESSION_BUS_ADDRESS="))
+                   (and (> (length entry) (length prefix))
+                        (string= prefix entry :end2 (length prefix)))))
+               environment)
+      environment
+      (cons (format nil "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/~D/bus" uid)
+            (remove-if (lambda (entry)
+                         (string= entry "DBUS_SESSION_BUS_ADDRESS="))
+                       environment))))
+
+(defun %deaf-file (watch type)
+  "The file of TYPE beside the pid file of the watcher WATCH describes."
+  (%detach-file (dw-stem watch) type))
+
+(defun %reap-notifiers ()
+  "Collect every notification process that has exited, without waiting on one
+   that has not, so none is left behind as a zombie."
+  (setf *notify-processes*
+        (remove-if (lambda (process)
+                     (unless (sb-ext:process-alive-p process)
+                       (ignore-errors (sb-ext:process-close process))
+                       t))
+                   *notify-processes*)))
+
+(defun %notify-deaf (watch elapsed-seconds)
+  "Tell the operator, on this host's desktop, that the agent WATCH serves has
+   left mail unread for ELAPSED-SECONDS. Never waits for the notification and
+   never signals: a desktop that cannot be reached must not stop the watch.
+
+   notify-send is started directly with its arguments as a list, never through
+   a shell, so nothing in an agent or bus name is interpreted. Where it is not
+   installed this says so in the log and does nothing more; the marker file is
+   already written by then, so the leader still sees the episode."
+  (let ((program (%find-on-path "notify-send")))
+    (if (null program)
+        (%warn "notify-send is not on PATH; the deafness alarm for ~A is in ~A only"
+               (dw-self-id watch)
+               (uiop:native-namestring (%deaf-file watch "deaf")))
+        (multiple-value-bind (summary body)
+            (%notify-text (dw-self-id watch) (dw-bus watch) elapsed-seconds)
+          (handler-case
+              (push (sb-ext:run-program program
+                                        (list "--app-name=dsmr-bus-watch"
+                                              "--urgency=critical"
+                                              summary body)
+                                        :wait nil :input nil :output nil :error nil
+                                        :environment (%notify-environment
+                                                      (sb-ext:posix-environ)
+                                                      (sb-posix:getuid)))
+                    *notify-processes*)
+            (error (e)
+              (%warn "could not run notify-send for the deafness alarm: ~A" e)))))))
+
+(defun %write-deaf-marker (watch since)
+  "Write the deafness marker for WATCH: one line naming when the unheard mail
+   was written (SINCE, Unix seconds), the agent and the bus."
+  (with-open-file (out (%deaf-file watch "deaf")
+                       :direction :output :if-exists :supersede
+                       :if-does-not-exist :create)
+    (format out "since=~D agent=~A bus=~A~%"
+            since (%field-token (dw-self-id watch))
+            (%field-token (or (dw-bus watch) "default")))))
+
+(defun %deaf-observe (now &rest observation)
+  "Feed one OBSERVATION at NOW (Unix seconds) to the deafness rule and act on
+   its answer: on a raise write the marker and then notify, on a clear remove
+   the marker. Does nothing while the alarm is off.
+
+   A marker that cannot be written is reported and the notification still goes
+   out, since the operator hearing about the episode matters more than the file."
+  (let ((watch *deaf-watch*))
+    (when watch
+      (multiple-value-bind (state action)
+          (apply #'%deaf-step *deaf-state* now
+                 :threshold (dw-threshold watch) observation)
+        (setf *deaf-state* state)
+        (case action
+          (:raise
+           (let ((since (deaf-state-unheard-since state)))
+             (handler-case (%write-deaf-marker watch since)
+               (error (e) (%warn "could not write the deafness marker: ~A" e)))
+             (%notify-deaf watch (- now since))))
+          (:clear
+           (let ((marker (%deaf-file watch "deaf")))
+             (when (probe-file marker) (delete-file marker)))))))))
+
+(defun %deaf-guarded (thunk)
+  "Call THUNK, reporting any error it signals once and returning. The deafness
+   alarm rides on the poll loop, and a fault in it must never stop the watch."
+  (handler-case (funcall thunk)
+    (error (e)
+      (let ((text (princ-to-string e)))
+        (unless (equal text *deaf-last-warning*)
+          (setf *deaf-last-warning* text)
+          (%warn "deafness check failed: ~A" text))))))
+
+(defun %deaf-parked-p (watch)
+  "True while the park marker for WATCH exists."
+  (and (probe-file (%deaf-file watch "parked")) t))
+
+(defun %note-signal-line ()
+  "Record that a wake or error line has just been written to the log, and
+   whether anything was following the log to hear it. Called at the one place
+   the detached watcher writes such a line, never for a diagnostic: a warning
+   about a failed notification must not start an episode of its own."
+  (let ((watch *deaf-watch*))
+    (when watch
+      (%deaf-guarded
+       (lambda ()
+         (%deaf-observe (%unix-time)
+                        :readers (%log-readers (%deaf-file watch "log"))
+                        :parked-p (%deaf-parked-p watch)
+                        :line-written-p t))))))
+
+(defun %deaf-sample ()
+  "Take one deafness sample, at most once a second, from the poll loop of the
+   detached watcher: who is following the log, whether the agent is parked, and
+   when a listener last saved its read offset. Does nothing while the alarm is
+   off, and never blocks or signals."
+  (let ((watch *deaf-watch*)
+        (now-rt (get-internal-real-time)))
+    (when (and watch
+               (or (null *deaf-last-sample*)
+                   (>= (- now-rt *deaf-last-sample*)
+                       internal-time-units-per-second)))
+      (setf *deaf-last-sample* now-rt)
+      (%deaf-guarded
+       (lambda ()
+         (%reap-notifiers)
+         (let ((offset (probe-file (%deaf-file watch "offset"))))
+           (%deaf-observe (%unix-time)
+                          :readers (%log-readers (%deaf-file watch "log"))
+                          :parked-p (%deaf-parked-p watch)
+                          :offset-time (and offset
+                                            (let ((date (file-write-date offset)))
+                                              (and date (%unix-time date)))))))))))
+
+(defun %arm-deafness-watch (self-id bus deaf-seconds)
+  "Start watching this detached watcher's own log for unheard mail, or leave the
+   alarm off when DEAF-SECONDS is 0. A marker left by an earlier watcher under
+   this stem is removed, since the episode it recorded is not this watcher's
+   to clear, and this watcher's marker is removed however it exits.
+
+   Called only from the detached watcher, which holds the lock on its stem, so
+   the stem is the current one and never resolved (see %RESOLVE-DETACH-STEM)."
+  (let* ((stem (%detach-stem bus self-id))
+         (marker (%detach-file stem "deaf")))
+    (ignore-errors (when (probe-file marker) (delete-file marker)))
+    (push marker *cleanup-paths*)
+    (setf *deaf-state* (make-deaf-state)
+          *deaf-watch* (and (plusp deaf-seconds)
+                            (make-deaf-watch :self-id self-id :bus bus :stem stem
+                                             :threshold deaf-seconds)))))
 
 (defstruct (follower (:conc-name fol-))
   "One log being followed for --wake: where it lives, the stream held open on
@@ -2021,6 +2251,7 @@ detached watcher, its pid file.
                        (uiop:native-namestring pid-path))
                 (uiop:quit 0))
               (push pid-path *cleanup-paths*)
+              (%arm-deafness-watch self-id bus (opt-deaf-seconds opts))
               (%warn "detached watcher pid ~D armed for ~A on bus ~A"
                      (sb-posix:getpid) self-id (or bus "default"))))
           (when beat-path (push beat-path *cleanup-paths*))
@@ -2032,6 +2263,8 @@ detached watcher, its pid file.
              (%effective-stall-seconds (opt-stall-seconds opts) poll-ms))
             (flet ((beat ()
                      (%note-poll)
+                     ;; Does nothing outside the detached watcher.
+                     (%deaf-sample)
                      (when beat-path
                        (heartbeat:write-beat beat-path :mode mode :baseline baseline
                                                        :poll-ms poll-ms))))
