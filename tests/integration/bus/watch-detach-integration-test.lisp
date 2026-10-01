@@ -1108,3 +1108,139 @@
             (is string= "" out)
             (is string= "" err)
             (true (< seconds 1) "a subagent's hook waited ~,1F s" seconds))))))
+
+(define-test mail-sent-between-arms-wakes-the-next-arm
+  "A line that lands during a turn, after one hook has woken the session and
+   before the next is armed, must wake the session as soon as the next arm
+   starts. Otherwise it waits for whatever mail comes after it."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((wal (bus-wal state *bus*))
+                (log (detach-file state "log")))
+            (let ((hook (launch-hook state bin)))
+              (unwind-protect
+                   (progn
+                     (sleep 0.5)
+                     (wal:append-record wal 1 "wakes the first arm")
+                     (multiple-value-bind (code out err) (finish-and-read-both hook 5)
+                       (declare (ignore out))
+                       (is eql 2 code)
+                       (true (eql 0 (search "bus:1" err)) "got ~S" err)))
+                (stop-process hook)))
+            (wal:append-record wal 2 "lands while nothing listens")
+            (true (await-log-text log "bus:2") "the line never reached the log")
+            (multiple-value-bind (out err code seconds)
+                (apply #'run-in-with-input state bin nil
+                       "--wake" "--hook" "--wake-seconds" "5" "--poll-ms" "50"
+                       (identity-args))
+              (is = 2 code)
+              (is string= "" out)
+              (true (eql 0 (search "bus:2" err)) "the next arm reported ~S" err)
+              (true (< seconds 2) "the next arm took ~,1F s" seconds)))))))
+
+(define-test a-first-arm-starts-at-the-end
+  "With no offset saved there is no record of what the agent has read, and a
+   first arm must not wake it for mail from before it ever listened. Every
+   return saves one, the background wake's included."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((log (detach-file state "log"))
+                (offset (detach-file state "offset")))
+            (wal:append-record (bus-wal state *bus*) 1 "from before any listener")
+            (true (await-log-text log "bus:1") "the line never reached the log")
+            (false (probe-file offset) "an offset existed before any arm")
+            (multiple-value-bind (out err code)
+                (apply #'run-in-with-input state bin nil
+                       "--wake" "--hook" "--wake-seconds" "1" "--poll-ms" "50"
+                       (identity-args))
+              (declare (ignore out))
+              (is = 2 code)
+              (true (eql 0 (search "idle wake-seconds=1" err))
+                    "a first arm reported an old line: ~S" err))
+            (true (probe-file offset) "a hook return saved no offset")
+            (delete-file offset)
+            (multiple-value-bind (out err code)
+                (apply #'run-in-with-input state bin nil
+                       "--wake" "--wake-seconds" "1" "--poll-ms" "50"
+                       (identity-args))
+              (declare (ignore err))
+              (is = 0 code)
+              (is string= "idle wake-seconds=1" out))
+            (true (probe-file offset) "a background wake saved no offset"))))))
+
+(define-test an-offset-for-a-replaced-log-is-ignored
+  "A saved offset names the file it was taken on. Once the log has been
+   replaced, it says nothing about the new one, and the arm starts at the end."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let* ((log (detach-file state "log"))
+                 (offset (detach-file state "offset")))
+            (wal:append-record (bus-wal state *bus*) 1 "already in the log")
+            (true (await-log-text log "bus:1") "the line never reached the log")
+            (let ((ino (sb-posix:stat-ino (sb-posix:stat (uiop:native-namestring log)))))
+              (flet ((save (ino)
+                       (with-open-file (out offset :direction :output
+                                                   :if-exists :supersede
+                                                   :if-does-not-exist :create)
+                         (format out "ino=~D pos=0~%" ino)))
+                     (arm ()
+                       (apply #'run-in-with-input state bin nil
+                              "--wake" "--hook" "--wake-seconds" "1" "--poll-ms" "50"
+                              (identity-args))))
+                (save ino)
+                (multiple-value-bind (out err code) (arm)
+                  (declare (ignore out))
+                  (is = 2 code)
+                  (true (eql 0 (search "bus:1" err))
+                        "an offset on the live log was not honoured: ~S" err))
+                (save (+ ino 12345))
+                (multiple-value-bind (out err code) (arm)
+                  (declare (ignore out))
+                  (is = 2 code)
+                  (true (eql 0 (search "idle wake-seconds=1" err))
+                        "an offset on another file was honoured: ~S" err)))))))))
+
+(define-test a-hook-read-counts-as-heard
+  "Mail written while no listener was armed, then reported by the next hook arm,
+   was heard: the offset that arm saves must keep the deafness alarm quiet."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" "--deaf-seconds" "3"
+                 (identity-args))
+          (let ((wal (bus-wal state *bus*))
+                (log (detach-file state "log")))
+            (let ((hook (launch-hook state bin)))
+              (unwind-protect
+                   (progn
+                     (sleep 0.5)
+                     (wal:append-record wal 1 "heard by the first arm")
+                     (is eql 2 (finish-and-read-both hook 5)))
+                (stop-process hook)))
+            (wal:append-record wal 2 "written with nothing armed")
+            (true (await-log-text log "bus:2") "the line never reached the log")
+            ;; The alarm compares whole seconds, and an offset saved in the
+            ;; same second the line was written does not count as newer.
+            (sleep 1.2)
+            (multiple-value-bind (out err code seconds)
+                (apply #'run-in-with-input state bin nil
+                       "--wake" "--hook" "--wake-seconds" "3" "--poll-ms" "50"
+                       (identity-args))
+              (declare (ignore out))
+              (is = 2 code)
+              (true (eql 0 (search "bus:2" err)) "got ~S" err)
+              (true (< seconds 1) "the next arm took ~,1F s" seconds))
+            (sleep 5)
+            (is = 0 (length (notify-calls state))
+                "a line the next arm reported raised the alarm")
+            (false (probe-file (detach-file state "deaf"))))))))

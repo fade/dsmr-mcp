@@ -679,7 +679,10 @@ Options:
                        input naming a subagent (`agent_id`), or another
                        listener for the same identity already armed. A
                        missing watcher wakes the session at most once an hour.
-                       STDOUT stays empty.
+                       Mail that reached the log while no listener was armed
+                       is reported by the next hook arm, from the read offset
+                       every --wake saves beside the log when it returns; the
+                       first arm ever starts at the end. STDOUT stays empty.
   --deaf-seconds N     how long a wake line may sit unheard in a detached
                        watcher's log before the watcher raises the deafness
                        alarm (default 600; 0 turns the alarm off). A line
@@ -2215,10 +2218,68 @@ detached watcher, its pid file.
    lines the monitor command filters for."
   (or (eql 0 (search "bus:" line)) (eql 0 (search "error:" line))))
 
+(defun %offset-path (log-path)
+  "The read offset file kept beside the detached log at LOG-PATH: the same stem,
+   type `offset`. The deafness alarm reads its write time as the moment the
+   agent was last heard."
+  (make-pathname :type "offset" :defaults log-path))
+
+(defun %read-offset (log-path)
+  "The inode and position a listener last saved for LOG-PATH, as a cons
+   (ino . pos), or NIL when none was saved or the file does not read as one."
+  (let ((line (ignore-errors (first (uiop:read-file-lines (%offset-path log-path))))))
+    (flet ((number-after (key)
+             (let ((at (and line (search key line))))
+               (and at (ignore-errors
+                        (parse-integer line :start (+ at (length key))
+                                            :junk-allowed t))))))
+      (let ((ino (number-after "ino="))
+            (pos (number-after "pos=")))
+        (and ino pos (>= pos 0) (cons ino pos))))))
+
+(defun %save-offsets (targets)
+  "Record, beside each log in TARGETS, how far a listener has now covered it:
+   the log's inode and its whole current size.
+
+   The whole size rather than the position after the reported line, because
+   the woken agent drains the bus, which covers every line already written;
+   only a line written after this belongs to the next arm. The deafness alarm
+   reads the time of this write as the moment the agent was last heard. A
+   failure is reported and otherwise ignored: the wake it follows has
+   happened either way."
+  (loop for (nil log-path) in targets
+        do (handler-case
+               (let ((stat (sb-posix:stat (uiop:native-namestring log-path))))
+                 (with-open-file (out (%offset-path log-path)
+                                      :direction :output :if-exists :supersede
+                                      :if-does-not-exist :create)
+                   (format out "ino=~D pos=~D~%"
+                           (sb-posix:stat-ino stat) (sb-posix:stat-size stat))))
+             (error (e)
+               (%warn "could not save the read offset for ~A: ~A"
+                      (uiop:native-namestring log-path) e)))))
+
+(defun %follow-rewind (fol ino pos)
+  "Move FOL, just opened at the end of its file, back to POS, when the file is
+   still the one with inode INO and POS is within it. A POS that falls inside a
+   line moves back to that line's start, so the line is reported whole. Returns
+   true when FOL was moved."
+  (let ((stream (fol-stream fol)))
+    (when (and stream (eql ino (fol-ino fol)) (<= 0 pos (fol-pos fol)))
+      (loop while (plusp pos)
+            do (file-position stream (1- pos))
+               (if (= (read-byte stream) 10)
+                   (return)
+                   (decf pos)))
+      (setf (fol-pos fol) pos
+            (fol-skip-p fol) nil
+            (fill-pointer (fol-partial fol)) 0)
+      t)))
+
 (defun %wake-wait (targets poll-ms
                    &key (watcher-alive-p (lambda (pid-path)
                                            (and (%live-detached-pid pid-path) t)))
-                        deadline-ms)
+                        deadline-ms start-offsets)
   "Wait for the next event line in any of TARGETS and return (values :event
    line bus), or (values :no-watcher nil bus) naming the first bus whose
    detached watcher is not running. Each target is a list (bus log-path
@@ -2226,7 +2287,10 @@ detached watcher, its pid file.
    this returns :timeout.
 
    Every log is read from its end as it stands when this starts, so a line
-   already there is never reported again. A watcher that is not running is
+   already there is never reported again. START-OFFSETS, an alist from a log's
+   native namestring to a saved (ino . pos), starts that log at POS instead,
+   so a line written while no listener was armed is still reported; a saved
+   offset for a log since replaced, or past its end, is ignored. A watcher that is not running is
    reported at once, and again if it stops while this waits: a wait on a log
    nothing will ever write to again never ends, and the agent running it would
    be as deaf as one running nothing."
@@ -2239,6 +2303,12 @@ detached watcher, its pid file.
     (let ((followers (loop for (bus log-path) in targets
                            collect (let ((fol (make-follower :path log-path)))
                                      (%follow-open fol t)
+                                     (let ((saved (cdr (assoc (uiop:native-namestring
+                                                               log-path)
+                                                              start-offsets
+                                                              :test #'string=))))
+                                       (when saved
+                                         (%follow-rewind fol (car saved) (cdr saved))))
                                      (cons bus fol))))
           (sleep-s (/ (max poll-ms 1) 1000.0))
           (limit (and deadline-ms (+ (now-ms) deadline-ms))))
@@ -2420,16 +2490,22 @@ detached watcher, its pid file.
    Only one listener waits for an identity at a time. Another one already
    waiting makes this print `already-armed` and exit 0 at once.
 
+   A wake or idle return saves a read offset beside each log it waited on (see
+   %SAVE-OFFSETS), which the deafness alarm counts as the agent being heard.
+
    With --hook this runs as a Claude Code Stop hook declared async with
    asyncRewake, which wakes the session when the hook exits 2 and hands it the
    hook's STDERR. The wake line, the idle line and the nowatcher line go to
    STDERR instead, each followed by what the woken session should do, and the
    exit status is 2: the idle return wakes the session too, so the listener is
-   renewed before the harness's own timeout ends it. Everything else exits 0
-   with nothing printed, because the hook starts again at every turn end and
-   must never turn into a loop: no identity, input naming a subagent, another
-   listener already armed, or a missing watcher it already reported within the
-   hour."
+   renewed before the harness's own timeout ends it. A hook listener starts
+   from the saved offset rather than the end of the log, so mail that arrived
+   during a turn, while nothing was listening, wakes the session as soon as
+   the next listener is armed; the first one ever starts at the end.
+   Everything else exits 0 with nothing printed, because the hook starts again
+   at every turn end and must never turn into a loop: no identity, input naming
+   a subagent, another listener already armed, or a missing watcher it already
+   reported within the hour."
   (let ((hook-p (opt-hook-p opts)))
     (when (and hook-p
                (or (null self-id)
@@ -2474,7 +2550,16 @@ detached watcher, its pid file.
           (no-watcher "*"))
         (multiple-value-bind (outcome line which)
             (%wake-wait targets (opt-poll-ms opts)
-                        :deadline-ms (%wake-deadline-ms wake-seconds))
+                        :deadline-ms (%wake-deadline-ms wake-seconds)
+                        :start-offsets
+                        (and hook-p
+                             (loop for (nil log-path) in targets
+                                   for saved = (%read-offset log-path)
+                                   when saved
+                                     collect (cons (uiop:native-namestring log-path)
+                                                   saved))))
+          (when (member outcome '(:event :timeout))
+            (%save-offsets targets))
           (case outcome
             (:event
              (if hook-p
