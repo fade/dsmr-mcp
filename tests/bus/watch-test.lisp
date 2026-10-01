@@ -117,7 +117,9 @@
                 #:%deaf-step
                 #:%notify-text
                 #:%notify-environment
-                #:opt-deaf-seconds)
+                #:opt-deaf-seconds
+                #:opt-park-p
+                #:opt-unpark-p)
   ;; The heartbeat helpers moved to a shared leaf so the watcher (writer) and the
   ;; MCP core (reader) share one implementation of the beat filename and format.
   ;; The pure liveness decision and its file-backed classifier both carry behavior
@@ -1642,3 +1644,30 @@
   (is eql 2 (opt-deaf-seconds (%parse-args '("--deaf-seconds" "2"))))
   (is eql 0 (opt-deaf-seconds (%parse-args '("--deaf-seconds" "0"))))
   (is eql 600 (opt-deaf-seconds (%parse-args '("--deaf-seconds" "soon")))))
+
+(define-test liveness-line-appends-park-and-deaf-after-readers
+  ;; Both fields come after readers=, parked before deaf, each only when set,
+  ;; so a probe parsing the line by position is unaffected.
+  (is string= "live pid=1 age_s=0 bus=dt readers=0 parked=1 deaf=1700000000"
+      (%liveness-line :live 0 1 "dt" 0 t 1700000000))
+  (is string= "live pid=1 age_s=0 bus=dt readers=0 parked=1"
+      (%liveness-line :live 0 1 "dt" 0 t nil))
+  (is string= "live pid=1 age_s=0 bus=dt readers=0 deaf=1700000000"
+      (%liveness-line :live 0 1 "dt" 0 nil 1700000000))
+  ;; An unreadable marker is still reported; leaving it out would read as an
+  ;; agent that can hear.
+  (is string= "dead bus=default readers=unknown deaf=unknown"
+      (%liveness-line :dead nil nil nil :unknown nil :unknown)))
+
+(define-test liveness-line-is-unchanged-without-markers
+  (is string= "live pid=42 age_s=1 bus=dt readers=0"
+      (%liveness-line :live 1 42 "dt" 0 nil nil))
+  (is string= (%liveness-line :stale 9 42 nil 2)
+      (%liveness-line :stale 9 42 nil 2 nil nil))
+  (is string= "dead bus=dt" (%liveness-line :dead nil nil "dt")))
+
+(define-test park-flags-parse
+  (true (opt-park-p (%parse-args '("--park"))))
+  (true (opt-unpark-p (%parse-args '("--unpark"))))
+  (false (opt-park-p (%parse-args '())))
+  (false (opt-unpark-p (%parse-args '()))))

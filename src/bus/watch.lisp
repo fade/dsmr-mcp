@@ -604,6 +604,12 @@ Options:
                        /proc cannot say). `live ... readers=0` means the
                        watcher is listening and nothing is following its log,
                        so the agent it serves cannot hear it.
+                       Two fields may follow, each only when it applies:
+                       ` parked=1` while the agent is parked (see --park), and
+                       ` deaf=<epoch>` while the deafness alarm stands (see
+                       --deaf-seconds), the epoch being when the unheard mail
+                       was written (`deaf=unknown` when the marker cannot be
+                       read).
   --live-window-seconds N
                        how fresh a heartbeat must be to count as live under
                        --check-live (default 5). A live watch refreshes every
@@ -667,10 +673,23 @@ Options:
                        it was written and nothing has followed it since. The
                        alarm is one desktop notification through notify-send,
                        naming the agent, the bus and the repository to type
-                       in, plus a `.deaf` file beside the watcher's pid file.
-                       It is raised
+                       in, plus a `.deaf` file beside the watcher's pid file;
+                       --check-live reports it as `deaf=<epoch>`. It is raised
                        once per episode and cleared when the agent is heard
-                       again. A quiet bus never raises it.
+                       again. A quiet bus never raises it, and neither does a
+                       parked agent.
+  --park               do not watch; write the park marker (a `.parked` file
+                       beside the pid file) for the resolved identity and bus,
+                       or with --all-buses for every bus it has a detached
+                       watcher on, print `parked bus=<name>` per bus and exit
+                       0. Run it as the park step, before the agent stops
+                       listening: while the marker exists no deafness alarm is
+                       raised, so a fleet takedown is silent. The watcher keeps
+                       running. Exits 2 with `unknown` when no identity
+                       resolves.
+  --unpark             remove the park marker the same way, printing
+                       `unparked bus=<name>`. --detach removes it too, so
+                       bring-up ends a park whichever is run.
   --all-buses          with --reap, stop this agent's detached watchers on every
                        bus rather than only the resolved one. With --wake, wait
                        on the log of every detached watcher this agent has a
@@ -734,6 +753,8 @@ detached watcher, its pid file.
   (wake-p nil)
   (wake-seconds 6600)
   (deaf-seconds 600)
+  (park-p nil)
+  (unpark-p nil)
   (stall-seconds 120)
   (help-p nil))
 
@@ -791,6 +812,10 @@ detached watcher, its pid file.
                         (opt-stream-p opts) t))
                  ((string= arg "--reap")
                   (setf (opt-reap-p opts) t))
+                 ((string= arg "--park")
+                  (setf (opt-park-p opts) t))
+                 ((string= arg "--unpark")
+                  (setf (opt-unpark-p opts) t))
                  ((string= arg "--all-buses")
                   (setf (opt-all-buses-p opts) t))
                  ((string= arg "--wake")
@@ -1000,7 +1025,7 @@ detached watcher, its pid file.
                   filter on this agent's own publishes."))
         (%last-seq wal-path))))
 
-(defun %liveness-line (status age pid bus &optional readers)
+(defun %liveness-line (status age pid bus &optional readers parked deaf-since)
   "The one status line --check-live prints for STATUS, as a string with no
    trailing newline. Pure: it prints nothing and exits nothing, so the answer
    can be read directly rather than inferred from a process.
@@ -1020,14 +1045,26 @@ detached watcher, its pid file.
    matters: the watcher is listening and nothing is following what it writes, so
    the agent it serves cannot hear it.
 
+   PARKED and DEAF-SINCE follow it, in that order and each only when set, for
+   the same reason: `parked=1` while the agent is parked, and `deaf=<epoch>`
+   while the watcher's deafness alarm stands, the epoch being when the unheard
+   mail was written, or `deaf=unknown` for a marker that cannot be read. An
+   unreadable marker is still shown, since leaving the field out would read as
+   an agent that can hear.
+
    The `unknown` answer deliberately has no case here. It is printed when no
    identity resolves, and a bus name printed beside an unresolved identity would
    read as a probe that found something."
   (let ((label (or bus "default"))
-        (suffix (if readers
-                    (format nil " readers=~A"
-                            (if (eq readers :unknown) "unknown" readers))
-                    "")))
+        (suffix (with-output-to-string (out)
+                  (when readers
+                    (format out " readers=~A"
+                            (if (eq readers :unknown) "unknown" readers)))
+                  (when parked
+                    (format out " parked=1"))
+                  (when deaf-since
+                    (format out " deaf=~A"
+                            (if (eq deaf-since :unknown) "unknown" deaf-since))))))
     (concatenate
      'string
      (ecase status
@@ -1060,7 +1097,11 @@ detached watcher, its pid file.
    (see %LOG-READERS). A watcher that is live is only half of an agent that can
    hear: the other half is whatever follows the log, and that half is the one
    the harness has to keep re-arming. The watcher itself is left out of the
-   count."
+   count.
+
+   After it come `parked=1` when the agent is parked and `deaf=<epoch>` when its
+   watcher has raised the deafness alarm, read from the marker files beside the
+   pid file, so a leader sees both without a process list."
   (if (null self-id)
       (progn
         (%warn "--check-live needs a resolved identity (pass --agent or ~
@@ -1077,7 +1118,11 @@ detached watcher, its pid file.
                                       (remove-if-not #'integerp
                                                      (list pid watcher)))))
           (format *standard-output* "~A~%"
-                  (%liveness-line status age pid bus readers)))
+                  (%liveness-line status age pid bus readers
+                                  (probe-file (%detach-file stem "parked"))
+                                  (let ((deaf (%detach-file stem "deaf")))
+                                    (and (probe-file deaf)
+                                         (%marker-since deaf))))))
         (force-output *standard-output*)
         (uiop:quit (if (eq status :live) 0 1)))))
 
@@ -1446,6 +1491,9 @@ detached watcher, its pid file.
    under the same name for a DIFFERENT namespace is reported as a conflict and
    left alone: it belongs to another agent.
 
+   This is the bring-up step, so it also removes a park marker left for this
+   identity and bus (see %PARK).
+
    Prints two lines on STDOUT, `running` in place of `detached` when a watcher
    was already up:
 
@@ -1468,6 +1516,11 @@ detached watcher, its pid file.
                      (%monitor-command log-path))
              (force-output *standard-output*)
              (uiop:quit 0)))
+      ;; Bring-up ends a park: the agent is about to listen again, and a park
+      ;; marker left behind would silence the deafness alarm for good.
+      (let ((parked (%detach-file stem "parked")))
+        (when (probe-file parked)
+          (ignore-errors (delete-file parked))))
       (let ((running (%live-detached-pid pid-path)))
         (when running
           (let ((recorded (nth-value 1 (%pid-file-contents pid-path))))
@@ -1983,6 +2036,75 @@ detached watcher, its pid file.
                             (make-deaf-watch :self-id self-id :bus bus :stem stem
                                              :threshold deaf-seconds)))))
 
+(defun %marker-since (path)
+  "The Unix time recorded as `since=` in the marker file at PATH, or :UNKNOWN
+   when the file cannot be read or carries no such field."
+  (let* ((text (ignore-errors (uiop:read-file-string path)))
+         (start (and text (search "since=" text))))
+    (or (and start
+             (ignore-errors
+              (parse-integer text :start (+ start (length "since="))
+                                  :junk-allowed t)))
+        :unknown)))
+
+(defun %park-targets (bus self-id all-buses-p)
+  "The marker stems --park and --unpark act on, each paired with its bus: the
+   one for SELF-ID on BUS, or with ALL-BUSES-P one for every bus SELF-ID has a
+   detached watcher's pid file on."
+  (if all-buses-p
+      (loop for (pid-path . target-bus) in (%reap-targets bus self-id t)
+            ;; The stem is cut from the native name rather than taken as the
+            ;; pathname name, which would stop at a dot inside an agent name.
+            collect (let ((name (uiop:native-namestring pid-path)))
+                      (cons (subseq name (1+ (position #\/ name :from-end t))
+                                    (- (length name) (length ".pid")))
+                            target-bus)))
+      (list (cons (%resolve-detach-stem bus self-id) bus))))
+
+(defun %park (opts bus self-id parking)
+  "Write the park marker for SELF-ID on BUS (or, with --all-buses, on every bus
+   it has a detached watcher on) when PARKING, or remove it when not, then exit.
+
+   The park step writes the marker before the agent stops listening, so the
+   silence of a fleet takedown raises no deafness alarm, and bring-up removes it
+   (--detach does so too). The watcher itself keeps running while parked.
+
+   Prints one line per bus, `parked bus=<bus>` or `unparked bus=<bus>`, or
+   `none bus=*` when --all-buses finds no watcher, and exits 0; 1 when a marker
+   could not be written or removed. With no resolved identity it prints
+   `unknown` and exits 2, as --check-live does."
+  (unless self-id
+    (%warn "~A needs a resolved identity (pass --agent with --namespace, or ~
+            --agent-id); the park marker is keyed on it."
+           (if parking "--park" "--unpark"))
+    (format *standard-output* "unknown~%")
+    (force-output *standard-output*)
+    (uiop:quit 2))
+  (let ((targets (%park-targets bus self-id (opt-all-buses-p opts)))
+        (clean t))
+    (if (null targets)
+        (format *standard-output* "none bus=*~%")
+        (loop for (stem . target-bus) in targets
+              for marker = (%detach-file stem "parked")
+              do (handler-case
+                     (progn
+                       (if parking
+                           (progn
+                             (ensure-directories-exist marker)
+                             (with-open-file (out marker :direction :output
+                                                         :if-exists :supersede
+                                                         :if-does-not-exist :create)
+                               (format out "since=~D~%" (%unix-time))))
+                           (when (probe-file marker) (delete-file marker)))
+                       (format *standard-output* "~:[unparked~;parked~] bus=~A~%"
+                               parking (or target-bus "default")))
+                   (error (e)
+                     (%warn "could not ~:[remove~;write~] ~A: ~A" parking
+                            (uiop:native-namestring marker) e)
+                     (setf clean nil)))))
+    (force-output *standard-output*)
+    (uiop:quit (if clean 0 1))))
+
 (defstruct (follower (:conc-name fol-))
   "One log being followed for --wake: where it lives, the stream held open on
    it, how far it has been read, which file that stream is on, and the bytes of
@@ -2233,6 +2355,10 @@ detached watcher, its pid file.
                (beat-path (and self-id (heartbeat:beat-path self-id watch-dir))))
           (when (opt-check-p opts)
             (%check-live self-id beat-path (opt-live-window-seconds opts) bus))
+          (when (opt-park-p opts)
+            (%park opts bus self-id t))
+          (when (opt-unpark-p opts)
+            (%park opts bus self-id nil))
           (when (opt-reap-p opts)
             (%reap opts bus self-id))
           (when (opt-wake-p opts)

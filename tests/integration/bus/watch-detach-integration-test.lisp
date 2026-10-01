@@ -726,7 +726,13 @@
             (true (eql 0 (search "since=" (or (ignore-errors
                                                (uiop:read-file-string marker))
                                               "")))
-                  "the marker does not say since when"))))))
+                  "the marker does not say since when")
+            (let* ((live (apply #'run-in state bin "--check-live" (identity-args)))
+                   (deaf (field "deaf" live)))
+              (true (and deaf (plusp (length deaf)) (every #'digit-char-p deaf)
+                         (= (+ (search " deaf=" live) (length " deaf=") (length deaf))
+                            (length live)))
+                    "--check-live does not end with deaf=<epoch>: ~S" live)))))))
 
 (define-test a-second-unheard-line-does-not-notify-again
   "One episode is one notification, however much more mail arrives unheard."
@@ -814,3 +820,110 @@
                 (apply #'run-in state bin "--check-live" (identity-args))
               (declare (ignore err))
               (is = 0 code "the watcher did not stay live: ~S" live)))))))
+
+;;; parking --------------------------------------------------------------------
+
+(define-test park-suppresses-the-deaf-alarm
+  "A parked agent is silent on purpose, so mail it leaves unread raises nothing,
+   and --check-live says it is parked."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (detach-deafness-watcher state bin)
+          (multiple-value-bind (out err code)
+              (apply #'run-in state bin "--park" (identity-args))
+            (is = 0 code "--park failed: ~A" err)
+            (is string= (format nil "parked bus=~A" *bus*) out))
+          (true (probe-file (detach-file state "parked")) "no park marker written")
+          (let ((live (apply #'run-in state bin "--check-live" (identity-args))))
+            (true (search " parked=1" live) "--check-live does not say parked: ~S" live)
+            (true (< (search " readers=" live) (search " parked=1" live))
+                  "parked= is not after readers=: ~S" live))
+          (wal:append-record (bus-wal state *bus*) 1 "left for after the park")
+          (sleep 6)
+          (is = 0 (length (notify-calls state)) "a parked agent raised the alarm")
+          (false (probe-file (detach-file state "deaf")))))))
+
+(define-test unpark-re-enables-it
+  "After --unpark, mail left unread raises the alarm again; mail from before the
+   unpark does not count against the agent."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (detach-deafness-watcher state bin)
+          (apply #'run-in state bin "--park" (identity-args))
+          (let ((wal (bus-wal state *bus*)))
+            (wal:append-record wal 1 "while parked")
+            (sleep 3)
+            (multiple-value-bind (out err code)
+                (apply #'run-in state bin "--unpark" (identity-args))
+              (is = 0 code "--unpark failed: ~A" err)
+              (is string= (format nil "unparked bus=~A" *bus*) out))
+            (false (probe-file (detach-file state "parked")) "the park marker stayed")
+            (sleep 3)
+            (is = 0 (length (notify-calls state))
+                "mail from the park raised the alarm after unparking")
+            (wal:append-record wal 2 "after the unpark")
+            (true (await 8 (lambda () (notify-calls state)))
+                  "unheard mail after the unpark raised nothing")
+            (is = 1 (length (notify-calls state))))))))
+
+(define-test detach-clears-a-stale-park-marker
+  "Bring-up ends a park, so a marker left by one must not silence the alarm for
+   the session that follows."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (detach-deafness-watcher state bin)
+          (apply #'run-in state bin "--park" (identity-args))
+          (true (probe-file (detach-file state "parked")))
+          (multiple-value-bind (out err code)
+              (apply #'run-in state bin "--detach" (identity-args))
+            (is = 0 code "--detach failed: ~A" err)
+            (true (eql 0 (search "running pid=" out)) "~S" out))
+          (false (probe-file (detach-file state "parked"))
+                 "--detach left the park marker in place")
+          (let ((live (apply #'run-in state bin "--check-live" (identity-args))))
+            (false (search "parked=" live) "~S" live))))))
+
+(define-test park-over-all-buses-marks-every-watcher
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (let ((who (list "--agent" *agent* "--namespace" *namespace*)))
+            (apply #'run-in state bin "--detach" "--poll-ms" "100" "--bus" *bus* who)
+            (apply #'run-in state bin "--detach" "--poll-ms" "100" "--bus" "dt2" who)
+            (multiple-value-bind (out err code)
+                (apply #'run-in state bin "--park" "--all-buses" who)
+              (is = 0 code "--park --all-buses failed: ~A" err)
+              (is equal (list "parked bus=dt" "parked bus=dt2")
+                  (sort (uiop:split-string out :separator '(#\Newline)) #'string<)))
+            (is = 2 (length (directory (merge-pathnames "dsmr-mcp/watch/*.parked"
+                                                        state))))
+            (multiple-value-bind (out err code)
+                (apply #'run-in state bin "--unpark" "--all-buses" who)
+              (declare (ignore err))
+              (is = 0 code)
+              (is equal (list "unparked bus=dt" "unparked bus=dt2")
+                  (sort (uiop:split-string out :separator '(#\Newline)) #'string<)))
+            (is = 0 (length (directory (merge-pathnames "dsmr-mcp/watch/*.parked"
+                                                        state)))))))))
+
+(define-test park-without-an-identity-says-unknown
+  "With no identity there is no marker to write, and saying so must not look
+   like success: the same `unknown` and exit 2 that --check-live gives."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (dolist (flag (list "--park" "--unpark"))
+            (multiple-value-bind (out err code)
+                (run-in state bin flag "--bus" *bus*)
+              (declare (ignore err))
+              (is = 2 code "~A with no identity exited ~A" flag code)
+              (is string= "unknown" out)))
+          (false (directory (merge-pathnames "dsmr-mcp/watch/*.parked" state)))))))
