@@ -661,11 +661,25 @@ Options:
                        reader under --check-live. When no detached watcher is
                        running for a bus it would wait on, at the start or
                        while waiting, it prints `nowatcher bus=<name>` and exits
-                       1, so start one with --detach and wake again. Exits 2
+                       1, so start one with --detach and wake again. One
+                       listener per identity: while another --wake for the
+                       same identity is waiting, on any bus, this prints
+                       `already-armed` and exits 0 at once. Exits 2
                        when no identity resolves, 143 on SIGTERM.
   --wake-seconds N     how long --wake waits before returning `idle` (default
                        6600, under the two-hour limit of a background command;
                        0 waits with no limit).
+  --hook               with --wake, run as a Claude Code Stop hook declared
+                       async with asyncRewake. The wake line, the idle line
+                       and the nowatcher line go to STDERR, each followed by
+                       one line telling the woken session what to do, and the
+                       exit status is 2, which is what makes the harness wake
+                       the session. Every other outcome exits 0 with nothing
+                       printed, so a hook can never loop: no identity, hook
+                       input naming a subagent (`agent_id`), or another
+                       listener for the same identity already armed. A
+                       missing watcher wakes the session at most once an hour.
+                       STDOUT stays empty.
   --deaf-seconds N     how long a wake line may sit unheard in a detached
                        watcher's log before the watcher raises the deafness
                        alarm (default 600; 0 turns the alarm off). A line
@@ -752,6 +766,7 @@ detached watcher, its pid file.
   (all-buses-p nil)
   (wake-p nil)
   (wake-seconds 6600)
+  (hook-p nil)
   (deaf-seconds 600)
   (park-p nil)
   (unpark-p nil)
@@ -820,6 +835,8 @@ detached watcher, its pid file.
                   (setf (opt-all-buses-p opts) t))
                  ((string= arg "--wake")
                   (setf (opt-wake-p opts) t))
+                 ((string= arg "--hook")
+                  (setf (opt-hook-p opts) t))
                  ((string= arg "--wake-seconds")
                   (setf (opt-wake-seconds opts)
                         (next-nonneg "--wake-seconds" (opt-wake-seconds opts))))
@@ -2262,6 +2279,127 @@ detached watcher, its pid file.
   "The line --wake prints when WAKE-SECONDS pass with nothing arriving."
   (format nil "idle wake-seconds=~D" wake-seconds))
 
+(defun %hook-input-names-subagent-p (text)
+  "True when TEXT, the JSON a Claude Code hook is handed on standard input,
+   carries an `agent_id` key whose value is a non-empty string. The harness sets
+   that key only when the hook fires inside a subagent, and a subagent must
+   never arm a listener under the identity of the session that spawned it.
+
+   One key is all this needs, so it is found by a plain scan rather than by a
+   JSON parser the binary would otherwise have to carry."
+  (let ((key "\"agent_id\"")
+        (end (length text)))
+    (flet ((skip-blanks (i)
+             (or (position-if-not (lambda (ch)
+                                    (member ch '(#\Space #\Tab #\Newline #\Return)))
+                                  text :start i)
+                 end)))
+      (loop for start = (search key text) then (search key text :start2 (1+ start))
+            while start
+            thereis (let ((i (skip-blanks (+ start (length key)))))
+                      (and (< i end)
+                           (char= (char text i) #\:)
+                           (let ((j (skip-blanks (1+ i))))
+                             (and (< (1+ j) end)
+                                  (char= (char text j) #\")
+                                  (char/= (char text (1+ j)) #\")))))))))
+
+(defun %read-hook-input (&optional (seconds 2))
+  "Everything on standard input up to its end, or NIL when standard input is a
+   terminal. Gives up after SECONDS with whatever has arrived, so a hook whose
+   input is never closed still answers rather than hanging the turn end it was
+   started from."
+  (unless (let ((tty (ignore-errors (sb-unix:unix-isatty 0))))
+            (and tty (not (eql tty 0))))
+    (let ((out (make-string-output-stream))
+          (deadline (+ (get-internal-real-time)
+                       (* seconds internal-time-units-per-second))))
+      (ignore-errors
+       (loop
+         (let ((ch (read-char-no-hang sb-sys:*stdin* nil :eof)))
+           (cond ((eq ch :eof) (return))
+                 (ch (write-char ch out))
+                 (t (let ((left (/ (- deadline (get-internal-real-time))
+                                   internal-time-units-per-second)))
+                      (when (or (<= left 0)
+                                (not (sb-sys:wait-until-fd-usable 0 :input left)))
+                        (return))))))))
+      (get-output-stream-string out))))
+
+(defun %identity-stem (self-id)
+  "The file stem for state an agent keeps whichever bus it listens on:
+   <agent>--<hash>, the hash being that of the whole normalised id, as in
+   %DETACH-STEM."
+  (let ((id (%normalise-agent-id self-id)))
+    (format nil "~A--~A" (%field-token (%agent-name id)) (%identity-hash id))))
+
+(defvar *armed-lock-stream* nil
+  "The open stream on this listener's lock file. Held for the life of the
+   process, since closing any descriptor on the file would drop the lock.")
+
+(defun %armed-lock (self-id)
+  "Take the listener lock for SELF-ID, which every --wake holds while it waits.
+   Returns true when this process now holds it, and NIL when another listener
+   for the same identity already does.
+
+   The lock is per identity rather than per bus. An agent has one session to
+   wake, and two listeners armed for it, whether two stacked Stop hooks or a
+   hook beside a background wake, would wake it twice for one message.
+
+   A lock file that cannot be opened at all is reported and treated as taken by
+   this process: refusing to listen over it would leave the agent deaf."
+  (let ((path (%detach-file (%identity-stem self-id) "armed")))
+    (let ((fd (handler-case
+                  (progn
+                    (ensure-directories-exist path)
+                    (sb-posix:open (uiop:native-namestring path)
+                                   (logior sb-posix:o-creat sb-posix:o-rdwr) #o644))
+                (error (e)
+                  (%warn "could not open the listener lock ~A: ~A; listening without it"
+                         (uiop:native-namestring path) e)
+                  nil))))
+      (if (null fd)
+          t
+          (handler-case
+              (progn
+                (sb-posix:fcntl fd sb-posix:f-setlk
+                                (%whole-file-lock sb-posix:f-wrlck))
+                (setf *armed-lock-stream*
+                      (sb-sys:make-fd-stream fd :input t :output t))
+                t)
+            (error ()
+              (ignore-errors (sb-posix:close fd))
+              nil))))))
+
+(defun %nowatcher-wake-due-p (self-id &optional (interval 3600))
+  "True when a hook listener for SELF-ID should wake its session to say no
+   watcher is running, and if so, record that it has. At most once every
+   INTERVAL seconds: a Stop hook is started again at every turn end, and waking
+   the session on every one of them about the same missing watcher would never
+   let it rest."
+  (let* ((stamp (%detach-file (%identity-stem self-id) "nowatcher"))
+         (date (and (probe-file stamp) (file-write-date stamp))))
+    (when (or (null date) (>= (- (get-universal-time) date) interval))
+      (handler-case
+          (progn
+            (ensure-directories-exist stamp)
+            (with-open-file (out stamp :direction :output :if-exists :supersede
+                                       :if-does-not-exist :create)
+              (format out "since=~D~%" (%unix-time))))
+        (error (e)
+          (%warn "could not record the nowatcher wake in ~A: ~A"
+                 (uiop:native-namestring stamp) e)))
+      t)))
+
+(defun %hook-exit (line advice)
+  "End a hook listener by waking its session: LINE, then ADVICE, on STDERR,
+   and exit 2. The harness hands STDERR to the woken session as hook feedback,
+   and a bare token there reads as a hook that blocked the stop, so ADVICE says
+   what to do next."
+  (format *error-output* "~A~%dsmr-bus-watch: ~A~%" line advice)
+  (force-output *error-output*)
+  (uiop:quit 2))
+
 (defun %wake (opts bus self-id)
   "Block until the next event line reaches this agent's detached log, print it
    and exit 0. With --all-buses, whichever of the agent's logs gets one first.
@@ -2277,34 +2415,84 @@ detached watcher, its pid file.
    When a bus asked for has no detached watcher running, prints
    `nowatcher bus=<bus>` and exits 1 straight away, so the agent starts one
    with --detach instead of waiting on a log nothing writes to. Exits 2 when no
-   identity resolves, and 143 on SIGTERM."
-  (unless self-id
-    (%warn "--wake needs a resolved identity (pass --agent with --namespace, or ~
-            --agent-id); the detached log is keyed on it.")
-    (uiop:quit 2))
-  (%install-termination-handler)
-  (let ((targets (%wake-targets bus self-id (opt-all-buses-p opts)))
-        (wake-seconds (opt-wake-seconds opts)))
-    (flet ((no-watcher (label)
-             (%warn "no detached watcher is running for ~A on bus ~A; start one ~
-                     with --detach, then wake again"
-                    self-id label)
-             (format *standard-output* "nowatcher bus=~A~%" label)
-             (force-output *standard-output*)
-             (uiop:quit 1))
-           (say-and-exit (text)
-             (format *standard-output* "~A~%" text)
-             (force-output *standard-output*)
-             (uiop:quit 0)))
-      (when (null targets)
-        (no-watcher "*"))
-      (multiple-value-bind (outcome line which)
-          (%wake-wait targets (opt-poll-ms opts)
-                      :deadline-ms (%wake-deadline-ms wake-seconds))
-        (case outcome
-          (:event (say-and-exit line))
-          (:timeout (say-and-exit (%idle-line wake-seconds)))
-          (t (no-watcher (or which "default"))))))))
+   identity resolves, and 143 on SIGTERM.
+
+   Only one listener waits for an identity at a time. Another one already
+   waiting makes this print `already-armed` and exit 0 at once.
+
+   With --hook this runs as a Claude Code Stop hook declared async with
+   asyncRewake, which wakes the session when the hook exits 2 and hands it the
+   hook's STDERR. The wake line, the idle line and the nowatcher line go to
+   STDERR instead, each followed by what the woken session should do, and the
+   exit status is 2: the idle return wakes the session too, so the listener is
+   renewed before the harness's own timeout ends it. Everything else exits 0
+   with nothing printed, because the hook starts again at every turn end and
+   must never turn into a loop: no identity, input naming a subagent, another
+   listener already armed, or a missing watcher it already reported within the
+   hour."
+  (let ((hook-p (opt-hook-p opts)))
+    (when (and hook-p
+               (or (null self-id)
+                   (%hook-input-names-subagent-p (or (%read-hook-input) ""))))
+      (uiop:quit 0))
+    (unless self-id
+      (%warn "--wake needs a resolved identity (pass --agent with --namespace, or ~
+              --agent-id); the detached log is keyed on it.")
+      (uiop:quit 2))
+    (%install-termination-handler)
+    (unless (%armed-lock self-id)
+      (unless hook-p
+        (format *standard-output* "already-armed~%")
+        (force-output *standard-output*))
+      (uiop:quit 0))
+    (let ((targets (%wake-targets bus self-id (opt-all-buses-p opts)))
+          (wake-seconds (opt-wake-seconds opts))
+          (re-arms "This hook arms the next listener itself when your turn ends; do not start one."))
+      (flet ((no-watcher (label)
+               (cond
+                 ((not hook-p)
+                  (%warn "no detached watcher is running for ~A on bus ~A; start one ~
+                          with --detach, then wake again"
+                         self-id label)
+                  (format *standard-output* "nowatcher bus=~A~%" label)
+                  (force-output *standard-output*)
+                  (uiop:quit 1))
+                 ((%nowatcher-wake-due-p self-id)
+                  (%hook-exit (format nil "nowatcher bus=~A" label)
+                              (format nil "no detached watcher is running for ~A ~
+                                           on bus ~A, so no mail can wake you. ~
+                                           Start one with dsmr-bus-watch --detach ~
+                                           and your usual --bus and identity ~
+                                           flags. ~A"
+                                      self-id label re-arms)))
+                 (t (uiop:quit 0))))
+             (say-and-exit (text)
+               (format *standard-output* "~A~%" text)
+               (force-output *standard-output*)
+               (uiop:quit 0)))
+        (when (null targets)
+          (no-watcher "*"))
+        (multiple-value-bind (outcome line which)
+            (%wake-wait targets (opt-poll-ms opts)
+                        :deadline-ms (%wake-deadline-ms wake-seconds))
+          (case outcome
+            (:event
+             (if hook-p
+                 (%hook-exit line
+                             (format nil "mail has arrived for you on bus ~A. ~
+                                          Drain the bus now with bus-receive and ~
+                                          act on what it holds. ~A"
+                                     (or which "default") re-arms))
+                 (say-and-exit line)))
+            (:timeout
+             (if hook-p
+                 (%hook-exit (%idle-line wake-seconds)
+                             (format nil "no mail arrived in ~D seconds; this wake ~
+                                          only renews the listener and there is ~
+                                          nothing to drain. ~A"
+                                     wake-seconds re-arms))
+                 (say-and-exit (%idle-line wake-seconds))))
+            (t (no-watcher (or which "default")))))))))
 
 (defun main ()
   "Entry point. Parse argv, resolve who this watch is for, arm a baseline, and

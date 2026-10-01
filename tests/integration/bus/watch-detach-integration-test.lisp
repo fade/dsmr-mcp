@@ -927,3 +927,184 @@
               (is = 2 code "~A with no identity exited ~A" flag code)
               (is string= "unknown" out)))
           (false (directory (merge-pathnames "dsmr-mcp/watch/*.parked" state)))))))
+
+(defun run-in-with-input (state bin input &rest args)
+  "Run BIN with ARGS under STATE as RUN-IN does, with the string INPUT on its
+   standard input (none when NIL), and return (values stdout stderr exit-code
+   seconds), SECONDS being how long it took."
+  (let ((start (get-internal-real-time)))
+    (multiple-value-bind (out err code)
+        (uiop:run-program (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR")
+                                  (watcher-env state)
+                                  (list (uiop:native-namestring bin))
+                                  args)
+                          :input (and input (make-string-input-stream input))
+                          :output '(:string :stripped t)
+                          :error-output '(:string :stripped t)
+                          :ignore-error-status t)
+      (values out err code
+              (/ (- (get-internal-real-time) start)
+                 internal-time-units-per-second)))))
+
+(defun launch-hook (state bin &rest extra)
+  "Start BIN as a Stop hook listener for the case's identity under STATE, with
+   the arguments in EXTRA added, and return the process. STDOUT and STDERR are
+   separate streams, since hook mode must keep the first empty."
+  (uiop:launch-program (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR")
+                               (watcher-env state)
+                               (list (uiop:native-namestring bin)
+                                     "--wake" "--hook" "--poll-ms" "50")
+                               extra
+                               (identity-args))
+                       :output :stream :error-output :stream :input nil))
+
+(defun finish-and-read-both (process seconds)
+  "Wait up to SECONDS for PROCESS, started by LAUNCH-HOOK, to exit, then return
+   (values exit-code stdout stderr), both outputs whole and stripped. The exit
+   code is NIL when it had to be killed."
+  (let ((code (await-exit process seconds)))
+    (stop-process process)
+    (flet ((slurp (stream)
+             (string-trim '(#\Newline #\Space)
+                          (or (ignore-errors (uiop:slurp-stream-string stream)) ""))))
+      (values code
+              (slurp (uiop:process-info-output process))
+              (slurp (uiop:process-info-error-output process))))))
+
+(define-test hook-wake-reports-idle-on-stderr-and-exits-two
+  "A hook on a quiet bus must still wake the session when its wait ends, so the
+   listener is renewed before the harness's timeout ends it."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((hook (launch-hook state bin "--wake-seconds" "1")))
+            (unwind-protect
+                 (multiple-value-bind (code out err) (finish-and-read-both hook 6)
+                   (is eql 2 code "a quiet hook did not exit 2")
+                   (is string= "" out)
+                   (true (eql 0 (search "idle wake-seconds=1" err)) "got ~S" err))
+              (stop-process hook)))))))
+
+(define-test hook-wake-reports-a-line-on-stderr-and-exits-two
+  "A line reaching the log must wake the session: the line on STDERR, then what
+   to do about it, exit 2, and nothing on STDOUT."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((hook (launch-hook state bin)))
+            (unwind-protect
+                 (progn
+                   (sleep 0.5)
+                   (wal:append-record (bus-wal state *bus*) 1 "wake the session")
+                   (multiple-value-bind (code out err) (finish-and-read-both hook 5)
+                     (is eql 2 code "a hook did not exit 2 on a line")
+                     (is string= "" out)
+                     (true (eql 0 (search "bus:1" err)) "got ~S" err)
+                     (true (search "bus-receive" err)
+                           "stderr does not say to drain the bus: ~S" err)))
+              (stop-process hook)))))))
+
+(define-test a-second-hook-arm-steps-aside
+  "Stop hooks stack when a turn ends while the last one is still waiting. The
+   second must leave at once and say nothing, and the first must still wake the
+   session on the next line."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((hook (launch-hook state bin)))
+            (unwind-protect
+                 (progn
+                   (sleep 0.5)
+                   (multiple-value-bind (out err code seconds)
+                       (apply #'run-in-with-input state bin nil
+                              "--wake" "--hook" "--wake-seconds" "3" "--poll-ms" "50"
+                              (identity-args))
+                     (is = 0 code "the second hook exited ~A: ~S" code err)
+                     (is string= "" out)
+                     (is string= "" err)
+                     (true (< seconds 1) "the second hook waited ~,1F s" seconds))
+                   (wal:append-record (bus-wal state *bus*) 1 "for the first hook")
+                   (multiple-value-bind (code out err) (finish-and-read-both hook 5)
+                     (is eql 2 code "the first hook did not wake on the line")
+                     (is string= "" out)
+                     (true (eql 0 (search "bus:1" err)) "got ~S" err)))
+              (stop-process hook)))))))
+
+(define-test a-default-wake-says-already-armed-while-a-hook-listens
+  "A background wake started while a hook is listening for the same agent must
+   say so and leave, or one message would wake the session twice."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((hook (launch-hook state bin)))
+            (unwind-protect
+                 (progn
+                   (sleep 0.5)
+                   (multiple-value-bind (out err code seconds)
+                       (apply #'run-in-with-input state bin nil
+                              "--wake" "--wake-seconds" "3" "--poll-ms" "50"
+                              (identity-args))
+                     (declare (ignore err))
+                     (is = 0 code "a second wake exited ~A" code)
+                     (is string= "already-armed" out)
+                     (true (< seconds 1) "a second wake waited ~,1F s" seconds)))
+              (stop-process hook)))))))
+
+(define-test hook-nowatcher-wakes-once-then-stays-quiet
+  "A missing watcher is worth waking the session for once, but the hook starts
+   again at every turn end, and waking on each of them would never stop."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (multiple-value-bind (out err code)
+              (apply #'run-in state bin "--wake" "--hook" (identity-args))
+            (is = 2 code "the first nowatcher hook exited ~A" code)
+            (is string= "" out)
+            (true (eql 0 (search (format nil "nowatcher bus=~A" *bus*) err))
+                  "stderr did not open with the nowatcher line: ~S" err)
+            (true (search "--detach" err) "stderr does not say how to start one: ~S" err))
+          (multiple-value-bind (out err code)
+              (apply #'run-in state bin "--wake" "--hook" (identity-args))
+            (is = 0 code "a second nowatcher hook woke the session again")
+            (is string= "" out)
+            (is string= "" err))))))
+
+(define-test hook-without-an-identity-does-nothing
+  "A session that is not in a fleet still runs the Stop hook at every turn end,
+   and must neither be woken nor told anything."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (multiple-value-bind (out err code)
+              (run-in state bin "--wake" "--hook" "--agent" "" "--bus" *bus*)
+            (is = 0 code "a hook with no identity exited ~A: ~S" code err)
+            (is string= "" out)
+            (is string= "" err))))))
+
+(define-test hook-inside-a-subagent-does-nothing
+  "A Stop hook that fires inside a subagent is handed an `agent_id`, and must
+   not arm a listener under the identity of the session that spawned it."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (multiple-value-bind (out err code seconds)
+              (apply #'run-in-with-input state bin
+                     "{\"hook_event_name\":\"Stop\",\"agent_id\":\"abc\"}"
+                     "--wake" "--hook" "--wake-seconds" "2" "--poll-ms" "50"
+                     (identity-args))
+            (is = 0 code "a subagent's hook exited ~A: ~S" code err)
+            (is string= "" out)
+            (is string= "" err)
+            (true (< seconds 1) "a subagent's hook waited ~,1F s" seconds))))))
