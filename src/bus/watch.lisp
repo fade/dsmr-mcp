@@ -1694,6 +1694,65 @@ detached watcher, its pid file.
                     (incf count)))))))
         count)))
 
+;;; ------------------------------------------------------------- unheard mail
+;;;
+;;; A watcher that is live with nothing following its log serves an agent that
+;;; cannot hear it. That alone is not an alarm: between turns nothing follows the
+;;; log, and a long quiet spell is normal. What is worth telling the operator is
+;;; mail that reached the log while nothing was following it and stayed unread.
+;;; The detached watcher owns the log for the life of the session, so it is the
+;;; one process placed to notice, and it does so without a bus client of its own.
+
+(defstruct (deaf-state (:copier nil))
+  "Where one detached watcher stands on the question `can the agent hear me?`.
+   UNHEARD-SINCE is when the oldest line nobody has heard was written, or NIL
+   when there is none. LATCHED is true once the alarm for the current episode
+   has been raised, so it is raised only once."
+  (unheard-since nil)
+  (latched nil))
+
+(defun %deaf-step (state now &key readers parked-p line-written-p offset-time
+                                  (threshold 600))
+  "One step of the deafness rule: STATE as it stands at NOW (seconds), given
+   what was just observed. Returns (values new-state action), ACTION one of
+   :NONE, :RAISE or :CLEAR. Pure: STATE is not modified, and nothing is read or
+   written.
+
+   The alarm means mail was written while nothing could hear it, and stayed
+   unheard for THRESHOLD seconds. A quiet bus with nobody following the log is
+   the normal state between turns and never alarms; it takes a line written
+   (LINE-WRITTEN-P) while READERS was 0 to start the clock.
+
+   The agent counts as heard when any sample sees a reader on the log, or when
+   OFFSET-TIME, the time a listener last saved its read offset, is newer than
+   the unheard line. Being heard ends the episode: :CLEAR when the alarm was
+   raised, a silent reset otherwise, so the next episode can raise again.
+
+   While PARKED-P, nothing raises and the pending line is forgotten, so an agent
+   that unparks is not alarmed about mail from before its park. The latch is
+   left as it was, since parking is not evidence the agent heard anything.
+
+   READERS of :UNKNOWN (no /proc to ask) is never read as zero: it neither
+   starts the clock nor raises. A default in place of a measurement would fake
+   a positive."
+  (let ((since (deaf-state-unheard-since state))
+        (latched (deaf-state-latched state))
+        (measured (integerp readers)))
+    (cond
+      (parked-p
+       (values (make-deaf-state :unheard-since nil :latched latched) :none))
+      ((or (and measured (plusp readers))
+           (and offset-time since (> offset-time since)))
+       (values (make-deaf-state) (if latched :clear :none)))
+      (t
+       (let ((since (or since
+                        (and line-written-p measured (zerop readers) now))))
+         (if (and since measured (not latched)
+                  (>= (- now since) threshold))
+             (values (make-deaf-state :unheard-since since :latched t) :raise)
+             (values (make-deaf-state :unheard-since since :latched latched)
+                     :none)))))))
+
 (defstruct (follower (:conc-name fol-))
   "One log being followed for --wake: where it lives, the stream held open on
    it, how far it has been read, which file that stream is on, and the bytes of

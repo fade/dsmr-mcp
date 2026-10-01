@@ -107,7 +107,14 @@
                 #:%follow-open
                 #:%follow-lines
                 #:%wake-wait
-                #:%log-readers)
+                #:%log-readers
+                ;; internal: the rule that decides when unheard mail becomes a
+                ;; deafness alarm. The watcher only feeds it samples, so the
+                ;; rule itself is pure and its boundaries are pinned here.
+                #:make-deaf-state
+                #:deaf-state-unheard-since
+                #:deaf-state-latched
+                #:%deaf-step)
   ;; The heartbeat helpers moved to a shared leaf so the watcher (writer) and the
   ;; MCP core (reader) share one implementation of the beat filename and format.
   ;; The pure liveness decision and its file-backed classifier both carry behavior
@@ -1492,3 +1499,117 @@
   (is string= "dead bus=dt readers=unknown"
       (%liveness-line :dead nil nil "dt" :unknown))
   (true (opt-wake-p (%parse-args '("--wake")))))
+
+(define-test mail-written-while-a-reader-listens-is-heard
+  ;; A line that reached the log while something was following it was heard,
+  ;; so it starts no episode at all.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state) 1000 :readers 1 :line-written-p t)
+    (is eq :none action)
+    (false (deaf-state-unheard-since state))
+    (false (deaf-state-latched state)))
+  ;; With nobody following, the same line starts the clock at the moment it
+  ;; was written, and nothing is raised yet.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state) 1000 :readers 0 :line-written-p t)
+    (is eq :none action)
+    (is eql 1000 (deaf-state-unheard-since state))
+    (false (deaf-state-latched state))))
+
+(define-test unheard-mail-raises-at-the-threshold-and-not-before
+  ;; The boundary is inclusive: a line unheard for exactly the threshold raises.
+  (let ((pending (make-deaf-state :unheard-since 1000)))
+    (multiple-value-bind (state action)
+        (%deaf-step pending 1599 :readers 0 :threshold 600)
+      (is eq :none action "raised one second early")
+      (false (deaf-state-latched state)))
+    (multiple-value-bind (state action)
+        (%deaf-step pending 1600 :readers 0 :threshold 600)
+      (is eq :raise action "did not raise at the threshold")
+      (true (deaf-state-latched state))
+      (is eql 1000 (deaf-state-unheard-since state)))))
+
+(define-test deafness-is-raised-once-per-episode
+  ;; Once raised, the episode stays latched and quiet however long it lasts and
+  ;; however much more mail arrives unheard.
+  (let ((raised (make-deaf-state :unheard-since 1000 :latched t)))
+    (multiple-value-bind (state action) (%deaf-step raised 9999 :readers 0)
+      (is eq :none action)
+      (true (deaf-state-latched state)))
+    (multiple-value-bind (state action)
+        (%deaf-step raised 9999 :readers 0 :line-written-p t)
+      (is eq :none action)
+      (true (deaf-state-latched state)))))
+
+(define-test a-reader-clears-the-episode
+  ;; The agent is heard again as soon as anything follows the log: a raised
+  ;; episode clears, and the state starts over so the next one can raise.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state :unheard-since 1000 :latched t) 9999 :readers 1)
+    (is eq :clear action)
+    (false (deaf-state-unheard-since state))
+    (false (deaf-state-latched state))))
+
+(define-test a-newer-read-offset-counts-as-heard
+  ;; A listener that saved its read offset after the line was written has read
+  ;; it, even though nothing holds the log open now.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state :unheard-since 1000 :latched t) 2000
+                  :readers 0 :offset-time 1001)
+    (is eq :clear action)
+    (false (deaf-state-unheard-since state))
+    (false (deaf-state-latched state)))
+  ;; Before any alarm, the same evidence resets the clock silently.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state :unheard-since 1000) 1200
+                  :readers 0 :offset-time 1001)
+    (is eq :none action)
+    (false (deaf-state-unheard-since state)))
+  ;; An offset saved before the line was written says nothing about it.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state :unheard-since 1000) 1600
+                  :readers 0 :offset-time 999 :threshold 600)
+    (is eq :raise action)
+    (true (deaf-state-latched state))))
+
+(define-test parked-suppresses-and-forgets
+  ;; A parked agent is meant to be silent: nothing raises, and the pending line
+  ;; is forgotten so unparking does not raise for mail from before the park.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state :unheard-since 1000) 5000
+                  :readers 0 :parked-p t)
+    (is eq :none action)
+    (false (deaf-state-unheard-since state))
+    (false (deaf-state-latched state)))
+  ;; A line written while parked starts nothing either.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state) 5000 :readers 0 :parked-p t :line-written-p t)
+    (is eq :none action)
+    (false (deaf-state-unheard-since state)))
+  ;; The latch is left as it was: parking does not pretend the agent was heard.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state :unheard-since 1000 :latched t) 5000
+                  :readers 0 :parked-p t)
+    (is eq :none action)
+    (true (deaf-state-latched state))))
+
+(define-test unknown-readers-never-raise
+  ;; Where the reader count cannot be measured it is not a zero, and an alarm
+  ;; built on a guessed zero would be a false one.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state :unheard-since 1000) 5000 :readers :unknown)
+    (is eq :none action)
+    (false (deaf-state-latched state)))
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state) 5000 :readers :unknown :line-written-p t)
+    (is eq :none action)
+    (false (deaf-state-unheard-since state))))
+
+(define-test a-quiet-bus-never-raises
+  ;; Nobody following the log is the normal state between turns. Without a line
+  ;; written there is nothing unheard, however long that lasts.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state) most-positive-fixnum :readers 0)
+    (is eq :none action)
+    (false (deaf-state-unheard-since state))
+    (false (deaf-state-latched state))))
