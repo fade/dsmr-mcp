@@ -640,13 +640,22 @@ Options:
                        wrote it, and exit 0. Lines already in the log are never
                        reported; a log that is rotated or truncated is followed
                        onto its new contents. Run it as a background command
-                       with no time limit and run it again after each drain.
+                       and run it again after each drain. When nothing has
+                       arrived after --wake-seconds, it prints
+                         idle wake-seconds=<N>
+                       and exits 0; treat that exactly like a wake: drain,
+                       then re-arm. Long silence on a bus is normal, and this
+                       keeps the wait inside the time limit a background
+                       runner imposes, so re-arming stays the ordinary path.
                        While it waits it holds the log open, so it counts as a
                        reader under --check-live. When no detached watcher is
                        running for a bus it would wait on, at the start or
                        while waiting, it prints `nowatcher bus=<name>` and exits
                        1, so start one with --detach and wake again. Exits 2
                        when no identity resolves, 143 on SIGTERM.
+  --wake-seconds N     how long --wake waits before returning `idle` (default
+                       6600, under the two-hour limit of a background command;
+                       0 waits with no limit).
   --all-buses          with --reap, stop this agent's detached watchers on every
                        bus rather than only the resolved one. With --wake, wait
                        on the log of every detached watcher this agent has a
@@ -708,6 +717,7 @@ detached watcher, its pid file.
   (reap-p nil)
   (all-buses-p nil)
   (wake-p nil)
+  (wake-seconds 6600)
   (stall-seconds 120)
   (help-p nil))
 
@@ -769,6 +779,9 @@ detached watcher, its pid file.
                   (setf (opt-all-buses-p opts) t))
                  ((string= arg "--wake")
                   (setf (opt-wake-p opts) t))
+                 ((string= arg "--wake-seconds")
+                  (setf (opt-wake-seconds opts)
+                        (next-nonneg "--wake-seconds" (opt-wake-seconds opts))))
                  ((string= arg "--stall-seconds")
                   (setf (opt-stall-seconds opts)
                         (next-nonneg "--stall-seconds" (opt-stall-seconds opts))))
@@ -1673,7 +1686,7 @@ detached watcher, its pid file.
    line bus), or (values :no-watcher nil bus) naming the first bus whose
    detached watcher is not running. Each target is a list (bus log-path
    pid-path). DEADLINE-MS, when given, is a limit in milliseconds after which
-   this returns :timeout; the command itself waits without one.
+   this returns :timeout.
 
    Every log is read from its end as it stands when this starts, so a line
    already there is never reported again. A watcher that is not running is
@@ -1720,9 +1733,26 @@ detached watcher, its pid file.
       (let ((stem (%detach-stem bus agent-name)))
         (list (list bus (%detach-file stem "log") (%detach-file stem "pid"))))))
 
+(defun %wake-deadline-ms (wake-seconds)
+  "The wait limit for --wake in milliseconds, or NIL for no limit when
+   WAKE-SECONDS is zero."
+  (and (plusp wake-seconds) (* 1000 wake-seconds)))
+
+(defun %idle-line (wake-seconds)
+  "The line --wake prints when WAKE-SECONDS pass with nothing arriving."
+  (format nil "idle wake-seconds=~D" wake-seconds))
+
 (defun %wake (opts bus self-id)
   "Block until the next event line reaches this agent's detached log, print it
    and exit 0. With --all-buses, whichever of the agent's logs gets one first.
+
+   When --wake-seconds pass with nothing arriving, prints `idle
+   wake-seconds=<N>` and exits 0. The agent runs this as a background command,
+   and its runner kills a background command at a fixed ceiling and tells the
+   agent not to start it again, which leaves the agent deaf on a quiet bus.
+   Returning on our own before that ceiling means the agent sees an ordinary
+   completion and re-arms the way it does after any wake. A limit of 0 waits
+   for ever.
 
    When a bus asked for has no detached watcher running, prints
    `nowatcher bus=<bus>` and exits 1 straight away, so the agent starts one
@@ -1733,24 +1763,28 @@ detached watcher, its pid file.
             --agent-id); the detached log is keyed on it.")
     (uiop:quit 2))
   (%install-termination-handler)
-  (let ((targets (%wake-targets bus (%agent-name self-id) (opt-all-buses-p opts))))
+  (let ((targets (%wake-targets bus (%agent-name self-id) (opt-all-buses-p opts)))
+        (wake-seconds (opt-wake-seconds opts)))
     (flet ((no-watcher (label)
              (%warn "no detached watcher is running for ~A on bus ~A; start one ~
                      with --detach, then wake again"
                     self-id label)
              (format *standard-output* "nowatcher bus=~A~%" label)
              (force-output *standard-output*)
-             (uiop:quit 1)))
+             (uiop:quit 1))
+           (say-and-exit (text)
+             (format *standard-output* "~A~%" text)
+             (force-output *standard-output*)
+             (uiop:quit 0)))
       (when (null targets)
         (no-watcher "*"))
       (multiple-value-bind (outcome line which)
-          (%wake-wait targets (opt-poll-ms opts))
-        (if (eq outcome :event)
-            (progn
-              (format *standard-output* "~A~%" line)
-              (force-output *standard-output*)
-              (uiop:quit 0))
-            (no-watcher (or which "default")))))))
+          (%wake-wait targets (opt-poll-ms opts)
+                      :deadline-ms (%wake-deadline-ms wake-seconds))
+        (case outcome
+          (:event (say-and-exit line))
+          (:timeout (say-and-exit (%idle-line wake-seconds)))
+          (t (no-watcher (or which "default"))))))))
 
 (defun main ()
   "Entry point. Parse argv, resolve who this watch is for, arm a baseline, and

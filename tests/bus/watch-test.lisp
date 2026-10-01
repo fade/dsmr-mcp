@@ -96,6 +96,9 @@
                 ;; that the test image can make and check directly; the
                 ;; binary's use of them is covered in the integration suite.
                 #:opt-wake-p
+                #:opt-wake-seconds
+                #:%wake-deadline-ms
+                #:%idle-line
                 #:make-follower
                 #:fol-stream
                 #:%follow-open
@@ -1331,6 +1334,41 @@
          (is eq :event outcome)
          (is equal "bus:7 from=sister" line)
          (is equal "two" bus)))))
+
+(define-test a-quiet-wake-returns-idle-at-its-deadline
+  ;; A background runner kills a wait that outlives its ceiling and the agent
+  ;; is then deaf, so a wait with nothing arriving has to end on its own and
+  ;; say so, rather than run on until something kills it.
+  (call-with-temp-logs
+   1 (lambda (log)
+       (append-log-line log "bus:1 from=old")
+       (let ((started (get-internal-real-time)))
+         (multiple-value-bind (outcome line bus)
+             (%wake-wait (list (list "dt" log nil)) 20
+                         :watcher-alive-p (constantly t)
+                         :deadline-ms (%wake-deadline-ms 1))
+           (is eq :timeout outcome)
+           (false line)
+           (false bus))
+         (true (< (- (get-internal-real-time) started)
+                  (* 3 internal-time-units-per-second))
+               "a one-second wake did not return near its deadline"))))
+  (is string= "idle wake-seconds=1" (%idle-line 1))
+  (is string= "idle wake-seconds=6600" (%idle-line 6600)))
+
+(define-test wake-seconds-parses-with-a-default-under-the-runner-ceiling
+  ;; The default has to sit under the two-hour ceiling of a background command,
+  ;; and 0 is the way back to a wait with no limit.
+  (is = 6600 (opt-wake-seconds (%parse-args '("--wake"))))
+  (is = 30 (opt-wake-seconds (%parse-args '("--wake" "--wake-seconds" "30"))))
+  (is = 0 (opt-wake-seconds (%parse-args '("--wake" "--wake-seconds" "0"))))
+  (is = 6600000 (%wake-deadline-ms 6600))
+  (is = 30000 (%wake-deadline-ms 30))
+  (false (%wake-deadline-ms 0) "0 must disable the limit, not end the wait at once")
+  (is = 6600
+      (opt-wake-seconds
+       (capturing-stderr (%parse-args '("--wake-seconds" "soon"))))
+      "an unparseable value must keep the default"))
 
 (define-test a-followed-log-survives-truncation-and-replacement
   ;; A half-written line at the arm is not an event, a truncated log is read
