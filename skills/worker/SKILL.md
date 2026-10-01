@@ -473,6 +473,13 @@ permanent** (operator, 2026-10-01): a quiet bus is normal, and a runner kill at 
 time limit is a wake too, so drain and re-arm whatever its note says. An idle
 sister wakes once every 110 minutes and does nothing else.
 
+⭐ **If the session Stop hook is installed** (`grep -c -- '--wake --hook'
+~/.claude/settings.json` prints 1 or more), it is your primary listener and re-arms
+itself at every turn end: start that background `--wake` once here, never re-arm it
+after it fires, never re-arm after a hook wake, and treat `already-armed` as "the
+hook is listening, leave it". After an interrupt, let your next turn end normally.
+The **bus-watch** skill has the full rules.
+
 Use the literal `~/.local/bin/dsmr-bus-watch` path and a literal name (never
 `"$DSMR_BUS_AGENT"`, which is inherited and can name another tree's agent). The path
 is what the narrow `Bash(~/.local/bin/dsmr-bus-watch:*)` allow rule matches, and a
