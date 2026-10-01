@@ -87,6 +87,9 @@
                 #:%effective-stall-seconds
                 #:%stalled-p
                 #:%detach-stem
+                #:%legacy-detach-stem
+                #:%identity-hash
+                #:%normalise-agent-id
                 #:%child-args
                 #:%shell-quote
                 #:%monitor-command
@@ -1199,11 +1202,59 @@
     (false (%stalled-p (* 10 unit) (* 9 unit) 2))
     (true (%stalled-p (* 10 unit) (* 7 unit) 2))))
 
-(define-test detached-files-are-named-for-bus-and-agent
-  ;; The stem matches the one watchers launched by hand already use, so a tail
-  ;; over *--<agent>.log follows both.
-  (is string= "valis--dsmr-mcp" (%detach-stem "valis" "dsmr-mcp"))
-  (is string= "default--dsmr-mcp" (%detach-stem nil "dsmr-mcp")))
+(define-test detached-files-are-named-for-bus-agent-and-identity
+  ;; The name stays readable at the front so a log can be found by eye; the
+  ;; identity hash at the end keeps two agents of one name apart.
+  (is string= (format nil "valis--dsmr-mcp--~A" (%identity-hash "/p/dsmr-mcp"))
+      (%detach-stem "valis" "/p/dsmr-mcp"))
+  (is string= (format nil "default--dsmr-mcp--~A" (%identity-hash "/p/dsmr-mcp"))
+      (%detach-stem nil "/p/dsmr-mcp")))
+
+(define-test doubled-separators-name-the-same-agent
+  ;; A doubled separator is a typing accident, not a second agent.
+  (is equal "/ns/name" (%normalise-agent-id "/ns//name"))
+  (is equal "/a/b/name" (%normalise-agent-id "/a//b///name"))
+  (is equal "/ns/name" (%normalise-agent-id "/ns/name//"))
+  (is equal "/other/name" (%normalise-agent-id "/other/name"))
+  (is equal "name" (%normalise-agent-id "name"))
+  (false (%normalise-agent-id nil)))
+
+(define-test agent-id-flag-collapses-doubled-separators
+  (with-env-agent (nil)
+    (is equal "/p/x" (%resolve-self-id (%parse-args (list "--agent-id" "/p//x"))))
+    (is equal "/p/x" (%resolve-self-id (%parse-args (list "--namespace" "/p//"
+                                                          "--agent" "x"))))
+    (is equal "/p/x" (%resolve-self-id (%parse-args (list "--namespace" "/p"
+                                                          "--agent" "x"))))))
+
+(define-test identity-hash-is-pinned-across-builds
+  ;; The hash names files that outlive the binary that wrote them, so it must
+  ;; come out the same from every build. The pinned value is FNV-1a 32 computed
+  ;; outside Lisp.
+  (let ((hash (%identity-hash "/home/fade/SourceCode/lisp/dsmr-mcp/mallet")))
+    (is = 8 (length hash))
+    (true (every (lambda (ch) (find ch "0123456789abcdef")) hash))
+    (is string= "8b77de7a" hash)))
+
+(define-test stem-differs-per-namespace-and-keeps-the-name
+  (let ((a (%detach-stem "dt" "/a/x"))
+        (b (%detach-stem "dt" "/b/x")))
+    (false (string= a b))
+    (is eql 0 (search "dt--x--" a))
+    (is eql 0 (search "dt--x--" b))
+    (is eql 0 (search "default--x--" (%detach-stem nil "/a/x")))
+    (is string= a (%detach-stem "dt" "/a//x"))))
+
+(define-test stem-stays-short-for-deep-namespaces
+  (let ((id (concatenate 'string "/" (make-string 399 :initial-element #\n) "/x")))
+    (true (< (length (%detach-stem "dt" id)) 120))))
+
+(define-test legacy-stem-is-the-old-format
+  ;; Watchers started by earlier builds named their files this way, and are
+  ;; found under it until they are restarted.
+  (is string= "dt--x" (%legacy-detach-stem "dt" "/a/x"))
+  (is string= "default--x" (%legacy-detach-stem nil "/a/x"))
+  (is string= "valis--dsmr-mcp" (%legacy-detach-stem "valis" "/p/dsmr-mcp")))
 
 (define-test the-detached-child-is-told-who-it-is
   ;; The child runs from / after its parent's shell is gone, so it must not

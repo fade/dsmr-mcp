@@ -614,8 +614,12 @@ Options:
                        /dev/null, survives the shell that started it, re-arms
                        itself in place at every idle recycle, and appends its
                        wake lines to
-                         $XDG_STATE_HOME/dsmr-mcp/watch/<bus>--<agent>.log
-                       beside a pid file of the same stem. Running it again while
+                         $XDG_STATE_HOME/dsmr-mcp/watch/<bus>--<agent>--<hash>.log
+                       where <hash> is a short hash of the full agent identity,
+                       so two agents of one name in different namespaces keep
+                       separate files, beside a pid file of the same stem. A
+                       watcher an earlier build started under the name-only
+                       stem is found and used. Running it again while
                        that watcher is up starts nothing. Prints
                          detached pid=<pid> bus=<name> log=<path>
                        (`running` in place of `detached` when one was already
@@ -856,6 +860,28 @@ detached watcher, its pid file.
     (when name
       (selector:validate-bus-name name))))
 
+(defun %normalise-agent-id (id)
+  "ID with every run of separators collapsed to one and any trailing separator
+   removed, or NIL for NIL.
+
+   A doubled separator names the same agent as a single one, but every file a
+   watcher keeps (cursor, heartbeat, log, pid file) is named from the id, so a
+   second spelling would be a second set of files, and a probe typed with it
+   would read a healthy agent as dead."
+  (when id
+    (let ((out (make-string-output-stream))
+          (previous-separator-p nil))
+      (loop for ch across id
+            do (let ((separator-p (char= ch #\/)))
+                 (unless (and separator-p previous-separator-p)
+                   (write-char ch out))
+                 (setf previous-separator-p separator-p)))
+      (let ((collapsed (get-output-stream-string out)))
+        (if (and (> (length collapsed) 1)
+                 (char= (char collapsed (1- (length collapsed))) #\/))
+            (subseq collapsed 0 (1- (length collapsed)))
+            collapsed)))))
+
 (defun %resolve-self-id (opts)
   "The full <namespace>/<name> bus id this watcher watches on behalf of, or NIL
    when no identity resolves.
@@ -865,30 +891,33 @@ detached watcher, its pid file.
    The one rule not carried over is the ephemeral opt-out: a watcher exists to
    watch for a STABLE identity, one whose cursor outlives a restart.
 
-   The namespace comes from --agent-id (taken whole, no construction) or
-   --namespace. The working directory is a last resort and announces itself: the
-   cursor file is keyed on the FULL id, so a namespace guessed from wherever the
-   operator happened to be standing points at another agent's cursor or at none
-   at all, and does it without a word. Construction goes through the shared
-   envelope leaf, so the id this builds and the id the publisher stamps into a
-   message can never drift apart."
+   The namespace comes from --agent-id (taken whole, no construction, apart from
+   collapsing doubled separators) or --namespace. Either way the id passes
+   through %NORMALISE-AGENT-ID: a doubled separator names the same agent, and a
+   second spelling of it would be a second set of files. The working directory
+   is a last resort and announces itself: the cursor file is keyed on the FULL
+   id, so a namespace guessed from wherever the operator happened to be standing
+   points at another agent's cursor or at none at all, and does it without a
+   word. Construction goes through the shared envelope leaf, so the id this
+   builds and the id the publisher stamps into a message can never drift apart."
   (let ((explicit (opt-agent-id opts)))
-    (if (and explicit (plusp (length explicit)))
-        explicit
-        (let* ((flagged (opt-agent opts))
-               (name (or (and flagged (plusp (length flagged)) flagged)
-                         (%env-agent-name))))
-          (when name
-            (let ((namespace
-                    (or (opt-namespace opts)
-                        (let ((cwd (namestring (uiop:getcwd))))
-                          (%warn "no --namespace given; inferring ~S from the ~
-                                  working directory. It must match the project ~
-                                  root the MCP session uses, or this watcher ~
-                                  reads the wrong cursor."
-                                 cwd)
-                          cwd))))
-              (envelope:agent-id namespace :name name)))))))
+    (%normalise-agent-id
+     (if (and explicit (plusp (length explicit)))
+         explicit
+         (let* ((flagged (opt-agent opts))
+                (name (or (and flagged (plusp (length flagged)) flagged)
+                          (%env-agent-name))))
+           (when name
+             (let ((namespace
+                     (or (opt-namespace opts)
+                         (let ((cwd (namestring (uiop:getcwd))))
+                           (%warn "no --namespace given; inferring ~S from the ~
+                                   working directory. It must match the project ~
+                                   root the MCP session uses, or this watcher ~
+                                   reads the wrong cursor."
+                                  cwd)
+                           cwd))))
+               (envelope:agent-id namespace :name name))))))))
 
 (defun %cursor-path (self-id cursors-dir)
   "Where SELF-ID's durable cursor lives under CURSORS-DIR. The filename is the
@@ -1027,7 +1056,7 @@ detached watcher, its pid file.
         (uiop:quit 2))
       (multiple-value-bind (status age pid)
           (heartbeat:beat-liveness beat-path window-seconds)
-        (let* ((stem (%detach-stem bus (%agent-name self-id)))
+        (let* ((stem (%resolve-detach-stem bus self-id))
                (watcher (%live-detached-pid (%detach-file stem "pid")))
                (readers (%log-readers (%detach-file stem "log")
                                       (remove-if-not #'integerp
@@ -1147,17 +1176,49 @@ detached watcher, its pid file.
 (defun %detach-dir ()
   "Where detached watchers keep their logs and pid files: dsmr-mcp/watch/ under
    the state home. One directory for every bus, so a single tail over
-   *--<agent>.log follows an agent on all the buses it has joined."
+   *--<agent>--*.log follows an agent on all the buses it has joined."
   (merge-pathnames "dsmr-mcp/watch/" (%state-home)))
 
 (defun %agent-name (self-id)
   "The name part of the full bus id SELF-ID."
   (nth-value 1 (envelope:split-agent-id self-id)))
 
-(defun %detach-stem (bus agent-name)
-  "The file stem for the detached watcher of AGENT-NAME on BUS:
-   <bus>--<agent>, with `default` standing for the unnamed bus."
-  (format nil "~A--~A" (%field-token (or bus "default")) (%field-token agent-name)))
+(defun %identity-hash (string)
+  "The 32-bit FNV-1a hash of STRING's character codes, as eight lowercase hex
+   digits.
+
+   The hash names files that outlive the binary that wrote them, and a later
+   build has to find them again, so it is computed here from first principles
+   rather than with SXHASH or any other function whose value an implementation
+   is free to change between builds."
+  (let ((hash 2166136261))
+    (loop for ch across string
+          do (setf hash (ldb (byte 32 0)
+                             (* (logxor hash (char-code ch)) 16777619))))
+    (format nil "~(~8,'0X~)" hash)))
+
+(defun %detach-stem (bus self-id)
+  "The file stem for the detached watcher of the full bus id SELF-ID on BUS:
+   <bus>--<agent>--<hash>, with `default` standing for the unnamed bus.
+
+   The agent name stays readable so an operator can find a log by eye. The hash
+   is of the whole normalised id (see %IDENTITY-HASH), so two agents with the
+   same name in different namespaces get separate files and separate reader
+   counts, and a namespace of any length adds only eight characters."
+  (let ((id (%normalise-agent-id self-id)))
+    (format nil "~A--~A--~A"
+            (%field-token (or bus "default"))
+            (%field-token (%agent-name id))
+            (%identity-hash id))))
+
+(defun %legacy-detach-stem (bus self-id)
+  "The stem earlier builds gave the detached watcher of SELF-ID on BUS: the bus
+   and the agent name alone, with no trace of the namespace. Watchers those
+   builds started are still running under it, and are found by it until they
+   are next restarted (see %RESOLVE-DETACH-STEM)."
+  (format nil "~A--~A"
+          (%field-token (or bus "default"))
+          (%field-token (%agent-name (%normalise-agent-id self-id)))))
 
 (defun %detach-file (stem type)
   "The file STEM.TYPE in the detach directory, built from a native namestring so
@@ -1236,6 +1297,36 @@ detached watcher, its pid file.
   (or (%lock-holder pid-path)
       (let ((pid (%pid-file-contents pid-path)))
         (and pid (%pid-alive-p pid) (%looks-like-watcher-p pid) pid))))
+
+(defun %recorded-id-matches-p (pid-path self-id)
+  "True when the pid file at PID-PATH records the same agent as SELF-ID, once
+   both are normalised. A file with no recorded id matches nothing."
+  (let ((recorded (nth-value 1 (%pid-file-contents pid-path))))
+    (and recorded self-id
+         (string= (%normalise-agent-id recorded) (%normalise-agent-id self-id)))))
+
+(defun %resolve-detach-stem (bus self-id)
+  "The stem to look for SELF-ID's detached watcher on BUS under.
+
+   That is the current stem (%DETACH-STEM) unless a watcher started by an
+   earlier build is still running under the older name-only stem and records
+   this same identity in its pid file. Then it is that older stem, so the
+   running watcher is adopted: --detach does not start a second one beside it,
+   and --check-live, --wake and --reap act on the files it is actually writing.
+   A same-named watcher from another namespace records another identity and is
+   never adopted.
+
+   Only callers looking for an existing watcher use this. A new watcher always
+   claims the current stem, and never calls this, since asking who holds a lock
+   from the holder drops the lock (see %LOCK-HOLDER)."
+  (let ((current (%detach-stem bus self-id))
+        (legacy (%legacy-detach-stem bus self-id)))
+    (cond ((%live-detached-pid (%detach-file current "pid")) current)
+          ((let ((legacy-pid (%detach-file legacy "pid")))
+             (and (%live-detached-pid legacy-pid)
+                  (%recorded-id-matches-p legacy-pid self-id)))
+           legacy)
+          (t current))))
 
 (defvar *pid-file-stream* nil
   "The open stream on the pid file this detached watcher has claimed. Held for the
@@ -1352,7 +1443,7 @@ detached watcher, its pid file.
     (%warn "--detach needs a resolved identity (pass --agent with --namespace, or ~
             --agent-id); a detached watcher is keyed on it.")
     (uiop:quit 2))
-  (let* ((stem (%detach-stem bus (%agent-name self-id)))
+  (let* ((stem (%resolve-detach-stem bus self-id))
          (log-path (%detach-file stem "log"))
          (pid-path (%detach-file stem "pid"))
          (label (or bus "default")))
@@ -1365,7 +1456,7 @@ detached watcher, its pid file.
       (let ((running (%live-detached-pid pid-path)))
         (when running
           (let ((recorded (nth-value 1 (%pid-file-contents pid-path))))
-            (when (and recorded (string/= recorded self-id))
+            (when (and recorded (not (%recorded-id-matches-p pid-path self-id)))
               (%warn "a detached watcher (pid ~D) already runs as ~A on bus ~A; ~
                       not starting a second one under the same name"
                      running recorded label)
@@ -1455,7 +1546,7 @@ detached watcher, its pid file.
          (ignore-errors (when (probe-file pid-path) (delete-file pid-path)))
          (say "none bus=~A" label)
          t)
-        ((and recorded self-id (string/= recorded self-id))
+        ((and recorded self-id (not (%recorded-id-matches-p pid-path self-id)))
          (say "foreign pid=~D bus=~A id=~A" pid label recorded)
          nil)
         (t
@@ -1476,23 +1567,41 @@ detached watcher, its pid file.
                   (say "survived pid=~D bus=~A" pid label)
                   nil))))))))
 
-(defun %reap-targets (bus agent-name all-buses-p)
+(defun %reap-targets (bus self-id all-buses-p)
   "The pid files --reap acts on, each paired with the bus it belongs to: the one
-   for AGENT-NAME on BUS, or with ALL-BUSES-P every pid file in the detach
-   directory that belongs to AGENT-NAME."
+   for SELF-ID on BUS, or with ALL-BUSES-P one for every bus SELF-ID has a pid
+   file on in the detach directory.
+
+   A bus is found from a pid file under the current stem, or under the older
+   name-only stem when that file records this same identity; a same-named agent
+   from another namespace is never picked up. Each bus is listed once, under
+   whichever stem %RESOLVE-DETACH-STEM settles on for it."
   (if all-buses-p
-      (let ((suffix (concatenate 'string "--" (%field-token agent-name))))
-        (loop for path in (directory (merge-pathnames
-                                      (make-pathname :name :wild :type "pid")
-                                      (%detach-dir)))
-              for stem = (pathname-name path)
-              when (and (> (length stem) (length suffix))
-                        (string= suffix stem
-                                 :start2 (- (length stem) (length suffix))))
-                collect (let ((token (subseq stem 0 (- (length stem)
-                                                       (length suffix)))))
-                          (cons path (if (string= token "default") nil token)))))
-      (list (cons (%detach-file (%detach-stem bus agent-name) "pid") bus))))
+      (let ((current-suffix (format nil "--~A--~A"
+                                    (%field-token (%agent-name self-id))
+                                    (%identity-hash (%normalise-agent-id self-id))))
+            (legacy-suffix (format nil "--~A" (%field-token (%agent-name self-id))))
+            (buses '()))
+        (flet ((bus-token (stem suffix)
+                 (and (> (length stem) (length suffix))
+                      (string= suffix stem
+                               :start2 (- (length stem) (length suffix)))
+                      (subseq stem 0 (- (length stem) (length suffix))))))
+          (dolist (path (directory (merge-pathnames
+                                    (make-pathname :name :wild :type "pid")
+                                    (%detach-dir))))
+            (let* ((stem (pathname-name path))
+                   (token (or (bus-token stem current-suffix)
+                              (and (%recorded-id-matches-p path self-id)
+                                   (bus-token stem legacy-suffix)))))
+              (when token
+                (pushnew (if (string= token "default") nil token) buses
+                         :test #'equal)))))
+        (loop for target-bus in (reverse buses)
+              collect (cons (%detach-file (%resolve-detach-stem target-bus self-id)
+                                          "pid")
+                            target-bus)))
+      (list (cons (%detach-file (%resolve-detach-stem bus self-id) "pid") bus))))
 
 (defun %reap (opts bus self-id)
   "Stop this agent's detached watcher on BUS, or with --all-buses on every bus,
@@ -1506,7 +1615,7 @@ detached watcher, its pid file.
     (%warn "--reap needs a resolved identity (pass --agent with --namespace, or ~
             --agent-id).")
     (uiop:quit 2))
-  (let ((targets (%reap-targets bus (%agent-name self-id) (opt-all-buses-p opts)))
+  (let ((targets (%reap-targets bus self-id (opt-all-buses-p opts)))
         (clean t))
     (if (null targets)
         (format *standard-output* "none bus=*~%")
@@ -1720,17 +1829,17 @@ detached watcher, its pid file.
           (let ((stream (fol-stream (cdr entry))))
             (when stream (ignore-errors (close stream)))))))))
 
-(defun %wake-targets (bus agent-name all-buses-p)
+(defun %wake-targets (bus self-id all-buses-p)
   "What --wake waits on, as (bus log-path pid-path) lists: the detached log for
-   AGENT-NAME on BUS, or with ALL-BUSES-P the log of every detached watcher this
+   SELF-ID on BUS, or with ALL-BUSES-P the log of every detached watcher this
    agent has a pid file for. A bus whose watcher was reaped has no pid file and
    is left out, so a bus the agent has left cannot hold the wait hostage."
   (if all-buses-p
-      (loop for (pid-path . target-bus) in (%reap-targets bus agent-name t)
+      (loop for (pid-path . target-bus) in (%reap-targets bus self-id t)
             collect (list target-bus
                           (make-pathname :type "log" :defaults pid-path)
                           pid-path))
-      (let ((stem (%detach-stem bus agent-name)))
+      (let ((stem (%resolve-detach-stem bus self-id)))
         (list (list bus (%detach-file stem "log") (%detach-file stem "pid"))))))
 
 (defun %wake-deadline-ms (wake-seconds)
@@ -1763,7 +1872,7 @@ detached watcher, its pid file.
             --agent-id); the detached log is keyed on it.")
     (uiop:quit 2))
   (%install-termination-handler)
-  (let ((targets (%wake-targets bus (%agent-name self-id) (opt-all-buses-p opts)))
+  (let ((targets (%wake-targets bus self-id (opt-all-buses-p opts)))
         (wake-seconds (opt-wake-seconds opts)))
     (flet ((no-watcher (label)
              (%warn "no detached watcher is running for ~A on bus ~A; start one ~
@@ -1845,8 +1954,9 @@ detached watcher, its pid file.
           (when (opt-detached-child-p opts)
             (ignore-errors (sb-posix:setsid))
             (sb-sys:enable-interrupt sb-posix:sighup :ignore)
-            (let ((pid-path (%detach-file (%detach-stem bus (%agent-name self-id))
-                                          "pid")))
+            ;; The child always claims the current stem; only callers looking
+            ;; for an existing watcher adopt an older one.
+            (let ((pid-path (%detach-file (%detach-stem bus self-id) "pid")))
               (unless (%claim-pid-file pid-path self-id)
                 (%warn "another detached watcher already holds ~A; exiting"
                        (uiop:native-namestring pid-path))
