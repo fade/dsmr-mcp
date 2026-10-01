@@ -64,12 +64,24 @@ written:   <ISO-8601>
      outside git: no diff, no revert), always leave a pointer, and move content **by line range
      rather than retyping it** so rulings stay byte-exact.
 
-4. **Leave your detached bus watcher RUNNING. PARK DOES NOT REAP** (operator ruling, 2026-09-30).
-   The watcher outlives the session by design: at bring-up, `--detach` answers `running` and adopts
-   it, and the new session re-arms only its background `--wake`. While you are down it answers
-   `--check-live` with `live … readers=0` — running, nobody listening — which is what parked
-   means; the bus holds your mail on your cursor. ⛔ Do not run `--reap` here. `--reap` is for an
-   agent LEAVING the fleet (`bus-leave`, disenrollment) or retiring a host; see **bus-watch**.
+4. **Mark the park, then leave your detached bus watcher RUNNING. PARK DOES NOT REAP** (operator
+   ruling, 2026-09-30). While you are still listening, run:
+
+   ```
+   ~/.local/bin/dsmr-bus-watch --park --all-buses --agent <name> --namespace <absolute-project-root>/
+   ```
+
+   It prints `parked bus=<b>` for each of your watchers and exits 0 (exit 1 means a marker could
+   not be written: say so in your park line). The marker tells your watcher that the silence which
+   follows is intended, so mail that waits on you while you are down raises no deafness
+   notification and a fleet takedown sounds no alarm. Skip it and every parked agent with mail
+   pending reads as deaf ten minutes later.
+
+   The watcher outlives the session by design: at bring-up, `--detach` answers `running`, adopts
+   it and clears the park marker. While you are down it answers `--check-live` with
+   `live … parked=1`, which is what parked means; the bus holds your mail on your cursor. ⛔ Do not
+   run `--reap` here. `--reap` is for an agent LEAVING the fleet (`bus-leave`, disenrollment) or
+   retiring a host; see **bus-watch**.
 
 5. Send the leader **exactly one line**: `PARKED <repo> @<short-sha>`
 
@@ -125,7 +137,9 @@ re-announces.
    on: the cursor advances on delivery.
 3. Arm the standing listener: `~/.local/bin/dsmr-bus-watch --detach --bus <TAG> --agent
    <your-name> --namespace <absolute-project-root>/` **once** (expect `running`: the watcher
-   survived the park and is adopted), then the background Bash (`run_in_background`,
+   survived the park and is adopted; `--detach` also clears the park marker for each bus it arms,
+   and `--unpark --all-buses` with the same identity flags is the explicit form), then the
+   background Bash (`run_in_background`,
    `timeout: 7200000`) wake,
    `~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <your-name> --namespace
    <absolute-project-root>/`, re-armed only after each wake (drain, re-arm; see **bus-watch**).
@@ -138,8 +152,9 @@ re-announces.
 5. Expect a quiet bus. Workers are not up. Do not block on them.
 6. As each worker checks in, confirm its live HEAD against its `PARK.md`. **A mismatch is a STOP —
    reconcile before any work.** Then run the reader check for it (`--check-live --bus <TAG>
-   --agent <sister> --namespace <sister-root>/`; see **leader**). `readers=0` once it has
+   --agent <sister> --namespace <sister-root>/`; see **leader**). A `deaf=` field once it has
    announced is a deaf sister: surface it to the operator, who must type in its terminal.
+   `parked=1` after it announced means its `--detach` never ran; ask for the arm, not a re-park.
 7. Collect every `BLOCKED.md` across the fleet into your first reply to the operator.
 
 ### Worker
@@ -149,11 +164,11 @@ re-announces.
 3. Read **your own** `.planning/PARK.md`. Check out its `branch`; confirm `git rev-parse HEAD`
    equals its `sha`. **Mismatch ⇒ stop and report; do not work.**
 4. Send **one line**: `RESUMED <repo> @<short-sha>`
-5. Arm your watch (`--detach` once, which adopts the watcher your park left running, then the
-   background `--wake`) and **confirm it with `--check-live` (must print `live`, your `bus=`, and
-   `readers=1` or more) before going silent.** **Go silent.** Await dispatch by
-   name. A worker that goes silent on a `dead`/`stale` or `readers=0` watch is deaf to its own
-   dispatch, and no one learns until the operator notices the wait.
+5. Arm your watch (`--detach` once, which adopts the watcher your park left running and clears
+   your park marker, then the background `--wake`) and **confirm it with `--check-live` (must print `live`, your `bus=`, and
+   `readers=1` or more, and no `parked=1`) before going silent.** **Go silent.** Await dispatch
+   by name. A worker that goes silent on a `dead`/`stale` watch, or with no listener armed, is
+   deaf to its own dispatch, and no one learns until the operator notices the wait.
 
 ⛔ **Bring-up is the checklist above and nothing else.** Do not explore the tooling, do not report
 what the harness can now do, do not verify another repo, do not comment on another worker's park, do
@@ -196,9 +211,12 @@ not summarise last session — it is in your files.
   idle mark while still reporting armed. `--detach` carries that recycle itself; the `while true
   … --stream --recycle-seconds 1800` Monitor loop is a last-resort fallback only for a binary
   without `--wake` (`make install-bus-watch` first). See the **bus-watch** skill for the full form.
-  **Park does not reap**; `--reap --all-buses` is for leaving the fleet or retiring a host.
+  **Park marks, it does not reap**: `--park --all-buses` before you stop listening, and
+  `--detach` clears the mark at bring-up; `--reap --all-buses` is for leaving the fleet or
+  retiring a host.
   Confirm liveness with `~/.local/bin/dsmr-bus-watch --check-live --bus <TAG> --agent <name>
   --namespace <absolute-project-root>/`. Require `live`, the right `bus=` and `readers=1` or more
-  before you report ready, never `dead`/`stale`/`readers=0`.
+  before you report ready, never `dead`/`stale`. Deafness is the `deaf=` field (mail unread for ten
+  minutes); `parked=1` is a park. `readers=0` alone is only a moment with no listener armed.
 - Boot: `fs-set-project-root {"path":"."}` → `load-system {"system":"<sys>"}`.
 - Park state: `.planning/PARK.md` per repo. Blocks: `.planning/BLOCKED.md` per repo.

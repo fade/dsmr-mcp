@@ -448,7 +448,9 @@ one, you have one.
 Launch (or adopt) the detached watcher **once per session per bus**, each with its
 own `--bus`. It survives the session, a park and a fleet restart, and re-arms
 itself at every recycle; if one is already up for you it answers `running` and is
-yours again:
+yours again. It also clears the park marker your last park left for that bus
+(`--unpark` with the same flags is the explicit form), so arming is still the
+first thing you do:
 
 ```
 ~/.local/bin/dsmr-bus-watch --detach --poll-ms 250 \
@@ -521,17 +523,30 @@ one `--wake --all-buses` waits on both.
 ~/.local/bin/dsmr-bus-watch --check-live --bus <tag> --agent <your-name> --namespace <absolute-project-root>/
 ```
 
-⛔ **`live` alone is no longer good enough.** The answer carries `bus=NAME` and
-` readers=<n>`, and you must check both. A watcher that is live on the wrong bus has
-a fresh heartbeat, answers `live`, and never fires: it is deaf in exactly the way
-that used to be invisible, which is why the field was added. And a watcher that is
-live on the right bus with **`readers=0`** has nothing following its log: no
-`--wake` is waiting, so it writes your wake to a file and wakes nobody.
+⛔ **`live` alone is no longer good enough.** The answer reads
+`live pid=<p> age_s=<n> bus=<name> readers=<n>`, followed by `parked=1` and
+`deaf=<epoch>` when they apply, and you must check the bus and the deafness fields.
+A watcher that is live on the wrong bus has a fresh heartbeat, answers `live`, and
+never fires: it is deaf in exactly the way that used to be invisible, which is why
+the field was added.
 
 - `live ... bus=<your tag> readers=1` (or more): you are listening to the right
   bus and can hear it. Go silent.
-- `live ... bus=<your tag> readers=0`: **you are deaf.** The watcher runs but no
-  `--wake` is waiting. Re-arm the background `--wake`, then check again.
+- **`deaf=<epoch>`: you are deaf, and have been since that Unix time.** Mail has
+  waited unread on your log for ten minutes with nothing following it, and the
+  operator has had a desktop notification saying so. Drain every joined bus now,
+  then arm a listener, then check again; the field clears once something reads
+  the log. `deaf=unknown` means the marker could not be read: treat it the same.
+- `readers=0` with no `deaf=`: nothing is following your log at this moment. That
+  is normal during a turn the listener's own wake started, before your first turn
+  ends under the session hook (see **bus-watch**), and between a background
+  `--wake` exiting and your re-arm. It means deaf only if it persists while you are
+  idle with no listener armed, which is exactly what `deaf=` reports. Before you go
+  silent with no session hook installed, re-arm the background `--wake` and check
+  again.
+- `parked=1`: your park marker is still set, so the alarm for you is off. A
+  `--detach` at bring-up clears it; run that (or `--unpark --all-buses`) before
+  you go silent.
 - `live ... bus=<something else>`: **you are deaf.** Re-arm with the right tag,
   and `--reap --bus <wrong tag>` the stray watcher so it stops answering `live`.
 - `bus=default`: you are on the shared host-wide bus. Correct only if that is
@@ -547,17 +562,26 @@ live on the right bus with **`readers=0`** has nothing following its log: no
   `--wake`.
 - exit 64: the bus name itself was refused. Fix the name; nothing was armed.
 
-Going silent on a dead, stale, wrong-bus or `readers=0` watch is going deaf. A
-dispatch by name will never reach you and nobody learns until the operator notices
-the wait. Never go silent deaf: the right `live` with `readers=1`+, on every joined
-bus, and then silence.
+Going silent on a dead, stale or wrong-bus watch, or with no listener armed, is
+going deaf. A dispatch by name will never reach you and nobody learns until the
+operator notices the wait. Never go silent deaf: the right `live` with no `deaf=`
+and a listener armed, on every joined bus, and then silence.
 
 ⛔ **PARK DOES NOT REAP (operator ruling, 2026-09-30).** At a fleet-restart park
-(see **fleet-restart**) or a `BLOCKED` park, leave the detached watcher running.
-At your next bring-up `--detach` answers `running` and adopts it, and you re-arm
-only the `--wake`. While you are parked it reads `live … readers=0`, which is what
-parked means; the bus holds your mail on your cursor. A `BLOCKED` park inside a live
-session additionally keeps its `--wake` armed, so it stays reachable.
+(see **fleet-restart**), mark the park before you stop listening, then leave the
+detached watcher running:
+
+```
+~/.local/bin/dsmr-bus-watch --park --all-buses --agent <your-name> --namespace <absolute-project-root>/
+```
+
+The marker tells the watcher your silence is intended, so mail waiting on you
+raises no deafness notification. At your next bring-up `--detach` answers
+`running`, adopts the watcher and clears the marker, and you re-arm only the
+listener. While you are parked it reads `live … parked=1`, which is what parked
+means; the bus holds your mail on your cursor. A `BLOCKED` park inside a live
+session is different: it sets no marker and keeps its listener armed, so it stays
+reachable and a deafness alarm still means something.
 
 `--reap` is for **leaving the fleet** (`bus-leave`, disenrollment) or retiring a
 host, after your last drain:
