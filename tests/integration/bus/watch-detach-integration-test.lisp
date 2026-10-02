@@ -28,7 +28,12 @@
 
 (defpackage #:dsmr-mcp/tests/integration/bus/watch-detach-integration-test
   (:use #:cl #:zebra)
-  (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal)))
+  (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal))
+  ;; The file names come from the watcher's own stem functions, so these cases
+  ;; look where the binary writes and can never drift from it.
+  (:import-from #:dsmr-bus-watch/src/bus/watch
+                #:%detach-stem
+                #:%legacy-detach-stem))
 
 (in-package #:dsmr-mcp/tests/integration/bus/watch-detach-integration-test)
 
@@ -50,22 +55,65 @@
                             (asdf:system-source-directory "dsmr-mcp"))))
     (when (probe-file p) p)))
 
+(defun stub-dir (state)
+  "The directory under the state root STATE holding the stub notify-send."
+  (merge-pathnames "stub-bin/" state))
+
+(defun notify-calls-file (state)
+  "The file the stub notify-send under STATE appends each call to."
+  (merge-pathnames "notify-calls" state))
+
+(defun install-notify-stub (state)
+  "Write a stub notify-send into STATE's stub directory that appends its
+   arguments, one call per line, to the calls file and does nothing else.
+
+   Every watcher these cases start finds the stub first on its PATH, so no case
+   can put a real notification on the developer's desktop."
+  (let ((stub (merge-pathnames "notify-send" (stub-dir state))))
+    (ensure-directories-exist stub)
+    (with-open-file (out stub :direction :output :if-exists :supersede)
+      (format out "#!/bin/sh~%printf '%s\\n' \"$*\" >> '~A'~%"
+              (uiop:native-namestring (notify-calls-file state))))
+    (sb-posix:chmod (uiop:native-namestring stub) #o755)
+    stub))
+
+(defun notify-calls (state)
+  "Every call the stub notify-send under STATE has received, one string each."
+  (or (ignore-errors (uiop:read-file-lines (notify-calls-file state))) '()))
+
+(defvar *watcher-path* nil
+  "When set, the whole PATH a watcher is run with. When NIL, the stub directory
+   under the case's state root is put in front of the inherited PATH.")
+
+(defun watcher-env (state)
+  "The environment assignments a watcher under STATE runs with: the private
+   state root, and a PATH that finds the stub notify-send first."
+  (list (format nil "XDG_STATE_HOME=~A" (uiop:native-namestring state))
+        (format nil "PATH=~A"
+                (or *watcher-path*
+                    (format nil "~A:~A"
+                            (string-right-trim "/" (uiop:native-namestring
+                                                    (stub-dir state)))
+                            (or (uiop:getenv "PATH") ""))))))
+
 (defun fresh-state-home ()
-  "A new, empty state root directly under /tmp. Kept short on purpose: the bus
-   refuses a state root whose derived socket path would pass 107 characters."
+  "A new, empty state root directly under /tmp, holding a stub notify-send.
+   Kept short on purpose: the bus refuses a state root whose derived socket path
+   would pass 107 characters."
   (let* ((suffix (let ((*random-state* (make-random-state t)))
                    (format nil "~36R" (random (expt 36 8)))))
          (dir (pathname (format nil "/tmp/dbw-~A/" suffix))))
     (ensure-directories-exist dir)
+    (install-notify-stub dir)
     dir))
 
 (defun run-in (state bin &rest args)
   "Run BIN with ARGS under the state root STATE, with no ambient bus identity or
-   bus selector, and return (values stdout stderr exit-code)."
-  (uiop:run-program (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR"
-                                  (format nil "XDG_STATE_HOME=~A"
-                                          (uiop:native-namestring state))
-                                  (uiop:native-namestring bin))
+   bus selector and the stub notify-send first on PATH, and return (values
+   stdout stderr exit-code)."
+  (uiop:run-program (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR")
+                            (watcher-env state)
+                            (list (uiop:native-namestring bin))
                             args)
                     :output '(:string :stripped t)
                     :error-output '(:string :stripped t)
@@ -74,8 +122,18 @@
 (defun identity-args ()
   (list "--bus" *bus* "--agent" *agent* "--namespace" *namespace*))
 
-(defun detach-file (state type)
-  (merge-pathnames (format nil "dsmr-mcp/watch/~A--~A.~A" *bus* *agent* type) state))
+(defun full-id (&optional (namespace *namespace*) (agent *agent*))
+  "The full bus id of AGENT under NAMESPACE, joined with one separator."
+  (format nil "~A/~A" (string-right-trim "/" namespace) agent))
+
+(defun detach-file (state type &key (namespace *namespace*) (agent *agent*) legacy)
+  "The detached watcher's file of TYPE for AGENT under NAMESPACE on *BUS*, under
+   the state root STATE. With LEGACY, the file under the older name-only stem."
+  (merge-pathnames (format nil "dsmr-mcp/watch/~A.~A"
+                           (funcall (if legacy #'%legacy-detach-stem #'%detach-stem)
+                                    *bus* (full-id namespace agent))
+                           type)
+                   state))
 
 (defun field (key line)
   "The value of KEY=... in LINE, or NIL."
@@ -336,10 +394,9 @@
 (defun launch-in (state bin &rest args)
   "Start BIN with ARGS under the state root STATE, as RUN-IN would, and return
    the process without waiting. Its STDOUT is a stream the test reads."
-  (uiop:launch-program (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR"
-                                     (format nil "XDG_STATE_HOME=~A"
-                                             (uiop:native-namestring state))
-                                     (uiop:native-namestring bin))
+  (uiop:launch-program (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR")
+                               (watcher-env state)
+                               (list (uiop:native-namestring bin))
                                args)
                        :output :stream :error-output nil :input nil))
 
@@ -504,3 +561,686 @@
                      (sleep 0.5)
                      (is equal "1" (readers) "a waiting --wake was not counted"))
                 (stop-process wake))))))))
+
+(define-test same-name-in-two-namespaces-keeps-separate-logs-and-readers
+  "Two agents of one name in different namespaces are two agents: each gets its
+   own watcher and log, and a reader of one is never counted for the other."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (let ((ns-a "/tmp/ns-a/")
+                (ns-b "/tmp/ns-b/")
+                (name "x"))
+            (flet ((who (ns)
+                     (list "--bus" *bus* "--agent" name "--namespace" ns))
+                   (log-of (ns)
+                     (detach-file state "log" :namespace ns :agent name)))
+              (flet ((readers (ns)
+                       (field "readers" (apply #'run-in state bin "--check-live"
+                                               (who ns)))))
+                (unwind-protect
+                     (progn
+                       (dolist (ns (list ns-a ns-b))
+                         (multiple-value-bind (out err code)
+                             (apply #'run-in state bin "--detach" "--poll-ms" "100"
+                                    (who ns))
+                           (is = 0 code "--detach for ~A failed: ~A ~A" ns out err)))
+                       (sleep 0.5)
+                       (false (equal (log-of ns-a) (log-of ns-b)))
+                       (true (probe-file (log-of ns-a)))
+                       (true (probe-file (log-of ns-b)))
+                       (let ((tail (uiop:launch-program
+                                    (list "tail" "-f"
+                                          (uiop:native-namestring (log-of ns-a)))
+                                    :output nil :error-output nil :input nil)))
+                         (unwind-protect
+                              (progn
+                                (sleep 0.3)
+                                (is equal "1" (readers ns-a)
+                                    "the tail on ns-a's log was not counted")
+                                (is equal "0" (readers ns-b)
+                                    "ns-a's reader was counted for ns-b"))
+                           (stop-process tail))))
+                  (dolist (ns (list ns-a ns-b))
+                    (ignore-errors (apply #'run-in state bin "--reap" (who ns))))))))))))
+
+(define-test check-live-accepts-a-doubled-separator
+  "A doubled separator names the same agent, so a healthy agent probed with one
+   must read live, not dead."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "100" (identity-args))
+          (sleep 0.5)
+          (dolist (who (list (list "--agent-id"
+                                   (format nil "~A/~A" *namespace* *agent*))
+                             (list "--agent" *agent*
+                                   "--namespace" (format nil "~A/" *namespace*))))
+            (multiple-value-bind (live err code)
+                (apply #'run-in state bin "--check-live" "--bus" *bus* who)
+              (declare (ignore err))
+              (is = 0 code "~S read ~S" who live)
+              (true (eql 0 (search "live pid=" live)) "~S read ~S" who live)))))))
+
+(define-test a-watcher-under-the-old-file-names-is-adopted
+  "A watcher an earlier build started is still writing under the old name-only
+   files, and the agent it serves must keep hearing it until the next restart.
+   Renaming a running watcher's files stands in for that build honestly: its
+   record lock and its open log both follow the inode across rename(2)."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (let* ((out (apply #'run-in state bin "--detach" "--poll-ms" "100"
+                             (identity-args)))
+                 (pid (parse-integer (field "pid" out)))
+                 (old-pid (detach-file state "pid" :legacy t))
+                 (old-log (detach-file state "log" :legacy t)))
+            (flet ((move (type legacy-path)
+                     (sb-posix:rename (uiop:native-namestring (detach-file state type))
+                                      (uiop:native-namestring legacy-path))))
+              (move "pid" old-pid)
+              (move "log" old-log))
+            (sleep 0.3)
+            (multiple-value-bind (live err code)
+                (apply #'run-in state bin "--check-live" (identity-args))
+              (declare (ignore err))
+              (is = 0 code)
+              (true (eql 0 (search (format nil "live pid=~D " pid) live))
+                    "the adopted watcher did not read live: ~S" live))
+            (multiple-value-bind (again err code)
+                (apply #'run-in state bin "--detach" (identity-args))
+              (is = 0 code "--detach beside an adopted watcher failed: ~A" err)
+              (true (eql 0 (search (format nil "running pid=~D " pid) again))
+                    "--detach did not report the adopted watcher: ~S" again)
+              (is equal (uiop:native-namestring old-log)
+                  (field "log" (first (uiop:split-string
+                                       again :separator '(#\Newline))))))
+            (is = 1 (length (directory (merge-pathnames "dsmr-mcp/watch/*.pid" state)))
+                "--detach started a second watcher beside the adopted one")
+            (multiple-value-bind (idle err code)
+                (apply #'run-in state bin "--wake" "--wake-seconds" "1"
+                       "--poll-ms" "50" (identity-args))
+              (declare (ignore err))
+              (is = 0 code)
+              (is string= "idle wake-seconds=1" idle))
+            (multiple-value-bind (reaped err code)
+                (apply #'run-in state bin "--reap" (identity-args))
+              (declare (ignore err))
+              (is = 0 code)
+              (true (search (format nil "reaped pid=~D" pid) reaped) "~A" reaped))
+            (false (alive-p pid)))))))
+
+;;; unheard mail ---------------------------------------------------------------
+
+(defun await (seconds predicate)
+  "True once PREDICATE returns true, checking every tenth of a second for up to
+   SECONDS."
+  (loop repeat (* 10 seconds)
+        thereis (funcall predicate)
+        do (sleep 0.1)))
+
+(defun detach-deafness-watcher (state bin)
+  "Start a detached watcher under STATE that raises the deafness alarm after two
+   seconds of unheard mail, and give it time to arm."
+  (multiple-value-bind (out err code)
+      (apply #'run-in state bin "--detach" "--poll-ms" "50" "--deaf-seconds" "2"
+             (identity-args))
+    (declare (ignore out))
+    (is = 0 code "--detach failed: ~A" err))
+  (sleep 0.5))
+
+(defun follow-log (state)
+  "Start a tail following the detached log under STATE, the way an agent's
+   listener holds it, and return the process."
+  (uiop:launch-program (list "tail" "-f" (uiop:native-namestring
+                                          (detach-file state "log")))
+                       :output nil :error-output nil :input nil))
+
+(define-test unheard-mail-notifies-once-and-leaves-a-marker
+  "Mail that reaches the log while nothing follows it, and stays unread past the
+   threshold, must tell the operator once, naming the agent, the bus and the
+   repository, and leave a marker the leader can read."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (detach-deafness-watcher state bin)
+          (wal:append-record (bus-wal state *bus*) 1 "nobody is listening")
+          (sleep 0.5)
+          (is = 0 (length (notify-calls state)) "notified before the threshold")
+          (true (await 8 (lambda () (notify-calls state)))
+                "no notification after the line sat unheard")
+          (sleep 1)
+          (let ((calls (notify-calls state)))
+            (is = 1 (length calls) "expected one notification, got ~S" calls)
+            (let ((call (first calls)))
+              (true (search "--urgency=critical" call) "~S" call)
+              (true (search (format nil "~A cannot hear the bus" *agent*) call) "~S" call)
+              (true (search (format nil "bus ~A:" *bus*) call) "~S" call)
+              (true (search (string-right-trim "/" *namespace*) call) "~S" call)))
+          (let ((marker (detach-file state "deaf")))
+            (true (probe-file marker) "no deafness marker beside the pid file")
+            (true (eql 0 (search "since=" (or (ignore-errors
+                                               (uiop:read-file-string marker))
+                                              "")))
+                  "the marker does not say since when")
+            (let* ((live (apply #'run-in state bin "--check-live" (identity-args)))
+                   (deaf (field "deaf" live)))
+              (true (and deaf (plusp (length deaf)) (every #'digit-char-p deaf)
+                         (= (+ (search " deaf=" live) (length " deaf=") (length deaf))
+                            (length live)))
+                    "--check-live does not end with deaf=<epoch>: ~S" live)))))))
+
+(define-test a-second-unheard-line-does-not-notify-again
+  "One episode is one notification, however much more mail arrives unheard."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (detach-deafness-watcher state bin)
+          (let ((wal (bus-wal state *bus*)))
+            (wal:append-record wal 1 "first, unheard")
+            (true (await 8 (lambda () (notify-calls state))) "never notified")
+            (wal:append-record wal 2 "second, still unheard")
+            (sleep 4)
+            (is = 1 (length (notify-calls state))
+                "a second unheard line notified again"))))))
+
+(define-test a-reader-clears-the-deaf-marker
+  "Once something follows the log again the agent is heard, and the marker the
+   leader reads must go."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (detach-deafness-watcher state bin)
+          (wal:append-record (bus-wal state *bus*) 1 "unheard for now")
+          (let ((marker (detach-file state "deaf")))
+            (true (await 8 (lambda () (probe-file marker))) "no marker was written")
+            (let ((tail (follow-log state)))
+              (unwind-protect
+                   (true (await 5 (lambda () (not (probe-file marker))))
+                         "the marker stayed with a reader on the log")
+                (stop-process tail))))))))
+
+(define-test mail-with-a-reader-never-notifies
+  "Mail written while the log is being followed was heard, so nothing is raised
+   however long it is since."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (detach-deafness-watcher state bin)
+          (let ((tail (follow-log state)))
+            (unwind-protect
+                 (progn
+                   (sleep 0.5)
+                   (wal:append-record (bus-wal state *bus*) 1 "heard as it lands")
+                   (sleep 6)
+                   (is = 0 (length (notify-calls state))
+                       "mail with a reader on the log raised the alarm")
+                   (false (probe-file (detach-file state "deaf"))))
+              (stop-process tail)))))))
+
+(define-test a-quiet-bus-never-notifies
+  "Nothing following the log is the normal state between turns; with no mail
+   written there is nothing unheard and nothing to raise."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (detach-deafness-watcher state bin)
+          (sleep 6)
+          (is = 0 (length (notify-calls state)) "a quiet bus raised the alarm")
+          (false (probe-file (detach-file state "deaf")))))))
+
+(define-test a-missing-notify-send-still-leaves-the-marker
+  "Without notify-send the leader must still see the episode, the log must say
+   why no notification went out, and the watch must carry on."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (let* ((empty (merge-pathnames "empty-bin/" state))
+                 (*watcher-path* (string-right-trim
+                                  "/" (uiop:native-namestring
+                                       (ensure-directories-exist empty)))))
+            (detach-deafness-watcher state bin)
+            (wal:append-record (bus-wal state *bus*) 1 "unheard, and no desktop")
+            (true (await 8 (lambda () (probe-file (detach-file state "deaf"))))
+                  "no marker without notify-send")
+            (true (await-log-text (detach-file state "log")
+                                  "notify-send is not on PATH")
+                  "the log does not say why nobody was notified")
+            (is = 0 (length (notify-calls state)))
+            (multiple-value-bind (live err code)
+                (apply #'run-in state bin "--check-live" (identity-args))
+              (declare (ignore err))
+              (is = 0 code "the watcher did not stay live: ~S" live)))))))
+
+;;; parking --------------------------------------------------------------------
+
+(define-test park-suppresses-the-deaf-alarm
+  "A parked agent is silent on purpose, so mail it leaves unread raises nothing,
+   and --check-live says it is parked."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (detach-deafness-watcher state bin)
+          (multiple-value-bind (out err code)
+              (apply #'run-in state bin "--park" (identity-args))
+            (is = 0 code "--park failed: ~A" err)
+            (is string= (format nil "parked bus=~A" *bus*) out))
+          (true (probe-file (detach-file state "parked")) "no park marker written")
+          (let ((live (apply #'run-in state bin "--check-live" (identity-args))))
+            (true (search " parked=1" live) "--check-live does not say parked: ~S" live)
+            (true (< (search " readers=" live) (search " parked=1" live))
+                  "parked= is not after readers=: ~S" live))
+          (wal:append-record (bus-wal state *bus*) 1 "left for after the park")
+          (sleep 6)
+          (is = 0 (length (notify-calls state)) "a parked agent raised the alarm")
+          (false (probe-file (detach-file state "deaf")))))))
+
+(define-test unpark-re-enables-it
+  "After --unpark, mail left unread raises the alarm again; mail from before the
+   unpark does not count against the agent."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (detach-deafness-watcher state bin)
+          (apply #'run-in state bin "--park" (identity-args))
+          (let ((wal (bus-wal state *bus*)))
+            (wal:append-record wal 1 "while parked")
+            (sleep 3)
+            (multiple-value-bind (out err code)
+                (apply #'run-in state bin "--unpark" (identity-args))
+              (is = 0 code "--unpark failed: ~A" err)
+              (is string= (format nil "unparked bus=~A" *bus*) out))
+            (false (probe-file (detach-file state "parked")) "the park marker stayed")
+            (sleep 3)
+            (is = 0 (length (notify-calls state))
+                "mail from the park raised the alarm after unparking")
+            (wal:append-record wal 2 "after the unpark")
+            (true (await 8 (lambda () (notify-calls state)))
+                  "unheard mail after the unpark raised nothing")
+            (is = 1 (length (notify-calls state))))))))
+
+(define-test detach-clears-a-stale-park-marker
+  "Bring-up ends a park, so a marker left by one must not silence the alarm for
+   the session that follows."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (detach-deafness-watcher state bin)
+          (apply #'run-in state bin "--park" (identity-args))
+          (true (probe-file (detach-file state "parked")))
+          (multiple-value-bind (out err code)
+              (apply #'run-in state bin "--detach" (identity-args))
+            (is = 0 code "--detach failed: ~A" err)
+            (true (eql 0 (search "running pid=" out)) "~S" out))
+          (false (probe-file (detach-file state "parked"))
+                 "--detach left the park marker in place")
+          (let ((live (apply #'run-in state bin "--check-live" (identity-args))))
+            (false (search "parked=" live) "~S" live))))))
+
+(define-test park-over-all-buses-marks-every-watcher
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (let ((who (list "--agent" *agent* "--namespace" *namespace*)))
+            (apply #'run-in state bin "--detach" "--poll-ms" "100" "--bus" *bus* who)
+            (apply #'run-in state bin "--detach" "--poll-ms" "100" "--bus" "dt2" who)
+            (multiple-value-bind (out err code)
+                (apply #'run-in state bin "--park" "--all-buses" who)
+              (is = 0 code "--park --all-buses failed: ~A" err)
+              (is equal (list "parked bus=dt" "parked bus=dt2")
+                  (sort (uiop:split-string out :separator '(#\Newline)) #'string<)))
+            (is = 2 (length (directory (merge-pathnames "dsmr-mcp/watch/*.parked"
+                                                        state))))
+            (multiple-value-bind (out err code)
+                (apply #'run-in state bin "--unpark" "--all-buses" who)
+              (declare (ignore err))
+              (is = 0 code)
+              (is equal (list "unparked bus=dt" "unparked bus=dt2")
+                  (sort (uiop:split-string out :separator '(#\Newline)) #'string<)))
+            (is = 0 (length (directory (merge-pathnames "dsmr-mcp/watch/*.parked"
+                                                        state)))))))))
+
+(define-test park-without-an-identity-says-unknown
+  "With no identity there is no marker to write, and saying so must not look
+   like success: the same `unknown` and exit 2 that --check-live gives."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (dolist (flag (list "--park" "--unpark"))
+            (multiple-value-bind (out err code)
+                (run-in state bin flag "--bus" *bus*)
+              (declare (ignore err))
+              (is = 2 code "~A with no identity exited ~A" flag code)
+              (is string= "unknown" out)))
+          (false (directory (merge-pathnames "dsmr-mcp/watch/*.parked" state)))))))
+
+(defun run-in-with-input (state bin input &rest args)
+  "Run BIN with ARGS under STATE as RUN-IN does, with the string INPUT on its
+   standard input (none when NIL), and return (values stdout stderr exit-code
+   seconds), SECONDS being how long it took."
+  (let ((start (get-internal-real-time)))
+    (multiple-value-bind (out err code)
+        (uiop:run-program (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR")
+                                  (watcher-env state)
+                                  (list (uiop:native-namestring bin))
+                                  args)
+                          :input (and input (make-string-input-stream input))
+                          :output '(:string :stripped t)
+                          :error-output '(:string :stripped t)
+                          :ignore-error-status t)
+      (values out err code
+              (/ (- (get-internal-real-time) start)
+                 internal-time-units-per-second)))))
+
+(defun launch-hook (state bin &rest extra)
+  "Start BIN as a Stop hook listener for the case's identity under STATE, with
+   the arguments in EXTRA added, and return the process. STDOUT and STDERR are
+   separate streams, since hook mode must keep the first empty."
+  (uiop:launch-program (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR")
+                               (watcher-env state)
+                               (list (uiop:native-namestring bin)
+                                     "--wake" "--hook" "--poll-ms" "50")
+                               extra
+                               (identity-args))
+                       :output :stream :error-output :stream :input nil))
+
+(defun finish-and-read-both (process seconds)
+  "Wait up to SECONDS for PROCESS, started by LAUNCH-HOOK, to exit, then return
+   (values exit-code stdout stderr), both outputs whole and stripped. The exit
+   code is NIL when it had to be killed."
+  (let ((code (await-exit process seconds)))
+    (stop-process process)
+    (flet ((slurp (stream)
+             (string-trim '(#\Newline #\Space)
+                          (or (ignore-errors (uiop:slurp-stream-string stream)) ""))))
+      (values code
+              (slurp (uiop:process-info-output process))
+              (slurp (uiop:process-info-error-output process))))))
+
+(define-test hook-wake-reports-idle-on-stderr-and-exits-two
+  "A hook on a quiet bus must still wake the session when its wait ends, so the
+   listener is renewed before the harness's timeout ends it."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((hook (launch-hook state bin "--wake-seconds" "1")))
+            (unwind-protect
+                 (multiple-value-bind (code out err) (finish-and-read-both hook 6)
+                   (is eql 2 code "a quiet hook did not exit 2")
+                   (is string= "" out)
+                   (true (eql 0 (search "idle wake-seconds=1" err)) "got ~S" err))
+              (stop-process hook)))))))
+
+(define-test hook-wake-reports-a-line-on-stderr-and-exits-two
+  "A line reaching the log must wake the session: the line on STDERR, then what
+   to do about it, exit 2, and nothing on STDOUT."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((hook (launch-hook state bin)))
+            (unwind-protect
+                 (progn
+                   (sleep 0.5)
+                   (wal:append-record (bus-wal state *bus*) 1 "wake the session")
+                   (multiple-value-bind (code out err) (finish-and-read-both hook 5)
+                     (is eql 2 code "a hook did not exit 2 on a line")
+                     (is string= "" out)
+                     (true (eql 0 (search "bus:1" err)) "got ~S" err)
+                     (true (search "bus-receive" err)
+                           "stderr does not say to drain the bus: ~S" err)))
+              (stop-process hook)))))))
+
+(define-test a-second-hook-arm-steps-aside
+  "Stop hooks stack when a turn ends while the last one is still waiting. The
+   second must leave at once and say nothing, and the first must still wake the
+   session on the next line."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((hook (launch-hook state bin)))
+            (unwind-protect
+                 (progn
+                   (sleep 0.5)
+                   (multiple-value-bind (out err code seconds)
+                       (apply #'run-in-with-input state bin nil
+                              "--wake" "--hook" "--wake-seconds" "3" "--poll-ms" "50"
+                              (identity-args))
+                     (is = 0 code "the second hook exited ~A: ~S" code err)
+                     (is string= "" out)
+                     (is string= "" err)
+                     (true (< seconds 1) "the second hook waited ~,1F s" seconds))
+                   (wal:append-record (bus-wal state *bus*) 1 "for the first hook")
+                   (multiple-value-bind (code out err) (finish-and-read-both hook 5)
+                     (is eql 2 code "the first hook did not wake on the line")
+                     (is string= "" out)
+                     (true (eql 0 (search "bus:1" err)) "got ~S" err)))
+              (stop-process hook)))))))
+
+(define-test a-default-wake-says-already-armed-while-a-hook-listens
+  "A background wake started while a hook is listening for the same agent must
+   say so and leave, or one message would wake the session twice."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((hook (launch-hook state bin)))
+            (unwind-protect
+                 (progn
+                   (sleep 0.5)
+                   (multiple-value-bind (out err code seconds)
+                       (apply #'run-in-with-input state bin nil
+                              "--wake" "--wake-seconds" "3" "--poll-ms" "50"
+                              (identity-args))
+                     (declare (ignore err))
+                     (is = 0 code "a second wake exited ~A" code)
+                     (is string= "already-armed" out)
+                     (true (< seconds 1) "a second wake waited ~,1F s" seconds)))
+              (stop-process hook)))))))
+
+(define-test hook-nowatcher-wakes-once-then-stays-quiet
+  "A missing watcher is worth waking the session for once, but the hook starts
+   again at every turn end, and waking on each of them would never stop."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (multiple-value-bind (out err code)
+              (apply #'run-in state bin "--wake" "--hook" (identity-args))
+            (is = 2 code "the first nowatcher hook exited ~A" code)
+            (is string= "" out)
+            (true (eql 0 (search (format nil "nowatcher bus=~A" *bus*) err))
+                  "stderr did not open with the nowatcher line: ~S" err)
+            (true (search "--detach" err) "stderr does not say how to start one: ~S" err))
+          (multiple-value-bind (out err code)
+              (apply #'run-in state bin "--wake" "--hook" (identity-args))
+            (is = 0 code "a second nowatcher hook woke the session again")
+            (is string= "" out)
+            (is string= "" err))))))
+
+(define-test hook-without-an-identity-does-nothing
+  "A session that is not in a fleet still runs the Stop hook at every turn end,
+   and must neither be woken nor told anything."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (multiple-value-bind (out err code)
+              (run-in state bin "--wake" "--hook" "--agent" "" "--bus" *bus*)
+            (is = 0 code "a hook with no identity exited ~A: ~S" code err)
+            (is string= "" out)
+            (is string= "" err))))))
+
+(define-test hook-inside-a-subagent-does-nothing
+  "A Stop hook that fires inside a subagent is handed an `agent_id`, and must
+   not arm a listener under the identity of the session that spawned it."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (multiple-value-bind (out err code seconds)
+              (apply #'run-in-with-input state bin
+                     "{\"hook_event_name\":\"Stop\",\"agent_id\":\"abc\"}"
+                     "--wake" "--hook" "--wake-seconds" "2" "--poll-ms" "50"
+                     (identity-args))
+            (is = 0 code "a subagent's hook exited ~A: ~S" code err)
+            (is string= "" out)
+            (is string= "" err)
+            (true (< seconds 1) "a subagent's hook waited ~,1F s" seconds))))))
+
+(define-test mail-sent-between-arms-wakes-the-next-arm
+  "A line that lands during a turn, after one hook has woken the session and
+   before the next is armed, must wake the session as soon as the next arm
+   starts. Otherwise it waits for whatever mail comes after it."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((wal (bus-wal state *bus*))
+                (log (detach-file state "log")))
+            (let ((hook (launch-hook state bin)))
+              (unwind-protect
+                   (progn
+                     (sleep 0.5)
+                     (wal:append-record wal 1 "wakes the first arm")
+                     (multiple-value-bind (code out err) (finish-and-read-both hook 5)
+                       (declare (ignore out))
+                       (is eql 2 code)
+                       (true (eql 0 (search "bus:1" err)) "got ~S" err)))
+                (stop-process hook)))
+            (wal:append-record wal 2 "lands while nothing listens")
+            (true (await-log-text log "bus:2") "the line never reached the log")
+            (multiple-value-bind (out err code seconds)
+                (apply #'run-in-with-input state bin nil
+                       "--wake" "--hook" "--wake-seconds" "5" "--poll-ms" "50"
+                       (identity-args))
+              (is = 2 code)
+              (is string= "" out)
+              (true (eql 0 (search "bus:2" err)) "the next arm reported ~S" err)
+              (true (< seconds 2) "the next arm took ~,1F s" seconds)))))))
+
+(define-test a-first-arm-starts-at-the-end
+  "With no offset saved there is no record of what the agent has read, and a
+   first arm must not wake it for mail from before it ever listened. Every
+   return saves one, the background wake's included."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((log (detach-file state "log"))
+                (offset (detach-file state "offset")))
+            (wal:append-record (bus-wal state *bus*) 1 "from before any listener")
+            (true (await-log-text log "bus:1") "the line never reached the log")
+            (false (probe-file offset) "an offset existed before any arm")
+            (multiple-value-bind (out err code)
+                (apply #'run-in-with-input state bin nil
+                       "--wake" "--hook" "--wake-seconds" "1" "--poll-ms" "50"
+                       (identity-args))
+              (declare (ignore out))
+              (is = 2 code)
+              (true (eql 0 (search "idle wake-seconds=1" err))
+                    "a first arm reported an old line: ~S" err))
+            (true (probe-file offset) "a hook return saved no offset")
+            (delete-file offset)
+            (multiple-value-bind (out err code)
+                (apply #'run-in-with-input state bin nil
+                       "--wake" "--wake-seconds" "1" "--poll-ms" "50"
+                       (identity-args))
+              (declare (ignore err))
+              (is = 0 code)
+              (is string= "idle wake-seconds=1" out))
+            (true (probe-file offset) "a background wake saved no offset"))))))
+
+(define-test an-offset-for-a-replaced-log-is-ignored
+  "A saved offset names the file it was taken on. Once the log has been
+   replaced, it says nothing about the new one, and the arm starts at the end."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let* ((log (detach-file state "log"))
+                 (offset (detach-file state "offset")))
+            (wal:append-record (bus-wal state *bus*) 1 "already in the log")
+            (true (await-log-text log "bus:1") "the line never reached the log")
+            (let ((ino (sb-posix:stat-ino (sb-posix:stat (uiop:native-namestring log)))))
+              (flet ((save (ino)
+                       (with-open-file (out offset :direction :output
+                                                   :if-exists :supersede
+                                                   :if-does-not-exist :create)
+                         (format out "ino=~D pos=0~%" ino)))
+                     (arm ()
+                       (apply #'run-in-with-input state bin nil
+                              "--wake" "--hook" "--wake-seconds" "1" "--poll-ms" "50"
+                              (identity-args))))
+                (save ino)
+                (multiple-value-bind (out err code) (arm)
+                  (declare (ignore out))
+                  (is = 2 code)
+                  (true (eql 0 (search "bus:1" err))
+                        "an offset on the live log was not honoured: ~S" err))
+                (save (+ ino 12345))
+                (multiple-value-bind (out err code) (arm)
+                  (declare (ignore out))
+                  (is = 2 code)
+                  (true (eql 0 (search "idle wake-seconds=1" err))
+                        "an offset on another file was honoured: ~S" err)))))))))
+
+(define-test a-hook-read-counts-as-heard
+  "Mail written while no listener was armed, then reported by the next hook arm,
+   was heard: the offset that arm saves must keep the deafness alarm quiet."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" "--deaf-seconds" "3"
+                 (identity-args))
+          (let ((wal (bus-wal state *bus*))
+                (log (detach-file state "log")))
+            (let ((hook (launch-hook state bin)))
+              (unwind-protect
+                   (progn
+                     (sleep 0.5)
+                     (wal:append-record wal 1 "heard by the first arm")
+                     (is eql 2 (finish-and-read-both hook 5)))
+                (stop-process hook)))
+            (wal:append-record wal 2 "written with nothing armed")
+            (true (await-log-text log "bus:2") "the line never reached the log")
+            ;; The alarm compares whole seconds, and an offset saved in the
+            ;; same second the line was written does not count as newer.
+            (sleep 1.2)
+            (multiple-value-bind (out err code seconds)
+                (apply #'run-in-with-input state bin nil
+                       "--wake" "--hook" "--wake-seconds" "3" "--poll-ms" "50"
+                       (identity-args))
+              (declare (ignore out))
+              (is = 2 code)
+              (true (eql 0 (search "bus:2" err)) "got ~S" err)
+              (true (< seconds 1) "the next arm took ~,1F s" seconds))
+            (sleep 5)
+            (is = 0 (length (notify-calls state))
+                "a line the next arm reported raised the alarm")
+            (false (probe-file (detach-file state "deaf"))))))))

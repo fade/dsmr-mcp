@@ -190,9 +190,13 @@ the session that started it. Then it confirms:
 ```
 
 and must see `live`, `bus=<tag>` **and** `readers=1` or more before going
-silent. `readers=0` means the watcher runs and nothing in her session is
-listening: deaf. The leader can run the same probe with the sister's name and
-root to check she can hear before dispatching (see **leader**).
+silent: that is the positive proof she can hear right now. Deafness is a
+different field: `deaf=<epoch>` means mail has waited unread on her log for ten
+minutes with nothing following it, and `parked=1` means she marked a park, so
+her silence is intended. `readers=0` alone is not deafness: between a wake and
+the next listener arming, nothing reads the log for a moment by design. The
+leader can run the same probe with the sister's name and root to check she can
+hear before dispatching (see **leader**).
 
 The detached watcher outlives the session, and **a park does not reap it**
 (operator ruling, 2026-09-30): at the next bring-up `--detach` adopts it. A
@@ -252,7 +256,7 @@ findings to a project it is not a member of.
 | A name is refused | fix the name. Never shorten it to fit; a truncated socket path is a different bus |
 | Add a sister to a running fleet | `open-enrollment` if shut, `enroll`, hand it the tag, have it arm and confirm `bus=<tag>` |
 | Remove one | the sister runs `bus-leave` and `--reap`s her watcher; the leader records it with `disenroll` |
-| "Is this sister connected?" | `--check-live --bus <tag> --agent <sister> --namespace <sister-root>/`, wanting `live` and `readers=1`+ (`readers=0` = deaf: the operator types in her terminal). **Not** the roster |
+| "Is this sister connected?" | `--check-live --bus <tag> --agent <sister> --namespace <sister-root>/`, wanting `live` and `readers=1`+ (`deaf=` = deaf: the operator types in her terminal; `parked=1` = parked). **Not** the roster |
 | Enroll came back `enrolled: false` | the gate is shut. That agent still uses the bus; nothing failed |
 | Sister says `live` with no `bus=` field | its `dsmr-bus-watch` binary predates named buses and armed on the shared bus. `make install-bus-watch`, then re-arm |
 | Two fleets on one machine | two tags, two declared leaders, two closed gates. There is no further guard and none is coming |

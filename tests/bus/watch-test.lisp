@@ -87,6 +87,9 @@
                 #:%effective-stall-seconds
                 #:%stalled-p
                 #:%detach-stem
+                #:%legacy-detach-stem
+                #:%identity-hash
+                #:%normalise-agent-id
                 #:%child-args
                 #:%shell-quote
                 #:%monitor-command
@@ -104,7 +107,19 @@
                 #:%follow-open
                 #:%follow-lines
                 #:%wake-wait
-                #:%log-readers)
+                #:%log-readers
+                ;; internal: the rule that decides when unheard mail becomes a
+                ;; deafness alarm. The watcher only feeds it samples, so the
+                ;; rule itself is pure and its boundaries are pinned here.
+                #:make-deaf-state
+                #:deaf-state-unheard-since
+                #:deaf-state-latched
+                #:%deaf-step
+                #:%notify-text
+                #:%notify-environment
+                #:opt-deaf-seconds
+                #:opt-park-p
+                #:opt-unpark-p)
   ;; The heartbeat helpers moved to a shared leaf so the watcher (writer) and the
   ;; MCP core (reader) share one implementation of the beat filename and format.
   ;; The pure liveness decision and its file-backed classifier both carry behavior
@@ -1199,11 +1214,59 @@
     (false (%stalled-p (* 10 unit) (* 9 unit) 2))
     (true (%stalled-p (* 10 unit) (* 7 unit) 2))))
 
-(define-test detached-files-are-named-for-bus-and-agent
-  ;; The stem matches the one watchers launched by hand already use, so a tail
-  ;; over *--<agent>.log follows both.
-  (is string= "valis--dsmr-mcp" (%detach-stem "valis" "dsmr-mcp"))
-  (is string= "default--dsmr-mcp" (%detach-stem nil "dsmr-mcp")))
+(define-test detached-files-are-named-for-bus-agent-and-identity
+  ;; The name stays readable at the front so a log can be found by eye; the
+  ;; identity hash at the end keeps two agents of one name apart.
+  (is string= (format nil "valis--dsmr-mcp--~A" (%identity-hash "/p/dsmr-mcp"))
+      (%detach-stem "valis" "/p/dsmr-mcp"))
+  (is string= (format nil "default--dsmr-mcp--~A" (%identity-hash "/p/dsmr-mcp"))
+      (%detach-stem nil "/p/dsmr-mcp")))
+
+(define-test doubled-separators-name-the-same-agent
+  ;; A doubled separator is a typing accident, not a second agent.
+  (is equal "/ns/name" (%normalise-agent-id "/ns//name"))
+  (is equal "/a/b/name" (%normalise-agent-id "/a//b///name"))
+  (is equal "/ns/name" (%normalise-agent-id "/ns/name//"))
+  (is equal "/other/name" (%normalise-agent-id "/other/name"))
+  (is equal "name" (%normalise-agent-id "name"))
+  (false (%normalise-agent-id nil)))
+
+(define-test agent-id-flag-collapses-doubled-separators
+  (with-env-agent (nil)
+    (is equal "/p/x" (%resolve-self-id (%parse-args (list "--agent-id" "/p//x"))))
+    (is equal "/p/x" (%resolve-self-id (%parse-args (list "--namespace" "/p//"
+                                                          "--agent" "x"))))
+    (is equal "/p/x" (%resolve-self-id (%parse-args (list "--namespace" "/p"
+                                                          "--agent" "x"))))))
+
+(define-test identity-hash-is-pinned-across-builds
+  ;; The hash names files that outlive the binary that wrote them, so it must
+  ;; come out the same from every build. The pinned value is FNV-1a 32 computed
+  ;; outside Lisp.
+  (let ((hash (%identity-hash "/home/fade/SourceCode/lisp/dsmr-mcp/mallet")))
+    (is = 8 (length hash))
+    (true (every (lambda (ch) (find ch "0123456789abcdef")) hash))
+    (is string= "8b77de7a" hash)))
+
+(define-test stem-differs-per-namespace-and-keeps-the-name
+  (let ((a (%detach-stem "dt" "/a/x"))
+        (b (%detach-stem "dt" "/b/x")))
+    (false (string= a b))
+    (is eql 0 (search "dt--x--" a))
+    (is eql 0 (search "dt--x--" b))
+    (is eql 0 (search "default--x--" (%detach-stem nil "/a/x")))
+    (is string= a (%detach-stem "dt" "/a//x"))))
+
+(define-test stem-stays-short-for-deep-namespaces
+  (let ((id (concatenate 'string "/" (make-string 399 :initial-element #\n) "/x")))
+    (true (< (length (%detach-stem "dt" id)) 120))))
+
+(define-test legacy-stem-is-the-old-format
+  ;; Watchers started by earlier builds named their files this way, and are
+  ;; found under it until they are restarted.
+  (is string= "dt--x" (%legacy-detach-stem "dt" "/a/x"))
+  (is string= "default--x" (%legacy-detach-stem nil "/a/x"))
+  (is string= "valis--dsmr-mcp" (%legacy-detach-stem "valis" "/p/dsmr-mcp")))
 
 (define-test the-detached-child-is-told-who-it-is
   ;; The child runs from / after its parent's shell is gone, so it must not
@@ -1441,3 +1504,170 @@
   (is string= "dead bus=dt readers=unknown"
       (%liveness-line :dead nil nil "dt" :unknown))
   (true (opt-wake-p (%parse-args '("--wake")))))
+
+(define-test mail-written-while-a-reader-listens-is-heard
+  ;; A line that reached the log while something was following it was heard,
+  ;; so it starts no episode at all.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state) 1000 :readers 1 :line-written-p t)
+    (is eq :none action)
+    (false (deaf-state-unheard-since state))
+    (false (deaf-state-latched state)))
+  ;; With nobody following, the same line starts the clock at the moment it
+  ;; was written, and nothing is raised yet.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state) 1000 :readers 0 :line-written-p t)
+    (is eq :none action)
+    (is eql 1000 (deaf-state-unheard-since state))
+    (false (deaf-state-latched state))))
+
+(define-test unheard-mail-raises-at-the-threshold-and-not-before
+  ;; The boundary is inclusive: a line unheard for exactly the threshold raises.
+  (let ((pending (make-deaf-state :unheard-since 1000)))
+    (multiple-value-bind (state action)
+        (%deaf-step pending 1599 :readers 0 :threshold 600)
+      (is eq :none action "raised one second early")
+      (false (deaf-state-latched state)))
+    (multiple-value-bind (state action)
+        (%deaf-step pending 1600 :readers 0 :threshold 600)
+      (is eq :raise action "did not raise at the threshold")
+      (true (deaf-state-latched state))
+      (is eql 1000 (deaf-state-unheard-since state)))))
+
+(define-test deafness-is-raised-once-per-episode
+  ;; Once raised, the episode stays latched and quiet however long it lasts and
+  ;; however much more mail arrives unheard.
+  (let ((raised (make-deaf-state :unheard-since 1000 :latched t)))
+    (multiple-value-bind (state action) (%deaf-step raised 9999 :readers 0)
+      (is eq :none action)
+      (true (deaf-state-latched state)))
+    (multiple-value-bind (state action)
+        (%deaf-step raised 9999 :readers 0 :line-written-p t)
+      (is eq :none action)
+      (true (deaf-state-latched state)))))
+
+(define-test a-reader-clears-the-episode
+  ;; The agent is heard again as soon as anything follows the log: a raised
+  ;; episode clears, and the state starts over so the next one can raise.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state :unheard-since 1000 :latched t) 9999 :readers 1)
+    (is eq :clear action)
+    (false (deaf-state-unheard-since state))
+    (false (deaf-state-latched state))))
+
+(define-test a-newer-read-offset-counts-as-heard
+  ;; A listener that saved its read offset after the line was written has read
+  ;; it, even though nothing holds the log open now.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state :unheard-since 1000 :latched t) 2000
+                  :readers 0 :offset-time 1001)
+    (is eq :clear action)
+    (false (deaf-state-unheard-since state))
+    (false (deaf-state-latched state)))
+  ;; Before any alarm, the same evidence resets the clock silently.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state :unheard-since 1000) 1200
+                  :readers 0 :offset-time 1001)
+    (is eq :none action)
+    (false (deaf-state-unheard-since state)))
+  ;; An offset saved before the line was written says nothing about it.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state :unheard-since 1000) 1600
+                  :readers 0 :offset-time 999 :threshold 600)
+    (is eq :raise action)
+    (true (deaf-state-latched state))))
+
+(define-test parked-suppresses-and-forgets
+  ;; A parked agent is meant to be silent: nothing raises, and the pending line
+  ;; is forgotten so unparking does not raise for mail from before the park.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state :unheard-since 1000) 5000
+                  :readers 0 :parked-p t)
+    (is eq :none action)
+    (false (deaf-state-unheard-since state))
+    (false (deaf-state-latched state)))
+  ;; A line written while parked starts nothing either.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state) 5000 :readers 0 :parked-p t :line-written-p t)
+    (is eq :none action)
+    (false (deaf-state-unheard-since state)))
+  ;; The latch is left as it was: parking does not pretend the agent was heard.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state :unheard-since 1000 :latched t) 5000
+                  :readers 0 :parked-p t)
+    (is eq :none action)
+    (true (deaf-state-latched state))))
+
+(define-test unknown-readers-never-raise
+  ;; Where the reader count cannot be measured it is not a zero, and an alarm
+  ;; built on a guessed zero would be a false one.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state :unheard-since 1000) 5000 :readers :unknown)
+    (is eq :none action)
+    (false (deaf-state-latched state)))
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state) 5000 :readers :unknown :line-written-p t)
+    (is eq :none action)
+    (false (deaf-state-unheard-since state))))
+
+(define-test a-quiet-bus-never-raises
+  ;; Nobody following the log is the normal state between turns. Without a line
+  ;; written there is nothing unheard, however long that lasts.
+  (multiple-value-bind (state action)
+      (%deaf-step (make-deaf-state) most-positive-fixnum :readers 0)
+    (is eq :none action)
+    (false (deaf-state-unheard-since state))
+    (false (deaf-state-latched state))))
+
+(define-test the-deaf-notification-names-agent-bus-and-repository
+  (multiple-value-bind (summary body) (%notify-text "/home/x/repo/runciter" "dt" 600)
+    (is string= "runciter cannot hear the bus" summary)
+    (is string= "bus dt: mail has waited unread for 10 min. Type in /home/x/repo." body))
+  ;; Nothing in a name can start a line of its own in the notification.
+  (multiple-value-bind (summary body)
+      (%notify-text (format nil "/a~Cb/x y" (code-char 10)) nil 60)
+    (is string= "x_y cannot hear the bus" summary)
+    (is string= "bus default: mail has waited unread for 1 min. Type in /a_b." body)))
+
+(define-test the-notification-finds-the-desktop-when-detached-from-it
+  ;; A session bus already named is left alone; a missing or empty one is
+  ;; supplied from the per-user socket.
+  (is equal '("A=1" "DBUS_SESSION_BUS_ADDRESS=x")
+      (%notify-environment '("A=1" "DBUS_SESSION_BUS_ADDRESS=x") 1000))
+  (is equal '("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus" "A=1")
+      (%notify-environment '("A=1") 1000))
+  (is equal '("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/7/bus")
+      (%notify-environment '("DBUS_SESSION_BUS_ADDRESS=") 7)))
+
+(define-test deaf-seconds-flag-parses
+  (is eql 600 (opt-deaf-seconds (%parse-args '())))
+  (is eql 2 (opt-deaf-seconds (%parse-args '("--deaf-seconds" "2"))))
+  (is eql 0 (opt-deaf-seconds (%parse-args '("--deaf-seconds" "0"))))
+  (is eql 600 (opt-deaf-seconds (%parse-args '("--deaf-seconds" "soon")))))
+
+(define-test liveness-line-appends-park-and-deaf-after-readers
+  ;; Both fields come after readers=, parked before deaf, each only when set,
+  ;; so a probe parsing the line by position is unaffected.
+  (is string= "live pid=1 age_s=0 bus=dt readers=0 parked=1 deaf=1700000000"
+      (%liveness-line :live 0 1 "dt" 0 t 1700000000))
+  (is string= "live pid=1 age_s=0 bus=dt readers=0 parked=1"
+      (%liveness-line :live 0 1 "dt" 0 t nil))
+  (is string= "live pid=1 age_s=0 bus=dt readers=0 deaf=1700000000"
+      (%liveness-line :live 0 1 "dt" 0 nil 1700000000))
+  ;; An unreadable marker is still reported; leaving it out would read as an
+  ;; agent that can hear.
+  (is string= "dead bus=default readers=unknown deaf=unknown"
+      (%liveness-line :dead nil nil nil :unknown nil :unknown)))
+
+(define-test liveness-line-is-unchanged-without-markers
+  (is string= "live pid=42 age_s=1 bus=dt readers=0"
+      (%liveness-line :live 1 42 "dt" 0 nil nil))
+  (is string= (%liveness-line :stale 9 42 nil 2)
+      (%liveness-line :stale 9 42 nil 2 nil nil))
+  (is string= "dead bus=dt" (%liveness-line :dead nil nil "dt")))
+
+(define-test park-flags-parse
+  (true (opt-park-p (%parse-args '("--park"))))
+  (true (opt-unpark-p (%parse-args '("--unpark"))))
+  (false (opt-park-p (%parse-args '())))
+  (false (opt-unpark-p (%parse-args '()))))

@@ -423,6 +423,19 @@ literal `~/.local/bin/dsmr-bus-watch` path and a literal name: the path is what 
 narrow `Bash(~/.local/bin/dsmr-bus-watch:*)` allow rule matches, and a matched rule
 resolves BEFORE the classifier in auto mode.
 
+⭐ **When the session Stop hook is installed it is your primary listener, and that
+background `--wake` is the fallback.** The hook is installed when
+`grep -c -- '--wake --hook' ~/.claude/settings.json` prints 1 or more. It arms
+`--wake --hook` at the end of every turn and wakes you as "Stop hook feedback"
+naming what arrived; drain every joined bus, act, end the turn, and **never
+re-arm**: that turn end arms the next listener. With the hook installed, start the
+background `--wake` above once at bring-up, so you can hear before your first turn
+ends, and do not re-arm it after it fires. A `--wake` that prints `already-armed`
+means the hook holds the arm: do not re-arm, do not retry. An interrupted turn
+fires no Stop hook, so after an interrupt let your next turn end normally, and
+`stop_hook_active` is true on every hook-started turn and is no loop guard. The
+**bus-watch** skill has the full rules.
+
 ⚠ **Why not the Monitor: the re-arm was the point of failure, twice.** Until
 2026-09-29 every 30-minute Monitor expiry meant a fresh watcher-launch command, which
 the permission classifier could refuse or leave with no verdict, and the agent went
@@ -469,8 +482,9 @@ count says only that something holds the log open, which your `--wake` does.
 ⛔ **It must print `live`, a `bus=` field naming the bus you armed, AND `readers=1`
 or more.** A `dead`/`stale` result means the leader itself is deaf. A `bus=` naming
 a different bus means the same thing while looking healthy, which is worse.
-**`readers=0` means the watcher runs and nothing is listening: you are deaf, re-arm
-the `--wake`.** No `bus=` field (or no `readers=` field) means the PATH binary
+**`deaf=<epoch>` means mail sat unread for ten minutes: you are deaf, drain and arm
+a listener.** `readers=0` at bring-up, before the background `--wake` is up, means
+arm it; mid-turn under the session hook it is normal. No `bus=` field (or no `readers=` field) means the PATH binary
 predates named buses (or `--wake`): `make install-bus-watch`, then re-arm. A leader
 that missed its own re-arm and lost inbound mail is exactly the failure this guards.
 On `dead`/`stale`, run `--detach` again and re-arm the `--wake`.
@@ -489,12 +503,17 @@ are host-local files, so the probe works for any agent on this host:
 `<sister-root>/` is her absolute project root, trailing separator included.
 
 - `live … bus=<TAG> readers=1`+: she can hear you. Dispatch.
-- ⛔ **`live … readers=0`: DEAF SISTER.** Her watcher runs and nothing in her
-  session is listening, so she cannot hear a dispatch. **Surface it to the
-  operator**: he must type in her terminal (re-arm her `--wake`, or `/worker`). Do
-  not dispatch into it and wait; do not publish a "please re-arm" she cannot hear.
-  A parked sister reads `readers=0` by design, so check the park record first:
-  parked is expected, deaf-while-working is the finding.
+- ⛔ **`deaf=<epoch>` (or `deaf=unknown`): DEAF SISTER.** Mail has sat unread on
+  her log for ten minutes with nothing in her session listening, so she cannot
+  hear a dispatch. **Surface it to the operator**: he must type in her terminal
+  (have her drain and arm a listener, or `/worker`). Do not dispatch into it and
+  wait; do not publish a "please re-arm" she cannot hear.
+- `parked=1`: she marked a park. Silence is intended and no alarm fires; check
+  the park record, and do not dispatch work into a park.
+- `readers=0` with no `deaf=`: not a finding by itself. Under the session hook
+  nothing reads her log during a turn her own wake started, and a background
+  `--wake` leaves a gap before its re-arm. If it lasts with mail waiting, the
+  watcher raises `deaf=` within ten minutes; that field is the finding.
 - `dead`/`stale`: she has no watcher. Same disposition: surface it; she needs a
   bring-up, not a message.
 - `readers=unknown` or no `readers=` field: unproven; say so rather than scoring it
@@ -505,8 +524,10 @@ than about your probe. Take the root from `docs/CONSTELLATION.org` or the repo o
 disk, never from memory.
 
 ⛔ **PARK DOES NOT REAP (operator ruling, 2026-09-30).** When the leader parks (see
-**fleet-restart**), leave the detached watcher running; at the next bring-up
-`--detach` answers `running` and adopts it, and you re-arm only the `--wake`.
+**fleet-restart**), mark it first with
+`~/.local/bin/dsmr-bus-watch --park --all-buses --agent <your-name> --namespace <absolute-project-root>/`,
+then leave the detached watcher running; at the next bring-up `--detach` answers
+`running`, adopts it and clears the mark, and you arm only the listener.
 `--reap` is for leaving the fleet or retiring a host:
 `~/.local/bin/dsmr-bus-watch --reap --all-buses --agent <your-name> --namespace <absolute-project-root>/`,
 exit 0 or say what survived.
@@ -552,12 +573,16 @@ Report to the operator, in this order and nothing else:
 
 1. **Phase N**, the cursor, and the single next action.
 2. The roster table — one line per repo, OK / MISMATCH / unresolved.
-3. **Blocked list**, consolidated, with exact grants, and **every deaf sister** (`readers=0` or no
-   watcher while not parked) with the terminal the operator must type in.
+3. **Blocked list**, consolidated, with exact grants, and **every deaf sister**: run the reader
+   check (`--check-live`, Step 4) for every sister at EVERY reply, not only at bring-up, and list
+   each one whose line carries `deaf=`, or answers `dead`/`stale` while she is not parked, beside the
+   BLOCKED items, naming the repository the operator must type in. It stays in the footer until her
+   line clears. `parked=1` is a park, not deafness. The watcher's desktop notification covers the
+   operator between your replies; the footer is what makes sure he never has to have seen it.
 4. What you are doing next.
 
 Then dispatch. **By name, one worker, one task.** Never broadcast work. Before each dispatch, run
-the reader check for that sister (Step 4); a `readers=0` sister goes to the operator, not onto the
+the reader check for that sister (Step 4); a `deaf=` sister goes to the operator, not onto the
 bus.
 
 ---
