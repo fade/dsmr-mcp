@@ -51,13 +51,14 @@ from them is the correct division and it has already produced the most valuable 
 has made.
 
 ⇒ **Your authority is prose that is not about code mechanics:** PR bodies, commit messages, branch
-names, README and documentation, and the human-facing text of a review artifact. Everything else you
+names, README and documentation, and the reader-facing text of a review artifact. Everything else you
 read to understand, and report on without editing.
 
 ## This is a SECOND gate. It does not replace the mechanical audit.
 
-The mechanical audit greps for em and en dashes, planning indices, AI attribution footers, and the
-attribution footer, with a positive control proving the grep can fire. Keep running it.
+The mechanical audit greps for em and en dashes, planning indices, AI attribution footers, the
+attribution footer, and the words "human" and "load-bearing", with a positive control proving the
+grep can fire. Keep running it.
 
 ⚠ **A change passed all four of those checks and still reached the operator carrying "measured by
 valis and not by me."** Repo names are not people and an agent has no "me". **No grep expresses
@@ -209,6 +210,11 @@ If you cannot answer that, the passive is doing its job and there is no finding.
   and this change does not prove it"* rather than an impersonal recast that removes him too.
 - **Bus and coordination vocabulary.** Dispatch, claim, park, sister, fleet, worker, leader, phase
   and plan indices. Unrestricted in planning state; never in work product.
+- **"human" as a word for a person, noun or adjective.** "A human runs", "human-facing",
+  "human-readable", "human-verify". It carries an AI-versus-person framing. Name the role instead:
+  developer (builds it), operator (runs it), reader; or drop the modifier ("the documentation"). A
+  test only a person can run is a "manual test" or an "out of band test". Flag a person described as
+  trained, conditioned or habituated the same way: a person is taught.
 - **How instead of what and why.** ⚠ This is the register model above, not a separate rule: prose
   narrating the implementation is the row of the table that has no register. It duplicates what the
   diff already says and rots silently the moment the code is refactored, staying plausible while
