@@ -63,23 +63,48 @@
   "The file the stub notify-send under STATE appends each call to."
   (merge-pathnames "notify-calls" state))
 
-(defun install-notify-stub (state)
+(defun install-notify-stub (state &key (exit-code 0))
   "Write a stub notify-send into STATE's stub directory that appends its
-   arguments, one call per line, to the calls file and does nothing else.
+   arguments, one call per line, to the calls file and exits EXIT-CODE.
 
    Every watcher these cases start finds the stub first on its PATH, so no case
    can put a real notification on the developer's desktop."
   (let ((stub (merge-pathnames "notify-send" (stub-dir state))))
     (ensure-directories-exist stub)
     (with-open-file (out stub :direction :output :if-exists :supersede)
-      (format out "#!/bin/sh~%printf '%s\\n' \"$*\" >> '~A'~%"
-              (uiop:native-namestring (notify-calls-file state))))
+      (format out "#!/bin/sh~%printf '%s\\n' \"$*\" >> '~A'~%exit ~D~%"
+              (uiop:native-namestring (notify-calls-file state))
+              exit-code))
     (sb-posix:chmod (uiop:native-namestring stub) #o755)
     stub))
 
 (defun notify-calls (state)
   "Every call the stub notify-send under STATE has received, one string each."
   (or (ignore-errors (uiop:read-file-lines (notify-calls-file state))) '()))
+
+(defun gdbus-calls-file (state)
+  "The file the stub gdbus under STATE appends each call to."
+  (merge-pathnames "gdbus-calls" state))
+
+(defun install-gdbus-stub (state &key (exit-code 0))
+  "Write a stub gdbus into STATE's stub directory that appends one line per call
+   to its calls file, each argument in square brackets so the argv it was given
+   can be read back exactly, and exits EXIT-CODE.
+
+   It shadows the real gdbus for the same reason the notify-send stub does: a
+   fallback must never reach the developer's desktop from a test."
+  (let ((stub (merge-pathnames "gdbus" (stub-dir state)))
+        (calls (uiop:native-namestring (gdbus-calls-file state))))
+    (ensure-directories-exist stub)
+    (with-open-file (out stub :direction :output :if-exists :supersede)
+      (format out "#!/bin/sh~%for arg in \"$@\"; do printf '[%s]' \"$arg\"; done >> '~A'~%printf '\\n' >> '~A'~%exit ~D~%"
+              calls calls exit-code))
+    (sb-posix:chmod (uiop:native-namestring stub) #o755)
+    stub))
+
+(defun gdbus-calls (state)
+  "Every call the stub gdbus under STATE has received, one string each."
+  (or (ignore-errors (uiop:read-file-lines (gdbus-calls-file state))) '()))
 
 (defvar *watcher-path* nil
   "When set, the whole PATH a watcher is run with. When NIL, the stub directory
@@ -97,7 +122,8 @@
                             (or (uiop:getenv "PATH") ""))))))
 
 (defun fresh-state-home ()
-  "A new, empty state root directly under /tmp, holding a stub notify-send.
+  "A new, empty state root directly under /tmp, holding a stub notify-send and
+   a stub gdbus.
    Kept short on purpose: the bus refuses a state root whose derived socket path
    would pass 107 characters."
   (let* ((suffix (let ((*random-state* (make-random-state t)))
@@ -105,6 +131,7 @@
          (dir (pathname (format nil "/tmp/dbw-~A/" suffix))))
     (ensure-directories-exist dir)
     (install-notify-stub dir)
+    (install-gdbus-stub dir)
     dir))
 
 (defun run-in (state bin &rest args)
@@ -721,6 +748,8 @@
               (true (search (format nil "~A cannot hear the bus" *agent*) call) "~S" call)
               (true (search (format nil "bus ~A:" *bus*) call) "~S" call)
               (true (search (string-right-trim "/" *namespace*) call) "~S" call)))
+          (is = 0 (length (gdbus-calls state))
+              "gdbus was tried although notify-send succeeded")
           (let ((marker (detach-file state "deaf")))
             (true (probe-file marker) "no deafness marker beside the pid file")
             (true (eql 0 (search "since=" (or (ignore-errors
@@ -820,6 +849,67 @@
                 (apply #'run-in state bin "--check-live" (identity-args))
               (declare (ignore err))
               (is = 0 code "the watcher did not stay live: ~S" live)))))))
+
+(define-test a-failing-notify-send-falls-back-to-gdbus-once
+  "A notify-send that aborts, as libnotify does against a notification server
+   reporting spec version 0, must not lose the alarm: the same notification goes
+   out once through gdbus as a direct Notify call, and the log says why."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (install-notify-stub state :exit-code 134)
+          (detach-deafness-watcher state bin)
+          (wal:append-record (bus-wal state *bus*) 1 "unheard, and libnotify aborts")
+          (true (await 8 (lambda () (gdbus-calls state)))
+                "gdbus was never tried after notify-send failed")
+          (sleep 3)
+          (is = 1 (length (notify-calls state))
+              "notify-send was not tried exactly once: ~S" (notify-calls state))
+          (let ((calls (gdbus-calls state)))
+            (is = 1 (length calls) "expected one gdbus call, got ~S" calls)
+            (let ((call (or (first calls) "")))
+              (true (eql 0 (search "[call][--session][--dest][org.freedesktop.Notifications]"
+                                   call))
+                    "~S" call)
+              (true (search "[--method][org.freedesktop.Notifications.Notify]" call)
+                    "~S" call)
+              (true (search (format nil "[\"~A cannot hear the bus\"]" *agent*) call)
+                    "the gdbus call does not carry the summary: ~S" call)
+              (true (search (format nil "[\"bus ~A:" *bus*) call) "~S" call)))
+          (true (await-log-text (detach-file state "log") "notify-send exited 134")
+                "the log does not say notify-send failed")
+          (true (probe-file (detach-file state "deaf"))
+                "no deafness marker beside the pid file")))))
+
+(define-test a-lost-alarm-is-logged-and-the-marker-stays
+  "When notify-send and gdbus both fail no notification reached the desktop, so
+   the log must say so and name the marker, the marker must be written, and the
+   watch must carry on."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (install-notify-stub state :exit-code 134)
+          (install-gdbus-stub state :exit-code 1)
+          (detach-deafness-watcher state bin)
+          (wal:append-record (bus-wal state *bus*) 1 "unheard, and no desktop answers")
+          (true (await 8 (lambda () (probe-file (detach-file state "deaf"))))
+                "no marker when both notifiers failed")
+          (let ((log (detach-file state "log")))
+            (true (await-log-text log "no desktop notification went out" 8)
+                  "the log does not say the alarm reached no desktop")
+            (true (await-log-text log "notify-send exited 134, and gdbus exited 1")
+                  "the log does not say how each notifier failed")
+            (true (await-log-text log (uiop:native-namestring
+                                       (detach-file state "deaf")))
+                  "the log does not name the marker"))
+          (is = 1 (length (notify-calls state)))
+          (is = 1 (length (gdbus-calls state)))
+          (multiple-value-bind (live err code)
+              (apply #'run-in state bin "--check-live" (identity-args))
+            (declare (ignore err))
+            (is = 0 code "the watcher did not stay live: ~S" live))))))
 
 ;;; parking --------------------------------------------------------------------
 
