@@ -14,6 +14,7 @@
   (:import-from #:dsmr-mcp/src/state
                 #:make-session
                 #:session-project-root
+                #:session-launch-project-root
                 #:session-project-root-just-set-p
                 #:get-tool-instance)
   (:import-from #:dsmr-mcp/src/project-root
@@ -45,12 +46,13 @@ setting -- including its absence -- on any exit."
              (sb-posix:setenv "DSMR_RELATED_PROJECTS" ,saved 1)
              (sb-posix:unsetenv "DSMR_RELATED_PROJECTS"))))))
 
-(defun %reroot-result (session target-namestring)
-  "Ask SESSION's fs-set-project-root tool to adopt TARGET-NAMESTRING without
-human_approved, and return the tool's result hash table."
+(defun %reroot-result (session target-namestring &key approved)
+  "Ask SESSION's fs-set-project-root tool to adopt TARGET-NAMESTRING, without
+human_approved unless APPROVED, and return the tool's result hash table."
   (let* ((tool (get-tool-instance session "fs-set-project-root"))
          (args (let ((h (make-hash-table :test 'equal)))
                  (setf (gethash "path" h) target-namestring)
+                 (when approved (setf (gethash "human_approved" h) t))
                  h)))
     (gethash "result" (tool-handle tool 1 args))))
 
@@ -329,3 +331,123 @@ parent once has to cover whatever is created under it afterwards."
                           "a directory nested under a listed root is accepted")
                    (is string= target (namestring (session-project-root session))))))))
       (uiop:delete-directory-tree listed :validate t :if-does-not-exist :ignore))))
+
+(define-test reroot-back-to-the-launch-project-needs-no-approval
+  "A session that re-roots away to a whitelisted sibling must be able to come
+back to the project it was launched in without human_approved, even though the
+launch project is on no whitelist and is no longer the current root."
+  (let ((sibling (%make-temp-directory)))
+    (unwind-protect
+         (with-temp-project-root (session root)
+           (let ((home  (namestring (truename root)))
+                 (there (namestring (truename sibling))))
+             (%with-related-projects ((string-right-trim "/" there))
+               (false (gethash "isError" (%reroot-result session there))
+                      "the whitelisted sibling is refused")
+               (let ((result (%reroot-result session home)))
+                 (false (gethash "isError" result)
+                        "going back to the launch project was refused: ~A"
+                        (gethash "error_type" result))
+                 (is string= home (namestring (session-project-root session)))))))
+      (uiop:delete-directory-tree sibling :validate t :if-does-not-exist :ignore))))
+
+(define-test the-launch-project-is-captured-once
+  "The launch project is the root the session started with, and no re-root moves
+it. A -> B -> A works without approval, and having been at B never makes B the
+way home: once the whitelist no longer lists B, going back there is refused."
+  (let ((sibling (%make-temp-directory)))
+    (unwind-protect
+         (with-temp-project-root (session root)
+           (let ((home  (namestring (truename root)))
+                 (there (namestring (truename sibling))))
+             (%with-related-projects ((string-right-trim "/" there))
+               (false (gethash "isError" (%reroot-result session there)))
+               (is string= home (namestring (session-launch-project-root session))
+                   "re-rooting to B moved the launch project")
+               (false (gethash "isError" (%reroot-result session home))
+                      "A -> B -> A was refused")
+               (false (gethash "isError" (%reroot-result session there))
+                      "A -> B -> A -> B was refused while B is listed"))
+             (%with-related-projects ("")
+               (false (gethash "isError" (%reroot-result session home))
+                      "going home from B with an empty whitelist was refused")
+               (let ((result (%reroot-result session there)))
+                 (true (gethash "isError" result)
+                       "B was treated as the launch project after the session visited it")
+                 (is string= "reroot-permission-required" (gethash "error_type" result)))
+               (is string= home (namestring (session-launch-project-root session))))))
+      (uiop:delete-directory-tree sibling :validate t :if-does-not-exist :ignore))))
+
+(define-test the-launch-project-does-not-open-any-other-project
+  "Permitting the launch project widens nothing else: from a whitelisted
+sibling, a third project that is neither listed nor the launch project is still
+refused without human_approved, and the root stays where it was."
+  (let ((sibling (%make-temp-directory))
+        (third   (%make-temp-directory)))
+    (unwind-protect
+         (with-temp-project-root (session _root)
+           (let ((there (namestring (truename sibling)))
+                 (other (namestring (truename third))))
+             (%with-related-projects ((string-right-trim "/" there))
+               (false (gethash "isError" (%reroot-result session there)))
+               (let ((result (%reroot-result session other)))
+                 (true (gethash "isError" result)
+                       "a project neither listed nor launched was accepted")
+                 (is string= "reroot-permission-required" (gethash "error_type" result))
+                 (is string= there (namestring (session-project-root session)))))))
+      (uiop:delete-directory-tree sibling :validate t :if-does-not-exist :ignore)
+      (uiop:delete-directory-tree third :validate t :if-does-not-exist :ignore))))
+
+(define-test a-session-whose-root-was-deleted-can-get-home
+  "A session that moved into a worktree which was then deleted must be able to
+return to its launch project without the operator, and the answer must say the
+root it left no longer exists. Re-rooting anywhere else from there says so too."
+  (let ((worktree (%make-temp-directory))
+        (third    (%make-temp-directory)))
+    (unwind-protect
+         (with-temp-project-root (session root)
+           (let ((home  (namestring (truename root)))
+                 (gone  (namestring (truename worktree)))
+                 (other (namestring (truename third))))
+             (%with-related-projects ((string-right-trim "/" gone))
+               (false (gethash "isError" (%reroot-result session gone))))
+             (uiop:delete-directory-tree worktree :validate t)
+             (%with-related-projects ("")
+               (let ((refused (%reroot-result session other)))
+                 (true (gethash "isError" refused))
+                 (true (gethash "previous_root_missing" refused))
+                 (true (search (format nil "The current root ~A no longer exists." gone)
+                               (gethash "text" (aref (gethash "content" refused) 0)))
+                       "the refusal does not say the current root is gone"))
+               (let ((result (%reroot-result session home)))
+                 (false (gethash "isError" result)
+                        "a session stranded in a deleted worktree could not get home")
+                 (is string= home (namestring (session-project-root session)))
+                 (true (search (format nil "The previous root ~A no longer exists." gone)
+                               (gethash "text" (aref (gethash "content" result) 0)))
+                       "the answer does not say the previous root is gone")))))
+      (uiop:delete-directory-tree worktree :validate t :if-does-not-exist :ignore)
+      (uiop:delete-directory-tree third :validate t :if-does-not-exist :ignore))))
+
+(define-test an-unseeded-session-takes-its-first-root-as-launch
+  "A session constructed with no root takes the first root established for it
+as its launch project, and that one only."
+  (let ((first-root (%make-temp-directory))
+        (sibling    (%make-temp-directory)))
+    (unwind-protect
+         (let ((session (make-session :id "test-unseeded"))
+               (home    (namestring (truename first-root)))
+               (there   (namestring (truename sibling))))
+           (false (session-launch-project-root session))
+           (%with-related-projects ("")
+             (false (gethash "isError" (%reroot-result session home :approved t))))
+           (is string= home (namestring (session-launch-project-root session)))
+           (%with-related-projects ((string-right-trim "/" there))
+             (false (gethash "isError" (%reroot-result session there))))
+           (is string= home (namestring (session-launch-project-root session))
+               "a later re-root moved the launch project")
+           (%with-related-projects ("")
+             (false (gethash "isError" (%reroot-result session home))
+                    "the first root established was not treated as home")))
+      (uiop:delete-directory-tree first-root :validate t :if-does-not-exist :ignore)
+      (uiop:delete-directory-tree sibling :validate t :if-does-not-exist :ignore))))
