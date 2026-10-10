@@ -164,8 +164,7 @@ check_core() {
         return
     fi
     local err
-    err=$(sbcl --core "$CORE" --noinform --disable-debugger --no-userinit --eval '(quit)' 2>&1)
-    if (($? == 0)); then
+    if err=$(sbcl --core "$CORE" --noinform --disable-debugger --no-userinit --eval '(quit)' 2>&1); then
         ok "core boots on this host"
         return
     fi
@@ -262,7 +261,8 @@ check_direnv_consent() {
             note "$name has no .envrc, so it carries no bus identity of its own"
             continue
         fi
-        local stamp="$SEEN_DIR/$(printf '%s' "$d" | sha256sum | cut -c1-32)"
+        local stamp
+        stamp="$SEEN_DIR/$(printf '%s' "$d" | sha256sum | cut -c1-32)"
         local now; now=$(sha256sum "$d/.envrc" | cut -d' ' -f1)
 
         if envrc_allowed "$d"; then

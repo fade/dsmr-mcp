@@ -134,13 +134,13 @@ self-test-preflight:
 ##   three variants before anyone looked.
 ##
 ##   HOOKS names which files to install; it defaults to all of them. Pass the
-##   two shared ones when installing into a repository that is not mine:
+##   three shared ones when installing into a repository that is not mine:
 ##   pre-commit legitimately varies per project (not everything runs a Lisp
 ##   linter), and replacing a deliberate local variant is not the same act as
 ##   delivering a shared fix.
 ##
 ##   Install atomically: a half-written hook makes a repository uncommittable.
-HOOKS ?= dsmr-workproduct-lint.sh commit-msg pre-commit
+HOOKS ?= dsmr-workproduct-lint.sh dsmr-shell-lint.sh commit-msg pre-commit
 install-hooks:
 	@set -e; \
 	target="$(if $(REPO),$(REPO),$(CURDIR))"; \
@@ -162,7 +162,7 @@ install-hooks:
 ##   Lisp linter.
 check-hooks:
 	@status=0; \
-	for f in dsmr-workproduct-lint.sh commit-msg; do \
+	for f in dsmr-workproduct-lint.sh dsmr-shell-lint.sh commit-msg; do \
 	  for d in $(WORKSPACE)/*/.git/hooks $(WORKSPACE)/*/*/.git/hooks; do \
 	    test -f "$$d/$$f" || continue; \
 	    repo=$$(cd "$$d/../.." && basename "$$PWD"); \
