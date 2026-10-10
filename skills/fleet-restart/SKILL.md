@@ -143,6 +143,10 @@ re-announces.
    `timeout: 7200000`) wake,
    `~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <your-name> --namespace
    <absolute-project-root>/`, re-armed only after each wake (drain, re-arm; see **bus-watch**).
+   When the session Stop hook is installed (`grep -c -- '--wake --hook' ~/.claude/settings.json`
+   prints 1 or more), the hook is the listener: start that background `--wake` once, so you can
+   hear before your first turn ends, and do not re-arm it after it fires. Each turn end arms the
+   next listener, and a `--wake` that answers `already-armed` means the hook holds the arm.
    Then **confirm it with `~/.local/bin/dsmr-bus-watch --check-live --bus <TAG> --agent
    <your-name> --namespace <absolute-project-root>/`**. It must print `live`, `bus=<TAG>` and
    `readers=1` or more. Bringing the leader up deaf leaves the
@@ -165,7 +169,8 @@ re-announces.
    equals its `sha`. **Mismatch ⇒ stop and report; do not work.**
 4. Send **one line**: `RESUMED <repo> @<short-sha>`
 5. Arm your watch (`--detach` once, which adopts the watcher your park left running and clears
-   your park marker, then the background `--wake`) and **confirm it with `--check-live` (must print `live`, your `bus=`, and
+   your park marker, then the background `--wake`, started once and never re-armed when the
+   session Stop hook is installed) and **confirm it with `--check-live` (must print `live`, your `bus=`, and
    `readers=1` or more, and no `parked=1`) before going silent.** **Go silent.** Await dispatch
    by name. A worker that goes silent on a `dead`/`stale` watch, or with no listener armed, is
    deaf to its own dispatch, and no one learns until the operator notices the wait.
