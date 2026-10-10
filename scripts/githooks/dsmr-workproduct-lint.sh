@@ -166,7 +166,7 @@ run_lint() {
     else
       wrong_mark='\xc2\xa9'; wrong_name='copyright sign'
     fi
-    if printf '%s\n' "$text" | grep -q "$(printf "$wrong_mark")"; then
+    if printf '%s\n' "$text" | grep -q "$(printf '%b' "$wrong_mark")"; then
       echo "✗ work-product lint: wrong attribution mark for this licence."
       if [ "$want" = "copyright" ]; then
         echo "    This project's licence is inherited and is not AGPL, so its trailer"
