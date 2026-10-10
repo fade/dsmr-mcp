@@ -689,6 +689,7 @@ Options:
                        counts as unheard when nothing was following the log as
                        it was written and nothing has followed it since. The
                        alarm is one desktop notification through notify-send,
+                       or through gdbus when notify-send is missing or fails,
                        naming the agent, the bus and the repository to type
                        in, plus a `.deaf` file beside the watcher's pid file;
                        --check-live reports it as `deaf=<epoch>`. It is raised
@@ -1876,7 +1877,8 @@ detached watcher, its pid file.
    reported once rather than every second.")
 
 (defvar *notify-processes* '()
-  "Notification processes started and not yet seen to exit.")
+  "Notification processes started and not yet seen to exit, each as a cons of
+   the process and the function to call if it fails.")
 
 (defun %notify-text (self-id bus elapsed-seconds)
   "The summary and body of the deafness notification, as two values.
@@ -1916,44 +1918,113 @@ detached watcher, its pid file.
   "The file of TYPE beside the pid file of the watcher WATCH describes."
   (%detach-file (dw-stem watch) type))
 
+(defun %notifier-failure (process)
+  "How the finished notification PROCESS failed, as a phrase to follow the
+   program's name, or NIL when it exited 0."
+  (let ((status (sb-ext:process-status process))
+        (code (sb-ext:process-exit-code process)))
+    (cond ((and (eq status :exited) (eql code 0)) nil)
+          ((eq status :exited) (format nil "exited ~D" code))
+          ((eq status :signaled) (format nil "was killed by signal ~D" code))
+          (t (format nil "ended ~(~A~)" status)))))
+
 (defun %reap-notifiers ()
   "Collect every notification process that has exited, without waiting on one
-   that has not, so none is left behind as a zombie."
-  (setf *notify-processes*
-        (remove-if (lambda (process)
-                     (unless (sb-ext:process-alive-p process)
-                       (ignore-errors (sb-ext:process-close process))
-                       t))
-                   *notify-processes*)))
+   that has not, so none is left behind as a zombie. Each one that did not exit
+   0 has its failure handler called with a phrase saying how it failed, after
+   the list is settled, so a handler may start another notifier."
+  (let ((running '())
+        (failed '()))
+    (dolist (entry *notify-processes*)
+      (destructuring-bind (process . on-failure) entry
+        (if (sb-ext:process-alive-p process)
+            (push entry running)
+            (let ((failure (%notifier-failure process)))
+              (when (and failure on-failure)
+                (push (cons on-failure failure) failed))
+              (ignore-errors (sb-ext:process-close process))))))
+    (setf *notify-processes* (nreverse running))
+    (dolist (call (nreverse failed))
+      (funcall (car call) (cdr call)))))
+
+(defun %start-notifier (name args on-failure)
+  "Start the notification program NAME, found on PATH, with the argument list
+   ARGS, and do not wait for it. ON-FAILURE is called with a phrase saying how
+   it failed: at once when NAME is not on PATH or cannot be started, and from
+   %REAP-NOTIFIERS when it exits other than 0. Never signals.
+
+   The program is started directly, never through a shell, so nothing in an
+   agent or bus name inside ARGS is interpreted."
+  (let ((program (%find-on-path name)))
+    (if (null program)
+        (funcall on-failure "is not on PATH")
+        (handler-case
+            (push (cons (sb-ext:run-program program args
+                                            :wait nil :input nil :output nil :error nil
+                                            :environment (%notify-environment
+                                                          (sb-ext:posix-environ)
+                                                          (sb-posix:getuid)))
+                        on-failure)
+                  *notify-processes*)
+          (error (e)
+            (funcall on-failure (format nil "could not be started: ~A" e)))))))
+
+(defun %gvariant-string (string)
+  "STRING as a GVariant text-format string literal, so gdbus takes it as exactly
+   that text whatever it contains."
+  (with-output-to-string (out)
+    (write-char #\" out)
+    (loop for ch across string
+          do (when (member ch '(#\" #\\)) (write-char #\\ out))
+             (write-char ch out))
+    (write-char #\" out)))
+
+(defun %gdbus-notify-args (summary body)
+  "The gdbus argument list that sends the critical notification SUMMARY and BODY
+   straight to the desktop's notification server over D-Bus.
+
+   This is the fallback for notify-send. libnotify refuses a server reporting a
+   spec version whose major number is 0, as StumpWM's does, and aborts, while
+   the server accepts the same Notify call made directly."
+  (list "call" "--session"
+        "--dest" "org.freedesktop.Notifications"
+        "--object-path" "/org/freedesktop/Notifications"
+        "--method" "org.freedesktop.Notifications.Notify"
+        (%gvariant-string "dsmr-bus-watch")
+        "0"
+        (%gvariant-string "")
+        (%gvariant-string summary)
+        (%gvariant-string body)
+        "[]"
+        "{\"urgency\": <byte 2>}"
+        "0"))
 
 (defun %notify-deaf (watch elapsed-seconds)
   "Tell the operator, on this host's desktop, that the agent WATCH serves has
    left mail unread for ELAPSED-SECONDS. Never waits for the notification and
    never signals: a desktop that cannot be reached must not stop the watch.
 
-   notify-send is started directly with its arguments as a list, never through
-   a shell, so nothing in an agent or bus name is interpreted. Where it is not
-   installed this says so in the log and does nothing more; the marker file is
-   already written by then, so the leader still sees the episode."
-  (let ((program (%find-on-path "notify-send")))
-    (if (null program)
-        (%warn "notify-send is not on PATH; the deafness alarm for ~A is in ~A only"
-               (dw-self-id watch)
-               (uiop:native-namestring (%deaf-file watch "deaf")))
-        (multiple-value-bind (summary body)
-            (%notify-text (dw-self-id watch) (dw-bus watch) elapsed-seconds)
-          (handler-case
-              (push (sb-ext:run-program program
-                                        (list "--app-name=dsmr-bus-watch"
-                                              "--urgency=critical"
-                                              summary body)
-                                        :wait nil :input nil :output nil :error nil
-                                        :environment (%notify-environment
-                                                      (sb-ext:posix-environ)
-                                                      (sb-posix:getuid)))
-                    *notify-processes*)
-            (error (e)
-              (%warn "could not run notify-send for the deafness alarm: ~A" e)))))))
+   notify-send goes first. When it is missing or exits other than 0 the same
+   notification goes through gdbus instead, so a desktop whose server libnotify
+   refuses still hears it, and only one of the two can succeed for an episode.
+   When both fail the log says so and names the marker, which is already written
+   by then, so a lost alarm is never silent and the leader still sees it."
+  (multiple-value-bind (summary body)
+      (%notify-text (dw-self-id watch) (dw-bus watch) elapsed-seconds)
+    (let ((self-id (dw-self-id watch))
+          (marker (uiop:native-namestring (%deaf-file watch "deaf"))))
+      (%start-notifier
+       "notify-send"
+       (list "--app-name=dsmr-bus-watch" "--urgency=critical" summary body)
+       (lambda (notify-send-failure)
+         (%warn "notify-send ~A; sending the deafness alarm for ~A through gdbus"
+                notify-send-failure self-id)
+         (%start-notifier
+          "gdbus"
+          (%gdbus-notify-args summary body)
+          (lambda (gdbus-failure)
+            (%warn "no desktop notification went out for the deafness alarm for ~A: notify-send ~A, and gdbus ~A; the alarm is in ~A only"
+                   self-id notify-send-failure gdbus-failure marker))))))))
 
 (defun %write-deaf-marker (watch since)
   "Write the deafness marker for WATCH: one line naming when the unheard mail

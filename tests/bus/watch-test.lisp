@@ -117,6 +117,7 @@
                 #:%deaf-step
                 #:%notify-text
                 #:%notify-environment
+                #:%gdbus-notify-args
                 #:opt-deaf-seconds
                 #:opt-park-p
                 #:opt-unpark-p)
@@ -1638,6 +1639,20 @@
       (%notify-environment '("A=1") 1000))
   (is equal '("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/7/bus")
       (%notify-environment '("DBUS_SESSION_BUS_ADDRESS=") 7)))
+
+(define-test the-gdbus-fallback-sends-the-text-exactly
+  ;; Each string goes to gdbus as a GVariant string literal, so a quote or a
+  ;; backslash in the text can neither end it early nor change what it says.
+  (let ((args (%gdbus-notify-args "a \"b\" c" "d\\e")))
+    (is equal '("call" "--session"
+                "--dest" "org.freedesktop.Notifications"
+                "--object-path" "/org/freedesktop/Notifications"
+                "--method" "org.freedesktop.Notifications.Notify")
+        (subseq args 0 8))
+    (is equal (list "\"dsmr-bus-watch\"" "0" "\"\""
+                    "\"a \\\"b\\\" c\"" "\"d\\\\e\""
+                    "[]" "{\"urgency\": <byte 2>}" "0")
+        (subseq args 8))))
 
 (define-test deaf-seconds-flag-parses
   (is eql 600 (opt-deaf-seconds (%parse-args '())))
