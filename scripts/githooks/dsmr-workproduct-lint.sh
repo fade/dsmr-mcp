@@ -110,7 +110,7 @@ strict_on() {
 }
 
 # Returns 0 = clean, 1 = blocked. Prints a report on block.
-run_lint() {
+run_workproduct_lint() {
   local mode="$1"; local text=""
   case "$mode" in
     staged)
@@ -202,4 +202,24 @@ EOF
     return 1
   fi
   return 0
+}
+
+# The entry point every pre-commit and commit-msg calls. A staged check also
+# runs shellcheck over the staged shell scripts when dsmr-shell-lint.sh is
+# installed beside this file. It rides on this call because nearly every
+# repository runs its own pre-commit, and each of them already calls this one:
+# installing this file and dsmr-shell-lint.sh turns shell lint on everywhere
+# without replacing anyone's hook.
+run_lint() {
+  local status=0 here
+  run_workproduct_lint "$@" || status=$?
+  if [ "$1" = "staged" ]; then
+    here=$(dirname "${BASH_SOURCE[0]}")
+    if [ -f "$here/dsmr-shell-lint.sh" ]; then
+      # shellcheck source=/dev/null  # resolved at run time beside this file
+      . "$here/dsmr-shell-lint.sh"
+      run_shell_lint || status=1
+    fi
+  fi
+  return "$status"
 }
