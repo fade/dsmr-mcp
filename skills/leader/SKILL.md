@@ -127,9 +127,11 @@ sweeps in every vendored dependency and dependency fork. Membership is an archit
 whole blob and silently yields a roster of one. A false roster is the exact failure this step exists
 to prevent, so the loop form is load-bearing, not style.
 
-⛔ **THE MEMBER-NAME CHARACTER CLASS MUST BE `[A-Za-z0-9-]`, NEVER `[a-z0-9-]`, AND THE LOWERCASE
+⛔ **THE MEMBER-NAME CHARACTER CLASS MUST BE `[A-Za-z0-9_-]`, NEVER `[a-z0-9-]`, AND THE LOWERCASE
 FORM DROPPED A DECLARED MEMBER FOR MONTHS.** One member is spelled with a capital (`Whistler`), so
-the lowercase pattern returned nine of ten. ⚠ **Understand why the check built for exactly this did
+the lowercase pattern returned nine of ten. `system_scripts` joined on 2026-10-10 and brought the
+underscore, which `[A-Za-z0-9-]` drops in exactly the same silent way.
+⚠ **Understand why the check built for exactly this did
 not catch it:** the two-set diff reports "in `CONSTELLATION.org` but not agent-bearing" as a FINDING,
 and it never fired, because the missing member was invisible to the grep feeding the diff. **A check
 downstream of a lossy extraction inherits the loss and reports clean** — the net and the hole were
@@ -138,17 +140,19 @@ right for the majority is the hardest to doubt.** Prove the extraction before tr
 on it, by running both classes and confirming they disagree:
 
 ```bash
-diff <(grep -oE '=[a-z0-9-]+=\s*\|'    docs/CONSTELLATION.org | tr -d '=| ' | sort -u) \
-     <(grep -oE '=[A-Za-z0-9-]+=\s*\|' docs/CONSTELLATION.org | tr -d '=| ' | sort -u)
+diff <(grep -oE '=[a-z0-9-]+=\s*\|'     docs/CONSTELLATION.org | tr -d '=| ' | sort -u) \
+     <(grep -oE '=[A-Za-z0-9_-]+=\s*\|' docs/CONSTELLATION.org | tr -d '=| ' | sort -u)
 ```
 
 ```bash
-grep -oE '=[A-Za-z0-9-]+=\s*\|' docs/CONSTELLATION.org | tr -d '=| ' | sort -u \
+grep -oE '=[A-Za-z0-9_-]+=\s*\|' docs/CONSTELLATION.org | tr -d '=| ' | sort -u \
   | cat - <(ls -1 "$LISP_WORKSPACE" 2>/dev/null) | sort -u \
   | while read -r r; do
       d=""
-      for c in "$(dirname "$PWD")/$r" "$LISP_WORKSPACE/$r"; do
-        [ -d "$c/.git" ] && [ -d "$c/.planning" ] && d="$c" && break
+      # The map's own root column first: a member may live outside the workspace.
+      root=$(grep -E "^\| =$r= " docs/CONSTELLATION.org | awk -F'|' '{gsub(/ /, "", $3); print $3}')
+      for c in "$root" "$(dirname "$PWD")/$r" "$LISP_WORKSPACE/$r"; do
+        [ -n "$c" ] && [ -d "$c/.git" ] && [ -d "$c/.planning" ] && d="$c" && break
       done
       [ -n "$d" ] || continue
       live=$(git -C "$d" rev-parse HEAD 2>/dev/null)
