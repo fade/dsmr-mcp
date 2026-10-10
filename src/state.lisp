@@ -24,6 +24,7 @@
            #:tool-instances
            #:session-slynk-attach
            #:session-project-root
+           #:session-launch-project-root
            #:session-notify-channel
            #:session-notify-channel-lock
            #:session-elicitation-p
@@ -90,6 +91,18 @@ leaks to another.  May be RE-ROOTED later via fs-set-project-root, which is
 permission-gated: re-rooting away from the launch root to a non-whitelisted
 directory requires human_approved:true (D-05).  Directly-constructed sessions
 (e.g. unit fixtures that call make-session without :project-root) start NIL.")
+   (launch-project-root
+    ;; Shares :project-root with the slot above on purpose, so every way of
+    ;; constructing a seeded session records where it was launched.
+    :initarg :project-root
+    :accessor session-launch-project-root
+    :initform nil
+    :documentation "The project this session was launched in: the root it was
+seeded with, or, for a session that started with none, the first root
+fs-set-project-root established. Captured once and never moved by a later
+re-root. fs-set-project-root always permits a re-root back here without
+human_approved, so a session that wandered into a worktree which was then
+deleted can still get home.")
    (notify-channel
     :initarg :notify-channel
     :accessor session-notify-channel

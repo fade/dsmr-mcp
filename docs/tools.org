@@ -557,8 +557,9 @@ Bounded by a 2 MB cap; use offset/limit to paginate large files.
 * fs-set-project-root
 
 Set the session project root directory. All subsequent fs-* verbs 
-resolve paths relative to this root. Re-rooting outside the configured whitelist 
-(DSMR_RELATED_PROJECTS) requires human_approved: true.
+resolve paths relative to this root. Re-rooting back to the project the session 
+was launched in is always permitted. Re-rooting anywhere else outside the configured 
+whitelist (DSMR_RELATED_PROJECTS) requires human_approved: true.
 
 #+begin_src json
 {
