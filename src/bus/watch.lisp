@@ -664,11 +664,24 @@ Options:
                        1, so start one with --detach and wake again. One
                        listener per identity: while another --wake for the
                        same identity is waiting, on any bus, this prints
-                       `already-armed` and exits 0 at once. Exits 2
+                       `already-armed` and exits 0 at once (but see
+                       --wait-for-arm). Exits 2
                        when no identity resolves, 143 on SIGTERM.
   --wake-seconds N     how long --wake waits before returning `idle` (default
                        6600, under the two-hour limit of a background command;
                        0 waits with no limit).
+  --wait-for-arm       with --wake, when another listener for the same identity
+                       is already waiting, wait for it to finish instead of
+                       printing `already-armed`, then listen from where the
+                       last listener stopped reading, so a line it did not
+                       report is reported here. While it waits it prints
+                       nothing and holds no log open, so --check-live does not
+                       count it as a reader. --wake-seconds covers the wait
+                       and the listen together: at the limit it prints the
+                       idle line wherever it is. Keep one such background wake
+                       armed beside a session hook: an interrupted turn runs no
+                       Stop hook, and this is what still hears the agent's mail
+                       once the hook's listener has fired. Ignored with --hook.
   --hook               with --wake, run as a Claude Code Stop hook declared
                        async with asyncRewake. The wake line, the idle line
                        and the nowatcher line go to STDERR, each followed by
@@ -771,6 +784,7 @@ detached watcher, its pid file.
   (wake-p nil)
   (wake-seconds 6600)
   (hook-p nil)
+  (wait-for-arm-p nil)
   (deaf-seconds 600)
   (park-p nil)
   (unpark-p nil)
@@ -841,6 +855,8 @@ detached watcher, its pid file.
                   (setf (opt-wake-p opts) t))
                  ((string= arg "--hook")
                   (setf (opt-hook-p opts) t))
+                 ((string= arg "--wait-for-arm")
+                  (setf (opt-wait-for-arm-p opts) t))
                  ((string= arg "--wake-seconds")
                   (setf (opt-wake-seconds opts)
                         (next-nonneg "--wake-seconds" (opt-wake-seconds opts))))
@@ -2512,6 +2528,51 @@ detached watcher, its pid file.
               (ignore-errors (sb-posix:close fd))
               nil))))))
 
+(defun %await-armed-lock (self-id poll-ms deadline-ms)
+  "Wait for the listener lock for SELF-ID, trying for it every POLL-MS, and
+   return true once this process holds it, or NIL when DEADLINE-MS (NIL for no
+   limit) passes first.
+
+   This is what lets a background wake stay armed beside a session hook. An
+   interrupted turn runs no Stop hook, so when the hook's listener fires during
+   or before that turn nothing would be left listening. The background wake
+   waits here instead and takes over the moment the hook's listener is gone.
+   While it waits it holds no log open, so --check-live still counts the one
+   listener that is actually reading."
+  (let ((sleep-s (/ (max poll-ms 1) 1000.0))
+        (limit (and deadline-ms (+ (now-ms) deadline-ms))))
+    (loop
+      (when (%armed-lock self-id)
+        (return t))
+      (when (and limit (>= (now-ms) limit))
+        (return nil))
+      (sleep sleep-s))))
+
+(defun %arm-wake (self-id hook-p waits-p poll-ms wake-seconds)
+  "Take the listener lock for SELF-ID on behalf of --wake, or end the process
+   when this wake is not to listen. Returns how many milliseconds of
+   WAKE-SECONDS are left for the listen itself, or NIL for no limit.
+
+   Another listener already holding the lock ends a hook silently with status
+   0, and a default wake with `already-armed`. A wake that WAITS-P waits for the
+   lock instead, and prints the idle line and exits 0 when WAKE-SECONDS run out
+   first, so the limit a background runner imposes covers the wait and the
+   listen together."
+  (let ((deadline-ms (%wake-deadline-ms wake-seconds))
+        (started-ms (now-ms)))
+    (flet ((say-and-exit (text)
+             (format *standard-output* "~A~%" text)
+             (force-output *standard-output*)
+             (uiop:quit 0)))
+      (unless (%armed-lock self-id)
+        (cond
+          (hook-p (uiop:quit 0))
+          ((not waits-p) (say-and-exit "already-armed"))
+          ((not (%await-armed-lock self-id poll-ms deadline-ms))
+           (say-and-exit (%idle-line wake-seconds)))))
+      (and deadline-ms
+           (max 0 (- deadline-ms (- (now-ms) started-ms)))))))
+
 (defun %nowatcher-wake-due-p (self-id &optional (interval 3600))
   "True when a hook listener for SELF-ID should wake its session to say no
    watcher is running, and if so, record that it has. At most once every
@@ -2559,7 +2620,13 @@ detached watcher, its pid file.
    identity resolves, and 143 on SIGTERM.
 
    Only one listener waits for an identity at a time. Another one already
-   waiting makes this print `already-armed` and exit 0 at once.
+   waiting makes this print `already-armed` and exit 0 at once, unless
+   --wait-for-arm is given. Then it waits, silent and holding no log open,
+   until that listener is gone, and listens from the saved read offset. This
+   exists for an agent whose session hook is its listener: an interrupted turn
+   runs no Stop hook, so a background wake kept armed this way is what still
+   hears the agent's mail after the hook's listener has fired. The
+   --wake-seconds limit covers the wait and the listen together.
 
    A wake or idle return saves a read offset beside each log it waited on (see
    %SAVE-OFFSETS), which the deafness alarm counts as the agent being heard.
@@ -2587,13 +2654,11 @@ detached watcher, its pid file.
               --agent-id); the detached log is keyed on it.")
       (uiop:quit 2))
     (%install-termination-handler)
-    (unless (%armed-lock self-id)
-      (unless hook-p
-        (format *standard-output* "already-armed~%")
-        (force-output *standard-output*))
-      (uiop:quit 0))
-    (let ((targets (%wake-targets bus self-id (opt-all-buses-p opts)))
-          (wake-seconds (opt-wake-seconds opts))
+    (let* ((wake-seconds (opt-wake-seconds opts))
+           (waits-p (and (opt-wait-for-arm-p opts) (not hook-p)))
+           (listen-ms (%arm-wake self-id hook-p waits-p (opt-poll-ms opts)
+                                 wake-seconds))
+           (targets (%wake-targets bus self-id (opt-all-buses-p opts)))
           (re-arms "This hook arms the next listener itself when your turn ends; do not start one."))
       (flet ((no-watcher (label)
                (cond
@@ -2621,9 +2686,9 @@ detached watcher, its pid file.
           (no-watcher "*"))
         (multiple-value-bind (outcome line which)
             (%wake-wait targets (opt-poll-ms opts)
-                        :deadline-ms (%wake-deadline-ms wake-seconds)
+                        :deadline-ms listen-ms
                         :start-offsets
-                        (and hook-p
+                        (and (or hook-p waits-p)
                              (loop for (nil log-path) in targets
                                    for saved = (%read-offset log-path)
                                    when saved
