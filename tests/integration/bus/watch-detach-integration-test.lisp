@@ -1148,6 +1148,96 @@
                      (true (< seconds 1) "a second wake waited ~,1F s" seconds)))
               (stop-process hook)))))))
 
+(define-test a-waiting-wake-holds-no-reader-while-a-hook-listens
+  "A background wake told to wait for the arm must stay quiet while a hook
+   listens for the same agent, and must not hold the log open, or the agent
+   would read as two listeners and the leader could not trust `readers=`."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((hook (launch-hook state bin)))
+            (unwind-protect
+                 (progn
+                   (sleep 0.5)
+                   (let ((wake (apply #'launch-in state bin "--wake" "--wait-for-arm"
+                                      "--poll-ms" "50" (identity-args))))
+                     (unwind-protect
+                          (progn
+                            (sleep 1)
+                            (true (uiop:process-alive-p wake)
+                                  "the waiting wake exited while the hook listened")
+                            (is equal "1"
+                                (field "readers"
+                                       (apply #'run-in state bin "--check-live"
+                                              (identity-args)))
+                                "the waiting wake was counted as a reader")
+                            (multiple-value-bind (code line) (finish-and-read wake 0)
+                              (is eql nil code "the waiting wake exited ~A" code)
+                              (is string= "" line)))
+                       (stop-process wake))))
+              (stop-process hook)))))))
+
+(define-test a-waiting-wake-takes-over-when-the-hook-fires
+  "An interrupted turn runs no Stop hook, so once the hook's listener has fired
+   nothing would listen. The waiting wake must take over then, leave the line
+   the hook already reported alone, and report the next one."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((wal (bus-wal state *bus*))
+                (hook (launch-hook state bin)))
+            (unwind-protect
+                 (progn
+                   (sleep 0.5)
+                   (let ((wake (apply #'launch-in state bin "--wake" "--wait-for-arm"
+                                      "--poll-ms" "50" (identity-args))))
+                     (unwind-protect
+                          (progn
+                            (sleep 0.5)
+                            (wal:append-record wal 1 "for the hook")
+                            (multiple-value-bind (code out err)
+                                (finish-and-read-both hook 5)
+                              (is eql 2 code "the hook did not wake on the first line")
+                              (is string= "" out)
+                              (true (eql 0 (search "bus:1" err)) "got ~S" err))
+                            (sleep 0.5)
+                            (true (uiop:process-alive-p wake)
+                                  "the waiting wake reported the line the hook had")
+                            (wal:append-record wal 2 "for the waiting wake")
+                            (multiple-value-bind (code line) (finish-and-read wake 5)
+                              (is eql 0 code "the waiting wake did not take over")
+                              (true (eql 0 (search "bus:2" line)) "got ~S" line)))
+                       (stop-process wake))))
+              (stop-process hook)))))))
+
+(define-test a-waiting-wake-returns-idle-at-its-deadline
+  "A wake waiting behind a hook still runs as a background command, and its
+   runner kills it at a fixed ceiling. It must keep to --wake-seconds while it
+   waits for the arm, so it returns idle and is re-armed like any other."
+  (let ((bin (watcher-binary)))
+    (if (null bin)
+        (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
+        (with-state (state bin)
+          (apply #'run-in state bin "--detach" "--poll-ms" "50" (identity-args))
+          (let ((hook (launch-hook state bin)))
+            (unwind-protect
+                 (progn
+                   (sleep 0.5)
+                   (multiple-value-bind (out err code seconds)
+                       (apply #'run-in-with-input state bin nil
+                              "--wake" "--wait-for-arm" "--wake-seconds" "2"
+                              "--poll-ms" "50" (identity-args))
+                     (is = 0 code "the waiting wake exited ~A: ~S" code err)
+                     (is string= "idle wake-seconds=2" out)
+                     (true (<= 1.5 seconds 4) "the waiting wake took ~,1F s" seconds))
+                   (true (uiop:process-alive-p hook)
+                         "the hook stopped listening while the wake waited"))
+              (stop-process hook)))))))
+
 (define-test hook-nowatcher-wakes-once-then-stays-quiet
   "A missing watcher is worth waking the session for once, but the hook starts
    again at every turn end, and waking on each of them would never stop."

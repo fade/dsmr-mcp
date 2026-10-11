@@ -427,18 +427,19 @@ literal `~/.local/bin/dsmr-bus-watch` path and a literal name: the path is what 
 narrow `Bash(~/.local/bin/dsmr-bus-watch:*)` allow rule matches, and a matched rule
 resolves BEFORE the classifier in auto mode.
 
-⭐ **When the session Stop hook is installed it is your primary listener, and that
-background `--wake` is the fallback.** The hook is installed when
+⭐ **When the session Stop hook is installed, keep a waiting background `--wake`
+beside it.** The hook is installed when
 `grep -c -- '--wake --hook' ~/.claude/settings.json` prints 1 or more. It arms
 `--wake --hook` at the end of every turn and wakes you as "Stop hook feedback"
-naming what arrived; drain every joined bus, act, end the turn, and **never
-re-arm**: that turn end arms the next listener. With the hook installed, start the
-background `--wake` above once at bring-up, so you can hear before your first turn
-ends, and do not re-arm it after it fires. A `--wake` that prints `already-armed`
-means the hook holds the arm: do not re-arm, do not retry. An interrupted turn
-fires no Stop hook, so after an interrupt let your next turn end normally, and
-`stop_hook_active` is true on every hook-started turn and is no loop guard. The
-**bus-watch** skill has the full rules.
+naming what arrived; drain every joined bus, act, end the turn, and do not re-arm
+for it: that turn end arms the next listener. An interrupted turn runs no Stop
+hook, so with the hook installed run the background line above as
+`~/.local/bin/dsmr-bus-watch --wake --wait-for-arm --all-buses --agent <your-name> --namespace <absolute-project-root>/`,
+keep exactly one armed at all times, and re-arm it after each time it fires
+(drain, re-arm). It waits silently while the hook's listener holds your identity
+and takes over when that listener has fired; `already-armed` is no longer an
+answer it gives. `stop_hook_active` is true on every hook-started turn and is no
+loop guard. The **bus-watch** skill has the full rules.
 
 ⚠ **Why not the Monitor: the re-arm was the point of failure, twice.** Until
 2026-09-29 every 30-minute Monitor expiry meant a fresh watcher-launch command, which

@@ -1,6 +1,6 @@
 ---
 name: bus-watch
-description: "Stay reachable on the dsmr-mcp coordination bus without polling: launch ONE detached watcher per joined bus once per session, then let ONE listener wait on it: the session Stop hook as the primary, which re-arms itself at every turn end, or a one-shot background Bash `--wake` as the fallback, which you drain and re-arm. Use when you need to listen for bus messages in the background, wake on a bus event, or stay attached across a session (lead or sister). Covers the detach-then-listen arm, the already-armed rule, why the Monitor tail is retired, marking a park and keeping the watcher across it (reap only on leaving the fleet), naming the bus with --bus, draining on wake, the stable-identity rule, and the --check-live probe whose bus=, readers=, parked= and deaf= fields say whether you can actually hear. Companion to fleet and fleet-restart."
+description: "Stay reachable on the dsmr-mcp coordination bus without polling: launch ONE detached watcher per joined bus once per session, then let ONE listener wait on it: the session Stop hook, which re-arms itself at every turn end, beside one background Bash `--wake --wait-for-arm` kept armed at all times, which you drain and re-arm; without the hook, the background `--wake` alone. Use when you need to listen for bus messages in the background, wake on a bus event, or stay attached across a session (lead or sister). Covers the detach-then-listen arm, the one-listener lock and --wait-for-arm, why the Monitor tail is retired, marking a park and keeping the watcher across it (reap only on leaving the fleet), naming the bus with --bus, draining on wake, the stable-identity rule, and the --check-live probe whose bus=, readers=, parked= and deaf= fields say whether you can actually hear. Companion to fleet and fleet-restart."
 ---
 
 # /bus-watch
@@ -11,10 +11,13 @@ then keep a one-shot **`--wake`** running as a **background Bash command**
 (`run_in_background`). It exits on the next message; the harness re-invokes you
 when it exits; you drain and re-arm the same line.
 
-When the operator has installed the session Stop hook, that hook is the
-**primary** listener: it arms the same `--wake` at the end of every turn, so you
-never re-arm, and the background `--wake` becomes the **fallback**, started once
-at bring-up and wherever the hook is absent.
+When the operator has installed the session Stop hook, that hook arms the same
+`--wake` at the end of every turn. An interrupted turn runs no Stop hook, though,
+so beside it you keep **one background `--wake --wait-for-arm` armed at all
+times** and re-arm it after each time it fires. It waits silently while the
+hook's listener holds your identity, and takes over the moment that listener
+has fired and nothing else is armed, which is exactly what an interrupt leaves
+behind.
 
 Launch the watcher once per session (it is adopted if already running). Re-arm
 the background `--wake` only after it fires, so an idle agent never re-arms at
@@ -179,7 +182,7 @@ namespace** or the child did not come up; exit 2 means no identity resolved.
 Neither armed anything for you. The pass-through flags (`--poll-ms`,
 `--recycle-seconds`, …) reach the detached watcher.
 
-**Step 2: one listener. The session hook is the primary; a background `--wake` is the fallback.**
+**Step 2: one listener at a time: the session hook, with a background `--wake --wait-for-arm` beside it.**
 
 The primary listener is a Stop hook that the operator installs once in
 `~/.claude/settings.json` (he holds the paste-ready block; ⛔ no agent writes a
@@ -199,7 +202,8 @@ it is your wake. It says which of three things happened:
   once an hour.
 
 In all three, **you do nothing to re-arm.** The end of the turn runs the hook
-again, and it arms the next listener itself. It resumes reading where the last
+again, and it arms the next listener itself; your background `--wait-for-arm`
+wake did not fire, so leave it waiting. It resumes reading where the last
 listener stopped, so mail that landed while you worked wakes you at once rather
 than being skipped. A subagent's turn end never arms one.
 
@@ -207,35 +211,40 @@ The hook is installed when
 `grep -c -- '--wake --hook' ~/.claude/settings.json` prints 1 or more. Check it
 once at bring-up and remember the answer.
 
-⛔ **One listener per identity, and `already-armed` is how you know.** Every
-`--wake` takes a lock on your identity. A background `--wake` started while the
-hook's listener waits prints `already-armed` and exits 0: the hook holds the
-arm. **Do not re-arm and do not retry.** The hook steps aside silently in the
-same way while a background `--wake` waits, so the two never listen at once.
+⛔ **One listener per identity.** Every `--wake` takes a lock on your identity,
+and only the holder reads your log. The hook steps aside silently while another
+listener holds the lock. A background `--wake --wait-for-arm` started while the
+hook's listener holds it prints nothing and waits, holding no log open, so
+`readers=` still counts one; when the hook's listener fires, the waiting wake
+takes the lock and reports the next line from where the hook stopped reading.
+`already-armed` is no longer an answer it gives; seeing it means the line was
+run without `--wait-for-arm`.
 
-With the hook installed, the background `--wake` below has one job: at
-bring-up, before your first turn has ended, nothing else is listening, so arm it
-once and pass the reader check. When it fires, drain as usual and do **not**
-re-arm it; the hook takes over when that turn ends.
+With the hook installed, **keep one background
+`~/.local/bin/dsmr-bus-watch --wake --wait-for-arm --all-buses --agent <name> --namespace <root>/`
+armed at all times**, and re-arm it after each time it fires: drain, then
+re-arm. Arm it at bring-up, before your first turn ends, and pass the reader
+check. A background command outlives an interrupted turn, so this is the
+listener that is still there when Esc stops a turn and no Stop hook runs.
+Arm exactly one: never a second while the first is still running. A binary
+whose `--help` lacks `--wait-for-arm` ignores the flag and answers
+`already-armed`; that host's binary is stale, so tell your leader (a worker) or
+the operator (the leader) rather than working around it.
 
-Know the gaps, because they are where the hook cannot help:
+Know the remaining gaps:
 
-- **An interrupted turn fires no Stop hook.** If you are stopped with Esc during
-  a turn that nothing was listening through (one the hook's own wake started),
-  no listener is armed until a later turn ends normally. When you are resumed
-  after an interrupt, let that turn run to its normal end. The deafness alarm
-  (mail unread for ten minutes, see the liveness probe) is the net for the gap.
 - **`stop_hook_active` is true on every turn the hook's wake started.** It is not
   a loop guard here and the hook does not read it. Never add a check that stops
   on it: a listener that did would never re-arm after its first wake.
-- **During your own turn `readers=0` is normal** when the hook's wake started
-  it: nothing reads the log until the turn ends and the hook arms. Deafness is
-  the `deaf=` field, not a reader count.
+- **A moment of `readers=0` is normal**: between a listener firing and the next
+  one taking the lock, and through your own turn when no background
+  `--wait-for-arm` wake is armed. Deafness is the `deaf=` field, not a reader
+  count.
 
-**The fallback listener: a background Bash `--wake`, re-armed after each wake.**
-Use it when the hook is not installed (the grep prints 0, or
-`~/.local/bin/dsmr-bus-watch --help` lacks `--hook`), and once at bring-up as
-above. Without the hook it is your only listener:
+**The background listener: a Bash `--wake`, re-armed after each wake.** With
+the hook installed it carries `--wait-for-arm`, as above. Without the hook (the
+grep prints 0, or `~/.local/bin/dsmr-bus-watch --help` lacks `--hook`) it is
+your only listener, and the plain form below is enough:
 
 ```
 Bash(
@@ -449,9 +458,9 @@ On **`bus:<SEQ>`**:
    prediction — if they disagree, believe the count and say so.
 
 2. **Re-arm the same `--wake` line** as a background Bash command, exactly as in
-   step 2 of the arm, literal `~/.local/bin/...` path included. ⛔ **Skip this
-   step when the session hook is installed**: the hook arms the next listener
-   when this turn ends. Then one catch-up
+   step 2 of the arm, literal `~/.local/bin/...` path included. With the
+   session hook installed that line carries `--wait-for-arm`, and you re-arm it
+   all the same: it is what hears you after an interrupted turn. Then one catch-up
    `bus-receive` per bus closes the gap between the old `--wake` exiting and the
    new one listening. **This is the only re-arm there is**, and it happens only
    after traffic: never on a timer, never while idle.
@@ -564,11 +573,11 @@ bus it uses an `ephemeral` identity, which never advances the main cursor.
 
 | Situation | Do |
 |---|---|
-| Start listening (whole session) | `--detach` once per joined bus (answers `detached` or `running`), then `~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <name> --namespace <root>/` as a **background Bash** command (`run_in_background`). Never the Monitor. With the session hook installed, that background `--wake` is the only one you start. |
-| Session hook wakes you ("Stop hook feedback" from `dsmr-bus-watch`) | mail: drain every joined bus and act; idle: nothing; no watcher: `--detach`. Then end the turn. **Never re-arm**: the hook arms the next listener at turn end. |
-| A `--wake` prints `already-armed` | another listener (the hook) holds the arm for you. Do not re-arm, do not retry. |
-| Resumed after an interrupt (Esc) | let the turn end normally; an interrupted turn fires no Stop hook, so that end is what re-arms. |
-| `--wake` exited with `bus:<SEQ>` | `bus-receive` every joined bus (stable id) → re-arm the same `--wake` line (not when the session hook is installed) → catch-up `bus-receive` → handle. |
+| Start listening (whole session) | `--detach` once per joined bus (answers `detached` or `running`), then `~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <name> --namespace <root>/` as a **background Bash** command (`run_in_background`). Never the Monitor. With the session hook installed, add `--wait-for-arm` after `--wake` and keep that one armed at all times. |
+| Session hook wakes you ("Stop hook feedback" from `dsmr-bus-watch`) | mail: drain every joined bus and act; idle: nothing; no watcher: `--detach`. Then end the turn. **Never re-arm** for it: the hook arms the next listener at turn end, and your background `--wait-for-arm` wake is still waiting. |
+| A `--wake` prints `already-armed` | another listener holds the arm and this line ran without `--wait-for-arm` (or on a binary too old to know it). Do not retry the same line; with the hook installed, arm the `--wait-for-arm` form once. |
+| Resumed after an interrupt (Esc) | nothing to do: your background `--wait-for-arm` wake outlives the interrupt and takes over once the hook's listener has fired. |
+| `--wake` exited with `bus:<SEQ>` | `bus-receive` every joined bus (stable id) → re-arm the same `--wake` line (with `--wait-for-arm` when the session hook is installed) → catch-up `bus-receive` → handle. |
 | `--wake` exited with `nowatcher bus=…` | `--detach` again (each bus on `bus=*`), then re-arm the `--wake`. |
 | `--wake` exited with `error:…` | the detached watcher hit a fault — `--check-live`; on `dead`/`stale` run `--detach` again; re-arm the `--wake`. |
 | Idle for hours | nothing. No timer, no re-arm; the `--wake` waits indefinitely. |
