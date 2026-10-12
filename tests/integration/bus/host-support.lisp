@@ -248,10 +248,15 @@
   (%note-started (uiop:launch-program (list "sleep" (princ-to-string seconds))
                                       :input nil :output nil :error-output nil)))
 
-(defun start-stub-service (state &key role (seconds 60))
+(defun start-stub-service (state &key role hold-members (seconds 60))
   "Start the stand-in host service under STATE, in ROLE (NIL or
    \"lock-in-child\"), wait up to SECONDS for it to beat, and return its pid. It
-   leads its own process group. Its output goes to stub.log under STATE."
+   leads its own process group. Its output goes to stub.log under STATE.
+
+   HOLD-MEMBERS, a bus root, makes the stand-in hold that bus's membership lock
+   from before its first beat and take over the broker of every degraded bus
+   whose broker lock comes free, as the service does (see host-stub.lisp). It
+   cannot be combined with ROLE."
   (let* ((script (%repo-file "tests/integration/bus/host-stub.lisp"))
          (asd (asdf:system-source-file "dsmr-mcp"))
          (log (with-open-file (out (merge-pathnames "stub.log" state)
@@ -265,7 +270,10 @@
                                  "--script" (uiop:native-namestring script)
                                  "dsmr-bus-host-stub"
                                  (uiop:native-namestring asd))
-                           (and role (list role)))
+                           (and role (list role))
+                           (and hold-members
+                                (list "--hold-members"
+                                      (uiop:native-namestring hold-members))))
                    :input nil
                    :output (uiop:native-namestring log)
                    :if-output-exists :append

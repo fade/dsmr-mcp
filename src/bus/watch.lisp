@@ -656,6 +656,35 @@ Options:
                        no value reads `-`. Exits 0 when the service is alive
                        with no bus degraded, or is not installed, and 1
                        otherwise.
+  --host-restore       hand a bus whose broker a client elected while the host
+                       service was away back to the service, then exit. For a
+                       leader restoring order after --host-status reports
+                       owner=client. Acts on the resolved bus, or with
+                       --all-buses on every bus recorded as degraded. Only the
+                       process the service recorded as that bus's broker is
+                       ever signalled, and only while it is still that
+                       process: it must be alive, have started when the record
+                       says, and be running the broker for that bus. It gets
+                       SIGTERM, then SIGKILL after 5s, never its process group,
+                       and the service takes the bus over as it exits. Because
+                       the service stays a member of the bus throughout, the
+                       broker's exit does not rotate the bus's log. Prints one
+                       line per bus:
+                         restored bus=<name> incumbent=<pid> signal=term|kill
+                         signalled bus=<name> incumbent=<pid> signal=term|kill
+                             service-took=no
+                         refused bus=<name> reason=<reason>
+                         vacated bus=<name> incumbent=<pid>
+                         clean bus=<name>
+                       `signalled` means the service had not taken the bus
+                       within 10s of the broker going. A refusal sends nothing;
+                       its reason is service-not-alive (restore needs a live
+                       service to hand the bus to), not-a-broker (the recorded
+                       pid runs something else), recycled-pid (the pid now
+                       belongs to a later process) or unreadable-record.
+                       `vacated` means the recorded broker is already gone, and
+                       `clean` that the bus is not degraded. Exits 0 when every
+                       bus is restored, vacated or clean, and 1 otherwise.
   --detach             make sure the resolved identity is watched on the
                        resolved bus, then exit. Where the host service is
                        installed, this registers the identity with it, and the
@@ -846,6 +875,7 @@ detached watcher, its pid file.
   (unpark-p nil)
   (stall-seconds 120)
   (host-status-p nil)
+  (host-restore-p nil)
   (help-p nil))
 
 (defun %parse-nonneg (string flag)
@@ -897,6 +927,8 @@ detached watcher, its pid file.
                   (setf (opt-check-p opts) t))
                  ((string= arg "--host-status")
                   (setf (opt-host-status-p opts) t))
+                 ((string= arg "--host-restore")
+                  (setf (opt-host-restore-p opts) t))
                  ((string= arg "--detach")
                   (setf (opt-detach-p opts) t))
                  ((string= arg "--detached-child")
@@ -1358,6 +1390,116 @@ detached watcher, its pid file.
       (write-line line *standard-output*))
     (force-output *standard-output*)
     (uiop:quit code)))
+
+(defun %broker-command-line-p (cmdline root)
+  "True when the argument vector CMDLINE is that of a bus broker serving the bus
+   rooted at ROOT: one argument names the broker's entry point and one names
+   that root as a directory. A root that is not a non-empty string matches
+   nothing.
+
+   The root is compared with its trailing separator, so a broker for
+   /tmp/bus-2/ is never taken for the broker of /tmp/bus/."
+  (when (and (stringp root) (plusp (length root)))
+    (let ((dir (if (char= (char root (1- (length root))) #\/)
+                   root
+                   (concatenate 'string root "/"))))
+      (and (some (lambda (arg) (search "broker-main" arg)) cmdline)
+           (some (lambda (arg) (search dir arg)) cmdline)
+           t))))
+
+(defun %host-restore-one (bus &key (term-seconds 5) (take-seconds 10))
+  "Hand BUS back to the host service when its broker was elected by a client,
+   print one line saying what happened, and return true when nothing is left
+   to do for BUS.
+
+   The degraded record the service wrote names the incumbent broker by pid and
+   start time. A file under the state root decides which process gets a
+   signal, so the record is trusted only as far as the process bears it out:
+   the pid must be alive, must be running the broker for the recorded bus
+   root, and must have started when the record says, since a pid the kernel
+   handed to a later process would otherwise be killed in the broker's name.
+   Any mismatch refuses and sends nothing. So does a service that is not alive,
+   because then there is nothing to hand the bus to and the client's broker is
+   the only one serving it.
+
+   On a match the pid alone gets SIGTERM, never its process group, and SIGKILL
+   after TERM-SECONDS if it is still there and still the same process. The
+   service holds a membership lock on every bus it serves, so the broker's
+   orderly exit does not take itself for the last member out and rotate the
+   log. The bus counts as restored once the service has cleared the record,
+   which it does when it takes the broker role; TAKE-SECONDS bounds that wait."
+  (let ((label (%field-token (or bus "default"))))
+    (flet ((say (control &rest args)
+             (format *standard-output* "~?~%" control args)
+             (force-output *standard-output*)))
+      (multiple-value-bind (record status) (hostfiles:read-degraded-record bus)
+        (case status
+          (:absent
+           (say "clean bus=~A" label)
+           t)
+          (:unreadable
+           (say "refused bus=~A reason=unreadable-record" label)
+           nil)
+          (t
+           (let ((pid (getf record :incumbent-pid))
+                 (start (getf record :incumbent-start))
+                 (root (getf record :root)))
+             (cond
+               ((not (hostfiles:service-alive-p))
+                (say "refused bus=~A reason=service-not-alive" label)
+                nil)
+               ;; Zero, one and every negative number name a process group or
+               ;; init to kill(2), never one broker.
+               ((not (and (integerp pid) (> pid 1)))
+                (say "refused bus=~A reason=not-a-broker" label)
+                nil)
+               ((not (%pid-alive-p pid))
+                (say "vacated bus=~A incumbent=~D" label pid)
+                t)
+               ((not (%broker-command-line-p (hostfiles:proc-cmdline pid) root))
+                (say "refused bus=~A reason=not-a-broker" label)
+                nil)
+               ((not (and (integerp start)
+                          (eql (hostfiles:proc-starttime pid) start)))
+                (say "refused bus=~A reason=recycled-pid" label)
+                nil)
+               (t
+                (let ((how "term"))
+                  (ignore-errors (sb-posix:kill pid sb-posix:sigterm))
+                  (unless (%await-true (lambda () (not (%pid-alive-p pid)))
+                                       term-seconds)
+                    (when (hostfiles:process-matches-p pid start)
+                      (setf how "kill")
+                      (ignore-errors (sb-posix:kill pid sb-posix:sigkill))
+                      (%await-true (lambda () (not (%pid-alive-p pid))) 2)))
+                  (cond ((%await-true
+                          (lambda ()
+                            (eq :absent
+                                (nth-value 1 (hostfiles:read-degraded-record bus))))
+                          take-seconds)
+                         (say "restored bus=~A incumbent=~D signal=~A" label pid how)
+                         t)
+                        (t
+                         (say "signalled bus=~A incumbent=~D signal=~A service-took=no"
+                              label pid how)
+                         nil))))))))))))
+
+(defun %host-restore (opts bus)
+  "Run --host-restore for BUS, or with --all-buses for every bus with a
+   degraded record, and exit 0 when every bus came back clean, restored or
+   vacated, and 1 otherwise (see %HOST-RESTORE-ONE). With --all-buses and no
+   degraded bus at all it prints `clean bus=*`."
+  (let ((buses (if (opt-all-buses-p opts)
+                   (mapcar #'car (hostfiles:degraded-records))
+                   (list bus)))
+        (clean t))
+    (if (null buses)
+        (format *standard-output* "clean bus=*~%")
+        (dolist (target buses)
+          (unless (%host-restore-one target)
+            (setf clean nil))))
+    (force-output *standard-output*)
+    (uiop:quit (if clean 0 1))))
 
 ;;; ------------------------------------------------------ termination and stalls
 ;;;
@@ -3080,6 +3222,9 @@ detached watcher, its pid file.
         ;; before either is resolved.
         (when (opt-host-status-p opts)
           (%host-status))
+        ;; About a bus but not about an identity.
+        (when (opt-host-restore-p opts)
+          (%host-restore opts (%resolve-bus opts)))
         (let* ((bus (%resolve-bus opts))
                (wal-path (if (opt-wal opts)
                              (pathname (opt-wal opts))

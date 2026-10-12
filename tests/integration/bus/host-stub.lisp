@@ -3,11 +3,12 @@
 ;;;;
 ;;;; A stand-in for the host bus service, for the watcher's cross-process tests.
 ;;;;
-;;;; The watcher's --detach, --reap and --host-status act on what the host
-;;;; service leaves on disk: its pid file, its beat, the acknowledgement of a
-;;;; registration and the pid-file lock it holds for every identity it serves.
-;;;; Those are properties of another process, so a case needs another process
-;;;; that keeps them up. This one does that and nothing else: it watches no bus.
+;;;; The watcher's --detach, --reap, --host-status and --host-restore act on
+;;;; what the host service leaves on disk: its pid file, its beat, the
+;;;; acknowledgement of a registration, the pid-file lock it holds for every
+;;;; identity it serves and the bus locks it holds. Those are properties of
+;;;; another process, so a case needs another process that keeps them up. This
+;;;; one does that and nothing else: it watches no bus.
 ;;;;
 ;;;; It is a script, not a test leaf, and no system loads it. A case starts it as
 ;;;;
@@ -25,6 +26,12 @@
 ;;;;   holder         the child of lock-in-child. It only holds locks, and exits
 ;;;;                  when its parent goes.
 ;;;;
+;;;; In place of ROLE, `--hold-members <bus-root>` runs the default role and
+;;;; also stands in for the service's standby brokers: it holds a shared lock on
+;;;; that bus's membership file for life, and every 0.2s takes the broker lock
+;;;; of each degraded bus whose lock is free, keeps it, and clears the bus's
+;;;; degraded record.
+;;;;
 ;;;; A lock is held on one descriptor that stays open, and the pid and identity
 ;;;; are written through that same descriptor, because closing any descriptor
 ;;;; on a file drops this process's locks on it. When a registration disappears
@@ -36,9 +43,14 @@
 (asdf:load-asd (pathname (third sb-ext:*posix-argv*)))
 (asdf:load-system "dsmr-mcp/src/bus/hostfiles")
 
+;; The broker's own flock(2) binding, so the stand-in's membership and broker
+;; locks are the same kind of lock a real broker takes and tests for.
+(asdf:load-system "dsmr-mcp/src/bus/election")
+
 (defpackage #:dsmr-bus-host-stub
   (:use #:cl)
-  (:local-nicknames (#:hostfiles #:dsmr-mcp/src/bus/hostfiles)))
+  (:local-nicknames (#:hostfiles #:dsmr-mcp/src/bus/hostfiles)
+                    (#:election #:dsmr-mcp/src/bus/election)))
 
 (in-package #:dsmr-bus-host-stub)
 
@@ -122,8 +134,55 @@
           do (hold-locks (registrations))
              (sleep 0.2))))
 
-(defun serve (claim-p)
-  "The service's loop: beat, acknowledge, and with CLAIM-P hold the locks."
+(defvar *members-fd* nil
+  "The descriptor holding a shared membership lock on the bus named by
+   --hold-members, open for the life of the process.")
+
+(defvar *brokers-held* (make-hash-table :test 'equal)
+  "Bus root namestring to the descriptor holding that bus's broker lock.")
+
+(defun bus-file (root name)
+  "The file NAME in the bus directory ROOT, a namestring."
+  (merge-pathnames name (uiop:ensure-directory-pathname root)))
+
+(defun hold-members (root)
+  "Take a shared membership lock on the bus at ROOT and keep it, as the service
+   does for every bus it serves."
+  (ensure-directories-exist (bus-file root "members"))
+  (let ((fd (election:open-lock (bus-file root "members"))))
+    (election:lock-shared fd)
+    (setf *members-fd* fd)))
+
+(defun take-brokers ()
+  "For each degraded bus whose broker lock is free, take that lock, keep it and
+   clear the record, as the service's standby broker does when the client's
+   broker goes."
+  (loop for (name . plist) in (hostfiles:degraded-records)
+        for root = (getf plist :root)
+        when (and (stringp root) (plusp (length root)))
+          do (let ((key (uiop:native-namestring
+                         (uiop:ensure-directory-pathname root))))
+               (unless (gethash key *brokers-held*)
+                 (let ((fd (ignore-errors
+                            (election:open-lock (bus-file root "broker.lock")))))
+                   (when fd
+                     (if (election:try-lock-exclusive fd)
+                         (setf (gethash key *brokers-held*) fd)
+                         (election:close-lock fd)))))
+               (when (gethash key *brokers-held*)
+                 (hostfiles:clear-degraded-record name)))))
+
+(defun hold-members-argument ()
+  "The bus root following --hold-members on the command line, or NIL. It takes
+   the place of ROLE, so a stand-in started with it runs as the default role."
+  (second (member "--hold-members" sb-ext:*posix-argv* :test #'equal)))
+
+(defun serve (claim-p &optional (members-root (hold-members-argument)))
+  "The service's loop: beat, acknowledge, and with CLAIM-P hold the locks. With
+   MEMBERS-ROOT, hold that bus's membership lock first, before the first beat
+   says the stand-in is up, and take over the broker of every degraded bus."
+  (when members-root
+    (hold-members members-root))
   (hostfiles:ensure-host-dir)
   (with-open-file (out (hostfiles:service-pid-path) :direction :output
                                                     :if-exists :supersede)
@@ -137,6 +196,8 @@
     (let ((current (registrations)))
       (when claim-p (hold-locks current))
       (acknowledge current))
+    (when members-root
+      (take-brokers))
     (sleep 0.2)))
 
 (let ((role (fourth sb-ext:*posix-argv*))
