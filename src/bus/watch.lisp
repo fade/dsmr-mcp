@@ -634,12 +634,20 @@ Options:
                        how fresh a heartbeat must be to count as live under
                        --check-live (default 5). A live watch refreshes every
                        poll, so this need only exceed --poll-ms with some slack.
-  --detach             make sure a detached streaming watcher is running for the
-                       resolved identity and bus, then exit. Launch it once per
-                       session: it runs in its own session with stdin from
+  --detach             make sure the resolved identity is watched on the
+                       resolved bus, then exit. Where the host service is
+                       installed, this registers the identity with it, and the
+                       service watches it with every other agent on the host.
+                       Where the host service is installed but does not answer
+                       within 5s, it says so on STDERR and starts a detached
+                       watcher of its own, so the agent keeps listening until
+                       the service returns. Otherwise it starts a detached
+                       streaming watcher. Launch it once per session. A
+                       detached watcher runs in its own session with stdin from
                        /dev/null, survives the shell that started it, re-arms
                        itself in place at every idle recycle, and appends its
-                       wake lines to
+                       wake lines (the service writes the same lines to the
+                       same file) to
                          $XDG_STATE_HOME/dsmr-mcp/watch/<bus>--<agent>--<hash>.log
                        where <hash> is a short hash of the full agent identity,
                        so two agents of one name in different namespaces keep
@@ -649,7 +657,8 @@ Options:
                        that watcher is up starts nothing. Prints
                          detached pid=<pid> bus=<name> log=<path>
                        (`running` in place of `detached` when one was already
-                       up) and then `monitor: <command>`, the tail to run under
+                       up, and the pid is the host service's when the service
+                       watches) and then `monitor: <command>`, the tail to run under
                        a persistent monitor. Exits 0, 1 when a watcher under the
                        same name belongs to another namespace or the child did
                        not come up, 2 when no identity resolves. The other watch
@@ -1573,9 +1582,106 @@ detached watcher, its pid file.
                         :directory "/"
                         :wait nil)))
 
-(defun %detach (bus self-id args)
-  "Make sure a detached watcher is running for SELF-ID on BUS and print where to
-   follow it, then exit.
+(defparameter *watcher-version*
+  (or (ignore-errors
+       (asdf:component-version (asdf:find-system "dsmr-bus-watch" nil)))
+      "unknown")
+  "The version of this watcher build, as its system declares it. Taken when the
+   binary is built, so a registration can say which build wrote it.")
+
+(defun %registration-token ()
+  "Sixteen random hex digits naming one registration, so the acknowledgement of
+   this registration cannot be mistaken for the acknowledgement of an earlier
+   one."
+  (format nil "~(~16,'0X~)" (random (expt 16 16) (make-random-state t))))
+
+(defun %await-true (thunk seconds)
+  "Call THUNK every tenth of a second until it answers true or SECONDS have
+   passed, and return its last answer."
+  (loop repeat (max 1 (round (* 10 seconds)))
+        for answer = (funcall thunk)
+        when answer do (return answer)
+        do (sleep 0.1)
+        finally (return (funcall thunk))))
+
+(defun %registration-plist (bus self-id opts token)
+  "The registration SELF-ID leaves for the host service to watch it on BUS with
+   the settings in OPTS, carrying TOKEN. It names the agent session this command
+   runs in, so the service can stop serving the registration when that session
+   ends."
+  (multiple-value-bind (session-pid session-start)
+      (hostfiles:session-from-environment)
+    (list :id self-id
+          :bus bus
+          :poll-ms (opt-poll-ms opts)
+          :recycle-seconds (opt-recycle-seconds opts)
+          :deaf-seconds (opt-deaf-seconds opts)
+          :session-pid session-pid
+          :session-start session-start
+          :token token
+          :registered-at (%unix-time)
+          :cli-version *watcher-version*)))
+
+(defun %detach-through-service (bus self-id opts
+                                &key (beat-seconds 5) (serve-seconds 10))
+  "Register SELF-ID on BUS with the host service and wait for it to be served.
+
+   Returns three values when the service took the registration: `running` when
+   the service was already watching this identity before the registration was
+   written, `detached` otherwise, then the service's pid and the file stem it
+   watches under. Returns NIL, with a warning on STDERR, when the service shows
+   no beat within BEAT-SECONDS or does not serve the registration within
+   SERVE-SECONDS; the caller then starts a watcher of the agent's own.
+
+   Served means the service has acknowledged this registration's own token and
+   holds the identity's pid-file lock, which is what every listener and probe
+   reads as `a watcher is running`. The registration is left on disk whatever
+   happens, so a service that comes back later finds it."
+  (let* ((stem (%detach-stem bus self-id))
+         (pid-path (%detach-file stem "pid"))
+         (token (%registration-token))
+         (service-before (hostfiles:read-service-pid))
+         (already-p (and service-before
+                         (eql (%lock-holder pid-path) service-before))))
+    (hostfiles:write-registration stem (%registration-plist bus self-id opts token))
+    (flet ((served-pid ()
+             (multiple-value-bind (ack status) (hostfiles:read-served-ack stem)
+               (let ((service (hostfiles:read-service-pid)))
+                 (and (eq status :ok)
+                      (equal (getf ack :token) token)
+                      service
+                      (eql (%lock-holder pid-path) service)
+                      service)))))
+      (cond
+        ((not (%await-true #'hostfiles:service-alive-p beat-seconds))
+         (%warn "the host service is installed but not answering (no beat within ~Ds); ~
+                 starting a watcher of this agent's own until it returns"
+                beat-seconds)
+         nil)
+        (t
+         (let ((service (%await-true #'served-pid serve-seconds)))
+           (if service
+               (values (if already-p "running" "detached") service stem)
+               (progn
+                 (%warn "the host service is installed but did not take this ~
+                         registration within ~Ds; starting a watcher of this ~
+                         agent's own until it does"
+                        serve-seconds)
+                 nil))))))))
+
+(defun %detach (bus self-id args &optional (opts (make-options)))
+  "Make sure SELF-ID is being watched on BUS and print where to follow it, then
+   exit.
+
+   On a host where the host service is installed, this registers the agent with
+   that service rather than starting a watcher of its own. One process watching
+   every agent on the host costs a fraction of one watcher per agent per bus,
+   and the service is what heals and reports for all of them. When the service
+   is installed but does not answer within a few seconds, the agent still gets a
+   detached watcher of its own, and a warning on STDERR says why: an agent must
+   keep listening while the service is down, and the registration stays on disk
+   for the service to pick up when it returns. On a host with no service
+   installed nothing about this step has changed.
 
    Idempotent. With a watcher already running for this identity, this reports it
    and starts nothing, so running it on every bring-up is safe. A watcher running
@@ -1591,8 +1697,9 @@ detached watcher, its pid file.
      detached pid=<pid> bus=<bus> log=<path>
      monitor: <command>
 
-   and exits 0. Exits 1 on a conflict or when the child failed to come up, and 2
-   when no identity resolves, since a detached watcher is keyed on one."
+   The pid is the host service's when the service is watching. Exits 0, 1 on a
+   conflict or when the child failed to come up, and 2 when no identity
+   resolves, since a watch is keyed on one."
   (unless self-id
     (%warn "--detach needs a resolved identity (pass --agent with --namespace, or ~
             --agent-id); a detached watcher is keyed on it.")
@@ -1601,10 +1708,10 @@ detached watcher, its pid file.
          (log-path (%detach-file stem "log"))
          (pid-path (%detach-file stem "pid"))
          (label (or bus "default")))
-    (flet ((report (verb pid)
+    (flet ((report (verb pid &optional (log log-path))
              (format *standard-output* "~A pid=~D bus=~A log=~A~%monitor: ~A~%"
-                     verb pid label (uiop:native-namestring log-path)
-                     (%monitor-command log-path))
+                     verb pid label (uiop:native-namestring log)
+                     (%monitor-command log))
              (force-output *standard-output*)
              (uiop:quit 0)))
       ;; Bring-up ends a park: the agent is about to listen again, and a park
@@ -1612,6 +1719,11 @@ detached watcher, its pid file.
       (let ((parked (%detach-file stem "parked")))
         (when (probe-file parked)
           (ignore-errors (delete-file parked))))
+      (when (hostfiles:service-installed-p)
+        (multiple-value-bind (verb pid service-stem)
+            (%detach-through-service bus self-id opts)
+          (when verb
+            (report verb pid (%detach-file service-stem "log")))))
       (let ((running (%live-detached-pid pid-path)))
         (when running
           (let ((recorded (nth-value 1 (%pid-file-contents pid-path))))
@@ -2829,7 +2941,7 @@ detached watcher, its pid file.
           (when (opt-wake-p opts)
             (%wake opts bus self-id))
           (when (and (opt-detach-p opts) (not (opt-detached-child-p opts)))
-            (%detach bus self-id args))
+            (%detach bus self-id args opts))
           (%install-termination-handler)
           (when (opt-detached-child-p opts)
             (ignore-errors (sb-posix:setsid))
