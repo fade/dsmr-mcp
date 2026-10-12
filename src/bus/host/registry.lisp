@@ -34,6 +34,9 @@
   (:import-from #:dsmr-bus-watch/src/bus/watch
                 #:%pid-alive-p
                 #:%unix-time
+                #:%lock-holder
+                #:%pid-file-contents
+                #:%whole-file-lock
                 #:default-wal-path
                 #:default-cursors-dir)
   (:export
@@ -50,6 +53,10 @@
    #:check-sessions
    #:drop-identity
    #:settle-tick
+   ;; watchers started before the service
+   #:find-legacy-watchers
+   #:adopt-legacy-watcher
+   #:adopt-legacy-watchers
    ;; roster
    #:roster-gap-findings
    ;; status
@@ -314,6 +321,340 @@
                  :subject stem
                  :msg "the mail that waited was read; registration removed")
         t))))
+
+;;; ------------------------------------------------- watchers started before it
+;;;
+;;; A host that already runs a detached watcher per agent has to be taken over
+;;; one watcher at a time without any listener seeing a moment when nobody
+;;; holds the agent's pid file: a probe reads that moment as a dead watcher and
+;;; a waiting listener gives up. So the service queues for the pid file's lock
+;;; before it ends the old watcher, and ends it with SIGKILL, which skips the
+;;; watcher's own clean-up. The pid file and heartbeat stay where they are, the
+;;; kernel hands the queued lock over as the old process dies, and the service
+;;; carries on with the same files, the log's inode included, so a listener
+;;; already following the log keeps its descriptor.
+
+(defvar *open-nofollow*
+  (let ((flag (find-symbol "O-NOFOLLOW" "SB-POSIX")))
+    (if (and flag (boundp flag)) (symbol-value flag) 0))
+  "O_NOFOLLOW where this SBCL provides it, else 0, so a pid file replaced by a
+   symbolic link is refused rather than followed.")
+
+(defun %legacy-command-p (args)
+  "True when the argument vector ARGS is a detached watcher's: the binary is
+   dsmr-bus-watch and it runs as the detached child."
+  (and (member "--detached-child" args :test #'string=)
+       (some (lambda (arg) (search "dsmr-bus-watch" arg)) args)
+       t))
+
+(defun %flag-value (args flag)
+  "The value given to FLAG in the argument vector ARGS, the last one when it is
+   given more than once, as the watcher's own parser takes it; NIL when absent."
+  (let ((value nil))
+    (loop for (arg next) on args
+          when (string= arg flag)
+            do (setf value next))
+    value))
+
+(defun %integer-flag (args flag)
+  "FLAG's value in ARGS as a non-negative integer, or NIL."
+  (let ((value (ignore-errors (parse-integer (or (%flag-value args flag) "")))))
+    (and value (>= value 0) value)))
+
+(defun %proc-locks ()
+  "The lines of /proc/locks, or NIL where there is none."
+  (ignore-errors (uiop:read-file-lines "/proc/locks")))
+
+(defun %inode (path)
+  "PATH's inode number, found without opening it, or NIL."
+  (ignore-errors (sb-posix:stat-ino (sb-posix:stat (%native path)))))
+
+(defun %lock-lines-on (ino lines)
+  "The lines of LINES, from /proc/locks, that describe a POSIX lock on inode
+   INO, each split into fields."
+  (when ino
+    (let ((suffix (format nil ":~D" ino)))
+      (loop for line in lines
+            for fields = (remove "" (uiop:split-string line :separator " ")
+                                 :test #'string=)
+            when (and (find "POSIX" fields :test #'string=)
+                      (some (lambda (field) (uiop:string-suffix-p field suffix)) fields))
+              collect fields))))
+
+(defun %held-here-p (ino lines)
+  "True when LINES from /proc/locks show this process holding a lock on inode
+   INO. Asking who holds such a file by opening it would drop that lock."
+  (let ((me (princ-to-string (sb-posix:getpid))))
+    (some (lambda (fields)
+            (and (not (find "->" fields :test #'string=))
+                 (find me fields :test #'string=)))
+          (%lock-lines-on ino lines))))
+
+(defun %queued-here-p (ino)
+  "True when /proc/locks shows this process waiting for a lock on inode INO."
+  (let ((me (princ-to-string (sb-posix:getpid))))
+    (some (lambda (fields)
+            (and (find "->" fields :test #'string=)
+                 (find me fields :test #'string=)))
+          (%lock-lines-on ino (%proc-locks)))))
+
+(defun find-legacy-watchers (&key (exclude-pids (list (sb-posix:getpid))) skip-stems)
+  "The detached watchers running on this host's watch files, as a list of
+   plists (:pid :start :pid-path :stem :id :bus :args).
+
+   Only pid files in this process's own watch state directory are looked at,
+   so a service, or a test, never reaches the watchers of another state home.
+   A watcher counts only when it holds the lock on its pid file, and its
+   command line shows the watcher binary running as a detached child. Holders
+   in EXCLUDE-PIDS are passed over. Files under SKIP-STEMS, and any file this
+   process holds a lock on, are never opened: asking who holds a lock from the
+   process that holds it lets the lock go.
+
+   ID is the identity the pid file records, or else the one on the command
+   line; BUS is the command line's, NIL for the unnamed bus. STEM is the
+   file's own, which is the older name-only stem for a watcher an earlier
+   build started."
+  (let ((locks (%proc-locks))
+        (found '()))
+    (dolist (path (ignore-errors (uiop:directory-files (hostfiles:watch-state-dir))))
+      (let* ((name (file-namestring path))
+             (stem (and (uiop:string-suffix-p name ".pid")
+                        (subseq name 0 (- (length name) 4)))))
+        (when (and stem (plusp (length stem))
+                   (not (member stem skip-stems :test #'string=))
+                   (not (%held-here-p (%inode path) locks)))
+          (let ((holder (%lock-holder path)))
+            (when (and holder (not (member holder exclude-pids)))
+              (let ((args (hostfiles:proc-cmdline holder))
+                    (start (hostfiles:proc-starttime holder)))
+                (when (and start (%legacy-command-p args))
+                  (let ((id (or (nth-value 1 (%pid-file-contents path))
+                                (%flag-value args "--agent-id"))))
+                    (when id
+                      (push (list :pid holder :start start :pid-path path :stem stem
+                                  :id (hostfiles:normalise-agent-id id)
+                                  :bus (%flag-value args "--bus")
+                                  :args args)
+                            found))))))))))
+    (nreverse found)))
+
+(defun %legacy-registration (legacy now)
+  "The registration the watcher LEGACY is adopted under: the one already on
+   disk for its stem, or one written now from its command line. The written one
+   names no session, so the agent is served until it is deregistered, as its
+   watcher would have run until it was reaped. NIL while the registration on
+   disk cannot be served; the registration scan deals with that file first."
+  (let ((stem (getf legacy :stem))
+        (args (getf legacy :args)))
+    (multiple-value-bind (plist status)
+        (hostfiles:read-registration (hostfiles:registration-path stem))
+      (case status
+        (:ok (and (null (%registration-problem stem plist)) plist))
+        (:absent
+         (hostfiles:write-registration
+          stem
+          (list :id (getf legacy :id)
+                :bus (getf legacy :bus)
+                :poll-ms (or (%integer-flag args "--poll-ms") 250)
+                :recycle-seconds (or (%integer-flag args "--recycle-seconds") 600)
+                :deaf-seconds (or (%integer-flag args "--deaf-seconds") 600)
+                :session-pid nil
+                :session-start nil
+                :token (format nil "~(~16,'0X~)"
+                               (random (expt 16 16) (make-random-state t)))
+                :registered-at now
+                :cli-version "adopted")))
+        (t nil)))))
+
+(defun %fd-lock-holder (fd)
+  "The pid of the process holding a lock that would block a write lock through
+   FD, or NIL. Asked through the descriptor already open, so no descriptor is
+   opened or closed on the file."
+  (let ((lock (%whole-file-lock sb-posix:f-wrlck)))
+    (sb-posix:fcntl fd sb-posix:f-getlk lock)
+    (unless (= (sb-posix:flock-type lock) sb-posix:f-unlck)
+      (sb-posix:flock-pid lock))))
+
+(defun %still-legacy-p (legacy)
+  "True while LEGACY's pid is still the watcher process found: the same start
+   time, and still the watcher binary running as a detached child. Checked
+   before any signal, since a pid on its own may by now name anything."
+  (let ((pid (getf legacy :pid)))
+    (and (hostfiles:process-matches-p pid (getf legacy :start))
+         (%legacy-command-p (hostfiles:proc-cmdline pid)))))
+
+(defun %serve-adopted (registry stem identity)
+  "Record IDENTITY as served under STEM and acknowledge its registration."
+  (setf (gethash stem (registry-identities registry)) identity)
+  (%acknowledge registry identity)
+  identity)
+
+(defun %adopt-by-queued-lock (registry legacy registration claim-keys grant-seconds
+                              report-fn)
+  "Take LEGACY's pid file over with no moment in which nobody holds its lock.
+   Returns the identity, or :GONE, :CHANGED or :TIMEOUT when it was not taken.
+
+   The pid file is opened once and that descriptor is the one that ends up
+   holding the lock. A helper thread queues a blocking write lock on it; once
+   the queued request shows, and the holder is checked once more to still be
+   the watcher found, the watcher alone is sent SIGKILL. SIGKILL is the point:
+   the watcher's clean-up would remove the pid file and heartbeat on the way
+   out, and a probe looking in between would see no watcher at all. The lock
+   passes to the queued request as the process dies, and the claim is
+   finished on that descriptor."
+  (let* ((stem (getf legacy :stem))
+         (path (%native (getf legacy :pid-path)))
+         (fd (handler-case (sb-posix:open path (logior sb-posix:o-rdwr *open-nofollow*))
+               (sb-posix:syscall-error () nil))))
+    (unless fd
+      (return-from %adopt-by-queued-lock :gone))
+    (unless (and (eql (ignore-errors (%fd-lock-holder fd)) (getf legacy :pid))
+                 (%still-legacy-p legacy))
+      (sb-posix:close fd)
+      (return-from %adopt-by-queued-lock :changed))
+    (let* ((ino (sb-posix:stat-ino (sb-posix:fstat fd)))
+           (helper (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (progn
+                            (sb-posix:fcntl fd sb-posix:f-setlkw
+                                            (%whole-file-lock sb-posix:f-wrlck))
+                            :granted)
+                        (error (e) e)))
+                    :name (format nil "adopt ~A" stem))))
+      (loop repeat 100
+            until (%queued-here-p ino)
+            do (sleep 0.01))
+      (when (%still-legacy-p legacy)
+        (ignore-errors (sb-posix:kill (getf legacy :pid) sb-posix:sigkill)))
+      (let ((outcome (sb-thread:join-thread helper :timeout grant-seconds
+                                                   :default :timeout)))
+        (when (eq outcome :timeout)
+          (ignore-errors (sb-thread:terminate-thread helper))
+          (setf outcome (sb-thread:join-thread helper :timeout 2 :default :timeout)))
+        (cond
+          ((eq outcome :granted)
+           (%serve-adopted registry stem
+                           (apply #'ident:finish-claim fd registration claim-keys)))
+          (t
+           ;; A helper still blocked keeps its descriptor: closing it under a
+           ;; request the kernel may yet grant would leave a lock nobody owns.
+           (unless (sb-thread:thread-alive-p helper)
+             (ignore-errors (sb-posix:close fd)))
+           (funcall report-fn :warn "legacy-watcher-found"
+                    :bus (getf legacy :bus) :id (getf legacy :id) :subject stem
+                    :msg (format nil "the lock of watcher ~D was not handed over within ~D s; ~
+                                      left for the next scan"
+                                 (getf legacy :pid) grant-seconds))
+           :timeout))))))
+
+(defun %adopt-by-terminating (registry legacy registration claim-keys grant-seconds)
+  "Take LEGACY over the naive way: ask it to stop, wait for it to go, then
+   claim its files afresh. Its clean-up removes the pid file and heartbeat
+   first, so for a moment no watcher shows at all. Kept only so a test can show
+   that moment exists when the lock is not queued first; the service never
+   adopts this way."
+  (let ((pid (getf legacy :pid)))
+    (when (%still-legacy-p legacy)
+      (ignore-errors (sb-posix:kill pid sb-posix:sigterm)))
+    (loop repeat (max 1 (ceiling (* 4 grant-seconds)))
+          while (%pid-alive-p pid)
+          do (sleep 0.25))
+    (let ((identity (apply #'ident:claim-identity registration claim-keys)))
+      (if identity
+          (%serve-adopted registry (getf legacy :stem) identity)
+          :timeout))))
+
+(defun adopt-legacy-watcher (registry legacy now
+                             &key (report-fn #'%default-report)
+                                  (wal-path-fn #'default-wal-path)
+                                  (cursors-dir-fn #'default-cursors-dir)
+                                  (grant-seconds 5)
+                                  (method :queued-lock))
+  "Take over LEGACY, a watcher FIND-LEGACY-WATCHERS returned, at NOW (Unix
+   seconds), and serve its agent from this process. Returns the identity, or a
+   keyword saying why not: :LEFT, :SERVED, :DEFERRED, :GONE, :CHANGED or
+   :TIMEOUT.
+
+   The agent's registration is the one on disk, or one written from the
+   watcher's command line when there is none. The pid file's lock is queued
+   for before the watcher is ended, so no probe or listener ever finds the
+   identity unwatched, and the log keeps its inode. A lock not handed over
+   within GRANT-SECONDS is reported and the watcher left for the next scan.
+
+   A watcher under the older name-only stem is reported once and left running:
+   its agent moves over at its next bring-up. METHOD :TERMINATE-THEN-CLAIM is
+   the naive takeover, there only to show what the queued lock prevents."
+  (let* ((stem (getf legacy :stem))
+         (id (getf legacy :id))
+         (bus (getf legacy :bus)))
+    (cond
+      ((not (string= stem (hostfiles:detach-stem bus id)))
+       (when (%note-once registry (list :kind :legacy-stem :stem stem
+                                        :pid (getf legacy :pid)))
+         (funcall report-fn :warn "legacy-stem-watcher" :bus bus :id id :subject stem
+                  :msg (format nil "watcher ~D runs under the name-only stem ~A; ~
+                                    left running until its agent's next bring-up"
+                               (getf legacy :pid) stem)))
+       :left)
+      ((gethash stem (registry-identities registry)) :served)
+      (t
+       (let ((registration (%legacy-registration legacy now)))
+         (if (null registration)
+             :deferred
+             (let ((claim-keys (list :service-pid (registry-service-pid registry)
+                                     :now now
+                                     :wal-path (funcall wal-path-fn bus)
+                                     :cursors-dir (funcall cursors-dir-fn bus)
+                                     :report-fn report-fn)))
+               (push legacy (registry-adopting registry))
+               (unwind-protect
+                    (ecase method
+                      (:queued-lock
+                       (%adopt-by-queued-lock registry legacy registration claim-keys
+                                              grant-seconds report-fn))
+                      (:terminate-then-claim
+                       (%adopt-by-terminating registry legacy registration claim-keys
+                                              grant-seconds)))
+                 (setf (registry-adopting registry)
+                       (remove legacy (registry-adopting registry)))))))))))
+
+(defun adopt-legacy-watchers (registry now &key (report-fn #'%default-report)
+                                               (wal-path-fn #'default-wal-path)
+                                               (cursors-dir-fn #'default-cursors-dir)
+                                               (grant-seconds 5))
+  "Find every detached watcher on this host's watch files and take each over,
+   at NOW (Unix seconds). Each one found is raised as LEGACY-WATCHER-FOUND,
+   offering adoption, so the supervisor decides and its breaker bounds how
+   often. A watcher under a name-only stem is reported and left, without a
+   fault. Returns the list of what each adoption answered."
+  (let ((outcomes '()))
+    (dolist (legacy (find-legacy-watchers
+                     :exclude-pids (list (sb-posix:getpid) (registry-service-pid registry))
+                     :skip-stems (loop for stem being the hash-keys
+                                         of (registry-identities registry)
+                                       collect stem)))
+      (flet ((adopt ()
+               (adopt-legacy-watcher registry legacy now
+                                     :report-fn report-fn
+                                     :wal-path-fn wal-path-fn
+                                     :cursors-dir-fn cursors-dir-fn
+                                     :grant-seconds grant-seconds)))
+        (push (if (string= (getf legacy :stem)
+                           (hostfiles:detach-stem (getf legacy :bus) (getf legacy :id)))
+                  (restart-case
+                      (conditions:raise-fault 'conditions:legacy-watcher-found
+                                              :bus (getf legacy :bus)
+                                              :id (getf legacy :id)
+                                              :subject (getf legacy :stem)
+                                              :detail (format nil "detached watcher ~D"
+                                                              (getf legacy :pid)))
+                    (conditions:adopt-legacy-watcher ()
+                      :report "Queue for the watcher's lock, end it and serve its agent."
+                      (adopt)))
+                  (adopt))
+              outcomes)))
+    (nreverse outcomes)))
 
 ;;; -------------------------------------------------------------------- roster
 
