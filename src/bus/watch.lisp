@@ -634,6 +634,28 @@ Options:
                        how fresh a heartbeat must be to count as live under
                        --check-live (default 5). A live watch refreshes every
                        poll, so this need only exceed --poll-ms with some slack.
+  --host-status        do not watch; report the host service, its buses and its
+                       registrations, for a leader's standing footer, and exit.
+                       Needs no identity. Prints
+                         service state=<s> pid=<pid> beat-age=<n> status-age=<n>
+                       where <s> is alive, stale (its beat is old), stopped (no
+                       beat, or its process is gone) or not-installed, and
+                       status-age is how old the service's last status summary
+                       is. Not installed, that is the only line, and it carries
+                       no status-age. Then one line per bus, per registration
+                       and per finding:
+                         bus <name> owner=host|client|none incumbent=<pid>
+                             degraded-since=<epoch>
+                         registration id=<id> bus=<name>
+                             state=serving|lapsed|adopting session=<pid>
+                         finding kind=<kind> bus=<name> id=<id>
+                       (each on one line). owner=client is a bus whose broker
+                       a client elected while the service was not serving it.
+                       A finding is a gap between the bus roster and the
+                       registrations, and is only informational. A field with
+                       no value reads `-`. Exits 0 when the service is alive
+                       with no bus degraded, or is not installed, and 1
+                       otherwise.
   --detach             make sure the resolved identity is watched on the
                        resolved bus, then exit. Where the host service is
                        installed, this registers the identity with it, and the
@@ -823,6 +845,7 @@ detached watcher, its pid file.
   (park-p nil)
   (unpark-p nil)
   (stall-seconds 120)
+  (host-status-p nil)
   (help-p nil))
 
 (defun %parse-nonneg (string flag)
@@ -872,6 +895,8 @@ detached watcher, its pid file.
                   (setf (opt-stream-p opts) t))
                  ((string= arg "--check-live")
                   (setf (opt-check-p opts) t))
+                 ((string= arg "--host-status")
+                  (setf (opt-host-status-p opts) t))
                  ((string= arg "--detach")
                   (setf (opt-detach-p opts) t))
                  ((string= arg "--detached-child")
@@ -1235,6 +1260,104 @@ detached watcher, its pid file.
                                          (%marker-since deaf))))))
         (force-output *standard-output*)
         (uiop:quit (if (eq status :live) 0 1)))))
+
+(defun %status-token (value)
+  "VALUE as one field of a --host-status line: `-` for none, a keyword's name in
+   lower case, and anything else printed and made safe to carry as one token."
+  (cond ((null value) "-")
+        ((keywordp value) (string-downcase (symbol-name value)))
+        (t (%field-token (princ-to-string value)))))
+
+(defun %status-epoch (time)
+  "TIME as Unix seconds for a --host-status line, or NIL for none. The service
+   records universal time; a value below the universal time of the Unix epoch
+   cannot be one and is taken as Unix seconds already."
+  (cond ((not (integerp time)) nil)
+        ((< time 2208988800) time)
+        (t (%unix-time time))))
+
+(defun %host-status-lines (&key (now (get-universal-time)))
+  "The lines --host-status prints and the status it exits with, as two values.
+   Pure apart from reading the host service's files: it prints nothing and
+   exits nothing.
+
+   Everything comes from files the shared host-file leaf names (the service's
+   state record, pid file and beat, its status summary and the degraded-bus
+   records), so asking costs no broker and no connection, and works while the
+   service is down. A degraded record is laid over the summary's bus list
+   because the summary is only rewritten every few seconds and a leader acting
+   on an older summary would hand back a bus that is already degraded again,
+   or miss one that just became so."
+  (unless (hostfiles:service-installed-p)
+    (return-from %host-status-lines
+      (values (list "service state=not-installed pid=- beat-age=-") 0)))
+  (let* ((pid (hostfiles:read-service-pid))
+         (beat-age (hostfiles:service-beat-age))
+         (state (cond ((hostfiles:service-alive-p) :alive)
+                      ((or (null beat-age) (and pid (not (%pid-alive-p pid))))
+                       :stopped)
+                      (t :stale)))
+         (snapshot (multiple-value-bind (plist status)
+                       (hostfiles:read-plist-file (hostfiles:service-status-path)
+                                                  :max-bytes (* 1024 1024))
+                     (and (eq status :ok) plist)))
+         (written (getf snapshot :written-at))
+         (buses (loop for entry in (getf snapshot :buses)
+                      when (listp entry)
+                        collect (cons (or (getf entry :bus) "default")
+                                      (copy-list entry)))))
+    (loop for (name . record) in (hostfiles:degraded-records)
+          for cell = (assoc name buses :test #'equal)
+          for overlay = (list :owner :client
+                              :incumbent-pid (getf record :incumbent-pid)
+                              :degraded-since (or (getf record :detected-at)
+                                                  (and cell
+                                                       (getf (cdr cell)
+                                                             :degraded-since))))
+          do (if cell
+                 (setf (cdr cell) (append overlay (cdr cell)))
+                 (setf buses (append buses (list (cons name overlay))))))
+    (let ((lines
+            (append
+             (list (format nil "service state=~A pid=~A beat-age=~A status-age=~A"
+                           (%status-token state) (%status-token pid)
+                           (%status-token beat-age)
+                           (%status-token (and (integerp written)
+                                               (max 0 (- now written))))))
+             (loop for (name . entry) in buses
+                   collect (format nil "bus ~A owner=~A incumbent=~A degraded-since=~A"
+                                   (%status-token name)
+                                   (%status-token (getf entry :owner))
+                                   (%status-token (getf entry :incumbent-pid))
+                                   (%status-token
+                                    (%status-epoch (getf entry :degraded-since)))))
+             (loop for entry in (getf snapshot :registrations)
+                   when (listp entry)
+                     collect (format nil "registration id=~A bus=~A state=~A session=~A"
+                                     (%status-token (getf entry :id))
+                                     (%status-token (or (getf entry :bus) "default"))
+                                     (%status-token (getf entry :state))
+                                     (%status-token (getf entry :session-pid))))
+             (loop for entry in (getf snapshot :findings)
+                   when (listp entry)
+                     collect (format nil "finding kind=~A bus=~A id=~A"
+                                     (%status-token (getf entry :kind))
+                                     (%status-token (or (getf entry :bus) "default"))
+                                     (%status-token (getf entry :id))))))
+          (degraded-p (loop for (nil . entry) in buses
+                            thereis (or (eq (getf entry :owner) :client)
+                                        (getf entry :degraded-since)))))
+      (values lines (if (and (eq state :alive) (not degraded-p)) 0 1)))))
+
+(defun %host-status ()
+  "Print the --host-status report on STDOUT and exit with its status: 0 when
+   the host service is alive and no bus is degraded, or the service is not
+   installed, and 1 otherwise (see %HOST-STATUS-LINES)."
+  (multiple-value-bind (lines code) (%host-status-lines)
+    (dolist (line lines)
+      (write-line line *standard-output*))
+    (force-output *standard-output*)
+    (uiop:quit code)))
 
 ;;; ------------------------------------------------------ termination and stalls
 ;;;
@@ -2953,6 +3076,10 @@ detached watcher, its pid file.
         (when (opt-help-p opts)
           (%usage)
           (uiop:quit 0))
+        ;; About the host, not about one identity or one bus, so it answers
+        ;; before either is resolved.
+        (when (opt-host-status-p opts)
+          (%host-status))
         (let* ((bus (%resolve-bus opts))
                (wal-path (if (opt-wal opts)
                              (pathname (opt-wal opts))

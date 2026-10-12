@@ -273,3 +273,132 @@ reaches the service."
               (is string= (format nil "survived pid=~D bus=~A" holder *bus*) out))
             (true (alive-p holder) "the holder is still running")
             (true (alive-p service) "and so is the service")))))))
+
+;;; --host-status --------------------------------------------------------------
+
+(defun install-service-files (state &key (beat-age 0) service-pid snapshot
+                                         degraded)
+  "Write the host service's records under STATE by hand: the state record, the
+   pid file naming SERVICE-PID when given, a beat BEAT-AGE seconds old unless
+   BEAT-AGE is NIL, the status SNAPSHOT when given, and one degraded record per
+   (BUS . PLIST) in DEGRADED."
+  (with-state-home (state)
+    (hostfiles:ensure-host-dir)
+    (hostfiles:write-plist-file (hostfiles:service-state-path) (list :installed t))
+    (when service-pid
+      (with-open-file (o (hostfiles:service-pid-path) :direction :output
+                                                      :if-exists :supersede)
+        (format o "~D~%" service-pid)))
+    (when beat-age
+      (let ((path (hostfiles:service-beat-path))
+            (unix (- (get-universal-time) 2208988800 beat-age)))
+        (with-open-file (o path :direction :output :if-exists :supersede)
+          (write-line "beat" o))
+        (sb-posix:utimes (uiop:native-namestring path) unix unix)))
+    (when snapshot
+      (hostfiles:write-plist-file (hostfiles:service-status-path) snapshot))
+    (loop for (bus . plist) in degraded
+          do (hostfiles:write-degraded-record bus plist))))
+
+(defun sample-snapshot (session)
+  "A status summary holding one bus the service owns, one registration it
+   serves for SESSION and one roster finding, written three seconds ago."
+  (list :pid 1
+        :written-at (- (get-universal-time) 3)
+        :buses (list (list :bus nil :owner :host :incumbent-pid nil
+                           :degraded-since nil))
+        :registrations (list (list :id (full-id *namespace* *agent*) :bus nil
+                                   :state :serving :session-pid session))
+        :findings (list (list :kind :enrolled-unregistered :bus nil
+                              :id (full-id *namespace* "absent")))))
+
+(defun host-status (state bin)
+  "Run --host-status under STATE: its lines and its exit code."
+  (multiple-value-bind (out err code) (run-in state bin "--host-status")
+    (declare (ignore err))
+    (values (uiop:split-string out :separator (string #\Newline)) code)))
+
+(define-test host-status-on-a-host-without-the-service
+  "With no service installed there is one line and nothing is wrong."
+  (with-binary (bin)
+    (with-host-state (state)
+      (multiple-value-bind (lines code) (host-status state bin)
+        (is equal '("service state=not-installed pid=- beat-age=-") lines)
+        (is = 0 code)))))
+
+(define-test host-status-reports-a-live-service-its-buses-registrations-and-findings
+  "A live service with no degraded bus reports every bus, registration and
+finding in the summary, and exits 0."
+  (with-binary (bin)
+    (with-host-state (state)
+      (let ((service (start-sleeper))
+            (session (start-sleeper)))
+        (install-service-files state :service-pid service
+                                     :snapshot (sample-snapshot session))
+        (multiple-value-bind (lines code) (host-status state bin)
+          (is = 0 code "got ~S" lines)
+          (is = 4 (length lines) "got ~S" lines)
+          (let ((head (first lines)))
+            (true (uiop:string-prefix-p
+                   (format nil "service state=alive pid=~D beat-age=" service)
+                   head)
+                  "got ~S" head)
+            (let ((age (ignore-errors (parse-integer (field "status-age" head)))))
+              (true (and age (<= 3 age 15)) "status-age=~A" age)))
+          (is string= "bus default owner=host incumbent=- degraded-since=-"
+              (second lines))
+          (is string= (format nil "registration id=~A bus=default state=serving session=~D"
+                              (full-id *namespace* *agent*) session)
+              (third lines))
+          (is string= (format nil "finding kind=enrolled-unregistered bus=default id=~A"
+                              (full-id *namespace* "absent"))
+              (fourth lines)))))))
+
+(define-test host-status-reports-a-degraded-bus-and-fails
+  "A bus whose broker a client elected reads owner=client with its incumbent and
+since when, even though the summary does not list it yet, and the report exits
+1 so a leader's footer cannot read it as healthy."
+  (with-binary (bin)
+    (with-host-state (state)
+      (let ((service (start-sleeper))
+            (session (start-sleeper))
+            (detected (get-universal-time)))
+        (install-service-files state :service-pid service
+                                     :snapshot (sample-snapshot session)
+                                     :degraded (list (cons "x" (list :bus "x"
+                                                                     :incumbent-pid 4242
+                                                                     :detected-at detected))))
+        (multiple-value-bind (lines code) (host-status state bin)
+          (is = 1 code "got ~S" lines)
+          (true (uiop:string-prefix-p "service state=alive " (first lines)))
+          (true (member "bus default owner=host incumbent=- degraded-since=-" lines
+                        :test #'string=)
+                "got ~S" lines)
+          (true (member (format nil "bus x owner=client incumbent=4242 degraded-since=~D"
+                                (- detected 2208988800))
+                        lines :test #'string=)
+                "got ~S" lines))))))
+
+(define-test host-status-reports-a-stale-service-and-fails
+  "A beat older than the live window reads stale, and exits 1."
+  (with-binary (bin)
+    (with-host-state (state)
+      (let ((service (start-sleeper)))
+        (install-service-files state :service-pid service :beat-age 30)
+        (multiple-value-bind (lines code) (host-status state bin)
+          (is = 1 code)
+          (true (uiop:string-prefix-p
+                 (format nil "service state=stale pid=~D beat-age=" service)
+                 (first lines))
+                "got ~S" lines)
+          (let ((age (ignore-errors (parse-integer (field "beat-age" (first lines))))))
+            (true (and age (<= 30 age 40)) "beat-age=~A" age)))))))
+
+(define-test host-status-reports-a-stopped-service-and-fails
+  "An installed service with no beat at all reads stopped, and exits 1."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-service-files state :beat-age nil)
+      (multiple-value-bind (lines code) (host-status state bin)
+        (is = 1 code)
+        (is equal '("service state=stopped pid=- beat-age=- status-age=-") lines)))))
