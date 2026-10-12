@@ -96,3 +96,19 @@
    system is the one that got in."
   (let ((closure (dependency-closure *watcher-system*)))
     (is equal '() (forbidden-reached closure))))
+
+(define-test watcher-reaches-the-shared-host-file-leaf
+  "The watcher names its files through the leaf the host service also uses.
+   This is the control on the case below: it shows the walk sees the edge into
+   that leaf, so a clean closure under it is a real answer."
+  (let ((closure (dependency-closure *watcher-system*)))
+    (true (gethash "dsmr-mcp/src/bus/hostfiles" closure))))
+
+(define-test host-file-leaf-reaches-no-transport-or-broker
+  "The host-file leaf is shared with the host service, which does run brokers,
+   so it is the likeliest door for the transport to come in by. Its own closure
+   is held to the watcher's rule, and a failure names the system that got in."
+  (let ((closure (dependency-closure "dsmr-mcp/src/bus/hostfiles")))
+    (true (gethash "dsmr-mcp/src/bus/cursor" closure)
+          "the walk from the leaf found its own dependencies")
+    (is equal '() (forbidden-reached closure))))

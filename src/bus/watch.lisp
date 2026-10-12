@@ -57,7 +57,8 @@
                     (#:cursor #:dsmr-mcp/src/bus/cursor)
                     (#:heartbeat #:dsmr-mcp/src/bus/heartbeat)
                     (#:wal #:dsmr-mcp/src/bus/wal)
-                    (#:selector #:dsmr-mcp/src/bus/selector))
+                    (#:selector #:dsmr-mcp/src/bus/selector)
+                    (#:hostfiles #:dsmr-mcp/src/bus/hostfiles))
   (:import-from #:dsmr-mcp/src/bus/wal
                 #:scan
                 #:now-ms
@@ -76,7 +77,34 @@
            #:poll-new-records
            #:default-wal-path
            #:default-cursors-dir
-           #:default-watch-dir))
+           #:default-watch-dir
+           ;; The per-identity file contract. The host service schedules these
+           ;; same functions for every agent it watches, so a listener cannot
+           ;; tell whether a line, a marker or a pid file was written by this
+           ;; binary or by the service.
+           #:%signal-line
+           #:%batch-parties
+           #:%deaf-step
+           #:make-deaf-state
+           #:deaf-state-unheard-since
+           #:deaf-state-latched
+           #:make-deaf-watch
+           #:%write-deaf-marker
+           #:%notify-deaf
+           #:%reap-notifiers
+           #:%fd-opened-for-reading-p
+           #:%directory-entries
+           #:%poll-forward
+           #:%whole-file-lock
+           #:%lock-holder
+           #:%pid-file-contents
+           #:%pid-alive-p
+           #:%resolve-detach-stem
+           #:%legacy-detach-stem
+           #:%unix-time
+           #:%event-line-p
+           #:%cursor-baseline
+           #:%recorded-id-matches-p))
 
 (in-package #:dsmr-bus-watch/src/bus/watch)
 
@@ -113,17 +141,9 @@
   "NAME rendered safe to carry as one field on a signal line: whitespace, a
    comma, an equals sign and any control character each become an underscore.
 
-   A bus name is an ordinary bare word and passes through untouched. A namespace
-   is a project root, though, and a path carrying a space would otherwise split
-   one name across two fields and make the line lie about who published. The
-   comma separates names within a field and the equals sign introduces one, so
-   neither can be allowed to occur inside a name either."
-  (map 'string
-       (lambda (ch)
-         (if (or (char<= ch #\Space) (char= ch #\,) (char= ch #\=))
-             #\_
-             ch))
-       name))
+   The derivation lives in the shared host-file leaf, so the watcher, the MCP
+   server and the host service name the same files and write the same fields."
+  (hostfiles:field-token name))
 
 (defun %signal-line (seq froms tos)
   "The text of one wake: `bus:<SEQ>`, then `from=` naming every agent that
@@ -941,23 +961,9 @@ detached watcher, its pid file.
   "ID with every run of separators collapsed to one and any trailing separator
    removed, or NIL for NIL.
 
-   A doubled separator names the same agent as a single one, but every file a
-   watcher keeps (cursor, heartbeat, log, pid file) is named from the id, so a
-   second spelling would be a second set of files, and a probe typed with it
-   would read a healthy agent as dead."
-  (when id
-    (let ((out (make-string-output-stream))
-          (previous-separator-p nil))
-      (loop for ch across id
-            do (let ((separator-p (char= ch #\/)))
-                 (unless (and separator-p previous-separator-p)
-                   (write-char ch out))
-                 (setf previous-separator-p separator-p)))
-      (let ((collapsed (get-output-stream-string out)))
-        (if (and (> (length collapsed) 1)
-                 (char= (char collapsed (1- (length collapsed))) #\/))
-            (subseq collapsed 0 (1- (length collapsed)))
-            collapsed)))))
+   The derivation lives in the shared host-file leaf, so the watcher, the MCP
+   server and the host service name the same files for one agent."
+  (hostfiles:normalise-agent-id id))
 
 (defun %resolve-self-id (opts)
   "The full <namespace>/<name> bus id this watcher watches on behalf of, or NIL
@@ -1264,49 +1270,42 @@ detached watcher, its pid file.
 ;;; crash can never be mistaken for one.
 
 (defun %state-home ()
-  "$XDG_STATE_HOME as a directory, falling back to ~/.local/state/."
-  (let ((xdg (uiop:getenv "XDG_STATE_HOME")))
-    (if (and xdg (plusp (length xdg)))
-        (uiop:ensure-directory-pathname xdg)
-        (merge-pathnames ".local/state/" (user-homedir-pathname)))))
+  "$XDG_STATE_HOME as a directory, falling back to ~/.local/state/.
+
+   The derivation lives in the shared host-file leaf, so the watcher, the MCP
+   server and the host service name the same files."
+  (hostfiles:state-home))
 
 (defun %detach-dir ()
   "Where detached watchers keep their logs and pid files: dsmr-mcp/watch/ under
-   the state home. One directory for every bus, so a single tail over
-   *--<agent>--*.log follows an agent on all the buses it has joined."
-  (merge-pathnames "dsmr-mcp/watch/" (%state-home)))
+   the state home.
+
+   The derivation lives in the shared host-file leaf, so the watcher, the MCP
+   server and the host service name the same files."
+  (hostfiles:watch-state-dir))
 
 (defun %agent-name (self-id)
-  "The name part of the full bus id SELF-ID."
-  (nth-value 1 (envelope:split-agent-id self-id)))
+  "The name part of the full bus id SELF-ID.
+
+   The derivation lives in the shared host-file leaf, so the watcher, the MCP
+   server and the host service name the same files."
+  (hostfiles:agent-name self-id))
 
 (defun %identity-hash (string)
   "The 32-bit FNV-1a hash of STRING's character codes, as eight lowercase hex
    digits.
 
-   The hash names files that outlive the binary that wrote them, and a later
-   build has to find them again, so it is computed here from first principles
-   rather than with SXHASH or any other function whose value an implementation
-   is free to change between builds."
-  (let ((hash 2166136261))
-    (loop for ch across string
-          do (setf hash (ldb (byte 32 0)
-                             (* (logxor hash (char-code ch)) 16777619))))
-    (format nil "~(~8,'0X~)" hash)))
+   The derivation lives in the shared host-file leaf, so the watcher, the MCP
+   server and the host service name the same files."
+  (hostfiles:identity-hash string))
 
 (defun %detach-stem (bus self-id)
   "The file stem for the detached watcher of the full bus id SELF-ID on BUS:
    <bus>--<agent>--<hash>, with `default` standing for the unnamed bus.
 
-   The agent name stays readable so an operator can find a log by eye. The hash
-   is of the whole normalised id (see %IDENTITY-HASH), so two agents with the
-   same name in different namespaces get separate files and separate reader
-   counts, and a namespace of any length adds only eight characters."
-  (let ((id (%normalise-agent-id self-id)))
-    (format nil "~A--~A--~A"
-            (%field-token (or bus "default"))
-            (%field-token (%agent-name id))
-            (%identity-hash id))))
+   The derivation lives in the shared host-file leaf, so the watcher, the MCP
+   server and the host service name the same files."
+  (hostfiles:detach-stem bus self-id))
 
 (defun %legacy-detach-stem (bus self-id)
   "The stem earlier builds gave the detached watcher of SELF-ID on BUS: the bus
@@ -1319,9 +1318,11 @@ detached watcher, its pid file.
 
 (defun %detach-file (stem type)
   "The file STEM.TYPE in the detach directory, built from a native namestring so
-   nothing in an agent name can be read as a wildcard."
-  (uiop:parse-native-namestring
-   (concatenate 'string (uiop:native-namestring (%detach-dir)) stem "." type)))
+   nothing in an agent name can be read as a wildcard.
+
+   The derivation lives in the shared host-file leaf, so the watcher, the MCP
+   server and the host service name the same files."
+  (hostfiles:watch-state-file stem type))
 
 (defun %whole-file-lock (type)
   "A lock record of TYPE covering the whole file."
