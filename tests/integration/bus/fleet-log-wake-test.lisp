@@ -3,13 +3,16 @@
 ;;;;
 ;;;; Cross-process cover for the watcher binary's fleet-log side: the
 ;;;; background listener a leader keeps on the host's fleet error log
-;;;; (`--wake --fleet-log`).
+;;;; (`--wake --fleet-log`), and the alarm the service's failure unit raises
+;;;; when the service dies (`--host-failed`).
 ;;;;
 ;;;; The listener is a separate process that exits when a line arrives, so the
 ;;;; cases start the real binary, write to the log from here, and read what it
-;;;; printed and how it exited. Every case runs under its own state root (see
-;;;; host-support). With no built binary (`make bus-watch`) the cases skip, and
-;;;; a skip is a failure for the runner this file is meant to be run by.
+;;;; printed and how it exited. The alarm cases read the fleet log and the
+;;;; calls the stub notifiers recorded. Every case runs under its own state
+;;;; root (see host-support), so no notification reaches the desktop. With no
+;;;; built binary (`make bus-watch`) the cases skip, and a skip is a failure for
+;;;; the runner this file is meant to be run by.
 
 ;; Package evolution guard
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -233,3 +236,115 @@ nothing without --wake: both are usage errors."
         (declare (ignore err))
         (is = 64 code)
         (is string= "" out)))))
+
+;;; the service-failed alarm ------------------------------------------------------
+
+(defun failure-lines (state)
+  "The service-failed lines in the fleet log under STATE."
+  (remove-if-not (lambda (line) (search " FLEET ERROR code=service-failed " line))
+                 (or (ignore-errors (uiop:read-file-lines (fleet-log state))) '())))
+
+(defun seconds-since (start)
+  (/ (- (get-internal-real-time) start) internal-time-units-per-second))
+
+(define-test host-failed-raises-one-fleet-line-and-one-notification
+  "The failure helper writes one service-failed fleet line and raises one
+critical notification naming the host bus service, and exits 0 within 6s."
+  (with-binary (bin)
+    (with-host-state (state)
+      (let ((start (get-internal-real-time)))
+        (multiple-value-bind (out err code) (run-in state bin "--host-failed")
+          (declare (ignore out))
+          (is = 0 code "stderr: ~A" err))
+        (true (< (seconds-since start) 6) "took ~,1Fs" (seconds-since start)))
+      (is = 1 (length (failure-lines state)) "got ~S" (failure-lines state))
+      (let ((calls (notify-calls state)))
+        (is = 1 (length calls) "got ~S" calls)
+        (true (search "--urgency=critical" (first calls)) "got ~S" calls)
+        (true (search "host bus service" (first calls)) "got ~S" calls))
+      (is = 0 (length (gdbus-calls state))))))
+
+(define-test host-failed-falls-back-to-gdbus
+  "When notify-send fails, the same notification goes through gdbus."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-notify-stub state :exit-code 1)
+      (multiple-value-bind (out err code) (run-in state bin "--host-failed")
+        (declare (ignore out))
+        (is = 0 code "stderr: ~A" err))
+      (is = 1 (length (notify-calls state)))
+      (let ((calls (gdbus-calls state)))
+        (is = 1 (length calls) "got ~S" calls)
+        (true (search "host bus service" (first calls)) "got ~S" calls))
+      (is = 1 (length (failure-lines state))))))
+
+(define-test host-failed-is-silent-on-an-ordinary-stop
+  "SERVICE_RESULT=success is systemd's word for an ordinary stop, which is no
+failure: nothing is written and nothing is raised."
+  (with-binary (bin)
+    (with-host-state (state)
+      (multiple-value-bind (out err code)
+          (run-in-env state '("SERVICE_RESULT=success") bin "--host-failed")
+        (is = 0 code "stderr: ~A" err)
+        (is string= "" out))
+      (false (probe-file (fleet-log state)) "no fleet log was written")
+      (is = 0 (length (notify-calls state)))
+      (is = 0 (length (gdbus-calls state))))))
+
+(define-test host-failed-names-what-systemd-reported
+  "The result, exit code and exit status systemd gave are named in the fleet
+line, so a leader can tell a crash from a watchdog kill."
+  (with-binary (bin)
+    (with-host-state (state)
+      (multiple-value-bind (out err code)
+          (run-in-env state '("SERVICE_RESULT=signal" "EXIT_CODE=killed"
+                              "EXIT_STATUS=KILL")
+                      bin "--host-failed")
+        (declare (ignore out))
+        (is = 0 code "stderr: ~A" err))
+      (let ((lines (failure-lines state)))
+        (is = 1 (length lines) "got ~S" lines)
+        (true (search "result=signal code=killed status=KILL" (first lines))
+              "got ~S" lines)))))
+
+(define-test host-failed-raises-one-alarm-when-both-unit-hooks-run
+  "Two runs within 10s, one after the other or at the same moment, raise one
+alarm: the unit runs the helper from both OnFailure= and ExecStopPost=."
+  (with-binary (bin)
+    (with-host-state (state)
+      (dotimes (i 2)
+        (multiple-value-bind (out err code) (run-in state bin "--host-failed")
+          (declare (ignore out))
+          (is = 0 code "run ~D stderr: ~A" i err)))
+      (is = 1 (length (failure-lines state)) "one after the other")
+      (is = 1 (length (notify-calls state)) "one after the other"))
+    (with-host-state (state)
+      (let ((runs (loop repeat 2
+                        collect (uiop:launch-program
+                                 (append (list "env" "-u" "SERVICE_RESULT")
+                                         (watcher-env state)
+                                         (list (uiop:native-namestring bin)
+                                               "--host-failed"))
+                                 :input nil :output nil :error-output nil))))
+        (dolist (run runs)
+          (is eql 0 (await-exit run 10))))
+      (is = 1 (length (failure-lines state)) "at the same moment")
+      (is = 1 (length (notify-calls state)) "at the same moment"))))
+
+(define-test host-failed-raises-again-for-a-later-failure
+  "The control for the case above: once the last alarm is more than 10s old,
+the next failure raises its own, so the suppression is the window and not a
+helper that only ever alarms once."
+  (with-binary (bin)
+    (with-host-state (state)
+      (multiple-value-bind (out err code) (run-in state bin "--host-failed")
+        (declare (ignore out))
+        (is = 0 code "stderr: ~A" err))
+      (with-open-file (out (merge-pathnames "dsmr-mcp/host/last-failed-alarm" state)
+                           :direction :output :if-exists :supersede)
+        (format out "~D~%" (- (get-universal-time) 2208988800 11)))
+      (multiple-value-bind (out err code) (run-in state bin "--host-failed")
+        (declare (ignore out))
+        (is = 0 code "stderr: ~A" err))
+      (is = 2 (length (failure-lines state)))
+      (is = 2 (length (notify-calls state))))))

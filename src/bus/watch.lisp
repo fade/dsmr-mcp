@@ -685,6 +685,21 @@ Options:
                        `vacated` means the recorded broker is already gone, and
                        `clean` that the bus is not degraded. Exits 0 when every
                        bus is restored, vacated or clean, and 1 otherwise.
+  --host-failed        raise the alarm that the host bus service has failed,
+                       then exit 0. This is what the service's failure unit
+                       runs, so a dead service is never silent: the alarm does
+                       not depend on the service running. It appends one
+                       `FLEET ERROR code=service-failed` line to the fleet log
+                       and raises one critical desktop notification (through
+                       gdbus when notify-send is missing or fails), waiting at
+                       most 5s for the notifier. It reads systemd's
+                       SERVICE_RESULT, EXIT_CODE and EXIT_STATUS (or their
+                       MONITOR_ forms) and names them in the alarm; with
+                       SERVICE_RESULT=success, an ordinary stop, it does
+                       nothing. A second run within 10s of an alarm does
+                       nothing either, so the unit may run it from both
+                       OnFailure= and ExecStopPost= and still raise one alarm
+                       per failure.
   --detach             make sure the resolved identity is watched on the
                        resolved bus, then exit. Where the host service is
                        installed, this registers the identity with it, and the
@@ -897,6 +912,7 @@ detached watcher, its pid file.
   (stall-seconds 120)
   (host-status-p nil)
   (host-restore-p nil)
+  (host-failed-p nil)
   (fleet-log-p nil)
   (help-p nil))
 
@@ -951,6 +967,8 @@ detached watcher, its pid file.
                   (setf (opt-host-status-p opts) t))
                  ((string= arg "--host-restore")
                   (setf (opt-host-restore-p opts) t))
+                 ((string= arg "--host-failed")
+                  (setf (opt-host-failed-p opts) t))
                  ((string= arg "--fleet-log")
                   (setf (opt-fleet-log-p opts) t))
                  ((string= arg "--detach")
@@ -2532,6 +2550,113 @@ detached watcher, its pid file.
             (%warn "no desktop notification went out for the deafness alarm for ~A: notify-send ~A, and gdbus ~A; the alarm is in ~A only"
                    self-id notify-send-failure gdbus-failure marker))))))))
 
+(defun %systemd-value (name)
+  "The value systemd gave the variable NAME, or NIL. A failure unit started by
+   OnFailure= may see it with a MONITOR_ prefix, as the result of the unit it
+   watches, so that form is read when the plain one is absent."
+  (let ((value (or (uiop:getenv name)
+                   (uiop:getenv (concatenate 'string "MONITOR_" name)))))
+    (and value (plusp (length value)) value)))
+
+(defun %claim-failure-alarm (&key (window 10) (now (%unix-time)))
+  "True when this run is the one to raise the alarm that the host service
+   failed, having recorded so in host/last-failed-alarm; NIL when another run
+   raised it less than WINDOW seconds ago.
+
+   The service's unit may run the alarm from OnFailure= and from ExecStopPost=
+   for the same failure, and those two can run at the same moment, so the
+   stamp is read and rewritten under a lock held across both. A stamp that
+   cannot be read or written raises the alarm anyway: a doubled alarm is a
+   nuisance, a lost one is the failure this exists to prevent."
+  (let ((path (merge-pathnames "last-failed-alarm" (hostfiles:host-dir)))
+        (fd nil))
+    (handler-case
+        (progn
+          (hostfiles:ensure-host-dir)
+          (setf fd (sb-posix:open (uiop:native-namestring path)
+                                  (logior sb-posix:o-creat sb-posix:o-rdwr) #o600))
+          (sb-posix:fcntl fd sb-posix:f-setlkw (%whole-file-lock sb-posix:f-wrlck))
+          (let ((stream (sb-sys:make-fd-stream fd :input t :output t
+                                                  :buffering :full
+                                                  :external-format :utf-8)))
+            ;; The stream owns the descriptor from here, and closing it is
+            ;; what releases the lock.
+            (setf fd nil)
+            (unwind-protect
+                 (let ((last (ignore-errors
+                              (parse-integer (read-line stream nil "")
+                                             :junk-allowed t))))
+                   (if (and last (<= 0 (- now last)) (< (- now last) window))
+                       nil
+                       (progn
+                         (file-position stream 0)
+                         (sb-posix:ftruncate (sb-sys:fd-stream-fd stream) 0)
+                         (format stream "~D~%" now)
+                         (finish-output stream)
+                         t)))
+              (close stream))))
+      (error (e)
+        (when fd (ignore-errors (sb-posix:close fd)))
+        (%warn "could not read or record the alarm stamp ~A: ~A; raising the alarm anyway"
+               (uiop:native-namestring path) e)
+        t))))
+
+(defun %host-failed (&key (notify-seconds 5))
+  "Raise the alarm that the host bus service failed, then exit 0. This is what
+   the service's failure unit runs, so it must work with the service dead and
+   must not depend on anything the service does.
+
+   systemd's SERVICE_RESULT says why the service stopped; `success` is an
+   ordinary stop, and then nothing is raised. Otherwise, unless another run
+   raised the alarm within the last ten seconds, it appends one
+   `FLEET ERROR code=service-failed` line to the fleet log, naming the result,
+   exit code and exit status when systemd gave them, and raises one critical
+   desktop notification: notify-send first, gdbus when that is missing or
+   fails. It waits up to NOTIFY-SECONDS for the notifier to finish, because a
+   oneshot unit that exits first may take the notifier with it."
+  (let ((result (%systemd-value "SERVICE_RESULT"))
+        (code (%systemd-value "EXIT_CODE"))
+        (status (%systemd-value "EXIT_STATUS")))
+    (when (equal result "success")
+      (uiop:quit 0))
+    (unless (%claim-failure-alarm)
+      (uiop:quit 0))
+    (let* ((detail (format nil "~@[ result=~A~]~@[ code=~A~]~@[ status=~A~]"
+                           (and result (%field-token result))
+                           (and code (%field-token code))
+                           (and status (%field-token status))))
+           (log (uiop:native-namestring (hostfiles:fleet-log-path)))
+           (summary "The dsmr host bus service failed")
+           (body (format nil "systemd is restarting it.~A Agents on this host ~
+                              cannot hear the bus until it is back. See ~A."
+                         detail log)))
+      (handler-case
+          (hostfiles:append-fleet-line
+           (hostfiles:fleet-line :error "service-failed"
+                                 :msg (format nil "the host bus service failed and ~
+                                                   systemd is restarting it~A"
+                                              detail)))
+        (error (e)
+          (%warn "could not write the service failure to the fleet log ~A: ~A"
+                 log e)))
+      (%start-notifier
+       "notify-send"
+       (list "--app-name=dsmr-bus-watch" "--urgency=critical" summary body)
+       (lambda (notify-send-failure)
+         (%warn "notify-send ~A; sending the service failure alarm through gdbus"
+                notify-send-failure)
+         (%start-notifier
+          "gdbus"
+          (%gdbus-notify-args summary body)
+          (lambda (gdbus-failure)
+            (%warn "no desktop notification went out for the service failure: notify-send ~A, and gdbus ~A; the alarm is in ~A only"
+                   notify-send-failure gdbus-failure log)))))
+      (loop repeat (* 10 notify-seconds)
+            do (%reap-notifiers)
+            until (null *notify-processes*)
+            do (sleep 0.1))
+      (uiop:quit 0))))
+
 (defun %write-deaf-marker (watch since)
   "Write the deafness marker for WATCH: one line naming when the unheard mail
    was written (SINCE, Unix seconds), the agent and the bus."
@@ -3330,6 +3455,8 @@ detached watcher, its pid file.
         ;; before either is resolved.
         (when (opt-host-status-p opts)
           (%host-status))
+        (when (opt-host-failed-p opts)
+          (%host-failed))
         ;; About a bus but not about an identity.
         (when (opt-host-restore-p opts)
           (%host-restore opts (%resolve-bus opts)))
