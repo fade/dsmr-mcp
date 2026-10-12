@@ -1022,9 +1022,47 @@ detached watcher, its pid file.
           (let ((value (and in (read in nil nil))))
             (and (integerp value) (>= value 0) t))))))
 
-(defun %cursor-baseline (self-id wal-path cursors-dir)
+(defun %stranded-fleet-message (report)
+  "The message of a fleet-log line about a stranded cursor: the old position,
+   its generation, the current generation and head, and how many records the
+   archived log still held above the old position."
+  (flet ((field (value) (if value (princ-to-string value) "-")))
+    (format nil "old-cursor=~A old-generation=~A generation=~A head=~A ~
+                 unread-in-archive=~A reason=~A"
+            (field (getf report :old-cursor))
+            (field (getf report :old-generation))
+            (field (getf report :generation))
+            (field (getf report :head))
+            (field (getf report :unread-in-archive))
+            (string-downcase (field (getf report :reason))))))
+
+(defun %report-stranded-cursor (action report bus)
+  "Say in the fleet log, and on stderr, what was done about a stranded cursor.
+   The fleet log carries a WARN for a cursor rewritten into the current log and
+   an ERROR for one that could not be, so a leader watching that file learns of
+   the second and can act on it. A fleet log that cannot be written is reported
+   on stderr and does not stop the arm."
+  (let* ((rebased-p (eq action :rebased))
+         (message (%stranded-fleet-message report))
+         (line (hostfiles:fleet-line (if rebased-p :warn :error)
+                                     (if rebased-p
+                                         "stranded-cursor"
+                                         "stranded-cursor-clamped")
+                                     :bus bus
+                                     :id (getf report :id)
+                                     :msg message)))
+    (handler-case (hostfiles:append-fleet-line line)
+      (error (e)
+        (%warn "could not write the fleet log: ~A" e)))
+    (%warn (if rebased-p
+               "cursor for ~S was stranded; rewritten into the current log (~A)"
+               "cursor for ~S is stranded and could not be rewritten; arming ~
+                at the log head (~A)")
+           (getf report :id) message)))
+
+(defun %cursor-baseline (self-id wal-path cursors-dir &optional bus)
   "The baseline seq taken from SELF-ID's durable cursor, or NIL when that cursor
-   is absent or holds nothing usable.
+   is absent or holds nothing usable. BUS names the bus for the fleet log only.
 
    Arming from the cursor rather than the log head is what closes the arm
    window. A record that landed between the agent's last drain and this arm sits
@@ -1037,13 +1075,27 @@ detached watcher, its pid file.
    this one still reading the same empty path, still seeing 0, and firing again
    on every poll for as long as it runs. The caller arms at the head instead.
 
-   READ-ONLY. The subscriber handle exists purely to read the value through the
-   canonical reader. This binary does not own that file — the MCP session
-   consuming the bus does — and writing to it from here would move that
-   session's delivery position behind its back."
+   The cursor file belongs to the MCP session consuming the bus, and this binary
+   reads it without writing, with one exception. A cursor that is provably
+   stranded (above the head of the log, or recorded against another generation
+   of it) is rewritten into the current log. Arming from such a cursor filters
+   out every record in the new log, so the agent goes deaf while every probe
+   reports it healthy, and no reading of a stranded position is a delivery
+   position the session could still want. The old position always goes to the
+   fleet log with the outcome, since rewriting discards the only record of it,
+   and to stderr if the fleet log cannot be written. When the
+   rewrite is refused the watch arms at the log head and the fleet log carries
+   an error; the cursor file is left as it was."
   (let ((path (%cursor-path self-id cursors-dir)))
     (if (%cursor-holds-seq-p path)
-        (cursor:cursor-value (cursor:make-subscriber self-id wal-path path))
+        (multiple-value-bind (baseline action report)
+            (hostfiles:heal-stranded-baseline self-id wal-path path :rebase-p t)
+          (when (member action '(:rebased :clamped))
+            (%report-stranded-cursor action report bus))
+          ;; :NO-CURSOR here means the file went away after the check above;
+          ;; its baseline is NIL, so the caller arms at the head as it would
+          ;; for a cursor that was never there.
+          baseline)
         (progn
           (%warn "no readable cursor for ~S at ~A; arming at the log head ~
                   instead. Check --namespace/--agent-id and --cursors-dir ~
@@ -1060,7 +1112,8 @@ detached watcher, its pid file.
    behavior from before the watcher had an identity, still correct, just unable
    to see anything that arrived before the arm."
   (or (opt-after opts)
-      (and self-id (%cursor-baseline self-id wal-path cursors-dir))
+      (and self-id (%cursor-baseline self-id wal-path cursors-dir
+                                     (ignore-errors (%resolve-bus opts))))
       (progn
         (unless self-id
           (%warn "no agent identity resolved (pass --agent or --agent-id, or ~
@@ -1607,7 +1660,8 @@ detached watcher, its pid file.
                                               (%note-signal-line)))))
             (setf last-error nil)
             (%warn "recycle: idle window elapsed; re-arming in place")
-            (setf baseline (or (%cursor-baseline self-id wal-path cursors-dir)
+            (setf baseline (or (%cursor-baseline self-id wal-path cursors-dir
+                                                 (ignore-errors (%resolve-bus opts)))
                                cursor)))
         (error (e)
           (let ((text (princ-to-string e)))
@@ -1621,7 +1675,8 @@ detached watcher, its pid file.
           (%note-poll)
           (sleep 5)
           (setf baseline (or (ignore-errors
-                              (%cursor-baseline self-id wal-path cursors-dir))
+                              (%cursor-baseline self-id wal-path cursors-dir
+                                                (ignore-errors (%resolve-bus opts))))
                              baseline)))))))
 
 (defun %reap-one (pid-path bus self-id &key (grace-seconds 3))
