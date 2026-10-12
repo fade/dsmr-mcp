@@ -672,7 +672,12 @@ Options:
                        `survived pid=<pid> bus=<name>`, or `foreign ...` for a
                        watcher under the same name in another namespace, which
                        is left running) and exits 0 when none is left, 1
-                       otherwise.
+                       otherwise. Where the host service watches the
+                       identity, nothing is signalled: the identity is
+                       deregistered from the service, which lets go of it, and
+                       the line reads `reaped pid=<service pid> bus=<name>
+                       signal=deregister`. No process in the service's process
+                       group is ever signalled.
   --wake               do not watch; wait for the next `bus:` or `error:` line
                        to reach the detached log for the resolved identity and
                        bus, print that line to STDOUT exactly as the watcher
@@ -1791,7 +1796,7 @@ detached watcher, its pid file.
                                                 (ignore-errors (%resolve-bus opts))))
                              baseline)))))))
 
-(defun %reap-one (pid-path bus self-id &key (grace-seconds 3))
+(defun %reap-one (pid-path bus self-id &key (grace-seconds 3) (release-seconds 5))
   "Stop the detached watcher behind PID-PATH and print one line saying what
    happened. Returns true when no watcher is left running there.
 
@@ -1801,10 +1806,19 @@ detached watcher, its pid file.
    decided by whether the pid is actually gone, not by which signal was sent.
 
    A watcher recorded under a different full id is left running and reported:
-   it shares the name but belongs to an agent in another namespace."
+   it shares the name but belongs to an agent in another namespace.
+
+   The host service is never signalled. It holds the lock of every identity it
+   watches, so signalling the holder would take down the whole host's listening
+   to stop one agent's. When the holder is the service, the identity is
+   deregistered instead: its registration is removed, the service lets go of
+   the lock within RELEASE-SECONDS, and the line names deregistration as the
+   signal. No process in the service's process group is signalled either,
+   whoever holds the lock, and such a holder is reported as `survived`."
   (let ((label (or bus "default"))
         (pid (%live-detached-pid pid-path))
-        (recorded (nth-value 1 (%pid-file-contents pid-path))))
+        (recorded (nth-value 1 (%pid-file-contents pid-path)))
+        (service (hostfiles:read-service-pid)))
     (labels ((say (control &rest args)
                (format *standard-output* "~?~%" control args)
                (force-output *standard-output*))
@@ -1821,7 +1835,14 @@ detached watcher, its pid file.
                (loop repeat tenths
                      until (gone-p group-p)
                      do (sleep 0.1))
-               (gone-p group-p)))
+               (gone-p group-p))
+             (service-p ()
+               (and service (eql pid service)
+                    (some (lambda (arg) (search "dsmr-bus-host" arg))
+                          (hostfiles:proc-cmdline pid))
+                    t))
+             (in-service-group-p ()
+               (and service (eql (ignore-errors (sb-posix:getpgid pid)) service))))
       (cond
         ((null pid)
          (ignore-errors (when (probe-file pid-path) (delete-file pid-path)))
@@ -1829,6 +1850,18 @@ detached watcher, its pid file.
          t)
         ((and recorded self-id (not (%recorded-id-matches-p pid-path self-id)))
          (say "foreign pid=~D bus=~A id=~A" pid label recorded)
+         nil)
+        ((service-p)
+         (hostfiles:remove-registration (pathname-name pid-path))
+         (cond ((%await-true (lambda () (not (eql (%lock-holder pid-path) pid)))
+                             release-seconds)
+                (say "reaped pid=~D bus=~A signal=deregister" pid label)
+                t)
+               (t
+                (say "survived pid=~D bus=~A" pid label)
+                nil)))
+        ((in-service-group-p)
+         (say "survived pid=~D bus=~A" pid label)
          nil)
         (t
          (let* ((group-p (eql (ignore-errors (sb-posix:getpgid pid)) pid))

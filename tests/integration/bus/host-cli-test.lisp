@@ -25,7 +25,11 @@
 
 (defpackage #:dsmr-mcp/tests/integration/bus/host-cli-test
   (:use #:cl #:zebra #:dsmr-mcp/tests/integration/bus/host-support)
-  (:local-nicknames (#:hostfiles #:dsmr-mcp/src/bus/hostfiles)))
+  (:local-nicknames (#:hostfiles #:dsmr-mcp/src/bus/hostfiles))
+  ;; The lock probe the watcher itself uses, so a case reads the holder exactly
+  ;; as --reap and --detach do.
+  (:import-from #:dsmr-bus-watch/src/bus/watch
+                #:%lock-holder))
 
 (in-package #:dsmr-mcp/tests/integration/bus/host-cli-test)
 
@@ -183,3 +187,89 @@ for the service to find when it returns."
             (true (alive-p pid) "a watcher of its own is running"))
           (is eq :ok (nth-value 1 (registration-of state))
               "the registration stays for the returning service"))))))
+
+;;; --reap ---------------------------------------------------------------------
+
+(defun register-by-hand (state)
+  "Leave a registration for this case's identity under STATE without running
+   --detach, for a stand-in that never acknowledges with the lock it holds."
+  (with-state-home (state)
+    (hostfiles:write-registration
+     (my-stem)
+     (list :id (full-id *namespace* *agent*) :bus *bus* :poll-ms 1000
+           :recycle-seconds 600 :deaf-seconds 600 :session-pid nil
+           :session-start nil :token "0000000000000000" :registered-at 0))))
+
+(define-test reap-deregisters-instead-of-signalling-the-service
+  "Reaping an identity the service watches removes its registration and leaves
+the service running: it holds every identity's lock, and signalling it would
+leave every agent on the host deaf."
+  (with-binary (bin)
+    (with-host-state (state)
+      (let ((service (start-stub-service state)))
+        (multiple-value-bind (out err code)
+            (apply #'run-in state bin "--detach" (id-args))
+          (declare (ignore out))
+          (is = 0 code "--detach failed: ~A" err))
+        (is = service (%lock-holder (my-file state "pid"))
+            "the service holds the identity's lock before the reap")
+        (multiple-value-bind (out err code)
+            (apply #'run-in state bin "--reap" (id-args))
+          (is = 0 code "--reap failed: ~A" err)
+          (is string= (format nil "reaped pid=~D bus=~A signal=deregister"
+                              service *bus*)
+              out))
+        (is eq :absent (nth-value 1 (registration-of state))
+            "the registration is gone")
+        (false (eql service (%lock-holder (my-file state "pid")))
+               "the service let go of the identity")
+        (true (alive-p service) "and the service is still running")))))
+
+(define-test reap-signals-a-holder-the-service-pid-does-not-name
+  "The guard keys on the service's own pid. With service.pid naming some other
+process, the holder is an ordinary watcher to --reap and is stopped the old
+way, which is what shows the guard, not luck, spared the service above."
+  (with-binary (bin)
+    (with-host-state (state)
+      (let ((service (start-stub-service state))
+            (other (start-sleeper)))
+        (multiple-value-bind (out err code)
+            (apply #'run-in state bin "--detach" (id-args))
+          (declare (ignore out))
+          (is = 0 code "--detach failed: ~A" err))
+        (with-state-home (state)
+          (with-open-file (o (hostfiles:service-pid-path) :direction :output
+                                                          :if-exists :supersede)
+            (format o "~D~%" other)))
+        (multiple-value-bind (out err code)
+            (apply #'run-in state bin "--reap" (id-args))
+          (is = 0 code "--reap failed: ~A" err)
+          (is string= (format nil "reaped pid=~D bus=~A signal=term" service *bus*)
+              out))
+        (true (await-true (lambda () (not (alive-p service))) 5)
+              "the stand-in took the signal and exited")))))
+
+(define-test reap-never-signals-the-service-s-process-group
+  "A lock holder in the service's process group is never signalled, even when
+it is not the service itself, because signalling a group the service leads
+reaches the service."
+  (with-binary (bin)
+    (with-host-state (state)
+      (let ((service (start-stub-service state :role "lock-in-child")))
+        (register-by-hand state)
+        (let ((holder (await-true
+                       (lambda ()
+                         (let ((pid (%lock-holder (my-file state "pid"))))
+                           (and pid (/= pid service) pid)))
+                       30)))
+          (true holder "a child of the service holds the identity's lock")
+          (when holder
+            (is = service (sb-posix:getpgid holder)
+                "in the service's process group")
+            (multiple-value-bind (out err code)
+                (apply #'run-in state bin "--reap" (id-args))
+              (declare (ignore err))
+              (is = 1 code)
+              (is string= (format nil "survived pid=~D bus=~A" holder *bus*) out))
+            (true (alive-p holder) "the holder is still running")
+            (true (alive-p service) "and so is the service")))))))
