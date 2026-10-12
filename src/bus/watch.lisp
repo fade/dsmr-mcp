@@ -105,6 +105,7 @@
            #:%event-line-p
            #:%cursor-baseline
            #:%cursor-holds-seq-p
+           #:%stranded-fleet-message
            #:%recorded-id-matches-p))
 
 (in-package #:dsmr-bus-watch/src/bus/watch)

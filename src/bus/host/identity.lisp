@@ -55,6 +55,7 @@
                 #:%poll-forward
                 #:%unix-time
                 #:%cursor-holds-seq-p
+                #:%stranded-fleet-message
                 #:poll-new-records
                 #:default-wal-path
                 #:default-cursors-dir)
@@ -84,6 +85,7 @@
    #:identity-cursor-path
    #:identity-cursor-mtime
    #:identity-pending-p
+   #:identity-service-pid
    ;; claim and release
    #:lock-pid-file
    #:finish-claim
@@ -91,7 +93,11 @@
    #:release-identity
    ;; serving
    #:identity-deliver
+   #:identity-tick
    #:identity-baseline
+   #:clamp-baseline
+   #:lapse-identity
+   #:unlapse-identity
    #:log-reader-counts
    ;; reports
    #:report-to-logs))
@@ -115,7 +121,7 @@
    under it. DEAF-WATCH and DEAF-STATE are the deafness alarm's, exactly as the
    detached watcher keeps them. CURSOR-MTIME is the agent's cursor file's write
    date when it was last looked at, and PENDING-P whether mail the agent would be
-   handed sits above its cursor."
+   handed sits above its cursor. SERVICE-PID is the pid the pid file records."
   id bus stem token session-pid session-start
   (state :serving)
   pid-stream log-stream log-path pid-path beat-path
@@ -130,7 +136,8 @@
   cursor-mtime
   (pending-p nil)
   pending-key
-  pid-ino)
+  pid-ino
+  service-pid)
 
 (defun report-to-logs (level code &key bus id subject msg)
   "Hand a report to the service's logs: INFO to the service log, anything worse
@@ -194,6 +201,20 @@
   "Close STREAM when there is one, ignoring a failure."
   (when stream (ignore-errors (close stream))))
 
+(defun %take-pid-file (identity fd)
+  "Record IDENTITY's service pid and full id in its pid file through FD, the
+   descriptor holding the file's lock, and keep FD as IDENTITY's pid stream.
+   Nothing else ever opens the file, so the lock lasts as long as the stream."
+  (sb-posix:ftruncate fd 0)
+  (sb-posix:lseek fd 0 sb-posix:seek-set)
+  (let ((stream (sb-sys:make-fd-stream fd :input t :output t
+                                          :external-format :utf-8
+                                          :buffering :full)))
+    (setf (identity-pid-stream identity) stream)
+    (format stream "~D~%~A~%" (identity-service-pid identity) (identity-id identity))
+    (finish-output stream))
+  (setf (identity-pid-ino identity) (sb-posix:stat-ino (sb-posix:fstat fd))))
+
 (defun finish-claim (fd registration &key (service-pid (sb-posix:getpid))
                                           (now (%unix-time))
                                           wal-path cursors-dir
@@ -230,21 +251,14 @@
                                      (make-deaf-watch :self-id id :bus bus :stem stem
                                                       :threshold deaf-seconds))
                     :cursor-path (%cursor-path id cursors-dir)
-                    :last-activity now))
+                    :last-activity now
+                    :service-pid service-pid))
          (claimed nil))
     (unwind-protect
          (progn
            (identity-baseline identity wal-path cursors-dir :report-fn report-fn)
            (setf (identity-cursor-mtime identity) (%mtime (identity-cursor-path identity)))
-           (sb-posix:ftruncate fd 0)
-           (sb-posix:lseek fd 0 sb-posix:seek-set)
-           (let ((stream (sb-sys:make-fd-stream fd :input t :output t
-                                                   :external-format :utf-8
-                                                   :buffering :full)))
-             (setf (identity-pid-stream identity) stream)
-             (format stream "~D~%~A~%" service-pid id)
-             (finish-output stream))
-           (setf (identity-pid-ino identity) (sb-posix:stat-ino (sb-posix:fstat fd)))
+           (%take-pid-file identity fd)
            (let ((log-fd (sb-posix:open (%native (identity-log-path identity))
                                         (logior sb-posix:o-creat sb-posix:o-wronly
                                                 sb-posix:o-append *open-nofollow*)
@@ -309,6 +323,44 @@
 
 ;;; ------------------------------------------------------------------ baseline
 
+(defun %heal-baseline (identity wal-path cursor-path rebase-p report-fn)
+  "The baseline for IDENTITY's stranded cursor at CURSOR-PATH: rewritten into
+   the log at WAL-PATH when REBASE-P and the rewrite succeeds, else the log's
+   head. Either outcome is reported with the cursor's old position."
+  (multiple-value-bind (baseline action report)
+      (hostfiles:heal-stranded-baseline (identity-id identity) wal-path cursor-path
+                                        :rebase-p rebase-p)
+    (when (member action '(:rebased :clamped))
+      (let ((rebased-p (eq action :rebased)))
+        (funcall report-fn (if rebased-p :warn :error)
+                 (if rebased-p "stranded-cursor" "stranded-cursor-clamped")
+                 :bus (identity-bus identity) :id (identity-id identity)
+                 :subject (identity-stem identity)
+                 :msg (%stranded-fleet-message report))))
+    ;; A cursor that vanished since it was read has no baseline to give, and
+    ;; the agent then arms at the head as it would with no cursor at all.
+    (or baseline (values (wal:scan wal-path)))))
+
+(defun %stranded-baseline (identity wal-path cursor-path reason head report-fn)
+  "Raise the STRANDED-CURSOR fault for IDENTITY's cursor, stranded for REASON
+   against a log whose head is HEAD, and return the baseline the heal taken
+   gives. Skipped, the fault leaves the identity armed at the head."
+  (restart-case
+      (progn
+        (conditions:raise-fault 'conditions:stranded-cursor
+                                :bus (identity-bus identity)
+                                :id (identity-id identity)
+                                :subject (identity-stem identity)
+                                :detail (format nil "~(~A~) against a log whose head is ~D"
+                                                reason head))
+        (%heal-baseline identity wal-path cursor-path nil report-fn))
+    (conditions:rebase-cursor ()
+      :report "Rewrite the cursor into the current log, reporting its old position."
+      (%heal-baseline identity wal-path cursor-path t report-fn))
+    (clamp-baseline ()
+      :report "Leave the cursor as it is and arm at the head of the log."
+      (%heal-baseline identity wal-path cursor-path nil report-fn))))
+
 (defun identity-baseline (identity wal-path cursors-dir
                           &key (report-fn #'report-to-logs))
   "Set IDENTITY's floor from the agent's durable cursor under CURSORS-DIR over
@@ -317,19 +369,36 @@
    Arming from the cursor is what lets mail that landed while nothing was
    watching still wake the agent. With no readable cursor the floor is the head
    of the log instead: a missing cursor read as 0 would make the whole log owed
-   to an agent that has never read it."
-  (let ((path (%cursor-path (identity-id identity) cursors-dir)))
+   to an agent that has never read it.
+
+   A cursor that is stranded, above the head of the log or recorded against a
+   generation of it that is gone, would filter out every record in the new log
+   while every probe called the agent healthy. That is raised as a
+   STRANDED-CURSOR fault offering two heals. REBASE-CURSOR rewrites the cursor
+   into the current log and reports the old position as a warning, since the
+   rewrite discards the only record of it. CLAMP-BASELINE leaves the cursor
+   alone and arms at the head of the log, reported as an error. A fault the
+   supervisor skips clamps too, so the identity never filters on a stranded
+   value."
+  (let* ((id (identity-id identity))
+         (path (%cursor-path id cursors-dir)))
     (setf (identity-cursor-path identity) path)
     (setf (identity-floor identity)
-          (if (%cursor-holds-seq-p path)
-              (cursor:cursor-value
-               (cursor:make-subscriber (identity-id identity) wal-path path))
+          (if (not (%cursor-holds-seq-p path))
               (progn
                 (funcall report-fn :info "no-cursor"
-                         :bus (identity-bus identity) :id (identity-id identity)
+                         :bus (identity-bus identity) :id id
                          :subject (identity-stem identity)
                          :msg "no readable cursor; armed at the log head")
-                (values (wal:scan wal-path)))))))
+                (values (wal:scan wal-path)))
+              (let* ((subscriber (cursor:make-subscriber id wal-path path))
+                     (head (values (wal:scan wal-path)))
+                     (reason (cursor:stranded-reason
+                              subscriber :head head
+                                         :log-generation (wal:generation wal-path))))
+                (if reason
+                    (%stranded-baseline identity wal-path path reason head report-fn)
+                    (cursor:cursor-value subscriber)))))))
 
 ;;; ------------------------------------------------------------------- readers
 
@@ -456,3 +525,237 @@
           (if (eq (identity-state identity) :serving)
               (progn (%announce identity mail now readers) t)
               (progn (setf (identity-pending-p identity) t) nil)))))))
+
+;;; --------------------------------------------------------------------- ticks
+
+(defun %refresh-beat (identity now)
+  "Move IDENTITY's heartbeat's write date to NOW (Unix seconds). The beat is
+   written once at claim and only touched afterwards, since rewriting every
+   agent's beat every second costs far more than moving its date.
+
+   A beat that cannot be touched is a STALE-BEAT fault, healed by writing the
+   beat again: a probe reads a missing beat as a dead watcher."
+  (let ((path (%native (identity-beat-path identity))))
+    (handler-case (sb-posix:utimes path now now)
+      (sb-posix:syscall-error (e)
+        (restart-case
+            (conditions:raise-fault 'conditions:stale-beat
+                                    :bus (identity-bus identity)
+                                    :id (identity-id identity)
+                                    :subject (identity-stem identity)
+                                    :detail (format nil "the heartbeat ~A could not be refreshed: ~A"
+                                                    path e))
+          (conditions:rewrite-beat ()
+            :report "Write the heartbeat again."
+            (heartbeat:write-beat (identity-beat-path identity)
+                                  :mode :stream :baseline (identity-floor identity)
+                                  :poll-ms 250)
+            (ignore-errors (sb-posix:utimes path now now))))))))
+
+(defun %reclaim-pid-file (identity)
+  "Take IDENTITY's pid file again after it was removed or replaced, and return
+   true, or NIL when another process now holds its lock. The descriptor on the
+   old file is closed only once the new one is held; its lock was on a file
+   that is no longer at the path."
+  (let ((fd (lock-pid-file (identity-pid-path identity)))
+        (old (identity-pid-stream identity)))
+    (when fd
+      (%take-pid-file identity fd)
+      (%close-quietly old)
+      t)))
+
+(defun %check-pid-claim (identity)
+  "Raise PID-CLAIM-LOST when the file at IDENTITY's pid path is gone or is not
+   the one this process holds. Probes read the lock on that path as `a watcher
+   is running`, so a lock on a file no longer there says nothing to them.
+
+   The path is only examined with stat, which opens nothing, so the lock this
+   process holds is never put at risk by the check."
+  (let ((ino (ignore-errors
+              (sb-posix:stat-ino (sb-posix:stat (%native (identity-pid-path identity)))))))
+    (unless (eql ino (identity-pid-ino identity))
+      (restart-case
+          (conditions:raise-fault 'conditions:pid-claim-lost
+                                  :bus (identity-bus identity)
+                                  :id (identity-id identity)
+                                  :subject (identity-stem identity)
+                                  :detail (if ino
+                                              "the pid file was replaced"
+                                              "the pid file was removed"))
+        (conditions:reclaim-pid-file ()
+          :report "Create the pid file again, lock it and record this process."
+          (%reclaim-pid-file identity))))))
+
+(defun %cursor-seq (identity wal-path)
+  "The seq IDENTITY's agent has consumed to, or NIL when its cursor holds
+   nothing readable. NIL is not 0: an unreadable cursor says nothing about what
+   the agent has read."
+  (let ((path (identity-cursor-path identity)))
+    (and path (%cursor-holds-seq-p path)
+         (cursor:cursor-value (cursor:make-subscriber (identity-id identity)
+                                                      wal-path path)))))
+
+(defun %stranded-p (identity wal-path)
+  "True when IDENTITY's cursor is stranded against the log at WAL-PATH. The
+   cheap question, asked before any fault is raised."
+  (let ((path (identity-cursor-path identity)))
+    (and path (%cursor-holds-seq-p path)
+         (ignore-errors
+          (cursor:stranded-reason
+           (cursor:make-subscriber (identity-id identity) wal-path path)))
+         t)))
+
+(defun %recheck-cursor (identity now readers wal-path cursors-dir report-fn
+                        &key force)
+  "Look at IDENTITY's cursor again when its write date has changed since the
+   last look, or when FORCE. A cursor found stranded is healed through
+   IDENTITY-BASELINE, and when the heal lowers the floor the mail between the
+   new floor and the old one is announced at once, since the bus's reader has
+   already moved past it.
+
+   A heal never raises the floor: records above the old floor have not been
+   handed over yet, and skipping them would lose mail."
+  (let ((mtime (%mtime (identity-cursor-path identity))))
+    (when (or force (not (eql mtime (identity-cursor-mtime identity))))
+      (setf (identity-cursor-mtime identity) mtime)
+      (when (%stranded-p identity wal-path)
+        (let* ((old-floor (identity-floor identity))
+               (baseline (identity-baseline identity wal-path cursors-dir
+                                            :report-fn report-fn)))
+          (setf (identity-cursor-mtime identity) (%mtime (identity-cursor-path identity)))
+          (if (< baseline old-floor)
+              (identity-deliver identity
+                                (values (%poll-forward wal-path (wal:make-reader) baseline))
+                                now :readers readers)
+              (setf (identity-floor identity) old-floor)))))))
+
+(defun %unread-mail (identity wal-path)
+  "The records between IDENTITY's cursor and its floor that its agent would be
+   handed, oldest first; NIL when the cursor holds nothing readable or has
+   reached the floor. Records above the floor are left to the next delivery."
+  (let ((cursor (%cursor-seq identity wal-path))
+        (floor (identity-floor identity)))
+    (when (and cursor (< cursor floor))
+      (remove-if (lambda (record) (> (wal:record-seq record) floor))
+                 (values (poll-new-records wal-path cursor (identity-id identity)))))))
+
+(defun %pending-p (identity wal-path)
+  "True when mail IDENTITY's agent would be handed sits above its cursor. The
+   log is read only when the cursor or the floor has moved since the last
+   answer, so a lapsed identity costs a stat and a small file read per tick."
+  (let* ((key (list (%cursor-seq identity wal-path) (identity-floor identity)))
+         (cached (identity-pending-key identity)))
+    (if (and cached (equal (car cached) key))
+        (cdr cached)
+        (let ((pending (and (%unread-mail identity wal-path) t)))
+          (setf (identity-pending-key identity) (cons key pending))
+          pending))))
+
+(defun %offset-time (identity)
+  "When a listener last saved its read offset for IDENTITY's log, in Unix
+   seconds, or NIL when it never has."
+  (let ((date (%mtime (%watch-file identity "offset"))))
+    (and date (%unix-time date))))
+
+(defun %reannounce (identity now readers wal-path cursors-dir report-fn)
+  "Once a recycle window has passed with the log quiet under IDENTITY, announce
+   again the mail still above the agent's cursor, and start the next window.
+
+   This is the detached watcher's re-arm on the same clock: a wake line that
+   nobody heard is not the agent's only chance to learn of its mail. The cursor
+   is checked for stranding first, as a re-arm would."
+  (let ((last (identity-last-activity identity)))
+    (when (and last (>= (- now last) (identity-recycle-seconds identity)))
+      (setf (identity-last-activity identity) now)
+      (%recheck-cursor identity now readers wal-path cursors-dir report-fn :force t)
+      (let ((mail (%unread-mail identity wal-path)))
+        (when mail
+          (%announce identity mail now readers))))))
+
+(defun %lapsed-tick (identity now readers wal-path)
+  "One tick of a lapsed IDENTITY: no lines, only the question of whether mail
+   is waiting unread. Mail that waits counts as a line nobody heard, so the
+   deafness rule raises the alarm after the threshold exactly as it would for a
+   served agent. Returns :HEARD once the cursor has moved past mail that was
+   pending, which ends the lapse, and :OK otherwise."
+  (let ((was (identity-pending-p identity))
+        (pending (%pending-p identity wal-path)))
+    (setf (identity-pending-p identity) pending)
+    (if (and was (not pending))
+        (let ((marker (%watch-file identity "deaf")))
+          (when (probe-file marker) (ignore-errors (delete-file marker)))
+          (setf (identity-deaf-state identity) (make-deaf-state))
+          :heard)
+        (progn
+          (%observe-deaf identity now
+                         :readers (%readers identity readers)
+                         :parked-p (%parked-p identity)
+                         :line-written-p pending
+                         :offset-time (%offset-time identity))
+          :ok))))
+
+(defun identity-tick (identity now &key readers wal-path cursors-dir
+                                        (report-fn #'report-to-logs))
+  "Do IDENTITY's duties for one tick at NOW (Unix seconds) and return :OK, or
+   :HEARD when a lapsed identity's agent has read past its pending mail.
+
+   Every tick refreshes the heartbeat, checks the pid file is still the one
+   held, and looks at the cursor again if it has been rewritten. A served
+   identity then announces unread mail again once a recycle window has passed
+   quietly, and samples the deafness rule; a lapsed one only watches for unread
+   mail. Faults are raised for the supervisor to heal.
+
+   READERS is the count of processes following the log from the supervisor's
+   one census of every log; left out, it is measured here. WAL-PATH and
+   CURSORS-DIR default to the bus's own."
+  (when (eq (identity-state identity) :released)
+    (return-from identity-tick :ok))
+  (let ((wal-path (or wal-path (default-wal-path (identity-bus identity))))
+        (cursors-dir (or cursors-dir (default-cursors-dir (identity-bus identity)))))
+    (%reap-notifiers)
+    (%refresh-beat identity now)
+    (%check-pid-claim identity)
+    (%recheck-cursor identity now readers wal-path cursors-dir report-fn)
+    (if (eq (identity-state identity) :lapsed)
+        (%lapsed-tick identity now readers wal-path)
+        (progn
+          (%reannounce identity now readers wal-path cursors-dir report-fn)
+          (%observe-deaf identity now
+                         :readers (%readers identity readers)
+                         :parked-p (%parked-p identity)
+                         :offset-time (%offset-time identity))
+          :ok))))
+
+;;; -------------------------------------------------------------------- lapses
+
+(defun lapse-identity (identity)
+  "Mark IDENTITY lapsed: its session ended without parking, so no wake lines
+   are written for it, but its files stay held and unread mail still raises
+   the alarm. Returns IDENTITY."
+  (setf (identity-state identity) :lapsed
+        (identity-pending-key identity) nil)
+  identity)
+
+(defun unlapse-identity (identity registration)
+  "Serve IDENTITY again for the session REGISTRATION names, taking that
+   registration's token, session and settings. Returns IDENTITY."
+  (let ((deaf-seconds (or (getf registration :deaf-seconds)
+                          (identity-deaf-seconds identity))))
+    (setf (identity-state identity) :serving
+          (identity-token identity) (getf registration :token)
+          (identity-session-pid identity) (getf registration :session-pid)
+          (identity-session-start identity) (getf registration :session-start)
+          (identity-poll-ms identity) (or (getf registration :poll-ms)
+                                          (identity-poll-ms identity))
+          (identity-recycle-seconds identity) (or (getf registration :recycle-seconds)
+                                                  (identity-recycle-seconds identity))
+          (identity-deaf-seconds identity) deaf-seconds
+          (identity-deaf-watch identity)
+          (and (plusp deaf-seconds)
+               (make-deaf-watch :self-id (identity-id identity)
+                                :bus (identity-bus identity)
+                                :stem (identity-stem identity)
+                                :threshold deaf-seconds))
+          (identity-pending-p identity) nil
+          (identity-pending-key identity) nil))
+  identity)
