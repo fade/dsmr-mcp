@@ -25,7 +25,8 @@
   :version "0.1.0"
   :depends-on ("dsmr-mcp/src/bus/hostfiles"
                "dsmr-bus-host/src/bus/host/conditions"
-               "dsmr-bus-host/src/bus/host/fleetlog")
+               "dsmr-bus-host/src/bus/host/fleetlog"
+               "dsmr-bus-host/src/bus/host/identity")
   :build-operation "program-op"
   :build-pathname "bin/dsmr-bus-host"
   :entry-point "dsmr-bus-host/src/bus/host/main:main")

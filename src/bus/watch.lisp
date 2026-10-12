@@ -104,6 +104,7 @@
            #:%unix-time
            #:%event-line-p
            #:%cursor-baseline
+           #:%cursor-holds-seq-p
            #:%recorded-id-matches-p))
 
 (in-package #:dsmr-bus-watch/src/bus/watch)
