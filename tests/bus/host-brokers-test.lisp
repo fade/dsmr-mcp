@@ -359,6 +359,6 @@
         (ensure-directories-exist (merge-pathnames "idle/" root))
         (with-open-file (out (merge-pathnames "idle/members" root)
                              :direction :output :if-does-not-exist :create)
-          (declare (ignore out)))
+          (declare (ignorable out)))
         (let ((found (brokers:discover-buses :registered-buses '("rb"))))
           (is equal '(nil "rb" "mb") found))))))
