@@ -112,3 +112,17 @@
     (true (gethash "dsmr-mcp/src/bus/cursor" closure)
           "the walk from the leaf found its own dependencies")
     (is equal '() (forbidden-reached closure))))
+
+(define-test host-service-closure-reaches-broker-but-not-the-server
+  "The host service runs every bus broker, so unlike the watcher it must reach
+   the broker and the ZeroMQ transport. It is still not the MCP server, and a
+   service that pulled the server in would carry its whole image on every host.
+   The positive assertions are the control: they show the walk follows the
+   service's edges, so the two absences below are a real answer."
+  (let ((closure (dependency-closure "dsmr-bus-host")))
+    (true (gethash "dsmr-mcp/src/bus/broker" closure))
+    (true (gethash "dsmr-mcp/src/bus/zmq" closure))
+    (true (gethash "dsmr-mcp/src/bus/hostfiles" closure))
+    (true (gethash "dsmr-bus-watch/src/bus/watch" closure))
+    (false (gethash "dsmr-mcp" closure))
+    (false (gethash "dsmr-mcp/src/main" closure))))

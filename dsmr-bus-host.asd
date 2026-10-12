@@ -29,7 +29,8 @@
                "dsmr-bus-host/src/bus/host/identity"
                "dsmr-bus-host/src/bus/host/registry"
                "dsmr-bus-host/src/bus/host/buswatch"
-               "dsmr-bus-host/src/bus/host/brokers")
+               "dsmr-bus-host/src/bus/host/brokers"
+               "dsmr-bus-host/src/bus/host/main")
   :build-operation "program-op"
   :build-pathname "bin/dsmr-bus-host"
   :entry-point "dsmr-bus-host/src/bus/host/main:main")
