@@ -781,6 +781,27 @@ Options:
                        is reported by the next hook arm, from the read offset
                        every --wake saves beside the log when it returns; the
                        first arm ever starts at the end. STDOUT stays empty.
+  --fleet-log          with --wake, listen on the host's fleet error log instead
+                       of an agent's watch log, and print the next fleet line
+                         <time> FLEET <ERROR|WARN|INFO> code=<code> bus=<name>
+                             id=<id> msg=<text>
+                       exactly as written, then exit 0. A fleet line records a
+                       fault the host bus service could not heal, or one that
+                       stopped it. A leader keeps one such wake armed in the
+                       background beside its bus listener, re-arms it after
+                       each return, and on a wake reads the fleet log and
+                       --host-status. It follows the --wake contract: the idle
+                       line and exit 0 at --wake-seconds, a log that is rotated
+                       is followed onto its new file, and it resumes from where
+                       the last fleet-log wake for the same identity stopped
+                       reading, so a line written between two wakes is still
+                       reported (with no identity it starts at the end). One
+                       fleet-log listener per identity: a second prints
+                       `already-armed` and exits 0 (but see --wait-for-arm),
+                       and it never blocks the identity's bus listener. On a
+                       host where neither the service nor the fleet log has
+                       ever existed it prints `noservice` and exits 1.
+                       Cannot be combined with --hook.
   --deaf-seconds N     how long a wake line may sit unheard in a detached
                        watcher's log before the watcher raises the deafness
                        alarm (default 600; 0 turns the alarm off). A line
@@ -876,6 +897,7 @@ detached watcher, its pid file.
   (stall-seconds 120)
   (host-status-p nil)
   (host-restore-p nil)
+  (fleet-log-p nil)
   (help-p nil))
 
 (defun %parse-nonneg (string flag)
@@ -929,6 +951,8 @@ detached watcher, its pid file.
                   (setf (opt-host-status-p opts) t))
                  ((string= arg "--host-restore")
                   (setf (opt-host-restore-p opts) t))
+                 ((string= arg "--fleet-log")
+                  (setf (opt-fleet-log-p opts) t))
                  ((string= arg "--detach")
                   (setf (opt-detach-p opts) t))
                  ((string= arg "--detached-child")
@@ -2777,10 +2801,11 @@ detached watcher, its pid file.
    agent was last heard."
   (make-pathname :type "offset" :defaults log-path))
 
-(defun %read-offset (log-path)
-  "The inode and position a listener last saved for LOG-PATH, as a cons
-   (ino . pos), or NIL when none was saved or the file does not read as one."
-  (let ((line (ignore-errors (first (uiop:read-file-lines (%offset-path log-path))))))
+(defun %read-offset (log-path &optional (offset-path (%offset-path log-path)))
+  "The inode and position a listener last saved for LOG-PATH in OFFSET-PATH
+   (by default the offset file beside the log), as a cons (ino . pos), or NIL
+   when none was saved or the file does not read as one."
+  (let ((line (ignore-errors (first (uiop:read-file-lines offset-path)))))
     (flet ((number-after (key)
              (let ((at (and line (search key line))))
                (and at (ignore-errors
@@ -2790,27 +2815,32 @@ detached watcher, its pid file.
             (pos (number-after "pos=")))
         (and ino pos (>= pos 0) (cons ino pos))))))
 
+(defun %save-offset (log-path &optional (offset-path (%offset-path log-path)))
+  "Record in OFFSET-PATH (by default the offset file beside the log) how far a
+   listener has now covered the log at LOG-PATH: its inode and its whole
+   current size. A failure is reported and otherwise ignored: the wake it
+   follows has happened either way."
+  (handler-case
+      (let ((stat (sb-posix:stat (uiop:native-namestring log-path))))
+        (with-open-file (out offset-path
+                             :direction :output :if-exists :supersede
+                             :if-does-not-exist :create)
+          (format out "ino=~D pos=~D~%"
+                  (sb-posix:stat-ino stat) (sb-posix:stat-size stat))))
+    (error (e)
+      (%warn "could not save the read offset for ~A: ~A"
+             (uiop:native-namestring log-path) e))))
+
 (defun %save-offsets (targets)
   "Record, beside each log in TARGETS, how far a listener has now covered it:
-   the log's inode and its whole current size.
+   the log's inode and its whole current size (see %SAVE-OFFSET).
 
    The whole size rather than the position after the reported line, because
    the woken agent drains the bus, which covers every line already written;
    only a line written after this belongs to the next arm. The deafness alarm
-   reads the time of this write as the moment the agent was last heard. A
-   failure is reported and otherwise ignored: the wake it follows has
-   happened either way."
+   reads the time of this write as the moment the agent was last heard."
   (loop for (nil log-path) in targets
-        do (handler-case
-               (let ((stat (sb-posix:stat (uiop:native-namestring log-path))))
-                 (with-open-file (out (%offset-path log-path)
-                                      :direction :output :if-exists :supersede
-                                      :if-does-not-exist :create)
-                   (format out "ino=~D pos=~D~%"
-                           (sb-posix:stat-ino stat) (sb-posix:stat-size stat))))
-             (error (e)
-               (%warn "could not save the read offset for ~A: ~A"
-                      (uiop:native-namestring log-path) e)))))
+        do (%save-offset log-path)))
 
 (defun %follow-rewind (fol ino pos)
   "Move FOL, just opened at the end of its file, back to POS, when the file is
@@ -2832,12 +2862,13 @@ detached watcher, its pid file.
 (defun %wake-wait (targets poll-ms
                    &key (watcher-alive-p (lambda (pid-path)
                                            (and (%live-detached-pid pid-path) t)))
-                        deadline-ms start-offsets)
+                        deadline-ms start-offsets (event-p #'%event-line-p))
   "Wait for the next event line in any of TARGETS and return (values :event
    line bus), or (values :no-watcher nil bus) naming the first bus whose
    detached watcher is not running. Each target is a list (bus log-path
    pid-path). DEADLINE-MS, when given, is a limit in milliseconds after which
-   this returns :timeout.
+   this returns :timeout. EVENT-P decides which lines count as events (by
+   default the wake and error lines of a watch log).
 
    Every log is read from its end as it stands when this starts, so a line
    already there is never reported again. START-OFFSETS, an alist from a log's
@@ -2868,7 +2899,7 @@ detached watcher, its pid file.
       (unwind-protect
            (loop
              (loop for (bus . fol) in followers
-                   do (let ((line (find-if #'%event-line-p (%follow-lines fol))))
+                   do (let ((line (find-if event-p (%follow-lines fol))))
                         (when line
                           (return-from %wake-wait (values :event line bus)))))
              (multiple-value-bind (dead bus) (dead-bus)
@@ -2960,10 +2991,12 @@ detached watcher, its pid file.
   "The open stream on this listener's lock file. Held for the life of the
    process, since closing any descriptor on the file would drop the lock.")
 
-(defun %armed-lock (self-id)
+(defun %armed-lock (self-id &optional (type "armed"))
   "Take the listener lock for SELF-ID, which every --wake holds while it waits.
    Returns true when this process now holds it, and NIL when another listener
-   for the same identity already does.
+   for the same identity already does. TYPE names the lock file: a fleet-log
+   listener takes its own, so it and the identity's bus listener never block
+   each other.
 
    The lock is per identity rather than per bus. An agent has one session to
    wake, and two listeners armed for it, whether two stacked Stop hooks or a
@@ -2971,7 +3004,7 @@ detached watcher, its pid file.
 
    A lock file that cannot be opened at all is reported and treated as taken by
    this process: refusing to listen over it would leave the agent deaf."
-  (let ((path (%detach-file (%identity-stem self-id) "armed")))
+  (let ((path (%detach-file (%identity-stem self-id) type)))
     (let ((fd (handler-case
                   (progn
                     (ensure-directories-exist path)
@@ -2994,7 +3027,7 @@ detached watcher, its pid file.
               (ignore-errors (sb-posix:close fd))
               nil))))))
 
-(defun %await-armed-lock (self-id poll-ms deadline-ms)
+(defun %await-armed-lock (self-id poll-ms deadline-ms &optional (type "armed"))
   "Wait for the listener lock for SELF-ID, trying for it every POLL-MS, and
    return true once this process holds it, or NIL when DEADLINE-MS (NIL for no
    limit) passes first.
@@ -3008,13 +3041,14 @@ detached watcher, its pid file.
   (let ((sleep-s (/ (max poll-ms 1) 1000.0))
         (limit (and deadline-ms (+ (now-ms) deadline-ms))))
     (loop
-      (when (%armed-lock self-id)
+      (when (%armed-lock self-id type)
         (return t))
       (when (and limit (>= (now-ms) limit))
         (return nil))
       (sleep sleep-s))))
 
-(defun %arm-wake (self-id hook-p waits-p poll-ms wake-seconds)
+(defun %arm-wake (self-id hook-p waits-p poll-ms wake-seconds
+                  &optional (lock-type "armed"))
   "Take the listener lock for SELF-ID on behalf of --wake, or end the process
    when this wake is not to listen. Returns how many milliseconds of
    WAKE-SECONDS are left for the listen itself, or NIL for no limit.
@@ -3023,18 +3057,18 @@ detached watcher, its pid file.
    0, and a default wake with `already-armed`. A wake that WAITS-P waits for the
    lock instead, and prints the idle line and exits 0 when WAKE-SECONDS run out
    first, so the limit a background runner imposes covers the wait and the
-   listen together."
+   listen together. LOCK-TYPE names the listener lock (see %ARMED-LOCK)."
   (let ((deadline-ms (%wake-deadline-ms wake-seconds))
         (started-ms (now-ms)))
     (flet ((say-and-exit (text)
              (format *standard-output* "~A~%" text)
              (force-output *standard-output*)
              (uiop:quit 0)))
-      (unless (%armed-lock self-id)
+      (unless (%armed-lock self-id lock-type)
         (cond
           (hook-p (uiop:quit 0))
           ((not waits-p) (say-and-exit "already-armed"))
-          ((not (%await-armed-lock self-id poll-ms deadline-ms))
+          ((not (%await-armed-lock self-id poll-ms deadline-ms lock-type))
            (say-and-exit (%idle-line wake-seconds)))))
       (and deadline-ms
            (max 0 (- deadline-ms (- (now-ms) started-ms)))))))
@@ -3067,6 +3101,71 @@ detached watcher, its pid file.
   (format *error-output* "~A~%dsmr-bus-watch: ~A~%" line advice)
   (force-output *error-output*)
   (uiop:quit 2))
+
+(defun %fleet-offset-path (self-id)
+  "Where SELF-ID's fleet-log listener keeps its read offset:
+   fleet-error--<agent>--<hash>.offset in the host directory. The fleet log is
+   shared by every leader on the host, so the offset is per identity and never
+   beside the log, where one leader's read would move another's."
+  (uiop:parse-native-namestring
+   (concatenate 'string
+                (uiop:native-namestring (hostfiles:host-dir))
+                "fleet-error--" (%identity-stem self-id) ".offset")))
+
+(defun %wake-fleet-log (opts self-id)
+  "Block until the next fleet line reaches the host's fleet error log, print it
+   and exit 0, or print the idle line and exit 0 when --wake-seconds pass first.
+   This is --wake --fleet-log: what a leader keeps armed in the background so
+   a fault the host service could not heal reaches it without polling.
+
+   It keeps the identity wake's contract. The log is followed across a
+   rotation onto its new file. With an identity, the wake resumes from the
+   offset the last fleet-log wake for that identity saved, so a line written
+   while no wake was armed is still reported, and saves its own on return; the
+   first ever starts at the end. One fleet-log listener per identity, through
+   a lock of its own, so it never stands in the way of the identity's bus
+   listener: a second prints `already-armed` and exits 0, or with
+   --wait-for-arm waits its turn. With no identity it starts at the end, saves
+   nothing and takes no lock.
+
+   On a host where the service was never installed and no fleet log exists,
+   nothing will ever write one, so it prints `noservice` and exits 1 rather
+   than waiting for ever."
+  (let ((log (hostfiles:fleet-log-path)))
+    (flet ((say-and-exit (text code)
+             (format *standard-output* "~A~%" text)
+             (force-output *standard-output*)
+             (uiop:quit code)))
+      (unless (or (hostfiles:service-installed-p) (probe-file log))
+        (%warn "no host bus service is installed here and there is no fleet log ~
+                at ~A to listen on"
+               (uiop:native-namestring log))
+        (say-and-exit "noservice" 1))
+      (unless self-id
+        (%warn "no identity resolved; listening on the fleet log from its end, ~
+                with no saved offset and no listener lock"))
+      (%install-termination-handler)
+      (let* ((wake-seconds (opt-wake-seconds opts))
+             (listen-ms (if self-id
+                            (%arm-wake self-id nil (opt-wait-for-arm-p opts)
+                                       (opt-poll-ms opts) wake-seconds
+                                       "fleet-armed")
+                            (%wake-deadline-ms wake-seconds)))
+             (offset-path (and self-id (%fleet-offset-path self-id)))
+             (saved (and offset-path (%read-offset log offset-path))))
+        (multiple-value-bind (outcome line)
+            (%wake-wait (list (list nil log nil)) (opt-poll-ms opts)
+                        :watcher-alive-p (constantly t)
+                        :event-p #'hostfiles:fleet-line-p
+                        :deadline-ms listen-ms
+                        :start-offsets (and saved
+                                            (list (cons (uiop:native-namestring log)
+                                                        saved))))
+          (when (and offset-path (probe-file log))
+            (%save-offset log offset-path))
+          (if (eq outcome :event)
+              (say-and-exit line 0)
+              (say-and-exit (%idle-line wake-seconds) 0)))))))
 
 (defun %wake (opts bus self-id)
   "Block until the next event line reaches this agent's detached log, print it
@@ -3110,6 +3209,8 @@ detached watcher, its pid file.
    at every turn end and must never turn into a loop: no identity, input naming
    a subagent, another listener already armed, or a missing watcher it already
    reported within the hour."
+  (when (opt-fleet-log-p opts)
+    (%wake-fleet-log opts self-id))
   (let ((hook-p (opt-hook-p opts)))
     (when (and hook-p
                (or (null self-id)
@@ -3218,6 +3319,13 @@ detached watcher, its pid file.
         (when (opt-help-p opts)
           (%usage)
           (uiop:quit 0))
+        ;; A fleet-log listener that ran as anything else would listen on the
+        ;; wrong log, or as a hook wake a session over the fleet's faults, so
+        ;; this misuse is refused rather than downgraded.
+        (when (and (opt-fleet-log-p opts)
+                   (or (not (opt-wake-p opts)) (opt-hook-p opts)))
+          (%warn "--fleet-log goes with --wake, and not with --hook")
+          (uiop:quit 64))
         ;; About the host, not about one identity or one bus, so it answers
         ;; before either is resolved.
         (when (opt-host-status-p opts)
