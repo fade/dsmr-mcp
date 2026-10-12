@@ -27,7 +27,8 @@
                "dsmr-bus-host/src/bus/host/conditions"
                "dsmr-bus-host/src/bus/host/fleetlog"
                "dsmr-bus-host/src/bus/host/identity"
-               "dsmr-bus-host/src/bus/host/registry")
+               "dsmr-bus-host/src/bus/host/registry"
+               "dsmr-bus-host/src/bus/host/buswatch")
   :build-operation "program-op"
   :build-pathname "bin/dsmr-bus-host"
   :entry-point "dsmr-bus-host/src/bus/host/main:main")
