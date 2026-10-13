@@ -329,6 +329,30 @@
           "the shared reader stands at the end of the log")
       (is = 3 (buswatch:bus-watch-progress bw)))))
 
+(define-test an-agent-armed-behind-the-reader-hears-the-mail-it-missed
+  "An agent that registers after the bus's reader has already passed mail
+   above its cursor is told of that mail on the next step, in one line naming
+   the newest record, and only once; mail after that reaches it as usual."
+  (with-host ()
+    (loop for seq from 1 to 3 do (append-from seq *other*))
+    (let ((bw (open-watch :feed nil)))
+      (step-watch bw '())
+      (is = 3 (buswatch:bus-watch-last-seq bw) "the reader has passed the mail")
+      (write-text (cursor-file "alpha") "1")
+      (let ((alpha (claim "alpha")))
+        (is = 1 (ident:identity-floor alpha))
+        (step-watch bw (list alpha))
+        (is = 1 (length (log-lines "alpha")) "~S" (log-lines "alpha"))
+        (true (uiop:string-prefix-p "bus:3 " (first (log-lines "alpha")))
+              "~S" (log-lines "alpha"))
+        (step-watch bw (list alpha))
+        (is = 1 (length (log-lines "alpha")) "the missed mail was announced twice")
+        (append-from 4 *other*)
+        (step-watch bw (list alpha))
+        (is = 2 (length (log-lines "alpha")))
+        (true (uiop:string-prefix-p "bus:4 " (second (log-lines "alpha")))
+              "~S" (log-lines "alpha"))))))
+
 ;;; ------------------------------------------------------------------ rotation
 
 (define-test a-rotation-rebases-every-stranded-stable-cursor-once

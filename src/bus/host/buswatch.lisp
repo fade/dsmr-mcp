@@ -264,19 +264,40 @@
             (%remake-feed bw))))
       (setf (bus-watch-growth-without-nudge bw) 0)))
 
-(defun %deliver (bw identities records now)
-  "Hand RECORDS to every agent in IDENTITIES on BW's bus. The readers of every
-   log are counted in one pass, and only when there is something to announce."
-  (when records
-    (let* ((served (remove-if-not (lambda (identity) (%on-bus-p bw identity))
-                                  identities))
-           (counts (ident:log-reader-counts (mapcar #'ident:identity-log-path served))))
-      (sb-thread:with-recursive-lock ((bus-watch-lock bw))
-        (dolist (identity served)
-          (ident:identity-deliver
-           identity records now
-           :readers (gethash (uiop:native-namestring (ident:identity-log-path identity))
-                             counts)))))))
+(defun %owed (bw identity records before)
+  "What IDENTITY is handed this step: RECORDS, read on from BEFORE, where the
+   reader had stopped. An agent armed below BEFORE, as one registering with
+   mail already waiting above its cursor is, gets everything in the log above
+   its floor instead, since the reader has already gone past that mail and
+   would otherwise never hand it over."
+  (if (< (ident:identity-floor identity) before)
+      (values (%poll-forward (bus-watch-wal-path bw) (wal:make-reader)
+                             (ident:identity-floor identity)))
+      records))
+
+(defun %deliver (bw identities records now before)
+  "Hand every agent in IDENTITIES on BW's bus what it is owed this step: the
+   RECORDS just read, or more for one armed below BEFORE (see %OWED). The
+   readers of every log are counted in one pass, and only when there is
+   something to hand over. A batch is worked out under the lock and handed over
+   under it again; a record at or below an agent's floor by then is ignored, so
+   nothing is announced twice."
+  (let* ((served (remove-if-not (lambda (identity) (%on-bus-p bw identity))
+                                identities))
+         (batches (sb-thread:with-recursive-lock ((bus-watch-lock bw))
+                    (mapcar (lambda (identity) (%owed bw identity records before))
+                            served))))
+    (when (some #'identity batches)
+      (let ((counts (ident:log-reader-counts (mapcar #'ident:identity-log-path served))))
+        (sb-thread:with-recursive-lock ((bus-watch-lock bw))
+          (loop for identity in served
+                for batch in batches
+                when batch
+                  do (ident:identity-deliver
+                      identity batch now
+                      :readers (gethash (uiop:native-namestring
+                                         (ident:identity-log-path identity))
+                                        counts))))))))
 
 (defun bus-watch-step (bw identities now &key (report-fn #'ident:report-to-logs))
   "One step of BW: wait for a nudge or the backstop, read the log forward once,
@@ -291,14 +312,15 @@
     (when nudged (incf (bus-watch-nudges-seen bw)))
     (multiple-value-bind (records last restarted)
         (%poll-forward (bus-watch-wal-path bw) (bus-watch-reader bw) 0)
-      (let* ((generation (wal:generation (bus-watch-wal-path bw)))
+      (let* ((before (bus-watch-last-seq bw))
+             (generation (wal:generation (bus-watch-wal-path bw)))
              (rotated (or restarted (/= generation (bus-watch-generation bw))))
              (grew (and (not rotated) (> last (bus-watch-last-seq bw)))))
         (setf (bus-watch-generation bw) generation
               (bus-watch-last-seq bw) last)
         (when rotated
           (%rotated bw identities report-fn))
-        (%deliver bw identities records now)
+        (%deliver bw identities records now before)
         (%watch-gap bw nudged grew)
         (incf (bus-watch-progress bw))
         (length records)))))
