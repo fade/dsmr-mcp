@@ -1,0 +1,41 @@
+[Unit]
+Description=dsmr-mcp host bus service (brokers and watcher for every bus on this host)
+# Each failure starts the alarm unit, so a crash loop is never silent.
+OnFailure=dsmr-bus-host-failed.service
+# No start limit: a crash loop keeps retrying while the fleet log says why,
+# rather than leaving every agent on the host deaf until someone notices.
+StartLimitIntervalSec=0
+
+[Service]
+# READY=1 is sent once every bus on the host has a broker or a recorded
+# degradation, so a successful start means the buses are actually served.
+Type=notify
+NotifyAccess=main
+ExecStart=%h/.local/bin/dsmr-bus-host
+# Readiness is strict: a bus whose broker neither serves nor is recorded as
+# degraded withholds READY=1. The service is normally ready in about a second,
+# so a minute without it means it is wedged; systemd then stops it, which
+# raises the alarm below, and starts it again.
+TimeoutStartSec=60
+# Always, not on-failure: the service only exits 0 after an orderly stop, so a
+# clean exit outside one is a fault too, and it must come back.
+Restart=always
+RestartSec=1
+# The supervisor sends WATCHDOG=1 every second while its broker and watch
+# threads are moving; a service that stops making progress is killed and
+# restarted.
+WatchdogSec=30
+TimeoutStopSec=10
+# KillMode is left at its default on purpose: everything in the service's
+# cgroup goes with it, because an old broker that survived a restart would
+# keep holding its bus's election and the new service could never serve it.
+#
+# This runs after every stop, whatever the restart mode or systemd version, so
+# every crash raises the alarm even where an automatic restart never enters
+# the failed state OnFailure= waits for. The alarm says nothing after an
+# ordinary stop, and raises one alarm when this and the alarm unit both run.
+ExecStopPost=%h/.local/bin/dsmr-bus-watch --host-failed
+Nice=5
+
+[Install]
+WantedBy=default.target

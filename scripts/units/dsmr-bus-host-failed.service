@@ -1,0 +1,9 @@
+[Unit]
+Description=dsmr-mcp host bus service failure alarm
+
+[Service]
+Type=oneshot
+# Appends one FLEET ERROR line to the fleet log and raises one desktop
+# notification. It needs nothing from the service, which is dead or
+# restarting by the time this runs.
+ExecStart=%h/.local/bin/dsmr-bus-watch --host-failed

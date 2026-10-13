@@ -17,7 +17,7 @@ export XDG_CACHE_HOME ?= $(CURDIR)/.ci-cache
 # whenever the dependencies, the SBCL build, or the project source change.
 CORE ?= dsmr.core
 
-.PHONY: bridge bus-watch bus-host install-bus-watch test test-integration core core-verify test-warm \
+.PHONY: bridge bus-watch bus-host install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify test-warm \
         install-skills check-skills install-harness check-harness install-sisters check-sisters \
         preflight check-preflight self-test-preflight install-hooks check-hooks
 
@@ -42,6 +42,12 @@ SKILLDIR ?= $(HOME)/.claude/skills
 # that every session is expected to share, is wrong the moment it is scoped to
 # one project: it cannot reach the others, and a fleet restart cannot widen it.
 AGENTDIR ?= $(HOME)/.claude
+
+# Where the host bus service's systemd user units are deployed. The user
+# manager reads its own units from here, and the service is a per-user one: it
+# serves the buses under this user's state directory, needs no root, and keeps
+# running between logins when linger is enabled for the user.
+UNITDIR ?= $(HOME)/.config/systemd/user
 
 ## bridge: build the standalone stdio<->TCP bridge binary.
 ##
@@ -129,6 +135,80 @@ install-bus-watch: bus-watch
 	@mv -f "$(BINDIR)/.dsmr-bus-watch.tmp" "$(BINDIR)/dsmr-bus-watch"
 	@echo "installed $(BINDIR)/dsmr-bus-watch"
 	@echo "running watchers keep the previous image until each is re-armed"
+
+## install-bus-host: publish the built host bus service binary onto PATH.
+##
+##   The service's unit runs the copy under $(BINDIR), so this is the step that
+##   changes what the host runs. Installed atomically for the same reason as the
+##   watcher. The running service keeps the image it started with until it is
+##   restarted, and a restart is a deliberate act because every agent on the
+##   host hears the bus through it.
+install-bus-host: bus-host
+	@mkdir -p "$(BINDIR)"
+	@cp bin/dsmr-bus-host "$(BINDIR)/.dsmr-bus-host.tmp"
+	@chmod 755 "$(BINDIR)/.dsmr-bus-host.tmp"
+	@mv -f "$(BINDIR)/.dsmr-bus-host.tmp" "$(BINDIR)/dsmr-bus-host"
+	@echo "installed $(BINDIR)/dsmr-bus-host"
+	@echo "the running service keeps the previous image until 'systemctl --user restart dsmr-bus-host'"
+
+## install-host-unit: deploy the host bus service's systemd user units.
+##
+##   Copies the service unit and its failure alarm unit into $(UNITDIR), reloads
+##   the user manager and enables the service so it starts at the next login or
+##   boot. It does not start it: starting the service moves every agent on the
+##   host onto it, and that is a step to take on purpose.
+##
+##   A deployed unit that differs from this tree is refused, with the
+##   difference, unless FORCE=1: a unit edited in place on a host is usually a
+##   local fix, and this target would destroy it. Run check-host-unit first and
+##   port the edit back here if it should be kept.
+HOST_UNITS = dsmr-bus-host.service dsmr-bus-host-failed.service
+install-host-unit:
+	@set -e; \
+	mkdir -p "$(UNITDIR)"; \
+	for u in $(HOST_UNITS); do \
+	  if [ -f "$(UNITDIR)/$$u" ] && ! cmp -s "scripts/units/$$u" "$(UNITDIR)/$$u" && [ "$(FORCE)" != 1 ]; then \
+	    echo "REFUSED: $(UNITDIR)/$$u differs from scripts/units/$$u" >&2; \
+	    diff -u "$(UNITDIR)/$$u" "scripts/units/$$u" | head -40 >&2; \
+	    echo "port the deployed edit into this tree, or pass FORCE=1 to replace it" >&2; \
+	    exit 1; \
+	  fi; \
+	done; \
+	for u in $(HOST_UNITS); do \
+	  cp "scripts/units/$$u" "$(UNITDIR)/.$$u.tmp"; \
+	  chmod 644 "$(UNITDIR)/.$$u.tmp"; \
+	  mv -f "$(UNITDIR)/.$$u.tmp" "$(UNITDIR)/$$u"; \
+	  echo "installed $(UNITDIR)/$$u"; \
+	done; \
+	systemctl --user daemon-reload; \
+	systemctl --user enable dsmr-bus-host.service; \
+	echo "enabled, not started: 'systemctl --user start dsmr-bus-host' moves this host's agents onto it"
+
+## check-host-unit: report whether the deployed units match this tree.
+##
+##   Never edits. Prints match, DIFFERS (with the difference) or NOT DEPLOYED for
+##   each unit, then whether the user lingers (without it the service stops at
+##   logout) and whether the service is enabled and running.
+##
+##   Each deployed unit is also put through systemd-analyze verify on its own,
+##   and any line it prints fails the check. Its exit status cannot be used:
+##   verify exits 0 after warning about a misspelled directive, which systemd
+##   then ignores. The alarm unit is verified separately because verifying the
+##   service does not notice that the unit its OnFailure= names is missing.
+check-host-unit:
+	@status=0; \
+	for u in $(HOST_UNITS); do \
+	  if [ ! -f "$(UNITDIR)/$$u" ]; then echo "NOT DEPLOYED: $(UNITDIR)/$$u"; continue; \
+	  elif cmp -s "scripts/units/$$u" "$(UNITDIR)/$$u"; then echo "match: $(UNITDIR)/$$u"; \
+	  else echo "DIFFERS: $(UNITDIR)/$$u"; diff -u "$(UNITDIR)/$$u" "scripts/units/$$u" | head -40; fi; \
+	  out=$$(systemd-analyze --user verify "$(UNITDIR)/$$u" 2>&1); \
+	  if [ -z "$$out" ]; then echo "verify clean: $$u"; \
+	  else echo "VERIFY WARNS: $$u"; echo "$$out" | sed 's/^/  /'; status=1; fi; \
+	done; \
+	echo "linger: $$(loginctl show-user "$$(id -un)" -p Linger --value 2>/dev/null || echo unknown)"; \
+	echo "enabled: $$(systemctl --user is-enabled dsmr-bus-host.service 2>/dev/null || true)"; \
+	echo "active: $$(systemctl --user is-active dsmr-bus-host.service 2>/dev/null || true)"; \
+	exit $$status
 
 ## preflight: check this host can run a fleet, establishing what is safe to.
 ##
