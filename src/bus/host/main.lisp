@@ -433,10 +433,13 @@ not start, 75 when its supervisor loop stalled.
    takes over any detached watcher left running and looks for buses to serve,
    starting a broker and a reader for each new one. Once a second it refreshes
    its beat, looks at every agent's session and does every agent's duties,
-   checks every broker, and tells systemd it is ready and alive. Once every five
-   seconds, last, it writes its status summary. The first tick does all of it."
+   checks every broker, and tells systemd it is ready and alive. Last, it
+   writes its status summary, every five seconds and also on the tick it
+   becomes ready, so the summary never says a bus is unserved for five seconds
+   after it is served. The first tick does all of it."
   (let ((five (%due-p (service-last-five svc) now 5))
-        (second (%due-p (service-last-second svc) now 1)))
+        (second (%due-p (service-last-second svc) now 1))
+        (was-ready (service-ready-p svc)))
     (%scan-registrations svc now)
     (when five
       (%adopt svc now)
@@ -448,7 +451,8 @@ not start, 75 when its supervisor loop stalled.
       (%check-brokers svc now)
       (%tell-systemd svc now))
     (when five
-      (setf (service-last-five svc) now)
+      (setf (service-last-five svc) now))
+    (when (or five (and (not was-ready) (service-ready-p svc)))
       (%write-status svc now)))
   svc)
 
