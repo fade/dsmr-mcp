@@ -457,6 +457,23 @@ first thing you do:
   --bus <tag> --agent <your-name> --namespace /absolute/path/to/this/repo/
 ```
 
+⭐ **Where the host bus service is installed, that same line registers you with
+it instead of starting a watcher.** One process on the host (`dsmr-bus-host`,
+under systemd) runs every bus's broker and watches every registered agent,
+writing the same lines to the same log, so everything below works unchanged.
+`--detach` names the service's pid in its `detached`/`running` line, and starts
+a watcher of your own only when the service is not installed or does not answer
+within 5 seconds (it says so on stderr; the service takes that watcher over when
+it returns). `--host-status` shows whether the service is up:
+`service state=not-installed` means the detached watcher described here is what
+you have.
+
+- **Stale-binary tell:** with the service up, a `--detached-child` process for
+  your identity, seen as `--detach` or `--check-live` naming a pid that is not
+  the service's, means an older binary armed you. The service adopts it within
+  about 5 seconds, so you are still heard, but say so in your report: the fix is
+  `make install-bus-watch` on this host.
+
 Then the standing listener: **one background Bash command** (`run_in_background:
 true`), NOT the Monitor tool. It exits on the next `bus:`/`error:` line from any of
 your detached logs, and that exit is what wakes you:
@@ -472,6 +489,10 @@ On wake, an `idle wake-seconds=<N>` line included: drain **every** joined bus wi
 permanent** (operator, 2026-10-01): a quiet bus is normal, and a runner kill at the
 time limit is a wake too, so drain and re-arm whatever its note says. An idle
 sister wakes once every 110 minutes and does nothing else.
+
+`nowatcher` can also mean the host bus service is restarting. systemd brings it
+back within seconds; run `--detach` again, which registers you or, if the
+service is still down, starts a watcher of your own.
 
 ⭐ **If the session Stop hook is installed** (`grep -c -- '--wake --hook'
 ~/.claude/settings.json` prints 1 or more), it re-arms itself at every turn end,
@@ -593,6 +614,12 @@ means; the bus holds your mail on your cursor. A `BLOCKED` park inside a live
 session is different: it sets no marker and keeps its listener armed, so it stays
 reachable and a deafness alarm still means something.
 
+With the host bus service installed, your registration ends when your parked
+session ends: the marker stays, your mail waits at your cursor, no alarm fires,
+and `--check-live` reads `dead ... parked=1` until your next bring-up, whose
+`--detach` registers you again and clears the marker. That is expected, not a
+fault, and you still do not reap at a park.
+
 `--reap` is for **leaving the fleet** (`bus-leave`, disenrollment) or retiring a
 host, after your last drain:
 
@@ -602,6 +629,8 @@ host, after your last drain:
 
 Exit 0 means nothing of yours is left. Exit 1 (`survived` or `foreign`) is said in
 your report, never left silently.
+Where the host bus service watches you, `--reap` deregisters you from it
+(`reaped pid=<service pid> bus=<b> signal=deregister`) and signals nothing.
 
 ⛔ **Do not use the roster as proof you are connected.** Being enrolled is not
 being reachable, and being unenrolled does not stop you reaching the bus. The

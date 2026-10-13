@@ -96,3 +96,33 @@
    system is the one that got in."
   (let ((closure (dependency-closure *watcher-system*)))
     (is equal '() (forbidden-reached closure))))
+
+(define-test watcher-reaches-the-shared-host-file-leaf
+  "The watcher names its files through the leaf the host service also uses.
+   This is the control on the case below: it shows the walk sees the edge into
+   that leaf, so a clean closure under it is a real answer."
+  (let ((closure (dependency-closure *watcher-system*)))
+    (true (gethash "dsmr-mcp/src/bus/hostfiles" closure))))
+
+(define-test host-file-leaf-reaches-no-transport-or-broker
+  "The host-file leaf is shared with the host service, which does run brokers,
+   so it is the likeliest door for the transport to come in by. Its own closure
+   is held to the watcher's rule, and a failure names the system that got in."
+  (let ((closure (dependency-closure "dsmr-mcp/src/bus/hostfiles")))
+    (true (gethash "dsmr-mcp/src/bus/cursor" closure)
+          "the walk from the leaf found its own dependencies")
+    (is equal '() (forbidden-reached closure))))
+
+(define-test host-service-closure-reaches-broker-but-not-the-server
+  "The host service runs every bus broker, so unlike the watcher it must reach
+   the broker and the ZeroMQ transport. It is still not the MCP server, and a
+   service that pulled the server in would carry its whole image on every host.
+   The positive assertions are the control: they show the walk follows the
+   service's edges, so the two absences below are a real answer."
+  (let ((closure (dependency-closure "dsmr-bus-host")))
+    (true (gethash "dsmr-mcp/src/bus/broker" closure))
+    (true (gethash "dsmr-mcp/src/bus/zmq" closure))
+    (true (gethash "dsmr-mcp/src/bus/hostfiles" closure))
+    (true (gethash "dsmr-bus-watch/src/bus/watch" closure))
+    (false (gethash "dsmr-mcp" closure))
+    (false (gethash "dsmr-mcp/src/main" closure))))

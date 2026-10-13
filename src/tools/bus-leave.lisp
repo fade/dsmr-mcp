@@ -22,7 +22,8 @@
 
 (defpackage #:dsmr-mcp/src/tools/bus-leave
   (:use #:cl)
-  (:local-nicknames (#:agent #:dsmr-mcp/src/bus/agent))
+  (:local-nicknames (#:agent #:dsmr-mcp/src/bus/agent)
+                    (#:hostfiles #:dsmr-mcp/src/bus/hostfiles))
   (:import-from #:dsmr-mcp/src/tools/base
                 #:mcp-tool #:mcp-tool-class #:tool-handle #:tool-session)
   (:import-from #:dsmr-mcp/src/tools/helpers
@@ -104,6 +105,21 @@ bound, so some were left unread rather than delivered."
 anyway. Without that record the busmaster has nothing to age your cursor \
 against, so an operator should disenroll you with bus-roster.")))
 
+(defun %deregister (a)
+  "Stop the host service watching the departed agent A on its bus, and answer
+   whether a registration was there to remove.
+
+   Only a stable identity registers with the service, so an ephemeral one is
+   left alone. The departure has already happened by the time this runs, so a
+   registration that cannot be removed answers false rather than turning a
+   completed leave into an error; the service also drops a registration whose
+   session has ended."
+  (and (agent:agent-stable-p a)
+       (ignore-errors
+        (hostfiles:remove-registration
+         (hostfiles:detach-stem (agent:agent-bus a) (agent:agent-id a))))
+       t))
+
 (defmethod tool-handle ((tool bus-leave-tool) id args)
   (let ((agent-id-arg (gethash "agent_id" args))
         (ephemeral (and (gethash "ephemeral" args) t))
@@ -133,6 +149,7 @@ a bus. Omit it to leave this session's own bus.")))))
             (forget-session-agent session agent-id-arg
                                   :ephemeral ephemeral :bus bus-arg)
             (result id (make-ht "left" t
+                                "deregistered" (%deregister a)
                                 "bus" (bus-label (agent:agent-bus a))
                                 "agent_id" (agent:agent-id a)
                                 "agent_name" (agent:agent-name a)

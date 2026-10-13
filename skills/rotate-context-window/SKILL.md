@@ -107,6 +107,11 @@ these, skip — there is no bus to rejoin.
   a Monitor, used only when the binary lacks `--wake`/`--detach`), record
   that instead; the successor moves to the `--wake` form where the binary
   supports it.
+  Where the host bus service is installed, the identity is registered
+  with the service rather than watched by a process of its own. When this
+  instance ends, the service keeps watching the cursor and raises the
+  deafness alarm if mail waits too long, but writes no wake lines until
+  the successor's `--detach` registers it again, so record the same flags.
 - Drain the cursor now (`bus-receive` until empty) so the handoff is
   written from a known-clean bus state, and note the active coordination
   thread (who leads, who is mid-task, what gates the next step).
@@ -145,6 +150,11 @@ moment it does and siblings may be waiting.
   drain every bus → re-arm the same `--wake` line → act → publish. On
   `nowatcher` (exit 1) re-run `--detach`, then re-arm. No timer re-arm:
   the `--wake` has no expiry. Only surface on a real `bus:<SEQ>` message.
+- **Host bus service:** where it is installed, `--detach` registers the
+  identity with the service instead of adopting a watcher, and names the
+  service's pid. The registration follows the session, so after a rotation
+  expect `detached` or `running`; both are fine. `nowatcher` can also mean
+  the service is restarting: `--detach` again.
 - **Process restart:** restart the Claude **client** for context but keep
   the bus MCP server (dsmr-mcp) UP to preserve the live bus + cursors.
   The bus WAL is durable, so even an MCP restart recovers — but only

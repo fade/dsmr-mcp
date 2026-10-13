@@ -37,6 +37,9 @@ bin/dsmr-mcp-bridge
 # Bus-watch build artefact (produced by asdf:make :dsmr-bus-watch / make bus-watch)
 bin/dsmr-bus-watch
 
+# Host bus service build artefact (produced by asdf:make :dsmr-bus-host / make bus-host)
+bin/dsmr-bus-host
+
 # Test/CI build artefacts — rebuilt on demand, never committed.
 # Project-local fasl cache isolating `make test` from the shared
 # ~/.cache/common-lisp fasls (GC-flavor crash dodge):

@@ -205,6 +205,18 @@ participant **leaving the fleet** reaps it: `~/.local/bin/dsmr-bus-watch --reap
 An unreaped watcher for an agent that has left is a listener nobody reads, and
 it keeps answering `live`.
 
+Where the host bus service is installed, the same arm line registers the sister
+with the service instead: one process on the host runs every bus's broker and
+watches every registered agent, writing the same lines to the same logs, so the
+listener and the probe above are unchanged. `--detach` starts a watcher of her
+own only while the service is down, and the service takes it over when it
+returns. Her registration ends when a parked session ends (mail waits at her
+cursor, and `--check-live` reads `dead ... parked=1`), and `--reap` deregisters
+her. `nowatcher` can also mean the service is restarting: `--detach` again. A
+`--detached-child` watcher for her while the service is up means an old binary
+armed her; the service adopts it, and `make install-bus-watch` stops it
+recurring. The leader checks the service with `--host-status` (see **leader**).
+
 ## Step 5 - Close enrollment, and know what that means
 
 ```

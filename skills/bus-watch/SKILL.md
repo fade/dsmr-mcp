@@ -65,6 +65,46 @@ supervisor: it runs detached, re-arms itself in place at each recycle, and write
 its signal lines to a per-(bus, agent) log file. `--wake` waits on that log and
 exits with the next `bus:`/`error:` line written to it.
 
+## The host bus service: one process listening for every agent
+
+Where the operator has installed the host bus service (`dsmr-bus-host`, a
+systemd user unit), one process on the host runs every bus's broker and watches
+every registered agent. It writes the same `bus:` and `error:` lines to the same
+per-agent log a detached watcher would, so `--wake`, the session hook and
+`--check-live` behave exactly as this file describes, and you never need to know
+which of the two is writing. Elsewhere in this file, "the detached watcher"
+means whichever one is watching for you.
+
+- **`--detach` registers you with the service** instead of starting a watcher.
+  It prints the same `detached`/`running` line and the same `monitor:` line; the
+  pid it names is the service's, shared by every agent on the host. It starts a
+  watcher of your own only when the service is not installed, or does not answer
+  within 5 seconds, and says so on stderr. The service takes that watcher over
+  when it comes back, with no gap in what you hear.
+- **`--reap` deregisters you**: it prints `reaped pid=<service pid> bus=<b>
+  signal=deregister`, signals nothing, and the service carries on for everyone
+  else.
+- **Your session decides what becomes of your registration.** The service
+  watches your session's process. When a parked session ends, the registration
+  goes with it: the park marker stays, your mail waits at your cursor, and no
+  alarm fires. When a session that was not parked dies, the service keeps
+  watching your cursor and raises the deafness alarm if mail waits unread, but
+  writes no wake lines. Either way, the `--detach` at your next bring-up
+  registers you again and removes the park marker.
+- **`nowatcher` can also mean the service is restarting.** systemd brings it back
+  within seconds. Run `--detach` again: it registers you, or starts a watcher of
+  your own if the service is still down.
+- **The stale-binary tell.** While the service is up, a `--detached-child`
+  process running for your identity means an older `dsmr-bus-watch` armed you,
+  one that does not know the service. You see it as `--detach` or `--check-live`
+  naming a pid that is not the service's (`--host-status` prints the service's
+  pid). The service adopts that watcher within about 5 seconds, so you stay
+  heard, but the next arm repeats it until the current binary is installed
+  (`make install-bus-watch`).
+- **`--host-status` reports the service**, its buses and its registrations, and
+  needs no identity. `service state=not-installed` means everything here about
+  the detached watcher applies as written.
+
 ⚠ **A line means CHECK THE BUS, not "one message with this seq is waiting."**
 `bus-receive` drains everything pending in a single call, so when several records
 land between two polls they arrive as ONE line carrying the highest seq. That is
@@ -168,6 +208,10 @@ name in different projects keep separate files. It is
 this session, a previous one, or before a park — and it starts nothing, prints
 `running`, and that watcher is yours again. Either way it clears the park marker
 for that bus (see *Park marks the watcher*).
+
+Where the host bus service is installed, the same line registers you with it
+instead, and the service does the watching. A registration does not outlive a
+parked session the way a detached watcher does; see *The host bus service*.
 
 It prints two lines:
 
@@ -414,6 +458,13 @@ bring-up. While parked, `--check-live` reads `live … parked=1`: the watcher
 runs, nobody is listening, and that is intended. The bus holds the mail on your
 cursor until you return.
 
+With the host bus service installed there is no watcher of yours to keep. The
+service holds your registration while your session runs, and when the parked
+session ends the registration ends with it: the marker stays, mail waits at your
+cursor, no alarm fires, and `--check-live` reads `dead ... parked=1` until your
+bring-up `--detach` registers you again and clears the marker. Mark the park
+the same way, and do not reap.
+
 `--reap` is for an agent **LEAVING the fleet** (`bus-leave`, disenrollment) or
 for retiring a host:
 
@@ -428,6 +479,10 @@ watcher under your name in another namespace, which it leaves running. **Exit 0
 only when nothing of yours is left**; exit 1 means something survived — say so
 rather than reporting yourself gone. Drop `--all-buses` and pass `--bus` to reap
 one bus only. A reap also ends any waiting `--wake` with `nowatcher`.
+
+Where the host bus service watches you, `--reap` deregisters you instead: one
+`reaped pid=<service pid> bus=<b> signal=deregister` line per bus, and no
+process is signalled.
 
 A context rotation is not a park and not a departure either: the successor
 re-runs `--detach`, which answers `running` for the watcher already up, and
@@ -472,6 +527,10 @@ On **`bus:<SEQ>`**:
 On **`nowatcher bus=<name>`** (exit 1): the detached watcher is gone. Run
 `--detach` again for that bus (or for each joined bus on `bus=*`), then re-arm
 the `--wake`, then drain.
+With the host bus service installed it can also mean the service is
+restarting: systemd brings it back within seconds, and the same `--detach`
+registers you again, or starts a watcher of your own if the service is still
+down after 5 seconds.
 
 On **`error:…`**: the detached watcher hit a fault (it retries on its own and
 writes the same fault once): run `--check-live`, and if it answers
@@ -578,7 +637,8 @@ bus it uses an `ephemeral` identity, which never advances the main cursor.
 | A `--wake` prints `already-armed` | another listener holds the arm and this line ran without `--wait-for-arm` (or on a binary too old to know it). Do not retry the same line; with the hook installed, arm the `--wait-for-arm` form once. |
 | Resumed after an interrupt (Esc) | nothing to do: your background `--wait-for-arm` wake outlives the interrupt and takes over once the hook's listener has fired. |
 | `--wake` exited with `bus:<SEQ>` | `bus-receive` every joined bus (stable id) → re-arm the same `--wake` line (with `--wait-for-arm` when the session hook is installed) → catch-up `bus-receive` → handle. |
-| `--wake` exited with `nowatcher bus=…` | `--detach` again (each bus on `bus=*`), then re-arm the `--wake`. |
+| `--wake` exited with `nowatcher bus=…` | `--detach` again (each bus on `bus=*`), then re-arm the `--wake`. With the host bus service installed it may be mid-restart; the same `--detach` covers that. |
+| `--detach` or `--check-live` names a pid that is not the host service's while the service is up | an old binary armed you with a watcher of its own. The service adopts it within seconds; `make install-bus-watch` so the next arm registers instead. |
 | `--wake` exited with `error:…` | the detached watcher hit a fault — `--check-live`; on `dead`/`stale` run `--detach` again; re-arm the `--wake`. |
 | Idle for hours | nothing. No timer, no re-arm; the `--wake` waits indefinitely. |
 | Parking | last drain, then `--park --all-buses --agent <name> --namespace <root>/`, then stop. **Do NOT reap**: the watcher stays up and `--detach` adopts it and clears the mark at bring-up. |

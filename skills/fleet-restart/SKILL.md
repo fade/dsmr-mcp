@@ -83,6 +83,12 @@ written:   <ISO-8601>
    run `--reap` here. `--reap` is for an agent LEAVING the fleet (`bus-leave`, disenrollment) or
    retiring a host; see **bus-watch**.
 
+   Where the host bus service is installed there is no watcher of yours to leave running: the
+   service holds your registration, and it ends when your parked session ends. The marker stays,
+   your mail waits at your cursor, and no alarm fires; `--check-live` reads `dead ... parked=1`
+   while you are down, which is what a park looks like under the service. Mark the park exactly as
+   above either way.
+
 5. Send the leader **exactly one line**: `PARKED <repo> @<short-sha>`
 
 ⛔ **No park announcement longer than that line.** No summaries, no findings, no lessons, no
@@ -148,6 +154,10 @@ re-announces.
    at all times, re-armed after each time it fires. Each turn end arms the hook's listener; the
    waiting wake stays silent beside it and takes over after an interrupted turn, which runs no
    Stop hook.
+   Where the host bus service is installed, `--detach` registers you with it rather than adopting
+   a watcher, so after a park expect `detached` naming the service's pid, not `running`. Then
+   check the service with `--host-status` and restore order as the **leader** skill says (Step 4,
+   *The host bus service*) before you assert control.
    Then **confirm it with `~/.local/bin/dsmr-bus-watch --check-live --bus <TAG> --agent
    <your-name> --namespace <absolute-project-root>/`**. It must print `live`, `bus=<TAG>` and
    `readers=1` or more. Bringing the leader up deaf leaves the
@@ -175,6 +185,8 @@ re-announces.
    `readers=1` or more, and no `parked=1`) before going silent.** **Go silent.** Await dispatch
    by name. A worker that goes silent on a `dead`/`stale` watch, or with no listener armed, is
    deaf to its own dispatch, and no one learns until the operator notices the wait.
+   Where the host bus service is installed, that `--detach` registers you with it and answers
+   `detached` with the service's pid; your parked session's registration ended with that session.
 
 ⛔ **Bring-up is the checklist above and nothing else.** Do not explore the tooling, do not report
 what the harness can now do, do not verify another repo, do not comment on another worker's park, do
@@ -220,6 +232,9 @@ not summarise last session — it is in your files.
   **Park marks, it does not reap**: `--park --all-buses` before you stop listening, and
   `--detach` clears the mark at bring-up; `--reap --all-buses` is for leaving the fleet or
   retiring a host.
+  With the host bus service installed, `--detach` registers with the service, a parked
+  session's registration ends with the session (mail waits at the cursor), and `--reap`
+  deregisters. A leader restores any bus `--host-status` shows as `owner=client`.
   Confirm liveness with `~/.local/bin/dsmr-bus-watch --check-live --bus <TAG> --agent <name>
   --namespace <absolute-project-root>/`. Require `live`, the right `bus=` and `readers=1` or more
   before you report ready, never `dead`/`stale`. Deafness is the `deaf=` field (mail unread for ten

@@ -10,8 +10,10 @@
 ;;;;
 ;;;; This lives in its own .asd (rather than alongside dsmr-mcp.asd) so its
 ;;;; primary system name matches the file and its lean dependency closure stays
-;;;; minimal: it depends on three ZeroMQ-free bus leaves — the WAL, the message
-;;;; envelope, and the delivery cursor — plus its own entrypoint. Never the
+;;;; minimal. It depends on ZeroMQ-free bus leaves only: the WAL, the message
+;;;; envelope, the delivery cursor, the bus-root selector and the heartbeat,
+;;;; plus the shared host-file leaf that names the files the watcher, the MCP
+;;;; server and the host service all use, and its own entrypoint. Never the
 ;;;; broker, never ZeroMQ, never the MCP server. A sister repo needs no libzmq to
 ;;;; arm a watcher, and the binary stays small.
 ;;;;
@@ -30,6 +32,7 @@
                "dsmr-mcp/src/bus/cursor"
                "dsmr-mcp/src/bus/selector"
                "dsmr-mcp/src/bus/heartbeat"
+               "dsmr-mcp/src/bus/hostfiles"
                "dsmr-bus-watch/src/bus/watch")
   :build-operation "program-op"
   :build-pathname "bin/dsmr-bus-watch"

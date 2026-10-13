@@ -32,7 +32,8 @@
   (:use #:cl #:zebra)
   (:local-nicknames (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:agent #:dsmr-mcp/src/bus/agent)
-                    (#:selector #:dsmr-mcp/src/bus/selector))
+                    (#:selector #:dsmr-mcp/src/bus/selector)
+                    (#:hostfiles #:dsmr-mcp/src/bus/hostfiles))
   (:import-from #:dsmr-mcp/src/tools/base
                 #:tool-handle)
   (:import-from #:dsmr-mcp/src/tools/bus-helpers
@@ -648,6 +649,33 @@ stop reporting into a neighbouring fleet without leaving its own."
         (is equal '("still here")
             (agent:agent-receive here :timeout-ms 5000)
             "and it still receives")))))
+
+(define-test leaving-deregisters-a-stable-agent-from-the-host-service
+  "A stable agent that leaves a bus stops being watched there by the host
+service, so leaving the fleet does not leave the service listening for an agent
+that has gone. An ephemeral identity never registers, and its leave touches no
+registration."
+  (with-isolated-bus ("alpha")
+    (with-rooted-session (session)
+      (let* ((stable (session-agent session "sister" :bus "alpha"))
+             (stable-stem (hostfiles:detach-stem "alpha" (agent:agent-id stable)))
+             (ephemeral (session-agent session nil :ephemeral t :bus "alpha"))
+             (ephemeral-stem (hostfiles:detach-stem "alpha"
+                                                    (agent:agent-id ephemeral))))
+        (dolist (stem (list stable-stem ephemeral-stem))
+          (hostfiles:write-registration stem (list :id stem :bus "alpha")))
+        (let ((payload (%leave session "agent_id" "sister" "bus" "alpha")))
+          (is eq t (%field payload "deregistered"))
+          (false (probe-file (hostfiles:registration-path stable-stem))
+                 "the stable agent's registration is gone"))
+        (let ((payload (%leave session "ephemeral" t "bus" "alpha")))
+          (is eq t (%field payload "left"))
+          (false (%field payload "deregistered"))
+          (true (probe-file (hostfiles:registration-path ephemeral-stem))
+                "the ephemeral leave left the registration alone"))
+        (let ((payload (%leave session "agent_id" "sister" "bus" "alpha")))
+          (false (%field payload "deregistered")
+                 "a second leave has nothing left to deregister"))))))
 
 (define-test the-leave-verb-needs-a-project-root
   "With no project root there is no identity to depart, and the verb says so in

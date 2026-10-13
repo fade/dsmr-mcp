@@ -409,6 +409,11 @@ you it answers `running` and is yours again:
   --bus <TAG> --agent <your-name> --namespace <absolute-project-root>/
 ```
 
+Where the host bus service is installed, that line registers you with the
+service rather than starting a watcher, and names the service's pid. Everything
+below works the same; *The host bus service*, later in this step, says what the
+service adds for a leader.
+
 Then the standing listener: **one background Bash command** (`run_in_background:
 true`), NOT the Monitor tool. It exits on the next `bus:`/`error:` line from any of
 your detached logs, and that exit is the wake:
@@ -494,6 +499,67 @@ predates named buses (or `--wake`): `make install-bus-watch`, then re-arm. A lea
 that missed its own re-arm and lost inbound mail is exactly the failure this guards.
 On `dead`/`stale`, run `--detach` again and re-arm the `--wake`.
 
+### The host bus service: restore order, then keep a fleet-log listener
+
+Where the operator has installed the host bus service (`dsmr-bus-host`, a
+systemd user unit), one process on this host runs every bus's broker and watches
+every registered agent, yours and your sisters'. What it cannot heal it writes
+to the host's fleet error log (`~/.local/state/dsmr-mcp/host/fleet-error.log`),
+and a bus whose broker a client elected while the service was away is a
+degradation that you put right. Check it at every bring-up, after your own ears:
+
+```
+~/.local/bin/dsmr-bus-watch --host-status
+```
+
+- `service state=not-installed` as the only line: there is no service on this
+  host. Skip the rest of this subsection.
+- `service state=alive pid=<p> beat-age=<n> status-age=<n>`: the service is up.
+  Read each `bus <name> owner=...` line; `owner=host` is in order.
+- ⛔ **`owner=client` on any bus: restore order.** A client elected that bus's
+  broker while the service was not serving it, so some agent's own MCP server is
+  carrying a broker, which is the overhead the service exists to remove. Hand
+  every such bus back:
+
+  ```
+  ~/.local/bin/dsmr-bus-watch --host-restore --all-buses
+  ```
+
+  and report the lines it prints. `restored` and `vacated` are done and `clean`
+  was never degraded. `signalled ... service-took=no` and any `refused ...
+  reason=<r>` go in your footer for the operator (`service-not-alive` means there
+  is no service to hand the bus to). It only ever signals the broker the service
+  recorded, while it is still that process, and the bus's log does not rotate.
+  Run `--host-status` again and expect `owner=host`.
+- `service state=stale` or `stopped`: the service is not watching anyone, so
+  every agent on this host hears the bus only through a watcher of its own, or
+  not at all. systemd should already be restarting it. Put it in your footer
+  with the last fleet log lines; starting or restarting the service is the
+  operator's call, not yours.
+- `finding kind=... bus=... id=...` lines are gaps between the bus roster and
+  the registrations. They are information, never a gate.
+
+Then keep **one background fleet-log listener** armed beside your bus listener:
+a background Bash command (`run_in_background: true`, `timeout: 7200000`), never
+the Monitor tool:
+
+```
+~/.local/bin/dsmr-bus-watch --wake --fleet-log --agent <your-name> --namespace <absolute-project-root>/
+```
+
+It exits on the next line written to the fleet error log, printed as
+`<time> FLEET <ERROR|WARN|INFO> code=<code> bus=<b> id=<id> msg=<text>`. Treat
+that exit as a wake: read the line, run `--host-status`, act on it
+(`--host-restore` for a degraded bus) or carry it to the operator, then re-arm
+the same line. `idle wake-seconds=<N>` is a wake with nothing in it: re-arm.
+`noservice` (exit 1) means this host has never had the service; do not re-arm.
+It resumes where the last one stopped reading, so a line written between two
+arms is still reported, and it never blocks your bus listener. Arm exactly one:
+a second for your identity answers `already-armed`.
+`FLEET ERROR code=service-failed` means the service failed and systemd is
+restarting it; the operator also gets a desktop notification for it. It stays in
+your footer until `--host-status` reads `alive` again.
+
 ### Can each sister hear you? The reader check, at bring-up and before dispatching
 
 A dispatch to a deaf sister is not delivered to anyone who will act on it: it waits
@@ -536,6 +602,10 @@ then leave the detached watcher running; at the next bring-up `--detach` answers
 `--reap` is for leaving the fleet or retiring a host:
 `~/.local/bin/dsmr-bus-watch --reap --all-buses --agent <your-name> --namespace <absolute-project-root>/`,
 exit 0 or say what survived.
+With the host bus service installed, a parked session's registration ends with
+the session; the marker stays, mail waits at the cursor, and the next
+`--detach` registers you again. `--reap` deregisters you from the service and
+signals nothing.
 
 ## Step 5 — Your own memory store
 
@@ -584,6 +654,10 @@ Report to the operator, in this order and nothing else:
    BLOCKED items, naming the repository the operator must type in. It stays in the footer until her
    line clears. `parked=1` is a park, not deafness. The watcher's desktop notification covers the
    operator between your replies; the footer is what makes sure he never has to have seen it.
+   The footer also carries the host bus service, from `~/.local/bin/dsmr-bus-watch --host-status`
+   (Step 4) at every reply, reduced to three things: every bus that reads `owner=client`, the
+   service line's state and `beat-age`, and any fleet-log line you have not yet seen resolved. On
+   a host where it reads `not-installed`, leave it out.
 4. What you are doing next.
 
 Then dispatch. **By name, one worker, one task.** Never broadcast work. Before each dispatch, run

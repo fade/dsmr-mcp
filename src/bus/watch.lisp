@@ -57,7 +57,8 @@
                     (#:cursor #:dsmr-mcp/src/bus/cursor)
                     (#:heartbeat #:dsmr-mcp/src/bus/heartbeat)
                     (#:wal #:dsmr-mcp/src/bus/wal)
-                    (#:selector #:dsmr-mcp/src/bus/selector))
+                    (#:selector #:dsmr-mcp/src/bus/selector)
+                    (#:hostfiles #:dsmr-mcp/src/bus/hostfiles))
   (:import-from #:dsmr-mcp/src/bus/wal
                 #:scan
                 #:now-ms
@@ -76,7 +77,36 @@
            #:poll-new-records
            #:default-wal-path
            #:default-cursors-dir
-           #:default-watch-dir))
+           #:default-watch-dir
+           ;; The per-identity file contract. The host service schedules these
+           ;; same functions for every agent it watches, so a listener cannot
+           ;; tell whether a line, a marker or a pid file was written by this
+           ;; binary or by the service.
+           #:%signal-line
+           #:%batch-parties
+           #:%deaf-step
+           #:make-deaf-state
+           #:deaf-state-unheard-since
+           #:deaf-state-latched
+           #:make-deaf-watch
+           #:%write-deaf-marker
+           #:%notify-deaf
+           #:%reap-notifiers
+           #:%fd-opened-for-reading-p
+           #:%directory-entries
+           #:%poll-forward
+           #:%whole-file-lock
+           #:%lock-holder
+           #:%pid-file-contents
+           #:%pid-alive-p
+           #:%resolve-detach-stem
+           #:%legacy-detach-stem
+           #:%unix-time
+           #:%event-line-p
+           #:%cursor-baseline
+           #:%cursor-holds-seq-p
+           #:%stranded-fleet-message
+           #:%recorded-id-matches-p))
 
 (in-package #:dsmr-bus-watch/src/bus/watch)
 
@@ -113,17 +143,9 @@
   "NAME rendered safe to carry as one field on a signal line: whitespace, a
    comma, an equals sign and any control character each become an underscore.
 
-   A bus name is an ordinary bare word and passes through untouched. A namespace
-   is a project root, though, and a path carrying a space would otherwise split
-   one name across two fields and make the line lie about who published. The
-   comma separates names within a field and the equals sign introduces one, so
-   neither can be allowed to occur inside a name either."
-  (map 'string
-       (lambda (ch)
-         (if (or (char<= ch #\Space) (char= ch #\,) (char= ch #\=))
-             #\_
-             ch))
-       name))
+   The derivation lives in the shared host-file leaf, so the watcher, the MCP
+   server and the host service name the same files and write the same fields."
+  (hostfiles:field-token name))
 
 (defun %signal-line (seq froms tos)
   "The text of one wake: `bus:<SEQ>`, then `from=` naming every agent that
@@ -614,12 +636,86 @@ Options:
                        how fresh a heartbeat must be to count as live under
                        --check-live (default 5). A live watch refreshes every
                        poll, so this need only exceed --poll-ms with some slack.
-  --detach             make sure a detached streaming watcher is running for the
-                       resolved identity and bus, then exit. Launch it once per
-                       session: it runs in its own session with stdin from
+  --host-status        do not watch; report the host service, its buses and its
+                       registrations, for a leader's standing footer, and exit.
+                       Needs no identity. Prints
+                         service state=<s> pid=<pid> beat-age=<n> status-age=<n>
+                       where <s> is alive, stale (its beat is old), stopped (no
+                       beat, or its process is gone) or not-installed, and
+                       status-age is how old the service's last status summary
+                       is. Not installed, that is the only line, and it carries
+                       no status-age. Then one line per bus, per registration
+                       and per finding:
+                         bus <name> owner=host|client|none incumbent=<pid>
+                             degraded-since=<epoch>
+                         registration id=<id> bus=<name>
+                             state=serving|lapsed|adopting session=<pid>
+                         finding kind=<kind> bus=<name> id=<id>
+                       (each on one line). owner=client is a bus whose broker
+                       a client elected while the service was not serving it.
+                       A finding is a gap between the bus roster and the
+                       registrations, and is only informational. A field with
+                       no value reads `-`. Exits 0 when the service is alive
+                       with no bus degraded, or is not installed, and 1
+                       otherwise.
+  --host-restore       hand a bus whose broker a client elected while the host
+                       service was away back to the service, then exit. For a
+                       leader restoring order after --host-status reports
+                       owner=client. Acts on the resolved bus, or with
+                       --all-buses on every bus recorded as degraded. Only the
+                       process the service recorded as that bus's broker is
+                       ever signalled, and only while it is still that
+                       process: it must be alive, have started when the record
+                       says, and be running the broker for that bus. It gets
+                       SIGTERM, then SIGKILL after 5s, never its process group,
+                       and the service takes the bus over as it exits. Because
+                       the service stays a member of the bus throughout, the
+                       broker's exit does not rotate the bus's log. Prints one
+                       line per bus:
+                         restored bus=<name> incumbent=<pid> signal=term|kill
+                         signalled bus=<name> incumbent=<pid> signal=term|kill
+                             service-took=no
+                         refused bus=<name> reason=<reason>
+                         vacated bus=<name> incumbent=<pid>
+                         clean bus=<name>
+                       `signalled` means the service had not taken the bus
+                       within 10s of the broker going. A refusal sends nothing;
+                       its reason is service-not-alive (restore needs a live
+                       service to hand the bus to), not-a-broker (the recorded
+                       pid runs something else), recycled-pid (the pid now
+                       belongs to a later process) or unreadable-record.
+                       `vacated` means the recorded broker is already gone, and
+                       `clean` that the bus is not degraded. Exits 0 when every
+                       bus is restored, vacated or clean, and 1 otherwise.
+  --host-failed        raise the alarm that the host bus service has failed,
+                       then exit 0. This is what the service's failure unit
+                       runs, so a dead service is never silent: the alarm does
+                       not depend on the service running. It appends one
+                       `FLEET ERROR code=service-failed` line to the fleet log
+                       and raises one critical desktop notification (through
+                       gdbus when notify-send is missing or fails), waiting at
+                       most 5s for the notifier. It reads systemd's
+                       SERVICE_RESULT, EXIT_CODE and EXIT_STATUS (or their
+                       MONITOR_ forms) and names them in the alarm; with
+                       SERVICE_RESULT=success, an ordinary stop, it does
+                       nothing. A second run within 10s of an alarm does
+                       nothing either, so the unit may run it from both
+                       OnFailure= and ExecStopPost= and still raise one alarm
+                       per failure.
+  --detach             make sure the resolved identity is watched on the
+                       resolved bus, then exit. Where the host service is
+                       installed, this registers the identity with it, and the
+                       service watches it with every other agent on the host.
+                       Where the host service is installed but does not answer
+                       within 5s, it says so on STDERR and starts a detached
+                       watcher of its own, so the agent keeps listening until
+                       the service returns. Otherwise it starts a detached
+                       streaming watcher. Launch it once per session. A
+                       detached watcher runs in its own session with stdin from
                        /dev/null, survives the shell that started it, re-arms
                        itself in place at every idle recycle, and appends its
-                       wake lines to
+                       wake lines (the service writes the same lines to the
+                       same file) to
                          $XDG_STATE_HOME/dsmr-mcp/watch/<bus>--<agent>--<hash>.log
                        where <hash> is a short hash of the full agent identity,
                        so two agents of one name in different namespaces keep
@@ -629,7 +725,8 @@ Options:
                        that watcher is up starts nothing. Prints
                          detached pid=<pid> bus=<name> log=<path>
                        (`running` in place of `detached` when one was already
-                       up) and then `monitor: <command>`, the tail to run under
+                       up, and the pid is the host service's when the service
+                       watches) and then `monitor: <command>`, the tail to run under
                        a persistent monitor. Exits 0, 1 when a watcher under the
                        same name belongs to another namespace or the child did
                        not come up, 2 when no identity resolves. The other watch
@@ -643,7 +740,12 @@ Options:
                        `survived pid=<pid> bus=<name>`, or `foreign ...` for a
                        watcher under the same name in another namespace, which
                        is left running) and exits 0 when none is left, 1
-                       otherwise.
+                       otherwise. Where the host service watches the
+                       identity, nothing is signalled: the identity is
+                       deregistered from the service, which lets go of it, and
+                       the line reads `reaped pid=<service pid> bus=<name>
+                       signal=deregister`. No process in the service's process
+                       group is ever signalled.
   --wake               do not watch; wait for the next `bus:` or `error:` line
                        to reach the detached log for the resolved identity and
                        bus, print that line to STDOUT exactly as the watcher
@@ -696,6 +798,27 @@ Options:
                        is reported by the next hook arm, from the read offset
                        every --wake saves beside the log when it returns; the
                        first arm ever starts at the end. STDOUT stays empty.
+  --fleet-log          with --wake, listen on the host's fleet error log instead
+                       of an agent's watch log, and print the next fleet line
+                         <time> FLEET <ERROR|WARN|INFO> code=<code> bus=<name>
+                             id=<id> msg=<text>
+                       exactly as written, then exit 0. A fleet line records a
+                       fault the host bus service could not heal, or one that
+                       stopped it. A leader keeps one such wake armed in the
+                       background beside its bus listener, re-arms it after
+                       each return, and on a wake reads the fleet log and
+                       --host-status. It follows the --wake contract: the idle
+                       line and exit 0 at --wake-seconds, a log that is rotated
+                       is followed onto its new file, and it resumes from where
+                       the last fleet-log wake for the same identity stopped
+                       reading, so a line written between two wakes is still
+                       reported (with no identity it starts at the end). One
+                       fleet-log listener per identity: a second prints
+                       `already-armed` and exits 0 (but see --wait-for-arm),
+                       and it never blocks the identity's bus listener. On a
+                       host where neither the service nor the fleet log has
+                       ever existed it prints `noservice` and exits 1.
+                       Cannot be combined with --hook.
   --deaf-seconds N     how long a wake line may sit unheard in a detached
                        watcher's log before the watcher raises the deafness
                        alarm (default 600; 0 turns the alarm off). A line
@@ -789,6 +912,10 @@ detached watcher, its pid file.
   (park-p nil)
   (unpark-p nil)
   (stall-seconds 120)
+  (host-status-p nil)
+  (host-restore-p nil)
+  (host-failed-p nil)
+  (fleet-log-p nil)
   (help-p nil))
 
 (defun %parse-nonneg (string flag)
@@ -838,6 +965,14 @@ detached watcher, its pid file.
                   (setf (opt-stream-p opts) t))
                  ((string= arg "--check-live")
                   (setf (opt-check-p opts) t))
+                 ((string= arg "--host-status")
+                  (setf (opt-host-status-p opts) t))
+                 ((string= arg "--host-restore")
+                  (setf (opt-host-restore-p opts) t))
+                 ((string= arg "--host-failed")
+                  (setf (opt-host-failed-p opts) t))
+                 ((string= arg "--fleet-log")
+                  (setf (opt-fleet-log-p opts) t))
                  ((string= arg "--detach")
                   (setf (opt-detach-p opts) t))
                  ((string= arg "--detached-child")
@@ -941,23 +1076,9 @@ detached watcher, its pid file.
   "ID with every run of separators collapsed to one and any trailing separator
    removed, or NIL for NIL.
 
-   A doubled separator names the same agent as a single one, but every file a
-   watcher keeps (cursor, heartbeat, log, pid file) is named from the id, so a
-   second spelling would be a second set of files, and a probe typed with it
-   would read a healthy agent as dead."
-  (when id
-    (let ((out (make-string-output-stream))
-          (previous-separator-p nil))
-      (loop for ch across id
-            do (let ((separator-p (char= ch #\/)))
-                 (unless (and separator-p previous-separator-p)
-                   (write-char ch out))
-                 (setf previous-separator-p separator-p)))
-      (let ((collapsed (get-output-stream-string out)))
-        (if (and (> (length collapsed) 1)
-                 (char= (char collapsed (1- (length collapsed))) #\/))
-            (subseq collapsed 0 (1- (length collapsed)))
-            collapsed)))))
+   The derivation lives in the shared host-file leaf, so the watcher, the MCP
+   server and the host service name the same files for one agent."
+  (hostfiles:normalise-agent-id id))
 
 (defun %resolve-self-id (opts)
   "The full <namespace>/<name> bus id this watcher watches on behalf of, or NIL
@@ -1016,9 +1137,47 @@ detached watcher, its pid file.
           (let ((value (and in (read in nil nil))))
             (and (integerp value) (>= value 0) t))))))
 
-(defun %cursor-baseline (self-id wal-path cursors-dir)
+(defun %stranded-fleet-message (report)
+  "The message of a fleet-log line about a stranded cursor: the old position,
+   its generation, the current generation and head, and how many records the
+   archived log still held above the old position."
+  (flet ((field (value) (if value (princ-to-string value) "-")))
+    (format nil "old-cursor=~A old-generation=~A generation=~A head=~A ~
+                 unread-in-archive=~A reason=~A"
+            (field (getf report :old-cursor))
+            (field (getf report :old-generation))
+            (field (getf report :generation))
+            (field (getf report :head))
+            (field (getf report :unread-in-archive))
+            (string-downcase (field (getf report :reason))))))
+
+(defun %report-stranded-cursor (action report bus)
+  "Say in the fleet log, and on stderr, what was done about a stranded cursor.
+   The fleet log carries a WARN for a cursor rewritten into the current log and
+   an ERROR for one that could not be, so a leader watching that file learns of
+   the second and can act on it. A fleet log that cannot be written is reported
+   on stderr and does not stop the arm."
+  (let* ((rebased-p (eq action :rebased))
+         (message (%stranded-fleet-message report))
+         (line (hostfiles:fleet-line (if rebased-p :warn :error)
+                                     (if rebased-p
+                                         "stranded-cursor"
+                                         "stranded-cursor-clamped")
+                                     :bus bus
+                                     :id (getf report :id)
+                                     :msg message)))
+    (handler-case (hostfiles:append-fleet-line line)
+      (error (e)
+        (%warn "could not write the fleet log: ~A" e)))
+    (%warn (if rebased-p
+               "cursor for ~S was stranded; rewritten into the current log (~A)"
+               "cursor for ~S is stranded and could not be rewritten; arming ~
+                at the log head (~A)")
+           (getf report :id) message)))
+
+(defun %cursor-baseline (self-id wal-path cursors-dir &optional bus)
   "The baseline seq taken from SELF-ID's durable cursor, or NIL when that cursor
-   is absent or holds nothing usable.
+   is absent or holds nothing usable. BUS names the bus for the fleet log only.
 
    Arming from the cursor rather than the log head is what closes the arm
    window. A record that landed between the agent's last drain and this arm sits
@@ -1031,13 +1190,27 @@ detached watcher, its pid file.
    this one still reading the same empty path, still seeing 0, and firing again
    on every poll for as long as it runs. The caller arms at the head instead.
 
-   READ-ONLY. The subscriber handle exists purely to read the value through the
-   canonical reader. This binary does not own that file — the MCP session
-   consuming the bus does — and writing to it from here would move that
-   session's delivery position behind its back."
+   The cursor file belongs to the MCP session consuming the bus, and this binary
+   reads it without writing, with one exception. A cursor that is provably
+   stranded (above the head of the log, or recorded against another generation
+   of it) is rewritten into the current log. Arming from such a cursor filters
+   out every record in the new log, so the agent goes deaf while every probe
+   reports it healthy, and no reading of a stranded position is a delivery
+   position the session could still want. The old position always goes to the
+   fleet log with the outcome, since rewriting discards the only record of it,
+   and to stderr if the fleet log cannot be written. When the
+   rewrite is refused the watch arms at the log head and the fleet log carries
+   an error; the cursor file is left as it was."
   (let ((path (%cursor-path self-id cursors-dir)))
     (if (%cursor-holds-seq-p path)
-        (cursor:cursor-value (cursor:make-subscriber self-id wal-path path))
+        (multiple-value-bind (baseline action report)
+            (hostfiles:heal-stranded-baseline self-id wal-path path :rebase-p t)
+          (when (member action '(:rebased :clamped))
+            (%report-stranded-cursor action report bus))
+          ;; :NO-CURSOR here means the file went away after the check above;
+          ;; its baseline is NIL, so the caller arms at the head as it would
+          ;; for a cursor that was never there.
+          baseline)
         (progn
           (%warn "no readable cursor for ~S at ~A; arming at the log head ~
                   instead. Check --namespace/--agent-id and --cursors-dir ~
@@ -1054,7 +1227,8 @@ detached watcher, its pid file.
    behavior from before the watcher had an identity, still correct, just unable
    to see anything that arrived before the arm."
   (or (opt-after opts)
-      (and self-id (%cursor-baseline self-id wal-path cursors-dir))
+      (and self-id (%cursor-baseline self-id wal-path cursors-dir
+                                     (ignore-errors (%resolve-bus opts))))
       (progn
         (unless self-id
           (%warn "no agent identity resolved (pass --agent or --agent-id, or ~
@@ -1163,6 +1337,214 @@ detached watcher, its pid file.
         (force-output *standard-output*)
         (uiop:quit (if (eq status :live) 0 1)))))
 
+(defun %status-token (value)
+  "VALUE as one field of a --host-status line: `-` for none, a keyword's name in
+   lower case, and anything else printed and made safe to carry as one token."
+  (cond ((null value) "-")
+        ((keywordp value) (string-downcase (symbol-name value)))
+        (t (%field-token (princ-to-string value)))))
+
+(defun %status-epoch (time)
+  "TIME as Unix seconds for a --host-status line, or NIL for none. The service
+   records universal time; a value below the universal time of the Unix epoch
+   cannot be one and is taken as Unix seconds already."
+  (cond ((not (integerp time)) nil)
+        ((< time 2208988800) time)
+        (t (%unix-time time))))
+
+(defun %host-status-lines (&key (now (get-universal-time)))
+  "The lines --host-status prints and the status it exits with, as two values.
+   Pure apart from reading the host service's files: it prints nothing and
+   exits nothing.
+
+   Everything comes from files the shared host-file leaf names (the service's
+   state record, pid file and beat, its status summary and the degraded-bus
+   records), so asking costs no broker and no connection, and works while the
+   service is down. A degraded record is laid over the summary's bus list
+   because the summary is only rewritten every few seconds and a leader acting
+   on an older summary would hand back a bus that is already degraded again,
+   or miss one that just became so."
+  (unless (hostfiles:service-installed-p)
+    (return-from %host-status-lines
+      (values (list "service state=not-installed pid=- beat-age=-") 0)))
+  (let* ((pid (hostfiles:read-service-pid))
+         (beat-age (hostfiles:service-beat-age))
+         (state (cond ((hostfiles:service-alive-p) :alive)
+                      ((or (null beat-age) (and pid (not (%pid-alive-p pid))))
+                       :stopped)
+                      (t :stale)))
+         (snapshot (multiple-value-bind (plist status)
+                       (hostfiles:read-plist-file (hostfiles:service-status-path)
+                                                  :max-bytes (* 1024 1024))
+                     (and (eq status :ok) plist)))
+         (written (getf snapshot :written-at))
+         (buses (loop for entry in (getf snapshot :buses)
+                      when (listp entry)
+                        collect (cons (or (getf entry :bus) "default")
+                                      (copy-list entry)))))
+    (loop for (name . record) in (hostfiles:degraded-records)
+          for cell = (assoc name buses :test #'equal)
+          for overlay = (list :owner :client
+                              :incumbent-pid (getf record :incumbent-pid)
+                              :degraded-since (or (getf record :detected-at)
+                                                  (and cell
+                                                       (getf (cdr cell)
+                                                             :degraded-since))))
+          do (if cell
+                 (setf (cdr cell) (append overlay (cdr cell)))
+                 (setf buses (append buses (list (cons name overlay))))))
+    (let ((lines
+            (append
+             (list (format nil "service state=~A pid=~A beat-age=~A status-age=~A"
+                           (%status-token state) (%status-token pid)
+                           (%status-token beat-age)
+                           (%status-token (and (integerp written)
+                                               (max 0 (- now written))))))
+             (loop for (name . entry) in buses
+                   collect (format nil "bus ~A owner=~A incumbent=~A degraded-since=~A"
+                                   (%status-token name)
+                                   (%status-token (getf entry :owner))
+                                   (%status-token (getf entry :incumbent-pid))
+                                   (%status-token
+                                    (%status-epoch (getf entry :degraded-since)))))
+             (loop for entry in (getf snapshot :registrations)
+                   when (listp entry)
+                     collect (format nil "registration id=~A bus=~A state=~A session=~A"
+                                     (%status-token (getf entry :id))
+                                     (%status-token (or (getf entry :bus) "default"))
+                                     (%status-token (getf entry :state))
+                                     (%status-token (getf entry :session-pid))))
+             (loop for entry in (getf snapshot :findings)
+                   when (listp entry)
+                     collect (format nil "finding kind=~A bus=~A id=~A"
+                                     (%status-token (getf entry :kind))
+                                     (%status-token (or (getf entry :bus) "default"))
+                                     (%status-token (getf entry :id))))))
+          (degraded-p (loop for (nil . entry) in buses
+                            thereis (or (eq (getf entry :owner) :client)
+                                        (getf entry :degraded-since)))))
+      (values lines (if (and (eq state :alive) (not degraded-p)) 0 1)))))
+
+(defun %host-status ()
+  "Print the --host-status report on STDOUT and exit with its status: 0 when
+   the host service is alive and no bus is degraded, or the service is not
+   installed, and 1 otherwise (see %HOST-STATUS-LINES)."
+  (multiple-value-bind (lines code) (%host-status-lines)
+    (dolist (line lines)
+      (write-line line *standard-output*))
+    (force-output *standard-output*)
+    (uiop:quit code)))
+
+(defun %broker-command-line-p (cmdline root)
+  "True when the argument vector CMDLINE is that of a bus broker serving the bus
+   rooted at ROOT: one argument names the broker's entry point and one names
+   that root as a directory. A root that is not a non-empty string matches
+   nothing.
+
+   The root is compared with its trailing separator, so a broker for
+   /tmp/bus-2/ is never taken for the broker of /tmp/bus/."
+  (when (and (stringp root) (plusp (length root)))
+    (let ((dir (if (char= (char root (1- (length root))) #\/)
+                   root
+                   (concatenate 'string root "/"))))
+      (and (some (lambda (arg) (search "broker-main" arg)) cmdline)
+           (some (lambda (arg) (search dir arg)) cmdline)
+           t))))
+
+(defun %host-restore-one (bus &key (term-seconds 5) (take-seconds 10))
+  "Hand BUS back to the host service when its broker was elected by a client,
+   print one line saying what happened, and return true when nothing is left
+   to do for BUS.
+
+   The degraded record the service wrote names the incumbent broker by pid and
+   start time. A file under the state root decides which process gets a
+   signal, so the record is trusted only as far as the process bears it out:
+   the pid must be alive, must be running the broker for the recorded bus
+   root, and must have started when the record says, since a pid the kernel
+   handed to a later process would otherwise be killed in the broker's name.
+   Any mismatch refuses and sends nothing. So does a service that is not alive,
+   because then there is nothing to hand the bus to and the client's broker is
+   the only one serving it.
+
+   On a match the pid alone gets SIGTERM, never its process group, and SIGKILL
+   after TERM-SECONDS if it is still there and still the same process. The
+   service holds a membership lock on every bus it serves, so the broker's
+   orderly exit does not take itself for the last member out and rotate the
+   log. The bus counts as restored once the service has cleared the record,
+   which it does when it takes the broker role; TAKE-SECONDS bounds that wait."
+  (let ((label (%field-token (or bus "default"))))
+    (flet ((say (control &rest args)
+             (format *standard-output* "~?~%" control args)
+             (force-output *standard-output*)))
+      (multiple-value-bind (record status) (hostfiles:read-degraded-record bus)
+        (case status
+          (:absent
+           (say "clean bus=~A" label)
+           t)
+          (:unreadable
+           (say "refused bus=~A reason=unreadable-record" label)
+           nil)
+          (t
+           (let ((pid (getf record :incumbent-pid))
+                 (start (getf record :incumbent-start))
+                 (root (getf record :root)))
+             (cond
+               ((not (hostfiles:service-alive-p))
+                (say "refused bus=~A reason=service-not-alive" label)
+                nil)
+               ;; Zero, one and every negative number name a process group or
+               ;; init to kill(2), never one broker.
+               ((not (and (integerp pid) (> pid 1)))
+                (say "refused bus=~A reason=not-a-broker" label)
+                nil)
+               ((not (%pid-alive-p pid))
+                (say "vacated bus=~A incumbent=~D" label pid)
+                t)
+               ((not (%broker-command-line-p (hostfiles:proc-cmdline pid) root))
+                (say "refused bus=~A reason=not-a-broker" label)
+                nil)
+               ((not (and (integerp start)
+                          (eql (hostfiles:proc-starttime pid) start)))
+                (say "refused bus=~A reason=recycled-pid" label)
+                nil)
+               (t
+                (let ((how "term"))
+                  (ignore-errors (sb-posix:kill pid sb-posix:sigterm))
+                  (unless (%await-true (lambda () (not (%pid-alive-p pid)))
+                                       term-seconds)
+                    (when (hostfiles:process-matches-p pid start)
+                      (setf how "kill")
+                      (ignore-errors (sb-posix:kill pid sb-posix:sigkill))
+                      (%await-true (lambda () (not (%pid-alive-p pid))) 2)))
+                  (cond ((%await-true
+                          (lambda ()
+                            (eq :absent
+                                (nth-value 1 (hostfiles:read-degraded-record bus))))
+                          take-seconds)
+                         (say "restored bus=~A incumbent=~D signal=~A" label pid how)
+                         t)
+                        (t
+                         (say "signalled bus=~A incumbent=~D signal=~A service-took=no"
+                              label pid how)
+                         nil))))))))))))
+
+(defun %host-restore (opts bus)
+  "Run --host-restore for BUS, or with --all-buses for every bus with a
+   degraded record, and exit 0 when every bus came back clean, restored or
+   vacated, and 1 otherwise (see %HOST-RESTORE-ONE). With --all-buses and no
+   degraded bus at all it prints `clean bus=*`."
+  (let ((buses (if (opt-all-buses-p opts)
+                   (mapcar #'car (hostfiles:degraded-records))
+                   (list bus)))
+        (clean t))
+    (if (null buses)
+        (format *standard-output* "clean bus=*~%")
+        (dolist (target buses)
+          (unless (%host-restore-one target)
+            (setf clean nil))))
+    (force-output *standard-output*)
+    (uiop:quit (if clean 0 1))))
+
 ;;; ------------------------------------------------------ termination and stalls
 ;;;
 ;;; A watcher can wedge in one place: a write of a wake line to STDOUT. When the
@@ -1264,49 +1646,42 @@ detached watcher, its pid file.
 ;;; crash can never be mistaken for one.
 
 (defun %state-home ()
-  "$XDG_STATE_HOME as a directory, falling back to ~/.local/state/."
-  (let ((xdg (uiop:getenv "XDG_STATE_HOME")))
-    (if (and xdg (plusp (length xdg)))
-        (uiop:ensure-directory-pathname xdg)
-        (merge-pathnames ".local/state/" (user-homedir-pathname)))))
+  "$XDG_STATE_HOME as a directory, falling back to ~/.local/state/.
+
+   The derivation lives in the shared host-file leaf, so the watcher, the MCP
+   server and the host service name the same files."
+  (hostfiles:state-home))
 
 (defun %detach-dir ()
   "Where detached watchers keep their logs and pid files: dsmr-mcp/watch/ under
-   the state home. One directory for every bus, so a single tail over
-   *--<agent>--*.log follows an agent on all the buses it has joined."
-  (merge-pathnames "dsmr-mcp/watch/" (%state-home)))
+   the state home.
+
+   The derivation lives in the shared host-file leaf, so the watcher, the MCP
+   server and the host service name the same files."
+  (hostfiles:watch-state-dir))
 
 (defun %agent-name (self-id)
-  "The name part of the full bus id SELF-ID."
-  (nth-value 1 (envelope:split-agent-id self-id)))
+  "The name part of the full bus id SELF-ID.
+
+   The derivation lives in the shared host-file leaf, so the watcher, the MCP
+   server and the host service name the same files."
+  (hostfiles:agent-name self-id))
 
 (defun %identity-hash (string)
   "The 32-bit FNV-1a hash of STRING's character codes, as eight lowercase hex
    digits.
 
-   The hash names files that outlive the binary that wrote them, and a later
-   build has to find them again, so it is computed here from first principles
-   rather than with SXHASH or any other function whose value an implementation
-   is free to change between builds."
-  (let ((hash 2166136261))
-    (loop for ch across string
-          do (setf hash (ldb (byte 32 0)
-                             (* (logxor hash (char-code ch)) 16777619))))
-    (format nil "~(~8,'0X~)" hash)))
+   The derivation lives in the shared host-file leaf, so the watcher, the MCP
+   server and the host service name the same files."
+  (hostfiles:identity-hash string))
 
 (defun %detach-stem (bus self-id)
   "The file stem for the detached watcher of the full bus id SELF-ID on BUS:
    <bus>--<agent>--<hash>, with `default` standing for the unnamed bus.
 
-   The agent name stays readable so an operator can find a log by eye. The hash
-   is of the whole normalised id (see %IDENTITY-HASH), so two agents with the
-   same name in different namespaces get separate files and separate reader
-   counts, and a namespace of any length adds only eight characters."
-  (let ((id (%normalise-agent-id self-id)))
-    (format nil "~A--~A--~A"
-            (%field-token (or bus "default"))
-            (%field-token (%agent-name id))
-            (%identity-hash id))))
+   The derivation lives in the shared host-file leaf, so the watcher, the MCP
+   server and the host service name the same files."
+  (hostfiles:detach-stem bus self-id))
 
 (defun %legacy-detach-stem (bus self-id)
   "The stem earlier builds gave the detached watcher of SELF-ID on BUS: the bus
@@ -1319,9 +1694,11 @@ detached watcher, its pid file.
 
 (defun %detach-file (stem type)
   "The file STEM.TYPE in the detach directory, built from a native namestring so
-   nothing in an agent name can be read as a wildcard."
-  (uiop:parse-native-namestring
-   (concatenate 'string (uiop:native-namestring (%detach-dir)) stem "." type)))
+   nothing in an agent name can be read as a wildcard.
+
+   The derivation lives in the shared host-file leaf, so the watcher, the MCP
+   server and the host service name the same files."
+  (hostfiles:watch-state-file stem type))
 
 (defun %whole-file-lock (type)
   "A lock record of TYPE covering the whole file."
@@ -1519,9 +1896,106 @@ detached watcher, its pid file.
                         :directory "/"
                         :wait nil)))
 
-(defun %detach (bus self-id args)
-  "Make sure a detached watcher is running for SELF-ID on BUS and print where to
-   follow it, then exit.
+(defparameter *watcher-version*
+  (or (ignore-errors
+       (asdf:component-version (asdf:find-system "dsmr-bus-watch" nil)))
+      "unknown")
+  "The version of this watcher build, as its system declares it. Taken when the
+   binary is built, so a registration can say which build wrote it.")
+
+(defun %registration-token ()
+  "Sixteen random hex digits naming one registration, so the acknowledgement of
+   this registration cannot be mistaken for the acknowledgement of an earlier
+   one."
+  (format nil "~(~16,'0X~)" (random (expt 16 16) (make-random-state t))))
+
+(defun %await-true (thunk seconds)
+  "Call THUNK every tenth of a second until it answers true or SECONDS have
+   passed, and return its last answer."
+  (loop repeat (max 1 (round (* 10 seconds)))
+        for answer = (funcall thunk)
+        when answer do (return answer)
+        do (sleep 0.1)
+        finally (return (funcall thunk))))
+
+(defun %registration-plist (bus self-id opts token)
+  "The registration SELF-ID leaves for the host service to watch it on BUS with
+   the settings in OPTS, carrying TOKEN. It names the agent session this command
+   runs in, so the service can stop serving the registration when that session
+   ends."
+  (multiple-value-bind (session-pid session-start)
+      (hostfiles:session-from-environment)
+    (list :id self-id
+          :bus bus
+          :poll-ms (opt-poll-ms opts)
+          :recycle-seconds (opt-recycle-seconds opts)
+          :deaf-seconds (opt-deaf-seconds opts)
+          :session-pid session-pid
+          :session-start session-start
+          :token token
+          :registered-at (%unix-time)
+          :cli-version *watcher-version*)))
+
+(defun %detach-through-service (bus self-id opts
+                                &key (beat-seconds 5) (serve-seconds 10))
+  "Register SELF-ID on BUS with the host service and wait for it to be served.
+
+   Returns three values when the service took the registration: `running` when
+   the service was already watching this identity before the registration was
+   written, `detached` otherwise, then the service's pid and the file stem it
+   watches under. Returns NIL, with a warning on STDERR, when the service shows
+   no beat within BEAT-SECONDS or does not serve the registration within
+   SERVE-SECONDS; the caller then starts a watcher of the agent's own.
+
+   Served means the service has acknowledged this registration's own token and
+   holds the identity's pid-file lock, which is what every listener and probe
+   reads as `a watcher is running`. The registration is left on disk whatever
+   happens, so a service that comes back later finds it."
+  (let* ((stem (%detach-stem bus self-id))
+         (pid-path (%detach-file stem "pid"))
+         (token (%registration-token))
+         (service-before (hostfiles:read-service-pid))
+         (already-p (and service-before
+                         (eql (%lock-holder pid-path) service-before))))
+    (hostfiles:write-registration stem (%registration-plist bus self-id opts token))
+    (flet ((served-pid ()
+             (multiple-value-bind (ack status) (hostfiles:read-served-ack stem)
+               (let ((service (hostfiles:read-service-pid)))
+                 (and (eq status :ok)
+                      (equal (getf ack :token) token)
+                      service
+                      (eql (%lock-holder pid-path) service)
+                      service)))))
+      (cond
+        ((not (%await-true #'hostfiles:service-alive-p beat-seconds))
+         (%warn "the host service is installed but not answering (no beat within ~Ds); ~
+                 starting a watcher of this agent's own until it returns"
+                beat-seconds)
+         nil)
+        (t
+         (let ((service (%await-true #'served-pid serve-seconds)))
+           (if service
+               (values (if already-p "running" "detached") service stem)
+               (progn
+                 (%warn "the host service is installed but did not take this ~
+                         registration within ~Ds; starting a watcher of this ~
+                         agent's own until it does"
+                        serve-seconds)
+                 nil))))))))
+
+(defun %detach (bus self-id args &optional (opts (make-options)))
+  "Make sure SELF-ID is being watched on BUS and print where to follow it, then
+   exit.
+
+   On a host where the host service is installed, this registers the agent with
+   that service rather than starting a watcher of its own. One process watching
+   every agent on the host costs a fraction of one watcher per agent per bus,
+   and the service is what heals and reports for all of them. When the service
+   is installed but does not answer within a few seconds, the agent still gets a
+   detached watcher of its own, and a warning on STDERR says why: an agent must
+   keep listening while the service is down, and the registration stays on disk
+   for the service to pick up when it returns. On a host with no service
+   installed nothing about this step has changed.
 
    Idempotent. With a watcher already running for this identity, this reports it
    and starts nothing, so running it on every bring-up is safe. A watcher running
@@ -1537,8 +2011,9 @@ detached watcher, its pid file.
      detached pid=<pid> bus=<bus> log=<path>
      monitor: <command>
 
-   and exits 0. Exits 1 on a conflict or when the child failed to come up, and 2
-   when no identity resolves, since a detached watcher is keyed on one."
+   The pid is the host service's when the service is watching. Exits 0, 1 on a
+   conflict or when the child failed to come up, and 2 when no identity
+   resolves, since a watch is keyed on one."
   (unless self-id
     (%warn "--detach needs a resolved identity (pass --agent with --namespace, or ~
             --agent-id); a detached watcher is keyed on it.")
@@ -1547,10 +2022,10 @@ detached watcher, its pid file.
          (log-path (%detach-file stem "log"))
          (pid-path (%detach-file stem "pid"))
          (label (or bus "default")))
-    (flet ((report (verb pid)
+    (flet ((report (verb pid &optional (log log-path))
              (format *standard-output* "~A pid=~D bus=~A log=~A~%monitor: ~A~%"
-                     verb pid label (uiop:native-namestring log-path)
-                     (%monitor-command log-path))
+                     verb pid label (uiop:native-namestring log)
+                     (%monitor-command log))
              (force-output *standard-output*)
              (uiop:quit 0)))
       ;; Bring-up ends a park: the agent is about to listen again, and a park
@@ -1558,6 +2033,11 @@ detached watcher, its pid file.
       (let ((parked (%detach-file stem "parked")))
         (when (probe-file parked)
           (ignore-errors (delete-file parked))))
+      (when (hostfiles:service-installed-p)
+        (multiple-value-bind (verb pid service-stem)
+            (%detach-through-service bus self-id opts)
+          (when verb
+            (report verb pid (%detach-file service-stem "log")))))
       (let ((running (%live-detached-pid pid-path)))
         (when running
           (let ((recorded (nth-value 1 (%pid-file-contents pid-path))))
@@ -1606,7 +2086,8 @@ detached watcher, its pid file.
                                               (%note-signal-line)))))
             (setf last-error nil)
             (%warn "recycle: idle window elapsed; re-arming in place")
-            (setf baseline (or (%cursor-baseline self-id wal-path cursors-dir)
+            (setf baseline (or (%cursor-baseline self-id wal-path cursors-dir
+                                                 (ignore-errors (%resolve-bus opts)))
                                cursor)))
         (error (e)
           (let ((text (princ-to-string e)))
@@ -1620,10 +2101,11 @@ detached watcher, its pid file.
           (%note-poll)
           (sleep 5)
           (setf baseline (or (ignore-errors
-                              (%cursor-baseline self-id wal-path cursors-dir))
+                              (%cursor-baseline self-id wal-path cursors-dir
+                                                (ignore-errors (%resolve-bus opts))))
                              baseline)))))))
 
-(defun %reap-one (pid-path bus self-id &key (grace-seconds 3))
+(defun %reap-one (pid-path bus self-id &key (grace-seconds 3) (release-seconds 5))
   "Stop the detached watcher behind PID-PATH and print one line saying what
    happened. Returns true when no watcher is left running there.
 
@@ -1633,10 +2115,19 @@ detached watcher, its pid file.
    decided by whether the pid is actually gone, not by which signal was sent.
 
    A watcher recorded under a different full id is left running and reported:
-   it shares the name but belongs to an agent in another namespace."
+   it shares the name but belongs to an agent in another namespace.
+
+   The host service is never signalled. It holds the lock of every identity it
+   watches, so signalling the holder would take down the whole host's listening
+   to stop one agent's. When the holder is the service, the identity is
+   deregistered instead: its registration is removed, the service lets go of
+   the lock within RELEASE-SECONDS, and the line names deregistration as the
+   signal. No process in the service's process group is signalled either,
+   whoever holds the lock, and such a holder is reported as `survived`."
   (let ((label (or bus "default"))
         (pid (%live-detached-pid pid-path))
-        (recorded (nth-value 1 (%pid-file-contents pid-path))))
+        (recorded (nth-value 1 (%pid-file-contents pid-path)))
+        (service (hostfiles:read-service-pid)))
     (labels ((say (control &rest args)
                (format *standard-output* "~?~%" control args)
                (force-output *standard-output*))
@@ -1653,7 +2144,14 @@ detached watcher, its pid file.
                (loop repeat tenths
                      until (gone-p group-p)
                      do (sleep 0.1))
-               (gone-p group-p)))
+               (gone-p group-p))
+             (service-p ()
+               (and service (eql pid service)
+                    (some (lambda (arg) (search "dsmr-bus-host" arg))
+                          (hostfiles:proc-cmdline pid))
+                    t))
+             (in-service-group-p ()
+               (and service (eql (ignore-errors (sb-posix:getpgid pid)) service))))
       (cond
         ((null pid)
          (ignore-errors (when (probe-file pid-path) (delete-file pid-path)))
@@ -1661,6 +2159,18 @@ detached watcher, its pid file.
          t)
         ((and recorded self-id (not (%recorded-id-matches-p pid-path self-id)))
          (say "foreign pid=~D bus=~A id=~A" pid label recorded)
+         nil)
+        ((service-p)
+         (hostfiles:remove-registration (pathname-name pid-path))
+         (cond ((%await-true (lambda () (not (eql (%lock-holder pid-path) pid)))
+                             release-seconds)
+                (say "reaped pid=~D bus=~A signal=deregister" pid label)
+                t)
+               (t
+                (say "survived pid=~D bus=~A" pid label)
+                nil)))
+        ((in-service-group-p)
+         (say "survived pid=~D bus=~A" pid label)
          nil)
         (t
          (let* ((group-p (eql (ignore-errors (sb-posix:getpgid pid)) pid))
@@ -2042,6 +2552,113 @@ detached watcher, its pid file.
             (%warn "no desktop notification went out for the deafness alarm for ~A: notify-send ~A, and gdbus ~A; the alarm is in ~A only"
                    self-id notify-send-failure gdbus-failure marker))))))))
 
+(defun %systemd-value (name)
+  "The value systemd gave the variable NAME, or NIL. A failure unit started by
+   OnFailure= may see it with a MONITOR_ prefix, as the result of the unit it
+   watches, so that form is read when the plain one is absent."
+  (let ((value (or (uiop:getenv name)
+                   (uiop:getenv (concatenate 'string "MONITOR_" name)))))
+    (and value (plusp (length value)) value)))
+
+(defun %claim-failure-alarm (&key (window 10) (now (%unix-time)))
+  "True when this run is the one to raise the alarm that the host service
+   failed, having recorded so in host/last-failed-alarm; NIL when another run
+   raised it less than WINDOW seconds ago.
+
+   The service's unit may run the alarm from OnFailure= and from ExecStopPost=
+   for the same failure, and those two can run at the same moment, so the
+   stamp is read and rewritten under a lock held across both. A stamp that
+   cannot be read or written raises the alarm anyway: a doubled alarm is a
+   nuisance, a lost one is the failure this exists to prevent."
+  (let ((path (merge-pathnames "last-failed-alarm" (hostfiles:host-dir)))
+        (fd nil))
+    (handler-case
+        (progn
+          (hostfiles:ensure-host-dir)
+          (setf fd (sb-posix:open (uiop:native-namestring path)
+                                  (logior sb-posix:o-creat sb-posix:o-rdwr) #o600))
+          (sb-posix:fcntl fd sb-posix:f-setlkw (%whole-file-lock sb-posix:f-wrlck))
+          (let ((stream (sb-sys:make-fd-stream fd :input t :output t
+                                                  :buffering :full
+                                                  :external-format :utf-8)))
+            ;; The stream owns the descriptor from here, and closing it is
+            ;; what releases the lock.
+            (setf fd nil)
+            (unwind-protect
+                 (let ((last (ignore-errors
+                              (parse-integer (read-line stream nil "")
+                                             :junk-allowed t))))
+                   (if (and last (<= 0 (- now last)) (< (- now last) window))
+                       nil
+                       (progn
+                         (file-position stream 0)
+                         (sb-posix:ftruncate (sb-sys:fd-stream-fd stream) 0)
+                         (format stream "~D~%" now)
+                         (finish-output stream)
+                         t)))
+              (close stream))))
+      (error (e)
+        (when fd (ignore-errors (sb-posix:close fd)))
+        (%warn "could not read or record the alarm stamp ~A: ~A; raising the alarm anyway"
+               (uiop:native-namestring path) e)
+        t))))
+
+(defun %host-failed (&key (notify-seconds 5))
+  "Raise the alarm that the host bus service failed, then exit 0. This is what
+   the service's failure unit runs, so it must work with the service dead and
+   must not depend on anything the service does.
+
+   systemd's SERVICE_RESULT says why the service stopped; `success` is an
+   ordinary stop, and then nothing is raised. Otherwise, unless another run
+   raised the alarm within the last ten seconds, it appends one
+   `FLEET ERROR code=service-failed` line to the fleet log, naming the result,
+   exit code and exit status when systemd gave them, and raises one critical
+   desktop notification: notify-send first, gdbus when that is missing or
+   fails. It waits up to NOTIFY-SECONDS for the notifier to finish, because a
+   oneshot unit that exits first may take the notifier with it."
+  (let ((result (%systemd-value "SERVICE_RESULT"))
+        (code (%systemd-value "EXIT_CODE"))
+        (status (%systemd-value "EXIT_STATUS")))
+    (when (equal result "success")
+      (uiop:quit 0))
+    (unless (%claim-failure-alarm)
+      (uiop:quit 0))
+    (let* ((detail (format nil "~@[ result=~A~]~@[ code=~A~]~@[ status=~A~]"
+                           (and result (%field-token result))
+                           (and code (%field-token code))
+                           (and status (%field-token status))))
+           (log (uiop:native-namestring (hostfiles:fleet-log-path)))
+           (summary "The dsmr host bus service failed")
+           (body (format nil "systemd is restarting it.~A Agents on this host ~
+                              cannot hear the bus until it is back. See ~A."
+                         detail log)))
+      (handler-case
+          (hostfiles:append-fleet-line
+           (hostfiles:fleet-line :error "service-failed"
+                                 :msg (format nil "the host bus service failed and ~
+                                                   systemd is restarting it~A"
+                                              detail)))
+        (error (e)
+          (%warn "could not write the service failure to the fleet log ~A: ~A"
+                 log e)))
+      (%start-notifier
+       "notify-send"
+       (list "--app-name=dsmr-bus-watch" "--urgency=critical" summary body)
+       (lambda (notify-send-failure)
+         (%warn "notify-send ~A; sending the service failure alarm through gdbus"
+                notify-send-failure)
+         (%start-notifier
+          "gdbus"
+          (%gdbus-notify-args summary body)
+          (lambda (gdbus-failure)
+            (%warn "no desktop notification went out for the service failure: notify-send ~A, and gdbus ~A; the alarm is in ~A only"
+                   notify-send-failure gdbus-failure log)))))
+      (loop repeat (* 10 notify-seconds)
+            do (%reap-notifiers)
+            until (null *notify-processes*)
+            do (sleep 0.1))
+      (uiop:quit 0))))
+
 (defun %write-deaf-marker (watch since)
   "Write the deafness marker for WATCH: one line naming when the unheard mail
    was written (SINCE, Unix seconds), the agent and the bus."
@@ -2311,10 +2928,11 @@ detached watcher, its pid file.
    agent was last heard."
   (make-pathname :type "offset" :defaults log-path))
 
-(defun %read-offset (log-path)
-  "The inode and position a listener last saved for LOG-PATH, as a cons
-   (ino . pos), or NIL when none was saved or the file does not read as one."
-  (let ((line (ignore-errors (first (uiop:read-file-lines (%offset-path log-path))))))
+(defun %read-offset (log-path &optional (offset-path (%offset-path log-path)))
+  "The inode and position a listener last saved for LOG-PATH in OFFSET-PATH
+   (by default the offset file beside the log), as a cons (ino . pos), or NIL
+   when none was saved or the file does not read as one."
+  (let ((line (ignore-errors (first (uiop:read-file-lines offset-path)))))
     (flet ((number-after (key)
              (let ((at (and line (search key line))))
                (and at (ignore-errors
@@ -2324,27 +2942,32 @@ detached watcher, its pid file.
             (pos (number-after "pos=")))
         (and ino pos (>= pos 0) (cons ino pos))))))
 
+(defun %save-offset (log-path &optional (offset-path (%offset-path log-path)))
+  "Record in OFFSET-PATH (by default the offset file beside the log) how far a
+   listener has now covered the log at LOG-PATH: its inode and its whole
+   current size. A failure is reported and otherwise ignored: the wake it
+   follows has happened either way."
+  (handler-case
+      (let ((stat (sb-posix:stat (uiop:native-namestring log-path))))
+        (with-open-file (out offset-path
+                             :direction :output :if-exists :supersede
+                             :if-does-not-exist :create)
+          (format out "ino=~D pos=~D~%"
+                  (sb-posix:stat-ino stat) (sb-posix:stat-size stat))))
+    (error (e)
+      (%warn "could not save the read offset for ~A: ~A"
+             (uiop:native-namestring log-path) e))))
+
 (defun %save-offsets (targets)
   "Record, beside each log in TARGETS, how far a listener has now covered it:
-   the log's inode and its whole current size.
+   the log's inode and its whole current size (see %SAVE-OFFSET).
 
    The whole size rather than the position after the reported line, because
    the woken agent drains the bus, which covers every line already written;
    only a line written after this belongs to the next arm. The deafness alarm
-   reads the time of this write as the moment the agent was last heard. A
-   failure is reported and otherwise ignored: the wake it follows has
-   happened either way."
+   reads the time of this write as the moment the agent was last heard."
   (loop for (nil log-path) in targets
-        do (handler-case
-               (let ((stat (sb-posix:stat (uiop:native-namestring log-path))))
-                 (with-open-file (out (%offset-path log-path)
-                                      :direction :output :if-exists :supersede
-                                      :if-does-not-exist :create)
-                   (format out "ino=~D pos=~D~%"
-                           (sb-posix:stat-ino stat) (sb-posix:stat-size stat))))
-             (error (e)
-               (%warn "could not save the read offset for ~A: ~A"
-                      (uiop:native-namestring log-path) e)))))
+        do (%save-offset log-path)))
 
 (defun %follow-rewind (fol ino pos)
   "Move FOL, just opened at the end of its file, back to POS, when the file is
@@ -2366,12 +2989,13 @@ detached watcher, its pid file.
 (defun %wake-wait (targets poll-ms
                    &key (watcher-alive-p (lambda (pid-path)
                                            (and (%live-detached-pid pid-path) t)))
-                        deadline-ms start-offsets)
+                        deadline-ms start-offsets (event-p #'%event-line-p))
   "Wait for the next event line in any of TARGETS and return (values :event
    line bus), or (values :no-watcher nil bus) naming the first bus whose
    detached watcher is not running. Each target is a list (bus log-path
    pid-path). DEADLINE-MS, when given, is a limit in milliseconds after which
-   this returns :timeout.
+   this returns :timeout. EVENT-P decides which lines count as events (by
+   default the wake and error lines of a watch log).
 
    Every log is read from its end as it stands when this starts, so a line
    already there is never reported again. START-OFFSETS, an alist from a log's
@@ -2402,7 +3026,7 @@ detached watcher, its pid file.
       (unwind-protect
            (loop
              (loop for (bus . fol) in followers
-                   do (let ((line (find-if #'%event-line-p (%follow-lines fol))))
+                   do (let ((line (find-if event-p (%follow-lines fol))))
                         (when line
                           (return-from %wake-wait (values :event line bus)))))
              (multiple-value-bind (dead bus) (dead-bus)
@@ -2494,10 +3118,12 @@ detached watcher, its pid file.
   "The open stream on this listener's lock file. Held for the life of the
    process, since closing any descriptor on the file would drop the lock.")
 
-(defun %armed-lock (self-id)
+(defun %armed-lock (self-id &optional (type "armed"))
   "Take the listener lock for SELF-ID, which every --wake holds while it waits.
    Returns true when this process now holds it, and NIL when another listener
-   for the same identity already does.
+   for the same identity already does. TYPE names the lock file: a fleet-log
+   listener takes its own, so it and the identity's bus listener never block
+   each other.
 
    The lock is per identity rather than per bus. An agent has one session to
    wake, and two listeners armed for it, whether two stacked Stop hooks or a
@@ -2505,7 +3131,7 @@ detached watcher, its pid file.
 
    A lock file that cannot be opened at all is reported and treated as taken by
    this process: refusing to listen over it would leave the agent deaf."
-  (let ((path (%detach-file (%identity-stem self-id) "armed")))
+  (let ((path (%detach-file (%identity-stem self-id) type)))
     (let ((fd (handler-case
                   (progn
                     (ensure-directories-exist path)
@@ -2528,7 +3154,7 @@ detached watcher, its pid file.
               (ignore-errors (sb-posix:close fd))
               nil))))))
 
-(defun %await-armed-lock (self-id poll-ms deadline-ms)
+(defun %await-armed-lock (self-id poll-ms deadline-ms &optional (type "armed"))
   "Wait for the listener lock for SELF-ID, trying for it every POLL-MS, and
    return true once this process holds it, or NIL when DEADLINE-MS (NIL for no
    limit) passes first.
@@ -2542,13 +3168,14 @@ detached watcher, its pid file.
   (let ((sleep-s (/ (max poll-ms 1) 1000.0))
         (limit (and deadline-ms (+ (now-ms) deadline-ms))))
     (loop
-      (when (%armed-lock self-id)
+      (when (%armed-lock self-id type)
         (return t))
       (when (and limit (>= (now-ms) limit))
         (return nil))
       (sleep sleep-s))))
 
-(defun %arm-wake (self-id hook-p waits-p poll-ms wake-seconds)
+(defun %arm-wake (self-id hook-p waits-p poll-ms wake-seconds
+                  &optional (lock-type "armed"))
   "Take the listener lock for SELF-ID on behalf of --wake, or end the process
    when this wake is not to listen. Returns how many milliseconds of
    WAKE-SECONDS are left for the listen itself, or NIL for no limit.
@@ -2557,18 +3184,18 @@ detached watcher, its pid file.
    0, and a default wake with `already-armed`. A wake that WAITS-P waits for the
    lock instead, and prints the idle line and exits 0 when WAKE-SECONDS run out
    first, so the limit a background runner imposes covers the wait and the
-   listen together."
+   listen together. LOCK-TYPE names the listener lock (see %ARMED-LOCK)."
   (let ((deadline-ms (%wake-deadline-ms wake-seconds))
         (started-ms (now-ms)))
     (flet ((say-and-exit (text)
              (format *standard-output* "~A~%" text)
              (force-output *standard-output*)
              (uiop:quit 0)))
-      (unless (%armed-lock self-id)
+      (unless (%armed-lock self-id lock-type)
         (cond
           (hook-p (uiop:quit 0))
           ((not waits-p) (say-and-exit "already-armed"))
-          ((not (%await-armed-lock self-id poll-ms deadline-ms))
+          ((not (%await-armed-lock self-id poll-ms deadline-ms lock-type))
            (say-and-exit (%idle-line wake-seconds)))))
       (and deadline-ms
            (max 0 (- deadline-ms (- (now-ms) started-ms)))))))
@@ -2601,6 +3228,71 @@ detached watcher, its pid file.
   (format *error-output* "~A~%dsmr-bus-watch: ~A~%" line advice)
   (force-output *error-output*)
   (uiop:quit 2))
+
+(defun %fleet-offset-path (self-id)
+  "Where SELF-ID's fleet-log listener keeps its read offset:
+   fleet-error--<agent>--<hash>.offset in the host directory. The fleet log is
+   shared by every leader on the host, so the offset is per identity and never
+   beside the log, where one leader's read would move another's."
+  (uiop:parse-native-namestring
+   (concatenate 'string
+                (uiop:native-namestring (hostfiles:host-dir))
+                "fleet-error--" (%identity-stem self-id) ".offset")))
+
+(defun %wake-fleet-log (opts self-id)
+  "Block until the next fleet line reaches the host's fleet error log, print it
+   and exit 0, or print the idle line and exit 0 when --wake-seconds pass first.
+   This is --wake --fleet-log: what a leader keeps armed in the background so
+   a fault the host service could not heal reaches it without polling.
+
+   It keeps the identity wake's contract. The log is followed across a
+   rotation onto its new file. With an identity, the wake resumes from the
+   offset the last fleet-log wake for that identity saved, so a line written
+   while no wake was armed is still reported, and saves its own on return; the
+   first ever starts at the end. One fleet-log listener per identity, through
+   a lock of its own, so it never stands in the way of the identity's bus
+   listener: a second prints `already-armed` and exits 0, or with
+   --wait-for-arm waits its turn. With no identity it starts at the end, saves
+   nothing and takes no lock.
+
+   On a host where the service was never installed and no fleet log exists,
+   nothing will ever write one, so it prints `noservice` and exits 1 rather
+   than waiting for ever."
+  (let ((log (hostfiles:fleet-log-path)))
+    (flet ((say-and-exit (text code)
+             (format *standard-output* "~A~%" text)
+             (force-output *standard-output*)
+             (uiop:quit code)))
+      (unless (or (hostfiles:service-installed-p) (probe-file log))
+        (%warn "no host bus service is installed here and there is no fleet log ~
+                at ~A to listen on"
+               (uiop:native-namestring log))
+        (say-and-exit "noservice" 1))
+      (unless self-id
+        (%warn "no identity resolved; listening on the fleet log from its end, ~
+                with no saved offset and no listener lock"))
+      (%install-termination-handler)
+      (let* ((wake-seconds (opt-wake-seconds opts))
+             (listen-ms (if self-id
+                            (%arm-wake self-id nil (opt-wait-for-arm-p opts)
+                                       (opt-poll-ms opts) wake-seconds
+                                       "fleet-armed")
+                            (%wake-deadline-ms wake-seconds)))
+             (offset-path (and self-id (%fleet-offset-path self-id)))
+             (saved (and offset-path (%read-offset log offset-path))))
+        (multiple-value-bind (outcome line)
+            (%wake-wait (list (list nil log nil)) (opt-poll-ms opts)
+                        :watcher-alive-p (constantly t)
+                        :event-p #'hostfiles:fleet-line-p
+                        :deadline-ms listen-ms
+                        :start-offsets (and saved
+                                            (list (cons (uiop:native-namestring log)
+                                                        saved))))
+          (when (and offset-path (probe-file log))
+            (%save-offset log offset-path))
+          (if (eq outcome :event)
+              (say-and-exit line 0)
+              (say-and-exit (%idle-line wake-seconds) 0)))))))
 
 (defun %wake (opts bus self-id)
   "Block until the next event line reaches this agent's detached log, print it
@@ -2644,6 +3336,8 @@ detached watcher, its pid file.
    at every turn end and must never turn into a loop: no identity, input naming
    a subagent, another listener already armed, or a missing watcher it already
    reported within the hour."
+  (when (opt-fleet-log-p opts)
+    (%wake-fleet-log opts self-id))
   (let ((hook-p (opt-hook-p opts)))
     (when (and hook-p
                (or (null self-id)
@@ -2752,6 +3446,22 @@ detached watcher, its pid file.
         (when (opt-help-p opts)
           (%usage)
           (uiop:quit 0))
+        ;; A fleet-log listener that ran as anything else would listen on the
+        ;; wrong log, or as a hook wake a session over the fleet's faults, so
+        ;; this misuse is refused rather than downgraded.
+        (when (and (opt-fleet-log-p opts)
+                   (or (not (opt-wake-p opts)) (opt-hook-p opts)))
+          (%warn "--fleet-log goes with --wake, and not with --hook")
+          (uiop:quit 64))
+        ;; About the host, not about one identity or one bus, so it answers
+        ;; before either is resolved.
+        (when (opt-host-status-p opts)
+          (%host-status))
+        (when (opt-host-failed-p opts)
+          (%host-failed))
+        ;; About a bus but not about an identity.
+        (when (opt-host-restore-p opts)
+          (%host-restore opts (%resolve-bus opts)))
         (let* ((bus (%resolve-bus opts))
                (wal-path (if (opt-wal opts)
                              (pathname (opt-wal opts))
@@ -2773,7 +3483,7 @@ detached watcher, its pid file.
           (when (opt-wake-p opts)
             (%wake opts bus self-id))
           (when (and (opt-detach-p opts) (not (opt-detached-child-p opts)))
-            (%detach bus self-id args))
+            (%detach bus self-id args opts))
           (%install-termination-handler)
           (when (opt-detached-child-p opts)
             (ignore-errors (sb-posix:setsid))
