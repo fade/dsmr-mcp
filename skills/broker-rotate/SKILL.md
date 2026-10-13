@@ -1,6 +1,6 @@
 ---
 name: broker-rotate
-description: "Retire a running dsmr-mcp bus broker and bring up a fresh one on current code, without losing messages or rotating the WAL. Use when the broker has been up long enough to be serving stale source, when a broker must be restarted to pick up a fix, or when the operator asks to reap or refresh the broker. Covers the last-member-out measurement that decides whether the WAL rotates, the correct signal, the authoritative liveness probe, and the two instruments that lie. Companion to bus-watch and fleet-restart."
+description: "Retire a running dsmr-mcp bus broker and bring up a fresh one on current code, without losing messages or rotating the WAL. Use when the broker has been up long enough to be serving stale source, when a broker must be restarted to pick up a fix, or when the operator asks to reap or refresh the broker. Covers the last-member-out measurement that decides whether the WAL rotates, the correct signal, the authoritative liveness probe, and the two instruments that lie. Where the host bus service serves the bus, retiring the broker means restarting the service, and a bus a client elected is handed back with --host-restore. Companion to bus-watch and fleet-restart."
 ---
 
 # /broker-rotate
@@ -31,6 +31,35 @@ is the only delivery mechanism.
 
 The cheap tell: compare the broker's start time against the last commit that
 touched anything under `src/bus/`.
+
+## First: who runs this bus's broker?
+
+Where the operator has installed the host bus service (`dsmr-bus-host`, a
+systemd user unit), it runs the brokers itself, and the procedure below is not
+how you retire one. Ask the service first, with `--host-status` on the watcher
+binary, and read the line for your bus:
+
+- **`bus <name> owner=host`**: the service runs this broker. Retire it by
+  restarting the service, after installing the new binary with
+  `make install-bus-host` if the point is new code:
+
+  ```
+  systemctl --user restart dsmr-bus-host
+  ```
+
+  The service never archives on stop, so the log does not rotate whoever is a
+  member, and the last-member measurement below does not apply. A restart
+  replaces every bus's broker and every agent's watch on this host at once, and
+  each agent goes unheard for the second or two it takes, so it still needs the
+  operator's go and a quiet bus. Confirm with `--host-status` that the service
+  reads `alive` and every bus `owner=host` again.
+- **`bus <name> owner=client`**: a client elected this broker while the service
+  was not serving the bus. Do not SIGTERM it by hand. `--host-restore --bus
+  <name>` hands the bus back to the service, signalling only the broker the
+  service recorded and leaving the log unrotated; restoring order is the
+  leader's job (see **leader**).
+- **`service state=not-installed`**: there is no service on this host, and the
+  rest of this file applies as written.
 
 ## Name the bus FIRST, and derive its root
 
@@ -232,6 +261,12 @@ one new message with no re-delivery of the sequences before it.
 ⚠ That is evidence from one rotation, on a fleet whose watcher binaries were all
 current. It is not a guarantee, and it says nothing about a watcher running an
 older binary. Still worth a rollcall afterwards rather than an assumption.
+
+Under the host bus service the agents' watches live in the same process as the
+brokers, so a service restart ends them too. The service picks every registration
+up again when it starts, writing to the same logs, and a background `--wake`
+waiting through the restart may answer `nowatcher`, which its owner handles by
+running `--detach` again. The rollcall afterwards matters more, not less.
 
 ## Expect the cursor reaper to fire, and expect it to be loud
 
