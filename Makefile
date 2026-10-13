@@ -17,7 +17,7 @@ export XDG_CACHE_HOME ?= $(CURDIR)/.ci-cache
 # whenever the dependencies, the SBCL build, or the project source change.
 CORE ?= dsmr.core
 
-.PHONY: bridge bus-watch install-bus-watch test test-integration core core-verify test-warm \
+.PHONY: bridge bus-watch bus-host install-bus-watch test test-integration core core-verify test-warm \
         install-skills check-skills install-harness check-harness install-sisters check-sisters \
         preflight check-preflight self-test-preflight install-hooks check-hooks
 
@@ -74,6 +74,45 @@ bus-watch:
 	     --eval '(asdf:load-asd (truename "dsmr-bus-watch.asd"))' \
 	     --eval '(asdf:make :dsmr-bus-watch)' \
 	     --eval '(quit)'
+
+## bus-host: build the host bus service binary.
+##
+##   Produces bin/dsmr-bus-host via ASDF program-op (save-lisp-and-die). One
+##   process per host runs every bus broker and the watch for every agent
+##   registered with it, in place of a broker elected by whichever client came
+##   first and a detached watcher process per agent per bus. Build artefact is
+##   .gitignored; rebuild with 'make bus-host' after any change under
+##   src/bus/host/ or to the bus leaves it shares.
+##
+##   Unlike the watcher it runs brokers, so it needs the ZeroMQ binding and
+##   log4cl: it is built with Quicklisp and the Lisp workspace visible (the
+##   workspace carries the vetted pzmq fork), but still without the user's init
+##   file, so nothing from a development session ends up in the saved image.
+##
+##   Every system in the image but the service's own, and the dsmr-mcp system
+##   its broker asks ASDF about when it records its own version, is registered
+##   as immutable before the image is saved (the service's own is left out
+##   because ASDF builds nothing for an immutable system). Without that, the
+##   saved image answers the broker by scanning the whole source registry,
+##   which on a workspace this size kept the first broker from serving for
+##   minutes. The old binary is removed first because ASDF sees no reason to
+##   save the image again when only this recipe has changed.
+bus-host:
+	@mkdir -p bin
+	@rm -f bin/dsmr-bus-host
+	sbcl --noinform --no-sysinit --no-userinit --disable-debugger \
+	     --eval '(require :asdf)' \
+	     --eval '(let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file ql) (load ql)))' \
+	     --eval '(pushnew (uiop:ensure-directory-pathname "$(WORKSPACE)") asdf:*central-registry* :test (function equal))' \
+	     --eval '(pushnew (uiop:ensure-directory-pathname "$(WORKSPACE)/pzmq") asdf:*central-registry* :test (function equal))' \
+	     --eval '(asdf:load-asd (truename "dsmr-mcp.asd"))' \
+	     --eval '(asdf:load-asd (truename "dsmr-bus-watch.asd"))' \
+	     --eval '(asdf:load-asd (truename "dsmr-bus-host.asd"))' \
+	     --eval '(asdf:load-system :dsmr-bus-host)' \
+	     --eval '(map nil (function asdf:register-immutable-system) (remove "dsmr-bus-host" (list* "dsmr-mcp" "dsmr-bus-watch" (asdf:already-loaded-systems)) :test (function equal)))' \
+	     --eval '(asdf:make :dsmr-bus-host)' \
+	     --eval '(quit)'
+	@test -x bin/dsmr-bus-host || { echo "bin/dsmr-bus-host was not written" >&2; exit 1; }
 
 ## install-bus-watch: publish the built watcher onto PATH.
 ##
