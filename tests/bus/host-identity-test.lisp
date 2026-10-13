@@ -618,6 +618,30 @@
       (true (search "old-cursor=372" (first lines)) "~S" lines)
       (true (search "old-cursor=500" (second lines)) "~S" lines))))
 
+(define-test a-roster-gap-reaches-the-fleet-log-once-while-it-stands
+  "A roster gap is a finding for a leader, so it is written to the fleet log
+   at INFO, once however often it is seen. Its recovery is written there too,
+   and a gap that opens again afterwards is written again. Routine INFO stays
+   out of the fleet log."
+  (with-host ()
+    (flet ((gap (&optional msg)
+             (ident:report-to-logs :info "roster-gap" :id "/n/x"
+                                   :subject "enrolled-unregistered /n/x"
+                                   :msg (or msg "/n/x enrolled on the roster with no registration")))
+           (gap-lines ()
+             (remove-if-not (lambda (line) (search " FLEET INFO code=roster-gap " line))
+                            (fleet-lines))))
+      (gap)
+      (gap)
+      (is = 1 (length (gap-lines)) "~S" (gap-lines))
+      (gap "recovered: /n/x is no longer enrolled on the roster with no registration")
+      (is = 2 (length (gap-lines)) "~S" (gap-lines))
+      (true (search "recovered" (second (gap-lines))) "~S" (gap-lines))
+      (gap)
+      (is = 3 (length (gap-lines)) "~S" (gap-lines))
+      (ident:report-to-logs :info "no-cursor" :id "/n/x" :msg "armed at the head")
+      (is = 0 (count-if (lambda (line) (search "code=no-cursor" line)) (fleet-lines))))))
+
 (define-test a-skipped-stranded-cursor-still-arms-at-the-head
   "A fault the supervisor skips, as it does once a breaker has tripped, must
    not leave the identity filtering on the stranded value."

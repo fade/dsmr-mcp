@@ -139,17 +139,32 @@
   pid-ino
   service-pid)
 
+(defparameter *fleet-findings* '("roster-gap")
+  "Codes reported at INFO that still belong in the fleet log. They are
+   findings rather than faults: nothing is broken and nothing heals them, but
+   a leader is the one who closes them, and the fleet log is where a leader
+   looks.")
+
 (defun report-to-logs (level code &key bus id subject msg)
   "Hand a report to the service's logs: INFO to the service log, anything worse
    to the fleet error log a leader watches. Takes the arguments the healing
    supervisor gives its report function, so it can be handed straight to it.
 
    A heal is routine and belongs in the service log; only what a leader may have
-   to act on goes to the fleet log."
-  (if (eq level :info)
-      (fleetlog:service-log :info "~A~@[ bus=~A~]~@[ id=~A~]~@[ subject=~A~]~@[: ~A~]"
-                            code bus id subject msg)
-      (fleetlog:fleet-report level code :bus bus :id id :subject subject :msg msg)))
+   to act on goes to the fleet log. A finding (see *FLEET-FINDINGS*) goes there
+   at INFO, once for as long as it stands, and a report whose message starts
+   with `recovered` says it has closed, so the same gap opening again later is
+   written again."
+  (cond
+    ((not (eq level :info))
+     (fleetlog:fleet-report level code :bus bus :id id :subject subject :msg msg))
+    ((member code *fleet-findings* :test #'equal)
+     (if (and (stringp msg) (uiop:string-prefix-p "recovered" msg))
+         (fleetlog:fleet-recovered code :bus bus :id id :subject subject)
+         (fleetlog:fleet-report :info code :bus bus :id id :subject subject :msg msg)))
+    (t
+     (fleetlog:service-log :info "~A~@[ bus=~A~]~@[ id=~A~]~@[ subject=~A~]~@[: ~A~]"
+                           code bus id subject msg))))
 
 ;;; ----------------------------------------------------------------- the files
 
