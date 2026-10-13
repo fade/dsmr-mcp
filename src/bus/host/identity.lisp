@@ -663,9 +663,13 @@
 
    This is the detached watcher's re-arm on the same clock: a wake line that
    nobody heard is not the agent's only chance to learn of its mail. The cursor
-   is checked for stranding first, as a re-arm would."
+   is checked for stranding first, as a re-arm would.
+
+   The window has to be exceeded, not just reached. The clock is in whole
+   seconds, so the log may have moved up to a second after the LAST it records,
+   and a window that was only reached could end almost a second early."
   (let ((last (identity-last-activity identity)))
-    (when (and last (>= (- now last) (identity-recycle-seconds identity)))
+    (when (and last (> (- now last) (identity-recycle-seconds identity)))
       (setf (identity-last-activity identity) now)
       (%recheck-cursor identity now readers wal-path cursors-dir report-fn :force t)
       (let ((mail (%unread-mail identity wal-path)))
