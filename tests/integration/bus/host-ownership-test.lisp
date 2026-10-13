@@ -6,6 +6,15 @@
 ;;;; process beside it, and restarting it rotates no log and loses nothing a
 ;;;; client submitted meanwhile.
 ;;;;
+;;;; The second half is about order on the bus. A bus a client's broker holds
+;;;; is recorded as degraded and handed back by a leader's --host-restore with
+;;;; no rotation and no moment in which nobody holds the role; a cursor left
+;;;; pointing into a log that is gone is rewritten, said so in the fleet log
+;;;; with its old position, and the mail it was hiding wakes the agent, at
+;;;; registration and when the cursor is spoiled while the agent is served; and
+;;;; the gap between a bus's roster and its registrations is reported, once,
+;;;; and gates nobody.
+;;;;
 ;;;; Every case runs the built bin/dsmr-bus-host and bin/dsmr-bus-watch under its
 ;;;; own fresh state root under /tmp, with stub desktop notifiers first on PATH
 ;;;; and no systemd notification socket. A missing binary is a failure here, not
@@ -25,7 +34,9 @@
   (:local-nicknames (#:hostfiles #:dsmr-mcp/src/bus/hostfiles)
                     (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:envelope #:dsmr-mcp/src/bus/envelope)
-                    (#:wal #:dsmr-mcp/src/bus/wal))
+                    (#:wal #:dsmr-mcp/src/bus/wal)
+                    (#:election #:dsmr-mcp/src/bus/election)
+                    (#:roster #:dsmr-mcp/src/bus/roster))
   (:import-from #:dsmr-mcp/tests/integration/bus/host-support
                 #:watcher-binary
                 #:host-binary
@@ -40,7 +51,10 @@
                 #:kill-service
                 #:processes-under-state
                 #:start-publisher
-                #:publisher-lines))
+                #:publisher-lines
+                #:publish-batch
+                #:write-cursor
+                #:start-foreign-broker))
 
 (in-package #:dsmr-mcp/tests/integration/bus/host-ownership-test)
 
@@ -135,6 +149,75 @@
 (defun seconds-since (start)
   (/ (- (get-internal-real-time) start) internal-time-units-per-second))
 
+(defun host-status (state)
+  "What --host-status prints under STATE, and the status it exits with."
+  (multiple-value-bind (out err code) (watch state "--host-status")
+    (declare (ignore err))
+    (values out code)))
+
+(defun fleet-lines (state level code)
+  "The fleet log lines under STATE at LEVEL (\"WARN\", \"INFO\") under CODE."
+  (let ((needle (format nil " FLEET ~A code=~A " level code)))
+    (remove-if-not (lambda (line) (search needle line))
+                   (or (ignore-errors
+                        (uiop:read-file-lines
+                         (merge-pathnames "dsmr-mcp/host/fleet-error.log" state)))
+                       '()))))
+
+(defun cursor-text (state bus agent)
+  "AGENT's cursor on BUS under STATE, as written, or NIL when there is none."
+  (with-state-home (state)
+    (let ((path (merge-pathnames (envelope:encode-id (id agent))
+                                 (broker:bus-paths-cursors-dir (bus-paths state bus)))))
+      (and (probe-file path)
+           (string-trim '(#\Space #\Newline) (uiop:read-file-string path))))))
+
+(defun strand (state agent)
+  "Leave the unnamed bus under STATE as a reboot used to: a log at generation
+   2 holding three records from another agent, and AGENT's cursor at 372 of
+   generation 1, a position in a log that has been rotated away."
+  (publish-batch state nil (list (list *client* :text "one")
+                                 (list *client* :text "two")
+                                 (list *client* :text "three")))
+  (let ((path (wal:generation-path (broker:bus-paths-wal (bus-paths state nil)))))
+    (with-open-file (out path :direction :output :if-exists :supersede
+                              :if-does-not-exist :create)
+      (write-string "2" out)))
+  (write-cursor state nil (id agent) 372 1))
+
+(defun start-lock-sampler (path hz)
+  "Start a thread that, HZ times a second, tries to take the lock at PATH
+   without waiting and lets it go at once, counting the tries and the ones
+   that found it free. The tries keep to a schedule, so time spent trying does
+   not lower the rate. Returns what STOP-LOCK-SAMPLER takes."
+  (let* ((box (vector nil 0 0))
+         (period (round internal-time-units-per-second hz))
+         (thread (sb-thread:make-thread
+                  (lambda ()
+                    (loop with next = (get-internal-real-time)
+                          until (svref box 0)
+                          do (let ((fd (election:open-lock path)))
+                               (unwind-protect
+                                    (when (election:try-lock-exclusive fd)
+                                      (incf (svref box 1))
+                                      (election:unlock fd))
+                                 (election:close-lock fd)))
+                             (incf (svref box 2))
+                             (incf next period)
+                             (let ((wait (- next (get-internal-real-time))))
+                               (when (plusp wait)
+                                 (sleep (/ wait internal-time-units-per-second))))))
+                  :name "broker lock sampler")))
+    (cons thread box)))
+
+(defun stop-lock-sampler (sampler)
+  "Stop SAMPLER and return how many of its tries found the lock free, and how
+   many tries it made."
+  (destructuring-bind (thread . box) sampler
+    (setf (svref box 0) t)
+    (sb-thread:join-thread thread :default nil :timeout 5)
+    (values (svref box 1) (svref box 2))))
+
 ;;; --------------------------------------------------------------------- cases
 
 (define-test one-service-serves-every-bus
@@ -224,3 +307,148 @@
                     "alpha's last line ~S does not announce the last record, ~D"
                     (car (last (log-lines state "a" "alpha"))) last-seq))
             (true (alive-p second))))))))
+
+(define-test a-leader-restores-a-client-elected-bus
+  "Started while a broker a client elected serves a bus, the service records
+   the bus degraded and --host-status names the client's broker and exits 1.
+   A leader's --host-restore then hands the bus back: it says restored, the
+   service owns the bus, no archive is written, the generation stays, and a
+   lock sampled fifty times a second across the hand-over is found free at
+   most once."
+  (with-binaries ()
+    (with-host-state (state)
+      (let ((paths (bus-paths state "b")))
+        (publish-batch state "b" (list (list *client* :text "already here")))
+        ;; The sampler's control: with no broker yet, it finds the lock free.
+        (let ((control (start-lock-sampler (broker:bus-paths-lock paths) 50)))
+          (sleep 0.3)
+          (true (plusp (stop-lock-sampler control)) "the sampler cannot see a free lock"))
+        (let* ((foreign (start-foreign-broker state "b"))
+               (service (start-service state))
+               (degraded (format nil "bus b owner=client incumbent=~D " foreign)))
+          (true (await-true (lambda () (search degraded (host-status state))) 6)
+                "--host-status does not show the client's broker: ~S" (host-status state))
+          (multiple-value-bind (out code) (host-status state)
+            (is eql 1 code "a degraded bus must make --host-status fail: ~S" out))
+          (let ((archives (archives paths))
+                (generation (generation paths))
+                (sampler (start-lock-sampler (broker:bus-paths-lock paths) 50)))
+            (multiple-value-bind (out err code) (watch state "--host-restore" "--bus" "b")
+              (is eql 0 code "--host-restore failed: ~A" err)
+              (is string= (format nil "restored bus=b incumbent=~D signal=term" foreign) out))
+            (true (await-true (lambda () (search "bus b owner=host " (host-status state))) 7)
+                  "--host-status does not show the service owning the bus: ~S"
+                  (host-status state))
+            (multiple-value-bind (free tries) (stop-lock-sampler sampler)
+              (format *trace-output* "~&broker lock free in ~D of ~D samples across the hand-over~%"
+                      free tries)
+              (true (> tries 50) "the sampler hardly ran: ~D tries" tries)
+              (true (<= free 1) "the broker lock was free in ~D samples" free))
+            (is eql service (broker-pid state "b"))
+            (false (alive-p foreign) "the client's broker is still running")
+            (is equal archives (archives paths) "the hand-over wrote an archive")
+            (is = generation (generation paths) "the hand-over moved the generation")
+            (true (plusp (head paths)) "the log kept its record")))))))
+
+(define-test a-stranded-cursor-is-announced-at-registration
+  "An agent registering with a cursor stranded in a rotated-away log, while
+   the new log already holds mail for it, hears of that mail at once: one wake
+   line for the third record within two seconds of --detach. Its cursor is
+   rewritten to the start of the current log, and the fleet log carries one
+   warning with the position the rewrite discarded."
+  (with-binaries ()
+    (with-host-state (state)
+      (strand state "alpha")
+      (let ((service (start-service state)))
+        (true (await-true (lambda () (eql service (broker-pid state nil))) 6)
+              "the service did not take the unnamed bus")
+        ;; Let the service's reader pass the mail first, as it has on a host
+        ;; whose agents come back after the service.
+        (sleep 1.5)
+        (multiple-value-bind (out err code) (detach state nil "alpha")
+          (is = 0 code "--detach failed: ~A" err)
+          (true (eql 0 (search (format nil "detached pid=~D " service) out)) "~S" out))
+        (true (await-true (lambda () (log-lines state nil "alpha")) 2)
+              "no wake line within 2 s of registering")
+        (sleep 1)
+        (let ((lines (log-lines state nil "alpha")))
+          (is = 1 (length lines) "~S" lines)
+          (true (eql 0 (search "bus:3 " (first lines))) "~S" lines))
+        (is equal "0 2" (cursor-text state nil "alpha"))
+        (let ((warnings (fleet-lines state "WARN" "stranded-cursor")))
+          (is = 1 (length warnings) "~S" warnings)
+          (true (search "old-cursor=372" (first warnings)) "~S" warnings))))))
+
+(define-test a-cursor-stranded-while-served-is-healed
+  "A served agent's cursor rewritten by another process to a position in a log
+   that is gone is healed within two seconds: rewritten to the start of the
+   current log, with one more warning in the fleet log naming the position
+   it held, and the mail it was hiding announced again."
+  (with-binaries ()
+    (with-host-state (state)
+      (strand state "alpha")
+      (let ((service (start-service state)))
+        (detach state nil "alpha")
+        (true (await-true (lambda () (log-lines state nil "alpha")) 3)
+              "no wake line after registering")
+        (true (await-true (lambda () (equal "0 2" (cursor-text state nil "alpha"))) 2))
+        (is = 1 (length (fleet-lines state "WARN" "stranded-cursor")))
+        ;; A new write date on the cursor is what the service looks for, and
+        ;; it is kept in whole seconds.
+        (sleep 1.1)
+        (write-cursor state nil (id "alpha") 500 1)
+        (let ((written (get-internal-real-time)))
+          (true (await-true (lambda () (equal "0 2" (cursor-text state nil "alpha"))) 2)
+                "the cursor still reads ~S ~,1F s after it was spoiled"
+                (cursor-text state nil "alpha") (seconds-since written)))
+        (true (await-true (lambda () (= 2 (length (fleet-lines state "WARN" "stranded-cursor"))))
+                          1)
+              "~S" (fleet-lines state "WARN" "stranded-cursor"))
+        (let ((warnings (fleet-lines state "WARN" "stranded-cursor")))
+          (is = 2 (length warnings) "~S" warnings)
+          (true (search "old-cursor=500" (second warnings)) "~S" warnings))
+        (true (await-true (lambda () (= 2 (length (log-lines state nil "alpha")))) 2)
+              "the mail was not announced again: ~S" (log-lines state nil "alpha"))
+        (true (alive-p service))))))
+
+(define-test roster-gaps-are-findings-not-gates
+  "With one agent enrolled on the unnamed bus's roster and never registered,
+   enrolment closed, and another registered without ever being enrolled,
+   --host-status shows both gaps as findings, the unenrolled agent is served
+   all the same, and across several status snapshots the fleet log says each
+   gap once."
+  (with-binaries ()
+    (with-host-state (state)
+      (let ((paths (bus-paths state nil)))
+        (broker:ensure-bus-dirs paths)
+        (roster:enroll (id "xray") (broker:bus-paths-roster-dir paths)
+                       (broker:bus-paths-roster-state paths))
+        (roster:close-enrollment (broker:bus-paths-roster-state paths))
+        (let ((service (start-service state))
+              (enrolled (format nil "finding kind=enrolled-unregistered bus=default id=~A"
+                                (id "xray")))
+              (registered (format nil "finding kind=registered-unenrolled bus=default id=~A"
+                                  (id "yankee"))))
+          (multiple-value-bind (out err code) (detach state nil "yankee")
+            (is = 0 code "--detach failed: ~A" err)
+            (true (eql 0 (search (format nil "detached pid=~D " service) out)) "~S" out))
+          (true (await-true (lambda ()
+                              (let ((status (host-status state)))
+                                (and (search enrolled status) (search registered status))))
+                            7)
+                "~S" (host-status state))
+          (true (eql 0 (search (format nil "live pid=~D " service)
+                               (check-live state nil "yankee")))
+                "~S" (check-live state nil "yankee"))
+          (sleep 15)
+          (flet ((gap-lines (agent)
+                   (remove-if-not (lambda (line)
+                                    (search (format nil " id=~A " (id agent)) line))
+                                  (fleet-lines state "INFO" "roster-gap"))))
+            (is = 1 (length (gap-lines "xray")) "~S" (gap-lines "xray"))
+            (is = 1 (length (gap-lines "yankee")) "~S" (gap-lines "yankee")))
+          (let ((status (host-status state)))
+            (true (search enrolled status) "~S" status)
+            (true (search registered status) "~S" status))
+          (true (eql 0 (search (format nil "live pid=~D " service)
+                               (check-live state nil "yankee")))))))))

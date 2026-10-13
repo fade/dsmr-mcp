@@ -72,7 +72,8 @@
            #:lock-holder
            #:processes-under-state
            #:start-publisher
-           #:publisher-lines))
+           #:publisher-lines
+           #:start-foreign-broker))
 
 (in-package #:dsmr-mcp/tests/integration/bus/host-support)
 
@@ -487,9 +488,11 @@
    given, and return its seq."
   (publish-batch state bus (list (list from-id :to to :text text))))
 
-(defun write-cursor (state bus id seq)
+(defun write-cursor (state bus id seq &optional generation)
   "Leave the agent ID a durable cursor at SEQ on BUS under STATE, as though it
-   had read the bus up to there, and return its path."
+   had read the bus up to there, and return its path. GENERATION, when given,
+   is written after the seq as the generation of the log the position was
+   taken against, as the bus client writes it."
   (with-state-home (state)
     (let ((path (merge-pathnames (envelope:encode-id id)
                                  (uiop:ensure-directory-pathname
@@ -497,7 +500,7 @@
       (ensure-directories-exist path)
       (with-open-file (out path :direction :output :if-exists :supersede
                                 :if-does-not-exist :create)
-        (format out "~D" seq))
+        (format out "~D~@[ ~D~]" seq generation))
       path)))
 
 (defun lock-holder (state bus namespace agent)
@@ -619,3 +622,31 @@
       (error "the publishing client did not connect within ~Ds; see ~A"
              seconds (%publisher-out state)))
     process))
+
+;;; a broker a client elected -------------------------------------------------
+
+(defun start-foreign-broker (state bus &key (seconds 120))
+  "Start a broker for BUS under STATE in a process of its own, the way a
+   client elects one while no service runs, wait up to SECONDS for it to win
+   the election and bind its intake, and return its pid. It is stopped with
+   the case.
+
+   Readiness is read from the identity record the broker writes and the
+   socket it binds, never by probing the election lock: a probe holds the lock
+   for an instant, and a broker started without blocking that loses to it
+   exits."
+  (with-state-home (state)
+    (let* ((paths (broker:ensure-bus-dirs
+                   (broker:make-bus-paths (broker:default-state-root bus))))
+           (pid (%note-started (broker:spawn-broker paths :block nil))))
+      (unless (await-true
+               (lambda ()
+                 (and (eql pid (broker:broker-identity-pid
+                                (broker:read-broker-identity paths)))
+                      (probe-file (merge-pathnames "submit.ipc"
+                                                   (broker:bus-paths-root paths)))
+                      t))
+               seconds)
+        (error "the broker (pid ~D) did not come up within ~Ds; see ~A"
+               pid seconds (merge-pathnames "broker.log" (broker:bus-paths-root paths))))
+      pid)))
