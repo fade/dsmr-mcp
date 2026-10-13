@@ -81,7 +81,7 @@
    :error-output (uiop:native-namestring (merge-pathnames "wake.err" state))
    :if-error-output-exists :supersede))
 
-(defun finish-wake (state process seconds)
+(defun finish-fleet-wake (state process seconds)
   "Wait up to SECONDS for PROCESS, and return its stdout (stripped) and its
    exit code, NIL when it is still running. A process still running is killed
    on the way out."
@@ -115,7 +115,7 @@ that is not a fleet line, or one written before the wake started, is not."
         (settle)
         (append-line state "an ordinary line with no fleet marker")
         (append-line state line)
-        (multiple-value-bind (out code) (finish-wake state wake 10)
+        (multiple-value-bind (out code) (finish-fleet-wake state wake 10)
           (is eql 0 code)
           (is string= line out))))))
 
@@ -143,7 +143,7 @@ name, never beside the shared log."
             (between (a-fleet-line "between")))
         (settle)
         (append-line state first)
-        (multiple-value-bind (out code) (finish-wake state wake 10)
+        (multiple-value-bind (out code) (finish-fleet-wake state wake 10)
           (is eql 0 code)
           (is string= first out))
         (append-line state between)
@@ -178,7 +178,7 @@ new file's fleet line is printed."
         (settle)
         (rename-file log (make-pathname :type "log-2026-10-12" :defaults log))
         (append-line state line)
-        (multiple-value-bind (out code) (finish-wake state wake 10)
+        (multiple-value-bind (out code) (finish-fleet-wake state wake 10)
           (is eql 0 code)
           (is string= line out))))))
 
@@ -204,7 +204,7 @@ the identity's bus listener is not held back by it."
           (is string= (format nil "nowatcher bus=~A" *bus*) out))
         (let ((line (a-fleet-line "release")))
           (append-line state line)
-          (multiple-value-bind (out code) (finish-wake state wake 10)
+          (multiple-value-bind (out code) (finish-fleet-wake state wake 10)
             (is eql 0 code)
             (is string= line out)))))))
 

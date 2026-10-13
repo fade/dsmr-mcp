@@ -109,7 +109,7 @@
                   5)
       pid)))
 
-(defun launch-wake (state bin)
+(defun launch-adoption-wake (state bin)
   "Start a background wake for this case's identity under STATE, as an agent
    keeps one armed, and return the process."
   (uiop:launch-program (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR"
@@ -166,7 +166,7 @@
       (values (loop for thread in samplers append (sb-thread:join-thread thread))
               value))))
 
-(defun publish (seq)
+(defun publish-seq (seq)
   "Append record SEQ from *OTHER*, addressed to everyone, to the case's bus."
   (ensure-directories-exist (default-wal-path *bus*))
   (wal:append-record (default-wal-path *bus*) seq
@@ -205,7 +205,7 @@
     (with-host-state (state)
       (let* ((legacy (start-legacy state bin))
              (log-ino (ino (my-file state "log")))
-             (wake (launch-wake state bin)))
+             (wake (launch-adoption-wake state bin)))
         (unwind-protect
              (with-host-state (elsewhere)
                (let ((stranger (start-legacy elsewhere bin)))
@@ -241,7 +241,7 @@
                                      :token)
                          (getf (hostfiles:read-served-ack (my-stem)) :token))
                      (true (alive-p stranger) "a watcher of another state home is untouched")
-                     (publish 1)
+                     (publish-seq 1)
                      (true (ident:identity-deliver
                             identity
                             (values (%poll-forward (default-wal-path *bus*)

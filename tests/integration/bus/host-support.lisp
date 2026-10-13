@@ -17,12 +17,6 @@
 ;;;; watchers whose pid files sit in that case's own root and whose environment
 ;;;; names that root.
 
-;; Package evolution guard
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (let ((pkg (find-package '#:dsmr-mcp/tests/integration/bus/host-support)))
-    (when pkg
-      (sb-ext:without-package-locks (delete-package pkg)))))
-
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :sb-posix))
 
