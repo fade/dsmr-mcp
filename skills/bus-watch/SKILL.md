@@ -84,13 +84,13 @@ means whichever one is watching for you.
 - **`--reap` deregisters you**: it prints `reaped pid=<service pid> bus=<b>
   signal=deregister`, signals nothing, and the service carries on for everyone
   else.
-- **Your registration ends with your session.** The service watches your
-  session's process. When a parked session ends, the registration goes with it:
-  the park marker stays, your mail waits at your cursor, and no alarm fires. When
-  a session that was not parked dies, the service keeps watching your cursor and
-  raises the deafness alarm if mail waits unread, but writes no wake lines.
-  Either way, the `--detach` at your next bring-up registers you again and
-  removes the park marker.
+- **Your session decides what becomes of your registration.** The service
+  watches your session's process. When a parked session ends, the registration
+  goes with it: the park marker stays, your mail waits at your cursor, and no
+  alarm fires. When a session that was not parked dies, the service keeps
+  watching your cursor and raises the deafness alarm if mail waits unread, but
+  writes no wake lines. Either way, the `--detach` at your next bring-up
+  registers you again and removes the park marker.
 - **`nowatcher` can also mean the service is restarting.** systemd brings it back
   within seconds. Run `--detach` again: it registers you, or starts a watcher of
   your own if the service is still down.

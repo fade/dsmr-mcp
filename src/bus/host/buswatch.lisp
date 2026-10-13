@@ -222,9 +222,10 @@
     rebased))
 
 (defun %rotated (bw identities report-fn)
-  "BW's log was rotated. Raise WAL-ROTATED offering REBASE-CURSORS; skipped,
-   every agent is still armed again, each healing its own cursor if it is
-   stranded, so none goes on filtering against the old log."
+  "BW's log was rotated. Raise WAL-ROTATED offering REBASE-CURSORS. If that
+   restart is not taken, every agent is still armed again, each healing its
+   own cursor if it is stranded, so none goes on filtering against the old
+   log."
   (restart-case
       (progn
         (conditions:raise-fault 'conditions:wal-rotated

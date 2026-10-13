@@ -363,7 +363,8 @@
 (defun %stranded-baseline (identity wal-path cursor-path reason head report-fn)
   "Raise the STRANDED-CURSOR fault for IDENTITY's cursor, stranded for REASON
    against a log whose head is HEAD, and return the baseline the heal taken
-   gives. Skipped, the fault leaves the identity armed at the head."
+   gives. If no heal is taken, the identity is left armed at the head of the
+   log."
   (restart-case
       (progn
         (conditions:raise-fault 'conditions:stranded-cursor

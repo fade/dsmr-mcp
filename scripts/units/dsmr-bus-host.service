@@ -1,5 +1,5 @@
 [Unit]
-Description=dsmr-mcp host bus service (brokers and watcher for every bus on this host)
+Description=dsmr bus host service: every bus broker and every registered agent's watch
 # Each failure starts the alarm unit, so a crash loop is never silent.
 OnFailure=dsmr-bus-host-failed.service
 # No start limit: a crash loop keeps retrying while the fleet log says why,

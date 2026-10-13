@@ -5,12 +5,14 @@
 ;;;; schedules every duty the other host leaves define, the readiness and
 ;;;; watchdog messages it sends systemd, and the orderly stop.
 ;;;;
-;;;; One process per host does what used to take a broker per bus and a watcher
-;;;; process per agent per bus. Each bus has a broker thread and one reader
-;;;; thread; every agent registered with the service is an identity the
-;;;; supervisor ticks. The supervisor runs each duty under the healing protocol,
-;;;; so a fault in one agent's files or one bus never stops the others, and what
-;;;; cannot be healed reaches the fleet error log a leader watches.
+;;;; While it runs, one process per host takes over from the broker a client
+;;;; elects for each bus and the watcher process each agent keeps per bus; those
+;;;; remain the fallback whenever the service is down. Each bus has a broker
+;;;; thread and one reader thread; every agent registered with the service is an
+;;;; identity the supervisor ticks. The supervisor runs each duty under the
+;;;; healing protocol, so a fault in one agent's files or one bus never stops the
+;;;; others, and what cannot be healed reaches the fleet error log a leader
+;;;; watches.
 ;;;;
 ;;;; Every duty is a function of the time it is handed, so one tick can be run in
 ;;;; a test against a clock the test chooses. The loop around it is the only

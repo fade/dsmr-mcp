@@ -85,20 +85,22 @@ bus-watch:
 ##
 ##   Produces bin/dsmr-bus-host via ASDF program-op (save-lisp-and-die). One
 ##   process per host runs every bus broker and the watch for every agent
-##   registered with it, in place of a broker elected by whichever client came
-##   first and a detached watcher process per agent per bus. Build artefact is
-##   .gitignored; rebuild with 'make bus-host' after any change under
-##   src/bus/host/ or to the bus leaves it shares.
+##   registered with it. While it runs it takes over from the broker elected by
+##   whichever client came first and the detached watcher process per agent per
+##   bus; those remain the fallback whenever the service is down. Build
+##   artefact is .gitignored; rebuild with 'make bus-host' after any change
+##   under src/bus/host/ or to the bus leaves it shares.
 ##
 ##   Unlike the watcher it runs brokers, so it needs the ZeroMQ binding and
 ##   log4cl: it is built with Quicklisp and the Lisp workspace visible (the
 ##   workspace carries the vetted pzmq fork), but still without the user's init
 ##   file, so nothing from a development session ends up in the saved image.
 ##
-##   Every system in the image but the service's own, and the dsmr-mcp system
-##   its broker asks ASDF about when it records its own version, is registered
-##   as immutable before the image is saved (the service's own is left out
-##   because ASDF builds nothing for an immutable system). Without that, the
+##   Before the image is saved, every system loaded in it except dsmr-bus-host
+##   itself is registered as immutable, and so are two systems named
+##   explicitly: dsmr-mcp, which the broker asks ASDF about when it records its
+##   own version, and dsmr-bus-watch. The service's own system is left out
+##   because ASDF builds nothing for an immutable system. Without that, the
 ##   saved image answers the broker by scanning the whole source registry,
 ##   which on a workspace this size kept the first broker from serving for
 ##   minutes. The old binary is removed first because ASDF sees no reason to

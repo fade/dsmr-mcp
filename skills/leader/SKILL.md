@@ -655,8 +655,8 @@ Report to the operator, in this order and nothing else:
    line clears. `parked=1` is a park, not deafness. The watcher's desktop notification covers the
    operator between your replies; the footer is what makes sure he never has to have seen it.
    The footer also carries the host bus service, from `~/.local/bin/dsmr-bus-watch --host-status`
-   (Step 4) at every reply, reduced to two things: every bus that reads `owner=client`, and the
-   service line's state and `beat-age`, plus any fleet-log line you have not yet seen resolved. On
+   (Step 4) at every reply, reduced to three things: every bus that reads `owner=client`, the
+   service line's state and `beat-age`, and any fleet-log line you have not yet seen resolved. On
    a host where it reads `not-installed`, leave it out.
 4. What you are doing next.
 
