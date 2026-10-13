@@ -73,7 +73,9 @@
            #:processes-under-state
            #:start-publisher
            #:publisher-lines
-           #:start-foreign-broker))
+           #:start-foreign-broker
+           #:elect-client-broker
+           #:start-stale-watcher))
 
 (in-package #:dsmr-mcp/tests/integration/bus/host-support)
 
@@ -649,4 +651,65 @@
                seconds)
         (error "the broker (pid ~D) did not come up within ~Ds; see ~A"
                pid seconds (merge-pathnames "broker.log" (broker:bus-paths-root paths))))
+      pid)))
+
+(defun elect-client-broker (state bus &key (seconds 120))
+  "Make sure a broker serves BUS under STATE the way an agent's client does
+   when no service runs, through the client's own ENSURE-BROKER, and return
+   two values: what it answered (:SPAWNED or :EXISTS) and the pid of the
+   broker serving the bus once one is up. A broker it launched is stopped with
+   the case."
+  (with-state-home (state)
+    (let ((paths (broker:ensure-bus-dirs
+                  (broker:make-bus-paths (broker:default-state-root bus)))))
+      (multiple-value-bind (answer process) (broker:ensure-broker paths)
+        (let ((pid (and process (%note-started process))))
+          (unless (await-true
+                   (lambda ()
+                     (let ((holder (broker:broker-identity-pid
+                                    (broker:read-broker-identity paths))))
+                       (and holder (or (null pid) (eql holder pid))
+                            (probe-file (merge-pathnames
+                                         "submit.ipc" (broker:bus-paths-root paths)))
+                            t)))
+                   seconds)
+            (error "no broker came up for bus ~A within ~Ds; see ~A"
+                   bus seconds
+                   (merge-pathnames "broker.log" (broker:bus-paths-root paths))))
+          (values answer
+                  (broker:broker-identity-pid (broker:read-broker-identity paths))))))))
+
+(defun start-stale-watcher (state bus namespace agent &key (poll-ms 100) (seconds 10))
+  "Start a detached watcher for AGENT under NAMESPACE on BUS (NIL for the
+   unnamed bus) under STATE directly, with the command line `--detach` gives
+   its child, as an agent running a binary built before the service would
+   start one while the service is up. Its output goes to the identity's log.
+   Wait up to SECONDS for it to hold its pid file's lock, and return its pid.
+   It is stopped with the case."
+  (let* ((id (hostfiles:normalise-agent-id (full-id namespace agent)))
+         (log (detach-file state bus namespace agent "log"))
+         (pid-file (detach-file state bus namespace agent "pid")))
+    (ensure-directories-exist log)
+    (with-open-file (stream log :direction :output :if-exists :append
+                                :if-does-not-exist :create)
+      (declare (ignore stream)))
+    (let* ((process (uiop:launch-program
+                     (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR"
+                                   "-u" "CLAUDE_PID")
+                             (watcher-env state)
+                             (list (uiop:native-namestring (watcher-binary))
+                                   "--poll-ms" (princ-to-string poll-ms))
+                             (and bus (list "--bus" bus))
+                             (list "--agent" agent "--namespace" namespace
+                                   "--detached-child" "--agent-id" id)
+                             (and bus (list "--bus" bus)))
+                     :input nil
+                     :output (uiop:native-namestring log)
+                     :if-output-exists :append
+                     :error-output :output
+                     :directory "/"))
+           (pid (%note-started process)))
+      (unless (await-true (lambda () (eql pid (%lock-holder pid-file))) seconds)
+        (error "the watcher (pid ~D) did not take its pid file within ~Ds; see ~A"
+               pid seconds log))
       pid)))
