@@ -30,10 +30,13 @@ TimeoutStopSec=10
 # cgroup goes with it, because an old broker that survived a restart would
 # keep holding its bus's election and the new service could never serve it.
 #
-# This runs after every stop, whatever the restart mode or systemd version, so
-# every crash raises the alarm even where an automatic restart never enters
-# the failed state OnFailure= waits for. The alarm says nothing after an
-# ordinary stop, and raises one alarm when this and the alarm unit both run.
+# The alarm runs from here as well as from OnFailure=, and each covers a crash
+# the other can miss. This runs after every stop, even where an automatic
+# restart never enters the failed state OnFailure= waits for. OnFailure= starts
+# a unit of its own, so it still fires when a kill of the whole cgroup (an
+# out-of-memory kill, or systemctl kill) takes this command down with the
+# service. The alarm says nothing after an ordinary stop, and raises one alarm
+# when both run for the same failure.
 ExecStopPost=%h/.local/bin/dsmr-bus-watch --host-failed
 Nice=5
 
