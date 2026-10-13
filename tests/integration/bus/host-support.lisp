@@ -30,7 +30,8 @@
   (:use #:cl)
   (:local-nicknames (#:hostfiles #:dsmr-mcp/src/bus/hostfiles)
                     (#:wal #:dsmr-mcp/src/bus/wal)
-                    (#:envelope #:dsmr-mcp/src/bus/envelope))
+                    (#:envelope #:dsmr-mcp/src/bus/envelope)
+                    (#:broker #:dsmr-mcp/src/bus/broker))
   (:import-from #:dsmr-bus-watch/src/bus/watch
                 #:default-wal-path
                 #:default-cursors-dir
@@ -68,7 +69,10 @@
            #:publish
            #:publish-batch
            #:write-cursor
-           #:lock-holder))
+           #:lock-holder
+           #:processes-under-state
+           #:start-publisher
+           #:publisher-lines))
 
 (in-package #:dsmr-mcp/tests/integration/bus/host-support)
 
@@ -500,3 +504,118 @@
   "The pid holding the lock on AGENT's pid file under NAMESPACE on BUS under
    STATE, or NIL. Asked from this process, which never holds that lock."
   (%lock-holder (detach-file state bus namespace agent "pid")))
+
+;;; processes under a state root ------------------------------------------------
+
+(defun %proc-text (pid file)
+  "The /proc FILE of PID as text, read byte for byte, or NIL when it cannot be
+   read."
+  (ignore-errors
+   (uiop:read-file-string (format nil "/proc/~D/~A" pid file)
+                          :external-format :latin-1)))
+
+(defun %own-process-p (pid)
+  "True when PID belongs to the user this process runs as."
+  (eql (ignore-errors (sb-posix:stat-uid (sb-posix:stat (format nil "/proc/~D" pid))))
+       (sb-posix:getuid)))
+
+(defun processes-under-state (state)
+  "Every process of this user whose environment names STATE as its state root,
+   as a list of (PID . COMMAND-LINE), the command line's arguments joined by
+   spaces. Only processes of this user are looked at, and one whose environment
+   cannot be read is passed over rather than counted."
+  (let ((wanted (format nil "XDG_STATE_HOME=~A" (uiop:native-namestring state)))
+        (nul (string (code-char 0))))
+    (loop for dir in (ignore-errors (uiop:subdirectories "/proc/"))
+          for name = (car (last (pathname-directory dir)))
+          for pid = (and (stringp name) (every #'digit-char-p name)
+                         (parse-integer name))
+          for environ = (and pid (%own-process-p pid) (%proc-text pid "environ"))
+          when (and environ
+                    (member wanted (uiop:split-string environ :separator nul)
+                            :test #'string=))
+            collect (cons pid (substitute #\Space (code-char 0)
+                                          (string-right-trim
+                                           nul (or (%proc-text pid "cmdline") "")))))))
+
+;;; a publishing client ---------------------------------------------------------
+
+(defun %publisher-out (state)
+  "Where the publishing client under STATE writes what it has done."
+  (merge-pathnames "publisher.out" state))
+
+(defun publisher-lines (state)
+  "What the publishing client under STATE has written so far, line by line."
+  (or (ignore-errors (uiop:read-file-lines (%publisher-out state))) '()))
+
+(defun %publisher-program (root from-id count interval)
+  "The form a publishing client evaluates once the bus client is loaded: join
+   the bus at ROOT, submit COUNT records from FROM-ID INTERVAL seconds apart,
+   then wait for the last of them to reach the log before closing, since the
+   socket drops whatever it still holds when it closes."
+  (format nil "(let* ((paths (dsmr-mcp/src/bus/broker:make-bus-paths (pathname ~S)))
+         (wal (dsmr-mcp/src/bus/broker:bus-paths-wal paths))
+         (members (dsmr-mcp/src/bus/broker:join-members paths))
+         (submitter (dsmr-mcp/src/bus/zmq:make-submitter
+                     (dsmr-mcp/src/bus/broker:bus-paths-submit-endpoint paths))))
+    (declare (ignorable members))
+    (format t \"ready~~%\") (finish-output)
+    (loop for n from 1 to ~D
+          do (dsmr-mcp/src/bus/zmq:send-message
+              submitter
+              (dsmr-mcp/src/bus/envelope:wrap-envelope
+               (format nil \"pub~~D\" n) ~S (format nil \"count=~~D\" n)))
+             (format t \"sent ~~D~~%\" n) (finish-output)
+             (sleep ~F))
+    (loop repeat 300
+          until (find \"count=~D\" (ignore-errors (dsmr-mcp/src/bus/wal:read-records wal))
+                      :test (lambda (want record)
+                              (search want (dsmr-mcp/src/bus/wal:record-body-string record))))
+          do (sleep 0.1))
+    (format t \"done~~%\") (finish-output)
+    (dsmr-mcp/src/bus/zmq:close-endpoint submitter))"
+          root count from-id interval count))
+
+(defun start-publisher (state bus from-id count &key (interval 0.1) (seconds 120))
+  "Start a bus client in a process of its own, under STATE, that joins BUS as a
+   member, as an agent's server does, and submits COUNT records from FROM-ID,
+   one every INTERVAL seconds, the Nth with the text count=N. It never elects a
+   broker: what it submits while nothing serves the bus waits in its socket.
+
+   It writes `ready` once connected, `sent N` after each submission and `done`
+   once its last record is in the log, to publisher.out under STATE (see
+   PUBLISHER-LINES). Waits up to SECONDS for `ready` and returns the process,
+   which is stopped with the case."
+  (let* ((root (with-state-home (state)
+                 (uiop:native-namestring
+                  (broker:bus-paths-root
+                   (broker:ensure-bus-dirs
+                    (broker:make-bus-paths (broker:default-state-root bus)))))))
+         (process (uiop:launch-program
+                   (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR"
+                                 "-u" "CLAUDE_PID")
+                           (watcher-env state)
+                           (list (uiop:native-namestring sb-ext:*runtime-pathname*)
+                                 "--noinform" "--disable-debugger" "--non-interactive"
+                                 "--eval" "(require :asdf)"
+                                 "--eval" (format nil "(asdf:load-asd ~S)"
+                                                  (uiop:native-namestring
+                                                   (asdf:system-source-file "dsmr-mcp")))
+                                 "--eval" "(asdf:load-system \"dsmr-mcp/src/bus/bus\")"
+                                 "--eval" (%publisher-program root from-id count interval)))
+                   :input nil
+                   :output (uiop:native-namestring
+                            (with-open-file (stream (%publisher-out state)
+                                                    :direction :output
+                                                    :if-exists :append
+                                                    :if-does-not-exist :create)
+                              (pathname stream)))
+                   :if-output-exists :append
+                   :error-output :output)))
+    (%note-started process)
+    (unless (await-true (lambda () (member "ready" (publisher-lines state)
+                                           :test #'string=))
+                        seconds)
+      (error "the publishing client did not connect within ~Ds; see ~A"
+             seconds (%publisher-out state)))
+    process))
