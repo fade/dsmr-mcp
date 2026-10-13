@@ -28,7 +28,13 @@
 
 (defpackage #:dsmr-mcp/tests/integration/bus/host-support
   (:use #:cl)
-  (:local-nicknames (#:hostfiles #:dsmr-mcp/src/bus/hostfiles))
+  (:local-nicknames (#:hostfiles #:dsmr-mcp/src/bus/hostfiles)
+                    (#:wal #:dsmr-mcp/src/bus/wal)
+                    (#:envelope #:dsmr-mcp/src/bus/envelope))
+  (:import-from #:dsmr-bus-watch/src/bus/watch
+                #:default-wal-path
+                #:default-cursors-dir
+                #:%lock-holder)
   (:export #:watcher-binary
            #:host-binary
            #:stub-dir
@@ -54,7 +60,15 @@
            #:sample-check-live
            #:with-host-state
            #:with-state-home
-           #:*started-pids*))
+           #:*started-pids*
+           #:start-service
+           #:kill-service
+           #:launch-wake
+           #:finish-wake
+           #:publish
+           #:publish-batch
+           #:write-cursor
+           #:lock-holder))
 
 (in-package #:dsmr-mcp/tests/integration/bus/host-support)
 
@@ -350,3 +364,139 @@
           collect (let ((out (apply #'run-in state bin "--check-live" id-args)))
                     (subseq out 0 (or (position #\Space out) (length out))))
           do (sleep interval))))
+
+;;; the real service ------------------------------------------------------------
+
+(defun start-service (state &key (seconds 10))
+  "Start the built host service under STATE, with no systemd notification
+   socket and no ambient bus identity or agent session, its output appended to
+   service.out under STATE. Wait up to SECONDS for it to record its pid and
+   write a beat of its own, and return its pid. It leads its own process group
+   and is stopped with the case."
+  (let* ((launched (get-universal-time))
+         (out (with-open-file (stream (merge-pathnames "service.out" state)
+                                      :direction :output :if-exists :append
+                                      :if-does-not-exist :create)
+                (pathname stream)))
+         (process (uiop:launch-program
+                   (append (list "env" "-u" "NOTIFY_SOCKET" "-u" "DSMR_BUS_AGENT"
+                                 "-u" "DSMR_BUS_SELECTOR" "-u" "CLAUDE_PID")
+                           (watcher-env state)
+                           (list (uiop:native-namestring (host-binary))))
+                   :input nil
+                   :output (uiop:native-namestring out)
+                   :if-output-exists :append
+                   :error-output :output))
+         (pid (%note-started process)))
+    (unless (await-true
+             (lambda ()
+               (with-state-home (state)
+                 (and (eql (hostfiles:read-service-pid) pid)
+                      (hostfiles:service-alive-p)
+                      (let ((beat (ignore-errors
+                                   (file-write-date (hostfiles:service-beat-path)))))
+                        (and beat (>= beat launched))))))
+             seconds)
+      (error "the host service (pid ~D) did not beat within ~Ds; see ~A"
+             pid seconds out))
+    pid))
+
+(defun kill-service (state signal &key (seconds 5))
+  "Send SIGNAL to the host service recorded under STATE, wait up to SECONDS for
+   it to exit, and return its exit status, or NIL while it is still running.
+   The recorded pid must be a process this case started; anything else is an
+   error and is never signalled."
+  (let* ((pid (with-state-home (state) (hostfiles:read-service-pid)))
+         (process (and pid (find pid *started-processes*
+                                 :key #'uiop:process-info-pid))))
+    (unless process
+      (error "the service pid ~A recorded under ~A was not started by this case"
+             pid state))
+    (sb-posix:kill pid signal)
+    (await-exit process seconds)))
+
+(defun launch-wake (state args &key hook-input)
+  "Start the watcher binary with ARGS under STATE as RUN-IN would, without
+   waiting, and return the process. HOOK-INPUT, a string, is written to its
+   standard input, which is then closed, as the harness hands a Stop hook its
+   event. STDOUT and STDERR are kept apart for FINISH-WAKE."
+  (let ((process (uiop:launch-program
+                  (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR"
+                                "-u" "CLAUDE_PID")
+                          (watcher-env state)
+                          (list (uiop:native-namestring (watcher-binary)))
+                          args)
+                  :input :stream :output :stream :error-output :stream)))
+    (%note-started process)
+    (let ((in (uiop:process-info-input process)))
+      (ignore-errors
+       (when hook-input
+         (write-string hook-input in)
+         (finish-output in)))
+      (ignore-errors (close in)))
+    process))
+
+(defun finish-wake (process seconds)
+  "Wait up to SECONDS for PROCESS, started by LAUNCH-WAKE, to exit, then return
+   (values exit-code stdout stderr), both outputs whole and trimmed. The exit
+   code is NIL when it was still running and had to be stopped."
+  (let ((code (await-exit process seconds)))
+    (unless code
+      (stop-process (uiop:process-info-pid process))
+      (ignore-errors (uiop:wait-process process)))
+    (flet ((slurp (stream)
+             (string-trim '(#\Newline #\Space)
+                          (or (ignore-errors (uiop:slurp-stream-string stream)) ""))))
+      (values code
+              (slurp (uiop:process-info-output process))
+              (slurp (uiop:process-info-error-output process))))))
+
+(defun publish-batch (state bus specs)
+  "Append one record per spec in SPECS to BUS's log under STATE, numbered on
+   from the log's head, in a single write so every reader finds them in one
+   batch, and return the highest seq written. Each spec is (FROM-ID &key TO
+   TEXT): the record is wrapped as FROM-ID publishing TEXT, addressed to TO when
+   given, exactly as the bus client wraps it."
+  (with-state-home (state)
+    (let* ((wal-path (default-wal-path bus))
+           (head (or (ignore-errors (values (wal:scan wal-path))) 0))
+           (bytes (apply #'concatenate '(vector (unsigned-byte 8))
+                         (loop for spec in specs
+                               for seq from (1+ head)
+                               collect (destructuring-bind (from &key to (text "mail"))
+                                           spec
+                                         (wal:encode-record
+                                          seq
+                                          (envelope:wrap-envelope
+                                           (format nil "c~D" seq) from text
+                                           :to to)))))))
+      (ensure-directories-exist wal-path)
+      (with-open-file (out wal-path :element-type '(unsigned-byte 8)
+                                    :direction :output :if-exists :append
+                                    :if-does-not-exist :create)
+        (write-sequence bytes out)
+        (finish-output out))
+      (+ head (length specs)))))
+
+(defun publish (state bus from-id &key to (text "mail"))
+  "Append one record from FROM-ID to BUS's log under STATE, addressed to TO when
+   given, and return its seq."
+  (publish-batch state bus (list (list from-id :to to :text text))))
+
+(defun write-cursor (state bus id seq)
+  "Leave the agent ID a durable cursor at SEQ on BUS under STATE, as though it
+   had read the bus up to there, and return its path."
+  (with-state-home (state)
+    (let ((path (merge-pathnames (envelope:encode-id id)
+                                 (uiop:ensure-directory-pathname
+                                  (default-cursors-dir bus)))))
+      (ensure-directories-exist path)
+      (with-open-file (out path :direction :output :if-exists :supersede
+                                :if-does-not-exist :create)
+        (format out "~D" seq))
+      path)))
+
+(defun lock-holder (state bus namespace agent)
+  "The pid holding the lock on AGENT's pid file under NAMESPACE on BUS under
+   STATE, or NIL. Asked from this process, which never holds that lock."
+  (%lock-holder (detach-file state bus namespace agent "pid")))
