@@ -335,7 +335,11 @@
         (funcall report-fn (if rebased-p :warn :error)
                  (if rebased-p "stranded-cursor" "stranded-cursor-clamped")
                  :bus (identity-bus identity) :id (identity-id identity)
-                 :subject (identity-stem identity)
+                 ;; The old position is part of what the report is about: the
+                 ;; fleet log writes one line per subject an hour, and a second
+                 ;; rewrite of the same cursor discards a position of its own.
+                 :subject (format nil "~A old-cursor=~A" (identity-stem identity)
+                                  (getf report :old-cursor))
                  :msg (%stranded-fleet-message report))))
     ;; A cursor that vanished since it was read has no baseline to give, and
     ;; the agent then arms at the head as it would with no cursor at all.

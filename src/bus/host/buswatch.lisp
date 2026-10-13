@@ -172,7 +172,10 @@
     (funcall report-fn (if rebased-p :warn :error)
              (if rebased-p "stranded-cursor" "stranded-cursor-clamped")
              :bus (bus-watch-name bw) :id (getf report :id)
-             :subject (getf report :id)
+             ;; One line per subject an hour; every rewrite discards a position
+             ;; of its own, so the position is part of the subject.
+             :subject (format nil "~A old-cursor=~A" (getf report :id)
+                              (getf report :old-cursor))
              :msg (%stranded-fleet-message report))))
 
 (defun %arm-again (bw identities report-fn)

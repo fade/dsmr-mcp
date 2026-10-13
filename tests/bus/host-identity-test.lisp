@@ -602,6 +602,22 @@
       (true (search " FLEET ERROR code=stranded-cursor-clamped "
                     (or (first (fleet-lines)) ""))))))
 
+(define-test every-rewritten-cursor-position-reaches-the-fleet-log
+  "Each rewrite discards a position nobody else recorded, so a second rewrite
+   of the same agent's cursor within the hour is written to the fleet log with
+   its own old position, not folded into the first as a repeat."
+  (with-host ()
+    (write-stranded-bus "372 1")
+    (let ((first (healing (lambda () (claim)))))
+      (ident:release-identity first))
+    (write-text (cursor-file) "500 1")
+    (true (healing (lambda () (claim))))
+    (let ((lines (remove-if-not (lambda (line) (search " code=stranded-cursor " line))
+                                (fleet-lines))))
+      (is = 2 (length lines) "~S" lines)
+      (true (search "old-cursor=372" (first lines)) "~S" lines)
+      (true (search "old-cursor=500" (second lines)) "~S" lines))))
+
 (define-test a-skipped-stranded-cursor-still-arms-at-the-head
   "A fault the supervisor skips, as it does once a breaker has tripped, must
    not leave the identity filtering on the stranded value."
