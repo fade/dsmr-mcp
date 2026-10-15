@@ -29,6 +29,16 @@
   (:import-from #:dsmr-mcp/src/transport/dispatch-pool
                 #:*dispatch-pool-size*
                 #:effective-dispatch-pool-size)
+  (:import-from #:dsmr-mcp/src/hermetic/worker-client
+                #:*worker-startup-timeout*
+                #:*resolved-worker-startup-timeout*
+                #:resolve-worker-startup-timeout
+                #:effective-worker-startup-timeout)
+  (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
+                #:*default-eval-timeout*
+                #:*resolved-eval-timeout*
+                #:resolve-eval-timeout
+                #:effective-eval-timeout)
   (:import-from #:sb-posix))
 
 (in-package #:dsmr-mcp/tests/hermetic/pool-settings-test)
@@ -61,17 +71,25 @@ thread started inside THUNK sees only the global value, and that is exactly
 what the pool's own threads read."
   (let ((saved-env (mapcar (lambda (name) (cons name (sb-posix:getenv name)))
                            +settings-env-vars+))
-        (saved-settings *resolved-pool-settings*))
+        (saved-settings *resolved-pool-settings*)
+        (saved-startup *resolved-worker-startup-timeout*)
+        (saved-eval *resolved-eval-timeout*))
     (unwind-protect
          (progn
            (dolist (name +settings-env-vars+) (%set-env name nil))
-           (setf *resolved-pool-settings* nil)
+           (setf *resolved-pool-settings* nil
+                 *resolved-worker-startup-timeout* nil
+                 *resolved-eval-timeout* nil)
            (let ((*worker-pool-warmup* nil)
                  (*max-pool-size* nil)
                  (*worker-kill-grace-seconds* nil)
-                 (*dispatch-pool-size* nil))
+                 (*dispatch-pool-size* nil)
+                 (*worker-startup-timeout* nil)
+                 (*default-eval-timeout* nil))
              (funcall thunk)))
-      (setf *resolved-pool-settings* saved-settings)
+      (setf *resolved-pool-settings* saved-settings
+            *resolved-worker-startup-timeout* saved-startup
+            *resolved-eval-timeout* saved-eval)
       (dolist (pair saved-env)
         (%set-env (car pair) (cdr pair))))))
 
@@ -155,3 +173,55 @@ number of warnings muffled."
     (let ((*max-pool-size* 4))
       (resolve-pool-settings))
     (is = 4 (effective-dispatch-pool-size))))
+
+;;; ---------------------------------------------------------------------------
+;;; Worker eval timeout and startup timeout
+;;; ---------------------------------------------------------------------------
+
+(define-test eval-timeout-reads-the-environment-when-resolved
+  (with-settings-env
+    (is = 120 (resolve-eval-timeout))
+    (%set-env "DSMR_WORKER_EVAL_TIMEOUT" "11")
+    (is = 11 (resolve-eval-timeout))
+    (is = 11 (effective-eval-timeout))
+    ;; Below one second is raised to one, as it always was.
+    (%set-env "DSMR_WORKER_EVAL_TIMEOUT" "0")
+    (is = 1 (resolve-eval-timeout))
+    (%set-env "DSMR_WORKER_EVAL_TIMEOUT" "x")
+    (multiple-value-bind (timeout warnings)
+        (%resolve-capturing-warnings #'resolve-eval-timeout)
+      (is = 120 timeout)
+      (true (plusp warnings)))))
+
+(define-test bound-eval-timeout-wins-over-the-environment
+  (with-settings-env
+    (%set-env "DSMR_WORKER_EVAL_TIMEOUT" "11")
+    (let ((*default-eval-timeout* 9))
+      (is = 9 (resolve-eval-timeout)))))
+
+(define-test effective-eval-timeout-resolves-lazily
+  (with-settings-env
+    (%set-env "DSMR_WORKER_EVAL_TIMEOUT" "13")
+    (false *resolved-eval-timeout*)
+    (is = 13 (effective-eval-timeout))
+    (true *resolved-eval-timeout*)))
+
+(define-test startup-timeout-reads-the-environment-when-resolved
+  (with-settings-env
+    (is = 30 (resolve-worker-startup-timeout))
+    (%set-env "DSMR_WORKER_STARTUP_TIMEOUT" "45")
+    (is = 45 (resolve-worker-startup-timeout))
+    (is = 45 (effective-worker-startup-timeout))))
+
+(define-test resolving-the-pool-refreshes-both-timeouts
+  ;; A pool start is the one place the server resolves, so it carries the
+  ;; worker timeouts along with the pool fields.
+  (with-settings-env
+    (resolve-pool-settings)
+    (is = 120 (effective-eval-timeout))
+    (is = 30 (effective-worker-startup-timeout))
+    (%set-env "DSMR_WORKER_EVAL_TIMEOUT" "17")
+    (%set-env "DSMR_WORKER_STARTUP_TIMEOUT" "19")
+    (resolve-pool-settings)
+    (is = 17 (effective-eval-timeout))
+    (is = 19 (effective-worker-startup-timeout))))

@@ -51,7 +51,9 @@
                 #:thread-alive-p)
   (:import-from #:sb-ext)
   (:import-from #:uiop)
-  (:export #:register-all-handlers #:*default-eval-timeout*))
+  (:export #:register-all-handlers #:*default-eval-timeout*
+           #:*resolved-eval-timeout* #:resolve-eval-timeout
+           #:effective-eval-timeout))
 
 (in-package #:dsmr-mcp/src/hermetic/worker/handlers)
 
@@ -59,14 +61,48 @@
 ;;; Configuration
 ;;; ---------------------------------------------------------------------------
 
-(defparameter *default-eval-timeout*
-  (let ((v (uiop:getenv "DSMR_WORKER_EVAL_TIMEOUT")))
-    (if (and v (not (string= v "")))
-        (max 1 (parse-integer v :junk-allowed t))
-        120))
-  "Default per-call eval timeout in seconds. Workers serving autonomous agents
-need a bounded default to prevent runaway evaluations.
-Override via DSMR_WORKER_EVAL_TIMEOUT environment variable.")
+(defvar *default-eval-timeout* nil
+  "Default per-call eval timeout in seconds, or NIL to read the environment at
+start. Workers serving autonomous agents need a bounded default to prevent
+runaway evaluations.
+
+NIL (the default) means resolve-eval-timeout reads DSMR_WORKER_EVAL_TIMEOUT, an
+integer number of seconds defaulting to 120 and raised to at least 1. A
+non-NIL value, set globally or bound in the thread that resolves, wins over
+the environment.")
+
+(defvar *resolved-eval-timeout* nil
+  "The eval timeout in seconds from the last resolve-eval-timeout call, or NIL
+when nothing has resolved yet.")
+
+(defun %env-seconds (name default)
+  "Read a whole number of seconds from environment variable NAME. Return
+DEFAULT when NAME is unset or empty. A value below 1 is raised to 1. An
+unparseable value warns and returns DEFAULT."
+  (let ((s (uiop:getenv name)))
+    (if (or (null s) (zerop (length s)))
+        default
+        (handler-case (max 1 (parse-integer s))
+          (error ()
+            (warn "~A=~S is not an integer; using default ~D" name s default)
+            default)))))
+
+(defun resolve-eval-timeout ()
+  "Read the eval timeout now and store it in *resolved-eval-timeout*. Returns
+the number of seconds: *default-eval-timeout* when non-NIL, else
+DSMR_WORKER_EVAL_TIMEOUT, else 120.
+
+The worker calls this as it starts and the server calls it whenever its pool
+starts, so a process booted from a prebuilt image reads its own environment
+rather than the one the image was built under."
+  (setf *resolved-eval-timeout*
+        (or *default-eval-timeout*
+            (%env-seconds "DSMR_WORKER_EVAL_TIMEOUT" 120))))
+
+(defun effective-eval-timeout ()
+  "The eval timeout in seconds as last resolved, resolving it first when
+nothing has."
+  (or *resolved-eval-timeout* (resolve-eval-timeout)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; worker/eval handler
@@ -110,17 +146,17 @@ result envelope before sending to the dispatcher."
     ;; Lisp object from the last evaluated form.  This lets us register the
     ;; actual result in REGISTRY from a single evaluation of the user code.
     (let* ((form (build-wrapping-form code package-name :surface-raw-value t))
+           (timeout (or timeout-seconds (effective-eval-timeout)))
            (result-list
              (handler-case
-                 (sb-ext:with-timeout (or timeout-seconds *default-eval-timeout*)
+                 (sb-ext:with-timeout timeout
                    (eval form))
                (sb-ext:timeout ()
-                 (list (format nil "TIMEOUT after ~As"
-                               (or timeout-seconds *default-eval-timeout*))
+                 (list (format nil "TIMEOUT after ~As" timeout)
                        nil "" ""
                        (list :condition-type "SB-EXT:TIMEOUT"
                              :message (format nil "Evaluation timed out after ~A seconds"
-                                              (or timeout-seconds *default-eval-timeout*))
+                                              timeout)
                              :restarts nil :frames nil)
                        nil nil))))
            (printed       (first  result-list))

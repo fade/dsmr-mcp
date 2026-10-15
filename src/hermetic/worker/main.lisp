@@ -10,6 +10,8 @@
 ;;;; MANDATORY STARTUP ORDER:
 ;;;;   1. sb-ext:disable-debugger   — prevents SBCL debugger writing to stdout
 ;;;;   2. configure-log4cl-for-server — installs stderr-only appender BEFORE any log
+;;;;      then resolve-eval-timeout, which reads the eval timeout from this
+;;;;      process's environment rather than the image it booted from
 ;;;;   3. log-event                 — first safe log point
 ;;;;   4. make-worker-server        — open ephemeral TCP port
 ;;;;   5. register-all-handlers     — wire method table
@@ -26,7 +28,7 @@
   (:import-from #:dsmr-mcp/src/hermetic/worker/server
                 #:make-worker-server #:server-port #:start-accept-loop)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
-                #:register-all-handlers)
+                #:register-all-handlers #:resolve-eval-timeout)
   (:import-from #:dsmr-mcp/src/hermetic/worker/registry
                 #:make-object-registry)
   (:import-from #:dsmr-mcp/src/log
@@ -198,7 +200,9 @@ Follows the mandatory startup order:
      asdf:load-system so ASDF compile notes and the Slynk banner do not
      corrupt the handshake channel.  Here we restore the raw fd-1 stream
      so step 6 (%output-handshake) can reach the parent's pipe read.
-  3. configure-log4cl-for-server — second; any earlier log would corrupt stdout
+  3. configure-log4cl-for-server, second: any earlier log would corrupt stdout;
+     then resolve-eval-timeout, so the eval timeout comes from this process's
+     environment and not from the image it booted from
   4. log worker.starting
   5. make-worker-server (ephemeral TCP)
   6. register-all-handlers
@@ -218,6 +222,11 @@ the process exits cleanly."
   (setf *standard-output* sb-sys:*stdout*)
   ;; Step 3: install stderr-only log appender BEFORE any log-event call.
   (configure-log4cl-for-server :info)
+  ;; Step 3 cont: read the eval timeout from this process's environment now,
+  ;; after the appender is in place so a warning about a bad value goes to
+  ;; stderr, never the handshake channel.  A worker booted from a prebuilt
+  ;; image would otherwise carry the value from when the image was built.
+  (resolve-eval-timeout)
   ;; Step 4: first safe log point.
   (let ((worker-id (or (uiop:getenv "DSMR_WORKER_ID") "?")))
     (log-event :info "worker.starting"

@@ -37,6 +37,9 @@
            #:*reaper-threads-lock* #:signal-worker-terminate
            #:worker-last-crash-reason #:worker-last-exit-status
            #:worker-last-exit-code #:*worker-startup-timeout*
+           #:*resolved-worker-startup-timeout*
+           #:resolve-worker-startup-timeout
+           #:effective-worker-startup-timeout
            #:worker-liveness #:worker-liveness-basis
            #:worker-last-ping-milliseconds
            #:worker-consecutive-missed-pings
@@ -52,13 +55,47 @@
   "Expected worker protocol version. Logs a warning on mismatch
 but does not hard-fail for forward compatibility.")
 
-(defparameter *worker-startup-timeout*
-  (let ((v (uiop:getenv "DSMR_WORKER_STARTUP_TIMEOUT")))
-    (if (and v (not (string= v "")))
-        (max 1 (parse-integer v :junk-allowed t))
-        30))
-  "Maximum seconds to wait for a worker handshake after launch.
-Override via DSMR_WORKER_STARTUP_TIMEOUT environment variable.")
+(defvar *worker-startup-timeout* nil
+  "Maximum seconds to wait for a worker handshake after launch, or NIL to read
+the environment at start.
+
+NIL (the default) means resolve-worker-startup-timeout reads
+DSMR_WORKER_STARTUP_TIMEOUT, an integer number of seconds defaulting to 30 and
+raised to at least 1. A non-NIL value, set globally or bound in the thread
+that resolves, wins over the environment.")
+
+(defvar *resolved-worker-startup-timeout* nil
+  "The handshake timeout in seconds from the last
+resolve-worker-startup-timeout call, or NIL when nothing has resolved yet.")
+
+(defun %env-seconds (name default)
+  "Read a whole number of seconds from environment variable NAME. Return
+DEFAULT when NAME is unset or empty. A value below 1 is raised to 1. An
+unparseable value warns and returns DEFAULT."
+  (let ((s (uiop:getenv name)))
+    (if (or (null s) (zerop (length s)))
+        default
+        (handler-case (max 1 (parse-integer s))
+          (error ()
+            (warn "~A=~S is not an integer; using default ~D" name s default)
+            default)))))
+
+(defun resolve-worker-startup-timeout ()
+  "Read the worker handshake timeout now and store it in
+*resolved-worker-startup-timeout*. Returns the number of seconds:
+*worker-startup-timeout* when non-NIL, else DSMR_WORKER_STARTUP_TIMEOUT,
+else 30.
+
+The pool calls this whenever it starts, so a server booted from a prebuilt
+image reads the environment it was started with."
+  (setf *resolved-worker-startup-timeout*
+        (or *worker-startup-timeout*
+            (%env-seconds "DSMR_WORKER_STARTUP_TIMEOUT" 30))))
+
+(defun effective-worker-startup-timeout ()
+  "The worker handshake timeout in seconds as last resolved, resolving it
+first when nothing has."
+  (or *resolved-worker-startup-timeout* (resolve-worker-startup-timeout)))
 
 (defvar *worker-id-counter* 0
   "Monotonically increasing worker ID counter.")
@@ -502,7 +539,7 @@ the handshake fails, or authentication is rejected."
           (log-event :info "worker.spawning" "id" id)
           (setf process (%launch-worker-process secret id))
           (multiple-value-bind (tcp-port pid swank-port)
-              (%read-handshake process *worker-startup-timeout*)
+              (%read-handshake process (effective-worker-startup-timeout))
             (log-event :info "worker.handshake.received"
                        "id" id
                        "tcp_port" tcp-port

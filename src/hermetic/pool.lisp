@@ -52,9 +52,10 @@
                 #:worker-consecutive-missed-pings
                 #:worker-liveness-checked-at
                 #:*reaper-threads* #:*reaper-threads-lock*
-                #:*worker-startup-timeout*)
+                #:resolve-worker-startup-timeout
+                #:effective-worker-startup-timeout)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
-                #:*default-eval-timeout*)
+                #:resolve-eval-timeout #:effective-eval-timeout)
   (:import-from #:dsmr-mcp/src/log #:log-event)
   (:import-from #:sb-ext)
   (:import-from #:sb-posix)
@@ -283,6 +284,9 @@ environment, else its default: *worker-pool-warmup* or DSMR_WORKER_POOL_WARMUP
 unparseable or out-of-range environment value warns and falls back to the
 default.
 
+It also resolves the worker handshake timeout and the eval timeout, so one
+call settles every pool and worker timing setting the server uses.
+
 initialize-pool calls this first on every start, so a server booted from a
 prebuilt image honours the environment it is started with."
   (let ((settings
@@ -295,6 +299,8 @@ prebuilt image honours the environment it is started with."
                                    (%env-int "DSMR_WORKER_KILL_GRACE_SECONDS"
                                              5 :min 1)))))
     (setf *resolved-pool-settings* settings)
+    (resolve-worker-startup-timeout)
+    (resolve-eval-timeout)
     settings))
 
 (defun %current-pool-settings ()
@@ -457,7 +463,7 @@ making it visible. Returns the worker on success."
 Returns the worker on success. Signals an error on failure or timeout."
   (bt:with-lock-held ((worker-placeholder-lock placeholder))
     (let ((deadline (+ (get-internal-real-time)
-                       (* (+ *worker-startup-timeout* 15)
+                       (* (+ (effective-worker-startup-timeout) 15)
                           internal-time-units-per-second))))
       (loop while (eq (worker-placeholder-state placeholder) :spawning)
             for remaining = (/ (max 0 (- deadline (get-internal-real-time)))
@@ -1338,15 +1344,15 @@ max_pool_size, warmup_target, workers (vector of per-worker hashes)."
 ;;; ---------------------------------------------------------------------------
 
 (defun pool-rpc-with-hard-kill (worker method params
-                                 &key (soft-timeout *default-eval-timeout*)
+                                 &key (soft-timeout nil)
                                       (grace nil))
   "Send METHOD with PARAMS to WORKER, returning the result hash-table.
 
 Implements a two-level timeout:
   - SOFT-TIMEOUT: passed to worker-rpc so the in-worker sb-ext:with-timeout
     fires if the eval exceeds it. The worker returns a TIMEOUT error payload.
-    Defaults to *default-eval-timeout* (120 s) — the eval budget, not the
-    startup budget.
+    Defaults to the resolved eval timeout (DSMR_WORKER_EVAL_TIMEOUT, 120 s
+    unless set): the eval budget, not the startup budget.
   - Hard-kill backstop: if the worker does not return within SOFT-TIMEOUT +
     GRACE seconds, the parent kills the worker via its sb-ext:process object
     (avoiding the PID-reuse hazard of killing by raw numeric pid after the
@@ -1358,9 +1364,9 @@ Implements a two-level timeout:
 
 WORKER-CRASHED from worker-rpc is re-signalled unchanged so the dispatcher's
 existing handler fires for both the soft and hard timeout cases."
-  (let* ((grace (or grace (effective-worker-kill-grace-seconds)))
-         (hard-timeout (when soft-timeout
-                         (+ soft-timeout grace))))
+  (let* ((soft-timeout (or soft-timeout (effective-eval-timeout)))
+         (grace (or grace (effective-worker-kill-grace-seconds)))
+         (hard-timeout (+ soft-timeout grace)))
     (handler-case
         (worker-rpc worker method params :timeout hard-timeout)
       (sb-ext:timeout ()

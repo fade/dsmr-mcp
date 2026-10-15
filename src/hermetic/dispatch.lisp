@@ -37,7 +37,7 @@
                 #:check-and-clear-reset-notification
                 #:worker-id)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
-                #:*default-eval-timeout*)
+                #:effective-eval-timeout)
   (:import-from #:dsmr-mcp/src/attach/registry
                 #:decode-object-id)
   (:export #:dispatch-hermetic-call
@@ -176,7 +176,7 @@ crash; the object id is no longer valid.")))))
                        (setf (gethash "max_elements" worker-params) max-elements)))
                    (let ((resp (pool-rpc-with-hard-kill worker "worker/inspect-object"
                                                         worker-params
-                                                        :soft-timeout *default-eval-timeout*)))
+                                                        :soft-timeout (effective-eval-timeout))))
                      (result id resp))))))
             ;; ----------------------------------------------------------------
             ;; Code-intelligence branch: route to worker/<name> and inject the
@@ -188,7 +188,7 @@ crash; the object id is no longer valid.")))))
              (let* ((params (or args (make-hash-table :test 'equal)))
                     (soft   (let ((v (gethash "timeout_seconds" params)))
                               (if (and v (integerp v) (plusp v))
-                                  v *default-eval-timeout*))))
+                                  v (effective-eval-timeout)))))
                ;; Inject project_root when the session has one set; the worker
                ;; handler reads it and passes it as :root to the code-core engine.
                (when session-root
@@ -208,7 +208,7 @@ crash; the object id is no longer valid.")))))
              (let* ((params (or args (make-hash-table :test 'equal)))
                     (soft   (let ((v (gethash "timeout_seconds" params)))
                               (if (and v (integerp v) (plusp v))
-                                  v *default-eval-timeout*)))
+                                  v (effective-eval-timeout))))
                     (resp   (pool-rpc-with-hard-kill worker
                                                      (format nil "worker/~A" name)
                                                      params
@@ -225,7 +225,7 @@ crash; the object id is no longer valid.")))))
              (let* ((params (or args (make-hash-table :test 'equal)))
                     (soft   (let ((v (gethash "timeout_seconds" params)))
                               (if (and v (integerp v) (plusp v))
-                                  v *default-eval-timeout*)))
+                                  v (effective-eval-timeout))))
                     (resp   (pool-rpc-with-hard-kill worker
                                                      (format nil "worker/~A" name)
                                                      params
@@ -245,7 +245,7 @@ crash; the object id is no longer valid.")))))
                     (soft   (let ((v (gethash "timeout_seconds" params)))
                               (if (and v (integerp v) (plusp v))
                                   v
-                                  *default-eval-timeout*)))
+                                  (effective-eval-timeout))))
                     (resp   (pool-rpc-with-hard-kill worker "worker/eval" params
                                                      :soft-timeout soft)))
                (result id resp)))))
