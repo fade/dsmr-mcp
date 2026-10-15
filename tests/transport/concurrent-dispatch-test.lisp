@@ -22,13 +22,13 @@
                 #:make-dispatch-pool
                 #:dispatch-pool-submit
                 #:dispatch-pool-shutdown
-                #:*dispatch-pool-size*)
+                #:effective-dispatch-pool-size)
   ;; Internal clamp helper — imported by qualified name so the clamp behavior
   ;; can be exercised directly without mutating the process environment.
   (:import-from #:dsmr-mcp/src/transport/dispatch-pool
                 #:%clamp-pool-size)
   (:import-from #:dsmr-mcp/src/hermetic/pool
-                #:*max-pool-size*)
+                #:effective-max-pool-size)
   ;; End-to-end CONC-01 offload test: drives serve-streams over real OS pipes
   ;; with a mock backend verb that blocks on a condition variable.
   (:import-from #:dsmr-mcp/src/transport/stdio
@@ -311,7 +311,7 @@ streams — so a failing assertion never leaks a blocked handler or a live threa
   ;; A request below the bound is honored as-is.
   (is = 1 (%clamp-pool-size 1 2))
   ;; The live default never exceeds the hermetic child-process bound.
-  (true (<= *dispatch-pool-size* *max-pool-size*)))
+  (true (<= (effective-dispatch-pool-size) (effective-max-pool-size))))
 
 (define-test queued-cancelled-task-is-lazily-skipped
   ;; D-04: a queued-not-started call whose promise is marked cancelled is

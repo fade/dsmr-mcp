@@ -6,7 +6,8 @@
 ;;;; Design principles:
 ;;;; 1. Strict exclusive affinity: 1 session = 1 dedicated worker. No sharing.
 ;;;; 2. Scale-out: When standbys exhausted, spawn new workers on demand up to max.
-;;;; 3. Warm standbys: Pool pre-spawns workers ready for immediate assignment.
+;;;; 3. Warm standbys: Pool can pre-spawn workers ready for immediate
+;;;;    assignment. Off unless DSMR_WORKER_POOL_WARMUP asks for some.
 ;;;; 4. Crash recovery: Detect crash, restart worker, arm reset notification.
 ;;;; 5. Explicit crash notification: Session gets ONE notification about
 ;;;;    crash/reset — the next call after that succeeds normally.
@@ -58,6 +59,13 @@
   (:import-from #:sb-ext)
   (:import-from #:sb-posix)
   (:export #:*worker-pool-warmup* #:*max-pool-size*
+           #:*worker-kill-grace-seconds*
+           #:pool-settings #:pool-settings-p
+           #:pool-settings-warmup #:pool-settings-max-pool-size
+           #:pool-settings-kill-grace-seconds
+           #:*resolved-pool-settings* #:resolve-pool-settings
+           #:effective-worker-pool-warmup #:effective-max-pool-size
+           #:effective-worker-kill-grace-seconds
            #:*health-check-interval-seconds*
            #:*worker-ping-timeout-seconds*
            #:*missed-pings-before-wedged*
@@ -108,9 +116,11 @@ Release unused sessions before creating new ones."
 NAME is unset or empty. When the value is unparseable, or with MIN given
 is below MIN, emit a warning and return DEFAULT.
 
-Used to seed pool-tuning defvars from the environment so operators can
-tune dsmr-mcp without editing source. Each fresh SBCL process reads the
-environment once at load time."
+Used by resolve-pool-settings to read the pool tuning settings, so you can
+tune dsmr-mcp without editing source. It runs when the pool starts, never
+when this file loads, so a server booted from a prebuilt image reads the
+environment it was started with rather than the one the image was built
+under."
   (let ((s (uiop:getenv name)))
     (cond
       ((or (null s) (zerop (length s))) default)
@@ -126,17 +136,24 @@ environment once at load time."
            (warn "~A=~S is not an integer; using default ~D" name s default)
            default))))))
 
-(defvar *worker-pool-warmup*
-  (%env-int "DSMR_WORKER_POOL_WARMUP" 1 :min 0)
-  "Number of standby workers to pre-spawn and maintain.
-Default 1; override with DSMR_WORKER_POOL_WARMUP env var (non-negative integer).
-Set to 0 to disable pre-spawning; workers spawn on demand as sessions arrive.")
+(defvar *worker-pool-warmup* nil
+  "Number of standby workers to pre-spawn and keep ready, or NIL to read the
+environment when the pool starts.
 
-(defvar *max-pool-size*
-  (%env-int "DSMR_MAX_POOL_SIZE" 16 :min 1)
-  "Maximum total number of workers (bound + standby). Prevents unbounded
-resource consumption. Each SBCL worker uses ~100-500 MB memory.
-Default 16; override with DSMR_MAX_POOL_SIZE env var (positive integer).")
+NIL (the default) means resolve-pool-settings reads DSMR_WORKER_POOL_WARMUP, a
+non-negative integer defaulting to 0. At 0 the pool keeps no standby and a
+worker spawns on a session's first hermetic request, so a host that never
+needs a worker pays nothing for one. A non-NIL value, set globally or bound
+in the thread that starts the pool, wins over the environment.")
+
+(defvar *max-pool-size* nil
+  "Maximum total number of workers (bound + standby), or NIL to read the
+environment when the pool starts. The bound prevents unbounded resource
+consumption: each SBCL worker uses ~100-500 MB memory.
+
+NIL (the default) means resolve-pool-settings reads DSMR_MAX_POOL_SIZE, a
+positive integer defaulting to 16. A non-NIL value, set globally or bound in
+the thread that starts the pool, wins over the environment.")
 
 (defvar *health-check-interval-seconds* 10.0d0
   "Seconds between health monitor poll iterations.")
@@ -222,16 +239,80 @@ something failed."))
 ;;; Parent hard-kill backstop — dsmr-mcp addition over cl-mcp
 ;;; ---------------------------------------------------------------------------
 
-(defparameter *worker-kill-grace-seconds*
-  (let ((v (uiop:getenv "DSMR_WORKER_KILL_GRACE_SECONDS")))
-    (if (and v (not (string= v "")))
-        (max 1 (parse-integer v :junk-allowed t))
-        5))
+(defvar *worker-kill-grace-seconds* nil
   "Grace margin in seconds added to the in-worker soft timeout before the
-parent SIGKILLs the worker. If the worker's sb-ext:with-timeout fires and
-the worker does not return a response within this grace margin, the parent
-treats the worker as runaway and kills it, routing the crash through the
-normal recovery path. Override via DSMR_WORKER_KILL_GRACE_SECONDS.")
+parent SIGKILLs the worker, or NIL to read the environment when the pool
+starts. If the worker's sb-ext:with-timeout fires and the worker does not
+return a response within this grace margin, the parent treats the worker as
+runaway and kills it, routing the crash through the normal recovery path.
+
+NIL (the default) means resolve-pool-settings reads
+DSMR_WORKER_KILL_GRACE_SECONDS, a positive integer defaulting to 5. A non-NIL
+value, set globally or bound in the thread that starts the pool, wins over
+the environment.")
+
+;;; ---------------------------------------------------------------------------
+;;; Settings resolved when the pool starts
+;;; ---------------------------------------------------------------------------
+
+(defstruct (pool-settings (:copier nil))
+  "The pool tuning settings in force, resolved once per start by
+resolve-pool-settings. Every pool thread reads this one global record, so the
+value a caller bound around initialize-pool is the value every thread sees,
+including threads started after the caller's binding has gone.
+
+The slots carry no type declaration on purpose: a bound special is taken as
+given, and initialize-pool reports an invalid one with its own error."
+  (warmup 0)
+  (max-pool-size 16)
+  (kill-grace-seconds 5))
+
+(defvar *resolved-pool-settings* nil
+  "The pool-settings record from the last resolve-pool-settings call, or NIL
+when nothing has resolved yet. The effective-* readers resolve on first use
+when it is NIL.")
+
+(defun resolve-pool-settings ()
+  "Read the pool tuning settings now and store them in *resolved-pool-settings*.
+Returns the fresh pool-settings record.
+
+Each field takes the matching special when it is non-NIL, else the
+environment, else its default: *worker-pool-warmup* or DSMR_WORKER_POOL_WARMUP
+(default 0), *max-pool-size* or DSMR_MAX_POOL_SIZE (default 16), and
+*worker-kill-grace-seconds* or DSMR_WORKER_KILL_GRACE_SECONDS (default 5). An
+unparseable or out-of-range environment value warns and falls back to the
+default.
+
+initialize-pool calls this first on every start, so a server booted from a
+prebuilt image honours the environment it is started with."
+  (let ((settings
+          (make-pool-settings
+           :warmup (or *worker-pool-warmup*
+                       (%env-int "DSMR_WORKER_POOL_WARMUP" 0 :min 0))
+           :max-pool-size (or *max-pool-size*
+                              (%env-int "DSMR_MAX_POOL_SIZE" 16 :min 1))
+           :kill-grace-seconds (or *worker-kill-grace-seconds*
+                                   (%env-int "DSMR_WORKER_KILL_GRACE_SECONDS"
+                                             5 :min 1)))))
+    (setf *resolved-pool-settings* settings)
+    settings))
+
+(defun %current-pool-settings ()
+  "Return *resolved-pool-settings*, resolving it first when nothing has."
+  (or *resolved-pool-settings* (resolve-pool-settings)))
+
+(defun effective-worker-pool-warmup ()
+  "The number of standby workers the pool keeps, as last resolved."
+  (pool-settings-warmup (%current-pool-settings)))
+
+(defun effective-max-pool-size ()
+  "The maximum number of workers the pool runs, as last resolved."
+  (pool-settings-max-pool-size (%current-pool-settings)))
+
+(defun effective-worker-kill-grace-seconds ()
+  "The grace in seconds past the soft timeout before a worker is killed, as
+last resolved."
+  (pool-settings-kill-grace-seconds (%current-pool-settings)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Global pool state
@@ -398,16 +479,18 @@ Returns the worker on success. Signals an error on failure or timeout."
 ;;; ---------------------------------------------------------------------------
 
 (defun %replenish-standbys ()
-  "Spawn standby workers until the pool has *worker-pool-warmup* standbys.
-Respects *max-pool-size*. Runs in a background thread; exits when
-*pool-running* becomes NIL."
+  "Spawn standby workers until the pool has the resolved warmup count of
+standbys. Respects the resolved maximum pool size. Runs in a background
+thread; exits when *pool-running* becomes NIL."
   (unwind-protect
       (loop (unless *pool-running* (return))
-            (let ((need-more nil))
+            (let ((need-more nil)
+                  (warmup (effective-worker-pool-warmup))
+                  (max-size (effective-max-pool-size)))
               (bt:with-lock-held (*pool-lock*)
                 (when (and *pool-running*
-                           (< (length *standby-workers*) *worker-pool-warmup*)
-                           (< (%effective-pool-size) *max-pool-size*))
+                           (< (length *standby-workers*) warmup)
+                           (< (%effective-pool-size) max-size))
                   (setf need-more t)))
               (unless need-more (return))
               (handler-case
@@ -417,7 +500,7 @@ Respects *max-pool-size*. Runs in a background thread; exits when
                         ((not *pool-running*)
                          (ignore-errors (kill-worker w))
                          (return))
-                        ((>= (%effective-pool-size) *max-pool-size*)
+                        ((>= (%effective-pool-size) max-size)
                          (log-event :info "pool.standby.cap-reached"
                                     "worker_id" (worker-id w))
                          (ignore-errors (kill-worker w))
@@ -436,24 +519,18 @@ Respects *max-pool-size*. Runs in a background thread; exits when
 
 (defun %schedule-replenish ()
   "Spawn a background thread to replenish standby workers if needed.
-Skips if a replenish thread is already running. Captures the caller's
-dynamic bindings for *worker-pool-warmup* and *max-pool-size* so the
-value is honoured inside the new thread."
-  (let ((should-start nil))
+Skips if a replenish thread is already running. The new thread reads the
+resolved pool settings, which are global, so a value the caller bound around
+initialize-pool is honoured there without being passed across."
+  (let ((should-start nil)
+        (warmup (effective-worker-pool-warmup)))
     (bt:with-lock-held (*pool-lock*)
       (when (and (not *replenish-running*)
-                 (< (length *standby-workers*) *worker-pool-warmup*))
+                 (< (length *standby-workers*) warmup))
         (setf *replenish-running* t
               should-start t)))
     (when should-start
-      (let ((warmup *worker-pool-warmup*)
-            (max-size *max-pool-size*))
-        (bt:make-thread
-         (lambda ()
-           (let ((*worker-pool-warmup* warmup)
-                 (*max-pool-size* max-size))
-             (%replenish-standbys)))
-         :name "pool-replenish")))))
+      (bt:make-thread #'%replenish-standbys :name "pool-replenish"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Internal — crash recovery
@@ -866,6 +943,11 @@ second is what %check-worker-liveness runs, for idle workers alone."
 multiple times (shuts down any existing pool first). Registers shutdown-pool
 in sb-ext:*exit-hooks* to clean up workers on parent process exit.
 
+Resolves the pool settings first, through resolve-pool-settings, so every
+start reads the environment it runs under and a special bound around the
+call wins in every pool thread. The validation below checks those resolved
+values.
+
 Pre-warms the worker system's fasl cache in the parent process before
 allowing any concurrent worker spawn. When the cache is cold, two workers
 spawning in parallel (warmup standby + on-demand session) would race
@@ -879,16 +961,18 @@ Returns immediately after pre-warm; warm standby workers spawn
 asynchronously via the replenish thread so the caller is not blocked on
 subprocess launches beyond the one-time fasl compile on a cold cache."
   (bt:with-lock-held (*init-lock*)
-    (unless (and (integerp *max-pool-size*) (plusp *max-pool-size*))
-      (error "Invalid *max-pool-size*: must be a positive integer, got ~S"
-             *max-pool-size*))
-    (unless (and (integerp *worker-pool-warmup*)
-                 (>= *worker-pool-warmup* 0))
-      (error "Invalid *worker-pool-warmup*: must be a non-negative integer, got ~S"
-             *worker-pool-warmup*))
-    (when (> *worker-pool-warmup* *max-pool-size*)
-      (error "*worker-pool-warmup* (~D) exceeds *max-pool-size* (~D)"
-             *worker-pool-warmup* *max-pool-size*))
+    (let* ((settings (resolve-pool-settings))
+           (max-size (pool-settings-max-pool-size settings))
+           (warmup (pool-settings-warmup settings)))
+      (unless (and (integerp max-size) (plusp max-size))
+        (error "Invalid *max-pool-size*: must be a positive integer, got ~S"
+               max-size))
+      (unless (and (integerp warmup) (>= warmup 0))
+        (error "Invalid *worker-pool-warmup*: must be a non-negative integer, got ~S"
+               warmup))
+      (when (> warmup max-size)
+        (error "*worker-pool-warmup* (~D) exceeds *max-pool-size* (~D)"
+               warmup max-size)))
     (when *pool-running*
       (shutdown-pool))
     ;; Pre-warm the worker system's fasl cache so concurrent child spawns
@@ -915,8 +999,8 @@ subprocess launches beyond the one-time fasl compile on a cold cache."
     (pushnew 'shutdown-pool sb-ext:*exit-hooks*)
     (%schedule-replenish)
     (log-event :info "pool.initialized"
-               "warmup_target" *worker-pool-warmup*
-               "max_pool_size" *max-pool-size*)))
+               "warmup_target" (effective-worker-pool-warmup)
+               "max_pool_size" (effective-max-pool-size))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Public API — shutdown
@@ -1070,8 +1154,9 @@ call inside the cooldown window; the condition carries the seconds remaining."
                                "worker_id" (worker-id w)
                                "pid" (worker-pid w)))))
         (when (and (null assigned-from-standby) (null entry))
-          (when (>= (%effective-pool-size) *max-pool-size*)
-            (error 'pool-capacity-exceeded :limit *max-pool-size*))
+          (let ((limit (effective-max-pool-size)))
+            (when (>= (%effective-pool-size) limit)
+              (error 'pool-capacity-exceeded :limit limit)))
           (let ((ph (make-worker-placeholder :session-id session-id)))
             (setf (gethash session-id *affinity-map*) ph
                   entry ph
@@ -1243,8 +1328,8 @@ max_pool_size, warmup_target, workers (vector of per-worker hashes)."
             (gethash "total_workers" info) (length workers)
             (gethash "standby_count" info) standby-count
             (gethash "bound_count" info) bound-count
-            (gethash "max_pool_size" info) *max-pool-size*
-            (gethash "warmup_target" info) *worker-pool-warmup*
+            (gethash "max_pool_size" info) (effective-max-pool-size)
+            (gethash "warmup_target" info) (effective-worker-pool-warmup)
             (gethash "workers" info) workers)
       info)))
 
@@ -1254,7 +1339,7 @@ max_pool_size, warmup_target, workers (vector of per-worker hashes)."
 
 (defun pool-rpc-with-hard-kill (worker method params
                                  &key (soft-timeout *default-eval-timeout*)
-                                      (grace *worker-kill-grace-seconds*))
+                                      (grace nil))
   "Send METHOD with PARAMS to WORKER, returning the result hash-table.
 
 Implements a two-level timeout:
@@ -1268,12 +1353,14 @@ Implements a two-level timeout:
     process may have already exited), then marks it crashed via the normal
     mark-worker-crashed path (which closes the stream and arms the reset
     notification), then signals WORKER-CRASHED so the dispatcher's existing
-    handler returns a structured isError.
+    handler returns a structured isError. GRACE defaults to the resolved
+    kill grace (DSMR_WORKER_KILL_GRACE_SECONDS, 5 s unless set).
 
 WORKER-CRASHED from worker-rpc is re-signalled unchanged so the dispatcher's
 existing handler fires for both the soft and hard timeout cases."
-  (let ((hard-timeout (when (and soft-timeout grace)
-                        (+ soft-timeout grace))))
+  (let* ((grace (or grace (effective-worker-kill-grace-seconds)))
+         (hard-timeout (when soft-timeout
+                         (+ soft-timeout grace))))
     (handler-case
         (worker-rpc worker method params :timeout hard-timeout)
       (sb-ext:timeout ()
