@@ -17,7 +17,13 @@ export XDG_CACHE_HOME ?= $(CURDIR)/.ci-cache
 # whenever the dependencies, the SBCL build, or the project source change.
 CORE ?= dsmr.core
 
-.PHONY: bridge bus-watch bus-host install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify test-warm \
+# Prebuilt worker core image: only the hermetic worker system, its dependencies
+# and Quicklisp. Hermetic workers boot from it instead of loading the system on
+# every spawn. WORKER_CORE_IMAGE is the image `core-verify-worker` checks.
+WORKER_CORE ?= dsmr.core.worker
+WORKER_CORE_IMAGE ?= $(WORKER_CORE)
+
+.PHONY: bridge bus-watch bus-host install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
         install-skills check-skills install-harness check-harness install-sisters check-sisters \
         preflight check-preflight self-test-preflight install-hooks check-hooks
 
@@ -453,6 +459,10 @@ test-integration:
 ##   it, so $(CORE) names a valid image at every instant: the final rename
 ##   replaces one complete file with another and there is no window where the
 ##   path is missing. Rollback is `mv $(CORE).prev $(CORE)`.
+##
+##   Once $(CORE) is installed it builds the worker core too (core-worker), so a
+##   worker core that fails to build or verify does so after $(CORE) is already
+##   in place and cannot touch it.
 core:
 	@rm -f "$(CORE).tmp" "$(CORE).tmp.manifest"
 	DSMR_CORE_OUTPUT=$(CORE).tmp $(SBCL) --noinform --disable-debugger \
@@ -467,6 +477,7 @@ core:
 	@mv -f "$(CORE).tmp.manifest" "$(CORE).manifest"
 	@echo "installed $(CORE) (previous image kept as $(CORE).prev)"
 	@echo "running servers keep the previous core until each restarts"
+	@$(MAKE) --no-print-directory core-worker
 
 ## core-verify: boot a core image and assert it is a complete, working build.
 ##
@@ -491,6 +502,51 @@ core-verify:
 	@test -s "$(CORE_IMAGE)" || { echo "no core image at $(CORE_IMAGE)" >&2; exit 1; }
 	@$(SBCL) --core "$(CORE_IMAGE)" --noinform --disable-debugger --non-interactive \
 	     --load scripts/verify-core.lisp
+
+## core-worker: build the hermetic worker core image ($(WORKER_CORE)).
+##
+##   A hermetic worker booted from this image reaches its handshake in well
+##   under a second instead of loading the worker system from source on every
+##   spawn, and every worker on the host shares the image's pages. That spawn
+##   cost was the only reason to keep a warm standby worker around.
+##
+##   The image holds the worker system, its dependencies and Quicklisp, and no
+##   test systems: a worker image that carried them would carry them into every
+##   image a worker saves. It is built with --no-userinit so nothing from a
+##   personal init file is frozen into it, and core-verify-worker refuses an
+##   image that holds a setting taken from the build host's environment.
+##
+##   Same staged, verified, atomic install as `core`: build to .tmp, boot the
+##   staged image and check it from the inside, keep the outgoing image as
+##   .prev by hard link, then rename into place. A failed build or a rejected
+##   image leaves the installed worker core untouched. `make core` runs this
+##   after it has installed $(CORE); run on its own, this target never touches
+##   $(CORE).
+core-worker:
+	@rm -f "$(WORKER_CORE).tmp" "$(WORKER_CORE).tmp.manifest"
+	DSMR_CORE_KIND=worker DSMR_CORE_OUTPUT=$(WORKER_CORE).tmp $(SBCL) --noinform --disable-debugger \
+	     --no-userinit --non-interactive --load scripts/build-core.lisp
+	@test -s "$(WORKER_CORE).tmp" || { echo "worker core build produced no image; $(WORKER_CORE) left untouched" >&2; exit 1; }
+	@test -s "$(WORKER_CORE).tmp.manifest" || { echo "worker core build produced no manifest; $(WORKER_CORE) left untouched" >&2; exit 1; }
+	@$(MAKE) --no-print-directory core-verify-worker WORKER_CORE_IMAGE="$(WORKER_CORE).tmp"
+	@rm -f "$(WORKER_CORE).prev" "$(WORKER_CORE).manifest.prev"
+	@if [ -e "$(WORKER_CORE)" ]; then ln "$(WORKER_CORE)" "$(WORKER_CORE).prev" 2>/dev/null || cp -p "$(WORKER_CORE)" "$(WORKER_CORE).prev"; fi
+	@if [ -e "$(WORKER_CORE).manifest" ]; then ln "$(WORKER_CORE).manifest" "$(WORKER_CORE).manifest.prev" 2>/dev/null || cp -p "$(WORKER_CORE).manifest" "$(WORKER_CORE).manifest.prev"; fi
+	@mv -f "$(WORKER_CORE).tmp" "$(WORKER_CORE)"
+	@mv -f "$(WORKER_CORE).tmp.manifest" "$(WORKER_CORE).manifest"
+	@echo "installed $(WORKER_CORE) (previous image kept as $(WORKER_CORE).prev)"
+
+## core-verify-worker: boot a worker core image and assert it is fit for workers.
+##
+##   Run by `make core-worker` against the staged image before it is installed.
+##   Checks from inside the image that the worker entry point is there, that no
+##   test system and no environment-derived setting is, and that Quicklisp can
+##   still find a system. Useful on its own against the installed image or any
+##   other (`make core-verify-worker WORKER_CORE_IMAGE=some.core`).
+core-verify-worker:
+	@test -s "$(WORKER_CORE_IMAGE)" || { echo "no worker core image at $(WORKER_CORE_IMAGE)" >&2; exit 1; }
+	@$(SBCL) --core "$(WORKER_CORE_IMAGE)" --noinform --disable-debugger --non-interactive \
+	     --no-userinit --load scripts/verify-core-worker.lisp
 
 ## test-warm: run the fast suite against the prebuilt core ($(CORE)).
 ##
