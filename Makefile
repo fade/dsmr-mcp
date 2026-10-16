@@ -409,6 +409,19 @@ install-harness:
 	done
 	@echo "installed into $(AGENTDIR)"
 
+## TEST_STATE_HOME: the shell prefix that gives a unit-test run its own state.
+##
+##   I run the unit suites under a fresh XDG_STATE_HOME made with mktemp and
+##   removed when the recipe ends, however it ends. The suites start a session
+##   pool, and a pool sweeps state and publishes its worker records under
+##   $XDG_STATE_HOME/dsmr-mcp/host/, which is exactly where a running host
+##   service looks for workers to stop or hibernate. A test run must never be
+##   something the live service acts on. XDG_CACHE_HOME is left alone, so the
+##   fasl cache stays shared between runs.
+TEST_STATE_HOME = state=$$(mktemp -d /tmp/dsmr-test-state.XXXXXX) || exit 1; \
+	trap 'rm -rf "$$state"' EXIT; trap 'exit 130' HUP INT TERM; \
+	XDG_STATE_HOME=$$state; export XDG_STATE_HOME;
+
 ## test: fast in-process unit suite (the push hot-path).
 ##
 ##   Runs the dsmr-mcp/tests umbrella — true in-process units, no child SBCLs.
@@ -419,8 +432,10 @@ install-harness:
 ##   suite loads slynk (a test dependency) which installs a debugger hook, and
 ##   without the wrapper an unhandled :perform error is caught by that hook and
 ##   the process hangs waiting for a debugger connection instead of failing.
+##
+##   Each run gets a fresh state home of its own (TEST_STATE_HOME below).
 test:
-	$(SBCL) --noinform --disable-debugger --non-interactive \
+	$(TEST_STATE_HOME) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests")' \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))'
@@ -553,7 +568,8 @@ core-verify-worker:
 ##   Skips the Quicklisp load and the recompile entirely — the core already
 ##   holds dsmr-mcp + the test leaves — so only the assertions run. Build the
 ##   core first with `make core`. `make test` remains the no-core load path and
-##   works whether or not a core is present.
+##   works whether or not a core is present. Like `test`, each run gets a fresh
+##   state home of its own (TEST_STATE_HOME).
 test-warm:
-	$(SBCL) --core $(CORE) --noinform --disable-debugger --non-interactive \
+	$(TEST_STATE_HOME) $(SBCL) --core $(CORE) --noinform --disable-debugger --non-interactive \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))'
