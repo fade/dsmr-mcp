@@ -1262,6 +1262,26 @@ Return the current status of the hermetic worker pool
 Only available in hermetic mode. Returns pool_running, total_workers, 
 standby_count, bound_count, max_pool_size, warmup_target, and a workers array.
 
+When the host runs short of memory, an idle worker may be hibernated: its 
+whole Lisp world is saved to a core file on disk, its process ends, and it is 
+resumed with that world on your next call. Threads, open files and sockets, 
+timers, values from get-internal-real-time and foreign memory do not survive 
+hibernation, so a worker running threads of its own is never hibernated. An 
+idle worker that holds no state may be stopped instead, and your next call 
+gets a fresh one with nothing lost.
+
+Each worker also reports stateful (it has run a call that can leave state 
+behind), busy (a call is holding it now), boot (core, source or resumed: how 
+its process started), last_activity (Unix seconds of its last call), 
+core_bytes (the size of its last saved core), core_age_seconds (how long it 
+has been hibernated), last_hibernate_ms and last_resume_ms (how long its last 
+save and resume took), and refused_reason (why its last hibernation was 
+refused). The pool also reports hibernated_count and resident_count (workers 
+on disk and workers with a running process), pressure_relief (active when the 
+pool is answering a live host memory service), worker_core (the core new 
+workers boot from, or null) and worker_core_status (in use, unset, missing, 
+or disabled with the reason).
+
 #+begin_src json
 {
   "properties": {},
