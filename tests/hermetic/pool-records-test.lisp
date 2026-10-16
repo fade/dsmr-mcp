@@ -405,8 +405,13 @@
     (is eq nil (records:read-rss-kb 999999999))
     (is eq nil (records:read-pss-kb 999999999))
     (true (>= (records:expected-core-bytes pid) 209715200))
-    (true (>= (records:expected-core-bytes pid :floor-bytes 1)
-              (* 1024 (records:read-rss-kb pid))))
+    ;; Resident memory moves while the test runs, since reading it allocates,
+    ;; so the estimate is checked against readings taken either side of it.
+    (let* ((before (records:read-rss-kb pid))
+           (expected (records:expected-core-bytes pid :floor-bytes 1))
+           (after (records:read-rss-kb pid)))
+      (true (<= (* 1024 (min before after)) expected (* 1024 (max before after)))
+            "expected ~D bytes, resident ~D then ~D KiB" expected before after))
     (is eql 209715200 (records:expected-core-bytes 999999999))))
 
 (define-test a-failed-core-is-kept-and-only-the-newest-two-stay
