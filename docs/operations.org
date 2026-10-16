@@ -320,6 +320,12 @@ does the same once a minute. A server is named by its pid and its start time
 together, so a pid the kernel has since handed to another process never makes
 a dead server's cores look live.
 
+A worker let go in the middle of a save, by a release, a kill or the server
+shutting down, takes its saving child with it, and its partial core is
+deleted at once. A shutdown never waits for a save to finish: it ends the
+save, so restarting a server takes seconds however large the world being
+saved, and the save in progress is all that is lost.
+
 A resume that fails for a reason that may pass (the handshake ran out of time
 on a slow disk, the kernel refused the fork for memory, the process was killed
 while it loaded) gives up nothing: the worker stays hibernated with its core

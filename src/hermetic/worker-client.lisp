@@ -56,6 +56,7 @@
            #:*hibernate-timeout-seconds*
            #:hibernate-worker-process #:hibernate-refusal-token
            #:release-worker-process #:resume-worker
+           #:end-worker-process #:*stream-lock-grace-seconds*
            #:worker-spawn-failed-kind #:worker-spawn-failure-final-p
            #:worker-runtime-path #:worker-runtime-identity
            #:worker-resume-failure #:runtime-identity #:resume-runtime
@@ -1399,6 +1400,63 @@ Returns T if signal was sent, NIL if process was already dead."
       (ignore-errors (sb-ext:process-kill process 15))
       t)))
 
+(defvar *stream-lock-grace-seconds* 2
+  "How long ending a worker waits for its channel to be free before it ends
+the process outright. A call or a save can hold the channel for minutes, and
+nothing that is ending the worker should wait that long behind it.")
+
+(defun end-worker-process (worker &key (grace 2))
+  "End WORKER's process now, without waiting for its channel. Sends SIGTERM,
+which a worker in the middle of a save answers by ending the save and
+deleting its partial core, waits up to GRACE seconds, then sends SIGKILL, and
+shuts the channel down so a thread reading it, such as one waiting on a save,
+gets end-of-file at once instead of at its deadline. The socket itself is
+left for release-worker-process to close. The worker's state is left alone.
+Safe on a worker whose process has already gone."
+  (let ((process (worker-process-info worker)))
+    (when process
+      (handler-case
+          (when (sb-ext:process-alive-p process)
+            (sb-ext:process-kill process 15)
+            (loop repeat (ceiling grace 0.05)
+                  while (sb-ext:process-alive-p process)
+                  do (sleep 0.05))
+            (when (sb-ext:process-alive-p process)
+              (log-event :warn "worker.sigkill"
+                         "id" (worker-id worker)
+                         "pid" (worker-pid worker)
+                         "reason" "ending")
+              (sb-ext:process-kill process 9)))
+        (error (e)
+          (log-event :warn "worker.end.error"
+                     "id" (worker-id worker)
+                     "error" (princ-to-string e))))))
+  (let ((socket (worker-socket worker)))
+    (when socket
+      (ignore-errors (usocket:socket-shutdown socket :io))))
+  worker)
+
+(defun %call-with-stream-lock-or-end (worker function)
+  "Call FUNCTION holding WORKER's stream lock. When the lock is not free within
+*stream-lock-grace-seconds*, whatever holds it (a call or a save) is cut off
+first: the process is ended with end-worker-process, which makes the holder
+read end-of-file and let go. Ending a worker therefore never waits on a save
+or a long call."
+  (let ((lock (worker-stream-lock worker))
+        (limit (+ (get-internal-real-time)
+                  (* *stream-lock-grace-seconds* internal-time-units-per-second))))
+    (loop until (bt:acquire-lock lock nil)
+          do (when (>= (get-internal-real-time) limit)
+               (log-event :warn "worker.channel-busy"
+                          "id" (worker-id worker)
+                          "pid" (worker-pid worker))
+               (end-worker-process worker :grace 0)
+               (bt:acquire-lock lock t)
+               (return))
+             (sleep 0.02))
+    (unwind-protect (funcall function)
+      (bt:release-lock lock))))
+
 (defun release-worker-process (worker)
   "Close WORKER's channel and end its process, leaving its state alone.
 Closes the TCP socket under stream-lock for mutual exclusion with
@@ -1416,12 +1474,16 @@ worker has saved its world and is to be recorded :hibernated rather than
   (let ((process (worker-process-info worker)))
     ;; Close TCP socket under stream-lock first, so any concurrent
     ;; worker-rpc sees the closure as a stream-error.
-    (bt:with-lock-held ((worker-stream-lock worker))
-      (let ((socket (worker-socket worker)))
-        (when socket
-          (ignore-errors (usocket:socket-close socket))
-          (setf (worker-socket worker) nil
-                (worker-stream worker) nil))))
+    ;; A save or a call holding the lock past the grace is cut off by ending
+    ;; the process, so this never waits minutes behind it.
+    (%call-with-stream-lock-or-end
+     worker
+     (lambda ()
+       (let ((socket (worker-socket worker)))
+         (when socket
+           (ignore-errors (usocket:socket-close socket))
+           (setf (worker-socket worker) nil
+                 (worker-stream worker) nil)))))
     ;; Terminate the OS process outside the lock (may block up to ~2.2s)
     (when process
       (handler-case
@@ -1463,12 +1525,16 @@ worker has saved its world and is to be recorded :hibernated rather than
   "Terminate the worker process, clean up its resources and set its state to
 :dead. The state is set under stream-lock, so a concurrent call that holds the
 lock sees the worker as it was; the cleanup is release-worker-process.
+When a call or a save holds the lock past *stream-lock-grace-seconds*, the
+process is ended first so the holder lets go: killing a worker in the middle
+of a save costs that save, never minutes of waiting.
 Robust against already-dead processes."
   (log-event :info "worker.killing"
              "id" (worker-id worker)
              "pid" (worker-pid worker))
-  (bt:with-lock-held ((worker-stream-lock worker))
-    (setf (worker-state worker) :dead))
+  (%call-with-stream-lock-or-end
+   worker
+   (lambda () (setf (worker-state worker) :dead)))
   (release-worker-process worker)
   (log-event :info "worker.killed"
              "id" (worker-id worker)

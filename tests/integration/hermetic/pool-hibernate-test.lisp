@@ -40,7 +40,8 @@
                 #:worker-consecutive-missed-pings #:worker-liveness
                 #:check-and-clear-reset-notification)
   (:import-from #:dsmr-mcp/src/hermetic/pool-records
-                #:server-stem #:owner-directory #:hibernated-core-path)
+                #:server-stem #:owner-directory #:hibernated-core-path
+                #:write-hibernate-request)
   (:import-from #:dsmr-mcp/src/bus/hostfiles
                 #:fleet-log-path)
   (:import-from #:dsmr-mcp/src/state
@@ -552,6 +553,58 @@ partial core, and the save answers that the worker died."
                      "the save answered ~A" result))
              (false (probe-file scratch) "the partial core is still at ~A" scratch))
         (when child (ignore-errors (sb-posix:kill child sb-posix:sigkill)))))))
+
+(define-test shutting-down-during-a-save-takes-seconds-not-the-save
+  "Shutting the pool down while the host service's request has a worker in
+the middle of a save that would never finish returns within 10 seconds, ends
+the saving child, and reports no lost world, because nobody lost one."
+  (%pool-case ()
+    (%eval "rushed" +slow-save-code+)
+    (let* ((w (%session-worker "rushed"))
+           (scratch (%scratch-path w))
+           (child nil))
+      (unwind-protect
+           (progn
+             (write-hibernate-request (server-stem) (worker-id w) :hibernate
+                                      :now (pool::%unix-now)
+                                      :reason "pool hibernate test")
+             (setf child (%saving-child scratch 20))
+             (true child "the requested save never started")
+             (is eq :hibernating (worker-state w))
+             (let* ((started (get-internal-real-time))
+                    (seconds (progn
+                               (shutdown-pool)
+                               (/ (- (get-internal-real-time) started)
+                                  internal-time-units-per-second))))
+               (true (< seconds 10) "shutdown took ~,1F s" seconds))
+             (true (%wait-until 5 (lambda () (%process-gone-p child)))
+                   "the saving child ~A outlived the shutdown" child)
+             (let ((log (or (ignore-errors (uiop:read-file-string (fleet-log-path)))
+                            "")))
+               (false (search "worker-hibernate-died" log) "~A" log)))
+        (when child (ignore-errors (sb-posix:kill child sb-posix:sigkill)))))))
+
+(define-test killing-a-worker-never-waits-behind-a-call-holding-its-channel
+  "Killing a worker whose channel a long call holds ends the process after
+the short grace instead of waiting for the call, returns within 5 seconds,
+and the call comes back with an error rather than hanging."
+  (%pool-case ()
+    (%eval "held" "(+ 1 1)")
+    (let* ((w (%session-worker "held"))
+           (call (bt:make-thread
+                  (lambda ()
+                    (handler-case (%reply-text (%eval-on w "(progn (sleep 60) :done)"))
+                      (error (e) (list :error (princ-to-string e)))))
+                  :name "held-call")))
+      (sleep 0.5)
+      (let* ((started (get-internal-real-time))
+             (seconds (progn
+                        (dsmr-mcp/src/hermetic/worker-client:kill-worker w)
+                        (/ (- (get-internal-real-time) started)
+                           internal-time-units-per-second))))
+        (true (< seconds 5) "killing the worker took ~,1F s" seconds))
+      (let ((result (sb-thread:join-thread call :timeout 10 :default :hung)))
+        (false (eq result :hung) "the call never came back")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Idleness and the health check

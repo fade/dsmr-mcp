@@ -63,6 +63,7 @@
                 #:worker-core-bytes #:worker-last-hibernate-milliseconds
                 #:worker-refused-reason #:worker-refused-at
                 #:hibernate-worker-process #:release-worker-process
+                #:end-worker-process
                 #:resume-worker #:*hibernate-timeout-seconds*
                 #:worker-last-resume-milliseconds
                 #:worker-spawned-at #:worker-boot-kind
@@ -1199,9 +1200,23 @@ subprocess launches beyond the one-time fasl compile on a cold cache."
   "Shut down all workers and clean up pool state. Stops the health monitor,
 stops answering the host service (removing this server's worker record and the
 requests waiting for it), waits for in-flight replenish/recovery/reaper
-threads, then kills all workers."
+threads, then kills all workers.
+
+A worker in the middle of a save is ended first, before anything waits on the
+thread running the save, and loses only that save. Shutdown is bounded: it
+never waits for a save to finish, so a server exit or restart takes seconds
+however large the world being saved."
   (log-event :info "pool.shutting-down")
-  (setf *pool-running* nil)
+  ;; Stopping the pool and listing the saves under way happen in one hold of
+  ;; *pool-lock*, the lock a save is started under, so no save can start
+  ;; after the list is taken.
+  (let ((saving (bt:with-lock-held (*pool-lock*)
+                  (setf *pool-running* nil)
+                  (remove-if-not (lambda (w) (eq (worker-state w) :hibernating))
+                                 *all-workers*))))
+    (dolist (w saving)
+      (log-event :info "pool.shutdown.ending-save" "worker_id" (worker-id w))
+      (ignore-errors (end-worker-process w))))
   ;; Wake health monitor so it exits promptly
   (bt:with-lock-held (*health-monitor-lock*)
     (%condition-broadcast *health-monitor-condvar*))
@@ -1909,8 +1924,8 @@ the session's entry, so the session's next call gets a fresh worker carrying
 that reset notice. This is not a crash: nothing is added to the crash history
 and the breaker is not touched. The loss is logged as an error and written to
 the fleet log under CODE. Returns OUTCOME and \"died\" for
-hibernate-session-worker. When the session let the worker go meanwhile there
-is no one to tell, nothing more is done, and the reason returned is
+hibernate-session-worker. When the session let the worker go meanwhile, or
+the pool is shutting down and ended the save itself, there is no one to tell, nothing more is done, and the reason returned is
 \"released\". Either way the partial core the save may have left is deleted,
 once the worker's process is gone."
   (release-worker-process worker)
@@ -1920,11 +1935,17 @@ once the worker's process is gone."
        (sb-posix:unlink (concatenate 'string scratch ".tmp")))))
   (let ((lost nil))
     (bt:with-lock-held (*pool-lock*)
-      (when (eq (worker-state worker) :hibernating)
-        (setf (worker-state worker) :dead
-              (worker-reset-reason worker) reason
-              *all-workers* (remove worker *all-workers*)
-              lost t)))
+      (cond
+        ((not (eq (worker-state worker) :hibernating)))
+        ;; The pool is stopping and ended the save itself: nothing was lost
+        ;; that anyone will ask for, so it is not reported as a loss.
+        ((not *pool-running*)
+         (setf (worker-state worker) :dead))
+        (t
+         (setf (worker-state worker) :dead
+               (worker-reset-reason worker) reason
+               *all-workers* (remove worker *all-workers*)
+               lost t))))
     (when lost
       (log-event :error "pool.worker.died-during-hibernate"
                  "session" session-id
