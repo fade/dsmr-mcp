@@ -182,7 +182,8 @@ Each thread terminates and self-removes after reaping its process.")
   (last-exit-status nil)
   (last-exit-code nil)
   ;; How this worker came up: :core when booted from the worker core, :source
-  ;; when its systems were loaded at spawn. spawn-worker writes both once.
+  ;; when its systems were loaded at spawn, :resumed when started from a core
+  ;; a worker saved of itself. spawn-worker writes both once.
   (boot-kind nil)
   ;; Milliseconds from process launch to an authenticated connection.
   (boot-milliseconds nil)
@@ -313,14 +314,18 @@ Handles both LF and CRLF line endings."
   "Environment variables that must NOT be inherited from the parent.
 These are set explicitly per-worker to the correct per-worker values.")
 
-(defun %build-environment (secret id)
+(defun %build-environment (secret id &key root)
   "Build the environment for worker processes.
 Inherits the parent's full environment, adding DSMR-specific variables
-and excluding only those that would conflict with per-worker overrides."
+and excluding only those that would conflict with per-worker overrides.
+When ROOT is non-NIL, DSMR_PROJECT_ROOT is set to it in place of any
+inherited value, so a resumed worker sees the project root its session had."
   (let ((env (list (format nil "DSMR_WORKER_SECRET=~A" secret)
                    (format nil "DSMR_WORKER_ID=~A" id)
                    (format nil "DSMR_PARENT_PID=~A" (sb-posix:getpid))
                    "DSMR_NO_WORKER_POOL=1")))
+    (when root
+      (push (format nil "DSMR_PROJECT_ROOT=~A" root) env))
     ;; Inherit all parent environment variables except those that
     ;; conflict with per-worker overrides set above.
     (dolist (entry (sb-ext:posix-environ))
@@ -328,7 +333,8 @@ and excluding only those that would conflict with per-worker overrides."
         (when eq-pos
           (let ((name (subseq entry 0 eq-pos)))
             (unless (or (member name *worker-env-denylist* :test #'string=)
-                        (string= name "DSMR_NO_WORKER_POOL"))
+                        (string= name "DSMR_NO_WORKER_POOL")
+                        (and root (string= name "DSMR_PROJECT_ROOT")))
               (push entry env))))))
     env))
 
@@ -366,8 +372,12 @@ loaded in the current image, or NIL otherwise."
               (namestring (merge-pathnames "setup.lisp"
                                            (namestring home))))))))))
 
-(defun %build-sbcl-args (&key core)
+(defun %build-sbcl-args (&key core hibernated-core)
   "Build command-line arguments for spawning a worker via bare SBCL.
+
+With HIBERNATED-CORE, the path of a core a worker saved of itself, the
+arguments are only the image and --noinform: the image's own entry point
+resumes the worker, and CORE is ignored.
 
 With CORE, the path of a worker core image, the worker boots from that image,
 which already holds the worker system, so nothing is loaded before start. The
@@ -392,6 +402,12 @@ finished.') are routed to stderr rather than the handshake channel (fd 1).
 sb-sys:*stdout* is the raw fd-1 FD-STREAM and is not affected by the
 rebinding; start() restores *standard-output* to it before emitting the
 handshake JSON line."
+  (when hibernated-core
+    ;; A core a worker saved of itself carries its own entry point, which
+    ;; redoes everything the arguments below would, so nothing is passed but
+    ;; the image and the runtime's banner switch.
+    (return-from %build-sbcl-args
+      (list "--core" (namestring hibernated-core) "--noinform")))
   (let ((source-dir (namestring (asdf:system-source-directory :dsmr-mcp)))
         (ql-setup (%quicklisp-setup-path)))
     (when core
@@ -420,15 +436,18 @@ handshake JSON line."
       "--eval" "(asdf:load-system :dsmr-mcp/src/hermetic/worker/main)"
       "--eval" "(dsmr-mcp/src/hermetic/worker/main:start)"))))
 
-(defun %launch-worker-process (secret id &key core)
-  "Launch a worker child process via sb-ext:run-program, booting it from the
-worker core image CORE when given, else loading it from source.
+(defun %launch-worker-process (secret id &key core hibernated-core root)
+  "Launch a worker child process via sb-ext:run-program: resumed from the
+saved core HIBERNATED-CORE when given, else booted from the worker core image
+CORE when given, else loaded from source. ROOT, when non-NIL, replaces the
+inherited DSMR_PROJECT_ROOT.
 Returns the sb-ext:process object with stdout and stderr as streams.
 Always uses bare SBCL; dsmr-mcp is SBCL-only (no ros run wrapper)."
-  (let ((env (%build-environment secret id))
+  (let ((env (%build-environment secret id :root root))
         (sbcl-path (%find-sbcl-path)))
     (sb-ext:run-program sbcl-path
-                        (%build-sbcl-args :core core)
+                        (%build-sbcl-args :core core
+                                          :hibernated-core hibernated-core)
                         :output :stream :error :stream :wait nil
                         :search t :environment env)))
 
@@ -591,9 +610,12 @@ Stores the thread in the worker's stderr-thread slot for cleanup."
 ;;; Public API — spawn
 ;;; ---------------------------------------------------------------------------
 
-(defun %spawn-worker-once (core)
-  "Launch one worker child process and return a WORKER struct, booting it
-from the worker core image CORE when non-NIL, else loading it from source.
+(defun %spawn-worker-once (core &key hibernated-core id root)
+  "Launch one worker child process and return a WORKER struct, resuming it
+from the saved core HIBERNATED-CORE when given, else booting it from the
+worker core image CORE when non-NIL, else loading it from source. ID, when
+non-NIL, is the worker id to use instead of a new one; ROOT, when non-NIL,
+replaces the inherited DSMR_PROJECT_ROOT.
 The worker is launched via sb-ext:run-program (bare SBCL only).
 Reads the JSON handshake to discover tcp_port/pid/swank_port, connects
 to the TCP port, authenticates with a shared secret, and returns the
@@ -601,7 +623,8 @@ worker in :standby state.
 
 Signals WORKER-SPAWN-FAILED if the process cannot be started,
 the handshake fails, or authentication is rejected."
-  (let ((id (%next-worker-id))
+  (let ((id (or id (%next-worker-id)))
+        (kind (cond (hibernated-core :resumed) (core :core) (t :source)))
         (secret (%generate-worker-secret))
         (process nil)
         (socket nil)
@@ -609,9 +632,12 @@ the handshake fails, or authentication is rejected."
     (handler-case
         (progn
           (log-event :info "worker.spawning" "id" id
-                     "boot" (if core "core" "source"))
+                     "boot" (string-downcase (symbol-name kind)))
           (setf started (get-internal-real-time)
-                process (%launch-worker-process secret id :core core))
+                process (%launch-worker-process secret id
+                                                :core core
+                                                :hibernated-core hibernated-core
+                                                :root root))
           (multiple-value-bind (tcp-port pid swank-port)
               (%read-handshake process (effective-worker-startup-timeout))
             (log-event :info "worker.handshake.received"
@@ -645,7 +671,7 @@ the handshake fails, or authentication is rejected."
                            :tcp-port tcp-port
                            :swank-port swank-port
                            :pid pid
-                           :boot-kind (if core :core :source)
+                           :boot-kind kind
                            :boot-milliseconds
                            (round (* 1000 (- (get-internal-real-time) started))
                                   internal-time-units-per-second))))
@@ -654,7 +680,7 @@ the handshake fails, or authentication is rejected."
                          "id" id
                          "tcp_port" tcp-port
                          "pid" pid
-                         "boot" (if core "core" "source")
+                         "boot" (string-downcase (symbol-name kind))
                          "boot_ms" (worker-boot-milliseconds worker))
               worker)))
       (error (e)
@@ -677,7 +703,7 @@ the handshake fails, or authentication is rejected."
             (error 'worker-spawn-failed
                    :message (princ-to-string e)))))))
 
-(defun spawn-worker (&key (core nil core-p))
+(defun spawn-worker (&key (core nil core-p) hibernated-core id root)
   "Launch a worker child process and return a WORKER struct in :standby state.
 
 CORE is the worker core image to boot from; when it is not given,
@@ -691,28 +717,43 @@ the worker fails to boot from it, the failure is logged as a warning,
 *worker-core-disabled* records it so this process does not try the core again,
 and the spawn is retried once from source.
 
-worker-boot-kind on the result says which way it came up, and
-worker-boot-milliseconds how long it took. Signals WORKER-SPAWN-FAILED when
-the worker cannot be brought up at all."
+HIBERNATED-CORE is a core a worker saved of itself. Given one, the worker is
+resumed from it with everything its session had built, CORE is ignored, and
+there is no retry from source: a fresh worker would silently stand in for the
+session's world, so a resume that fails signals instead and the caller decides.
+ID is the worker id to give the new process (a resumed worker keeps the id it
+had), and ROOT, when non-NIL, is the project root to give it in place of the
+inherited DSMR_PROJECT_ROOT.
+
+worker-boot-kind on the result says which way it came up (:core, :source or
+:resumed), and worker-boot-milliseconds how long it took. Signals
+WORKER-SPAWN-FAILED when the worker cannot be brought up at all."
+  (when hibernated-core
+    (unless (%regular-file-p (namestring hibernated-core))
+      (error 'worker-spawn-failed
+             :message (format nil "no saved core at ~A" hibernated-core)))
+    (return-from spawn-worker
+      (%spawn-worker-once nil :hibernated-core (namestring hibernated-core)
+                              :id id :root root)))
   (multiple-value-bind (path reason)
       (if core-p
           (if core (%offered-core core) (values nil "not requested"))
           (worker-core-path))
     (cond
       (path
-       (handler-case (%spawn-worker-once path)
+       (handler-case (%spawn-worker-once path :id id :root root)
          (worker-spawn-failed (e)
            (let ((why (princ-to-string e)))
              (log-event :warn "worker.core.boot-failed"
                         "core" path
                         "error" why)
              (setf *worker-core-disabled* why)
-             (%spawn-worker-once nil)))))
+             (%spawn-worker-once nil :id id :root root)))))
       (t
        (unless *worker-core-unavailable-logged*
          (setf *worker-core-unavailable-logged* t)
          (log-event :info "worker.core.unavailable" "reason" reason))
-       (%spawn-worker-once nil)))))
+       (%spawn-worker-once nil :id id :root root)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Internal helpers — crash handling
