@@ -51,6 +51,8 @@
    #:session-gone
    #:parked-session-gone
    #:roster-gap
+   #:memory-pressure
+   #:memory-pressure-unrelieved
    ;; restarts
    #:skip-fault
    #:restart-broker-thread
@@ -63,6 +65,7 @@
    #:adopt-legacy-watcher
    #:lapse
    #:deregister
+   #:request-hibernation
    ;; signalling
    #:raise-fault
    ;; breaker
@@ -183,6 +186,20 @@
   (:documentation "An agent is on a bus roster but has no registration with the
    service. A finding to report, never a gate."))
 
+(define-condition memory-pressure (host-fault)
+  ()
+  (:default-initargs :code "memory-pressure")
+  (:documentation "The host is short of memory: stalls on memory are high or
+   little memory is left available. The heal asks a session pool to stop or
+   hibernate one idle worker."))
+
+(define-condition memory-pressure-unrelieved (host-fault)
+  ()
+  (:default-initargs :code "memory-pressure-unrelieved")
+  (:documentation "The host has stayed short of memory with no idle worker left
+   to stop or hibernate. Nothing the service can do helps, so it is reported
+   for a leader to act on."))
+
 ;;; ------------------------------------------------------------------ signalling
 
 (defun raise-fault (class &rest initargs)
@@ -280,7 +297,11 @@
     (:class parked-session-gone :restart deregister
      :threshold 50 :window 600 :cooldown 600 :level :info :code "parked-session-ended")
     (:class roster-gap :restart nil
-     :level :info :code "roster-gap"))
+     :level :info :code "roster-gap")
+    (:class memory-pressure :restart request-hibernation
+     :threshold 30 :window 600 :cooldown 60 :level :warn :code "memory-pressure")
+    (:class memory-pressure-unrelieved :restart nil
+     :level :error :code "memory-pressure-unrelieved"))
   "The healing policy, one row per fault class: the restart that heals it (NIL
    when nothing does), the breaker's THRESHOLD heals per WINDOW seconds and its
    COOLDOWN, the LEVEL a fault that goes unhealed is reported at, and the CODE
