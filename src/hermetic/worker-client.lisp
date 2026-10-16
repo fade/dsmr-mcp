@@ -59,7 +59,8 @@
            #:end-worker-process #:*stream-lock-grace-seconds*
            #:worker-spawn-failed-kind #:worker-spawn-failure-final-p
            #:worker-runtime-path #:worker-runtime-identity
-           #:worker-resume-failure #:runtime-identity #:resume-runtime
+           #:worker-resume-failure #:worker-resume-deferrals
+           #:runtime-identity #:resume-runtime
            #:*worker-resume-timeout* #:*resolved-worker-resume-timeout*
            #:resolve-worker-resume-timeout #:effective-worker-resume-timeout))
 
@@ -292,7 +293,10 @@ Each thread terminates and self-removes after reaping its process.")
   (runtime-identity nil)
   ;; Why the last resume of this worker's saved world failed in a way worth
   ;; retrying, while its core is still on disk; NIL once a resume succeeds.
-  (resume-failure nil))
+  (resume-failure nil)
+  ;; How many resumes of this worker's saved world in a row have failed in a
+  ;; way worth retrying; 0 once a resume succeeds.
+  (resume-deferrals 0 :type integer))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Conditions

@@ -331,14 +331,23 @@ A resume that fails for a reason that may pass (the handshake ran out of time
 on a slow disk, the kernel refused the fork for memory, the process was killed
 while it loaded) gives up nothing: the worker stays hibernated with its core
 in place, that call fails with an error saying the world is still saved, and
-the session's next call tries again. A resume is retried from the runtime
-that wrote the core, even after the =sbcl= package was upgraded under a
-running server, because the server's own executable is still the old build.
-To give the world up instead, kill the session's worker with
+the session's next call tries again. The first such failure writes a
+=worker-resume-deferred= warning to the fleet error log, so you see a world
+that has stopped resuming before it is given up. A resume is retried from the
+runtime that wrote the core, even after the =sbcl= package was upgraded under
+a running server, because the server's own executable is still the old build.
+
+Retries are bounded. A failure that looks as if it may pass can be permanent
+(a core damaged inside the file makes the resumed process die the same way
+every time), so once =DSMR_MAX_RESUME_ATTEMPTS= resumes in a row (default 3)
+have failed, the world is given up as described below: the core is kept under
+=hibernate/failed/= and the session gets a fresh worker with a notice saying
+its saved world could not be restored. A resume that succeeds starts the count
+again. To give the world up sooner, kill the session's worker with
 =pool-kill-worker=.
 
-Only a core the runtime refuses outright, or one whose runtime is gone, is
-final. It is moved to =hibernate/failed/= and kept for diagnosis, and nothing
+A core the runtime refuses outright, one whose runtime is gone, and one that
+has reached the retry limit above are final. It is moved to =hibernate/failed/= and kept for diagnosis, and nothing
 ever resumes from that directory. The newest failed core of every worker whose
 server is still running is always kept, so a burst of failures across many
 sessions never deletes one session's world to make room for another's; beyond

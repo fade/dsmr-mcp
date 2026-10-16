@@ -68,7 +68,8 @@
                 #:worker-last-resume-milliseconds
                 #:worker-spawned-at #:worker-boot-kind
                 #:worker-core-path #:*worker-core-disabled*
-                #:worker-resume-failure #:worker-spawn-failure-final-p
+                #:worker-resume-failure #:worker-resume-deferrals
+                #:worker-spawn-failure-final-p
                 #:resolve-worker-resume-timeout
                 #:effective-worker-resume-timeout)
   (:local-nicknames (#:pool-records #:dsmr-mcp/src/hermetic/pool-records))
@@ -94,6 +95,8 @@
            #:pool-settings-pressure-kill-min-age-seconds
            #:pool-settings-max-hibernated-workers
            #:*max-hibernated-workers* #:effective-max-hibernated-workers
+           #:pool-settings-max-resume-attempts
+           #:*max-resume-attempts* #:effective-max-resume-attempts
            #:*resolved-pool-settings* #:resolve-pool-settings
            #:effective-worker-pool-warmup #:effective-max-pool-size
            #:effective-worker-kill-grace-seconds
@@ -333,6 +336,20 @@ DSMR_MAX_HIBERNATED_WORKERS, a non-negative integer defaulting to 8; 0 turns
 hibernation off. A non-NIL value, set globally or bound in the thread that
 starts the pool, wins over the environment.")
 
+(defvar *max-resume-attempts* nil
+  "How many resumes of one hibernated worker in a row may fail in a way that
+may pass before its world is given up, or NIL to read the environment when the
+pool starts. A failure that looks passing (a timeout, a process that exited
+before its handshake) can in fact be permanent, as with a core damaged inside
+the file, and without a limit such a session would be told on every call that
+its world is still saved and would never get a working worker. At the limit
+the world is given up as a failure that can never pass: its core is kept for
+diagnosis and the session gets a fresh worker with a notice saying why.
+
+NIL (the default) means resolve-pool-settings reads DSMR_MAX_RESUME_ATTEMPTS,
+a positive integer defaulting to 3. A non-NIL value, set globally or bound in
+the thread that starts the pool, wins over the environment.")
+
 ;;; ---------------------------------------------------------------------------
 ;;; Settings resolved when the pool starts
 ;;; ---------------------------------------------------------------------------
@@ -349,7 +366,8 @@ given, and initialize-pool reports an invalid one with its own error."
   (max-pool-size 16)
   (kill-grace-seconds 5)
   (pressure-kill-min-age-seconds 10)
-  (max-hibernated-workers 8))
+  (max-hibernated-workers 8)
+  (max-resume-attempts 3))
 
 (defvar *resolved-pool-settings* nil
   "The pool-settings record from the last resolve-pool-settings call, or NIL
@@ -365,7 +383,8 @@ environment, else its default: *worker-pool-warmup* or DSMR_WORKER_POOL_WARMUP
 (default 0), *max-pool-size* or DSMR_MAX_POOL_SIZE (default 16),
 *worker-kill-grace-seconds* or DSMR_WORKER_KILL_GRACE_SECONDS (default 5), and
 *pressure-kill-min-age-seconds* or DSMR_PRESSURE_MIN_KILL_AGE_SECONDS (default
-10), and *max-hibernated-workers* or DSMR_MAX_HIBERNATED_WORKERS (default 8).
+10), *max-hibernated-workers* or DSMR_MAX_HIBERNATED_WORKERS (default 8), and
+*max-resume-attempts* or DSMR_MAX_RESUME_ATTEMPTS (default 3).
 An unparseable or out-of-range environment value warns and falls back to
 the default.
 
@@ -389,7 +408,10 @@ prebuilt image honours the environment it is started with."
                (%env-int "DSMR_PRESSURE_MIN_KILL_AGE_SECONDS" 10 :min 0))
            :max-hibernated-workers
            (or *max-hibernated-workers*
-               (%env-int "DSMR_MAX_HIBERNATED_WORKERS" 8 :min 0)))))
+               (%env-int "DSMR_MAX_HIBERNATED_WORKERS" 8 :min 0))
+           :max-resume-attempts
+           (or *max-resume-attempts*
+               (%env-int "DSMR_MAX_RESUME_ATTEMPTS" 3 :min 1)))))
     (setf *resolved-pool-settings* settings)
     (resolve-worker-startup-timeout)
     (resolve-worker-resume-timeout)
@@ -423,6 +445,13 @@ resolved."
 (defun effective-max-hibernated-workers ()
   "The most workers this server keeps hibernated at once, as last resolved."
   (pool-settings-max-hibernated-workers (%current-pool-settings)))
+
+(defun effective-max-resume-attempts ()
+  "How many resumes of one worker in a row may fail in a way that may pass
+before its world is given up: a binding of *max-resume-attempts* visible here,
+else the value last resolved."
+  (or *max-resume-attempts*
+      (pool-settings-max-resume-attempts (%current-pool-settings))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Global pool state
@@ -1171,7 +1200,11 @@ subprocess launches beyond the one-time fasl compile on a cold cache."
       (let ((limit (pool-settings-max-hibernated-workers settings)))
         (unless (and (integerp limit) (>= limit 0))
           (error "Invalid *max-hibernated-workers*: must be a non-negative integer, got ~S"
-                 limit))))
+                 limit)))
+      (let ((attempts (pool-settings-max-resume-attempts settings)))
+        (unless (and (integerp attempts) (plusp attempts))
+          (error "Invalid *max-resume-attempts*: must be a positive integer, got ~S"
+                 attempts))))
     (when *pool-running*
       (shutdown-pool))
     ;; Pre-warm the worker system's fasl cache so concurrent child spawns
@@ -1367,6 +1400,7 @@ same way."
               (worker-hibernated-at worker) nil
               (worker-core-bytes worker) nil
               (worker-resume-failure worker) nil
+              (worker-resume-deferrals worker) 0
               serving t))
       (%condition-broadcast *pool-transition-condvar*))
     (cond
@@ -1442,14 +1476,20 @@ meanwhile, there is no one to tell and pool-spawn-cancelled is signalled."
   "Put WORKER, whose resume failed for CAUSE in a way that may pass, back to
 :hibernated with its core untouched, and remember CAUSE on it so requests that
 were waiting on this resume are told the same rather than each trying again at
-once. Returns T. Nothing is lost, so no notice is armed, nothing goes to the
-fleet log and the crash record is left alone. When the session let the worker
-go meanwhile, pool-spawn-cancelled is signalled instead."
-  (let ((deferred nil))
+once. Returns T. Nothing is lost, so no notice is armed and the crash record
+is left alone. The failure is counted on the worker, so that
+%resume-hibernated-worker gives the world up once *max-resume-attempts*
+resumes in a row have failed, and the first failure of a run writes a warning
+to the fleet log, so a leader sees a world that has stopped resuming before
+it is given up. When the session let the worker go meanwhile,
+pool-spawn-cancelled is signalled instead."
+  (let ((deferred nil)
+        (count 0))
     (bt:with-lock-held (*pool-lock*)
       (when (eq (worker-state worker) :resuming)
         (setf (worker-state worker) :hibernated
               (worker-resume-failure worker) cause
+              count (incf (worker-resume-deferrals worker))
               deferred t))
       (%condition-broadcast *pool-transition-condvar*))
     (unless deferred
@@ -1461,7 +1501,18 @@ go meanwhile, pool-spawn-cancelled is signalled instead."
     (log-event :warn "pool.resume.deferred"
                "session" session-id
                "worker_id" (worker-id worker)
+               "attempt" count
                "cause" cause)
+    (when (= count 1)
+      (ignore-errors
+       (append-fleet-line
+        (fleet-line :warn "worker-resume-deferred"
+                    :id session-id
+                    :msg (format nil "worker ~D of session ~A could not be resumed ~
+                                      (~A); its world is still saved and is given ~
+                                      up after ~D failures like this in a row"
+                                 (worker-id worker) session-id cause
+                                 (effective-max-resume-attempts))))))
     t))
 
 (defun %resume-hibernated-worker (session-id worker)
@@ -1477,7 +1528,9 @@ Any other failure may pass: the handshake ran out of time on a slow disk, the
 kernel refused the fork for memory, the process was killed while it loaded.
 Then the world is not given up. The worker goes back to :hibernated with its
 core in place and pool-resume-deferred is signalled, so this call fails with
-an error saying so and the session's next call tries again.
+an error saying so and the session's next call tries again. Once
+*max-resume-attempts* resumes in a row have failed that way, the last failure
+is taken as final instead, as above.
 
 Signals pool-spawn-cancelled when the session let the worker go while it was
 resuming."
@@ -1494,7 +1547,14 @@ resuming."
                (error (e)
                  (if (worker-spawn-failure-final-p e)
                      (setf final (princ-to-string e))
-                     (setf passing (princ-to-string e))))))
+                     (setf passing (princ-to-string e)))))
+             ;; A failure that may pass, repeated this often, is taken as
+             ;; permanent: nothing else would ever stop the retries.
+             (let ((attempts (1+ (worker-resume-deferrals worker))))
+               (when (and passing (>= attempts (effective-max-resume-attempts)))
+                 (setf final (format nil "~D resumes in a row failed, the last: ~A"
+                                     attempts passing)
+                       passing nil))))
            (cond
              (final
               (multiple-value-prog1 (%fail-resume session-id worker path final)
@@ -1534,7 +1594,8 @@ be resumed does the session get a fresh worker, and then its next reply says
 its world was reset and why. A resume that failed in a way that may pass
 leaves the worker hibernated with its core, and signals pool-resume-deferred
 to this request and to every request that waited on it; the next call tries
-again. None of this counts toward the circuit breaker.
+again, until *max-resume-attempts* resumes in a row have failed and the world
+is given up as above. None of this counts toward the circuit breaker.
 
 Circuit breaker: before spawning, checks *circuit-breaker-map* for a recent
 trip within *circuit-breaker-cooldown* seconds and fails fast with an error.

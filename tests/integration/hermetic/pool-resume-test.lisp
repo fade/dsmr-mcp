@@ -34,7 +34,8 @@
                 #:worker-last-resume-milliseconds
                 #:check-and-clear-reset-notification
                 #:worker-runtime-path #:worker-runtime-identity
-                #:runtime-identity #:*resolved-worker-resume-timeout*)
+                #:runtime-identity #:*resolved-worker-resume-timeout*
+                #:worker-resume-deferrals)
   (:import-from #:dsmr-mcp/src/hermetic/pool-records
                 #:server-stem #:owner-directory #:hibernate-root
                 #:failed-core-directory)
@@ -190,6 +191,14 @@ that the save succeeded."
 (defun %fleet-log ()
   "The fleet error log's text, or NIL when there is none."
   (ignore-errors (uiop:read-file-string (fleet-log-path))))
+
+(defun count-matches (needle text)
+  "How many times NEEDLE occurs in TEXT."
+  (loop with start = 0
+        for at = (search needle text :start2 start)
+        while at
+        count t
+        do (setf start (1+ at))))
 
 (defun %live-session-workers ()
   "The workers the pool tracks whose processes are running."
@@ -394,8 +403,9 @@ notice names the missing file, and a fleet line records it."
 (define-test a-resume-that-may-pass-keeps-the-world-for-the-next-call
   "A resume whose handshake runs out of time gives nothing up: that call fails
 with an error saying the world is still saved, the worker stays hibernated
-with its core in place, nothing is kept as failed or written to the fleet
-log, and the next call resumes the same worker with its world."
+with its core in place, nothing is kept as failed, the fleet log carries a
+warning and no failure, and the next call resumes the same worker with its
+world, which starts the count of failed resumes again."
   (%pool-case ()
     (%eval "flaky" "(defvar *kept* (list 1 2 3))")
     (let* ((w (%session-worker "flaky"))
@@ -410,17 +420,61 @@ log, and the next call resumes the same worker with its world."
                 "~A" condition)))
       (is eq :hibernated (worker-state w))
       (is eq w (%session-worker "flaky"))
+      (is = 1 (worker-resume-deferrals w))
       (true (probe-file path) "the core was given up")
       (false (uiop:directory-files (failed-core-directory)))
       (let ((log (%fleet-log)))
-        (false (and log (search "code=worker-resume-failed" log)) "~A" log))
+        (false (and log (search "code=worker-resume-failed" log)) "~A" log)
+        (true (and log (search "code=worker-resume-deferred" log)) "~A" log))
       (let ((r (get-or-assign-worker "flaky")))
         (is eq w r)
         (is = id (worker-id r))
         (is eq :resumed (worker-boot-kind r))
+        (is = 0 (worker-resume-deferrals r))
         (false (check-and-clear-reset-notification r)))
       (true (%answers-p (%answer-in "flaky" "(equal *kept* (list 1 2 3))") "T"))
       (%no-crash-recorded "flaky"))))
+
+(define-test a-resume-that-keeps-failing-the-same-passing-way-is-given-up
+  "A resume that fails the same way that may pass on every call is deferred
+until the limit of failed resumes in a row, and no sooner, then given up as a
+failure that can never pass: the core is kept as failed, the fleet log carries
+the failure, and the session gets a fresh worker whose notice says its world
+could not be resumed. The warning goes to the fleet log once, on the first
+failure. No crash is counted."
+  (%pool-case ()
+    (%eval "stuck" "(defvar *kept* 1)")
+    (let* ((w (%session-worker "stuck"))
+           (old-id (worker-id w))
+           (path (%hibernated-core "stuck"))
+           (pool:*max-resume-attempts* 3))
+      ;; No handshake can arrive this soon, on any attempt.
+      (let ((*resolved-worker-resume-timeout* 0.001))
+        (dotimes (attempt 2)
+          (let ((condition (handler-case (progn (get-or-assign-worker "stuck") nil)
+                             (pool-resume-deferred (c) c))))
+            (true condition "attempt ~D was not deferred" (1+ attempt))
+            (is eq :hibernated (worker-state w) "after attempt ~D" (1+ attempt))
+            (true (probe-file path) "the core went after attempt ~D" (1+ attempt))
+            (false (uiop:directory-files (failed-core-directory))
+                   "a core was kept as failed after attempt ~D" (1+ attempt))))
+        (let ((log (or (%fleet-log) "")))
+          (is = 1 (count-matches "code=worker-resume-deferred" log) "~A" log)
+          (false (search "code=worker-resume-failed" log) "~A" log))
+        (let ((r (get-or-assign-worker "stuck")))
+          (true (/= old-id (worker-id r)) "the third failure was not final")
+          (is eq :bound (worker-state r))
+          (multiple-value-bind (had reason) (check-and-clear-reset-notification r)
+            (true had)
+            (true (and reason (search "could not be resumed" reason)) "~A" reason)
+            (true (and reason (search "3 resumes in a row" reason)) "~A" reason))))
+      (false (probe-file path))
+      (is = 1 (length (uiop:directory-files (failed-core-directory))))
+      (let ((log (or (%fleet-log) "")))
+        (is = 1 (count-matches "code=worker-resume-deferred" log) "~A" log)
+        (true (search "code=worker-resume-failed" log) "~A" log))
+      (true (%answers-p (%answer-in "stuck" "(+ 1 1)") 2))
+      (%no-crash-recorded "stuck"))))
 
 (define-test a-resume-starts-the-runtime-that-wrote-the-core
   "A worker records the runtime it was started with, and its saved world is
