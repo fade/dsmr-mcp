@@ -2456,7 +2456,9 @@ passed. ALIVE is what the pool just saw of the host service."
 
 (defun %answer-pending-requests (state)
   "Answer every request waiting for this server, oldest name first, removing
-each once answered and remembering the last answer in STATE. A request that
+each once answered and remembering the last answer in STATE. The worker record
+is republished after each answer and before its request is removed, so the
+service never reads a record older than the answer. A request that
 fails validation was already removed by pending-requests and is only logged.
 One request that cannot be answered is logged and removed, and the rest are
 still answered."
@@ -2486,6 +2488,15 @@ still answered."
               (log-event :error "pool.pressure.request-error"
                          "worker_id" id
                          "action" action
+                         "error" (princ-to-string e))))
+          ;; The record goes out before the request is removed: the service
+          ;; asks again only once no request stands, and it must then read
+          ;; what this answer did, not the record from before it.
+          (handler-case
+              (%publish-worker-record
+               state (eq (pressure-agent-state-service state) t))
+            (error (e)
+              (log-event :error "pool.pressure.record-failed"
                          "error" (princ-to-string e))))
           (ignore-errors (remove-request path)))))))
 

@@ -276,6 +276,20 @@ is gone, and the session's next worker is a new one with no reset notice."
       (is eq :killed (%await-result id 3))
       (%no-crash-recorded "fresh"))))
 
+(define-test the-record-shows-an-answer-before-its-request-goes
+  "By the time an answered request has been removed, the published record
+already carries the answer and no longer lists the stopped worker, so the
+service can never read a request gone and a record from before it."
+  (%pool-case (:agent-interval 600)
+    (let* ((w (get-or-assign-worker "ordered"))
+           (id (worker-id w))
+           (path (%request id :kill)))
+      (pool::%answer-pending-requests pool::*pressure-agent-current*)
+      (false (probe-file path) "the request is still there")
+      (is eq :killed (%last-result id))
+      (false (find id (getf (%record) :workers) :key (lambda (e) (getf e :id)))
+             "the record still lists worker ~A" id))))
+
 (define-test a-stop-that-finds-a-call-holding-the-worker-is-busy
   "When a call takes the worker after the stop chose it and before the stop
 acts, the stop answers busy, the worker keeps serving and the call is
