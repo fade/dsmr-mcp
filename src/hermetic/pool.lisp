@@ -2235,12 +2235,22 @@ as a fresh idle worker."
            (worker-needs-reset-notification worker))
        t))
 
+(defun %live-pid (worker)
+  "WORKER's pid, or NIL while it has no process of its own: hibernated, or
+resuming and not yet answering. The pid it had then names a process that has
+ended, and the kernel may have given that number to another."
+  (if (member (worker-state worker) '(:hibernated :resuming))
+      nil
+      (worker-pid worker)))
+
 (defun %worker-record-entry (worker now)
   "WORKER as one entry of the published record. Its last activity falls back
 to its spawn time, and to NOW when it has neither, so the service never reads
-a live worker without one."
+a live worker without one. A worker with no process (hibernated, or still
+resuming) is published without a pid, since the one it last had may since
+belong to another process."
   (list :id (worker-id worker)
-        :pid (worker-pid worker)
+        :pid (%live-pid worker)
         :state (worker-state worker)
         :session (worker-session-id worker)
         :stateful (%holds-state-p worker)
@@ -2594,7 +2604,8 @@ acts on nothing after it."
 
 (defun pool-worker-info ()
   "Return a vector of worker info hash-tables for inclusion in pool-status output.
-Includes id, session (truncated), tcp_port, pid, state, and the liveness the
+Includes id, session (truncated), tcp_port, pid (JSON null while the worker
+is hibernated or resuming and has no process), state, and the liveness the
 health monitor last established: the classification, how it was established, the
 last ping round trip in milliseconds, how many pings in a row have gone
 unanswered, and the universal time the classification was taken. Omits
@@ -2622,7 +2633,7 @@ and that rendering belongs to the verb doing the reporting, not to the pool."
                                                 (concatenate 'string (subseq sid 0 8) "...")
                                                 sid))
                   (gethash "tcp_port" ht) (worker-tcp-port w)
-                  (gethash "pid" ht) (worker-pid w)
+                  (gethash "pid" ht) (or-null (%live-pid w))
                   (gethash "state" ht) (string-downcase
                                          (symbol-name (worker-state w)))
                   (gethash "liveness" ht) (string-downcase
@@ -2670,7 +2681,8 @@ and that rendering belongs to the verb doing the reporting, not to the pool."
 
 (defun pool-status-info ()
   "Return a hash-table with pool diagnostic information for the pool-status MCP tool.
-Keys: pool_running, total_workers, standby_count, bound_count,
+Keys: pool_running, total_workers, standby_count, bound_count (workers bound
+to a session with a process; hibernated ones are counted apart),
 max_pool_size, warmup_target, workers (vector of per-worker hashes),
 hibernated_count (workers saved to disk, holding no memory),
 max_hibernated_workers (the most this server keeps hibernated), resident_count
@@ -2687,8 +2699,9 @@ workers boot from, or JSON null) and worker_core_status (\"in use\", \"unset\",
     (when running
       (bt:with-lock-held (*pool-lock*)
         (setf standby-count (length *standby-workers*)
-              bound-count (- (length *all-workers*) (length *standby-workers*))
               hibernated-count (count :hibernated *all-workers* :key #'worker-state)
+              bound-count (- (length *all-workers*) (length *standby-workers*)
+                             hibernated-count)
               resident-count (- (length *all-workers*) hibernated-count))))
     (multiple-value-bind (core core-status) (%worker-core-status)
       (let ((info (make-hash-table :test 'equal))

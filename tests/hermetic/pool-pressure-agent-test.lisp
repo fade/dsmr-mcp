@@ -117,6 +117,8 @@ worker with every field the host service chooses by."
           (is eql 1500 (getf busy :last-activity)))
         (let ((hib (%record-worker record 5)))
           (is eq :hibernated (getf hib :state))
+          (is eq nil (getf hib :pid)
+              "a hibernated worker has no process, so no pid is published")
           (is eql 123456789 (getf hib :core-bytes))
           (is equal "busy" (getf hib :refused-reason))
           (is eql 1600 (getf hib :refused-at)))))))
@@ -171,6 +173,8 @@ never its REPL port."
         (is eql 48 (gethash "last_resume_ms" hib))
         (is equal "busy" (gethash "refused_reason" hib))
         (is equal "hibernated" (gethash "state" hib))
+        (is eq 'cl:null (gethash "pid" hib))
+        (is eql 501001 (gethash "pid" fresh))
         ;; A worker with no saved world reports its absence as null.
         (is eql 1000 (gethash "last_activity" fresh))
         (is eq 'cl:null (gethash "core_bytes" fresh))
@@ -189,6 +193,8 @@ whether pressure relief is active."
       (let ((info (pool-status-info)))
         (is = 1 (gethash "hibernated_count" info))
         (is = 2 (gethash "resident_count" info))
+        (is = 2 (gethash "bound_count" info)
+            "a hibernated worker is not counted as bound")
         (is equal "inactive" (gethash "pressure_relief" info)
             "no pressure agent runs in this case")
         (dolist (key '("pool_running" "total_workers" "standby_count"

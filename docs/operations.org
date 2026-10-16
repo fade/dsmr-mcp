@@ -150,7 +150,7 @@ fields:
 | =pool_running=       | =true= when the pool's health monitor is live.                                                                                              |
 | =total_workers=      | Count of workers the pool holds: bound, standby and hibernated.                                                                             |
 | =standby_count=      | Warm workers ready for immediate assignment. Zero unless =DSMR_WORKER_POOL_WARMUP= asks for some.                                           |
-| =bound_count=        | Workers currently bound to a session.                                                                                                       |
+| =bound_count=        | Workers bound to a session and running; hibernated ones are counted in =hibernated_count= instead.                                          |
 | =hibernated_count=   | Workers whose world is saved to disk and whose process has ended.                                                                           |
 | =max_hibernated_workers= | The most workers this server keeps hibernated (=DSMR_MAX_HIBERNATED_WORKERS=, default 8).                                                  |
 | =resident_count=     | Workers with a running process.                                                                                                             |
