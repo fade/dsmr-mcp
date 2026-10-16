@@ -325,7 +325,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/integration/bus/host-service-test"
                "dsmr-mcp/tests/integration/bus/host-ownership-test"
                "dsmr-mcp/tests/integration/bus/host-migration-test"
-               "dsmr-mcp/tests/integration/scripts/launcher-supervise-test")
+               "dsmr-mcp/tests/integration/scripts/launcher-supervise-test"
+               "dsmr-mcp/tests/integration/scripts/launcher-core-freshness-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
