@@ -47,7 +47,8 @@
   (:import-from #:dsmr-mcp/src/hermetic/worker/registry
                 #:make-object-registry)
   (:import-from #:dsmr-mcp/src/hermetic/worker/hibernate
-                #:handle-hibernate #:install-descriptor-placeholders)
+                #:handle-hibernate #:install-descriptor-placeholders
+                #:abandon-save)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event #:configure-log4cl-for-server)
   (:import-from #:com.inuoe.jzon)
@@ -132,11 +133,15 @@ and filesystem verb support requires a later extension."
 (defun %install-signal-handlers ()
   "Install SIGTERM handler so the worker exits cleanly when the parent
 shuts down the pool. Without this, SBCL raises a condition for SIGTERM
-which cascades into nested errors when stderr is a broken pipe."
+which cascades into nested errors when stderr is a broken pipe.
+
+A worker ended in the middle of a save first ends the save, so neither the
+saving child nor its partial core outlives it."
   (sb-sys:enable-interrupt
    sb-posix:sigterm
    (lambda (signo context info)
      (declare (ignore signo context info))
+     (ignore-errors (abandon-save))
      (ignore-errors
        (log-event :info "worker.sigterm" "pid" (%get-pid)))
      (sb-ext:exit :code 0 :abort t))))

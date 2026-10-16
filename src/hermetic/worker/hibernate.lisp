@@ -48,6 +48,7 @@
   (:import-from #:uiop)
   (:export #:hibernate-directory
            #:handle-hibernate
+           #:abandon-save
            #:*stale-descriptors*
            #:install-descriptor-placeholders
            #:placeholder-floor
@@ -381,6 +382,46 @@ it runs threads when the host was only short of memory."
       "has-threads"
       "fork-failed"))
 
+(defvar *save-child* nil
+  "The pid of the child saving this worker's world while a save runs, else
+NIL. The SIGTERM handler reads it to end the save with the worker.")
+
+(defvar *save-scratch* nil
+  "The partial core file a save in progress writes, else NIL. The SIGTERM
+handler deletes it, so a worker ended in the middle of a save leaves no
+half-written world behind.")
+
+(defun %die-with-parent (parent-pid)
+  "In the forked child: have the kernel kill this process with SIGKILL when
+the worker PARENT-PID that forked it dies, and end at once if it already has.
+A save outliving its worker would hold a copy of the whole heap, on a host
+that may be short of memory, for a world nobody will resume."
+  ;; PR_SET_PDEATHSIG is option 1 of prctl(2), Linux only; elsewhere the
+  ;; call fails and the SIGTERM handler is the only guard.
+  (ignore-errors
+   (sb-alien:alien-funcall
+    (sb-alien:extern-alien "prctl" (function sb-alien:int sb-alien:int
+                                             sb-alien:unsigned-long))
+    1 sb-posix:sigkill))
+  (unless (= (sb-posix:getppid) parent-pid)
+    (sb-ext:exit :code 3 :abort t)))
+
+(defun abandon-save ()
+  "End a save in progress: kill the saving child, collect it within a second,
+and delete the partial core it was writing. Does nothing when no save runs.
+The worker's SIGTERM handler calls it before the worker exits, so a session
+released or killed in the middle of a save leaves neither a child nor a file
+behind."
+  (let ((pid *save-child*)
+        (scratch *save-scratch*))
+    (when pid
+      (ignore-errors (sb-posix:kill pid sb-posix:sigkill))
+      (%reap pid 1)
+      (setf *save-child* nil))
+    (when scratch
+      (%delete-quietly scratch)
+      (setf *save-scratch* nil))))
+
 (defun handle-hibernate (params server toplevel &key stop-watchdog start-watchdog)
   "Save this worker's world to the core file PARAMS names, then stop SERVER.
 
@@ -416,13 +457,27 @@ message begins with one of these tokens followed by a colon:
     (flet ((recover ()
              (%delete-quietly tmp)
              (when start-watchdog (funcall start-watchdog))))
-      (let ((pid (handler-case (sb-posix:fork)
-                   (error (e)
-                     (when start-watchdog (funcall start-watchdog))
-                     (%refuse (%fork-refusal-token e) "~A" e)))))
+      (let* ((parent (sb-posix:getpid))
+             (pid (progn
+                    ;; Named before the fork, so a SIGTERM that lands while
+                    ;; the child starts still finds the file to delete.
+                    (setf *save-scratch* tmp)
+                    (handler-case (sb-posix:fork)
+                      (error (e)
+                        (setf *save-scratch* nil)
+                        (when start-watchdog (funcall start-watchdog))
+                        (%refuse (%fork-refusal-token e) "~A" e))))))
         (when (zerop pid)
+          ;; The child must not carry the parent's save into the core it
+          ;; writes, and must not outlive the worker.
+          (setf *save-child* nil
+                *save-scratch* nil)
+          (%die-with-parent parent)
           (%child-save tmp toplevel))
-        (let ((status (%wait-for-child pid deadline)))
+        (setf *save-child* pid)
+        (let ((status (unwind-protect (%wait-for-child pid deadline)
+                        (setf *save-child* nil
+                              *save-scratch* nil))))
           (cond
             ((null status)
              (recover)

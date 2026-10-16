@@ -1291,6 +1291,17 @@ ignored: the file may already be gone."
       (ignore-errors (sb-posix:unlink native))
       (ignore-errors (sb-posix:unlink (concatenate 'string native ".tmp"))))))
 
+(defun %worker-core-file (worker)
+  "Where WORKER's world is or would be saved: the core it was hibernated to,
+else the path a save of it writes, which follows its id. NIL when this
+process cannot name itself. A worker let go in the middle of a save has no
+recorded core yet, and the partial file of that save must still be found."
+  (or (worker-hibernate-core-path worker)
+      (ignore-errors
+       (let ((stem (server-stem)))
+         (and stem (uiop:native-namestring
+                    (hibernated-core-path stem (worker-id worker))))))))
+
 (defun %finish-resume (session-id worker path)
   "Put WORKER, whose process resume-worker has just started from the core at
 PATH, back into service, and return it.
@@ -1672,8 +1683,9 @@ A world the worker had saved to disk goes with it: the core is deleted.
 
 If a spawn is in progress (placeholder), marks it as cancelled so the
 spawn thread will clean up the worker after it completes. A worker in the
-middle of saving is released the same way, and the save, finding it released,
-deletes the core it wrote."
+middle of saving is released the same way: its saving child ends with it, the
+partial core is deleted, and a save that finished meanwhile, finding it
+released, deletes the core it wrote."
   (let ((worker-to-kill nil)
         (core-path nil))
     (bt:with-lock-held (*pool-lock*)
@@ -1705,7 +1717,7 @@ deletes the core it wrote."
       ;; then kill-worker can acquire it without deadlock.
       (ignore-errors (signal-worker-terminate worker-to-kill))
       (ignore-errors (kill-worker worker-to-kill))
-      (%delete-core-files core-path)
+      (%delete-core-files (or core-path (%worker-core-file worker-to-kill)))
       (%schedule-replenish))))
 
 ;;; ---------------------------------------------------------------------------
@@ -1752,7 +1764,7 @@ was bound, :placeholder if a spawn was in progress (cancelled)."
                  "worker_id" (worker-id worker-to-kill))
       (ignore-errors (signal-worker-terminate worker-to-kill))
       (ignore-errors (kill-worker worker-to-kill))
-      (%delete-core-files core-path)
+      (%delete-core-files (or core-path (%worker-core-file worker-to-kill)))
       (%schedule-replenish))
     kill-result))
 
@@ -1877,7 +1889,7 @@ outcome and reason for hibernate-session-worker."
                   "ms" milliseconds)
        (values :hibernated nil))
       (t
-       (ignore-errors (delete-file path))
+       (%delete-core-files path)
        (log-event :info "pool.hibernate.discarded"
                   "session" session-id
                   "worker_id" (worker-id worker)
@@ -1899,8 +1911,13 @@ and the breaker is not touched. The loss is logged as an error and written to
 the fleet log under CODE. Returns OUTCOME and \"died\" for
 hibernate-session-worker. When the session let the worker go meanwhile there
 is no one to tell, nothing more is done, and the reason returned is
-\"released\"."
+\"released\". Either way the partial core the save may have left is deleted,
+once the worker's process is gone."
   (release-worker-process worker)
+  (let ((scratch (%worker-core-file worker)))
+    (when scratch
+      (ignore-errors
+       (sb-posix:unlink (concatenate 'string scratch ".tmp")))))
   (let ((lost nil))
     (bt:with-lock-held (*pool-lock*)
       (when (eq (worker-state worker) :hibernating)

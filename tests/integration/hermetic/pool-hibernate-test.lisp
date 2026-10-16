@@ -470,6 +470,90 @@ the new session gets a worker."
     (is eq :bound (worker-state (get-or-assign-worker "cap-c")))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Ending a worker in the middle of a save
+;;; ---------------------------------------------------------------------------
+
+(defparameter +slow-save-code+
+  "(defun dsmr-mcp/src/hermetic/worker/hibernate::%child-save (tmp toplevel)
+     (declare (ignore toplevel))
+     (handler-case
+         (progn
+           (dsmr-mcp/src/hermetic/worker/hibernate::%close-inherited-descriptors)
+           (dsmr-mcp/src/hermetic/worker/hibernate::%silence-stdout)
+           (with-open-file (s tmp :direction :output :if-exists :supersede)
+             (format s \"~D\" (sb-posix:getpid)))
+           (loop (sleep 1)))
+       (serious-condition () (sb-ext:exit :code 3 :abort t))))"
+  "Code that makes a worker's saving child behave like a save on a hung disk:
+it starts as a real one does, writes its own pid into the partial core, and
+never finishes.")
+
+(defun %scratch-path (worker)
+  "The partial core a save of WORKER writes."
+  (concatenate 'string
+               (uiop:native-namestring
+                (hibernated-core-path (server-stem) (worker-id worker)))
+               ".tmp"))
+
+(defun %saving-child (scratch seconds)
+  "The pid a slow save wrote into SCRATCH, waiting up to SECONDS for it, or
+NIL when no save started."
+  (%wait-until seconds
+               (lambda ()
+                 (ignore-errors
+                  (parse-integer (uiop:read-file-string scratch))))))
+
+(defun %start-slow-save (session)
+  "Make SESSION's worker save slowly, start its save in a thread, and return
+the thread, the worker, its partial core and the saving child's pid."
+  (%eval session +slow-save-code+)
+  (let* ((w (%session-worker session))
+         (scratch (%scratch-path w))
+         (thread (bt:make-thread
+                  (lambda ()
+                    (multiple-value-list (hibernate-session-worker session)))
+                  :name "slow-save")))
+    (values thread w scratch (%saving-child scratch 20))))
+
+(define-test a-session-released-during-a-save-leaves-no-child-and-no-partial-core
+  "Releasing a session whose worker is in the middle of a save ends the saving
+child with the worker and deletes the partial core, and the save returns."
+  (%pool-case ()
+    (multiple-value-bind (thread w scratch child) (%start-slow-save "parted")
+      (declare (ignore w))
+      (unwind-protect
+           (progn
+             (true child "the save never started")
+             (pool:release-session "parted")
+             (true (%wait-until 5 (lambda () (%process-gone-p child)))
+                   "the saving child ~A outlived its worker" child)
+             (true (%wait-until 5 (lambda () (not (probe-file scratch))))
+                   "the partial core is still at ~A" scratch)
+             (let ((result (sb-thread:join-thread thread :timeout 20
+                                                         :default :still-saving)))
+               (true (consp result) "the save answered ~A" result)))
+        (when child (ignore-errors (sb-posix:kill child sb-posix:sigkill)))))))
+
+(define-test a-worker-killed-outright-during-a-save-takes-its-child-and-partial-core
+  "A worker killed with SIGKILL in the middle of a save, which runs no handler
+of its own, still takes its saving child with it, the pool deletes the
+partial core, and the save answers that the worker died."
+  (%pool-case ()
+    (multiple-value-bind (thread w scratch child) (%start-slow-save "felled")
+      (unwind-protect
+           (progn
+             (true child "the save never started")
+             (sb-posix:kill (worker-pid w) sb-posix:sigkill)
+             (true (%wait-until 5 (lambda () (%process-gone-p child)))
+                   "the saving child ~A outlived its worker" child)
+             (let ((result (sb-thread:join-thread thread :timeout 20
+                                                         :default :still-saving)))
+               (true (and (consp result) (eq :died (first result)))
+                     "the save answered ~A" result))
+             (false (probe-file scratch) "the partial core is still at ~A" scratch))
+        (when child (ignore-errors (sb-posix:kill child sb-posix:sigkill)))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Idleness and the health check
 ;;; ---------------------------------------------------------------------------
 
