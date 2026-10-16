@@ -360,8 +360,22 @@ Handles both LF and CRLF line endings."
 ;;; ---------------------------------------------------------------------------
 
 (defun %generate-worker-secret ()
-  "Generate a 128-bit random hex secret for worker TCP authentication."
-  (format nil "~32,'0X" (random (expt 2 128))))
+  "Generate a 128-bit random hex secret for worker TCP authentication.
+
+The bits come from /dev/urandom. Every server starts from the same image, and
+SBCL starts every process with the same global random state, so a secret drawn
+from that state would be the same in every server; when the device cannot be
+read, a random state freshly seeded from the system is used instead."
+  (let ((n (handler-case
+               (with-open-file (in "/dev/urandom" :element-type '(unsigned-byte 8))
+                 (let ((bytes (make-array 16 :element-type '(unsigned-byte 8))))
+                   (unless (= 16 (read-sequence bytes in))
+                     (error "short read from /dev/urandom"))
+                   (reduce (lambda (acc b) (logior (ash acc 8) b)) bytes
+                           :initial-value 0)))
+             (error ()
+               (random (expt 2 128) (make-random-state t))))))
+    (format nil "~32,'0X" n)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Internal helpers — environment
