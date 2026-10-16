@@ -49,7 +49,9 @@
   (:export #:hibernate-directory
            #:handle-hibernate
            #:*stale-descriptors*
-           #:install-descriptor-placeholders))
+           #:install-descriptor-placeholders
+           #:placeholder-floor
+           #:descriptor-soft-limit))
 
 (in-package #:dsmr-mcp/src/hermetic/worker/hibernate)
 
@@ -66,10 +68,6 @@ the resumed process covers each number with /dev/null and clears it.")
   "Seconds a save may take before the worker kills the saving child and goes
 on serving. A save is disk-bound and has been seen to take most of a minute
 on a busy rotational disk.")
-
-(defparameter *placeholder-floor* 900
-  "Lowest descriptor number the /dev/null placeholder source is moved to while
-it is copied over the stale numbers, so it never sits on one of them.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Where cores may be written
@@ -198,7 +196,36 @@ so anything the runtime prints while saving must not reach it."
     (sb-posix:dup2 fd 1)
     (when (/= fd 1) (sb-posix:close fd))))
 
-(defun install-descriptor-placeholders ()
+(defun descriptor-soft-limit ()
+  "This process's soft limit on open descriptors (RLIMIT_NOFILE), or NIL when
+it cannot be read."
+  (handler-case
+      (sb-alien:with-alien ((limits (array (sb-alien:unsigned 64) 2)))
+        (if (zerop (sb-alien:alien-funcall
+                    (sb-alien:extern-alien
+                     "getrlimit"
+                     (function sb-alien:int sb-alien:int
+                               (* (array (sb-alien:unsigned 64) 2))))
+                    7                   ; RLIMIT_NOFILE on Linux
+                    (sb-alien:addr limits)))
+            (sb-alien:deref limits 0)
+            nil))
+    (error () nil)))
+
+(defun placeholder-floor (stale soft-limit)
+  "The lowest number the /dev/null placeholder source may sit at while it is
+copied onto the STALE descriptor numbers: one above the highest of them below
+SOFT-LIMIT, so it is never one of them. NIL when that number would not be
+below SOFT-LIMIT, where the kernel refuses it; NIL as SOFT-LIMIT means the
+limit is not known, and the floor is tried anyway. A number at or above the
+limit cannot be opened by this process, so it needs no room above it."
+  (let ((below (remove-if (lambda (fd) (and soft-limit (>= fd soft-limit))) stale)))
+    (when below
+      (let ((floor (1+ (reduce #'max below))))
+        (when (or (null soft-limit) (< floor soft-limit))
+          floor)))))
+
+(defun install-descriptor-placeholders (&key (soft-limit (descriptor-soft-limit)))
   "Cover every descriptor number in *STALE-DESCRIPTORS* that this process does
 not have open with a descriptor on /dev/null, then clear the list.
 
@@ -206,21 +233,48 @@ A stale socket or stream object carried in the saved world still holds its old
 descriptor number. Once that number is covered, closing or reading the stale
 object touches /dev/null, never a file or socket this process opened since.
 
-Returns two values: how many numbers were covered, and the numbers that were
-already open in this process and so were left alone. Nothing is logged here,
-because this runs before logging is set up; the caller reports both values."
-  (let ((covered 0) (in-use '()))
+One /dev/null descriptor is placed above every stale number, at
+placeholder-floor for SOFT-LIMIT (by default this process's descriptor soft
+limit), and copied onto each number. When there is no room for it below the
+limit, or it cannot be had, each number gets a /dev/null descriptor of its own
+instead, so a low limit never stops a resume.
+
+Returns three values: how many numbers were covered, the numbers that were
+already open in this process and so were left alone, and the numbers that
+could not be covered. Nothing is logged here, because this runs before
+logging is set up; the caller reports all three."
+  (let ((covered 0) (in-use '()) (uncovered '()))
     (when *stale-descriptors*
-      (let* ((low (sb-posix:open "/dev/null" sb-posix:o-rdwr))
-             (high (sb-posix:fcntl low sb-posix:f-dupfd *placeholder-floor*)))
-        (sb-posix:close low)
+      (let* ((floor (placeholder-floor *stale-descriptors* soft-limit))
+             (high (and floor
+                        (handler-case
+                            (let ((low (sb-posix:open "/dev/null" sb-posix:o-rdwr)))
+                              (unwind-protect
+                                   (sb-posix:fcntl low sb-posix:f-dupfd floor)
+                                (sb-posix:close low)))
+                          (error () nil)))))
         (unwind-protect
              (dolist (fd *stale-descriptors*)
-               (cond ((%descriptor-open-p fd) (push fd in-use))
-                     (t (sb-posix:dup2 high fd) (incf covered))))
-          (sb-posix:close high))))
+               (handler-case
+                   (cond ((%descriptor-open-p fd) (push fd in-use))
+                         ;; Beyond the limit: nothing in this process can be
+                         ;; given that number, so nothing can be covered.
+                         ((and soft-limit (>= fd soft-limit)) (push fd uncovered))
+                         (high (sb-posix:dup2 high fd) (incf covered))
+                         (t
+                          ;; The lowest free number is at most FD, which is
+                          ;; free, and every stale number below it was already
+                          ;; dealt with, so the new descriptor is FD itself or
+                          ;; a number no stale object holds.
+                          (let ((own (sb-posix:open "/dev/null" sb-posix:o-rdwr)))
+                            (unless (= own fd)
+                              (sb-posix:dup2 own fd)
+                              (sb-posix:close own))
+                            (incf covered))))
+                 (error () (push fd uncovered))))
+          (when high (ignore-errors (sb-posix:close high))))))
     (setf *stale-descriptors* nil)
-    (values covered (nreverse in-use))))
+    (values covered (nreverse in-use) (nreverse uncovered))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Threads

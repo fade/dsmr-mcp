@@ -371,7 +371,12 @@ belongs to the process rather than the heap is redone, in the resume order:
 The connection authenticates against DSMR_WORKER_SECRET from this process's
 environment, so the process that resumes the core decides the secret."
   (sb-ext:disable-debugger)
-  (multiple-value-bind (covered in-use) (install-descriptor-placeholders)
+  ;; Covering the stale numbers protects later descriptors from stale
+  ;; objects, but a resume that cannot do it still serves: the failure is
+  ;; kept and reported once logging is up.
+  (multiple-value-bind (covered in-use uncovered problem)
+      (handler-case (install-descriptor-placeholders)
+        (error (e) (values 0 nil nil (princ-to-string e))))
     (setf *standard-output* sb-sys:*stdout*)
     (configure-log4cl-for-server :info)
     (resolve-eval-timeout)
@@ -380,7 +385,11 @@ environment, so the process that resumes the core decides the secret."
                "pid" (%get-pid))
     (log-event :info "worker.resume.placeholders" "count" covered)
     (dolist (fd in-use)
-      (log-event :warn "worker.resume.descriptor-in-use" "fd" fd)))
+      (log-event :warn "worker.resume.descriptor-in-use" "fd" fd))
+    (dolist (fd uncovered)
+      (log-event :warn "worker.resume.descriptor-uncovered" "fd" fd))
+    (when problem
+      (log-event :error "worker.resume.placeholders-failed" "error" problem)))
   (%install-signal-handlers)
   (%setup-project-root)
   (%forget-source-registry-scan)
