@@ -326,6 +326,11 @@ nothing ever resumes from that directory. Read the =worker-resume-failed= line
 in the fleet error log for the cause, then delete the file when you are done
 with it.
 
+The dead-owner sweep removes a server's files only on positive evidence that
+it is gone: no process with its pid, or one that started at another time. When
+=/proc= cannot be read (the reader is out of descriptors or memory) everything
+is kept, and the service logs =owner-state-unknown=.
+
 Hibernation is refused when free space on that filesystem is below twice the
 worker's expected core size, so a save cannot fill the disk. The worker stays
 resident and =pool-status= shows why in its =refused_reason=.

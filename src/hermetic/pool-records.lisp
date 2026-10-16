@@ -69,6 +69,7 @@
    #:remove-request
    ;; sweep
    #:sweep-dead-owners
+   #:*owner-starttime-function*
    ;; host readings
    #:free-disk-bytes
    #:disk-allows-hibernation-p
@@ -170,10 +171,65 @@
     (error "~S is not a worker id (a positive integer)." worker-id))
   worker-id)
 
-(defun %owner-alive-p (stem)
-  "True when the server STEM names is still the running process it was."
+(defun %read-owner-starttime (pid)
+  "When PID started, in clock ticks since boot, or NIL when the system says
+positively that there is no such process: kill(PID, 0) answers ESRCH, or its
+/proc/PID/stat is not there (ENOENT). Any other failure to find out (out of
+descriptors, out of memory, a restricted /proc) signals, because it says
+nothing about whether the process is running."
+  (handler-case (sb-posix:kill pid 0)
+    (sb-posix:syscall-error (e)
+      (cond ((= (sb-posix:syscall-errno e) sb-posix:esrch)
+             (return-from %read-owner-starttime nil))
+            ;; EPERM: running, under another user.
+            ((= (sb-posix:syscall-errno e) sb-posix:eperm))
+            (t (error e)))))
+  (let ((fd (handler-case (sb-posix:open (format nil "/proc/~D/stat" pid)
+                                         sb-posix:o-rdonly)
+              (sb-posix:syscall-error (e)
+                (if (= (sb-posix:syscall-errno e) sb-posix:enoent)
+                    (return-from %read-owner-starttime nil)
+                    (error e))))))
+    (let ((text (with-open-stream (in (sb-sys:make-fd-stream
+                                       fd :input t :external-format :latin-1
+                                          :auto-close t))
+                  (let ((out (make-string-output-stream)))
+                    (loop for ch = (read-char in nil nil)
+                          for n from 0
+                          while (and ch (< n 4096))
+                          do (write-char ch out))
+                    (get-output-stream-string out)))))
+      (let* ((close (position #\) text :from-end t))
+             (fields (and close
+                          (remove "" (uiop:split-string (subseq text (1+ close))
+                                                        :separator " ")
+                                  :test #'string=)))
+             (field (nth 19 fields)))
+        (unless (and field (%ascii-digits-p field))
+          (error "/proc/~D/stat has no start time field." pid))
+        (parse-integer field)))))
+
+(defvar *owner-starttime-function* '%read-owner-starttime
+  "The function the sweep and the failed-core retention ask when a server
+started: called with a pid, it returns the start time, NIL when the process
+positively does not exist, and signals when it cannot tell. Tests replace it
+to make that question fail.")
+
+(defun %owner-state (stem)
+  "Whether the server STEM names is still the running process it was: :alive,
+:dead, or :unknown when the question could not be answered, with the reason as
+a second value for :unknown. Only positive evidence makes a server :dead: no
+process with its pid, or one that started at another time. A failure to read
+/proc is never taken for an answer, so nothing a server owns is removed
+because the reader ran out of descriptors or memory."
   (multiple-value-bind (pid start) (parse-server-stem stem)
-    (and pid (hostfiles:process-matches-p pid start))))
+    (if (null pid)
+        :dead
+        (handler-case
+            (let ((now (funcall *owner-starttime-function* pid)))
+              (if (eql now start) :alive :dead))
+          (error (e)
+            (values :unknown (princ-to-string e)))))))
 
 ;;; --------------------------------------------------------- hibernated cores
 
@@ -542,24 +598,40 @@
    Both the pools and the host service call this, so whichever side outlives a
    dead server clears what it left. A server is alive only when its pid is
    running and started at the recorded time, so a pid handed to a later
-   process does not keep a dead server's files. Nothing is followed through a
+   process does not keep a dead server's files. A server is dead only on
+   positive evidence (see %owner-state): when whether it runs cannot be read,
+   everything of it is kept and that is reported. Nothing is followed through a
    link: a link at a server's level is removed as a link when its server is
    gone and reported either way, and a link in place of a whole directory
    makes the sweep leave that directory alone.
 
    REPORT-FN, when given, is called as (funcall REPORT-FN level code :subject
    path :msg text) once for each removal and each refusal."
-  (let ((directories 0) (records 0) (requests 0) (bytes 0))
-    (flet ((report (level code subject msg)
-             (when report-fn
-               (funcall report-fn level code :subject subject :msg msg))))
+  (let ((directories 0) (records 0) (requests 0) (bytes 0)
+        (states (make-hash-table :test 'equal)))
+    (labels ((report (level code subject msg)
+               (when report-fn
+                 (funcall report-fn level code :subject subject :msg msg)))
+             (dead-p (stem)
+               ;; Asked once per stem per sweep. A server whose state cannot
+               ;; be read is kept, and reported once.
+               (multiple-value-bind (state known) (gethash stem states)
+                 (unless known
+                   (multiple-value-bind (answer why) (%owner-state stem)
+                     (when (eq answer :unknown)
+                       (report :warn "owner-state-unknown" stem
+                               (format nil "could not tell whether server ~A is running, so nothing of it was removed: ~A"
+                                       stem why)))
+                     (setf state answer
+                           (gethash stem states) answer)))
+                 (eq state :dead))))
       (let ((root (%native (hibernate-root))))
         (when (%listable-directory-p root #'report)
           (dolist (name (%directory-entries root))
             (when (parse-server-stem name)
               (let* ((child (concatenate 'string root "/" name))
                      (stat (%lstat child))
-                     (alive (%owner-alive-p name)))
+                     (alive (not (dead-p name))))
                 (cond ((null stat))
                       ((= (%kind stat) sb-posix:s-iflnk)
                        (if alive
@@ -586,7 +658,7 @@
         (when (%listable-directory-p dir #'report)
           (dolist (name (%names-with-suffix (workers-record-dir) ".rec"))
             (let ((stem (subseq name 0 (- (length name) 4))))
-              (when (and (parse-server-stem stem) (not (%owner-alive-p stem)))
+              (when (and (parse-server-stem stem) (dead-p stem))
                 (let ((path (concatenate 'string dir "/" name)))
                   (when (%unlink-if-present path)
                     (incf records)
@@ -597,7 +669,7 @@
         (when (%listable-directory-p dir #'report)
           (dolist (name (%names-with-suffix (hibernate-request-dir) ".req"))
             (let ((stem (%parse-request-name name)))
-              (when (and stem (not (%owner-alive-p stem)))
+              (when (and stem (dead-p stem))
                 (let ((path (concatenate 'string dir "/" name)))
                   (when (%unlink-if-present path)
                     (incf requests)

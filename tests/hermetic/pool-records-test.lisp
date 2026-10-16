@@ -365,6 +365,34 @@
         (true (probe-file (records:request-path live 1)))
         (is string= "keep me" (uiop:read-file-string target))))))
 
+(define-test the-sweep-keeps-what-it-cannot-tell-is-dead
+  "When reading whether a server runs fails (out of descriptors, out of
+memory), the sweep removes nothing of that server and reports it once."
+  (with-state-home (home)
+    (let ((stems (list "999999999-1" (stale-stem))))
+      (dolist (stem stems)
+        (write-text (records:hibernated-core-path stem 1) "world")
+        (records:ensure-owner-directory stem)
+        (records:write-worker-record stem (list :server-pid 1))
+        (records:write-hibernate-request stem 1 :hibernate :now 5))
+      (multiple-value-bind (report-fn records-given) (recorder)
+        (let ((counts (let ((records:*owner-starttime-function*
+                              (lambda (pid)
+                                (declare (ignore pid))
+                                (error "Too many open files"))))
+                        (records:sweep-dead-owners :report-fn report-fn))))
+          (is = 0 (getf counts :directories))
+          (is = 0 (getf counts :records))
+          (is = 0 (getf counts :requests)))
+        (let ((unknown (remove "owner-state-unknown" (funcall records-given)
+                               :key #'second :test-not #'string=)))
+          (is = 2 (length unknown))
+          (true (every (lambda (r) (eq :warn (first r))) unknown))))
+      (dolist (stem stems)
+        (true (probe-file (records:hibernated-core-path stem 1)))
+        (true (probe-file (records:worker-record-path stem)))
+        (true (probe-file (records:request-path stem 1)))))))
+
 ;;; ------------------------------------------------------------ host readings
 
 (define-test free-disk-agrees-with-df
