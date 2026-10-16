@@ -2,7 +2,8 @@
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
 ;;;; Unit tests for the parts of a worker's save and resume that need no
-;;;; worker: the refusal word for a fork that failed, and covering a resumed
+;;;; worker: the refusal word for a fork that failed, collecting a saving
+;;;; child without ever blocking on it, and covering a resumed
 ;;;; world's stale descriptor numbers, also under a descriptor limit far below
 ;;;; the numbers a server usually reaches.
 ;;;;
@@ -16,6 +17,8 @@
                 #:install-descriptor-placeholders #:placeholder-floor
                 #:descriptor-soft-limit #:*stale-descriptors*)
   (:import-from #:sb-alien)
+  (:import-from #:sb-ext)
+  (:import-from #:sb-thread)
   (:import-from #:sb-posix))
 
 (in-package #:dsmr-mcp/tests/hermetic/hibernate-helpers-test)
@@ -35,6 +38,38 @@ other fork failure reads fork-failed."
       (hibernate::%fork-refusal-token
        (make-condition 'simple-error
                        :format-control "fork(2) failed: Cannot allocate memory"))))
+
+;;; ---------------------------------------------------------------------------
+;;; Collecting a child
+;;; ---------------------------------------------------------------------------
+
+(define-test collecting-a-child-never-waits-past-its-bound
+  "Collecting a child that does not exit gives up within its bound instead of
+blocking the worker, and a child that has been killed is collected with its
+status."
+  (let* ((process (sb-ext:run-program "/bin/sleep" '("30") :wait nil))
+         (pid (sb-ext:process-pid process)))
+    ;; SBCL collects the children it started itself; take this one off its
+    ;; list so the collection tested here is the only one.
+    (sb-thread::with-system-mutex (sb-impl::*active-processes-lock*)
+      (setf sb-impl::*active-processes*
+            (delete process sb-impl::*active-processes*)))
+    (unwind-protect
+         (let* ((started (get-internal-real-time))
+                (thread (sb-thread:make-thread
+                         (lambda () (hibernate::%reap pid 0.5))
+                         :name "reap-bound"))
+                (result (sb-thread:join-thread thread :timeout 3 :default :blocked))
+                (seconds (/ (- (get-internal-real-time) started)
+                            internal-time-units-per-second)))
+           (is eq nil result "collecting a live child answered ~A" result)
+           (true (< seconds 2) "collecting a live child took ~,2F s" seconds)
+           (sb-posix:kill pid sb-posix:sigkill)
+           (let ((status (hibernate::%reap pid 2)))
+             (true (and status (sb-posix:wifsignaled status)
+                        (= sb-posix:sigkill (sb-posix:wtermsig status)))
+                   "the killed child was collected as ~A" status)))
+      (ignore-errors (sb-posix:kill pid sb-posix:sigkill)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Stale descriptor numbers in a resumed world

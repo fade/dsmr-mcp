@@ -326,10 +326,29 @@ left as it is."
          (format nil "signal ~D" (sb-posix:wtermsig status)))
         (t (format nil "raw status ~D" status))))
 
+(defun %reap (pid seconds)
+  "Collect the exit status of the child PID, waiting at most SECONDS. Returns
+the waitpid status, or NIL when the child is still there at the end (a child
+stuck in the kernel, as on a hung disk, cannot be collected even after
+SIGKILL) or cannot be waited for. Never blocks past SECONDS, so a worker
+cleaning up after its save always comes back to answer."
+  (let ((limit (+ (get-internal-real-time)
+                  (* seconds internal-time-units-per-second))))
+    (loop
+      (multiple-value-bind (done status)
+          (handler-case (sb-posix:waitpid pid sb-posix:wnohang)
+            (error () (return nil)))
+        (when (and done (= done pid))
+          (return status)))
+      (when (>= (get-internal-real-time) limit)
+        (return nil))
+      (sleep 0.02))))
+
 (defun %wait-for-child (pid deadline-seconds)
   "Poll the child PID until it exits or DEADLINE-SECONDS pass. Returns the
-waitpid status, or NIL when the deadline passed and the child was killed and
-reaped."
+waitpid status, or NIL when the deadline passed and the child was killed.
+A killed child is collected within two seconds; one that cannot be is logged
+and left, rather than holding the worker past its answer."
   (let ((limit (+ (get-internal-real-time)
                   (* deadline-seconds internal-time-units-per-second))))
     (loop
@@ -338,7 +357,8 @@ reaped."
           (return status)))
       (when (>= (get-internal-real-time) limit)
         (ignore-errors (sb-posix:kill pid sb-posix:sigkill))
-        (ignore-errors (sb-posix:waitpid pid 0))
+        (unless (%reap pid 2)
+          (log-event :warn "worker.hibernate.child-unreaped" "pid" pid))
         (return nil))
       (sleep 0.05))))
 
