@@ -359,6 +359,23 @@ spawned 2 s earlier is answered too-young and the worker keeps serving."
       (is eq :bound (worker-state w))
       (is eq w (%session-worker "young")))))
 
+(define-test a-kill-request-for-a-worker-loaded-from-source-leaves-it-serving
+  "A worker that loaded from source, because no worker core was in use, is
+refused a :kill with no-core: its replacement would load from source too,
+which is slow and costs more memory than it frees. The worker keeps serving,
+keeps the refusal so the service passes it over, and still answers."
+  (%pool-case ()
+    (let ((w (get-or-assign-worker "sourced")))
+      ;; Booting a real worker from source takes tens of seconds; the pool
+      ;; decides from the boot kind it recorded, so that is what is set.
+      (bt:with-lock-held (pool::*pool-lock*)
+        (setf (dsmr-mcp/src/hermetic/worker-client::worker-boot-kind w) :source))
+      (is eq :no-core (act-on-hibernate-request (%kill-request w)))
+      (is eq :bound (worker-state w))
+      (is eq w (%session-worker "sourced"))
+      (is equal "no-core" (dsmr-mcp/src/hermetic/worker-client::worker-refused-reason w))
+      (true (%answers-p (%answer-in "sourced" "(+ 2 3)") 5)))))
+
 (define-test a-hibernate-request-saves-a-stateful-idle-worker
   "A :hibernate request for a stateful idle worker ends with the worker
 hibernated, the answer recorded and the request file gone."

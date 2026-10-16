@@ -175,7 +175,7 @@ Each entry in =workers= carries =id=, a truncated =session=, =tcp_port=,
 | =core_age_seconds=  | How long it has been hibernated.                                                                          |
 | =last_hibernate_ms= | How long its last save took.                                                                              |
 | =last_resume_ms=    | How long its last resume took.                                                                            |
-| =refused_reason=    | Why its last hibernation was refused (busy, threads of its own, too little disk, a refused path, a failed or slow save). |
+| =refused_reason=    | Why it was last refused: for hibernation busy, threads of its own, =at-limit=, too little disk, a refused path, a failed or slow save; for a stop =no-core= (it loaded from source, so its replacement would too). |
 
 =pool-status= is only meaningful in hermetic mode. Called when =*mode*=
 is *not* =:hermetic=, it returns an informative =isError= ("pool-status

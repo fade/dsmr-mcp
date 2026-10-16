@@ -2340,7 +2340,8 @@ breaker alone."
 returns it, and return what came of it as a keyword.
 
 A :kill request stops a worker only when it is :bound, idle, holds no state
-and is at least the minimum kill age old: a worker in that state has lost
+and is at least the minimum kill age old, and only when it booted from a
+worker core rather than from source: a worker in that state has lost
 nothing and the next call boots a new one in a tenth of a second, so it is
 stopped without a reset notice. A worker that still owes its session a reset
 notice counts as holding state (%holds-state-p): it is never stopped, and it
@@ -2349,6 +2350,13 @@ request saves a worker only when it is :bound, idle and holds state. The
 answer is:
   :killed          the worker was stopped.
   :too-young       a :kill for a worker spawned too recently to stop.
+  :no-core         a :kill for a worker that loaded from source because no
+                   worker core was in use. A stop is cheap only because the
+                   next worker boots from the core in a tenth of a second;
+                   without one it loads from source,
+                   which takes tens of seconds and more memory at its peak
+                   than the worker it replaces, so the worker is left
+                   serving and the refusal is kept on it.
   :busy            a call took the worker just before it was stopped.
   :changed         the worker has since become busy, gained state (for a
                    :kill), lost it (for a :hibernate), or left its session.
@@ -2393,6 +2401,15 @@ here, never by the request."
                    :changed)
                   ((eq action :kill)
                    (cond ((%holds-state-p worker) :changed)
+                         ((eq (worker-boot-kind worker) :source)
+                          ;; A worker that had to load from source says no
+                          ;; core is in use, so its replacement would load
+                          ;; from source too. The refusal is kept on the
+                          ;; worker, so the service passes it over instead
+                          ;; of asking again at once.
+                          (setf (worker-refused-reason worker) "no-core"
+                                (worker-refused-at worker) now)
+                          :no-core)
                          ((< (%worker-age worker now)
                              (effective-pressure-kill-min-age-seconds))
                           :too-young)
