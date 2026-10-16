@@ -4,7 +4,9 @@
 ;;;; Zebra tests for the host service's supervisor, run in this process: one
 ;;;; tick against a clock the case chooses writes the status summary that
 ;;;; --host-status reads, an orderly stop lets everything go without rotating a
-;;;; log or removing an agent's files, and the watchdog's progress rule.
+;;;; log or removing an agent's files, and the watchdog's progress rule. The
+;;;; memory cases hand the service readings and pool records of their choosing
+;;;; and check which worker it asks for, when, and what it reports.
 ;;;;
 ;;;; The state home is a fresh short directory under /tmp (a bus socket path has
 ;;;; to fit in 107 bytes), the fleet and service logs are installed there before
@@ -26,7 +28,11 @@
                     (#:fleetlog #:dsmr-bus-host/src/bus/host/fleetlog)
                     (#:hostfiles #:dsmr-mcp/src/bus/hostfiles)
                     (#:broker #:dsmr-mcp/src/bus/broker)
-                    (#:wal #:dsmr-mcp/src/bus/wal))
+                    (#:wal #:dsmr-mcp/src/bus/wal)
+                    (#:conditions #:dsmr-bus-host/src/bus/host/conditions)
+                    (#:ident #:dsmr-bus-host/src/bus/host/identity)
+                    (#:memory #:dsmr-bus-host/src/bus/host/memory)
+                    (#:pool-records #:dsmr-mcp/src/hermetic/pool-records))
   (:import-from #:dsmr-bus-watch/src/bus/watch
                 #:%reap-notifiers
                 #:%unix-time))
@@ -252,3 +258,320 @@
       (ignore-errors (sb-bsd-sockets:socket-close by-name))
       (ignore-errors (uiop:delete-directory-tree dir :validate t
                                                      :if-does-not-exist :ignore)))))
+
+;;; ------------------------------------------------------------ memory relief
+
+(defvar *reports* '()
+  "Every report the current memory case's service made, newest first, as
+   (level code subject msg).")
+
+(defun recording-report (level code &key bus id subject msg)
+  "Note a report in *REPORTS*, then hand it to the service's logs as the
+   service's own report function would."
+  (push (list level code subject msg) *reports*)
+  (ident:report-to-logs level code :bus bus :id id :subject subject :msg msg))
+
+(defun reported (code &optional level)
+  "The reports made under CODE, at LEVEL when given."
+  (remove-if-not (lambda (r)
+                   (and (equal code (second r))
+                        (or (null level) (eq level (first r)))))
+                 *reports*))
+
+(defun readings (available-percent &key (some 0.0))
+  "A memory reading with AVAILABLE-PERCENT of a 1 GB host available."
+  (memory:make-memory-readings :some-avg10 some :full-avg10 0.0
+                               :mem-total-kb 1000000
+                               :mem-available-kb (* 10000 available-percent)))
+
+(defvar *reading* nil
+  "What the current memory case's service reads as the host's memory.")
+
+(defun memory-service (&key (reader (lambda () *reading*)) thresholds)
+  "A service that reads its memory through READER and reports through
+   RECORDING-REPORT, noted for clean-up."
+  (let ((svc (apply #'service:make-service :feed-p nil :report-fn #'recording-report
+                    :memory-reader reader
+                    (and thresholds (list :memory-thresholds thresholds)))))
+    (push svc *services*)
+    svc))
+
+(defmacro with-memory-case ((state) &body body)
+  "Run BODY inside WITH-HOST with fresh reports and fresh heal breakers, so one
+   case's heals never use up another's."
+  `(with-host (,state)
+     (let ((*reports* '())
+           (*reading* (readings 50))
+           (conditions:*breakers* (make-hash-table :test 'equal :synchronized t)))
+       ,@body)))
+
+(defun check (svc now)
+  "Run SVC's memory duty at NOW the way the supervisor does."
+  (service::%duty svc "memory" (lambda () (service::%check-memory svc now))
+                  :subject "host"))
+
+(defun own-stem ()
+  "This process's server stem: its records belong to a live owner."
+  (pool-records:server-stem))
+
+(defun worker (id &key stateful (state :bound) busy spawned-at last-activity)
+  "One worker entry of a pool's record."
+  (list :id id :pid nil :state state :session (format nil "s~D" id)
+        :stateful stateful :busy busy :spawned-at spawned-at
+        :last-activity last-activity :refused-reason nil :refused-at nil
+        :core-bytes nil))
+
+(defun publish (workers &key (stem (own-stem)) (owner stem))
+  "Publish WORKERS as the record of the server STEM, the record saying it
+   belongs to the server OWNER names."
+  (multiple-value-bind (pid start) (pool-records:parse-server-stem owner)
+    (pool-records:write-worker-record
+     stem (list :server-pid pid :server-start start :written-at (%unix-time)
+                :service-seen t :workers workers :last-action nil))))
+
+(defun requests ()
+  "The requests waiting, as plists."
+  (mapcar #'cdr (pool-records:pending-requests)))
+
+(defun fleet-lines-with (&rest needles)
+  "The fleet log lines containing every one of NEEDLES."
+  (let ((path (hostfiles:fleet-log-path)))
+    (remove-if-not (lambda (line) (every (lambda (n) (search n line)) needles))
+                   (and (probe-file path) (uiop:read-file-lines path)))))
+
+(define-test calm-memory-asks-for-nothing
+  "With memory to spare, an idle stateful worker is left alone."
+  (with-memory-case (state)
+    (let ((svc (memory-service))
+          (now (%unix-time)))
+      (publish (list (worker 1 :stateful t :spawned-at (- now 100)
+                               :last-activity (- now 50))))
+      (check svc now)
+      (is equal '() (requests)))))
+
+(define-test pressure-asks-for-one-worker-at-a-time
+  "Under pressure the service asks the owning pool to hibernate the idle
+   stateful worker, and asks nothing more while that request stands, however
+   long it stands short of the request timeout."
+  (with-memory-case (state)
+    (let ((svc (memory-service))
+          (now (%unix-time)))
+      (setf *reading* (readings 5))
+      (publish (list (worker 1 :stateful t :spawned-at (- now 100)
+                               :last-activity (- now 50))
+                     (worker 2 :stateful t :spawned-at (- now 100)
+                               :last-activity (- now 40))))
+      (check svc now)
+      (let ((asked (requests)))
+        (is = 1 (length asked))
+        (is = 1 (getf (first asked) :worker-id))
+        (is eq :hibernate (getf (first asked) :action)))
+      (check svc (+ now 1))
+      (is = 1 (length (requests)) "a second request while one stands")
+      ;; Past the spacing between requests, the standing one still holds
+      ;; every other back.
+      (check svc (+ now 5))
+      (let ((asked (requests)))
+        (is = 1 (length asked) "a second request once the spacing had passed")
+        (is = now (getf (first asked) :requested-at) "the standing request was made again")))))
+
+(define-test requests-are-at-least-two-seconds-apart
+  "Once a request is answered, the next is not made until two seconds after
+   the last."
+  (with-memory-case (state)
+    (let ((svc (memory-service))
+          (now (%unix-time)))
+      (setf *reading* (readings 5))
+      (publish (list (worker 1 :stateful t :spawned-at (- now 100)
+                               :last-activity (- now 50))
+                     (worker 2 :stateful t :spawned-at (- now 100)
+                               :last-activity (- now 40))))
+      (check svc now)
+      (is = 1 (length (requests)))
+      ;; The pool answers: the worker is saved and its request removed.
+      (dolist (entry (pool-records:pending-requests))
+        (pool-records:remove-request (car entry)))
+      (publish (list (worker 1 :stateful t :state :hibernated :spawned-at (- now 100)
+                               :last-activity (- now 50))
+                     (worker 2 :stateful t :spawned-at (- now 100)
+                               :last-activity (- now 40))))
+      (check svc (+ now 1))
+      (is equal '() (requests) "asked again within two seconds")
+      (check svc (+ now 2))
+      (let ((asked (requests)))
+        (is = 1 (length asked))
+        (is = 2 (getf (first asked) :worker-id))))))
+
+(define-test a-fresh-idle-worker-is-stopped-before-a-stateful-one-is-saved
+  "A fresh idle worker old enough is asked to stop before any stateful worker
+   is asked to hibernate, and one spawned three seconds ago is never asked."
+  (with-memory-case (state)
+    (let ((svc (memory-service))
+          (now (%unix-time)))
+      (setf *reading* (readings 5))
+      (publish (list (worker 1 :spawned-at (- now 60))
+                     (worker 2 :stateful t :spawned-at (- now 200)
+                               :last-activity (- now 100))
+                     (worker 3 :spawned-at (- now 3))))
+      (check svc now)
+      (let ((asked (requests)))
+        (is = 1 (length asked))
+        (is = 1 (getf (first asked) :worker-id))
+        (is eq :kill (getf (first asked) :action)))
+      (dolist (entry (pool-records:pending-requests))
+        (pool-records:remove-request (car entry)))
+      (publish (list (worker 2 :stateful t :spawned-at (- now 200)
+                               :last-activity (- now 100))
+                     (worker 3 :spawned-at (- now 3))))
+      (check svc (+ now 2))
+      (let ((asked (requests)))
+        (is = 1 (length asked))
+        (is = 2 (getf (first asked) :worker-id))
+        (is eq :hibernate (getf (first asked) :action)))
+      (dolist (entry (pool-records:pending-requests))
+        (pool-records:remove-request (car entry)))
+      (publish (list (worker 2 :stateful t :state :hibernated
+                               :spawned-at (- now 200) :last-activity (- now 100))
+                     (worker 3 :spawned-at (- now 3))))
+      (check svc (+ now 4))
+      (is equal '() (requests) "the young worker was asked to stop"))))
+
+(define-test a-dead-server-s-record-and-request-are-removed-and-never-acted-on
+  "A record and a request whose server is gone are removed, and nothing is
+   asked of the gone server."
+  (with-memory-case (state)
+    (let ((svc (memory-service))
+          (now (%unix-time))
+          (dead "999999999-12345"))
+      (setf *reading* (readings 5))
+      (publish (list (worker 1 :stateful t :spawned-at (- now 100)
+                               :last-activity (- now 50)))
+               :stem dead)
+      (let ((request (pool-records:write-hibernate-request dead 1 :hibernate
+                                                           :now now)))
+        (check svc now)
+        (false (probe-file request) "the dead server's request is still there"))
+      (false (probe-file (pool-records:worker-record-path dead))
+             "the dead server's record is still there")
+      (is equal '() (requests)))))
+
+(define-test a-request-left-unanswered-for-five-minutes-is-removed-with-a-warning
+  "A request 301 seconds old is removed and reported as stale."
+  (with-memory-case (state)
+    (let ((svc (memory-service))
+          (now (%unix-time)))
+      (setf *reading* (readings 5))
+      (publish '())
+      (let ((request (pool-records:write-hibernate-request (own-stem) 7 :hibernate
+                                                           :now (- now 301))))
+        (check svc now)
+        (false (probe-file request) "the stale request is still there"))
+      (is = 1 (length (reported "memory-request-stale" :warn))))))
+
+(define-test pressure-with-nothing-left-to-relieve-is-reported-once-then-recovers
+  "Pressure with no candidate is reported once as unrelieved after sixty
+   seconds, not again in the same episode, and calm held for thirty seconds
+   ends the episode with a recovered line."
+  (with-memory-case (state)
+    (let ((svc (memory-service))
+          (now (%unix-time)))
+      (setf *reading* (readings 5))
+      (publish '())
+      (check svc now)
+      (is = 1 (length (fleet-lines-with "WARN code=memory-pressure ")))
+      (check svc (+ now 30))
+      (is = 0 (length (fleet-lines-with "code=memory-pressure-unrelieved")))
+      (check svc (+ now 61))
+      (is = 1 (length (fleet-lines-with "ERROR code=memory-pressure-unrelieved")))
+      (check svc (+ now 120))
+      (is = 1 (length (fleet-lines-with "code=memory-pressure-unrelieved")))
+      (setf *reading* (readings 50))
+      (check svc (+ now 121))
+      (check svc (+ now 151))
+      (is eq :ok (memory:memory-state-verdict (service::service-memory-state svc)))
+      (is = 1 (length (fleet-lines-with "INFO code=memory-pressure " "recovered"))))))
+
+(define-test a-failing-memory-reader-never-stops-the-supervisor
+  "A memory reader that signals is reported as a failed duty about the host,
+   and the tick carries on and returns."
+  (with-memory-case (state)
+    (let ((svc (memory-service :reader (lambda () (error "no /proc here")))))
+      (is eq svc (service:supervisor-tick svc (%unix-time)))
+      (let ((failed (remove-if-not (lambda (r) (equal "host" (third r)))
+                                   (reported "duty-failed" :error))))
+        (is = 1 (length failed))
+        (true (search "no /proc here" (fourth (first failed))))))))
+
+(define-test the-status-summary-carries-the-memory-state-and-the-worker-counts
+  "After one tick the status summary says how memory stands and counts the
+   hibernated and resident workers of live servers."
+  (with-memory-case (state)
+    (let ((svc (memory-service))
+          (now (%unix-time)))
+      (publish (list (worker 1 :stateful t :state :hibernated :spawned-at (- now 100))
+                     (worker 2 :spawned-at (- now 100))
+                     (worker 3 :stateful t :spawned-at (- now 100))))
+      (publish (list (worker 1 :state :hibernated)) :stem "999999999-12345")
+      (service:supervisor-tick svc now)
+      (let ((memory (getf (read-status) :memory)))
+        (true memory "no :memory in the summary")
+        (is eq :ok (getf memory :state))
+        (true (member :since memory))
+        (is = 1 (getf memory :hibernated))
+        (is = 2 (getf memory :resident))
+        (is = 50 (getf memory :available-percent))))))
+
+(define-test the-owner-sweep-removes-a-gone-server-s-cores-once-a-minute
+  "The owner sweep removes the core directory of a server that is gone, and
+   runs again only once sixty seconds have passed."
+  (with-memory-case (state)
+    (let ((svc (memory-service))
+          (now (%unix-time))
+          (dead "999999999-12345"))
+      (pool-records:ensure-owner-directory dead)
+      (service::%sweep-owners svc now)
+      (false (probe-file (pool-records:owner-directory dead)) "first sweep left it")
+      (pool-records:ensure-owner-directory dead)
+      (service::%sweep-owners svc (+ now 30))
+      (true (probe-file (pool-records:owner-directory dead)) "swept before it was due")
+      (service::%sweep-owners svc (+ now 60))
+      (false (probe-file (pool-records:owner-directory dead)) "the due sweep left it"))))
+
+(define-test a-record-whose-name-disagrees-with-its-contents-is-skipped
+  "A record filed under one live server's name that says it belongs to another
+   is reported and never acted on."
+  (with-memory-case (state)
+    (let* ((svc (memory-service))
+           (now (%unix-time))
+           (other (sb-ext:run-program "/bin/sleep" '("30") :wait nil)))
+      (unwind-protect
+           (let ((other-stem (pool-records:server-stem (sb-ext:process-pid other))))
+             (setf *reading* (readings 5))
+             (publish (list (worker 1 :stateful t :spawned-at (- now 100)
+                                      :last-activity (- now 50)))
+                      :stem other-stem :owner (own-stem))
+             (check svc now)
+             (is equal '() (requests))
+             (is = 1 (length (reported "worker-record-mismatch" :warn)))
+             (true (probe-file (pool-records:worker-record-path other-stem))
+                   "a live server's record was removed"))
+        (ignore-errors (sb-ext:process-kill other 15))
+        (ignore-errors (sb-ext:process-wait other))))))
+
+(define-test a-threshold-the-environment-spells-wrongly-is-reported-once
+  "A pressure threshold the environment cannot give is reported at WARN,
+   naming the variable, on the first memory check and never again."
+  (with-memory-case (state)
+    (let ((previous (uiop:getenv "DSMR_PRESSURE_ENTER_SOME")))
+      (unwind-protect
+           (let ((svc (progn (sb-posix:setenv "DSMR_PRESSURE_ENTER_SOME" "banana" 1)
+                             (memory-service)))
+                 (now (%unix-time)))
+             (check svc now)
+             (check svc (+ now 1))
+             (let ((warned (reported "memory-threshold-ignored" :warn)))
+               (is = 1 (length warned))
+               (true (search "DSMR_PRESSURE_ENTER_SOME" (fourth (first warned))))))
+        (if previous
+            (sb-posix:setenv "DSMR_PRESSURE_ENTER_SOME" previous 1)
+            (ignore-errors (sb-posix:unsetenv "DSMR_PRESSURE_ENTER_SOME")))))))

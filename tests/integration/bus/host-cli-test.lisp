@@ -402,3 +402,43 @@ since when, even though the summary does not list it yet, and the report exits
       (multiple-value-bind (lines code) (host-status state bin)
         (is = 1 code)
         (is equal '("service state=stopped pid=- beat-age=- status-age=-") lines)))))
+
+(define-test host-status-reports-memory-pressure-without-failing
+  "A summary that says the host is under memory pressure gives a memory line
+right after the service line, with the state, the hibernated and resident
+counts and since when; pressure alone does not make the report fail."
+  (with-binary (bin)
+    (with-host-state (state)
+      (let* ((service (start-sleeper))
+             (session (start-sleeper))
+             (since (- (get-universal-time) 42)))
+        (install-service-files
+         state :service-pid service
+               :snapshot (append (sample-snapshot session)
+                                 (list :memory (list :state :pressure :since since
+                                                     :some-avg10 12.5
+                                                     :available-percent 9
+                                                     :hibernated 2 :resident 3
+                                                     :last-action nil))))
+        (multiple-value-bind (lines code) (host-status state bin)
+          (is = 0 code "got ~S" lines)
+          (is = 5 (length lines) "got ~S" lines)
+          (true (uiop:string-prefix-p "service state=alive " (first lines)))
+          (let ((line (second lines)))
+            (true (uiop:string-prefix-p "memory state=pressure hibernated=2 resident=3 " line)
+                  "got ~S" line)
+            (is string= (princ-to-string (- since 2208988800)) (field "since" line))))))))
+
+(define-test host-status-prints-no-memory-line-without-a-memory-state
+  "A summary from a service that says nothing about memory gives no memory
+line."
+  (with-binary (bin)
+    (with-host-state (state)
+      (let ((service (start-sleeper))
+            (session (start-sleeper)))
+        (install-service-files state :service-pid service
+                                     :snapshot (sample-snapshot session))
+        (multiple-value-bind (lines code) (host-status state bin)
+          (is = 0 code "got ~S" lines)
+          (false (find-if (lambda (line) (uiop:string-prefix-p "memory " line)) lines)
+                 "got ~S" lines))))))
