@@ -409,9 +409,9 @@ install-harness:
 	done
 	@echo "installed into $(AGENTDIR)"
 
-## TEST_STATE_HOME: the shell prefix that gives a unit-test run its own state.
+## TEST_STATE_HOME: the shell prefix that gives a test run its own state.
 ##
-##   I run the unit suites under a fresh XDG_STATE_HOME made with mktemp and
+##   I run the unit and integration suites under a fresh XDG_STATE_HOME made with mktemp and
 ##   removed when the recipe ends, however it ends. The suites start a session
 ##   pool, and a pool sweeps state and publishes its worker records under
 ##   $XDG_STATE_HOME/dsmr-mcp/host/, which is exactly where a running host
@@ -443,10 +443,11 @@ test:
 ## test-integration: slow cross-process suite (gated, off the push hot-path).
 ##
 ##   Runs dsmr-mcp/tests/integration — each leaf spawns a real child SBCL and
-##   skips cleanly when none can be spawned. Same CL_SOURCE_REGISTRY and
-##   fail-fast contract as `test`. Run on a schedule / label, not every push.
+##   skips cleanly when none can be spawned. Same CL_SOURCE_REGISTRY,
+##   fail-fast contract and private state home as `test`, because several
+##   leaves start a pool too. Run on a schedule / label, not every push.
 test-integration:
-	$(SBCL) --noinform --disable-debugger --non-interactive \
+	$(TEST_STATE_HOME) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests/integration")' \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests/integration") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))'
