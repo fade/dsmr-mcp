@@ -2032,6 +2032,19 @@ spawn time, so a worker of unknown age is never old enough to stop."
   (let ((spawned (worker-spawned-at worker)))
     (if spawned (max 0 (- now spawned)) 0)))
 
+(defun %holds-state-p (worker)
+  "True when stopping WORKER would lose something its session must not lose:
+the state its calls left in its image, or a reset notice it still owes. A
+worker that replaced a crashed or lost one is fresh, but until its session has
+been told its world was reset, that notice lives only on this worker, and
+stopping it would leave the session calling functions that are gone with no
+word of why. Such a worker is treated as stateful everywhere a stop is
+decided, and is published as stateful, so the host service never offers it
+as a fresh idle worker."
+  (and (or (worker-stateful-p worker)
+           (worker-needs-reset-notification worker))
+       t))
+
 (defun %worker-record-entry (worker now)
   "WORKER as one entry of the published record. Its last activity falls back
 to its spawn time, and to NOW when it has neither, so the service never reads
@@ -2040,7 +2053,7 @@ a live worker without one."
         :pid (worker-pid worker)
         :state (worker-state worker)
         :session (worker-session-id worker)
-        :stateful (and (worker-stateful-p worker) t)
+        :stateful (%holds-state-p worker)
         :busy (and (plusp (worker-in-flight worker)) t)
         :spawned-at (worker-spawned-at worker)
         :last-activity (or (worker-last-activity worker)
@@ -2079,7 +2092,8 @@ or NIL. Nothing is written; the caller publishes the plist."
   "Stop WORKER, SESSION-ID's worker, only if it is still idle, holds no state
 and is old enough, and return :killed, or say why not: :gone when it is no
 longer the session's :bound worker, :busy when a call holds it, :stateful when
-it holds state, :too-young when it was spawned too recently.
+it holds state or still owes its session a reset notice (%holds-state-p),
+:too-young when it was spawned too recently.
 Every check and the change of state happen in one hold of *pool-lock*, the
 same lock a call takes its worker under, so a call and a stop can never both
 win: a call that took the worker first makes this answer :busy, and a call
@@ -2095,7 +2109,7 @@ breaker alone."
               ((not (eq (gethash session-id *affinity-map*) worker)) :gone)
               ((not (eq (worker-state worker) :bound)) :gone)
               ((plusp (worker-in-flight worker)) :busy)
-              ((worker-stateful-p worker) :stateful)
+              ((%holds-state-p worker) :stateful)
               ((< (%worker-age worker now)
                   (effective-pressure-kill-min-age-seconds))
                :too-young)
@@ -2118,8 +2132,11 @@ returns it, and return what came of it as a keyword.
 A :kill request stops a worker only when it is :bound, idle, holds no state
 and is at least the minimum kill age old: a worker in that state has lost
 nothing and the next call boots a new one in a tenth of a second, so it is
-stopped without a reset notice. A :hibernate request saves a worker only when
-it is :bound, idle and holds state. The answer is:
+stopped without a reset notice. A worker that still owes its session a reset
+notice counts as holding state (%holds-state-p): it is never stopped, and it
+may be hibernated, which keeps the notice with the worker. A :hibernate
+request saves a worker only when it is :bound, idle and holds state. The
+answer is:
   :killed          the worker was stopped.
   :too-young       a :kill for a worker spawned too recently to stop.
   :busy            a call took the worker just before it was stopped.
@@ -2165,13 +2182,13 @@ here, never by the request."
                              (zerop (worker-in-flight worker))))
                    :changed)
                   ((eq action :kill)
-                   (cond ((worker-stateful-p worker) :changed)
+                   (cond ((%holds-state-p worker) :changed)
                          ((< (%worker-age worker now)
                              (effective-pressure-kill-min-age-seconds))
                           :too-young)
                          (t :stop)))
                   ((eq action :hibernate)
-                   (if (worker-stateful-p worker) :hibernate :changed))
+                   (if (%holds-state-p worker) :hibernate :changed))
                   (t :changed)))))
       (unless worker
         (log-event :warn "pool.pressure.request-refused"

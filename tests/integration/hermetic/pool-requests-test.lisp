@@ -21,14 +21,18 @@
   (:import-from #:dsmr-mcp/src/hermetic/pool
                 #:initialize-pool #:shutdown-pool #:get-or-assign-worker
                 #:pool-rpc-with-hard-kill #:with-session-worker
-                #:act-on-hibernate-request
+                #:act-on-hibernate-request #:build-worker-record
+                #:hibernate-session-worker
                 #:*after-assign-hook* #:*circuit-breaker-map*
                 #:*pressure-kill-min-age-seconds* #:*pressure-agent-interval*
                 #:*worker-pool-warmup* #:*max-pool-size*
                 #:*health-check-interval-seconds*)
   (:import-from #:dsmr-mcp/src/hermetic/worker-client
                 #:*worker-core* #:worker-id #:worker-state #:worker-in-flight
-                #:check-and-clear-reset-notification)
+                #:check-and-clear-reset-notification
+                #:worker-pid #:worker-stateful-p
+                #:worker-needs-reset-notification
+                #:worker-hibernate-core-path)
   (:import-from #:dsmr-mcp/src/hermetic/pool-records
                 #:server-stem #:parse-server-stem
                 #:worker-record-path #:read-worker-record
@@ -366,6 +370,55 @@ worker keeps serving with its world."
       (is eq :changed (%await-result id 3))
       (is eq :bound (worker-state w))
       (true (%answers-p (%answer-in "stateful" "*kept*") 7)))))
+
+(define-test a-replacement-still-owing-its-reset-notice-is-never-stopped
+  "A fresh worker that replaced a crashed one, or one whose world could not
+be resumed, still owes its session a reset notice. It is published as
+stateful, a :kill request for it is refused as stateful, it keeps serving, and
+the session's next call delivers the notice."
+  (%pool-case ()
+    ;; A crash: the process is killed and the pool replaces the worker.
+    (let* ((first (get-or-assign-worker "crashed"))
+           (pid (worker-pid first)))
+      (sb-posix:kill pid sb-posix:sigkill)
+      (%wait-until 5 (lambda () (not (pool::%worker-process-alive-p first))))
+      (pool::%handle-worker-crash first)
+      (let ((r (%session-worker "crashed")))
+        (true (and r (not (eq r first))) "no replacement")
+        (is eq :bound (worker-state r))
+        (false (worker-stateful-p r))
+        (true (worker-needs-reset-notification r))
+        (let ((entry (find (worker-id r) (getf (build-worker-record (%unix-now)) :workers)
+                           :key (lambda (e) (getf e :id)))))
+          (true entry)
+          (true (getf entry :stateful) "published as a fresh idle worker"))
+        (is eq :stateful (pool::%stop-idle-worker "crashed" r))
+        (is eq :changed (act-on-hibernate-request (%kill-request r)))
+        (is eq :bound (worker-state r))
+        (is eq r (%session-worker "crashed"))
+        (let ((had nil) (text nil))
+          (with-session-worker (w "crashed")
+            (setf had (check-and-clear-reset-notification w)
+                  text (%answer-on w "(+ 1 1)")))
+          (true had "the reset notice was lost")
+          (true (%answers-p text 2) "~A" text))))
+    ;; A world that could not be resumed: the replacement owes the notice too.
+    (%answer-in "lost" "(progn (defvar *kept* 7) *kept*)")
+    (multiple-value-bind (outcome reason) (hibernate-session-worker "lost")
+      (is eq :hibernated outcome "reason ~A" reason))
+    (let ((path (worker-hibernate-core-path (%session-worker "lost"))))
+      (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                :if-exists :supersede)
+        (write-sequence (make-array 4096 :element-type '(unsigned-byte 8)
+                                         :initial-element 0)
+                        out)))
+    (let ((r (get-or-assign-worker "lost")))
+      (true (worker-needs-reset-notification r))
+      (is eq :stateful (pool::%stop-idle-worker "lost" r))
+      (is eq :changed (act-on-hibernate-request (%kill-request r)))
+      (multiple-value-bind (had reason) (check-and-clear-reset-notification r)
+        (true had)
+        (true (and reason (search "could not be resumed" reason)) "~A" reason)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Requests the pool refuses or never sees
