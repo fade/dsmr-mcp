@@ -65,10 +65,12 @@
 sorted ascending. The child sets this, so the value is written into the core;
 the resumed process covers each number with /dev/null and clears it.")
 
-(defparameter *default-deadline-seconds* 170
+(defparameter *default-deadline-seconds* 150
   "Seconds a save may take before the worker kills the saving child and goes
-on serving. A save is disk-bound and has been seen to take most of a minute
-on a busy rotational disk.")
+on serving, when the request names no deadline. A save is disk-bound and has
+been seen to take most of a minute on a busy rotational disk. The pool sends
+its own deadline, by default this same 150: its 180 s wait less a margin for
+the worker to collect the child and answer.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Where cores may be written
@@ -426,7 +428,7 @@ behind."
   "Save this worker's world to the core file PARAMS names, then stop SERVER.
 
 PARAMS holds \"path\", an absolute file name ending in .core inside the
-hibernate directory, and optionally \"deadline_seconds\" (default 170).
+hibernate directory, and optionally \"deadline_seconds\" (default 150).
 TOPLEVEL is the function a process started from the core runs.
 STOP-WATCHDOG and START-WATCHDOG stop and restart the parent watchdog thread.
 

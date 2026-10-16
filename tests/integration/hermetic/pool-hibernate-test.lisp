@@ -390,12 +390,14 @@ notice says why. No crash is counted either way."
            (old-id (worker-id w))
            (old-pid (worker-pid w))
            (outcome nil))
-      ;; The pool's wait is cut far below any save, so the worker's answer
-      ;; arrives after the pool has stopped waiting for it.
+      ;; The pool's wait is cut far below any save, and it listens for no
+      ;; late answer, so the worker's answer arrives after the pool has
+      ;; stopped waiting for it.
       (let ((*hibernate-worker-process-function*
               (lambda (worker core-path &rest keys)
                 (declare (ignore keys))
-                (hibernate-worker-process worker core-path :timeout 0.05))))
+                (hibernate-worker-process worker core-path :timeout 0.05
+                                                           :grace 0))))
         (multiple-value-bind (result reason) (hibernate-session-worker "late")
           (setf outcome result)
           (true (member result '(:timeout :hibernated)) "outcome ~A ~A" result reason)))
@@ -538,6 +540,29 @@ the thread, the worker, its partial core and the saving child's pid."
                     (multiple-value-list (hibernate-session-worker session)))
                   :name "slow-save")))
     (values thread w scratch (%saving-child scratch 20))))
+
+(define-test a-save-the-worker-gives-up-is-refused-in-time-and-keeps-the-world
+  "A save that never finishes is given up by the worker in time for its
+refusal to reach the pool, even when the pool's wait is shorter than the
+worker's deadline and the refusal lands in the time the pool goes on
+listening for a late answer. The worker keeps serving with its world, and no
+crash is counted."
+  (%pool-case ()
+    (%eval "slow" "(defvar *kept* 5)")
+    (%eval "slow" +slow-save-code+)
+    (let ((w (%session-worker "slow")))
+      (let ((*hibernate-worker-process-function*
+              (lambda (worker core-path &rest keys)
+                (declare (ignore keys))
+                (hibernate-worker-process worker core-path :timeout 0.5))))
+        (multiple-value-bind (outcome reason) (hibernate-session-worker "slow")
+          (is eq :refused outcome "reason ~A" reason)
+          (is equal "save-timeout" reason)))
+      (is eq :bound (worker-state w))
+      (is eq w (%session-worker "slow"))
+      (false (probe-file (%scratch-path w)) "the partial core was left behind")
+      (true (%answers-p (%answer-in "slow" "*kept*") 5))
+      (%no-crash-recorded "slow"))))
 
 (define-test a-session-released-during-a-save-leaves-no-child-and-no-partial-core
   "Releasing a session whose worker is in the middle of a save ends the saving

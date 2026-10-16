@@ -53,7 +53,8 @@
            #:worker-last-resume-milliseconds
            #:worker-refused-reason #:worker-refused-at
            #:worker-reset-reason
-           #:*hibernate-timeout-seconds*
+           #:*hibernate-timeout-seconds* #:*hibernate-answer-margin-seconds*
+           #:*hibernate-late-answer-seconds* #:hibernate-save-deadline
            #:hibernate-worker-process #:hibernate-refusal-token
            #:release-worker-process #:resume-worker
            #:end-worker-process #:*stream-lock-grace-seconds*
@@ -120,8 +121,26 @@ first when nothing has."
   "Seconds the pool waits for a worker's answer to a request to hibernate.
 
 A save can take tens of seconds on a large world. The worker is given its own
-deadline ten seconds shorter than this, so it always answers first, and this
-wait only matters when the worker cannot answer at all.")
+deadline *hibernate-answer-margin-seconds* shorter than this (see
+hibernate-save-deadline), so it always answers first, and this wait only
+matters when the worker cannot answer at all.")
+
+(defparameter *hibernate-answer-margin-seconds* 30
+  "How much sooner than the pool stops waiting a worker must give up its save.
+After its deadline the worker still has to kill and collect the saving child,
+restart its watchdog and send its answer, and a host short of memory, which is
+when saves run, can deschedule it for seconds at a time. A refusal that lands
+after the pool stopped waiting would end a worker whose world was intact.")
+
+(defparameter *hibernate-late-answer-seconds* 15
+  "How long the pool goes on listening for a worker's answer to a save once its
+wait has run out, before it ends the worker. A late refusal read in that time
+puts the worker back into service with its world instead of losing it.")
+
+(defun hibernate-save-deadline (timeout)
+  "The deadline in whole seconds, at least 1, a worker is given for a save the
+pool waits TIMEOUT seconds for: TIMEOUT less *hibernate-answer-margin-seconds*."
+  (max 1 (floor (- timeout *hibernate-answer-margin-seconds*))))
 
 (defvar *worker-resume-timeout* nil
   "Maximum seconds to wait for the handshake of a worker resumed from a core it
@@ -1339,7 +1358,8 @@ server's. Returns the whole trimmed message when it carries no colon."
 
 (defun hibernate-worker-process (worker path
                                  &key (timeout *hibernate-timeout-seconds*)
-                                      (deadline 170))
+                                      (deadline (hibernate-save-deadline timeout))
+                                      (grace *hibernate-late-answer-seconds*))
   "Ask WORKER to save its whole world to the core file PATH, and say how it went.
 
 Returns one of:
@@ -1350,15 +1370,19 @@ Returns one of:
   (values :refused TOKEN MESSAGE)  the worker declined and is still serving;
                                    TOKEN is its reason word (see
                                    hibernate-refusal-token), MESSAGE the text.
-  (values :timeout NIL)            no answer within TIMEOUT seconds; the
-                                   worker's state, stream and socket are left
-                                   exactly as they were.
+  (values :timeout NIL)            no answer within TIMEOUT seconds, nor in
+                                   the GRACE seconds after; the worker's
+                                   state, stream and socket are left exactly
+                                   as they were.
   (values :died NIL)               the channel ended or broke before an answer
                                    came, or the answer could not be read, so
                                    the worker cannot be trusted to be serving.
 
-DEADLINE is the worker's own limit on the save, sent with the request; it is
-kept below TIMEOUT so the worker answers before this stops waiting.
+DEADLINE is the worker's own limit on the save, sent with the request. By
+default it is TIMEOUT less *hibernate-answer-margin-seconds*, so the worker
+answers well before this stops waiting. When TIMEOUT runs out regardless, the
+channel is read for GRACE seconds more, and an answer that arrives then counts
+as if it had come in time.
 
 None of these outcomes marks the worker crashed. A successful save ends the
 channel by design, and a worker killed for memory in the middle of a save has
@@ -1372,25 +1396,38 @@ what each outcome means for the session. Signals WORKER-CRASHED with reason
           (params (make-hash-table :test 'equal)))
       (setf (gethash "path" params) (uiop:native-namestring path)
             (gethash "deadline_seconds" params) deadline)
-      (handler-case
-          (progn
-            (%send-json-rpc (worker-stream worker) id "worker/hibernate" params)
-            (values :hibernated
-                    (%read-json-rpc-response (worker-stream worker) id timeout)))
-        (worker-rpc-error (e)
-          (let ((message (or (worker-rpc-error-message e) "")))
-            (values :refused (hibernate-refusal-token message) message)))
-        (sb-ext:timeout ()
-          (values :timeout nil))
-        (end-of-file ()
-          (values :died nil))
-        (stream-error ()
-          (values :died nil))
-        (error (e)
-          (log-event :warn "worker.hibernate.unreadable-answer"
-                     "id" (worker-id worker)
-                     "error" (princ-to-string e))
-          (values :died nil))))))
+      (flet ((outcome (thunk)
+               (handler-case
+                   (values :hibernated (funcall thunk))
+                 (worker-rpc-error (e)
+                   (let ((message (or (worker-rpc-error-message e) "")))
+                     (values :refused (hibernate-refusal-token message) message)))
+                 (sb-ext:timeout ()
+                   (values :timeout nil))
+                 (end-of-file ()
+                   (values :died nil))
+                 (stream-error ()
+                   (values :died nil))
+                 (error (e)
+                   (log-event :warn "worker.hibernate.unreadable-answer"
+                              "id" (worker-id worker)
+                              "error" (princ-to-string e))
+                   (values :died nil)))))
+        (multiple-value-bind (result detail message)
+            (outcome (lambda ()
+                       (%send-json-rpc (worker-stream worker) id "worker/hibernate"
+                                       params)
+                       (%read-json-rpc-response (worker-stream worker) id timeout)))
+          (if (and (eq result :timeout) grace (plusp grace))
+              (progn
+                (log-event :warn "worker.hibernate.answer-late"
+                           "id" (worker-id worker)
+                           "timeout_seconds" timeout
+                           "grace_seconds" grace)
+                (outcome (lambda ()
+                           (%read-json-rpc-response (worker-stream worker) id
+                                                    grace))))
+              (values result detail message)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Public API — kill

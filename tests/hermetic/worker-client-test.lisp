@@ -149,6 +149,20 @@ while loading are not final."
            "~A was taken as final" kind))
   (false (worker-spawn-failure-final-p (make-condition 'simple-error))))
 
+(define-test a-worker-gives-up-its-save-well-before-the-pool-stops-waiting
+  "The deadline a worker is given for a save leaves the pool's whole answer
+margin before the pool's wait runs out, never falls below one second, and
+follows a changed wait rather than staying fixed."
+  (true (<= (wc:hibernate-save-deadline wc:*hibernate-timeout-seconds*)
+            (- wc:*hibernate-timeout-seconds* wc:*hibernate-answer-margin-seconds*)))
+  (let ((wc:*hibernate-answer-margin-seconds* 30))
+    (is = 150 (wc:hibernate-save-deadline 180))
+    (is = 30 (wc:hibernate-save-deadline 60))
+    (dolist (timeout '(31 45 60 180 600))
+      (true (>= (- timeout (wc:hibernate-save-deadline timeout)) 30) "timeout ~A" timeout))
+    (dolist (timeout '(0.05 1 10 30))
+      (is = 1 (wc:hibernate-save-deadline timeout) "timeout ~A" timeout))))
+
 (define-test the-resume-handshake-budget-is-read-when-resolved
   "The resume handshake budget defaults to 120 s, reads
 DSMR_WORKER_RESUME_TIMEOUT when resolved, and a bound special wins."

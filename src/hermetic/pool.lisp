@@ -65,6 +65,7 @@
                 #:hibernate-worker-process #:release-worker-process
                 #:end-worker-process
                 #:resume-worker #:*hibernate-timeout-seconds*
+                #:*hibernate-late-answer-seconds*
                 #:worker-last-resume-milliseconds
                 #:worker-spawned-at #:worker-boot-kind
                 #:worker-core-path #:*worker-core-disabled*
@@ -1353,9 +1354,11 @@ without creating a new one."
 
 (defun %transition-wait-seconds ()
   "How long a request waits for its session's worker to finish saving or
-resuming before it gives up: the longest a save may take, plus the longest a
-process may take to come up, fresh or resumed, plus a margin."
+resuming before it gives up: the longest a save may take, including the time
+the pool goes on listening for a late answer, plus the longest a process may
+take to come up, fresh or resumed, plus a margin."
   (+ *hibernate-timeout-seconds*
+     *hibernate-late-answer-seconds*
      (max (effective-worker-startup-timeout) (effective-worker-resume-timeout))
      15))
 
