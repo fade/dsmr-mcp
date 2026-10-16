@@ -45,7 +45,17 @@
            #:worker-liveness #:worker-liveness-basis
            #:worker-last-ping-milliseconds
            #:worker-consecutive-missed-pings
-           #:worker-liveness-checked-at))
+           #:worker-liveness-checked-at
+           #:worker-stateful-p #:worker-spawned-at #:worker-last-activity
+           #:worker-in-flight #:worker-spawn-root
+           #:worker-hibernate-core-path #:worker-hibernated-at
+           #:worker-core-bytes #:worker-last-hibernate-milliseconds
+           #:worker-last-resume-milliseconds
+           #:worker-refused-reason #:worker-refused-at
+           #:worker-reset-reason
+           #:*hibernate-timeout-seconds*
+           #:hibernate-worker-process #:hibernate-refusal-token
+           #:release-worker-process))
 
 (in-package #:dsmr-mcp/src/hermetic/worker-client)
 
@@ -98,6 +108,13 @@ image reads the environment it was started with."
   "The worker handshake timeout in seconds as last resolved, resolving it
 first when nothing has."
   (or *resolved-worker-startup-timeout* (resolve-worker-startup-timeout)))
+
+(defvar *hibernate-timeout-seconds* 180
+  "Seconds the pool waits for a worker's answer to a request to hibernate.
+
+A save can take tens of seconds on a large world. The worker is given its own
+deadline ten seconds shorter than this, so it always answers first, and this
+wait only matters when the worker cannot answer at all.")
 
 (defvar *worker-core* nil
   "Path of a worker core image to boot workers from, or NIL to read
@@ -165,6 +182,15 @@ Each thread terminates and self-removes after reaping its process.")
 (defstruct worker
   "Represents a child worker process and its communication channel."
   (id nil)
+  ;; Where the worker is in its life:
+  ;;   :standby      spawned and waiting for a session;
+  ;;   :bound        serving one session;
+  ;;   :hibernating  saving its world to a core, so no call may reach it;
+  ;;   :hibernated   its world is on disk and its process is gone;
+  ;;   :resuming     a process is being started from its saved core;
+  ;;   :crashed      its channel failed and it is being replaced;
+  ;;   :released     taken out of service on purpose (session end, kill, stop);
+  ;;   :dead         its process has been terminated.
   (state :dead :type keyword)
   (process-info nil)
   (stream nil)
@@ -194,7 +220,35 @@ Each thread terminates and self-removes after reaping its process.")
   (liveness-basis nil)
   (last-ping-milliseconds nil)
   (consecutive-missed-pings 0 :type integer)
-  (liveness-checked-at nil))
+  (liveness-checked-at nil)
+  ;; True once the pool has sent this worker a call that can leave state
+  ;; behind in its image. The pool counts every call except a ping and the
+  ;; three read-only code-intelligence calls, which is wider than strictly
+  ;; needed on purpose: a worker wrongly thought stateful is hibernated rather
+  ;; than stopped, and that costs disk, never a session's work.
+  (stateful-p nil :type boolean)
+  ;; Unix seconds at which the worker authenticated, and at which it was last
+  ;; handed to a call or handed back. last-activity starts at spawned-at, so a
+  ;; live worker always has one.
+  (spawned-at nil)
+  (last-activity nil)
+  ;; Calls currently holding this worker. The pool's acquire and release own it.
+  (in-flight 0 :type integer)
+  ;; The DSMR_PROJECT_ROOT the worker was started with, or NIL.
+  (spawn-root nil)
+  ;; The saved world: where it is, when it was written, how large it is, and
+  ;; how long the last save and the last resume took.
+  (hibernate-core-path nil)
+  (hibernated-at nil)
+  (core-bytes nil)
+  (last-hibernate-milliseconds nil)
+  (last-resume-milliseconds nil)
+  ;; Why the last request to hibernate this worker was refused, and when.
+  (refused-reason nil)
+  (refused-at nil)
+  ;; Why the session's previous worker was lost, when it was lost for a reason
+  ;; other than a crash. The session's reset notice carries it.
+  (reset-reason nil))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Conditions
@@ -296,6 +350,10 @@ Handles both LF and CRLF line endings."
   "Return the next monotonically increasing worker ID."
   (bt:with-lock-held (*worker-id-lock*)
     (incf *worker-id-counter*)))
+
+(defun %unix-now ()
+  "The current time in whole Unix seconds."
+  (- (get-universal-time) (encode-universal-time 0 0 0 1 1 1970 0)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Internal helpers — secret generation
@@ -610,6 +668,13 @@ Stores the thread in the worker's stderr-thread slot for cleanup."
 ;;; Public API — spawn
 ;;; ---------------------------------------------------------------------------
 
+(defun %spawn-root (root)
+  "The project root a worker launched with ROOT sees: ROOT when given, else
+the DSMR_PROJECT_ROOT this process passes on, else NIL."
+  (or root
+      (let ((inherited (uiop:getenv "DSMR_PROJECT_ROOT")))
+        (and inherited (plusp (length inherited)) inherited))))
+
 (defun %spawn-worker-once (core &key hibernated-core id root)
   "Launch one worker child process and return a WORKER struct, resuming it
 from the saved core HIBERNATED-CORE when given, else booting it from the
@@ -662,19 +727,23 @@ the handshake fails, or authentication is rejected."
                              (gethash "authenticated" auth-resp))
                   (error 'worker-spawn-failed
                          :message "Worker authentication failed"))))
-            (let ((worker (make-worker
-                           :id id
-                           :state :standby
-                           :process-info process
-                           :stream (usocket:socket-stream socket)
-                           :socket socket
-                           :tcp-port tcp-port
-                           :swank-port swank-port
-                           :pid pid
-                           :boot-kind kind
-                           :boot-milliseconds
-                           (round (* 1000 (- (get-internal-real-time) started))
-                                  internal-time-units-per-second))))
+            (let* ((now (%unix-now))
+                   (worker (make-worker
+                            :id id
+                            :state :standby
+                            :spawned-at now
+                            :last-activity now
+                            :spawn-root (%spawn-root root)
+                            :process-info process
+                            :stream (usocket:socket-stream socket)
+                            :socket socket
+                            :tcp-port tcp-port
+                            :swank-port swank-port
+                            :pid pid
+                            :boot-kind kind
+                            :boot-milliseconds
+                            (round (* 1000 (- (get-internal-real-time) started))
+                                   internal-time-units-per-second))))
               (%start-stderr-drain worker)
               (log-event :info "worker.spawned"
                          "id" id
@@ -887,7 +956,7 @@ the worker handler. These are re-signaled without marking the worker crashed."
           (error 'worker-crashed :worker worker
                  :reason (format nil "protocol-error: ~A" e)))))))
 
-(defun worker-ping (worker &key timeout)
+(defun worker-ping (worker &key timeout (eligible-p (constantly t)))
   "Ask WORKER the liveness question and return the round trip in milliseconds.
 
 WORKER-RPC treats a timeout as a crash, and for a general call that is right:
@@ -907,8 +976,17 @@ decides what a run of silences means.
 
 Signals WORKER-CRASHED for the failures that admit no second opinion: a channel
 already closed, an end of file, a stream error, or an answer that cannot be
-parsed. Those mark the worker crashed here, as WORKER-RPC does."
+parsed. Those mark the worker crashed here, as WORKER-RPC does.
+
+ELIGIBLE-P is called with WORKER once the stream lock is held and before
+anything else is looked at. When it answers NIL nothing is sent and this
+returns :skipped. A ping can wait on the lock behind a save, and by the time it
+gets the lock the worker may have saved its world and closed its channel; the
+check lets the caller say, at that moment, whether the worker is still one it
+means to probe, so a finished save is never read as a crash."
   (bt:with-lock-held ((worker-stream-lock worker))
+    (unless (funcall eligible-p worker)
+      (return-from worker-ping :skipped))
     (unless (worker-stream worker)
       (error 'worker-crashed :worker worker :reason "already-dead"))
     (let ((id (incf (worker-request-counter worker)))
@@ -937,6 +1015,78 @@ parsed. Those mark the worker crashed here, as WORKER-RPC does."
           (error 'worker-crashed :worker worker
                  :reason (format nil "protocol-error: ~A" e)))))))
 
+(defun hibernate-refusal-token (message)
+  "The reason word at the start of a worker's refusal to hibernate, such as
+\"has-threads\" or \"bad-path\", taken from the error MESSAGE it sent.
+
+The worker writes its refusal as the word, a colon and the detail, and its
+server puts \"Internal error: \" in front of every handler error. The prefix is
+removed first, on purpose, so the word read is the worker's and not the
+server's. Returns the whole trimmed message when it carries no colon."
+  (let* ((prefix "Internal error: ")
+         (text (string-trim '(#\Space) (or message "")))
+         (body (if (and (>= (length text) (length prefix))
+                        (string= prefix text :end2 (length prefix)))
+                   (subseq text (length prefix))
+                   text))
+         (colon (position #\: body)))
+    (string-trim '(#\Space) (if colon (subseq body 0 colon) body))))
+
+(defun hibernate-worker-process (worker path
+                                 &key (timeout *hibernate-timeout-seconds*)
+                                      (deadline 170))
+  "Ask WORKER to save its whole world to the core file PATH, and say how it went.
+
+Returns one of:
+  (values :hibernated RESULT)      the core is written; RESULT is the worker's
+                                   reply, with \"path\", \"bytes\" and
+                                   \"milliseconds\". The worker closes its
+                                   channel after answering.
+  (values :refused TOKEN MESSAGE)  the worker declined and is still serving;
+                                   TOKEN is its reason word (see
+                                   hibernate-refusal-token), MESSAGE the text.
+  (values :timeout NIL)            no answer within TIMEOUT seconds; the
+                                   worker's state, stream and socket are left
+                                   exactly as they were.
+  (values :died NIL)               the channel ended or broke before an answer
+                                   came, or the answer could not be read, so
+                                   the worker cannot be trusted to be serving.
+
+DEADLINE is the worker's own limit on the save, sent with the request; it is
+kept below TIMEOUT so the worker answers before this stops waiting.
+
+None of these outcomes marks the worker crashed. A successful save ends the
+channel by design, and a worker killed for memory in the middle of a save has
+not crashed in any sense the crash breaker should count; the caller decides
+what each outcome means for the session. Signals WORKER-CRASHED with reason
+\"already-dead\" only when the worker has no channel at all."
+  (bt:with-lock-held ((worker-stream-lock worker))
+    (unless (worker-stream worker)
+      (error 'worker-crashed :worker worker :reason "already-dead"))
+    (let ((id (incf (worker-request-counter worker)))
+          (params (make-hash-table :test 'equal)))
+      (setf (gethash "path" params) (uiop:native-namestring path)
+            (gethash "deadline_seconds" params) deadline)
+      (handler-case
+          (progn
+            (%send-json-rpc (worker-stream worker) id "worker/hibernate" params)
+            (values :hibernated
+                    (%read-json-rpc-response (worker-stream worker) id timeout)))
+        (worker-rpc-error (e)
+          (let ((message (or (worker-rpc-error-message e) "")))
+            (values :refused (hibernate-refusal-token message) message)))
+        (sb-ext:timeout ()
+          (values :timeout nil))
+        (end-of-file ()
+          (values :died nil))
+        (stream-error ()
+          (values :died nil))
+        (error (e)
+          (log-event :warn "worker.hibernate.unreadable-answer"
+                     "id" (worker-id worker)
+                     "error" (princ-to-string e))
+          (values :died nil))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Public API — kill
 ;;; ---------------------------------------------------------------------------
@@ -949,20 +1099,21 @@ Returns T if signal was sent, NIL if process was already dead."
       (ignore-errors (sb-ext:process-kill process 15))
       t)))
 
-(defun kill-worker (worker)
-  "Terminate the worker process and clean up resources.
+(defun release-worker-process (worker)
+  "Close WORKER's channel and end its process, leaving its state alone.
 Closes the TCP socket under stream-lock for mutual exclusion with
 concurrent worker-rpc calls. Sends SIGTERM first, waits up to 2
-seconds, then SIGKILL if still alive. Sets state to :dead.
+seconds, then SIGKILL if still alive.
 Closes the worker's stderr pipe before waiting on the drain thread so
 the thread exits cleanly (read-line returns NIL) without holding
 *stderr-drain-lock*; falls back to destroy-thread only if the thread
 has not exited after 1 s.
-Robust against already-dead processes."
+Robust against already-dead processes and safe to call twice.
+
+The pool calls this directly when the state is its own to set, as after a
+worker has saved its world and is to be recorded :hibernated rather than
+:dead."
   (let ((process (worker-process-info worker)))
-    (log-event :info "worker.killing"
-               "id" (worker-id worker)
-               "pid" (worker-pid worker))
     ;; Close TCP socket under stream-lock first, so any concurrent
     ;; worker-rpc sees the closure as a stream-error.
     (bt:with-lock-held ((worker-stream-lock worker))
@@ -970,8 +1121,7 @@ Robust against already-dead processes."
         (when socket
           (ignore-errors (usocket:socket-close socket))
           (setf (worker-socket worker) nil
-                (worker-stream worker) nil)))
-      (setf (worker-state worker) :dead))
+                (worker-stream worker) nil))))
     ;; Terminate the OS process outside the lock (may block up to ~2.2s)
     (when process
       (handler-case
@@ -1007,10 +1157,23 @@ Robust against already-dead processes."
             (ignore-errors (bt:destroy-thread th)))
           (setf (worker-stderr-thread worker) nil)))
       (ignore-errors (sb-ext:process-close process)))
-    (log-event :info "worker.killed"
-               "id" (worker-id worker)
-               "pid" (worker-pid worker))
     worker))
+
+(defun kill-worker (worker)
+  "Terminate the worker process, clean up its resources and set its state to
+:dead. The state is set under stream-lock, so a concurrent call that holds the
+lock sees the worker as it was; the cleanup is release-worker-process.
+Robust against already-dead processes."
+  (log-event :info "worker.killing"
+             "id" (worker-id worker)
+             "pid" (worker-pid worker))
+  (bt:with-lock-held ((worker-stream-lock worker))
+    (setf (worker-state worker) :dead))
+  (release-worker-process worker)
+  (log-event :info "worker.killed"
+             "id" (worker-id worker)
+             "pid" (worker-pid worker))
+  worker)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Public API — utility
@@ -1029,11 +1192,17 @@ full semantics (state, stream close, reset-notification, reaper thread)."
 
 (defun check-and-clear-reset-notification (worker)
   "Atomically check and clear the needs-reset-notification flag.
-Returns T if the flag was set (and is now cleared), NIL otherwise.
+Returns T if the flag was set (and is now cleared), NIL otherwise. The second
+value is the worker's reset reason, a sentence saying why the session's
+previous worker was lost when that was not a crash, or NIL; it is cleared too.
 Uses stream-lock for mutual exclusion with concurrent callers,
 preventing the TOCTOU race where two threads both see the flag
 as set and both return crash notifications."
   (bt:with-lock-held ((worker-stream-lock worker))
-    (when (worker-needs-reset-notification worker)
-      (setf (worker-needs-reset-notification worker) nil)
-      t)))
+    (let ((reason (worker-reset-reason worker)))
+      (setf (worker-reset-reason worker) nil)
+      (if (worker-needs-reset-notification worker)
+          (progn
+            (setf (worker-needs-reset-notification worker) nil)
+            (values t reason))
+          (values nil reason)))))

@@ -28,7 +28,7 @@
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht #:text-content #:result #:rpc-error)
   (:import-from #:dsmr-mcp/src/hermetic/pool
-                #:get-or-assign-worker #:pool-shutting-down
+                #:with-session-worker #:pool-shutting-down
                 #:pool-capacity-exceeded #:pool-rpc-with-hard-kill
                 #:circuit-breaker-active
                 #:circuit-breaker-active-remaining-seconds)
@@ -73,13 +73,28 @@ dispatcher-side tools fall through to the local tool dispatch."
        (member name +worker-routed-tools+ :test #'string=)
        t))
 
+(defun %reset-notice (reason)
+  "The text a session is given on its first call after its worker was replaced.
+REASON, when non-NIL, says why the previous worker was lost; without one the
+worker crashed."
+  (if reason
+      (format nil "Worker was reset: ~A. In-image state has been lost. ~
+Retry your call." reason)
+      "Worker was reset after a crash. \
+In-image state has been lost. Retry your call."))
+
 (defun dispatch-hermetic-call (session id name args)
   "Route one tools/call to the session's dedicated hermetic worker.
 
-Implements the one-notification pattern: if the worker was just reset after
-a crash, the agent receives a structured isError reset notification as the
-response to THIS call, and the call is NOT forwarded to the worker. The next
-call from the same session proceeds normally.
+The whole call runs while the session's worker is held through
+with-session-worker, so it can never land on a worker that is being saved to
+disk or stopped.
+
+Implements the one-notification pattern: if the worker was just reset, after
+a crash or for a reason the pool recorded (which the notice then names), the
+agent receives a structured isError reset notification as the response to
+THIS call, and the call is NOT forwarded to the worker. The next call from the
+same session proceeds normally.
 
 Routes by NAME:
   \"inspect-object\" -> worker method \"worker/inspect-object\" with a
@@ -112,19 +127,19 @@ name string. ARGS is the tool arguments hash-table, or NIL when the client
 sent no arguments."
   (let ((session-root (session-project-root session)))
     (handler-case
-        (let* ((worker    (get-or-assign-worker *current-session-id*))
-               (had-reset (check-and-clear-reset-notification worker)))
-          (when had-reset
-            (log-event :warn "dispatch.worker-reset"
-                       "session" *current-session-id*
-                       "tool" name)
-            (return-from dispatch-hermetic-call
-              (result id
-                      (make-ht "isError" t
-                               "content"
-                               (text-content
-                                "Worker was reset after a crash. \
-In-image state has been lost. Retry your call.")))))
+        (with-session-worker (worker *current-session-id*)
+          (multiple-value-bind (had-reset reset-reason)
+              (check-and-clear-reset-notification worker)
+            (when had-reset
+              (log-event :warn "dispatch.worker-reset"
+                         "session" *current-session-id*
+                         "tool" name
+                         "reason" (or reset-reason "crash"))
+              (return-from dispatch-hermetic-call
+                (result id
+                        (make-ht "isError" t
+                                 "content"
+                                 (text-content (%reset-notice reset-reason)))))))
           ;; Name-based routing.
           (cond
             ;; ----------------------------------------------------------------

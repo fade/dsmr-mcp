@@ -18,6 +18,9 @@
 ;;;;    the eval; the parent additionally SIGKILLs the worker after the soft
 ;;;;    timeout plus DSMR_WORKER_KILL_GRACE_SECONDS (default 5s) to cover
 ;;;;    runaway FFI that cannot be interrupted by the soft timeout.
+;;;; 8. Workers are held while their session lives and are never reaped for
+;;;;    idleness; under memory pressure an idle one may be hibernated or, when
+;;;;    it holds no state, stopped.
 ;;;;
 ;;;; Thread safety — lock hierarchy (NEVER acquire in reverse order):
 ;;;;   *pool-lock* (global) -> placeholder.lock -> worker.stream-lock
@@ -53,7 +56,20 @@
                 #:worker-liveness-checked-at
                 #:*reaper-threads* #:*reaper-threads-lock*
                 #:resolve-worker-startup-timeout
-                #:effective-worker-startup-timeout)
+                #:effective-worker-startup-timeout
+                #:worker-stateful-p #:worker-last-activity
+                #:worker-in-flight #:worker-reset-reason
+                #:worker-hibernate-core-path #:worker-hibernated-at
+                #:worker-core-bytes #:worker-last-hibernate-milliseconds
+                #:worker-refused-reason #:worker-refused-at
+                #:hibernate-worker-process #:release-worker-process)
+  (:import-from #:dsmr-mcp/src/hermetic/pool-records
+                #:server-stem #:ensure-owner-directory
+                #:unsafe-hibernate-path #:hibernated-core-path
+                #:disk-allows-hibernation-p #:expected-core-bytes
+                #:free-disk-bytes)
+  (:import-from #:dsmr-mcp/src/bus/hostfiles
+                #:fleet-line #:append-fleet-line)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
                 #:resolve-eval-timeout #:effective-eval-timeout)
   (:import-from #:dsmr-mcp/src/log #:log-event)
@@ -81,7 +97,14 @@
            #:circuit-breaker-active
            #:circuit-breaker-active-session-id
            #:circuit-breaker-active-remaining-seconds
-           #:pool-rpc-with-hard-kill))
+           #:pool-rpc-with-hard-kill
+           #:call-with-session-worker #:with-session-worker
+           #:*after-assign-hook*
+           #:hibernate-session-worker
+           #:*free-disk-bytes-function*
+           #:*hibernate-worker-process-function*
+           #:*pool-transition-condvar*
+           #:+stateless-worker-methods+))
 
 (in-package #:dsmr-mcp/src/hermetic/pool)
 
@@ -360,6 +383,42 @@ Must be acquired before any worker-stream-lock (lock hierarchy).")
   "Maps session-id to list of crash timestamps (get-universal-time).
 Used by the circuit breaker to detect repeated crash loops.")
 
+(defvar *pool-transition-condvar*
+  (bt:make-condition-variable :name "pool-transition")
+  "Broadcast, with *pool-lock* held, whenever a worker changes state or a call
+hands its worker back. A thread waiting for a worker to finish saving or
+resuming waits on it with *pool-lock*.")
+
+(defvar *after-assign-hook* nil
+  "NIL, or a function of one argument, the worker, that call-with-session-worker
+calls after get-or-assign-worker returns and before it takes the worker for the
+call. It exists so a test can make something happen to the worker inside that
+window deterministically; nothing in the server sets it.")
+
+(defvar *free-disk-bytes-function* #'free-disk-bytes
+  "The function hibernate-session-worker asks for the free bytes of a
+directory before it lets a worker save its world there.")
+
+(defvar *hibernate-worker-process-function* #'hibernate-worker-process
+  "The function hibernate-session-worker calls, with the worker and the core
+path, to have a worker save its world. It answers as hibernate-worker-process
+does; a test binds it to stand in for a save that is slow or that dies.")
+
+;; The calls that leave nothing behind in a worker's image. Every other call
+;; marks the worker stateful. This is wider than the strict rule (only an
+;; eval, a system load or a test run can create state) on purpose: the inspect
+;; calls can only act on objects an earlier eval registered, so they never mark
+;; a fresh worker in practice, and when in doubt a worker should be hibernated
+;; rather than stopped.
+(defparameter +stateless-worker-methods+
+  '("worker/ping" "worker/code-find" "worker/code-describe"
+    "worker/code-find-references")
+  "Worker methods that do not make a worker stateful.")
+
+(defun %unix-now ()
+  "The current time in whole Unix seconds."
+  (- (get-universal-time) (encode-universal-time 0 0 0 1 1 1970 0)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Placeholder struct — coordinates concurrent spawn requests for same session
 ;;; ---------------------------------------------------------------------------
@@ -382,26 +441,32 @@ until the spawn completes or fails."
   (cancelled nil :type boolean))
 
 (defun %effective-pool-size ()
-  "Return the effective pool size: live workers plus in-flight spawns.
-Counts all *all-workers* plus placeholder entries in *affinity-map*.
-Must be called with *pool-lock* held."
+  "Return the effective pool size: resident workers plus in-flight spawns.
+Counts every worker in *all-workers* except those in state :hibernated, plus
+placeholder entries in *affinity-map*. A hibernated worker has no process and
+holds no memory, only a file on disk, and the size limit exists to bound
+memory, so it does not take a place; a worker that is saving or resuming
+still has a process and does. Must be called with *pool-lock* held."
   (let ((pending 0))
     (maphash (lambda (k v)
                (declare (ignore k))
                (when (typep v 'worker-placeholder)
                  (incf pending)))
              *affinity-map*)
-    (+ (length *all-workers*) pending)))
+    (+ (count-if-not (lambda (w) (eq (worker-state w) :hibernated))
+                     *all-workers*)
+       pending)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Internal — spawn and bind
 ;;; ---------------------------------------------------------------------------
 
-(defun %spawn-and-bind (session-id placeholder &key need-reset)
+(defun %spawn-and-bind (session-id placeholder &key need-reset reset-reason)
   "Spawn a worker, bind it to SESSION-ID, and notify waiting threads.
 On failure, clean up the affinity map entry and notify waiters. When
 NEED-RESET is true, arms needs-reset-notification on the new worker before
-making it visible. Returns the worker on success."
+making it visible, with RESET-REASON, when given, as the reason the session's
+reset notice names. Returns the worker on success."
   (let ((new-worker nil))
     (unwind-protect
         (progn
@@ -409,7 +474,8 @@ making it visible. Returns the worker on success."
           (setf (worker-state new-worker) :bound)
           (setf (worker-session-id new-worker) session-id)
           (when need-reset
-            (setf (worker-needs-reset-notification new-worker) t))
+            (setf (worker-needs-reset-notification new-worker) t
+                  (worker-reset-reason new-worker) reset-reason))
           (let ((cancelled nil))
             (bt:with-lock-held (*pool-lock*)
               (cond
@@ -418,7 +484,8 @@ making it visible. Returns the worker on success."
                  (setf (worker-state new-worker) :released))
                 (t
                  (setf (gethash session-id *affinity-map*) new-worker)
-                 (push new-worker *all-workers*))))
+                 (push new-worker *all-workers*)))
+              (%condition-broadcast *pool-transition-condvar*))
             (cond
               (cancelled
                (bt:with-lock-held ((worker-placeholder-lock placeholder))
@@ -769,6 +836,18 @@ reaches *missed-pings-before-wedged*, at which point the worker is retired."
                               (symbol-name (worker-liveness worker)))
                   "error" (princ-to-string condition))))))
 
+(defun %ping-eligible-p (worker)
+  "True when WORKER is still one a liveness ping may reach: :bound or :standby
+with no call holding it.
+
+worker-ping calls this while it holds the worker's stream lock, so it reads
+the slots without taking *pool-lock*, which would invert the lock order. The
+read is enough: every state that rules a ping out is set before the save or
+stop takes the stream lock, and stays set until the channel is gone."
+  (and (member (worker-state worker) '(:bound :standby))
+       (zerop (worker-in-flight worker))
+       t))
+
 (defun %ping-idle-worker (worker)
   "Ask WORKER a real question and record what the answer established.
 
@@ -801,14 +880,26 @@ A miss from a worker whose process has gone establishes :dead at once: the wedge
 case is an addition to the crash case, never a replacement for it, and a dead
 process must not be reported as merely unresponsive.
 
+A worker that is saving, saved or resuming is never pinged, and the state is
+checked a second time once the ping holds the worker's stream lock, through
+%ping-eligible-p: a ping that waited on that lock behind a save would otherwise
+reach a channel the save has just closed and read it as a crash. A ping skipped
+that way records nothing.
+
 Returns T when the worker answered."
+  (when (member (worker-state worker) '(:hibernating :hibernated :resuming))
+    (return-from %ping-idle-worker nil))
   (handler-case
       (let ((milliseconds (worker-ping worker
-                                       :timeout *worker-ping-timeout-seconds*)))
-        (setf (worker-consecutive-missed-pings worker) 0)
-        (%record-liveness worker :healthy :active-probe
-                          :milliseconds milliseconds)
-        t)
+                                       :timeout *worker-ping-timeout-seconds*
+                                       :eligible-p #'%ping-eligible-p)))
+        (cond
+          ((eq milliseconds :skipped) nil)
+          (t
+           (setf (worker-consecutive-missed-pings worker) 0)
+           (%record-liveness worker :healthy :active-probe
+                             :milliseconds milliseconds)
+           t)))
     (error (e)
       (%record-missed-ping worker e)
       nil)))
@@ -823,10 +914,17 @@ as :healthy on a passive-inference basis, and the basis is the whole of the
 honesty here: it says the process is alive and its channel has not failed, and
 it does not say the worker answered anything. A worker wedged inside an
 evaluation reads :healthy here until its own call's timeout fires, which is what
-the timeout is for."
-  (if (%worker-process-alive-p worker)
-      (%record-liveness worker :healthy :passive-inference)
-      (%record-liveness worker :dead :passive-inference)))
+the timeout is for.
+
+A worker that is saving, saved or resuming is left alone: its process is
+meant to be going or gone, and that is not evidence of anything."
+  (cond
+    ((member (worker-state worker) '(:hibernating :hibernated :resuming))
+     nil)
+    ((%worker-process-alive-p worker)
+     (%record-liveness worker :healthy :passive-inference))
+    (t
+     (%record-liveness worker :dead :passive-inference))))
 
 (defun %check-worker-liveness (workers)
   "Establish a liveness classification for every worker in WORKERS on this tick.
@@ -842,6 +940,8 @@ this thread the length of that call and nothing else, since a real call's own
 answer keeps the worker classified healthy either way."
   (dolist (w workers)
     (case (worker-state w)
+      ;; Saving, saved or resuming: no channel to ask and no process to judge.
+      ((:hibernating :hibernated :resuming) nil)
       (:standby (%ping-idle-worker w))
       (:bound (%infer-bound-worker-liveness w))
       (t nil))))
@@ -871,7 +971,11 @@ second is what %check-worker-liveness runs, for idle workers alone."
                    ;; Snapshot worker list under lock
                    (bt:with-lock-held (*pool-lock*)
                      (setf workers (copy-list *all-workers*)))
-                   ;; Check each bound/standby worker outside the lock
+                   ;; Check each bound/standby worker outside the lock. Only
+                   ;; those two states are judged: a worker that is saving,
+                   ;; saved or resuming (:hibernating, :hibernated,
+                   ;; :resuming) has a process that is meant to end, so its
+                   ;; absence is never a crash here.
                    (dolist (w workers)
                      (when (member (worker-state w) '(:bound :standby))
                        (unless (%worker-process-alive-p w)
@@ -1089,7 +1193,7 @@ Signals pool-capacity-exceeded if max workers would be exceeded.
 Signals circuit-breaker-active both when the breaker trips and on any later
 call inside the cooldown window; the condition carries the seconds remaining."
   (let ((entry nil) (need-spawn nil) (assigned-from-standby nil)
-        (need-reset nil) (old-worker-to-kill nil)
+        (need-reset nil) (reset-reason nil) (old-worker-to-kill nil)
         (circuit-breaker-tripped nil))
     (bt:with-lock-held (*pool-lock*)
       (unless *pool-running*
@@ -1137,7 +1241,14 @@ call inside the cooldown window; the condition carries the seconds remaining."
              (when (>= (length history) *crash-breaker-threshold*)
                (setf circuit-breaker-tripped t))))
          (setf entry nil
-               need-reset (not (worker-needs-reset-notification old-worker-to-kill))))
+               need-reset (not (worker-needs-reset-notification old-worker-to-kill)))
+         ;; A worker lost for a reason the pool recorded (it died while
+         ;; saving its world) is no crash: no history was pushed above, and
+         ;; the session is told why in the notice.
+         (when (and (eq :dead (worker-state old-worker-to-kill))
+                    (worker-reset-reason old-worker-to-kill))
+           (setf need-reset t
+                 reset-reason (worker-reset-reason old-worker-to-kill))))
         ;; Path 2: placeholder — another thread is spawning
         ((and entry (typep entry 'worker-placeholder))
          nil))
@@ -1151,7 +1262,8 @@ call inside the cooldown window; the condition carries the seconds remaining."
                           (worker-session-id w) session-id
                           (gethash session-id *affinity-map*) w)
                     (when need-reset
-                      (setf (worker-needs-reset-notification w) t))
+                      (setf (worker-needs-reset-notification w) t
+                            (worker-reset-reason w) reset-reason))
                     (setf assigned-from-standby w)
                     (return))
                    (t
@@ -1189,7 +1301,8 @@ call inside the cooldown window; the condition carries the seconds remaining."
        (%schedule-replenish)
        assigned-from-standby)
       (need-spawn
-       (%spawn-and-bind session-id entry :need-reset need-reset))
+       (%spawn-and-bind session-id entry :need-reset need-reset
+                                         :reset-reason reset-reason))
       (t
        (%wait-for-placeholder entry)))))
 
@@ -1222,7 +1335,8 @@ spawn thread will clean up the worker after it completes."
            (remhash session-id *crash-history*)
            (remhash session-id *circuit-breaker-map*)
            (log-event :info "pool.session.cancelled-spawn"
-                      "session" session-id)))))
+                      "session" session-id))))
+      (%condition-broadcast *pool-transition-condvar*))
     (when worker-to-kill
       (log-event :info "pool.session.released"
                  "session" session-id
@@ -1266,7 +1380,8 @@ was bound, :placeholder if a spawn was in progress (cancelled)."
                  kill-result :placeholder)
            (remhash session-id *affinity-map*)
            (remhash session-id *crash-history*)
-           (when reset (remhash session-id *circuit-breaker-map*))))))
+           (when reset (remhash session-id *circuit-breaker-map*)))))
+      (%condition-broadcast *pool-transition-condvar*))
     (when worker-to-kill
       (log-event :info "pool.session.worker-killed"
                  "session" session-id
@@ -1275,6 +1390,286 @@ was bound, :placeholder if a spawn was in progress (cancelled)."
       (ignore-errors (kill-worker worker-to-kill))
       (%schedule-replenish))
     kill-result))
+
+;;; ---------------------------------------------------------------------------
+;;; Public API: acquiring a session's worker for one call
+;;; ---------------------------------------------------------------------------
+
+(defparameter *acquire-attempts* 5
+  "How many times call-with-session-worker asks for the session's worker before
+giving up. Each retry means the worker it was given stopped being usable in
+between, which takes a save, a stop or a crash landing in that instant, so a
+handful of passes is already far beyond anything ordinary.")
+
+(defun call-with-session-worker (session-id function)
+  "Call FUNCTION with SESSION-ID's worker, holding that worker for the call.
+
+The worker is taken in the same *pool-lock* hold that checks it is still the
+session's worker and still :bound, by counting one more call in flight on it,
+and it is handed back when FUNCTION returns or unwinds. Hibernating a worker
+and stopping it under memory pressure both check that no call is in flight and
+change the state within one hold of the same lock, so either the call took the
+worker first and they refuse it as busy, or they acted first and this sees the
+worker is no longer :bound. In that case the worker is not used at all: the
+request goes back through get-or-assign-worker, which hands out a usable one,
+and no call ever reaches a worker that is saving, saved or stopped.
+
+Signals an error naming the session when no usable worker could be held after
+*acquire-attempts* passes; get-or-assign-worker's own conditions pass through."
+  (loop repeat *acquire-attempts*
+        do (let ((worker (get-or-assign-worker session-id))
+                 (acquired nil))
+             (when *after-assign-hook*
+               (funcall *after-assign-hook* worker))
+             (bt:with-lock-held (*pool-lock*)
+               (when (and (eq (gethash session-id *affinity-map*) worker)
+                          (eq (worker-state worker) :bound))
+                 (incf (worker-in-flight worker))
+                 (setf (worker-last-activity worker) (%unix-now)
+                       acquired t)))
+             (when acquired
+               (return-from call-with-session-worker
+                 (unwind-protect (funcall function worker)
+                   (bt:with-lock-held (*pool-lock*)
+                     (setf (worker-in-flight worker)
+                           (max 0 (1- (worker-in-flight worker)))
+                           (worker-last-activity worker) (%unix-now))
+                     (%condition-broadcast *pool-transition-condvar*)))))
+             (log-event :debug "pool.acquire.retry"
+                        "session" session-id
+                        "worker_id" (worker-id worker)
+                        "state" (string-downcase
+                                 (symbol-name (worker-state worker))))))
+  (error "No usable worker could be held for session ~A after ~D attempts."
+         session-id *acquire-attempts*))
+
+(defmacro with-session-worker ((var session-id) &body body)
+  "Evaluate BODY with VAR bound to SESSION-ID's worker, held for the duration
+of BODY as call-with-session-worker holds it."
+  `(call-with-session-worker ,session-id (lambda (,var) ,@body)))
+
+;;; ---------------------------------------------------------------------------
+;;; Public API: hibernating a session's worker
+;;; ---------------------------------------------------------------------------
+
+(defparameter *died-while-hibernating-reason*
+  "its worker died while hibernating, most likely killed for memory"
+  "The reset reason a session is given when its worker died during a save and
+left no core behind. A save can briefly need twice the worker's memory, so on
+a host already short of it the kernel is the likeliest cause.")
+
+(defun %return-to-service (worker reason)
+  "Put WORKER, marked :hibernating, back to :bound and keep REASON, a word, as
+why it was not hibernated. Leaves a worker whose state something else changed
+in the meantime alone."
+  (bt:with-lock-held (*pool-lock*)
+    (when (eq (worker-state worker) :hibernating)
+      (setf (worker-state worker) :bound))
+    (setf (worker-refused-reason worker) reason
+          (worker-refused-at worker) (%unix-now))))
+
+(defun %core-file-bytes (path)
+  "The size of the regular file PATH in bytes, or NIL when there is none."
+  (handler-case
+      (let ((stat (sb-posix:stat (uiop:native-namestring path))))
+        (and (sb-posix:s-isreg (sb-posix:stat-mode stat))
+             (sb-posix:stat-size stat)))
+    (error () nil)))
+
+(defun %finish-hibernation (session-id worker path result milliseconds)
+  "Record WORKER, whose world is saved at PATH, as :hibernated.
+
+The worker's process and channel are let go first, outside *pool-lock*. When
+the session let the worker go while it was saving (it is no longer
+:hibernating), the saved world belongs to nobody and the file is deleted.
+RESULT is the worker's reply, or NIL when there was none to read. Returns the
+outcome and reason for hibernate-session-worker."
+  (release-worker-process worker)
+  (let ((bytes (or (and (hash-table-p result) (gethash "bytes" result))
+                   (%core-file-bytes path)))
+        (kept nil))
+    (bt:with-lock-held (*pool-lock*)
+      (when (eq (worker-state worker) :hibernating)
+        (setf (worker-state worker) :hibernated
+              (worker-hibernate-core-path worker) (uiop:native-namestring path)
+              (worker-hibernated-at worker) (%unix-now)
+              (worker-core-bytes worker) bytes
+              (worker-last-hibernate-milliseconds worker) milliseconds
+              kept t)))
+    (cond
+      (kept
+       (log-event :info "pool.worker.hibernated"
+                  "session" session-id
+                  "worker_id" (worker-id worker)
+                  "bytes" (or bytes "unknown")
+                  "ms" milliseconds)
+       (values :hibernated nil))
+      (t
+       (ignore-errors (delete-file path))
+       (log-event :info "pool.hibernate.discarded"
+                  "session" session-id
+                  "worker_id" (worker-id worker)
+                  "state" (string-downcase (symbol-name (worker-state worker))))
+       (values :not-eligible (string-downcase
+                              (symbol-name (worker-state worker))))))))
+
+(defun %lose-worker-during-hibernation (session-id worker)
+  "Take WORKER, which died while saving and left no core, out of service.
+
+Its process and channel are let go outside *pool-lock*. Under the lock it
+becomes :dead with the reason the session will be told, and it stays the
+session's entry, so the session's next call gets a fresh worker carrying that
+reset notice. This is not a crash: nothing is added to the crash history and
+the breaker is not touched. When the session let the worker go meanwhile there
+is no one to tell, and nothing more is done."
+  (release-worker-process worker)
+  (let ((lost nil))
+    (bt:with-lock-held (*pool-lock*)
+      (when (eq (worker-state worker) :hibernating)
+        (setf (worker-state worker) :dead
+              (worker-reset-reason worker) *died-while-hibernating-reason*
+              *all-workers* (remove worker *all-workers*)
+              lost t)))
+    (when lost
+      (log-event :error "pool.worker.died-during-hibernate"
+                 "session" session-id
+                 "worker_id" (worker-id worker))
+      (ignore-errors
+       (append-fleet-line
+        (fleet-line :error "worker-hibernate-died"
+                    :id session-id
+                    :msg (format nil "worker ~D of session ~A: ~A"
+                                 (worker-id worker) session-id
+                                 *died-while-hibernating-reason*)))))
+    (values :died (if lost "died" "released"))))
+
+(defun %hibernate-marked-worker (session-id worker)
+  "Save the world of WORKER, already marked :hibernating, and settle its state.
+Runs without *pool-lock*, which is taken only for each state change. Returns
+the outcome and reason for hibernate-session-worker."
+  (let* ((id (worker-id worker))
+         (pid (worker-pid worker))
+         (stem (server-stem))
+         (dir (handler-case (ensure-owner-directory stem)
+                (error (e)
+                  (log-event :warn "pool.hibernate.refused"
+                             "session" session-id
+                             "worker_id" id
+                             "reason" "bad-path"
+                             "error" (princ-to-string e))
+                  (%return-to-service worker "bad-path")
+                  (return-from %hibernate-marked-worker
+                    (values :refused "bad-path")))))
+         (path (hibernated-core-path stem id))
+         (expected (expected-core-bytes pid)))
+    (multiple-value-bind (allowed free)
+        (disk-allows-hibernation-p dir expected
+                                   :free-fn *free-disk-bytes-function*)
+      (unless allowed
+        (log-event :warn "pool.hibernate.refused"
+                   "session" session-id
+                   "worker_id" id
+                   "reason" "disk"
+                   "free_bytes" (or free "unknown")
+                   "expected_bytes" expected)
+        (%return-to-service worker "disk")
+        (return-from %hibernate-marked-worker (values :disk "disk"))))
+    (let ((started (get-internal-real-time)))
+      (multiple-value-bind (outcome detail message)
+          (handler-case (funcall *hibernate-worker-process-function* worker path)
+            (error (e)
+              (log-event :error "pool.hibernate.error"
+                         "session" session-id
+                         "worker_id" id
+                         "error" (princ-to-string e))
+              (values :died nil)))
+        (let ((milliseconds (round (* 1000 (- (get-internal-real-time) started))
+                                   internal-time-units-per-second)))
+          (case outcome
+            (:hibernated
+             (%finish-hibernation session-id worker path detail milliseconds))
+            (:refused
+             (log-event :info "pool.hibernate.refused"
+                        "session" session-id
+                        "worker_id" id
+                        "reason" detail
+                        "message" (or message ""))
+             (%return-to-service worker detail)
+             (values :refused detail))
+            (:timeout
+             ;; The worker's own deadline is shorter than this wait, so it
+             ;; should always have answered first; this is the backstop.
+             (log-event :error "pool.hibernate.timeout"
+                        "session" session-id
+                        "worker_id" id
+                        "ms" milliseconds)
+             (%return-to-service worker "timeout")
+             (values :timeout "timeout"))
+            (t
+             ;; The channel ended without a reply. A core on disk means the
+             ;; save finished and only the answer was lost.
+             (if (%core-file-bytes path)
+                 (%finish-hibernation session-id worker path nil milliseconds)
+                 (%lose-worker-during-hibernation session-id worker)))))))))
+
+(defun hibernate-session-worker (session-id)
+  "Have SESSION-ID's worker save its whole world to disk and end its process,
+so it holds no memory until the session needs it again.
+
+Returns (values OUTCOME REASON), OUTCOME being one of:
+  :hibernated    the world is saved and the process is gone; the worker is
+                 :hibernated and no longer counts against the pool size.
+  :busy          a call is holding the worker; it is left serving.
+  :not-eligible  the session has no worker, or it is not :bound (REASON
+                 names the state), or the pool is not running.
+  :refused       the worker declined (REASON is its word: has-threads when
+                 the session started threads of its own, a save that failed,
+                 or bad-path); it is left serving.
+  :disk          less than twice the expected core size is free; it is left
+                 serving.
+  :timeout       no answer in time; it is left serving.
+  :died          it died during the save and left no core; its session gets a
+                 fresh worker and a reset notice saying so on its next call.
+
+A worker is refused rather than saved whenever saving it could lose work it is
+doing or make a short host worse: a call in flight, a thread of the session's
+own, or a disk without room for the core. The reason and time of a refusal are
+kept on the worker. The worker is marked :hibernating under *pool-lock*, which
+is never held across the save; no call can be handed the worker meanwhile, and
+none of these outcomes counts as a crash."
+  (let ((worker nil))
+    (bt:with-lock-held (*pool-lock*)
+      (let ((entry (gethash session-id *affinity-map*)))
+        (cond
+          ((not *pool-running*)
+           (return-from hibernate-session-worker
+             (values :not-eligible "pool-not-running")))
+          ((not (typep entry 'worker))
+           (return-from hibernate-session-worker
+             (values :not-eligible (if entry "spawning" "no-worker"))))
+          ((not (eq (worker-state entry) :bound))
+           (return-from hibernate-session-worker
+             (values :not-eligible
+                     (string-downcase (symbol-name (worker-state entry))))))
+          ((plusp (worker-in-flight entry))
+           (setf (worker-refused-reason entry) "busy"
+                 (worker-refused-at entry) (%unix-now))
+           (return-from hibernate-session-worker (values :busy "busy")))
+          (t
+           (setf (worker-state entry) :hibernating
+                 worker entry)
+           (%condition-broadcast *pool-transition-condvar*)))))
+    (log-event :info "pool.hibernate.start"
+               "session" session-id
+               "worker_id" (worker-id worker))
+    (unwind-protect (%hibernate-marked-worker session-id worker)
+      (bt:with-lock-held (*pool-lock*)
+        ;; Only an unexpected unwind, such as an interrupt, leaves the mark in
+        ;; place. The worker goes back to serving; if its channel did not
+        ;; survive, the next call finds that out the ordinary way.
+        (when (eq (worker-state worker) :hibernating)
+          (setf (worker-state worker) :bound))
+        (%condition-broadcast *pool-transition-condvar*)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Public API — pool-worker-info / pool-status-info
@@ -1363,7 +1758,16 @@ Implements a two-level timeout:
     kill grace (DSMR_WORKER_KILL_GRACE_SECONDS, 5 s unless set).
 
 WORKER-CRASHED from worker-rpc is re-signalled unchanged so the dispatcher's
-existing handler fires for both the soft and hard timeout cases."
+existing handler fires for both the soft and hard timeout cases.
+
+Before sending, the worker's last activity is stamped, and any METHOD outside
++stateless-worker-methods+ marks the worker stateful, so the pool knows it may
+hold a session's work. Both happen under *pool-lock*, which is released before
+the call goes out."
+  (bt:with-lock-held (*pool-lock*)
+    (setf (worker-last-activity worker) (%unix-now))
+    (unless (member method +stateless-worker-methods+ :test #'string=)
+      (setf (worker-stateful-p worker) t)))
   (let* ((soft-timeout (or soft-timeout (effective-eval-timeout)))
          (grace (or grace (effective-worker-kill-grace-seconds)))
          (hard-timeout (+ soft-timeout grace)))
