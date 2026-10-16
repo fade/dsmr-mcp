@@ -1743,6 +1743,13 @@ of BODY as call-with-session-worker holds it."
 left no core behind. A save can briefly need twice the worker's memory, so on
 a host already short of it the kernel is the likeliest cause.")
 
+(defparameter *unanswered-hibernate-reason*
+  "its worker stopped answering while hibernating and was ended"
+  "The reset reason a session is given when its worker did not answer a
+request to hibernate in time and left no finished core. The worker may still
+have been saving, so it is ended rather than put back in service, where its
+session's next call would find it gone and count a crash.")
+
 (defun %return-to-service (worker reason)
   "Put WORKER, marked :hibernating, back to :bound and keep REASON, a word, as
 why it was not hibernated. Leaves a worker whose state something else changed
@@ -1798,35 +1805,41 @@ outcome and reason for hibernate-session-worker."
        (values :not-eligible (string-downcase
                               (symbol-name (worker-state worker))))))))
 
-(defun %lose-worker-during-hibernation (session-id worker)
-  "Take WORKER, which died while saving and left no core, out of service.
+(defun %lose-worker-during-hibernation (session-id worker
+                                        &key (reason *died-while-hibernating-reason*)
+                                             (code "worker-hibernate-died")
+                                             (outcome :died))
+  "Take WORKER, which left no core while saving, out of service.
 
 Its process and channel are let go outside *pool-lock*. Under the lock it
-becomes :dead with the reason the session will be told, and it stays the
-session's entry, so the session's next call gets a fresh worker carrying that
-reset notice. This is not a crash: nothing is added to the crash history and
-the breaker is not touched. When the session let the worker go meanwhile there
-is no one to tell, and nothing more is done."
+becomes :dead with REASON, the sentence the session will be told, and it stays
+the session's entry, so the session's next call gets a fresh worker carrying
+that reset notice. This is not a crash: nothing is added to the crash history
+and the breaker is not touched. The loss is logged as an error and written to
+the fleet log under CODE. Returns OUTCOME and \"died\" for
+hibernate-session-worker. When the session let the worker go meanwhile there
+is no one to tell, nothing more is done, and the reason returned is
+\"released\"."
   (release-worker-process worker)
   (let ((lost nil))
     (bt:with-lock-held (*pool-lock*)
       (when (eq (worker-state worker) :hibernating)
         (setf (worker-state worker) :dead
-              (worker-reset-reason worker) *died-while-hibernating-reason*
+              (worker-reset-reason worker) reason
               *all-workers* (remove worker *all-workers*)
               lost t)))
     (when lost
       (log-event :error "pool.worker.died-during-hibernate"
                  "session" session-id
-                 "worker_id" (worker-id worker))
+                 "worker_id" (worker-id worker)
+                 "reason" reason)
       (ignore-errors
        (append-fleet-line
-        (fleet-line :error "worker-hibernate-died"
+        (fleet-line :error code
                     :id session-id
                     :msg (format nil "worker ~D of session ~A: ~A"
-                                 (worker-id worker) session-id
-                                 *died-while-hibernating-reason*)))))
-    (values :died (if lost "died" "released"))))
+                                 (worker-id worker) session-id reason)))))
+    (values outcome (if lost "died" "released"))))
 
 (defun %hibernate-marked-worker (session-id worker)
   "Save the world of WORKER, already marked :hibernating, and settle its state.
@@ -1883,13 +1896,25 @@ the outcome and reason for hibernate-session-worker."
              (values :refused detail))
             (:timeout
              ;; The worker's own deadline is shorter than this wait, so it
-             ;; should always have answered first; this is the backstop.
+             ;; should always have answered first; this is the backstop. Its
+             ;; answer may still be on the way, and it may still be saving,
+             ;; so it never goes back to serving: it is ended, and a core it
+             ;; finished is kept as the session's world.
              (log-event :error "pool.hibernate.timeout"
                         "session" session-id
                         "worker_id" id
                         "ms" milliseconds)
-             (%return-to-service worker "timeout")
-             (values :timeout "timeout"))
+             (release-worker-process worker)
+             (bt:with-lock-held (*pool-lock*)
+               (setf (worker-refused-reason worker) "timeout"
+                     (worker-refused-at worker) (%unix-now)))
+             (if (%core-file-bytes path)
+                 (%finish-hibernation session-id worker path nil milliseconds)
+                 (%lose-worker-during-hibernation
+                  session-id worker
+                  :reason *unanswered-hibernate-reason*
+                  :code "worker-hibernate-timeout"
+                  :outcome :timeout)))
             (t
              ;; The channel ended without a reply. A core on disk means the
              ;; save finished and only the answer was lost.
@@ -1915,7 +1940,11 @@ Returns (values OUTCOME REASON), OUTCOME being one of:
                  bad-path); it is left serving.
   :disk          less than twice the expected core size is free; it is left
                  serving.
-  :timeout       no answer in time; it is left serving.
+  :timeout       no answer in time and no finished core. The worker may still
+                 have been saving, so it is ended, never put back to serving;
+                 its session gets a fresh worker and a reset notice saying so
+                 on its next call. (When a finished core is there after all,
+                 the outcome is :hibernated.)
   :died          it died during the save and left no core; its session gets a
                  fresh worker and a reset notice saying so on its next call.
 

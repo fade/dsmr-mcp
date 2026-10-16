@@ -374,6 +374,58 @@ and no crash is counted."
       (let ((log (ignore-errors (uiop:read-file-string (fleet-log-path)))))
         (true (and log (search "code=worker-hibernate-died" log)) "~A" log)))))
 
+(define-test a-save-whose-answer-comes-too-late-never-returns-the-worker-to-service
+  "When the worker's answer to a save comes later than the pool waits, the
+worker may still be saving, so it is never put back to serving: its process is
+ended, and the session's next call is answered either by the same worker with
+its world back, when the save had finished, or by a fresh worker whose reset
+notice says why. No crash is counted either way."
+  (%pool-case ()
+    (%eval "late" "(defvar *kept* 1)")
+    (let* ((w (%session-worker "late"))
+           (old-id (worker-id w))
+           (old-pid (worker-pid w))
+           (outcome nil))
+      ;; The pool's wait is cut far below any save, so the worker's answer
+      ;; arrives after the pool has stopped waiting for it.
+      (let ((*hibernate-worker-process-function*
+              (lambda (worker core-path &rest keys)
+                (declare (ignore keys))
+                (hibernate-worker-process worker core-path :timeout 0.05))))
+        (multiple-value-bind (result reason) (hibernate-session-worker "late")
+          (setf outcome result)
+          (true (member result '(:timeout :hibernated)) "outcome ~A ~A" result reason)))
+      (false (eq :bound (worker-state w)) "the worker went back to serving")
+      (true (%wait-until 5 (lambda () (%process-gone-p old-pid)))
+            "the worker's process is still running")
+      (let ((had nil) (reason nil) (new-id nil) (text nil))
+        (with-session-worker (nw "late")
+          (multiple-value-setq (had reason)
+            (check-and-clear-reset-notification nw))
+          (setf new-id (worker-id nw)
+                text (%answer-on nw "(+ 1 1)")))
+        (true (%answers-p text 2) "~A" text)
+        (if (eq outcome :timeout)
+            (progn
+              (true had)
+              (true (and reason (search "stopped answering" reason)) "~A" reason)
+              (true (/= old-id new-id)))
+            (progn
+              (false had)
+              (is = old-id new-id))))
+      (%no-crash-recorded "late")
+      ;; The save the worker started may still be writing its partial core;
+      ;; let it finish before the state home is removed.
+      (let ((tmp (concatenate 'string
+                              (uiop:native-namestring
+                               (hibernated-core-path (server-stem) old-id))
+                              ".tmp")))
+        (%wait-until 20 (lambda ()
+                          (let ((a (ignore-errors (sb-posix:stat-size (sb-posix:stat tmp)))))
+                            (sleep 0.5)
+                            (eql a (ignore-errors
+                                    (sb-posix:stat-size (sb-posix:stat tmp)))))))))))
+
 (define-test a-worker-running-a-session-thread-refuses-and-keeps-serving
   "A worker running a thread the session started refuses with has-threads,
 keeps the reason, and still answers."
