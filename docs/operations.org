@@ -320,11 +320,24 @@ does the same once a minute. A server is named by its pid and its start time
 together, so a pid the kernel has since handed to another process never makes
 a dead server's cores look live.
 
-A core that could not be resumed is moved to =hibernate/failed/= and kept for
-diagnosis. The pool keeps the two newest there and deletes older ones, and
-nothing ever resumes from that directory. Read the =worker-resume-failed= line
-in the fleet error log for the cause, then delete the file when you are done
-with it.
+A resume that fails for a reason that may pass (the handshake ran out of time
+on a slow disk, the kernel refused the fork for memory, the process was killed
+while it loaded) gives up nothing: the worker stays hibernated with its core
+in place, that call fails with an error saying the world is still saved, and
+the session's next call tries again. A resume is retried from the runtime
+that wrote the core, even after the =sbcl= package was upgraded under a
+running server, because the server's own executable is still the old build.
+To give the world up instead, kill the session's worker with
+=pool-kill-worker=.
+
+Only a core the runtime refuses outright, or one whose runtime is gone, is
+final. It is moved to =hibernate/failed/= and kept for diagnosis, and nothing
+ever resumes from that directory. The newest failed core of every worker whose
+server is still running is always kept, so a burst of failures across many
+sessions never deletes one session's world to make room for another's; beyond
+those, the two newest are kept and older ones are deleted. Read the
+=worker-resume-failed= line in the fleet error log for the cause, then delete
+the file when you are done with it.
 
 The dead-owner sweep removes a server's files only on positive evidence that
 it is gone: no process with its pid, or one that started at another time. When
@@ -382,9 +395,10 @@ service's own log instead.
   hibernate. Nothing the service can do will help. A leader puts it in front
   of the operator at once; ending or parking sessions is the only relief left.
 - =worker-resume-failed= (ERROR, written by the pool, =id= naming the session):
-  a hibernated world could not be resumed. The session already received a
-  fresh worker and a reset notice naming the cause, and the core is kept under
-  =hibernate/failed/=. A leader tells whoever owns that session that its
+  a hibernated world could not be resumed, because the runtime refused the
+  core or the runtime that wrote it is gone. A failure that may pass never
+  writes this line. The session already received a fresh worker and a reset
+  notice naming the cause, and the core is kept under =hibernate/failed/=. A leader tells whoever owns that session that its
   in-image state is gone, and reports it if it happens again.
 
 Three WARN codes say the service set something aside: =memory-threshold-ignored=

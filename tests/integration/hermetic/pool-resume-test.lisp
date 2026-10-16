@@ -24,6 +24,7 @@
                 #:with-session-worker #:hibernate-session-worker
                 #:*after-assign-hook* #:*hibernate-worker-process-function*
                 #:*circuit-breaker-map* #:pool-capacity-exceeded
+                #:pool-resume-deferred
                 #:*worker-pool-warmup* #:*max-pool-size*
                 #:*health-check-interval-seconds*)
   (:import-from #:dsmr-mcp/src/hermetic/worker-client
@@ -31,7 +32,9 @@
                 #:worker-id #:worker-pid #:worker-state #:worker-boot-kind
                 #:worker-hibernate-core-path
                 #:worker-last-resume-milliseconds
-                #:check-and-clear-reset-notification)
+                #:check-and-clear-reset-notification
+                #:worker-runtime-path #:worker-runtime-identity
+                #:runtime-identity #:*resolved-worker-resume-timeout*)
   (:import-from #:dsmr-mcp/src/hermetic/pool-records
                 #:server-stem #:owner-directory #:hibernate-root
                 #:failed-core-directory)
@@ -387,6 +390,86 @@ notice names the missing file, and a fleet line records it."
       (let ((log (%fleet-log)))
         (true (and log (search "code=worker-resume-failed" log)) "~A" log))
       (%no-crash-recorded "vanished"))))
+
+(define-test a-resume-that-may-pass-keeps-the-world-for-the-next-call
+  "A resume whose handshake runs out of time gives nothing up: that call fails
+with an error saying the world is still saved, the worker stays hibernated
+with its core in place, nothing is kept as failed or written to the fleet
+log, and the next call resumes the same worker with its world."
+  (%pool-case ()
+    (%eval "flaky" "(defvar *kept* (list 1 2 3))")
+    (let* ((w (%session-worker "flaky"))
+           (id (worker-id w))
+           (path (%hibernated-core "flaky")))
+      ;; No handshake can arrive this soon.
+      (let ((*resolved-worker-resume-timeout* 0.001))
+        (let ((condition (handler-case (progn (get-or-assign-worker "flaky") nil)
+                           (pool-resume-deferred (c) c))))
+          (true condition "the call did not fail as one to retry")
+          (true (and condition (search "still saved" (princ-to-string condition)))
+                "~A" condition)))
+      (is eq :hibernated (worker-state w))
+      (is eq w (%session-worker "flaky"))
+      (true (probe-file path) "the core was given up")
+      (false (uiop:directory-files (failed-core-directory)))
+      (let ((log (%fleet-log)))
+        (false (and log (search "code=worker-resume-failed" log)) "~A" log))
+      (let ((r (get-or-assign-worker "flaky")))
+        (is eq w r)
+        (is = id (worker-id r))
+        (is eq :resumed (worker-boot-kind r))
+        (false (check-and-clear-reset-notification r)))
+      (true (%answers-p (%answer-in "flaky" "(equal *kept* (list 1 2 3))") "T"))
+      (%no-crash-recorded "flaky"))))
+
+(define-test a-resume-starts-the-runtime-that-wrote-the-core
+  "A worker records the runtime it was started with, and its saved world is
+resumed with that runtime, not with whatever this process would start a fresh
+worker with. When that runtime is gone and this server's own executable is the
+same file, the world is resumed with the server's executable."
+  (%pool-case ()
+    (%eval "runtime" "(defvar *kept* 9)")
+    (let* ((w (%session-worker "runtime"))
+           (recorded (worker-runtime-path w))
+           (own (format nil "/proc/~D/exe" (sb-posix:getpid))))
+      (true (and recorded (char= #\/ (char recorded 0))) "recorded ~A" recorded)
+      (is equal (runtime-identity recorded) (worker-runtime-identity w))
+      (%hibernated-core "runtime")
+      ;; The record names a link to the same runtime, and a fresh worker
+      ;; would be started from a path that does not exist, so only the
+      ;; recorded runtime can bring the world back.
+      (let* ((dir (merge-pathnames "runtime-link/" *state-home*))
+             (link (uiop:native-namestring (merge-pathnames "sbcl" dir))))
+        (ensure-directories-exist dir)
+        (sb-posix:symlink recorded link)
+        (bt:with-lock-held (pool::*pool-lock*)
+          (setf (worker-runtime-path w) link))
+        (let ((dsmr-mcp/src/hermetic/worker-client::*cached-sbcl-path*
+                "/nonexistent-runtime/sbcl"))
+          (let ((r (get-or-assign-worker "runtime")))
+            (is eq w r)
+            (is eq :resumed (worker-boot-kind r))
+            (is string= link (worker-runtime-path r))
+            (let ((argv0 (first (uiop:split-string
+                                 (uiop:read-file-string
+                                  (format nil "/proc/~D/cmdline" (worker-pid r)))
+                                 :separator (string (code-char 0))))))
+              (is string= link argv0)))))
+      (true (%answers-p (%answer-in "runtime" "*kept*") 9))
+      ;; The recorded runtime replaced by another file, as a package upgrade
+      ;; does, while this server still runs the one that wrote the core.
+      (true (equal (runtime-identity recorded) (runtime-identity own))
+            "this test process does not run the workers' runtime ~A" recorded)
+      (%hibernated-core "runtime")
+      (bt:with-lock-held (pool::*pool-lock*)
+        (setf (worker-runtime-path w) "/nonexistent-runtime/sbcl"
+              (worker-runtime-identity w) (runtime-identity own)))
+      (let ((r (get-or-assign-worker "runtime")))
+        (is eq w r)
+        (is eq :resumed (worker-boot-kind r))
+        (is string= own (worker-runtime-path r)))
+      (true (%answers-p (%answer-in "runtime" "*kept*") 9))
+      (%no-crash-recorded "runtime"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The pool size

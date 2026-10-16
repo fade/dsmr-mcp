@@ -49,6 +49,7 @@ variable.
 | =DSMR_WORKER_CORE=             | Worker core image new hermetic workers boot from. The launcher sets it when =dsmr.core.worker= is fresh and unsets it otherwise, so leave it alone; unset means workers load from source | set by the launcher | =src/hermetic/worker-client.lisp= (set by =scripts/dsmr-mcp-launch.sh=) |
 | =DSMR_MAX_POOL_SIZE=           | Max total hermetic workers (bound + standby)                       | =16= (min 1)     | =src/hermetic/pool.lisp=           |
 | =DSMR_WORKER_STARTUP_TIMEOUT=  | Seconds to await a worker handshake                               | =30=             | =src/hermetic/worker-client.lisp=  |
+| =DSMR_WORKER_RESUME_TIMEOUT=   | Seconds to await the handshake of a worker resumed from its saved core. A large world read from a busy disk can take far longer than a fresh boot, and a resume that runs out of time keeps the world and is retried on the next call | =120= (min 1), read at server start | =src/hermetic/worker-client.lisp= |
 | =DSMR_WORKER_KILL_GRACE_SECONDS= | Grace before the parent SIGKILLs a hung worker                  | =5= (min 1)      | =src/hermetic/pool.lisp=           |
 | =DSMR_ALIVE_LSP_DIR=           | alive-lsp source checkout to spawn for LSP-backed verbs            | unset (attach-only) | =src/lsp/client.lisp=           |
 | =DSMR_LSP_STARTUP_TIMEOUT=     | Seconds to await a spawned alive-lsp startup line                  | =30=             | =src/lsp/client.lisp=              |

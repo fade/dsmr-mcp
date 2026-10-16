@@ -31,7 +31,8 @@
                 #:with-session-worker #:pool-shutting-down
                 #:pool-capacity-exceeded #:pool-rpc-with-hard-kill
                 #:circuit-breaker-active
-                #:circuit-breaker-active-remaining-seconds)
+                #:circuit-breaker-active-remaining-seconds
+                #:pool-resume-deferred)
   (:import-from #:dsmr-mcp/src/hermetic/worker-client
                 #:worker-crashed
                 #:check-and-clear-reset-notification
@@ -117,6 +118,8 @@ Routes by NAME:
 Structured conditions are caught and returned as isError / rpc-error
 responses so the MCP serve loop never sees an unhandled condition:
   worker-crashed      -> isError with crash message
+  pool-resume-deferred -> isError saying the saved world is intact and the
+                          next call tries again
   pool-shutting-down  -> rpc-error -32000
   pool-capacity-exceeded -> rpc-error -32000
   error (circuit breaker) -> rpc-error -32000
@@ -288,6 +291,15 @@ crash; the object id is no longer valid.")))))
                                      e
                                      (circuit-breaker-active-remaining-seconds
                                       e))))))
+      (pool-resume-deferred (e)
+        (log-event :warn "dispatch.resume-deferred"
+                   "session" *current-session-id*
+                   "tool" name
+                   "reason" (princ-to-string e))
+        (result id (make-ht "isError" t
+                            "error_type" "resume_deferred"
+                            "content"
+                            (text-content (princ-to-string e)))))
       (pool-shutting-down ()
         (rpc-error id -32000 "Worker pool is shutting down"))
       (pool-capacity-exceeded ()

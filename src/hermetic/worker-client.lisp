@@ -55,7 +55,12 @@
            #:worker-reset-reason
            #:*hibernate-timeout-seconds*
            #:hibernate-worker-process #:hibernate-refusal-token
-           #:release-worker-process #:resume-worker))
+           #:release-worker-process #:resume-worker
+           #:worker-spawn-failed-kind #:worker-spawn-failure-final-p
+           #:worker-runtime-path #:worker-runtime-identity
+           #:worker-resume-failure #:runtime-identity #:resume-runtime
+           #:*worker-resume-timeout* #:*resolved-worker-resume-timeout*
+           #:resolve-worker-resume-timeout #:effective-worker-resume-timeout))
 
 (in-package #:dsmr-mcp/src/hermetic/worker-client)
 
@@ -115,6 +120,35 @@ first when nothing has."
 A save can take tens of seconds on a large world. The worker is given its own
 deadline ten seconds shorter than this, so it always answers first, and this
 wait only matters when the worker cannot answer at all.")
+
+(defvar *worker-resume-timeout* nil
+  "Maximum seconds to wait for the handshake of a worker resumed from a core it
+saved of itself, or NIL to read the environment at start.
+
+A resumed world is read back from disk, possibly hundreds of megabytes on a
+busy disk while the host is short of memory, so it gets a budget of its own,
+longer than a fresh worker's. NIL (the default) means
+resolve-worker-resume-timeout reads DSMR_WORKER_RESUME_TIMEOUT, an integer
+number of seconds defaulting to 120 and raised to at least 1. A non-NIL value,
+set globally or bound in the thread that resolves, wins over the environment.")
+
+(defvar *resolved-worker-resume-timeout* nil
+  "The resume handshake timeout in seconds from the last
+resolve-worker-resume-timeout call, or NIL when nothing has resolved yet.")
+
+(defun resolve-worker-resume-timeout ()
+  "Read the resume handshake timeout now and store it in
+*resolved-worker-resume-timeout*. Returns the number of seconds:
+*worker-resume-timeout* when non-NIL, else DSMR_WORKER_RESUME_TIMEOUT, else
+120. The pool calls this whenever it starts."
+  (setf *resolved-worker-resume-timeout*
+        (or *worker-resume-timeout*
+            (%env-seconds "DSMR_WORKER_RESUME_TIMEOUT" 120))))
+
+(defun effective-worker-resume-timeout ()
+  "The resume handshake timeout in seconds as last resolved, resolving it
+first when nothing has."
+  (or *resolved-worker-resume-timeout* (resolve-worker-resume-timeout)))
 
 (defvar *worker-core* nil
   "Path of a worker core image to boot workers from, or NIL to read
@@ -248,7 +282,16 @@ Each thread terminates and self-removes after reaping its process.")
   (refused-at nil)
   ;; Why the session's previous worker was lost, when it was lost for a reason
   ;; other than a crash. The session's reset notice carries it.
-  (reset-reason nil))
+  (reset-reason nil)
+  ;; The runtime executable this worker's process was started with, as an
+  ;; absolute path, and that file's identity when it started (see
+  ;; runtime-identity). A core the worker saves can only be resumed by the
+  ;; same runtime build, so a resume starts from this one.
+  (runtime-path nil)
+  (runtime-identity nil)
+  ;; Why the last resume of this worker's saved world failed in a way worth
+  ;; retrying, while its core is still on disk; NIL once a resume succeeds.
+  (resume-failure nil))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Conditions
@@ -268,10 +311,30 @@ Each thread terminates and self-removes after reaping its process.")
                            (format nil "crashed (~A)" r)))))))
 
 (define-condition worker-spawn-failed (error)
-  ((message :initarg :message :reader worker-spawn-failed-message))
+  ((message :initarg :message :reader worker-spawn-failed-message)
+   (kind :initarg :kind :initform :other :reader worker-spawn-failed-kind))
   (:report (lambda (c s)
              (format s "Failed to spawn worker: ~A"
-                     (worker-spawn-failed-message c)))))
+                     (worker-spawn-failed-message c))))
+  (:documentation "A worker could not be brought up. KIND says how, so a caller
+can tell a failure worth retrying from one that will never succeed:
+  :launch        the process could not be started (fork or exec failed);
+  :timeout       no handshake arrived in time;
+  :exited        the process ended before its handshake;
+  :rejected      the runtime refused the core it was given;
+  :runtime-gone  the runtime a saved core needs is no longer installed;
+  :no-core       there is no saved core to start from;
+  :connect, :auth, :other  the channel could not be set up."))
+
+(defun worker-spawn-failure-final-p (condition)
+  "True when CONDITION says a saved world can never be resumed as things stand:
+the runtime refused the core, the runtime that wrote it is gone, or there is
+no core. Every other failure, a timeout, a fork that failed for memory, a
+process killed while it loaded, may succeed when tried again."
+  (and (typep condition 'worker-spawn-failed)
+       (member (worker-spawn-failed-kind condition)
+               '(:rejected :runtime-gone :no-core))
+       t))
 
 (define-condition worker-rpc-error (error)
   ((code :initarg :code :reader worker-rpc-error-code)
@@ -432,6 +495,72 @@ falls back to 'which sbcl'."
                       (if (and path (plusp (length path))) path "sbcl"))
                   (error () "sbcl"))))))
 
+(defun %executable-file-p (native)
+  "True when NATIVE names a regular file this process may execute."
+  (handler-case
+      (and (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:stat native)))
+           (progn (sb-posix:access native sb-posix:x-ok) t))
+    (error () nil)))
+
+(defun %resolve-executable (name)
+  "NAME as the absolute path of the file that would run, looked up through PATH
+the way a shell would when NAME holds no slash, or NAME itself when nothing
+matches. Workers are started from the resolved path, so the runtime a worker
+ran is exactly the one recorded on it."
+  (cond ((find #\/ name)
+         (if (char= (char name 0) #\/)
+             name
+             (uiop:native-namestring (merge-pathnames name (uiop:getcwd)))))
+        (t
+         (or (loop for dir in (uiop:split-string (or (uiop:getenv "PATH") "")
+                                                 :separator ":")
+                   for candidate = (and (plusp (length dir))
+                                        (concatenate 'string
+                                                     (string-right-trim "/" dir)
+                                                     "/" name))
+                   when (and candidate (%executable-file-p candidate))
+                     return candidate)
+             name))))
+
+(defun runtime-identity (path)
+  "The identity of the executable file at PATH, following links: a list of its
+device, inode, size and modification time, or NIL when it cannot be read. Two
+equal identities name the same file, so a runtime package upgraded in place,
+which writes a new file, never compares equal to the one it replaced."
+  (handler-case
+      (let ((st (sb-posix:stat path)))
+        (list (sb-posix:stat-dev st) (sb-posix:stat-ino st)
+              (sb-posix:stat-size st) (sb-posix:stat-mtime st)))
+    (error () nil)))
+
+(defun resume-runtime (worker)
+  "The runtime to resume WORKER's saved core with, and why, as two values.
+
+A core can only be resumed by the runtime build that wrote it, which is the
+one WORKER's process ran. In order:
+  the recorded runtime path, while the file there is still the same one
+    (:recorded);
+  this server's own executable, through /proc/<pid>/exe, when it is that same
+    file, as after the package was upgraded under a running server (:server);
+  the recorded path anyway when a different file is there now (:changed); if
+    it is another build it refuses the core, and that refusal is final;
+  the runtime this process starts fresh workers with, when nothing was
+    recorded (:unrecorded).
+Returns (values NIL :gone) when the recorded runtime is gone and nothing else
+is that same file."
+  (let ((path (worker-runtime-path worker))
+        (identity (worker-runtime-identity worker))
+        (own (format nil "/proc/~D/exe" (sb-posix:getpid))))
+    (cond ((null path)
+           (values (%resolve-executable (%find-sbcl-path)) :unrecorded))
+          ((and identity (equal identity (runtime-identity path)))
+           (values path :recorded))
+          ((and identity (equal identity (runtime-identity own)))
+           (values own :server))
+          ((%executable-file-p path)
+           (values path :changed))
+          (t (values nil :gone)))))
+
 (defun %quicklisp-setup-path ()
   "Return the absolute path to Quicklisp's setup.lisp if Quicklisp is
 loaded in the current image, or NIL otherwise."
@@ -508,20 +637,23 @@ handshake JSON line."
       "--eval" "(asdf:load-system :dsmr-mcp/src/hermetic/worker/main)"
       "--eval" "(dsmr-mcp/src/hermetic/worker/main:start)"))))
 
-(defun %launch-worker-process (secret id &key core hibernated-core root)
+(defun %launch-worker-process (secret id &key core hibernated-core root runtime)
   "Launch a worker child process via sb-ext:run-program: resumed from the
 saved core HIBERNATED-CORE when given, else booted from the worker core image
 CORE when given, else loaded from source. ROOT, when non-NIL, replaces the
-inherited DSMR_PROJECT_ROOT.
-Returns the sb-ext:process object with stdout and stderr as streams.
+inherited DSMR_PROJECT_ROOT. RUNTIME, when non-NIL, is the runtime executable
+to start; otherwise it is the one this process runs, resolved through PATH.
+Returns two values: the sb-ext:process object with stdout and stderr as
+streams, and the absolute path of the runtime started.
 Always uses bare SBCL; dsmr-mcp is SBCL-only (no ros run wrapper)."
   (let ((env (%build-environment secret id :root root))
-        (sbcl-path (%find-sbcl-path)))
-    (sb-ext:run-program sbcl-path
-                        (%build-sbcl-args :core core
-                                          :hibernated-core hibernated-core)
-                        :output :stream :error :stream :wait nil
-                        :search t :environment env)))
+        (sbcl-path (or runtime (%resolve-executable (%find-sbcl-path)))))
+    (values (sb-ext:run-program sbcl-path
+                                (%build-sbcl-args :core core
+                                                  :hibernated-core hibernated-core)
+                                :output :stream :error :stream :wait nil
+                                :search t :environment env)
+            sbcl-path)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Internal helpers — handshake
@@ -535,6 +667,7 @@ since (integerp 'null) is NIL."
   (loop for line = (%read-line-limited stdout nil +max-json-line-bytes+)
         unless line do
           (error 'worker-spawn-failed
+                 :kind :exited
                  :message "Worker closed stdout before handshake")
         do (let ((json (ignore-errors (com.inuoe.jzon:parse line))))
              (when (and (hash-table-p json) (gethash "tcp_port" json))
@@ -558,15 +691,16 @@ since (integerp 'null) is NIL."
 (defun %read-handshake (process timeout)
   "Read the JSON handshake line from the worker's stdout.
 Returns three values: tcp-port, pid, swank-port (or NIL).
-Signals WORKER-SPAWN-FAILED on timeout or if stdout is closed
-before a valid handshake is found."
+Signals WORKER-SPAWN-FAILED of kind :timeout on timeout, or of kind :exited
+when stdout is closed before a valid handshake is found."
   (let ((stdout (sb-ext:process-output process)))
     (handler-case
         (sb-ext:with-timeout timeout
           (%parse-handshake-from-stream stdout))
       (sb-ext:timeout ()
         (error 'worker-spawn-failed
-               :message (format nil "Worker handshake timed out after ~Ds"
+               :kind :timeout
+               :message (format nil "Worker handshake timed out after ~As"
                                 timeout))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -689,36 +823,98 @@ the DSMR_PROJECT_ROOT this process passes on, else NIL."
       (let ((inherited (uiop:getenv "DSMR_PROJECT_ROOT")))
         (and inherited (plusp (length inherited)) inherited))))
 
-(defun %spawn-worker-once (core &key hibernated-core id root)
+(defun %early-exit-report (process)
+  "How PROCESS, which closed its stdout before its handshake, ended: three
+values, :exited or :signaled (NIL when it has not ended within two seconds),
+the exit code or signal number, and up to 4096 characters of what it wrote to
+stderr. Reads nothing while the process is still running."
+  (let ((status nil) (code nil) (text ""))
+    (ignore-errors
+     (loop repeat 20
+           while (sb-ext:process-alive-p process)
+           do (sleep 0.1))
+     (setf status (sb-ext:process-status process))
+     (when (member status '(:exited :signaled))
+       (setf code (sb-ext:process-exit-code process))
+       (let ((err (sb-ext:process-error process))
+             (out (make-string-output-stream)))
+         (when err
+           (handler-case
+               (sb-ext:with-timeout 1
+                 (loop for ch = (read-char err nil nil)
+                       for n from 0
+                       while (and ch (< n 4096))
+                       do (write-char ch out)))
+             (error () nil))
+           (setf text (get-output-stream-string out))))))
+    (values (and (member status '(:exited :signaled)) status) code text)))
+
+(defun %core-rejection-p (text)
+  "True when TEXT, what a runtime printed before exiting, says it refused the
+core it was given: the wrong build, a bad magic number, a truncated file or one
+it could not open. A runtime that could not get memory for the heap is not
+refusing the core and is left out, since it may succeed later."
+  (let ((low (string-downcase (or text ""))))
+    (and (some (lambda (needle) (search needle low))
+               '("core was built for" "magic number in core" "core file"
+                 "could not open file" "not a core"))
+         (notany (lambda (needle) (search needle low))
+                 '("allocate" "memory" "mmap"))
+         t)))
+
+(defun %last-line (text)
+  "The last non-blank line of TEXT, trimmed and cut to 200 characters."
+  (let* ((lines (remove-if (lambda (line) (zerop (length (string-trim " " line))))
+                           (uiop:split-string (or text "")
+                                              :separator (string #\Newline))))
+         (line (string-trim " " (or (car (last lines)) ""))))
+    (if (> (length line) 200) (subseq line 0 200) line)))
+
+(defun %spawn-worker-once (core &key hibernated-core id root runtime)
   "Launch one worker child process and return a WORKER struct, resuming it
 from the saved core HIBERNATED-CORE when given, else booting it from the
 worker core image CORE when non-NIL, else loading it from source. ID, when
 non-NIL, is the worker id to use instead of a new one; ROOT, when non-NIL,
-replaces the inherited DSMR_PROJECT_ROOT.
+replaces the inherited DSMR_PROJECT_ROOT; RUNTIME, when non-NIL, is the
+runtime executable to start instead of the one this process runs.
 The worker is launched via sb-ext:run-program (bare SBCL only).
 Reads the JSON handshake to discover tcp_port/pid/swank_port, connects
 to the TCP port, authenticates with a shared secret, and returns the
-worker in :standby state.
+worker in :standby state, with the runtime it was started with recorded.
+A resumed worker is given the resume handshake budget, a fresh one the
+startup budget.
 
 Signals WORKER-SPAWN-FAILED if the process cannot be started,
-the handshake fails, or authentication is rejected."
+the handshake fails, or authentication is rejected. Its kind says which
+(see the condition); a process that ended before its handshake is reported
+as :rejected when what it printed says the runtime refused the core."
   (let ((id (or id (%next-worker-id)))
         (kind (cond (hibernated-core :resumed) (core :core) (t :source)))
         (secret (%generate-worker-secret))
         (process nil)
+        (runtime-path nil)
         (socket nil)
         (started (get-internal-real-time)))
     (handler-case
         (progn
           (log-event :info "worker.spawning" "id" id
                      "boot" (string-downcase (symbol-name kind)))
-          (setf started (get-internal-real-time)
-                process (%launch-worker-process secret id
-                                                :core core
-                                                :hibernated-core hibernated-core
-                                                :root root))
+          (setf started (get-internal-real-time))
+          (handler-case
+              (multiple-value-setq (process runtime-path)
+                (%launch-worker-process secret id
+                                        :core core
+                                        :hibernated-core hibernated-core
+                                        :root root
+                                        :runtime runtime))
+            (error (e)
+              (error 'worker-spawn-failed
+                     :kind :launch
+                     :message (princ-to-string e))))
           (multiple-value-bind (tcp-port pid swank-port)
-              (%read-handshake process (effective-worker-startup-timeout))
+              (%read-handshake process (if hibernated-core
+                                           (effective-worker-resume-timeout)
+                                           (effective-worker-startup-timeout)))
             (log-event :info "worker.handshake.received"
                        "id" id
                        "tcp_port" tcp-port
@@ -729,7 +925,12 @@ the handshake fails, or authentication is rejected."
             ;; entire worker lifetime.
             (ignore-errors
               (close (sb-ext:process-output process)))
-            (setf socket (%connect-to-worker "127.0.0.1" tcp-port))
+            (setf socket
+                  (handler-case (%connect-to-worker "127.0.0.1" tcp-port)
+                    (error (e)
+                      (error 'worker-spawn-failed
+                             :kind :connect
+                             :message (princ-to-string e)))))
             ;; Authenticate with shared secret
             (let ((auth-stream (usocket:socket-stream socket)))
               (%send-json-rpc auth-stream 0 "worker/authenticate"
@@ -740,6 +941,7 @@ the handshake fails, or authentication is rejected."
                 (unless (and (hash-table-p auth-resp)
                              (gethash "authenticated" auth-resp))
                   (error 'worker-spawn-failed
+                         :kind :auth
                          :message "Worker authentication failed"))))
             (let* ((now (%unix-now))
                    (worker (make-worker
@@ -748,6 +950,8 @@ the handshake fails, or authentication is rejected."
                             :spawned-at now
                             :last-activity now
                             :spawn-root (%spawn-root root)
+                            :runtime-path runtime-path
+                            :runtime-identity (runtime-identity runtime-path)
                             :process-info process
                             :stream (usocket:socket-stream socket)
                             :socket socket
@@ -767,26 +971,45 @@ the handshake fails, or authentication is rejected."
                          "boot_ms" (worker-boot-milliseconds worker))
               worker)))
       (error (e)
-        ;; Clean up on failure
-        (when socket
-          (ignore-errors (usocket:socket-close socket)))
-        (when process
-          (ignore-errors
-            (when (sb-ext:process-alive-p process)
-              (sb-ext:process-kill process 15)
-              (sleep 0.5)
+        (let ((failure (if (typep e 'worker-spawn-failed)
+                           e
+                           (make-condition 'worker-spawn-failed
+                                           :message (princ-to-string e)))))
+          ;; A process that ended before its handshake says why on stderr;
+          ;; read it before the cleanup below closes the pipe.
+          (when (and process (eq (worker-spawn-failed-kind failure) :exited))
+            (multiple-value-bind (status code text) (%early-exit-report process)
+              (let ((line (%last-line text)))
+                (setf failure
+                      (make-condition
+                       'worker-spawn-failed
+                       :kind (if (and (eq status :exited) (%core-rejection-p text))
+                                 :rejected
+                                 :exited)
+                       :message (format nil "~A (~(~A~) ~A)~@[: ~A~]"
+                                        (worker-spawn-failed-message failure)
+                                        (or status "still running")
+                                        (or code "")
+                                        (and (plusp (length line)) line)))))))
+          ;; Clean up on failure
+          (when socket
+            (ignore-errors (usocket:socket-close socket)))
+          (when process
+            (ignore-errors
               (when (sb-ext:process-alive-p process)
-                (sb-ext:process-kill process 9)))
-            (sb-ext:process-close process)))
-        (log-event :warn "worker.spawn.failed"
-                   "id" id
-                   "error" (princ-to-string e))
-        (if (typep e 'worker-spawn-failed)
-            (error e)
-            (error 'worker-spawn-failed
-                   :message (princ-to-string e)))))))
+                (sb-ext:process-kill process 15)
+                (sleep 0.5)
+                (when (sb-ext:process-alive-p process)
+                  (sb-ext:process-kill process 9)))
+              (sb-ext:process-close process)))
+          (log-event :warn "worker.spawn.failed"
+                     "id" id
+                     "kind" (string-downcase
+                             (symbol-name (worker-spawn-failed-kind failure)))
+                     "error" (princ-to-string failure))
+          (error failure))))))
 
-(defun spawn-worker (&key (core nil core-p) hibernated-core id root)
+(defun spawn-worker (&key (core nil core-p) hibernated-core id root runtime)
   "Launch a worker child process and return a WORKER struct in :standby state.
 
 CORE is the worker core image to boot from; when it is not given,
@@ -806,7 +1029,8 @@ there is no retry from source: a fresh worker would silently stand in for the
 session's world, so a resume that fails signals instead and the caller decides.
 ID is the worker id to give the new process (a resumed worker keeps the id it
 had), and ROOT, when non-NIL, is the project root to give it in place of the
-inherited DSMR_PROJECT_ROOT.
+inherited DSMR_PROJECT_ROOT. RUNTIME, used only with HIBERNATED-CORE, is the
+runtime executable to resume it with (see resume-runtime).
 
 worker-boot-kind on the result says which way it came up (:core, :source or
 :resumed), and worker-boot-milliseconds how long it took. Signals
@@ -814,10 +1038,11 @@ WORKER-SPAWN-FAILED when the worker cannot be brought up at all."
   (when hibernated-core
     (unless (%regular-file-p (namestring hibernated-core))
       (error 'worker-spawn-failed
+             :kind :no-core
              :message (format nil "no saved core at ~A" hibernated-core)))
     (return-from spawn-worker
       (%spawn-worker-once nil :hibernated-core (namestring hibernated-core)
-                              :id id :root root)))
+                              :id id :root root :runtime runtime)))
   (multiple-value-bind (path reason)
       (if core-p
           (if core (%offered-core core) (values nil "not requested"))
@@ -845,42 +1070,59 @@ from that core and return WORKER.
 The worker stays the same struct with the same id, session, stateful flag and
 last activity, so the session keeps the worker it had and every object id
 issued before the save still names it. Only what belongs to a process is
-replaced: the process, its channel, its ports and pid, its stderr drain and
-how it booted, which reads :resumed. last-resume-milliseconds records how long
-the resume took. The worker's state is left to the caller.
+replaced: the process, its channel, its ports and pid, its stderr drain, the
+runtime it runs and how it booted, which reads :resumed.
+last-resume-milliseconds records how long the resume took. The worker's state
+is left to the caller.
 
-Signals WORKER-SPAWN-FAILED when no core is recorded, when the file is gone,
-or when no process comes up from it (a corrupt core, or one written by a
-different runtime). WORKER is untouched in that case."
+The core is resumed with the runtime build that wrote it, as resume-runtime
+chooses, and the handshake gets the resume budget.
+
+Signals WORKER-SPAWN-FAILED when no core is recorded or the file is gone
+(kind :no-core), when the runtime that wrote it is gone (:runtime-gone), or
+when no process comes up from it; worker-spawn-failure-final-p tells a refused
+core from a failure worth retrying. WORKER is untouched in every case."
   (let ((path (worker-hibernate-core-path worker))
         (started (get-internal-real-time)))
     (unless path
       (error 'worker-spawn-failed
+             :kind :no-core
              :message (format nil "worker ~D has no saved core recorded"
                               (worker-id worker))))
-    (let ((fresh (spawn-worker :hibernated-core path
-                               :id (worker-id worker)
-                               :root (worker-spawn-root worker)))
-          (milliseconds nil))
-      (setf milliseconds (round (* 1000 (- (get-internal-real-time) started))
-                                internal-time-units-per-second))
-      (bt:with-lock-held ((worker-stream-lock worker))
-        (setf (worker-process-info worker) (worker-process-info fresh)
-              (worker-stream worker) (worker-stream fresh)
-              (worker-socket worker) (worker-socket fresh)
-              (worker-tcp-port worker) (worker-tcp-port fresh)
-              (worker-swank-port worker) (worker-swank-port fresh)
-              (worker-pid worker) (worker-pid fresh)
-              (worker-stderr-thread worker) (worker-stderr-thread fresh)
-              (worker-boot-kind worker) :resumed
-              (worker-boot-milliseconds worker) (worker-boot-milliseconds fresh)
-              (worker-consecutive-missed-pings worker) 0
-              (worker-last-resume-milliseconds worker) milliseconds))
-      (log-event :info "worker.resumed"
-                 "id" (worker-id worker)
-                 "pid" (worker-pid worker)
-                 "ms" milliseconds)
-      worker)))
+    (multiple-value-bind (runtime basis) (resume-runtime worker)
+      (unless runtime
+        (error 'worker-spawn-failed
+               :kind :runtime-gone
+               :message (format nil "the runtime that saved it, ~A, is no longer installed"
+                                (worker-runtime-path worker))))
+      (let ((fresh (spawn-worker :hibernated-core path
+                                 :id (worker-id worker)
+                                 :root (worker-spawn-root worker)
+                                 :runtime runtime))
+            (milliseconds nil))
+        (setf milliseconds (round (* 1000 (- (get-internal-real-time) started))
+                                  internal-time-units-per-second))
+        (bt:with-lock-held ((worker-stream-lock worker))
+          (setf (worker-process-info worker) (worker-process-info fresh)
+                (worker-stream worker) (worker-stream fresh)
+                (worker-socket worker) (worker-socket fresh)
+                (worker-tcp-port worker) (worker-tcp-port fresh)
+                (worker-swank-port worker) (worker-swank-port fresh)
+                (worker-pid worker) (worker-pid fresh)
+                (worker-stderr-thread worker) (worker-stderr-thread fresh)
+                (worker-runtime-path worker) (worker-runtime-path fresh)
+                (worker-runtime-identity worker) (worker-runtime-identity fresh)
+                (worker-boot-kind worker) :resumed
+                (worker-boot-milliseconds worker) (worker-boot-milliseconds fresh)
+                (worker-consecutive-missed-pings worker) 0
+                (worker-last-resume-milliseconds worker) milliseconds))
+        (log-event :info "worker.resumed"
+                   "id" (worker-id worker)
+                   "pid" (worker-pid worker)
+                   "runtime" runtime
+                   "runtime_basis" (string-downcase (symbol-name basis))
+                   "ms" milliseconds)
+        worker))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Internal helpers — crash handling

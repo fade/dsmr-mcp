@@ -350,7 +350,8 @@ because the reader ran out of descriptors or memory."
   (%remove-tree (%native (owner-directory stem))))
 
 (defun failed-core-directory ()
-  "Where a core that failed to save is kept for diagnosis."
+  "Where a saved world that could not be resumed is kept, for diagnosis and
+   for recovery by hand."
   (merge-pathnames "failed/" (hibernate-root)))
 
 (defun %failed-core-time (name)
@@ -364,12 +365,34 @@ because the reader ran out of descriptors or memory."
         (parse-integer digits)
         0)))
 
+(defun %failed-core-owner (name)
+  "The server stem and the worker a kept failed core's NAME,
+<pid>-<start>-<id>-<time>.core, belongs to, as two values: the stem, and the
+string <stem>-<id> naming the worker. NIL when NAME has another shape."
+  (when (uiop:string-suffix-p name ".core")
+    (let ((parts (uiop:split-string (subseq name 0 (- (length name) 5))
+                                    :separator "-")))
+      (when (and (= (length parts) 4) (every #'%ascii-digits-p parts))
+        (let ((stem (format nil "~A-~A" (first parts) (second parts))))
+          (when (parse-server-stem stem)
+            (values stem (format nil "~A-~A" stem (third parts)))))))))
+
 (defun retain-failed-core (path stem worker-id &key (keep 2) now)
-  "Move the core at PATH, which the server STEM's worker WORKER-ID failed to
-   save, to failed/<stem>-<id>-<unix time>.core and return its new path. Only
-   the KEEP newest failed cores are kept; older ones are deleted, so repeated
-   failures cannot fill the disk. NOW, Unix seconds, defaults to the clock.
-   Signals UNSAFE-HIBERNATE-PATH when PATH is a link or not a regular file."
+  "Move the core at PATH, the saved world of the server STEM's worker
+WORKER-ID that could not be resumed, to failed/<stem>-<id>-<unix time>.core
+and return its new path. NOW, Unix seconds, defaults to the clock. Signals
+UNSAFE-HIBERNATE-PATH when PATH is a link or not a regular file.
+
+What stays in failed/ afterwards:
+  - the newest core of every worker whose server is still running, or whose
+    server cannot be told apart from running, however many there are. Each
+    is a session's world, and one session's failure never deletes another's
+    to make room; a burst of failures across many sessions keeps them all;
+  - besides those, the KEEP newest cores, whatever their server.
+Everything else goes: older cores of the same worker, and the cores of servers
+that are gone, beyond the KEEP newest. Cores of running servers are bounded by
+the number of their workers that ever failed a resume, and the rest by KEEP,
+so failures cannot fill the disk."
   (%check-stem stem)
   (%check-worker-id worker-id)
   (let* ((now (or now (%unix-time)))
@@ -383,14 +406,31 @@ because the reader ran out of descriptors or memory."
     (let* ((failed (%ensure-private-directory (failed-core-directory)))
            (target (%file-in failed (format nil "~A-~D-~D.core" stem worker-id now))))
       (sb-posix:rename source (%native target))
-      (let ((kept (sort (remove-if-not (lambda (name) (uiop:string-suffix-p name ".core"))
-                                       (%directory-entries (%native failed)))
-                        (lambda (a b)
-                          (let ((ta (%failed-core-time a))
-                                (tb (%failed-core-time b)))
-                            (or (> ta tb) (and (= ta tb) (string> a b))))))))
-        (dolist (old (nthcdr keep kept))
-          (ignore-errors (%remove-tree (concatenate 'string (%native failed) "/" old)))))
+      (let* ((names (sort (remove-if-not (lambda (name) (uiop:string-suffix-p name ".core"))
+                                         (%directory-entries (%native failed)))
+                          (lambda (a b)
+                            (let ((ta (%failed-core-time a))
+                                  (tb (%failed-core-time b)))
+                              (or (> ta tb) (and (= ta tb) (string> a b)))))))
+             (kept (subseq names 0 (min keep (length names))))
+             (owners (make-hash-table :test 'equal))
+             (states (make-hash-table :test 'equal)))
+        ;; NAMES runs newest first, so the first core seen for a worker is its
+        ;; newest.
+        (dolist (name names)
+          (multiple-value-bind (owner-stem owner-key) (%failed-core-owner name)
+            (when (and owner-key (not (gethash owner-key owners)))
+              (setf (gethash owner-key owners) t)
+              (unless (eq :dead
+                          (multiple-value-bind (state known) (gethash owner-stem states)
+                            (if known
+                                state
+                                (setf (gethash owner-stem states)
+                                      (values (%owner-state owner-stem))))))
+                (pushnew name kept :test #'string=)))))
+        (dolist (old names)
+          (unless (member old kept :test #'string=)
+            (ignore-errors (%remove-tree (concatenate 'string (%native failed) "/" old))))))
       target)))
 
 ;;; ----------------------------------------------------------- worker records

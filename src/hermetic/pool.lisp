@@ -66,7 +66,10 @@
                 #:resume-worker #:*hibernate-timeout-seconds*
                 #:worker-last-resume-milliseconds
                 #:worker-spawned-at #:worker-boot-kind
-                #:worker-core-path #:*worker-core-disabled*)
+                #:worker-core-path #:*worker-core-disabled*
+                #:worker-resume-failure #:worker-spawn-failure-final-p
+                #:resolve-worker-resume-timeout
+                #:effective-worker-resume-timeout)
   (:local-nicknames (#:pool-records #:dsmr-mcp/src/hermetic/pool-records))
   (:import-from #:dsmr-mcp/src/hermetic/pool-records
                 #:server-stem #:ensure-owner-directory
@@ -106,6 +109,8 @@
            #:pool-worker-info #:find-session-worker
            #:pool-shutting-down #:pool-capacity-exceeded
            #:pool-spawn-cancelled #:*recovery-threads*
+           #:pool-resume-deferred #:pool-resume-deferred-session-id
+           #:pool-resume-deferred-cause
            #:circuit-breaker-active
            #:circuit-breaker-active-session-id
            #:circuit-breaker-active-remaining-seconds
@@ -142,6 +147,19 @@ Release unused sessions before creating new ones."
   (:report (lambda (c s)
              (format s "Session ~A was released during worker spawn."
                      (pool-spawn-cancelled-session-id c)))))
+
+(define-condition pool-resume-deferred (error)
+  ((session-id :initarg :session-id :reader pool-resume-deferred-session-id)
+   (cause :initarg :cause :reader pool-resume-deferred-cause))
+  (:report (lambda (c s)
+             (format s "Session ~A's hibernated world could not be resumed just now (~A). ~
+It is still saved on disk, and the next call tries again; nothing has been lost."
+                     (pool-resume-deferred-session-id c)
+                     (pool-resume-deferred-cause c))))
+  (:documentation "A hibernated session's world failed to come back for a
+reason that may pass, such as a slow disk, a fork the kernel refused for
+memory, or a process killed while it loaded. The worker stays hibernated with
+its core in place, so retrying the call resumes it."))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Configuration
@@ -333,7 +351,8 @@ environment, else its default: *worker-pool-warmup* or DSMR_WORKER_POOL_WARMUP
 10). An unparseable or out-of-range environment value warns and falls back to
 the default.
 
-It also resolves the worker handshake timeout and the eval timeout, so one
+It also resolves the worker handshake timeouts, for a fresh worker and for a
+resumed one, and the eval timeout, so one
 call settles every pool and worker timing setting the server uses.
 
 initialize-pool calls this first on every start, so a server booted from a
@@ -352,6 +371,7 @@ prebuilt image honours the environment it is started with."
                (%env-int "DSMR_PRESSURE_MIN_KILL_AGE_SECONDS" 10 :min 0)))))
     (setf *resolved-pool-settings* settings)
     (resolve-worker-startup-timeout)
+    (resolve-worker-resume-timeout)
     (resolve-eval-timeout)
     settings))
 
@@ -1257,8 +1277,10 @@ without creating a new one."
 (defun %transition-wait-seconds ()
   "How long a request waits for its session's worker to finish saving or
 resuming before it gives up: the longest a save may take, plus the longest a
-process may take to come up, plus a margin."
-  (+ *hibernate-timeout-seconds* (effective-worker-startup-timeout) 15))
+process may take to come up, fresh or resumed, plus a margin."
+  (+ *hibernate-timeout-seconds*
+     (max (effective-worker-startup-timeout) (effective-worker-resume-timeout))
+     15))
 
 (defun %delete-core-files (path)
   "Delete the saved core at PATH and the partial <PATH>.tmp a save in progress
@@ -1289,6 +1311,7 @@ same way."
               (worker-hibernate-core-path worker) nil
               (worker-hibernated-at worker) nil
               (worker-core-bytes worker) nil
+              (worker-resume-failure worker) nil
               serving t))
       (%condition-broadcast *pool-transition-condvar*))
     (cond
@@ -1360,30 +1383,74 @@ meanwhile, there is no one to tell and pool-spawn-cancelled is signalled."
                                (or kept-at "nowhere")))))
     nil))
 
+(defun %defer-resume (session-id worker cause)
+  "Put WORKER, whose resume failed for CAUSE in a way that may pass, back to
+:hibernated with its core untouched, and remember CAUSE on it so requests that
+were waiting on this resume are told the same rather than each trying again at
+once. Returns T. Nothing is lost, so no notice is armed, nothing goes to the
+fleet log and the crash record is left alone. When the session let the worker
+go meanwhile, pool-spawn-cancelled is signalled instead."
+  (let ((deferred nil))
+    (bt:with-lock-held (*pool-lock*)
+      (when (eq (worker-state worker) :resuming)
+        (setf (worker-state worker) :hibernated
+              (worker-resume-failure worker) cause
+              deferred t))
+      (%condition-broadcast *pool-transition-condvar*))
+    (unless deferred
+      (log-event :info "pool.resume.cancelled"
+                 "session" session-id
+                 "worker_id" (worker-id worker)
+                 "cause" cause)
+      (error 'pool-spawn-cancelled :session-id session-id))
+    (log-event :warn "pool.resume.deferred"
+               "session" session-id
+               "worker_id" (worker-id worker)
+               "cause" cause)
+    t))
+
 (defun %resume-hibernated-worker (session-id worker)
   "Resume WORKER, which this thread has marked :resuming, from its saved core.
 Runs without *pool-lock*, which is taken only to settle the state.
 
-Returns WORKER, :bound again with the world it had, or NIL when the world
-could not be resumed (no core recorded, the file missing, or no process
-coming up from it), in which case the session's next pass gets a fresh worker
-with a reset notice. Signals pool-spawn-cancelled when the session let the
-worker go while it was resuming."
+Returns WORKER, :bound again with the world it had, or NIL when the world can
+never be resumed (no core recorded, the file missing, the runtime refusing it,
+or the runtime that wrote it gone), in which case the session's next pass gets
+a fresh worker with a reset notice.
+
+Any other failure may pass: the handshake ran out of time on a slow disk, the
+kernel refused the fork for memory, the process was killed while it loaded.
+Then the world is not given up. The worker goes back to :hibernated with its
+core in place and pool-resume-deferred is signalled, so this call fails with
+an error saying so and the session's next call tries again.
+
+Signals pool-spawn-cancelled when the session let the worker go while it was
+resuming."
   (let* ((path (worker-hibernate-core-path worker))
-         (cause (cond ((null path) "no saved core was recorded")
+         (final (cond ((null path) "no saved core was recorded")
                       ((not (%core-file-bytes path))
                        (format nil "the saved core ~A is missing" path))))
+         (passing nil)
          (settled nil))
     (unwind-protect
          (progn
-           (unless cause
+           (unless final
              (handler-case (resume-worker worker)
-               (error (e) (setf cause (princ-to-string e)))))
-           (multiple-value-prog1
-               (if cause
-                   (%fail-resume session-id worker path cause)
-                   (%finish-resume session-id worker path))
-             (setf settled t)))
+               (error (e)
+                 (if (worker-spawn-failure-final-p e)
+                     (setf final (princ-to-string e))
+                     (setf passing (princ-to-string e))))))
+           (cond
+             (final
+              (multiple-value-prog1 (%fail-resume session-id worker path final)
+                (setf settled t)))
+             (passing
+              (%defer-resume session-id worker passing)
+              (setf settled t)
+              (error 'pool-resume-deferred :session-id session-id :cause passing))
+             (t
+              (multiple-value-prog1 (%finish-resume session-id worker path)
+                (setf settled t)))))
       ;; Only an unexpected unwind, such as an interrupt, gets here unsettled.
       ;; The worker goes back to hibernated, so no request waits on it for
       ;; ever, and any process the resume had started is ended.
@@ -1407,9 +1474,12 @@ A session whose worker is hibernated gets that same worker back, resumed from
 its saved core with the world it had, and no reset notice: the session never
 sees that it was on disk. A request that arrives while the worker is saving
 or resuming waits for that to finish, so every concurrent request gets the
-same worker and only one process is ever started. Only when the core cannot
+same worker and only one process is ever started. Only when the core can never
 be resumed does the session get a fresh worker, and then its next reply says
-its world was reset and why. None of this counts toward the circuit breaker.
+its world was reset and why. A resume that failed in a way that may pass
+leaves the worker hibernated with its core, and signals pool-resume-deferred
+to this request and to every request that waited on it; the next call tries
+again. None of this counts toward the circuit breaker.
 
 Circuit breaker: before spawning, checks *circuit-breaker-map* for a recent
 trip within *circuit-breaker-cooldown* seconds and fails fast with an error.
@@ -1422,7 +1492,8 @@ Signals circuit-breaker-active both when the breaker trips and on any later
 call inside the cooldown window; the condition carries the seconds remaining.
 Signals an error naming the session and the state when a save or resume it
 waited on has not finished within %transition-wait-seconds."
-  (let ((transition-deadline nil))
+  (let ((transition-deadline nil)
+        (waited-on-resume nil))
     (loop
       (let ((entry nil) (need-spawn nil) (assigned-from-standby nil)
             (need-reset nil) (reset-reason nil) (old-worker-to-kill nil)
@@ -1448,6 +1519,8 @@ waited on has not finished within %transition-wait-seconds."
             (unless (and (typep entry 'worker)
                          (member (worker-state entry) '(:hibernating :resuming)))
               (return))
+            (when (eq (worker-state entry) :resuming)
+              (setf waited-on-resume entry))
             (let ((now (get-internal-real-time)))
               (unless transition-deadline
                 (setf transition-deadline
@@ -1466,6 +1539,13 @@ waited on has not finished within %transition-wait-seconds."
             ;; Path 1a: hibernated worker, resumed outside the lock when
             ;; the pool has room for its process.
             ((and entry (typep entry 'worker) (eq :hibernated (worker-state entry)))
+             ;; This request waited on a resume that failed in a way that may
+             ;; pass: it gets the same answer as the request that tried, and
+             ;; the session's next call tries again.
+             (when (and (eq entry waited-on-resume) (worker-resume-failure entry))
+               (error 'pool-resume-deferred
+                      :session-id session-id
+                      :cause (worker-resume-failure entry)))
              (let ((limit (effective-max-pool-size)))
                (when (>= (%effective-pool-size) limit)
                  (error 'pool-capacity-exceeded :limit limit)))

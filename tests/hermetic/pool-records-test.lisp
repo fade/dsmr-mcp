@@ -442,25 +442,66 @@ memory), the sweep removes nothing of that server and reports it once."
             "expected ~D bytes, resident ~D then ~D KiB" expected before after))
     (is eql 209715200 (records:expected-core-bytes 999999999))))
 
-(define-test a-failed-core-is-kept-and-only-the-newest-two-stay
-  "A core that failed to save is kept for diagnosis, and old ones are dropped so
-   failures cannot fill the disk."
+(defun %fail-core (stem id now)
+  "Write a core for the server STEM's worker ID and keep it as failed at NOW,
+asserting it moved into the failed directory."
+  (let ((core (records:hibernated-core-path stem id)))
+    (records:ensure-owner-directory stem)
+    (write-text core "world")
+    (let ((moved (records:retain-failed-core core stem id :now now)))
+      (true (uiop:string-prefix-p
+             (uiop:native-namestring (records:failed-core-directory))
+             (uiop:native-namestring moved)))
+      (false (probe-file core)))))
+
+(defun %failed-names ()
+  "The names in the failed directory, sorted."
+  (sort (mapcar #'file-namestring
+                (uiop:directory-files (records:failed-core-directory)))
+        #'string<))
+
+(define-test a-burst-of-failures-keeps-every-running-servers-world
+  "Failed cores of five workers of a running server are all kept, however
+many fail at once: one session's failure never deletes another's world."
   (with-state-home (home)
     (let ((stem (own-stem)))
-      (loop for now in '(100 101 102)
-            for id from 1
-            do (let ((core (records:hibernated-core-path stem id)))
-                 (records:ensure-owner-directory stem)
-                 (write-text core "partial")
-                 (let ((moved (records:retain-failed-core core stem id :now now)))
-                   (true (uiop:string-prefix-p
-                          (uiop:native-namestring (records:failed-core-directory))
-                          (uiop:native-namestring moved)))
-                   (false (probe-file core)))))
-      (let ((names (sort (mapcar #'file-namestring
-                                 (uiop:directory-files (records:failed-core-directory)))
-                         #'string<)))
-        (is equal (list (format nil "~A-2-101.core" stem)
-                        (format nil "~A-3-102.core" stem))
-            names))
+      (loop for id from 1 to 5
+            for now from 100
+            do (%fail-core stem id now))
+      (is equal (loop for id from 1 to 5
+                      for now from 100
+                      collect (format nil "~A-~D-~D.core" stem id now))
+          (%failed-names))
       (is = #o700 (mode-bits (records:failed-core-directory))))))
+
+(define-test failed-cores-of-gone-servers-and-older-copies-are-capped
+  "Beyond the newest core of each worker of a running server, only the two
+newest stay: cores of a server that is gone are dropped past those, and so is
+an older core of the same worker."
+  (with-state-home (home)
+    (let ((live (own-stem))
+          (gone "999999999-1"))
+      (%fail-core live 7 50)
+      (%fail-core live 7 60)
+      (loop for id from 1 to 4
+            for now from 100
+            do (%fail-core gone id now))
+      (is equal (sort (list (format nil "~A-7-60.core" live)
+                            (format nil "~A-3-102.core" gone)
+                            (format nil "~A-4-103.core" gone))
+                      #'string<)
+          (%failed-names)))))
+
+(define-test a-failed-core-whose-server-cannot-be-read-is-kept
+  "When whether a server runs cannot be read, its failed cores are kept as if
+it were running."
+  (with-state-home (home)
+    (let ((stem "999999999-1"))
+      (let ((records:*owner-starttime-function*
+              (lambda (pid)
+                (declare (ignore pid))
+                (error "Too many open files"))))
+        (loop for id from 1 to 4
+              for now from 100
+              do (%fail-core stem id now)))
+      (is = 4 (length (%failed-names))))))
