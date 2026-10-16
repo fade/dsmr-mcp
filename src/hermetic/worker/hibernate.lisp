@@ -298,6 +298,15 @@ reaped."
   (let ((v (and params (gethash "deadline_seconds" params))))
     (if (and (integerp v) (plusp v)) v *default-deadline-seconds*)))
 
+(defun %fork-refusal-token (condition)
+  "The refusal word for a fork that signalled CONDITION: has-threads when SBCL
+refused because other threads are running, fork-failed for anything else, such
+as the kernel being out of memory or processes. A session must never be told
+it runs threads when the host was only short of memory."
+  (if (search "multiple threads" (princ-to-string condition))
+      "has-threads"
+      "fork-failed"))
+
 (defun handle-hibernate (params server toplevel &key stop-watchdog start-watchdog)
   "Save this worker's world to the core file PARAMS names, then stop SERVER.
 
@@ -314,6 +323,8 @@ On failure the worker keeps serving, with its watchdog running, and the error
 message begins with one of these tokens followed by a colon:
   bad-path     the path is not one the worker may write;
   has-threads  a thread the session started is running;
+  fork-failed  the saving child could not be started, as when the host is
+               out of memory or processes;
   save-failed  the saving child failed;
   save-timeout the saving child did not finish within the deadline."
   (let* ((started (get-internal-real-time))
@@ -334,7 +345,7 @@ message begins with one of these tokens followed by a colon:
       (let ((pid (handler-case (sb-posix:fork)
                    (error (e)
                      (when start-watchdog (funcall start-watchdog))
-                     (%refuse "has-threads" "~A" e)))))
+                     (%refuse (%fork-refusal-token e) "~A" e)))))
         (when (zerop pid)
           (%child-save tmp toplevel))
         (let ((status (%wait-for-child pid deadline)))

@@ -1910,8 +1910,9 @@ Returns (values OUTCOME REASON), OUTCOME being one of:
                  was given and the session's worker is no longer that one
                  (REASON is replaced).
   :refused       the worker declined (REASON is its word: has-threads when
-                 the session started threads of its own, a save that failed,
-                 or bad-path); it is left serving.
+                 the session started threads of its own, fork-failed when the
+                 saving child could not be started, a save that failed, or
+                 bad-path); it is left serving.
   :disk          less than twice the expected core size is free; it is left
                  serving.
   :timeout       no answer in time; it is left serving.
