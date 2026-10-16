@@ -17,6 +17,8 @@
 ;;;;
 ;;;;   - it holds the worker entry point and its method table, so a worker can
 ;;;;     reach its handshake without loading anything;
+;;;;   - it can save a worker's world to a core and come back from one: the
+;;;;     resume entry point is there and a worker server answers the save method;
 ;;;;   - it holds no test systems and no test framework, because a worker image
 ;;;;     that carried them would carry them into every image a worker saves;
 ;;;;   - it holds no setting taken from the build host's environment, because a
@@ -83,6 +85,12 @@ run has not passed."
 (defparameter *verify-core-worker-handlers* "DSMR-MCP/SRC/HERMETIC/WORKER/HANDLERS")
 (defparameter *verify-core-worker-client* "DSMR-MCP/SRC/HERMETIC/WORKER-CLIENT")
 
+(defparameter *verify-core-worker-hibernate* "DSMR-MCP/SRC/HERMETIC/WORKER/HIBERNATE")
+
+(defparameter *verify-core-worker-server* "DSMR-MCP/SRC/HERMETIC/WORKER/SERVER")
+
+(defparameter *verify-core-worker-registry* "DSMR-MCP/SRC/HERMETIC/WORKER/REGISTRY")
+
 (defun verify-core-symbol (package name)
   "Return the symbol NAME in PACKAGE, or NIL if either is absent.
 Both arguments are strings in the canonical upcased reader spelling."
@@ -134,6 +142,40 @@ image that does not hold the worker at all."
 (defun verify-core-check-handlers ()
   (verify-core-fbound-check "worker method table installer fbound"
                             *verify-core-worker-handlers* "REGISTER-ALL-HANDLERS"))
+
+(defun verify-core-check-hibernate-wiring ()
+  "A worker image must be able to save itself and come back: the resume entry
+point, the method installer and the save handler are fbound, and a server
+given the worker's methods over a fresh object registry answers the method
+that saves it."
+  (verify-core-fbound-check "worker resume entry point fbound"
+                            *verify-core-worker-main* "RESUME")
+  (verify-core-fbound-check "worker method installer fbound"
+                            *verify-core-worker-main* "REGISTER-WORKER-METHODS")
+  (verify-core-fbound-check "worker save handler fbound"
+                            *verify-core-worker-hibernate* "HANDLE-HIBERNATE")
+  (verify-core-checking "worker/hibernate registered on a worker server"
+    (let ((make-server (verify-core-symbol *verify-core-worker-server*
+                                           "MAKE-WORKER-SERVER"))
+          (stop (verify-core-symbol *verify-core-worker-server* "STOP-SERVER"))
+          (methods (verify-core-symbol *verify-core-worker-server*
+                                       "WORKER-SERVER-METHODS"))
+          (install (verify-core-symbol *verify-core-worker-main*
+                                       "REGISTER-WORKER-METHODS"))
+          (make-registry (verify-core-symbol *verify-core-worker-registry*
+                                             "MAKE-OBJECT-REGISTRY")))
+      (if (notevery (lambda (s) (and s (fboundp s)))
+                    (list make-server stop methods install make-registry))
+          (values nil "a function needed to build a worker server is absent")
+          (let ((server (funcall make-server)))
+            (unwind-protect
+                 (progn
+                   (funcall install server (funcall make-registry))
+                   (if (gethash "worker/hibernate" (funcall methods server))
+                       (values t (format nil "~D methods"
+                                         (hash-table-count (funcall methods server))))
+                       (values nil "worker/hibernate is not in the method table")))
+              (funcall stop server)))))))
 
 (defun verify-core-check-no-test-systems ()
   (verify-core-checking "no test packages in image"
@@ -192,6 +234,7 @@ image that does not hold the worker at all."
   (verify-core-note "sbcl ~A" (lisp-implementation-version))
   (verify-core-check-entry-point)
   (verify-core-check-handlers)
+  (verify-core-check-hibernate-wiring)
   (verify-core-check-no-test-systems)
   (verify-core-check-no-test-framework)
   (verify-core-check-eval-timeout-unset)

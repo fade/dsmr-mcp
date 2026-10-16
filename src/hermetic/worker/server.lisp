@@ -21,6 +21,7 @@
   (:import-from #:sb-ext)
   (:import-from #:uiop)
   (:export #:worker-server #:make-worker-server #:server-port
+           #:reopen-worker-server
            #:start-accept-loop #:stop-server #:register-method
            #:*worker-read-timeout*))
 
@@ -79,6 +80,25 @@ worker/ping method is registered automatically."
 (defun server-port (server)
   "Return the TCP port the worker SERVER is listening on."
   (worker-server-port server))
+
+(defun reopen-worker-server (server)
+  "Give SERVER a new listener on an ephemeral 127.0.0.1 port and return the port.
+
+A worker resumed from a saved core gets its server, method table and object
+registry back from the heap, but not its socket. This replaces the listener,
+records the new port, marks the server running again and clears the
+authentication flag, so the new connection must authenticate with the secret
+in the resumed process's own environment."
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0
+                                          :reuse-address t
+                                          :element-type 'character))
+         (port (usocket:get-local-port listener)))
+    (setf (worker-server-listen-socket server) listener
+          (worker-server-port server) port
+          (worker-server-running-p server) t
+          (worker-server-authenticated-p server) nil)
+    (log-event :info "worker.server.reopened" "port" port)
+    port))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Method registry
