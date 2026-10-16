@@ -145,15 +145,36 @@ attached mode only.
 that takes no arguments and returns a structured JSON body with these
 fields:
 
-| Field            | Meaning                                                                                                                                          |
-|------------------+------------------------------------------------------------------------------------------------------------------------------------------------|
-| =pool_running=   | =true= when the pool's health monitor is live.                                                                                                  |
-| =total_workers=  | Count of all live worker processes (bound + standby).                                                                                           |
-| =standby_count=  | Warm workers ready for immediate assignment.                                                                                                    |
-| =bound_count=    | Workers currently bound to a session.                                                                                                           |
-| =max_pool_size=  | Configured ceiling (=DSMR_MAX_POOL_SIZE=, default 16).                                                                                          |
-| =warmup_target=  | Configured standby target (=DSMR_WORKER_POOL_WARMUP=, default 1).                                                                               |
-| =workers=        | Per-worker array of =id=, truncated =session=, =tcp_port=, =pid=, and =state=. The Slynk port is deliberately omitted so the health view cannot be used to bypass MCP policy. |
+| Field                | Meaning                                                                                                                                      |
+|----------------------+----------------------------------------------------------------------------------------------------------------------------------------------|
+| =pool_running=       | =true= when the pool's health monitor is live.                                                                                              |
+| =total_workers=      | Count of workers the pool holds: bound, standby and hibernated.                                                                             |
+| =standby_count=      | Warm workers ready for immediate assignment. Zero unless =DSMR_WORKER_POOL_WARMUP= asks for some.                                           |
+| =bound_count=        | Workers currently bound to a session.                                                                                                       |
+| =hibernated_count=   | Workers whose world is saved to disk and whose process has ended.                                                                           |
+| =resident_count=     | Workers with a running process.                                                                                                             |
+| =max_pool_size=      | Configured ceiling (=DSMR_MAX_POOL_SIZE=, default 16). Resident workers count against it; hibernated ones do not.                           |
+| =warmup_target=      | Configured standby target (=DSMR_WORKER_POOL_WARMUP=, default 0).                                                                           |
+| =pressure_relief=    | =active= when the pool is answering a live host bus service, else =inactive=.                                                              |
+| =worker_core=        | The worker core new workers boot from, or =null=.                                                                                           |
+| =worker_core_status= | =in use=, =unset=, =missing=, or =disabled:= and the reason (a core that would not boot is set aside for the life of the server).          |
+| =workers=            | Per-worker array, described below. The Slynk port is deliberately omitted so the health view cannot be used to bypass MCP policy.          |
+
+Each entry in =workers= carries =id=, a truncated =session=, =tcp_port=,
+=pid=, =state= and the liveness fields =backend-status= also reports, plus:
+
+| Field               | Meaning                                                                                                   |
+|---------------------+-----------------------------------------------------------------------------------------------------------|
+| =state=             | =standby=, =bound=, =hibernating= (saving its world), =hibernated=, =resuming=, =crashed=, =released= or =dead=. |
+| =stateful=          | It has run a call that can leave state behind, so it is hibernated rather than stopped under pressure.    |
+| =busy=              | A call is holding it now. A busy worker is never stopped or hibernated.                                  |
+| =boot=              | How its process started: =core=, =source= or =resumed=.                                                   |
+| =last_activity=     | Unix seconds of its last call.                                                                            |
+| =core_bytes=        | Size of its last saved core.                                                                              |
+| =core_age_seconds=  | How long it has been hibernated.                                                                          |
+| =last_hibernate_ms= | How long its last save took.                                                                              |
+| =last_resume_ms=    | How long its last resume took.                                                                            |
+| =refused_reason=    | Why its last hibernation was refused (busy, threads of its own, too little disk, a refused path, a failed or slow save). |
 
 =pool-status= is only meaningful in hermetic mode. Called when =*mode*=
 is *not* =:hermetic=, it returns an informative =isError= ("pool-status
@@ -271,6 +292,125 @@ start failing fast.
 The circuit breaker is a denial-of-service mitigation (3 crashes / 300 s
 window, 60 s cooldown); see the corresponding STRIDE row in
 [[file:threat-model.org]].
+
+* Memory pressure and hibernated workers
+
+Where the host bus service runs, it watches the host's memory and, under
+pressure, asks pools to stop fresh idle workers and hibernate stateful idle
+ones (see [[file:architecture.org::*Worker lifecycle][Worker lifecycle]] for why
+and in what order). A pool acts only on those requests. With no host service,
+nothing is ever stopped or hibernated, and a worker lives until its session
+ends. =pool-status= reports =pressure_relief= as =active= when its pool is
+answering a live service.
+
+** Where hibernated cores live, and who removes them
+
+Each MCP server keeps its workers' saved worlds at
+=~/.local/state/dsmr-mcp/hibernate/<server pid>-<start time>/<worker id>.core=
+(under =$XDG_STATE_HOME= when that is set). The directories are readable by
+you alone (0700) and so are the files (0600), because a core holds everything
+the worker held. They sit on disk rather than tmpfs, outside any repository,
+and must never be synced between hosts.
+
+A core is removed when its worker resumes, when its session is released, when
+the worker is killed, and when the server shuts down. A server that dies
+without shutting down leaves its directory behind: the next pool to start on
+the host sweeps every directory whose server is gone, and the host service
+does the same once a minute. A server is named by its pid and its start time
+together, so a pid the kernel has since handed to another process never makes
+a dead server's cores look live.
+
+A core that could not be resumed is moved to =hibernate/failed/= and kept for
+diagnosis. The pool keeps the two newest there and deletes older ones, and
+nothing ever resumes from that directory. Read the =worker-resume-failed= line
+in the fleet error log for the cause, then delete the file when you are done
+with it.
+
+Hibernation is refused when free space on that filesystem is below twice the
+worker's expected core size, so a save cannot fill the disk. The worker stays
+resident and =pool-status= shows why in its =refused_reason=.
+
+** Capacity
+
+A hibernated session does not count against =DSMR_MAX_POOL_SIZE=: it has no
+process and holds no memory. It still needs a place to resume into. If the
+pool is full when the session's next call arrives, that call fails with
+=pool-capacity-exceeded= and the session stays hibernated with its world
+intact on disk. Nothing hibernates another worker to make room. Retry once a
+session ends or a worker is stopped, or raise =DSMR_MAX_POOL_SIZE=.
+
+** The memory line of =--host-status=
+
+=~/.local/bin/dsmr-bus-watch --host-status= prints one more line after the
+service line once the service watches memory:
+
+#+begin_example
+memory state=ok hibernated=0 resident=3 since=1760584000 some=0.0 available=61 last-action=-
+#+end_example
+
+=state= is =ok=, =pressure=, or =unknown= before the first reading.
+=hibernated= and =resident= count the workers of live servers. =since= is
+when the state last changed and =last-action= when a pool was last asked to
+give memory back, both in Unix seconds (=-= for never). =some= is the
+ten-second "some" stall figure and =available= the share of memory still
+available, in whole percent. Pressure never changes the command's exit status:
+it is information for a leader, not a fault of the service. A host whose
+service predates memory relief prints no such line.
+
+** Fleet error log codes
+
+The service writes to the fleet error log, where a leader listens, only what
+someone may have to act on. Each relief request is routine and goes to the
+service's own log instead.
+
+- =memory-pressure= (WARN): the host has entered pressure, with the readings
+  that showed it, and relief has begun. A leader notes it in the footer;
+  nothing needs doing unless one of the two lines below follows. When pressure
+  ends, a =recovered= line for the same code closes the episode.
+- =breaker-tripped= naming =memory-pressure= (ERROR): the service asked for
+  relief 30 times within ten minutes and pressure kept coming back, so it has
+  paused relief for a minute. Memory is being taken faster than idle workers
+  can give it back. A leader carries it to the operator, who decides whether
+  to park sessions or stop work on the host.
+- =memory-pressure-unrelieved= (ERROR, once per episode): the host has been
+  short of memory for over a minute and no idle worker is left to stop or
+  hibernate. Nothing the service can do will help. A leader puts it in front
+  of the operator at once; ending or parking sessions is the only relief left.
+- =worker-resume-failed= (ERROR, written by the pool, =id= naming the session):
+  a hibernated world could not be resumed. The session already received a
+  fresh worker and a reset notice naming the cause, and the core is kept under
+  =hibernate/failed/=. A leader tells whoever owns that session that its
+  in-image state is gone, and reports it if it happens again.
+
+Three WARN codes say the service set something aside: =memory-threshold-ignored=
+(a setting it could not use, see [[file:configuration.org][Configuration]]),
+=memory-request-stale= (a request no pool answered within five minutes, which
+it withdrew) and =worker-record-mismatch= (a worker record whose name and
+contents disagree, which it never acts on).
+
+** The core images
+
+=make core= builds two images: =dsmr.core= for the MCP server, then
+=dsmr.core.worker= for hermetic workers, each verified before it replaces the
+one installed, with the previous image kept beside it as =.prev=. Run
+=make core-worker= to rebuild the worker image alone and
+=make core-verify-worker= to check an installed one. The launcher judges the
+worker image by the same freshness rule as =dsmr.core=, rebuilds it in the
+background when it is stale, and passes it to the server only while it is
+fresh, so a server started meanwhile simply loads its workers from source.
+Running servers keep the image they started with until they restart.
+
+To measure what idle workers cost on a host, run
+
+#+begin_src sh
+scripts/measure-worker-footprint.sh dsmr.core.worker 8
+#+end_src
+
+It starts that many workers from the image one after another, sums their
+proportional set size, stops them all, and prints one line:
+=workers=8 total_pss_kb=... avg_pss_kb=... max_handshake_ms=... median_handshake_ms=...=.
+On the development box eight workers averaged about 39 MB each and reached
+their handshake in about 80 ms.
 
 * alive-lsp absence
 

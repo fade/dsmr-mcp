@@ -337,13 +337,68 @@ loading the test package and calling it.
 * Hermetic worker pool and circuit breaker
 
 The hermetic pool manages worker processes with /strict exclusive session
-affinity/: one session is bound to exactly one worker, never shared. The pool
-keeps a small set of warm standby workers ready (=DSMR_WORKER_POOL_WARMUP=,
-default 1) and spawns on demand up to a ceiling (=DSMR_MAX_POOL_SIZE=, default
-16); exceeding the ceiling signals a typed capacity error rather than queueing.
-At hermetic startup the pool pre-warms the worker system's FASL cache once in the
-parent so concurrent child spawns never race to compile the same files, starts a
+affinity/: one session is bound to exactly one worker, never shared. It spawns
+on demand up to a ceiling (=DSMR_MAX_POOL_SIZE=, default 16); exceeding the
+ceiling signals a typed capacity error rather than queueing. At hermetic startup
+the pool pre-warms the worker system's FASL cache once in the parent so
+concurrent child spawns never race to compile the same files, starts a
 background health monitor, and registers a shutdown hook.
+
+** Worker lifecycle
+
+A worker boots from the worker core, =dsmr.core.worker=, a prebuilt image of
+the worker system and its dependencies that the launcher keeps fresh beside
+=dsmr.core= and hands to the server. A worker from the core is serving in
+about a tenth of a second (135 ms measured on the development box), and every
+worker on the host shares the image's pages, so idle workers cost far less
+than workers loaded from source. When the worker core is unset, missing or
+stale, or fails to boot, the pool loads the worker system from source as it
+always did and logs that it did. A worker booted from the core reads your ASDF
+source registry configuration again at its first system lookup, rather than
+using the one saved in the image, so a project added since the image was built
+is still found.
+
+There is no warm standby (=DSMR_WORKER_POOL_WARMUP=, default 0). A session's
+worker is spawned on its first hermetic call. The standby existed only because
+a worker loaded from source took seconds to start, and on a host with many MCP
+servers the idle standbys added up to gigabytes that no session was using.
+
+A worker is then held for as long as its session lives. Nothing reaps it for
+being idle. I chose that because a long-lived worker's world is the work:
+definitions, loaded systems and data built up over many calls. Losing it inside
+an already stressed system is the risk I will not take, so memory is given back
+in a way that keeps the world:
+
+- *The host service decides.* The host bus service reads the kernel's memory
+  pressure figures and =MemAvailable= once a second. Under pressure it asks one
+  pool at a time to give up one idle worker, two seconds apart, and never while
+  an earlier request is still waiting for an answer. A pool never acts on its
+  own.
+- *Fresh idle workers are stopped first.* A worker that has run nothing that can
+  leave state behind holds nothing a session built, and its session's next call
+  gets a new one with no notice and nothing lost.
+- *Stateful idle workers are hibernated next*, least recently used first, the
+  larger first when two were last used at the same moment. Hibernation saves the
+  worker's whole Lisp world to a core file on disk and ends its process. The
+  session's next call resumes it from that core: same worker id, same world, no
+  reset notice. Measured on the development box, a save took about 1.2 s for a
+  150 MB core and a resume about 50 ms from a warm page cache (about 190 ms cold).
+- *A worker serving a call, or running threads of its own, is never chosen*,
+  and the pool makes its final check under the same lock a call takes its worker
+  under, so a call that arrives as a request lands always keeps its worker.
+
+A resumed world does not have back what lived outside the heap: threads, open
+files and sockets, timers, foreign memory and values from
+=get-internal-real-time=. That is why a worker running threads of its own is
+never hibernated. A save or a stop is not a crash: neither adds to the crash
+record or touches the circuit breaker below. A worker that dies while saving,
+most likely killed for memory, is replaced on the next call with a reset
+notice naming the cause, and a saved world that cannot be resumed is replaced
+the same way, with its core kept for diagnosis. [[file:operations.org][Operations]]
+covers where cores live, what =pool-status= shows, and what each signal asks
+of you.
+
+** Crash recovery
 
 When a worker dies the health monitor detects it and asynchronously spawns a
 replacement bound to the same session. The session receives exactly /one/ crash
