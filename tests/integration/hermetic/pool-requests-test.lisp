@@ -110,11 +110,12 @@ directory removed afterwards."
           (uiop:delete-directory-tree *state-home* :validate t))))))
 
 (defmacro %pool-case ((&key (min-kill-age 0) (agent-interval 1)
-                            (shutdown t))
+                            (health-interval 10.0d0) (shutdown t))
                       &body body)
   "Evaluate BODY against a running pool whose workers boot from the test
 worker core, with no standbys, a minimum pressure-stop age of MIN-KILL-AGE
-seconds and a pressure agent ticking every AGENT-INTERVAL seconds, inside a
+seconds, a pressure agent ticking every AGENT-INTERVAL seconds and a health
+check every HEALTH-INTERVAL seconds, inside a
 private state home, with the pool's log lines captured in *CAPTURE*. The pool
 is shut down afterwards whatever happens; when SHUTDOWN is NIL, BODY is
 expected to shut it down itself. Skips when no core can be built."
@@ -126,7 +127,7 @@ expected to shut it down itself. Skips when no core can be built."
                (*worker-core* ,core)
                (*worker-pool-warmup* 0)
                (*max-pool-size* 4)
-               (*health-check-interval-seconds* 10.0d0)
+               (*health-check-interval-seconds* ,health-interval)
                (*pressure-kill-min-age-seconds* ,min-kill-age)
                (*pressure-agent-interval* ,agent-interval)
                (*capture* (make-instance '%capture-appender)))
@@ -425,7 +426,9 @@ worker keeps serving with its world."
 be resumed, still owes its session a reset notice. It is published as
 stateful, a :kill request for it is refused as stateful, it keeps serving, and
 the session's next call delivers the notice."
-  (%pool-case ()
+  ;; The crash below is handled by hand; a health check finding the same dead
+  ;; worker first would replace it under the case's feet.
+  (%pool-case (:health-interval 600.0d0)
     ;; A crash: the process is killed and the pool replaces the worker.
     (let* ((first (get-or-assign-worker "crashed"))
            (pid (worker-pid first)))
