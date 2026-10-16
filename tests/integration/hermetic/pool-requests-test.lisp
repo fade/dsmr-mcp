@@ -277,18 +277,36 @@ is gone, and the session's next worker is a new one with no reset notice."
       (%no-crash-recorded "fresh"))))
 
 (define-test the-record-shows-an-answer-before-its-request-goes
-  "By the time an answered request has been removed, the published record
-already carries the answer and no longer lists the stopped worker, so the
-service can never read a request gone and a record from before it."
+  "At the moment an answered request is removed, the published record already
+carries the answer and no longer lists the stopped worker, so the service can
+never read a request gone and a record from before it."
   (%pool-case (:agent-interval 600)
     (let* ((w (get-or-assign-worker "ordered"))
            (id (worker-id w))
-           (path (%request id :kill)))
-      (pool::%answer-pending-requests pool::*pressure-agent-current*)
+           (path (%request id :kill))
+           (seen nil))
+      ;; Read the record from inside the removal of this request, which is
+      ;; the moment the service may next look.
+      (sb-int:encapsulate
+       'dsmr-mcp/src/hermetic/pool-records:remove-request 'record-order
+       (lambda (original removed &rest args)
+         (when (equal (file-namestring removed) (file-namestring path))
+           (setf seen (list :result (%last-result id)
+                            :listed (and (find id (getf (%record) :workers)
+                                               :key (lambda (e) (getf e :id)))
+                                         t))))
+         (apply original removed args)))
+      (unwind-protect
+           (pool::%answer-pending-requests pool::*pressure-agent-current*)
+        (sb-int:unencapsulate 'dsmr-mcp/src/hermetic/pool-records:remove-request
+                              'record-order))
+      (true seen "the request was never removed")
+      (is eq :killed (getf seen :result)
+          "the record did not carry the answer when the request was removed")
+      (false (getf seen :listed)
+             "the record still listed worker ~A when the request was removed" id)
       (false (probe-file path) "the request is still there")
-      (is eq :killed (%last-result id))
-      (false (find id (getf (%record) :workers) :key (lambda (e) (getf e :id)))
-             "the record still lists worker ~A" id))))
+      (is eq :killed (%last-result id)))))
 
 (define-test a-stop-that-finds-a-call-holding-the-worker-is-busy
   "When a call takes the worker after the stop chose it and before the stop
