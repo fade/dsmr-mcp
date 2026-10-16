@@ -225,12 +225,16 @@ worker_core_status says in use, unset, missing or disabled with the reason."
                (is eq 'cl:null (gethash "worker_core" info))
                (is equal "disabled: boot failed"
                    (gethash "worker_core_status" info))))
-           (let ((env (uiop:getenv "DSMR_WORKER_CORE")))
-             (when (or (null env) (zerop (length env)))
-               (let ((*worker-core* nil)
-                     (*worker-core-disabled* nil))
-                 (is equal "unset"
-                     (gethash "worker_core_status" (pool-status-info)))))))
+           ;; The launcher may have exported a core into this process; it is
+           ;; taken away for the check so the check always runs.
+           (let ((env (sb-posix:getenv "DSMR_WORKER_CORE")))
+             (unwind-protect
+                  (let ((*worker-core* nil)
+                        (*worker-core-disabled* nil))
+                    (sb-posix:unsetenv "DSMR_WORKER_CORE")
+                    (is equal "unset"
+                        (gethash "worker_core_status" (pool-status-info))))
+               (when env (sb-posix:setenv "DSMR_WORKER_CORE" env 1)))))
       (ignore-errors (delete-file file)))))
 
 ;;; ---------------------------------------------------------------------------
