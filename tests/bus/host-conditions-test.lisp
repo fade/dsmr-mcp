@@ -261,7 +261,9 @@
     (conditions:legacy-watcher-found conditions:adopt-legacy-watcher 50 600 600 :warn "legacy-watcher-found")
     (conditions:session-gone conditions:lapse 50 600 600 :warn "session-lapsed")
     (conditions:parked-session-gone conditions:deregister 50 600 600 :info "parked-session-ended")
-    (conditions:roster-gap nil nil nil nil :info "roster-gap"))
+    (conditions:roster-gap nil nil nil nil :info "roster-gap")
+    (conditions:memory-pressure conditions:request-hibernation 30 600 60 :warn "memory-pressure")
+    (conditions:memory-pressure-unrelieved nil nil nil nil :error "memory-pressure-unrelieved"))
   "Each fault class with the heal, budget, level and code it is handled with.")
 
 (defun row-matches-p (class restart threshold window cooldown level code)
@@ -293,4 +295,93 @@
   (true (apply #'row-matches-p (nth 9 *expected-rows*)))
   (true (apply #'row-matches-p (nth 10 *expected-rows*)))
   (true (apply #'row-matches-p (nth 11 *expected-rows*)))
-  (true (apply #'row-matches-p (nth 12 *expected-rows*))))
+  (true (apply #'row-matches-p (nth 12 *expected-rows*)))
+  (true (apply #'row-matches-p (nth 13 *expected-rows*)))
+  (true (apply #'row-matches-p (nth 14 *expected-rows*))))
+
+(define-test the-memory-pressure-row-heals-by-asking-for-hibernation
+  "Memory pressure is healed by a hibernation request, at most 30 times in 600
+   s, with a 60 s cooldown after a trip, and goes unhealed at WARN."
+  (let ((row (conditions:healing-entry 'conditions:memory-pressure)))
+    (is eq 'conditions:memory-pressure (getf row :class))
+    (is eq 'conditions:request-hibernation (getf row :restart))
+    (is eql 30 (getf row :threshold))
+    (is eql 600 (getf row :window))
+    (is eql 60 (getf row :cooldown))
+    (is eq :warn (getf row :level))
+    (is equal "memory-pressure" (getf row :code))))
+
+(define-test the-unrelieved-pressure-row-has-no-heal-and-reports-at-error
+  "Pressure with nothing left to act on has no heal and is reported at ERROR
+   under its own code."
+  (let ((row (conditions:healing-entry 'conditions:memory-pressure-unrelieved)))
+    (is eq 'conditions:memory-pressure-unrelieved (getf row :class))
+    (is eq nil (getf row :restart))
+    (is eq nil (getf row :threshold))
+    (is eq nil (getf row :window))
+    (is eq nil (getf row :cooldown))
+    (is eq :error (getf row :level))
+    (is equal "memory-pressure-unrelieved" (getf row :code))))
+
+(defun inject-memory-pressure (heals)
+  "Raise memory pressure on the host with a hibernation request on offer, as
+   the memory check would. The request counts itself in the car of HEALS and
+   answers :REQUESTED."
+  (restart-case (conditions:raise-fault 'conditions:memory-pressure
+                                        :subject "host"
+                                        :detail "some avg10 at 15")
+    (conditions:request-hibernation ()
+      (incf (car heals))
+      :requested)))
+
+(define-test memory-pressure-relief-is-bounded-by-its-breaker
+  "Thirty requests inside the window run and are reported at INFO; the next
+   trips the breaker with one ERROR record and is skipped; once the 60 s
+   cooldown has run, a request runs again."
+  (multiple-value-bind (report-fn records) (recorder)
+    (let* ((heals (list 0))
+           (clock 0)
+           (breakers (fresh-breakers)))
+      (flet ((once ()
+               (conditions:call-with-healing
+                (lambda () (inject-memory-pressure heals))
+                :now-fn (lambda () clock)
+                :report-fn report-fn
+                :breakers breakers)))
+        (let ((results (loop for now from 0 below 30
+                             collect (progn (setf clock now) (once)))))
+          (is = 30 (count :requested results)))
+        (is = 30 (car heals))
+        (is = 30 (count-if (lambda (r) (and (eq :info (first r))
+                                            (equal "memory-pressure" (second r))))
+                           (funcall records)))
+        (setf clock 30)
+        (is eq :skipped (once))
+        (is = 30 (car heals))
+        (let ((trips (records-with-code (funcall records) "breaker-tripped")))
+          (is = 1 (length trips))
+          (is eq :error (first (first trips)))
+          (is string= "host" (fifth (first trips))))
+        (setf clock 89)
+        (is eq :skipped (once))
+        (setf clock (+ 30 60))
+        (is eq :requested (once))
+        (is = 31 (car heals))
+        (is = 1 (length (records-with-code (funcall records) "breaker-tripped")))))))
+
+(define-test unrelieved-memory-pressure-is-reported-at-error-and-skipped
+  "With nothing left to act on, pressure is one ERROR record under its own
+   code, and the supervised work carries on."
+  (multiple-value-bind (report-fn records) (recorder)
+    (let ((result (conditions:call-with-healing
+                   (lambda ()
+                     (conditions:raise-fault 'conditions:memory-pressure-unrelieved
+                                             :subject "host"
+                                             :detail "no worker left to relieve"))
+                   :now-fn (lambda () 0)
+                   :report-fn report-fn
+                   :breakers (fresh-breakers))))
+      (is eq :skipped result)
+      (is = 1 (length (funcall records)))
+      (is eq :error (first (first (funcall records))))
+      (is string= "memory-pressure-unrelieved" (second (first (funcall records)))))))
