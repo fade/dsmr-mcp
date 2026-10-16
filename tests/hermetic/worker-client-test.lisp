@@ -130,6 +130,29 @@ core was built for runtime \"a\" but this is \"b\""))
 Can't allocate 8589934592 bytes for dynamic space"))
   (false (wc::%core-rejection-p "")))
 
+(define-test a-core-the-runtime-could-not-open-or-read-for-a-passing-reason-is-not-refused
+  "A runtime that could not open or read the core because it ran out of
+descriptors or memory, was interrupted or hit an I/O error has not refused
+the core, since that may pass; one that could not open it because it is not
+there, or not readable, has."
+  (dolist (why '("Too many open files" "Too many open files in system"
+                 "Interrupted system call" "Input/output error"))
+    (false (wc::%core-rejection-p
+            (format nil "could not open file \"/x/1.core\"~%open: ~A~%" why))
+           "open: ~A" why))
+  (dolist (errno '(4 5 12 23 24))
+    (false (wc::%core-rejection-p
+            (format nil "fatal error encountered in SBCL pid 1:~%~
+                         unable to read core file (errno = ~D)" errno))
+           "errno ~D" errno))
+  (true (wc::%core-rejection-p
+         (format nil "could not open file \"/x/1.core\"~%open: No such file or directory~%")))
+  (true (wc::%core-rejection-p
+         (format nil "could not open file \"/x/1.core\"~%open: Permission denied~%")))
+  (true (wc::%core-rejection-p
+         (format nil "fatal error encountered in SBCL pid 1:~%~
+                      unable to read core file (errno = 21)"))))
+
 (define-test a-core-the-runtime-refuses-is-final-and-other-failures-are-not
   "A runtime refusing a file that is no core ends the spawn with the kind
 rejected, which is final. A timeout, a launch failure and a process killed

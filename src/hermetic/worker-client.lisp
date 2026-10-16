@@ -873,17 +873,36 @@ stderr. Reads nothing while the process is still running."
            (setf text (get-output-stream-string out))))))
     (values (and (member status '(:exited :signaled)) status) code text)))
 
+(defun %transient-read-failure-p (low)
+  "True when LOW, lower-cased runtime output, says the core could not be
+opened or read for a reason that has nothing to do with the core: out of
+descriptors, out of memory, an interrupted call or an I/O error. SBCL reports
+a failed open with the system's error text and a failed read with the error
+number, so both forms are recognised."
+  (or (some (lambda (needle) (search needle low))
+            '("too many open files" "interrupted system call" "input/output error"))
+      (let ((at (search "errno = " low)))
+        (and at
+             (member (parse-integer low :start (+ at (length "errno = "))
+                                        :junk-allowed t)
+                     (list sb-posix:eintr sb-posix:eio sb-posix:enomem
+                           sb-posix:enfile sb-posix:emfile))
+             t))))
+
 (defun %core-rejection-p (text)
   "True when TEXT, what a runtime printed before exiting, says it refused the
 core it was given: the wrong build, a bad magic number, a truncated file or one
 it could not open. A runtime that could not get memory for the heap is not
-refusing the core and is left out, since it may succeed later."
+refusing the core and is left out, since it may succeed later, and so is one
+that could not open or read the file for a passing reason such as running out
+of descriptors (%transient-read-failure-p)."
   (let ((low (string-downcase (or text ""))))
     (and (some (lambda (needle) (search needle low))
                '("core was built for" "magic number in core" "core file"
                  "could not open file" "not a core"))
          (notany (lambda (needle) (search needle low))
                  '("allocate" "memory" "mmap"))
+         (not (%transient-read-failure-p low))
          t)))
 
 (defun %last-line (text)
