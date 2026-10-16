@@ -365,9 +365,10 @@ worker's expected core size, so a save cannot fill the disk. The worker stays
 resident and =pool-status= shows why in its =refused_reason=.
 
 Each server also keeps at most =DSMR_MAX_HIBERNATED_WORKERS= workers (default
-8) hibernated or saving at once. Without a limit, a server whose sessions come
-and go without being released would keep saving their worlds until the disk
-check alone stopped it, with the disk nearly full. At the limit a request to
+8) hibernated, saving or resuming at once; a worker being resumed still owns
+its core, which stays on disk if the resume fails. Without a limit, a server
+whose sessions come and go without being released would keep saving their
+worlds until the disk check alone stopped it, with the disk nearly full. At the limit a request to
 hibernate is refused with =at-limit=, the server's record tells the host
 service it is full so the service asks it for no more saves, and the service
 turns to other workers. The free-space check above still applies below the

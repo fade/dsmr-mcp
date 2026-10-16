@@ -495,6 +495,32 @@ is full, and once the first world resumes the second worker can be saved."
       (false (getf (pool:build-worker-record (pool::%unix-now)) :hibernate-full))
       (is eq :hibernated (hibernate-session-worker "second")))))
 
+(define-test a-worker-being-resumed-counts-toward-the-hibernated-limit
+  "A worker whose world is being resumed still owns its core, since a resume
+that fails in a way that may pass leaves it on disk. With the limit at one,
+while the first worker is resuming a second save is refused with at-limit and
+the published record says the server is full."
+  (%pool-case (:max-hibernated 1)
+    (%eval "first" "(defvar *kept* 1)")
+    (%eval "second" "(defvar *kept* 2)")
+    (let ((first (%session-worker "first"))
+          (second (%session-worker "second")))
+      (is eq :hibernated (hibernate-session-worker "first"))
+      ;; The state a request gives the worker when it starts resuming it.
+      (bt:with-lock-held (pool::*pool-lock*)
+        (setf (worker-state first) :resuming))
+      (unwind-protect
+           (progn
+             (multiple-value-bind (outcome reason) (hibernate-session-worker "second")
+               (is eq :at-limit outcome "reason ~A" reason))
+             (is eq :bound (worker-state second))
+             (true (getf (pool:build-worker-record (pool::%unix-now)) :hibernate-full)))
+        (bt:with-lock-held (pool::*pool-lock*)
+          (when (eq (worker-state first) :resuming)
+            (setf (worker-state first) :hibernated))))
+      (true (%answers-p (%answer-in "first" "*kept*") 1))
+      (true (%answers-p (%answer-in "second" "*kept*") 2)))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Ending a worker in the middle of a save
 ;;; ---------------------------------------------------------------------------

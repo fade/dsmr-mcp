@@ -2133,11 +2133,16 @@ the outcome and reason for hibernate-session-worker."
                  (%finish-hibernation session-id worker path nil milliseconds)
                  (%lose-worker-during-hibernation session-id worker)))))))))
 
+(defun %holds-saved-world-p (worker)
+  "True when WORKER's world is on disk or on its way there or back: it is
+hibernated, being saved, or being resumed. A resume that fails in a way that
+may pass leaves the world on disk, so a resuming worker still owns its core."
+  (and (member (worker-state worker) '(:hibernated :hibernating :resuming)) t))
+
 (defun %saved-worker-count ()
-  "How many of this pool's workers are hibernated or being saved. Must be
-called with *pool-lock* held."
-  (count-if (lambda (w) (member (worker-state w) '(:hibernated :hibernating)))
-            *all-workers*))
+  "How many of this pool's workers hold a saved world (%holds-saved-world-p).
+Must be called with *pool-lock* held."
+  (count-if #'%holds-saved-world-p *all-workers*))
 
 (defun hibernate-session-worker (session-id &key ((:worker expected)))
   "Have SESSION-ID's worker save its whole world to disk and end its process,
@@ -2156,7 +2161,7 @@ Returns (values OUTCOME REASON), OUTCOME being one of:
                  saving child could not be started, a save that failed, or
                  bad-path); it is left serving.
   :at-limit      this server already keeps *max-hibernated-workers* workers
-                 hibernated or saving; it is left serving.
+                 hibernated, saving or resuming; it is left serving.
   :disk          less than twice the expected core size is free; it is left
                  serving. This check applies under the limit as well.
   :timeout       no answer in time and no finished core. The worker may still
@@ -2339,16 +2344,13 @@ was spawned and last active, its last refusal and the size of its saved core.
 SERVICE-SEEN says whether the pool last found the host service alive, and
 LAST-ACTION is the last request answered, as (:worker-id :action :result :at),
 or NIL. :HIBERNATE-FULL is true while the server keeps as many workers
-hibernated or saving as *max-hibernated-workers* allows, so the service asks
+hibernated, saving or resuming as *max-hibernated-workers* allows, so the service asks
 it for no more saves until one resumes or goes. Nothing is written; the caller
 publishes the plist."
   (multiple-value-bind (entries saved)
       (flet ((read-workers (list)
                (values (mapcar (lambda (w) (%worker-record-entry w now)) list)
-                       (count-if (lambda (w)
-                                   (member (worker-state w)
-                                           '(:hibernated :hibernating)))
-                                 list))))
+                       (count-if #'%holds-saved-world-p list))))
         (if workers-p
             (read-workers workers)
             (bt:with-lock-held (*pool-lock*)
