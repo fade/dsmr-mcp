@@ -321,12 +321,12 @@
         :last-activity last-activity :refused-reason nil :refused-at nil
         :core-bytes nil))
 
-(defun publish (workers &key (stem (own-stem)) (owner stem))
+(defun publish (workers &key (stem (own-stem)) (owner stem) (at (%unix-time)))
   "Publish WORKERS as the record of the server STEM, the record saying it
-   belongs to the server OWNER names."
+   belongs to the server OWNER names and was written AT, in Unix seconds."
   (multiple-value-bind (pid start) (pool-records:parse-server-stem owner)
     (pool-records:write-worker-record
-     stem (list :server-pid pid :server-start start :written-at (%unix-time)
+     stem (list :server-pid pid :server-start start :written-at at
                 :service-seen t :workers workers :last-action nil))))
 
 (defun requests ()
@@ -467,6 +467,56 @@
         (check svc now)
         (false (probe-file request) "the stale request is still there"))
       (is = 1 (length (reported "memory-request-stale" :warn))))))
+
+(define-test a-pool-whose-record-has-gone-stale-is-never-asked
+  "A live server whose pool stopped rewriting its record a minute ago is never
+   asked for relief, and pressure with nothing else to ask is reported as
+   unrelieved after sixty seconds, naming the pool that is not answering."
+  (with-memory-case (state)
+    (let ((svc (memory-service))
+          (now (%unix-time)))
+      (setf *reading* (readings 5))
+      (publish (list (worker 1 :stateful t :spawned-at (- now 200)
+                               :last-activity (- now 100)))
+               :at (- now 60))
+      (check svc now)
+      (is equal '() (requests) "a pool whose record is a minute old was asked")
+      (check svc (+ now 61))
+      (is equal '() (requests))
+      (let ((lines (fleet-lines-with "ERROR code=memory-pressure-unrelieved")))
+        (is = 1 (length lines))
+        (true (and lines (search "1 pool not answering" (first lines)))
+              "~A" lines)))))
+
+(define-test a-pool-that-left-a-request-unanswered-is-passed-over-for-another
+  "When a request is withdrawn unanswered, relief moves on at once to a worker
+   of another pool instead of asking the silent pool for the same worker
+   again, even though that pool's record still offers it first."
+  (with-memory-case (state)
+    (let* ((svc (memory-service))
+           (now (%unix-time))
+           (later (+ now 301))
+           (other (sb-ext:run-program "/bin/sleep" '("60") :wait nil)))
+      (unwind-protect
+           (let ((other-stem (pool-records:server-stem (sb-ext:process-pid other))))
+             (setf *reading* (readings 5))
+             (publish (list (worker 1 :stateful t :spawned-at (- now 200)
+                                      :last-activity (- now 100)))
+                      :at later)
+             (publish (list (worker 1 :stateful t :spawned-at (- now 200)
+                                      :last-activity (- now 50)))
+                      :stem other-stem :at later)
+             (pool-records:write-hibernate-request (own-stem) 1 :hibernate :now now)
+             (check svc later)
+             (let ((asked (mapcar #'cdr (pool-records:pending-requests))))
+               (is = 1 (length asked))
+               (multiple-value-bind (pid start) (pool-records:parse-server-stem other-stem)
+                 (is eql pid (getf (first asked) :server-pid)
+                     "the silent pool was asked again: ~S" asked)
+                 (is eql start (getf (first asked) :server-start))))
+             (is = 1 (length (reported "memory-request-stale" :warn))))
+        (ignore-errors (sb-ext:process-kill other 15))
+        (ignore-errors (sb-ext:process-wait other))))))
 
 (define-test pressure-with-nothing-left-to-relieve-is-reported-once-then-recovers
   "Pressure with no candidate is reported once as unrelieved after sixty

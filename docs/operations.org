@@ -363,6 +363,17 @@ pool is full when the session's next call arrives, that call fails with
 intact on disk. Nothing hibernates another worker to make room. Retry once a
 session ends or a worker is stopped, or raise =DSMR_MAX_POOL_SIZE=.
 
+** A pool that stops answering
+
+The service asks one pool at a time and nothing more while a request
+stands, so it guards against a pool that has stopped listening while its
+server still runs. A pool rewrites its worker record at least every five
+seconds; a record older than thirty seconds is not acted on. A request left
+unanswered for five minutes is withdrawn, and that pool is passed over for
+the next five minutes while relief moves on to the other pools. When nothing
+else is left, the episode is reported as =memory-pressure-unrelieved=, so
+systemd-oomd is never left to choose silently.
+
 ** The memory line of =--host-status=
 
 =~/.local/bin/dsmr-bus-watch --host-status= prints one more line after the
@@ -398,7 +409,8 @@ service's own log instead.
   to park sessions or stop work on the host.
 - =memory-pressure-unrelieved= (ERROR, once per episode): the host has been
   short of memory for over a minute and no idle worker is left to stop or
-  hibernate. Nothing the service can do will help. A leader puts it in front
+  hibernate, or none in a pool that is still answering; the line says how
+  many pools were passed over. Nothing the service can do will help. A leader puts it in front
   of the operator at once; ending or parking sessions is the only relief left.
 - =worker-resume-failed= (ERROR, written by the pool, =id= naming the session):
   a hibernated world could not be resumed, because the runtime refused the
@@ -410,7 +422,7 @@ service's own log instead.
 Three WARN codes say the service set something aside: =memory-threshold-ignored=
 (a setting it could not use, see [[file:configuration.org][Configuration]]),
 =memory-request-stale= (a request no pool answered within five minutes, which
-it withdrew) and =worker-record-mismatch= (a worker record whose name and
+it withdrew, passing that pool over for the next five minutes) and =worker-record-mismatch= (a worker record whose name and
 contents disagree, which it never acts on).
 
 ** The core images

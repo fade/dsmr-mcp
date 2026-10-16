@@ -108,6 +108,17 @@
   "Seconds a request may wait for its pool to answer before it is taken back,
    so a pool that stopped listening cannot hold up relief for every other.")
 
+(defconstant +unanswered-backoff-seconds+ 300
+  "Seconds a pool whose request was withdrawn unanswered is passed over, so
+   relief moves on to other pools instead of asking the same silent one
+   again at once.")
+
+(defconstant +record-max-age+ 30
+  "Seconds after which a pool's worker record is too old to act on. A pool
+   that is listening rewrites its record at least every five seconds, so one
+   this old belongs to a pool that has stopped listening, whatever its
+   server's process says, and nothing is asked of it.")
+
 (defconstant +unrelieved-seconds+ 60
   "Seconds pressure may last with no worker left to ask before it is reported
    as unrelieved, for a leader to act on.")
@@ -166,6 +177,8 @@ not start, 75 when its supervisor loop stalled.
    classifier stands, MEMORY-SINCE when the current verdict began and
    LAST-MEMORY-SUMMARY the last verdict with the readings behind it.
    LAST-MEMORY-ACTION is when a pool was last asked to give memory back,
+   UNANSWERING maps the stem of each pool whose request was withdrawn
+   unanswered to when that happened, so the pool is passed over for a while,
    UNRELIEVED-REPORTED-P says this episode of pressure has been reported as
    unrelieved, and LAST-OWNER-SWEEP is when gone servers' files were last
    swept. All times are Unix seconds."
@@ -191,6 +204,7 @@ not start, 75 when its supervisor loop stalled.
   (memory-since nil)
   (last-memory-summary nil)
   (last-memory-action nil)
+  (unanswering (make-hash-table :test 'equal))
   (unrelieved-reported-p nil)
   (last-owner-sweep nil))
 
@@ -455,7 +469,8 @@ not start, 75 when its supervisor loop stalled.
 
    A request whose server has gone is removed. One left unanswered for longer
    than the request timeout is withdrawn and reported, because its pool has
-   stopped listening and would otherwise hold up relief for every other."
+   stopped listening and would otherwise hold up relief for every other; that
+   pool is then remembered as not answering."
   (let ((report-fn (service-report-fn svc))
         (standing '()))
     (dolist (entry (pool-records:pending-requests) (nreverse standing))
@@ -469,10 +484,43 @@ not start, 75 when its supervisor loop stalled.
                             :msg "its server is gone; the request was removed")))
                 ((or (null at) (> (- now at) +memory-request-timeout+))
                  (pool-records:remove-request path)
+                 (setf (gethash (format nil "~D-~D" (getf plist :server-pid)
+                                        (getf plist :server-start))
+                                (service-unanswering svc))
+                       now)
                  (funcall report-fn :warn "memory-request-stale" :subject name
-                          :msg (format nil "no answer within ~D s; the request was withdrawn"
-                                       +memory-request-timeout+)))
+                          :msg (format nil "no answer within ~D s; the request was withdrawn ~
+                                            and its pool is passed over for ~D s"
+                                       +memory-request-timeout+
+                                       +unanswered-backoff-seconds+)))
                 (t (push entry standing))))))))
+
+(defun %answering-records (svc records now)
+  "The RECORDS of pools that may be asked for relief at NOW, and how many pools
+   were passed over, as two values.
+
+   A pool is passed over while its record is older than the record age limit,
+   or carries no time, because a pool that listens rewrites its record every
+   few seconds; and for a while after one of its requests was withdrawn
+   unanswered. One pool that has stopped answering, with its server still
+   running, then never holds up relief for the rest of the host."
+  (let ((unanswering (service-unanswering svc))
+        (kept '())
+        (skipped 0))
+    (maphash (lambda (stem at)
+               (when (>= (- now at) +unanswered-backoff-seconds+)
+                 (remhash stem unanswering)))
+             unanswering)
+    (dolist (record records)
+      (let ((written (getf record :written-at))
+            (stem (format nil "~D-~D" (getf record :server-pid)
+                          (getf record :server-start))))
+        (if (or (not (realp written))
+                (> (- now written) +record-max-age+)
+                (gethash stem unanswering))
+            (incf skipped)
+            (push record kept))))
+    (values (nreverse kept) skipped)))
 
 (defun %relieve-pressure (svc now)
   "Ask one pool to give memory back, when that may be done at NOW, and return
@@ -481,51 +529,57 @@ not start, 75 when its supervisor loop stalled.
 
    Nothing is asked while any request stands anywhere on the host, nor within
    the action spacing of the last request. Otherwise the first candidate among
-   the live servers' workers is asked for, through the memory-pressure fault,
-   so the healing table's breaker bounds how often the service acts however
-   long the pressure lasts. With no candidate, pressure that has lasted past
-   the unrelieved limit is reported once for the episode."
+   the workers of live servers whose pools are answering is asked for,
+   through the memory-pressure fault, so the healing table's breaker bounds
+   how often the service acts however long the pressure lasts. A pool that
+   has stopped answering is passed over (%answering-records), so relief moves
+   on to the others. With no candidate, pressure that has lasted past the
+   unrelieved limit is reported once for the episode, saying how many pools
+   were passed over."
   (when (%standing-requests svc now)
     (return-from %relieve-pressure :in-flight))
   (unless (%due-p (service-last-memory-action svc) now +memory-action-spacing+)
     (return-from %relieve-pressure :spaced))
   (let* ((thresholds (service-memory-thresholds svc))
          (records (%live-worker-records svc :prune t))
-         (candidate (first (memory:rank-candidates
-                            records now
-                            :min-kill-age (memory:memory-thresholds-min-kill-age-seconds
-                                           thresholds))))
          (since (memory:memory-state-since (service-memory-state svc))))
-    (cond
-      (candidate
-       (let ((stem (getf candidate :stem))
-             (id (getf candidate :worker-id))
-             (action (getf candidate :action)))
-         (restart-case
-             (progn
-               (conditions:raise-fault 'memory-pressure
-                                       :subject "host"
-                                       :detail (format nil "~(~A~) worker ~D of server ~A"
-                                                       action id stem))
-               nil)
-           (request-hibernation ()
-             :report "Ask the owning pool to hibernate or stop one idle worker."
-             (pool-records:write-hibernate-request stem id action
-                                                   :now now :reason "memory-pressure")
-             (setf (service-last-memory-action svc) now)
-             :requested))))
-      ((and (not (service-unrelieved-reported-p svc))
-            since
-            (> (- now since) +unrelieved-seconds+))
-       (setf (service-unrelieved-reported-p svc) t)
-       (multiple-value-bind (hibernated resident) (%worker-counts records)
-         (conditions:raise-fault 'memory-pressure-unrelieved
-                                 :subject "host"
-                                 :detail (format nil "short of memory for ~D s with no idle ~
-                                                      worker left to ask; ~D resident, ~
-                                                      ~D hibernated"
-                                                 (- now since) resident hibernated)))
-       nil))))
+    (multiple-value-bind (answering passed-over) (%answering-records svc records now)
+      (let ((candidate (first (memory:rank-candidates
+                               answering now
+                               :min-kill-age (memory:memory-thresholds-min-kill-age-seconds
+                                              thresholds)))))
+        (cond
+          (candidate
+           (let ((stem (getf candidate :stem))
+                 (id (getf candidate :worker-id))
+                 (action (getf candidate :action)))
+             (restart-case
+                 (progn
+                   (conditions:raise-fault 'memory-pressure
+                                           :subject "host"
+                                           :detail (format nil "~(~A~) worker ~D of server ~A"
+                                                           action id stem))
+                   nil)
+               (request-hibernation ()
+                 :report "Ask the owning pool to hibernate or stop one idle worker."
+                 (pool-records:write-hibernate-request stem id action
+                                                       :now now :reason "memory-pressure")
+                 (setf (service-last-memory-action svc) now)
+                 :requested))))
+          ((and (not (service-unrelieved-reported-p svc))
+                since
+                (> (- now since) +unrelieved-seconds+))
+           (setf (service-unrelieved-reported-p svc) t)
+           (multiple-value-bind (hibernated resident) (%worker-counts records)
+             (conditions:raise-fault 'memory-pressure-unrelieved
+                                     :subject "host"
+                                     :detail (format nil "short of memory for ~D s with no idle ~
+                                                          worker left to ask; ~D resident, ~
+                                                          ~D hibernated~[~:;; ~:*~D pool~:P ~
+                                                          not answering~]"
+                                                     (- now since) resident hibernated
+                                                     passed-over)))
+           nil))))))
 
 (defun %check-memory (svc now)
   "Read the host's memory at NOW, in Unix seconds, decide whether it is under
