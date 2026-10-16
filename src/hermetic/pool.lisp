@@ -64,15 +64,19 @@
                 #:worker-refused-reason #:worker-refused-at
                 #:hibernate-worker-process #:release-worker-process
                 #:resume-worker #:*hibernate-timeout-seconds*
-                #:worker-last-resume-milliseconds)
+                #:worker-last-resume-milliseconds
+                #:worker-spawned-at #:worker-boot-kind
+                #:worker-core-path #:*worker-core-disabled*)
   (:local-nicknames (#:pool-records #:dsmr-mcp/src/hermetic/pool-records))
   (:import-from #:dsmr-mcp/src/hermetic/pool-records
                 #:server-stem #:ensure-owner-directory
                 #:unsafe-hibernate-path #:hibernated-core-path
                 #:disk-allows-hibernation-p #:expected-core-bytes
-                #:free-disk-bytes)
+                #:free-disk-bytes #:parse-server-stem
+                #:write-worker-record #:remove-worker-record
+                #:pending-requests #:remove-request)
   (:import-from #:dsmr-mcp/src/bus/hostfiles
-                #:fleet-line #:append-fleet-line)
+                #:fleet-line #:append-fleet-line #:service-alive-p)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
                 #:resolve-eval-timeout #:effective-eval-timeout)
   (:import-from #:dsmr-mcp/src/log #:log-event)
@@ -83,9 +87,14 @@
            #:pool-settings #:pool-settings-p
            #:pool-settings-warmup #:pool-settings-max-pool-size
            #:pool-settings-kill-grace-seconds
+           #:pool-settings-pressure-kill-min-age-seconds
            #:*resolved-pool-settings* #:resolve-pool-settings
            #:effective-worker-pool-warmup #:effective-max-pool-size
            #:effective-worker-kill-grace-seconds
+           #:effective-pressure-kill-min-age-seconds
+           #:*pressure-kill-min-age-seconds* #:*pressure-agent-interval*
+           #:start-pressure-agent #:stop-pressure-agent
+           #:build-worker-record #:act-on-hibernate-request
            #:*health-check-interval-seconds*
            #:*worker-ping-timeout-seconds*
            #:*missed-pings-before-wedged*
@@ -278,6 +287,18 @@ DSMR_WORKER_KILL_GRACE_SECONDS, a positive integer defaulting to 5. A non-NIL
 value, set globally or bound in the thread that starts the pool, wins over
 the environment.")
 
+(defvar *pressure-kill-min-age-seconds* nil
+  "How old, in seconds, a worker must be before the host service may have it
+stopped under memory pressure, or NIL to read the environment when the pool
+starts. A worker that was just spawned has cost its boot and not yet served
+anything, so stopping it would only make the next call pay for another boot.
+
+NIL (the default) means resolve-pool-settings reads
+DSMR_PRESSURE_MIN_KILL_AGE_SECONDS, a non-negative integer defaulting to 10. A
+non-NIL value, set globally or bound in the thread that starts the pool, wins
+over the environment; a binding visible to the thread deciding a stop wins
+there too.")
+
 ;;; ---------------------------------------------------------------------------
 ;;; Settings resolved when the pool starts
 ;;; ---------------------------------------------------------------------------
@@ -292,7 +313,8 @@ The slots carry no type declaration on purpose: a bound special is taken as
 given, and initialize-pool reports an invalid one with its own error."
   (warmup 0)
   (max-pool-size 16)
-  (kill-grace-seconds 5))
+  (kill-grace-seconds 5)
+  (pressure-kill-min-age-seconds 10))
 
 (defvar *resolved-pool-settings* nil
   "The pool-settings record from the last resolve-pool-settings call, or NIL
@@ -305,10 +327,11 @@ Returns the fresh pool-settings record.
 
 Each field takes the matching special when it is non-NIL, else the
 environment, else its default: *worker-pool-warmup* or DSMR_WORKER_POOL_WARMUP
-(default 0), *max-pool-size* or DSMR_MAX_POOL_SIZE (default 16), and
-*worker-kill-grace-seconds* or DSMR_WORKER_KILL_GRACE_SECONDS (default 5). An
-unparseable or out-of-range environment value warns and falls back to the
-default.
+(default 0), *max-pool-size* or DSMR_MAX_POOL_SIZE (default 16),
+*worker-kill-grace-seconds* or DSMR_WORKER_KILL_GRACE_SECONDS (default 5), and
+*pressure-kill-min-age-seconds* or DSMR_PRESSURE_MIN_KILL_AGE_SECONDS (default
+10). An unparseable or out-of-range environment value warns and falls back to
+the default.
 
 It also resolves the worker handshake timeout and the eval timeout, so one
 call settles every pool and worker timing setting the server uses.
@@ -323,7 +346,10 @@ prebuilt image honours the environment it is started with."
                               (%env-int "DSMR_MAX_POOL_SIZE" 16 :min 1))
            :kill-grace-seconds (or *worker-kill-grace-seconds*
                                    (%env-int "DSMR_WORKER_KILL_GRACE_SECONDS"
-                                             5 :min 1)))))
+                                             5 :min 1))
+           :pressure-kill-min-age-seconds
+           (or *pressure-kill-min-age-seconds*
+               (%env-int "DSMR_PRESSURE_MIN_KILL_AGE_SECONDS" 10 :min 0)))))
     (setf *resolved-pool-settings* settings)
     (resolve-worker-startup-timeout)
     (resolve-eval-timeout)
@@ -345,6 +371,13 @@ prebuilt image honours the environment it is started with."
   "The grace in seconds past the soft timeout before a worker is killed, as
 last resolved."
   (pool-settings-kill-grace-seconds (%current-pool-settings)))
+
+(defun effective-pressure-kill-min-age-seconds ()
+  "The age in seconds a worker must reach before a pressure stop may take it:
+a binding of *pressure-kill-min-age-seconds* visible here, else the value last
+resolved."
+  (or *pressure-kill-min-age-seconds*
+      (pool-settings-pressure-kill-min-age-seconds (%current-pool-settings))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Global pool state
@@ -1085,7 +1118,11 @@ subprocess launches beyond the one-time fasl compile on a cold cache."
                warmup))
       (when (> warmup max-size)
         (error "*worker-pool-warmup* (~D) exceeds *max-pool-size* (~D)"
-               warmup max-size)))
+               warmup max-size))
+      (let ((min-age (pool-settings-pressure-kill-min-age-seconds settings)))
+        (unless (and (integerp min-age) (>= min-age 0))
+          (error "Invalid *pressure-kill-min-age-seconds*: must be a non-negative integer, got ~S"
+                 min-age))))
     (when *pool-running*
       (shutdown-pool))
     ;; Pre-warm the worker system's fasl cache so concurrent child spawns
@@ -1127,6 +1164,7 @@ subprocess launches beyond the one-time fasl compile on a cold cache."
         (log-event :warn "pool.hibernate.cleanup-failed"
                    "error" (princ-to-string e))))
     (%start-health-monitor)
+    (start-pressure-agent)
     (pushnew 'shutdown-pool sb-ext:*exit-hooks*)
     (%schedule-replenish)
     (log-event :info "pool.initialized"
@@ -1139,7 +1177,9 @@ subprocess launches beyond the one-time fasl compile on a cold cache."
 
 (defun shutdown-pool ()
   "Shut down all workers and clean up pool state. Stops the health monitor,
-waits for in-flight replenish/recovery/reaper threads, then kills all workers."
+stops answering the host service (removing this server's worker record and the
+requests waiting for it), waits for in-flight replenish/recovery/reaper
+threads, then kills all workers."
   (log-event :info "pool.shutting-down")
   (setf *pool-running* nil)
   ;; Wake health monitor so it exits promptly
@@ -1152,6 +1192,9 @@ waits for in-flight replenish/recovery/reaper threads, then kills all workers."
     (handler-case (bt:join-thread *health-thread*)
       (error () nil)))
   (setf *health-thread* nil)
+  ;; Stop answering the host service before any worker goes, and take this
+  ;; server's record and the requests waiting for it along.
+  (stop-pressure-agent)
   ;; Wait for in-flight replenish thread
   (loop repeat 100
         while (bt:with-lock-held (*pool-lock*) *replenish-running*)
@@ -1854,7 +1897,7 @@ the outcome and reason for hibernate-session-worker."
                  (%finish-hibernation session-id worker path nil milliseconds)
                  (%lose-worker-during-hibernation session-id worker)))))))))
 
-(defun hibernate-session-worker (session-id)
+(defun hibernate-session-worker (session-id &key ((:worker expected)))
   "Have SESSION-ID's worker save its whole world to disk and end its process,
 so it holds no memory until the session needs it again.
 
@@ -1863,7 +1906,9 @@ Returns (values OUTCOME REASON), OUTCOME being one of:
                  :hibernated and no longer counts against the pool size.
   :busy          a call is holding the worker; it is left serving.
   :not-eligible  the session has no worker, or it is not :bound (REASON
-                 names the state), or the pool is not running.
+                 names the state), or the pool is not running, or WORKER
+                 was given and the session's worker is no longer that one
+                 (REASON is replaced).
   :refused       the worker declined (REASON is its word: has-threads when
                  the session started threads of its own, a save that failed,
                  or bad-path); it is left serving.
@@ -1889,6 +1934,9 @@ none of these outcomes counts as a crash."
           ((not (typep entry 'worker))
            (return-from hibernate-session-worker
              (values :not-eligible (if entry "spawning" "no-worker"))))
+          ((and expected (not (eq entry expected)))
+           (return-from hibernate-session-worker
+             (values :not-eligible "replaced")))
           ((not (eq (worker-state entry) :bound))
            (return-from hibernate-session-worker
              (values :not-eligible
@@ -1914,6 +1962,404 @@ none of these outcomes counts as a crash."
         (%condition-broadcast *pool-transition-condvar*)))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Public API: answering the host service under memory pressure
+;;; ---------------------------------------------------------------------------
+;;;
+;;; One host service watches the memory of the whole machine and every MCP
+;;; server's pool of workers. The service decides; each pool listens. A pool
+;;; publishes a record of its workers, at most once a second and at least every
+;;; few seconds, and reads the requests the service leaves for it: stop a fresh
+;;; idle worker, which costs nothing to replace, or hibernate a stateful idle
+;;; one. By the time a request is read the worker may be serving a call, may
+;;; have picked up state, or may be gone, so every request is checked again
+;;; under *pool-lock* and refused when it is no longer safe. Without a service
+;;; the pool takes no action of its own.
+
+(defvar *pressure-agent-interval* 1
+  "Seconds between two passes of the pressure agent, read when it starts.")
+
+(defparameter *pressure-record-refresh-seconds* 5
+  "The longest the pool leaves its worker record unwritten. The record is
+written at once when anything in it changes, and at least this often anyway,
+so the service can tell a quiet pool from a dead one.")
+
+(defparameter *pressure-request-max-age-seconds* 300
+  "The oldest request, in seconds, the pool still acts on. Anything older was
+written about a host that may no longer be short of memory, so it is removed
+unread.")
+
+(defparameter *pressure-agent-join-seconds* 10
+  "How long stopping the pressure agent waits for its thread to finish. A pass
+that is hibernating a worker can take far longer; the pass then ends on its
+own and acts on nothing more.")
+
+(defvar *before-pressure-stop-hook* nil
+  "NIL, or a function of one argument, the worker, that act-on-hibernate-request
+calls after it has decided to stop the worker and before %stop-idle-worker
+acts. It exists so a test can put a call in that window deterministically;
+nothing in the server sets it.")
+
+(defstruct (pressure-agent-state (:copier nil))
+  "What one pressure agent remembers between passes: the server stem it
+answers for, the record it last wrote (without its time) and when, what it
+last saw of the host service (:unknown before the first look, then T or NIL),
+and the last request it answered."
+  (stem nil)
+  (published nil)
+  (published-at nil)
+  (service :unknown)
+  (last-action nil))
+
+(defvar *pressure-agent-current* nil
+  "The state of the pressure agent that should be running, or NIL. An agent's
+thread keeps going only while this is its own state, so an agent that was
+stopped can never act again, even when its thread outlives the stop.")
+
+(defvar *pressure-agent-thread* nil
+  "The pressure agent's thread, or NIL.")
+
+(defvar *pressure-agent-lock* (bt:make-lock "pool-pressure-agent-lock")
+  "Lock pairing with *pressure-agent-condvar* for the agent's wait and wake.")
+
+(defvar *pressure-agent-condvar*
+  (bt:make-condition-variable :name "pool-pressure-agent-condvar")
+  "Broadcast to wake the pressure agent early when it is being stopped.")
+
+(defun %worker-age (worker now)
+  "Seconds from WORKER's spawn to NOW, in Unix seconds; 0 when it has no
+spawn time, so a worker of unknown age is never old enough to stop."
+  (let ((spawned (worker-spawned-at worker)))
+    (if spawned (max 0 (- now spawned)) 0)))
+
+(defun %worker-record-entry (worker now)
+  "WORKER as one entry of the published record. Its last activity falls back
+to its spawn time, and to NOW when it has neither, so the service never reads
+a live worker without one."
+  (list :id (worker-id worker)
+        :pid (worker-pid worker)
+        :state (worker-state worker)
+        :session (worker-session-id worker)
+        :stateful (and (worker-stateful-p worker) t)
+        :busy (and (plusp (worker-in-flight worker)) t)
+        :spawned-at (worker-spawned-at worker)
+        :last-activity (or (worker-last-activity worker)
+                           (worker-spawned-at worker)
+                           now)
+        :refused-reason (worker-refused-reason worker)
+        :refused-at (worker-refused-at worker)
+        :core-bytes (worker-core-bytes worker)))
+
+(defun build-worker-record (now &key (workers nil workers-p) service-seen
+                                     last-action)
+  "The worker record this server publishes for the host service, as of NOW in
+Unix seconds.
+
+The record names this server by pid and start time and lists every worker in
+WORKERS, which defaults to the pool's workers read under *pool-lock*, with its
+id, pid, state, session, whether it holds state or is serving a call, when it
+was spawned and last active, its last refusal and the size of its saved core.
+SERVICE-SEEN says whether the pool last found the host service alive, and
+LAST-ACTION is the last request answered, as (:worker-id :action :result :at),
+or NIL. Nothing is written; the caller publishes the plist."
+  (let ((entries (if workers-p
+                     (mapcar (lambda (w) (%worker-record-entry w now)) workers)
+                     (bt:with-lock-held (*pool-lock*)
+                       (mapcar (lambda (w) (%worker-record-entry w now))
+                               *all-workers*)))))
+    (multiple-value-bind (pid start) (parse-server-stem (server-stem))
+      (list :server-pid pid
+            :server-start start
+            :written-at now
+            :service-seen (and service-seen t)
+            :workers entries
+            :last-action last-action))))
+
+(defun %stop-idle-worker (session-id worker &key (now (%unix-now)))
+  "Stop WORKER, SESSION-ID's worker, only if it is still idle, holds no state
+and is old enough, and return :killed, or say why not: :gone when it is no
+longer the session's :bound worker, :busy when a call holds it, :stateful when
+it holds state, :too-young when it was spawned too recently.
+Every check and the change of state happen in one hold of *pool-lock*, the
+same lock a call takes its worker under, so a call and a stop can never both
+win: a call that took the worker first makes this answer :busy, and a call
+arriving after the stop finds the session without a worker and gets a fresh
+one. The worker is marked :released and dropped from the session and the pool
+inside that hold; its process is ended after the lock is let go. Nothing was
+lost, so the session's next call is answered without a reset notice, and a
+stop is not a crash: it adds nothing to the crash record and leaves the
+breaker alone."
+  (let ((outcome
+          (bt:with-lock-held (*pool-lock*)
+            (cond
+              ((not (eq (gethash session-id *affinity-map*) worker)) :gone)
+              ((not (eq (worker-state worker) :bound)) :gone)
+              ((plusp (worker-in-flight worker)) :busy)
+              ((worker-stateful-p worker) :stateful)
+              ((< (%worker-age worker now)
+                  (effective-pressure-kill-min-age-seconds))
+               :too-young)
+              (t
+               (setf (worker-state worker) :released)
+               (remhash session-id *affinity-map*)
+               (setf *all-workers* (remove worker *all-workers*))
+               (%condition-broadcast *pool-transition-condvar*)
+               :killed)))))
+    (when (eq outcome :killed)
+      (ignore-errors (signal-worker-terminate worker))
+      (ignore-errors (kill-worker worker))
+      (%schedule-replenish))
+    outcome))
+
+(defun act-on-hibernate-request (plist &key (now (%unix-now)))
+  "Answer one request from the host service, PLIST as read-hibernate-request
+returns it, and return what came of it as a keyword.
+
+A :kill request stops a worker only when it is :bound, idle, holds no state
+and is at least the minimum kill age old: a worker in that state has lost
+nothing and the next call boots a new one in a tenth of a second, so it is
+stopped without a reset notice. A :hibernate request saves a worker only when
+it is :bound, idle and holds state. The answer is:
+  :killed          the worker was stopped.
+  :too-young       a :kill for a worker spawned too recently to stop.
+  :busy            a call took the worker just before it was stopped.
+  :changed         the worker has since become busy, gained state (for a
+                   :kill), lost it (for a :hibernate), or left its session.
+  :unknown-worker  no worker of this pool has that id, or the request names
+                   another server.
+  :stale           the request is older than *pressure-request-max-age-seconds*
+                   or carries no time.
+  :hibernated, :refused, :disk, :timeout, :died
+                   as hibernate-session-worker answers a :hibernate.
+A stale or unknown request is logged as a warning and nothing is done. A
+request only ever names a worker by its id; where a world is saved is decided
+here, never by the request."
+  (let ((id (getf plist :worker-id))
+        (action (getf plist :action))
+        (requested-at (getf plist :requested-at)))
+    (multiple-value-bind (pid start) (parse-server-stem (server-stem))
+      (unless (and pid
+                   (eql pid (getf plist :server-pid))
+                   (eql start (getf plist :server-start)))
+        (log-event :warn "pool.pressure.request-refused"
+                   "worker_id" id "action" action "reason" "another-server")
+        (return-from act-on-hibernate-request :unknown-worker)))
+    (unless (and (integerp requested-at)
+                 (<= (- now requested-at) *pressure-request-max-age-seconds*))
+      (log-event :warn "pool.pressure.request-refused"
+                 "worker_id" id "action" action "reason" "stale"
+                 "requested_at" requested-at)
+      (return-from act-on-hibernate-request :stale))
+    (let ((worker nil)
+          (session nil)
+          (verdict nil))
+      (bt:with-lock-held (*pool-lock*)
+        (setf worker (find id *all-workers* :key #'worker-id))
+        (when worker
+          (setf session (worker-session-id worker)
+                verdict
+                (cond
+                  ((not (and session
+                             (eq (gethash session *affinity-map*) worker)
+                             (eq (worker-state worker) :bound)
+                             (zerop (worker-in-flight worker))))
+                   :changed)
+                  ((eq action :kill)
+                   (cond ((worker-stateful-p worker) :changed)
+                         ((< (%worker-age worker now)
+                             (effective-pressure-kill-min-age-seconds))
+                          :too-young)
+                         (t :stop)))
+                  ((eq action :hibernate)
+                   (if (worker-stateful-p worker) :hibernate :changed))
+                  (t :changed)))))
+      (unless worker
+        (log-event :warn "pool.pressure.request-refused"
+                   "worker_id" id "action" action "reason" "unknown-worker")
+        (return-from act-on-hibernate-request :unknown-worker))
+      (case verdict
+        (:stop
+         (when *before-pressure-stop-hook*
+           (funcall *before-pressure-stop-hook* worker))
+         (let ((outcome (%stop-idle-worker session worker :now now)))
+           (case outcome
+             (:killed
+              (log-event :info "pool.worker.pressure-stopped"
+                         "session" session
+                         "worker_id" id)
+              :killed)
+             ((:busy :too-young) outcome)
+             (t :changed))))
+        (:hibernate
+         (let ((outcome (hibernate-session-worker session :worker worker)))
+           (if (eq outcome :not-eligible) :changed outcome)))
+        (t verdict)))))
+
+(defun %pressure-agent-live-p (state)
+  "True while STATE belongs to the pressure agent that should be running."
+  (eq *pressure-agent-current* state))
+
+(defun %note-service (state)
+  "Look at whether the host service is alive and remember it in STATE. Says
+once that pressure relief is inactive when the service is missing, and once
+that it is back when it returns, never on every pass."
+  (let ((alive (and (ignore-errors (service-alive-p)) t))
+        (seen (pressure-agent-state-service state)))
+    (cond
+      ((and alive (not (eq seen t)))
+       (when (null seen)
+         (log-event :info "pool.pressure.service-back"
+                    "msg" "the host service is alive; pressure relief is active"))
+       (setf (pressure-agent-state-service state) t))
+      ((and (not alive) (not (null seen)))
+       (log-event :warn "pool.pressure.no-service"
+                  "msg" "no host service is alive; pressure relief is inactive")
+       (setf (pressure-agent-state-service state) nil)))
+    alive))
+
+(defun %publish-worker-record (state alive)
+  "Write this server's worker record when anything in it but its time has
+changed since the last write, or when *pressure-record-refresh-seconds* have
+passed. ALIVE is what the pool just saw of the host service."
+  (let* ((now (%unix-now))
+         (record (build-worker-record
+                  now :service-seen alive
+                      :last-action (pressure-agent-state-last-action state)))
+         (content (loop for (key value) on record by #'cddr
+                        unless (eq key :written-at)
+                          append (list key value)))
+         (published-at (pressure-agent-state-published-at state)))
+    (when (and (%pressure-agent-live-p state)
+               (or (null published-at)
+                   (not (equal content (pressure-agent-state-published state)))
+                   (>= (- now published-at) *pressure-record-refresh-seconds*)))
+      (write-worker-record (pressure-agent-state-stem state) record)
+      (setf (pressure-agent-state-published state) content
+            (pressure-agent-state-published-at state) now))))
+
+(defun %answer-pending-requests (state)
+  "Answer every request waiting for this server, oldest name first, removing
+each once answered and remembering the last answer in STATE. A request that
+fails validation was already removed by pending-requests and is only logged.
+One request that cannot be answered is logged and removed, and the rest are
+still answered."
+  (let ((stem (pressure-agent-state-stem state)))
+    (multiple-value-bind (pending rejected) (pending-requests stem)
+      (dolist (entry rejected)
+        (log-event :warn "pool.pressure.request-rejected"
+                   "file" (file-namestring (car entry))
+                   "reason" (cdr entry)))
+      (dolist (entry pending)
+        (unless (%pressure-agent-live-p state)
+          (return))
+        (let* ((path (car entry))
+               (plist (cdr entry))
+               (id (getf plist :worker-id))
+               (action (getf plist :action)))
+          (handler-case
+              (let ((result (act-on-hibernate-request plist)))
+                (log-event :info "pool.pressure.answered"
+                           "worker_id" id
+                           "action" action
+                           "result" result)
+                (setf (pressure-agent-state-last-action state)
+                      (list :worker-id id :action action :result result
+                            :at (%unix-now))))
+            (error (e)
+              (log-event :error "pool.pressure.request-error"
+                         "worker_id" id
+                         "action" action
+                         "error" (princ-to-string e))))
+          (ignore-errors (remove-request path)))))))
+
+(defun %pressure-agent-pass (state)
+  "One pass of the pressure agent: look at the host service, publish the
+worker record when it is due, then answer the requests waiting. Each step is
+guarded on its own, so a failure in one is logged and the others still run."
+  (let ((alive nil))
+    (handler-case (setf alive (%note-service state))
+      (error (e)
+        (log-event :error "pool.pressure.service-check-failed"
+                   "error" (princ-to-string e))))
+    (handler-case (%publish-worker-record state alive)
+      (error (e)
+        (log-event :error "pool.pressure.record-failed"
+                   "error" (princ-to-string e))))
+    (handler-case (%answer-pending-requests state)
+      (error (e)
+        (log-event :error "pool.pressure.requests-failed"
+                   "error" (princ-to-string e))))))
+
+(defun %pressure-agent-loop (state interval)
+  "Run passes of the pressure agent STATE every INTERVAL seconds, the first at
+once, until the agent is stopped. A stop wakes the wait at once."
+  (loop while (%pressure-agent-live-p state)
+        do (%pressure-agent-pass state)
+           (bt:with-lock-held (*pressure-agent-lock*)
+             (when (%pressure-agent-live-p state)
+               (bt:condition-wait *pressure-agent-condvar*
+                                  *pressure-agent-lock*
+                                  :timeout interval)))))
+
+(defun start-pressure-agent ()
+  "Start the thread through which this pool answers the host service, and
+return it. Every *pressure-agent-interval* seconds it publishes this server's
+worker record when that is due and answers the requests left for this server.
+Returns NIL, logging why, when this process cannot name itself to the service.
+A running agent is left as it is."
+  (when (and *pressure-agent-current*
+             *pressure-agent-thread*
+             (bt:thread-alive-p *pressure-agent-thread*))
+    (return-from start-pressure-agent *pressure-agent-thread*))
+  (let ((stem (server-stem)))
+    (unless stem
+      (log-event :warn "pool.pressure.no-identity"
+                 "msg" "this process cannot read its start time; pressure relief is inactive")
+      (return-from start-pressure-agent nil))
+    (let ((state (make-pressure-agent-state :stem stem))
+          (interval *pressure-agent-interval*))
+      (bt:with-lock-held (*pressure-agent-lock*)
+        (setf *pressure-agent-current* state))
+      (setf *pressure-agent-thread*
+            (bt:make-thread (lambda () (%pressure-agent-loop state interval))
+                            :name "pool-pressure-agent")))))
+
+(defun %remove-own-pressure-files ()
+  "Remove this server's worker record and every request waiting for it."
+  (handler-case
+      (let ((stem (server-stem)))
+        (when stem
+          (remove-worker-record stem)
+          (dolist (entry (pending-requests stem))
+            (remove-request (car entry)))))
+    (error (e)
+      (log-event :warn "pool.pressure.cleanup-failed"
+                 "error" (princ-to-string e)))))
+
+(defun stop-pressure-agent ()
+  "Stop the pressure agent, waiting up to *pressure-agent-join-seconds* for its
+thread, then remove this server's worker record and the requests waiting for
+it. An agent stopped in the middle of a pass finishes the request it is on and
+acts on nothing after it."
+  (bt:with-lock-held (*pressure-agent-lock*)
+    (setf *pressure-agent-current* nil)
+    (%condition-broadcast *pressure-agent-condvar*))
+  (let ((thread *pressure-agent-thread*))
+    (when (and thread (bt:threadp thread))
+      (let ((deadline (+ (get-internal-real-time)
+                         (* *pressure-agent-join-seconds*
+                            internal-time-units-per-second))))
+        (loop while (and (bt:thread-alive-p thread)
+                         (< (get-internal-real-time) deadline))
+              do (sleep 0.05))
+        (if (bt:thread-alive-p thread)
+            (log-event :warn "pool.pressure.stop-slow"
+                       "msg" "the pressure agent is still finishing a request")
+            (handler-case (bt:join-thread thread)
+              (error () nil)))))
+    (setf *pressure-agent-thread* nil))
+  (%remove-own-pressure-files))
+
+;;; ---------------------------------------------------------------------------
 ;;; Public API — pool-worker-info / pool-status-info
 ;;; ---------------------------------------------------------------------------
 
@@ -1925,56 +2371,115 @@ last ping round trip in milliseconds, how many pings in a row have gone
 unanswered, and the universal time the classification was taken. Omits
 swank_port to prevent unrestricted REPL access bypassing MCP security policies.
 
+It also gives what memory pressure relief needs to be seen: whether the worker
+holds state and whether a call is holding it, its last activity in Unix
+seconds, how it booted (core, source or resumed), the size in bytes of its last
+saved core and, while it is hibernated, the age of that core in seconds, how
+long its last save and its last resume took in milliseconds, and why its last
+hibernation was refused. Each of these that has no value is JSON null.
+
 The liveness values are raw here on purpose. A reader needs to state what a
 classification does and does not establish before putting it in front of anyone,
 and that rendering belongs to the verb doing the reporting, not to the pool."
-  (let ((result (make-array 0 :adjustable t :fill-pointer 0)))
-    (bt:with-lock-held (*pool-lock*)
-      (dolist (w *all-workers*)
-        (let ((ht (make-hash-table :test 'equal)))
-          (setf (gethash "id" ht) (worker-id w)
-                (gethash "session" ht) (let ((sid (worker-session-id w)))
-                                          (if (and (stringp sid) (> (length sid) 8))
-                                              (concatenate 'string (subseq sid 0 8) "...")
-                                              sid))
-                (gethash "tcp_port" ht) (worker-tcp-port w)
-                (gethash "pid" ht) (worker-pid w)
-                (gethash "state" ht) (string-downcase
-                                       (symbol-name (worker-state w)))
-                (gethash "liveness" ht) (string-downcase
-                                          (symbol-name (worker-liveness w)))
-                (gethash "liveness_basis" ht)
-                  (let ((basis (worker-liveness-basis w)))
-                    (and basis (string-downcase (symbol-name basis))))
-                (gethash "last_ping_ms" ht) (worker-last-ping-milliseconds w)
-                (gethash "consecutive_missed_pings" ht)
-                  (worker-consecutive-missed-pings w)
-                (gethash "liveness_checked_at" ht)
-                  (worker-liveness-checked-at w))
-          (vector-push-extend ht result))))
+  (let ((result (make-array 0 :adjustable t :fill-pointer 0))
+        (now (%unix-now)))
+    (flet ((or-null (value) (if (null value) 'cl:null value)))
+      (bt:with-lock-held (*pool-lock*)
+        (dolist (w *all-workers*)
+          (let ((ht (make-hash-table :test 'equal)))
+            (setf (gethash "id" ht) (worker-id w)
+                  (gethash "session" ht) (let ((sid (worker-session-id w)))
+                                            (if (and (stringp sid) (> (length sid) 8))
+                                                (concatenate 'string (subseq sid 0 8) "...")
+                                                sid))
+                  (gethash "tcp_port" ht) (worker-tcp-port w)
+                  (gethash "pid" ht) (worker-pid w)
+                  (gethash "state" ht) (string-downcase
+                                         (symbol-name (worker-state w)))
+                  (gethash "liveness" ht) (string-downcase
+                                            (symbol-name (worker-liveness w)))
+                  (gethash "liveness_basis" ht)
+                    (let ((basis (worker-liveness-basis w)))
+                      (and basis (string-downcase (symbol-name basis))))
+                  (gethash "last_ping_ms" ht) (worker-last-ping-milliseconds w)
+                  (gethash "consecutive_missed_pings" ht)
+                    (worker-consecutive-missed-pings w)
+                  (gethash "liveness_checked_at" ht)
+                    (worker-liveness-checked-at w)
+                  (gethash "stateful" ht) (and (worker-stateful-p w) t)
+                  (gethash "busy" ht) (and (plusp (worker-in-flight w)) t)
+                  (gethash "last_activity" ht)
+                    (or-null (or (worker-last-activity w) (worker-spawned-at w)))
+                  (gethash "boot" ht)
+                    (let ((kind (worker-boot-kind w)))
+                      (if kind (string-downcase (symbol-name kind)) 'cl:null))
+                  (gethash "core_bytes" ht) (or-null (worker-core-bytes w))
+                  (gethash "core_age_seconds" ht)
+                    (let ((at (worker-hibernated-at w)))
+                      (if (and at (eq (worker-state w) :hibernated))
+                          (max 0 (- now at))
+                          'cl:null))
+                  (gethash "last_hibernate_ms" ht)
+                    (or-null (worker-last-hibernate-milliseconds w))
+                  (gethash "last_resume_ms" ht)
+                    (or-null (worker-last-resume-milliseconds w))
+                  (gethash "refused_reason" ht) (or-null (worker-refused-reason w)))
+            (vector-push-extend ht result)))))
     result))
+
+(defun %worker-core-status ()
+  "The worker core new workers boot from, or JSON null, and a word for it:
+\"in use\", \"unset\", \"missing\", or \"disabled: \" and why, as two values."
+  (multiple-value-bind (path reason) (worker-core-path)
+    (cond
+      (path (values path "in use"))
+      (*worker-core-disabled*
+       (values 'cl:null (format nil "disabled: ~A" *worker-core-disabled*)))
+      ((and reason (uiop:string-prefix-p "missing" reason))
+       (values 'cl:null "missing"))
+      (t (values 'cl:null "unset")))))
 
 (defun pool-status-info ()
   "Return a hash-table with pool diagnostic information for the pool-status MCP tool.
 Keys: pool_running, total_workers, standby_count, bound_count,
-max_pool_size, warmup_target, workers (vector of per-worker hashes)."
+max_pool_size, warmup_target, workers (vector of per-worker hashes),
+hibernated_count (workers saved to disk, holding no memory), resident_count
+(workers with a running process), pressure_relief (\"active\" when the pool is
+answering a live host service, else \"inactive\"), worker_core (the core new
+workers boot from, or JSON null) and worker_core_status (\"in use\", \"unset\",
+\"missing\", or \"disabled: \" and why)."
   (let* ((running *pool-running*)
          (workers (if running (pool-worker-info) (vector)))
          (standby-count 0)
-         (bound-count 0))
+         (bound-count 0)
+         (hibernated-count 0)
+         (resident-count 0))
     (when running
       (bt:with-lock-held (*pool-lock*)
         (setf standby-count (length *standby-workers*)
-              bound-count (- (length *all-workers*) (length *standby-workers*)))))
-    (let ((info (make-hash-table :test 'equal)))
-      (setf (gethash "pool_running" info) (if running t nil)
-            (gethash "total_workers" info) (length workers)
-            (gethash "standby_count" info) standby-count
-            (gethash "bound_count" info) bound-count
-            (gethash "max_pool_size" info) (effective-max-pool-size)
-            (gethash "warmup_target" info) (effective-worker-pool-warmup)
-            (gethash "workers" info) workers)
-      info)))
+              bound-count (- (length *all-workers*) (length *standby-workers*))
+              hibernated-count (count :hibernated *all-workers* :key #'worker-state)
+              resident-count (- (length *all-workers*) hibernated-count))))
+    (multiple-value-bind (core core-status) (%worker-core-status)
+      (let ((info (make-hash-table :test 'equal))
+            (relief (and running
+                         *pressure-agent-current*
+                         *pressure-agent-thread*
+                         (bt:thread-alive-p *pressure-agent-thread*)
+                         (ignore-errors (service-alive-p)))))
+        (setf (gethash "pool_running" info) (if running t nil)
+              (gethash "total_workers" info) (length workers)
+              (gethash "standby_count" info) standby-count
+              (gethash "bound_count" info) bound-count
+              (gethash "max_pool_size" info) (effective-max-pool-size)
+              (gethash "warmup_target" info) (effective-worker-pool-warmup)
+              (gethash "workers" info) workers
+              (gethash "hibernated_count" info) hibernated-count
+              (gethash "resident_count" info) resident-count
+              (gethash "pressure_relief" info) (if relief "active" "inactive")
+              (gethash "worker_core" info) core
+              (gethash "worker_core_status" info) core-status)
+        info))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Public API — pool-rpc-with-hard-kill
