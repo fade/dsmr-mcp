@@ -62,7 +62,10 @@
                 #:worker-hibernate-core-path #:worker-hibernated-at
                 #:worker-core-bytes #:worker-last-hibernate-milliseconds
                 #:worker-refused-reason #:worker-refused-at
-                #:hibernate-worker-process #:release-worker-process)
+                #:hibernate-worker-process #:release-worker-process
+                #:resume-worker #:*hibernate-timeout-seconds*
+                #:worker-last-resume-milliseconds)
+  (:local-nicknames (#:pool-records #:dsmr-mcp/src/hermetic/pool-records))
   (:import-from #:dsmr-mcp/src/hermetic/pool-records
                 #:server-stem #:ensure-owner-directory
                 #:unsafe-hibernate-path #:hibernated-core-path
@@ -1105,6 +1108,24 @@ subprocess launches beyond the one-time fasl compile on a cold cache."
             *recovery-threads* nil)
       (clrhash *crash-history*)
       (clrhash *circuit-breaker-map*))
+    ;; Clear what servers that are no longer running left behind, then this
+    ;; server's own core directory, which can only hold worlds of workers no
+    ;; pool tracks any more. A start never fails over cleanup.
+    (handler-case
+        (pool-records:sweep-dead-owners
+         :report-fn (lambda (level code &key subject msg)
+                      (log-event level (format nil "pool.sweep.~A" code)
+                                 "subject" subject
+                                 "msg" msg)))
+      (error (e)
+        (log-event :warn "pool.sweep.failed" "error" (princ-to-string e))))
+    (handler-case
+        (let ((stem (server-stem)))
+          (when stem
+            (pool-records:remove-owner-directory stem)))
+      (error (e)
+        (log-event :warn "pool.hibernate.cleanup-failed"
+                   "error" (princ-to-string e))))
     (%start-health-monitor)
     (pushnew 'shutdown-pool sb-ext:*exit-hooks*)
     (%schedule-replenish)
@@ -1161,8 +1182,19 @@ waits for in-flight replenish/recovery/reaper threads, then kills all workers."
       (setf *all-workers* nil
             *standby-workers* nil)
       (clrhash *affinity-map*)
-      (clrhash *circuit-breaker-map*))
+      (clrhash *circuit-breaker-map*)
+      ;; Wake any request waiting on a save or a resume, so it sees the
+      ;; pool stopping now rather than at its deadline.
+      (%condition-broadcast *pool-transition-condvar*))
     (dolist (w workers) (ignore-errors (kill-worker w))))
+  ;; Every world this server saved belongs to a worker that is now gone.
+  (handler-case
+      (let ((stem (server-stem)))
+        (when stem
+          (pool-records:remove-owner-directory stem)))
+    (error (e)
+      (log-event :warn "pool.hibernate.cleanup-failed"
+                 "error" (princ-to-string e))))
   (log-event :info "pool.shutdown-complete"))
 
 ;;; ---------------------------------------------------------------------------
@@ -1179,132 +1211,332 @@ without creating a new one."
                  (eq :bound (worker-state entry)))
         entry))))
 
+(defun %transition-wait-seconds ()
+  "How long a request waits for its session's worker to finish saving or
+resuming before it gives up: the longest a save may take, plus the longest a
+process may take to come up, plus a margin."
+  (+ *hibernate-timeout-seconds* (effective-worker-startup-timeout) 15))
+
+(defun %delete-core-files (path)
+  "Delete the saved core at PATH and the partial <PATH>.tmp a save in progress
+writes first, whichever exist. A link is removed as a link. Errors are
+ignored: the file may already be gone."
+  (when path
+    (let ((native (uiop:native-namestring path)))
+      (ignore-errors (sb-posix:unlink native))
+      (ignore-errors (sb-posix:unlink (concatenate 'string native ".tmp"))))))
+
+(defun %finish-resume (session-id worker path)
+  "Put WORKER, whose process resume-worker has just started from the core at
+PATH, back into service, and return it.
+
+The core is deleted while the worker is still :resuming. A :bound worker can
+be saved again at once, to the same path because the path follows the worker
+id, and deleting afterwards could remove that newer world.
+
+When the session let the worker go while it was resuming (a release, a kill
+or a shutdown changed its state), the new process belongs to nobody: it is
+ended and pool-spawn-cancelled is signalled, as for a spawn cancelled the
+same way."
+  (%delete-core-files path)
+  (let ((serving nil))
+    (bt:with-lock-held (*pool-lock*)
+      (when (eq (worker-state worker) :resuming)
+        (setf (worker-state worker) :bound
+              (worker-hibernate-core-path worker) nil
+              (worker-hibernated-at worker) nil
+              (worker-core-bytes worker) nil
+              serving t))
+      (%condition-broadcast *pool-transition-condvar*))
+    (cond
+      (serving
+       (log-event :info "pool.worker.resumed"
+                  "session" session-id
+                  "worker_id" (worker-id worker)
+                  "ms" (worker-last-resume-milliseconds worker))
+       worker)
+      (t
+       (log-event :info "pool.resume.cancelled"
+                  "session" session-id
+                  "worker_id" (worker-id worker)
+                  "state" (string-downcase (symbol-name (worker-state worker))))
+       (ignore-errors (kill-worker worker))
+       (error 'pool-spawn-cancelled :session-id session-id)))))
+
+(defun %fail-resume (session-id worker path cause)
+  "Take WORKER, whose saved world at PATH could not be resumed for CAUSE, out
+of service, and return NIL.
+
+The worker becomes :dead with a reset reason naming CAUSE and stays the
+session's entry, so whichever request reaches it first replaces it with a
+fresh worker carrying that notice, and no request can be handed a fresh
+worker without it. It leaves *all-workers* at once. This is not a crash:
+nothing is added to the crash history and the breaker is not touched.
+
+The core is kept under the failed-core directory for diagnosis, the failure
+is logged as an error, and a line goes to the fleet error log that leaders
+watch, so a lost world is never silent. When the session let the worker go
+meanwhile, there is no one to tell and pool-spawn-cancelled is signalled."
+  (let ((lost nil)
+        (kept-at nil))
+    (bt:with-lock-held (*pool-lock*)
+      (when (eq (worker-state worker) :resuming)
+        (setf (worker-state worker) :dead
+              (worker-reset-reason worker)
+              (format nil "its hibernated world could not be resumed (~A)" cause)
+              *all-workers* (remove worker *all-workers*)
+              lost t))
+      (%condition-broadcast *pool-transition-condvar*))
+    (unless lost
+      (log-event :info "pool.resume.cancelled"
+                 "session" session-id
+                 "worker_id" (worker-id worker)
+                 "cause" cause)
+      (error 'pool-spawn-cancelled :session-id session-id))
+    (when (and path (%core-file-bytes path))
+      (handler-case
+          (setf kept-at (uiop:native-namestring
+                         (pool-records:retain-failed-core
+                          path (server-stem) (worker-id worker))))
+        (error (e)
+          (log-event :warn "pool.resume.core-not-kept"
+                     "session" session-id
+                     "worker_id" (worker-id worker)
+                     "error" (princ-to-string e)))))
+    (log-event :error "pool.worker.resume-failed"
+               "session" session-id
+               "worker_id" (worker-id worker)
+               "cause" cause
+               "kept_at" (or kept-at "none"))
+    (ignore-errors
+     (append-fleet-line
+      (fleet-line :error "worker-resume-failed"
+                  :id session-id
+                  :msg (format nil "worker ~D of session ~A: ~A; core kept at ~A"
+                               (worker-id worker) session-id cause
+                               (or kept-at "nowhere")))))
+    nil))
+
+(defun %resume-hibernated-worker (session-id worker)
+  "Resume WORKER, which this thread has marked :resuming, from its saved core.
+Runs without *pool-lock*, which is taken only to settle the state.
+
+Returns WORKER, :bound again with the world it had, or NIL when the world
+could not be resumed (no core recorded, the file missing, or no process
+coming up from it), in which case the session's next pass gets a fresh worker
+with a reset notice. Signals pool-spawn-cancelled when the session let the
+worker go while it was resuming."
+  (let* ((path (worker-hibernate-core-path worker))
+         (cause (cond ((null path) "no saved core was recorded")
+                      ((not (%core-file-bytes path))
+                       (format nil "the saved core ~A is missing" path))))
+         (settled nil))
+    (unwind-protect
+         (progn
+           (unless cause
+             (handler-case (resume-worker worker)
+               (error (e) (setf cause (princ-to-string e)))))
+           (multiple-value-prog1
+               (if cause
+                   (%fail-resume session-id worker path cause)
+                   (%finish-resume session-id worker path))
+             (setf settled t)))
+      ;; Only an unexpected unwind, such as an interrupt, gets here unsettled.
+      ;; The worker goes back to hibernated, so no request waits on it for
+      ;; ever, and any process the resume had started is ended.
+      (unless settled
+        (let ((reverted nil))
+          (bt:with-lock-held (*pool-lock*)
+            (when (eq (worker-state worker) :resuming)
+              (setf (worker-state worker) :hibernated
+                    reverted t))
+            (%condition-broadcast *pool-transition-condvar*))
+          (when reverted
+            (ignore-errors (release-worker-process worker))))))))
+
 (defun get-or-assign-worker (session-id)
   "Return the worker bound to SESSION-ID, assigning one if needed.
 If a standby worker is available, it is assigned immediately; otherwise
 a new worker is spawned. Multiple concurrent threads requesting the same
 new session coordinate via a placeholder so only one spawn occurs.
 
+A session whose worker is hibernated gets that same worker back, resumed from
+its saved core with the world it had, and no reset notice: the session never
+sees that it was on disk. A request that arrives while the worker is saving
+or resuming waits for that to finish, so every concurrent request gets the
+same worker and only one process is ever started. Only when the core cannot
+be resumed does the session get a fresh worker, and then its next reply says
+its world was reset and why. None of this counts toward the circuit breaker.
+
 Circuit breaker: before spawning, checks *circuit-breaker-map* for a recent
 trip within *circuit-breaker-cooldown* seconds and fails fast with an error.
 
 Signals pool-shutting-down if the pool is not running.
-Signals pool-capacity-exceeded if max workers would be exceeded.
+Signals pool-capacity-exceeded if max workers would be exceeded, including
+when resuming a hibernated worker would exceed it; that worker stays
+hibernated.
 Signals circuit-breaker-active both when the breaker trips and on any later
-call inside the cooldown window; the condition carries the seconds remaining."
-  (let ((entry nil) (need-spawn nil) (assigned-from-standby nil)
-        (need-reset nil) (reset-reason nil) (old-worker-to-kill nil)
-        (circuit-breaker-tripped nil))
-    (bt:with-lock-held (*pool-lock*)
-      (unless *pool-running*
-        (error 'pool-shutting-down))
-      ;; Check circuit-breaker cooldown BEFORE anything else.
-      ;; Blocks calls during the fail-fast window after the breaker trips.
-      (let ((trip-time (gethash session-id *circuit-breaker-map*)))
-        (when (and trip-time
-                   (< (get-universal-time) (+ trip-time *circuit-breaker-cooldown*)))
-          (let ((remaining (- (+ trip-time *circuit-breaker-cooldown*)
-                              (get-universal-time))))
-            (error 'circuit-breaker-active
-                   :session-id session-id
-                   :remaining-seconds (ceiling remaining)))))
-      (setf entry (gethash session-id *affinity-map*))
-      (cond
-        ;; Path 1: existing bound worker — return immediately
-        ((and entry (typep entry 'worker) (eq :bound (worker-state entry)))
-         (return-from get-or-assign-worker entry))
-        ;; Path 1b: existing dead/crashed worker — remove and reassign
-        ((and entry (typep entry 'worker))
-         (setf old-worker-to-kill entry)
-         (remhash session-id *affinity-map*)
-         (setf *all-workers* (remove entry *all-workers*))
-         ;; Record crash for circuit breaker (avoid double-counting if
-         ;; %handle-worker-crash already pushed for this worker).
-         (when (and (eq :crashed (worker-state entry))
-                    (not (worker-crash-history-pushed-p entry)))
-           (let* ((now (get-universal-time))
-                  (window-start (- now *crash-breaker-window*))
-                  (history (gethash session-id *crash-history*)))
-             (setf history (remove-if (lambda (ts) (< ts window-start)) history))
-             (push now history)
-             (setf (gethash session-id *crash-history*) history)
-             (when (>= (length history) *crash-breaker-threshold*)
-               (setf circuit-breaker-tripped t))))
-         ;; Also check if health monitor already pushed enough history to trip it
-         (when (and (not circuit-breaker-tripped)
-                    (eq :crashed (worker-state entry))
-                    (worker-crash-history-pushed-p entry))
-           (let ((window-start (- (get-universal-time) *crash-breaker-window*))
-                 (history (gethash session-id *crash-history*)))
-             (setf history (remove-if (lambda (ts) (< ts window-start)) history))
-             (setf (gethash session-id *crash-history*) history)
-             (when (>= (length history) *crash-breaker-threshold*)
-               (setf circuit-breaker-tripped t))))
-         (setf entry nil
-               need-reset (not (worker-needs-reset-notification old-worker-to-kill)))
-         ;; A worker lost for a reason the pool recorded (it died while
-         ;; saving its world) is no crash: no history was pushed above, and
-         ;; the session is told why in the notice.
-         (when (and (eq :dead (worker-state old-worker-to-kill))
-                    (worker-reset-reason old-worker-to-kill))
-           (setf need-reset t
-                 reset-reason (worker-reset-reason old-worker-to-kill))))
-        ;; Path 2: placeholder — another thread is spawning
-        ((and entry (typep entry 'worker-placeholder))
-         nil))
-      ;; Assign standby or insert placeholder for spawn
-      (when (and (null entry) (not circuit-breaker-tripped))
-        (loop while *standby-workers*
-              for w = (pop *standby-workers*)
-              do (cond
-                   ((%worker-process-alive-p w)
-                    (setf (worker-state w) :bound
-                          (worker-session-id w) session-id
-                          (gethash session-id *affinity-map*) w)
-                    (when need-reset
-                      (setf (worker-needs-reset-notification w) t
-                            (worker-reset-reason w) reset-reason))
-                    (setf assigned-from-standby w)
-                    (return))
-                   (t
-                    (setf *all-workers* (remove w *all-workers*))
-                    (log-event :warn "pool.standby.dead-on-assign"
-                               "worker_id" (worker-id w)
-                               "pid" (worker-pid w)))))
-        (when (and (null assigned-from-standby) (null entry))
-          (let ((limit (effective-max-pool-size)))
-            (when (>= (%effective-pool-size) limit)
-              (error 'pool-capacity-exceeded :limit limit)))
-          (let ((ph (make-worker-placeholder :session-id session-id)))
-            (setf (gethash session-id *affinity-map*) ph
-                  entry ph
-                  need-spawn t)))))
-    ;; Kill orphaned old worker outside the lock (kill-worker may block ~2s)
-    (when old-worker-to-kill
-      (ignore-errors (kill-worker old-worker-to-kill)))
-    ;; Circuit breaker: record trip time and fail fast
-    (when circuit-breaker-tripped
-      (bt:with-lock-held (*pool-lock*)
-        ;; Record the trip time for the 60s fail-fast window
-        (setf (gethash session-id *circuit-breaker-map*) (get-universal-time))
-        (remhash session-id *crash-history*))
-      (log-event :error "pool.circuit-breaker.tripped"
-                 "session" session-id
-                 "threshold" *crash-breaker-threshold*
-                 "window_seconds" *crash-breaker-window*
-                 "cooldown_seconds" *circuit-breaker-cooldown*)
-      (error 'circuit-breaker-active
-             :session-id session-id
-             :remaining-seconds *circuit-breaker-cooldown*))
-    (cond
-      (assigned-from-standby
-       (%schedule-replenish)
-       assigned-from-standby)
-      (need-spawn
-       (%spawn-and-bind session-id entry :need-reset need-reset
-                                         :reset-reason reset-reason))
-      (t
-       (%wait-for-placeholder entry)))))
+call inside the cooldown window; the condition carries the seconds remaining.
+Signals an error naming the session and the state when a save or resume it
+waited on has not finished within %transition-wait-seconds."
+  (let ((transition-deadline nil))
+    (loop
+      (let ((entry nil) (need-spawn nil) (assigned-from-standby nil)
+            (need-reset nil) (reset-reason nil) (old-worker-to-kill nil)
+            (circuit-breaker-tripped nil) (to-resume nil))
+        (bt:with-lock-held (*pool-lock*)
+          ;; Read the entry, waiting out a save or a resume in progress. The
+          ;; wait releases *pool-lock*; every pass re-reads everything.
+          (loop
+            (unless *pool-running*
+              (error 'pool-shutting-down))
+            ;; Check circuit-breaker cooldown BEFORE anything else.
+            ;; Blocks calls during the fail-fast window after the breaker trips.
+            (let ((trip-time (gethash session-id *circuit-breaker-map*)))
+              (when (and trip-time
+                         (< (get-universal-time)
+                            (+ trip-time *circuit-breaker-cooldown*)))
+                (let ((remaining (- (+ trip-time *circuit-breaker-cooldown*)
+                                    (get-universal-time))))
+                  (error 'circuit-breaker-active
+                         :session-id session-id
+                         :remaining-seconds (ceiling remaining)))))
+            (setf entry (gethash session-id *affinity-map*))
+            (unless (and (typep entry 'worker)
+                         (member (worker-state entry) '(:hibernating :resuming)))
+              (return))
+            (let ((now (get-internal-real-time)))
+              (unless transition-deadline
+                (setf transition-deadline
+                      (+ now (* (%transition-wait-seconds)
+                                internal-time-units-per-second))))
+              (when (>= now transition-deadline)
+                (error "Gave up waiting for session ~A's worker, still ~(~A~) after ~D s."
+                       session-id (worker-state entry) (%transition-wait-seconds)))
+              (bt:condition-wait *pool-transition-condvar* *pool-lock*
+                                 :timeout (/ (- transition-deadline now)
+                                             internal-time-units-per-second))))
+          (cond
+            ;; Path 1: existing bound worker, returned immediately
+            ((and entry (typep entry 'worker) (eq :bound (worker-state entry)))
+             (return-from get-or-assign-worker entry))
+            ;; Path 1a: hibernated worker, resumed outside the lock when
+            ;; the pool has room for its process.
+            ((and entry (typep entry 'worker) (eq :hibernated (worker-state entry)))
+             (let ((limit (effective-max-pool-size)))
+               (when (>= (%effective-pool-size) limit)
+                 (error 'pool-capacity-exceeded :limit limit)))
+             (setf (worker-state entry) :resuming
+                   to-resume entry)
+             (%condition-broadcast *pool-transition-condvar*))
+            ;; Path 1b: existing dead/crashed worker, removed and reassigned
+            ((and entry (typep entry 'worker)
+                  (member (worker-state entry) '(:crashed :dead :released)))
+             (setf old-worker-to-kill entry)
+             (remhash session-id *affinity-map*)
+             (setf *all-workers* (remove entry *all-workers*))
+             ;; Record crash for circuit breaker (avoid double-counting if
+             ;; %handle-worker-crash already pushed for this worker).
+             (when (and (eq :crashed (worker-state entry))
+                        (not (worker-crash-history-pushed-p entry)))
+               (let* ((now (get-universal-time))
+                      (window-start (- now *crash-breaker-window*))
+                      (history (gethash session-id *crash-history*)))
+                 (setf history (remove-if (lambda (ts) (< ts window-start)) history))
+                 (push now history)
+                 (setf (gethash session-id *crash-history*) history)
+                 (when (>= (length history) *crash-breaker-threshold*)
+                   (setf circuit-breaker-tripped t))))
+             ;; Also check if health monitor already pushed enough history to trip it
+             (when (and (not circuit-breaker-tripped)
+                        (eq :crashed (worker-state entry))
+                        (worker-crash-history-pushed-p entry))
+               (let ((window-start (- (get-universal-time) *crash-breaker-window*))
+                     (history (gethash session-id *crash-history*)))
+                 (setf history (remove-if (lambda (ts) (< ts window-start)) history))
+                 (setf (gethash session-id *crash-history*) history)
+                 (when (>= (length history) *crash-breaker-threshold*)
+                   (setf circuit-breaker-tripped t))))
+             (setf entry nil
+                   need-reset (not (worker-needs-reset-notification old-worker-to-kill)))
+             ;; A worker lost for a reason the pool recorded (it died while
+             ;; saving its world, or its world could not be resumed) is no
+             ;; crash: no history was pushed above, and the session is told
+             ;; why in the notice.
+             (when (and (eq :dead (worker-state old-worker-to-kill))
+                        (worker-reset-reason old-worker-to-kill))
+               (setf need-reset t
+                     reset-reason (worker-reset-reason old-worker-to-kill))))
+            ;; A worker struct in any other state never belongs in the map.
+            ((and entry (typep entry 'worker))
+             (error "Session ~A's worker is in a state no session worker should have: ~(~A~)."
+                    session-id (worker-state entry)))
+            ;; Path 2: placeholder; another thread is spawning
+            ((and entry (typep entry 'worker-placeholder))
+             nil))
+          ;; Assign standby or insert placeholder for spawn
+          (when (and (null entry) (null to-resume) (not circuit-breaker-tripped))
+            (loop while *standby-workers*
+                  for w = (pop *standby-workers*)
+                  do (cond
+                       ((%worker-process-alive-p w)
+                        (setf (worker-state w) :bound
+                              (worker-session-id w) session-id
+                              (gethash session-id *affinity-map*) w)
+                        (when need-reset
+                          (setf (worker-needs-reset-notification w) t
+                                (worker-reset-reason w) reset-reason))
+                        (setf assigned-from-standby w)
+                        (return))
+                       (t
+                        (setf *all-workers* (remove w *all-workers*))
+                        (log-event :warn "pool.standby.dead-on-assign"
+                                   "worker_id" (worker-id w)
+                                   "pid" (worker-pid w)))))
+            (when (and (null assigned-from-standby) (null entry))
+              (let ((limit (effective-max-pool-size)))
+                (when (>= (%effective-pool-size) limit)
+                  (error 'pool-capacity-exceeded :limit limit)))
+              (let ((ph (make-worker-placeholder :session-id session-id)))
+                (setf (gethash session-id *affinity-map*) ph
+                      entry ph
+                      need-spawn t)))))
+        (cond
+          (to-resume
+           ;; NIL means the core could not be resumed: the entry is now :dead
+           ;; with a reset reason, and the next pass replaces it through
+           ;; Path 1b with a notice saying why.
+           (let ((resumed (%resume-hibernated-worker session-id to-resume)))
+             (when resumed
+               (return resumed))))
+          (t
+           ;; Kill orphaned old worker outside the lock (kill-worker may block ~2s)
+           (when old-worker-to-kill
+             (ignore-errors (kill-worker old-worker-to-kill)))
+           ;; Circuit breaker: record trip time and fail fast
+           (when circuit-breaker-tripped
+             (bt:with-lock-held (*pool-lock*)
+               ;; Record the trip time for the 60s fail-fast window
+               (setf (gethash session-id *circuit-breaker-map*) (get-universal-time))
+               (remhash session-id *crash-history*))
+             (log-event :error "pool.circuit-breaker.tripped"
+                        "session" session-id
+                        "threshold" *crash-breaker-threshold*
+                        "window_seconds" *crash-breaker-window*
+                        "cooldown_seconds" *circuit-breaker-cooldown*)
+             (error 'circuit-breaker-active
+                    :session-id session-id
+                    :remaining-seconds *circuit-breaker-cooldown*))
+           (return
+             (cond
+               (assigned-from-standby
+                (%schedule-replenish)
+                assigned-from-standby)
+               (need-spawn
+                (%spawn-and-bind session-id entry :need-reset need-reset
+                                                  :reset-reason reset-reason))
+               (t
+                (%wait-for-placeholder entry))))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Public API — release-session
@@ -1313,15 +1545,20 @@ call inside the cooldown window; the condition carries the seconds remaining."
 (defun release-session (session-id)
   "Release the worker bound to SESSION-ID. Kills the worker and removes it
 from the pool. Also clears circuit-breaker state so a manual reset works.
+A world the worker had saved to disk goes with it: the core is deleted.
 
 If a spawn is in progress (placeholder), marks it as cancelled so the
-spawn thread will clean up the worker after it completes."
-  (let ((worker-to-kill nil))
+spawn thread will clean up the worker after it completes. A worker in the
+middle of saving is released the same way, and the save, finding it released,
+deletes the core it wrote."
+  (let ((worker-to-kill nil)
+        (core-path nil))
     (bt:with-lock-held (*pool-lock*)
       (let ((entry (gethash session-id *affinity-map*)))
         (cond
           ((and entry (typep entry 'worker))
-           (setf worker-to-kill entry)
+           (setf worker-to-kill entry
+                 core-path (worker-hibernate-core-path entry))
            (setf (worker-state worker-to-kill) :released)
            (remhash session-id *affinity-map*)
            (remhash session-id *crash-history*)
@@ -1345,6 +1582,7 @@ spawn thread will clean up the worker after it completes."
       ;; then kill-worker can acquire it without deadlock.
       (ignore-errors (signal-worker-terminate worker-to-kill))
       (ignore-errors (kill-worker worker-to-kill))
+      (%delete-core-files core-path)
       (%schedule-replenish))))
 
 ;;; ---------------------------------------------------------------------------
@@ -1354,7 +1592,8 @@ spawn thread will clean up the worker after it completes."
 (defun kill-session-worker (session-id &key reset)
   "Kill the worker bound to SESSION-ID without ending the session.
 Unlike release-session, the session remains active — the next tool call
-will spawn a fresh worker via get-or-assign-worker.
+will spawn a fresh worker via get-or-assign-worker. A world the worker had
+saved to disk is deleted with it.
 
 Clears crash history so the intentional kill does not count toward the
 circuit breaker. When RESET is true, also clears *circuit-breaker-map*
@@ -1363,12 +1602,14 @@ for this session (manual breaker reset).
 Returns :killed if a worker was found and killed, :no-worker if none
 was bound, :placeholder if a spawn was in progress (cancelled)."
   (let ((worker-to-kill nil)
+        (core-path nil)
         (kill-result :no-worker))
     (bt:with-lock-held (*pool-lock*)
       (let ((entry (gethash session-id *affinity-map*)))
         (cond
           ((and entry (typep entry 'worker))
            (setf worker-to-kill entry
+                 core-path (worker-hibernate-core-path entry)
                  kill-result :killed)
            (setf (worker-state worker-to-kill) :released)
            (remhash session-id *affinity-map*)
@@ -1388,6 +1629,7 @@ was bound, :placeholder if a spawn was in progress (cancelled)."
                  "worker_id" (worker-id worker-to-kill))
       (ignore-errors (signal-worker-terminate worker-to-kill))
       (ignore-errors (kill-worker worker-to-kill))
+      (%delete-core-files core-path)
       (%schedule-replenish))
     kill-result))
 

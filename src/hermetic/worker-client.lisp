@@ -55,7 +55,7 @@
            #:worker-reset-reason
            #:*hibernate-timeout-seconds*
            #:hibernate-worker-process #:hibernate-refusal-token
-           #:release-worker-process))
+           #:release-worker-process #:resume-worker))
 
 (in-package #:dsmr-mcp/src/hermetic/worker-client)
 
@@ -823,6 +823,50 @@ WORKER-SPAWN-FAILED when the worker cannot be brought up at all."
          (setf *worker-core-unavailable-logged* t)
          (log-event :info "worker.core.unavailable" "reason" reason))
        (%spawn-worker-once nil :id id :root root)))))
+
+(defun resume-worker (worker)
+  "Bring WORKER, whose world is saved at its hibernate-core-path, back to life
+from that core and return WORKER.
+
+The worker stays the same struct with the same id, session, stateful flag and
+last activity, so the session keeps the worker it had and every object id
+issued before the save still names it. Only what belongs to a process is
+replaced: the process, its channel, its ports and pid, its stderr drain and
+how it booted, which reads :resumed. last-resume-milliseconds records how long
+the resume took. The worker's state is left to the caller.
+
+Signals WORKER-SPAWN-FAILED when no core is recorded, when the file is gone,
+or when no process comes up from it (a corrupt core, or one written by a
+different runtime). WORKER is untouched in that case."
+  (let ((path (worker-hibernate-core-path worker))
+        (started (get-internal-real-time)))
+    (unless path
+      (error 'worker-spawn-failed
+             :message (format nil "worker ~D has no saved core recorded"
+                              (worker-id worker))))
+    (let ((fresh (spawn-worker :hibernated-core path
+                               :id (worker-id worker)
+                               :root (worker-spawn-root worker)))
+          (milliseconds nil))
+      (setf milliseconds (round (* 1000 (- (get-internal-real-time) started))
+                                internal-time-units-per-second))
+      (bt:with-lock-held ((worker-stream-lock worker))
+        (setf (worker-process-info worker) (worker-process-info fresh)
+              (worker-stream worker) (worker-stream fresh)
+              (worker-socket worker) (worker-socket fresh)
+              (worker-tcp-port worker) (worker-tcp-port fresh)
+              (worker-swank-port worker) (worker-swank-port fresh)
+              (worker-pid worker) (worker-pid fresh)
+              (worker-stderr-thread worker) (worker-stderr-thread fresh)
+              (worker-boot-kind worker) :resumed
+              (worker-boot-milliseconds worker) (worker-boot-milliseconds fresh)
+              (worker-consecutive-missed-pings worker) 0
+              (worker-last-resume-milliseconds worker) milliseconds))
+      (log-event :info "worker.resumed"
+                 "id" (worker-id worker)
+                 "pid" (worker-pid worker)
+                 "ms" milliseconds)
+      worker)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Internal helpers — crash handling
