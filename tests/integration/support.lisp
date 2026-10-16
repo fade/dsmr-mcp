@@ -45,7 +45,9 @@
            #:reset-build-probes
            #:with-worker-child-or-skip
            #:with-foreign-slynk-child-or-skip
-           #:with-mcp-server-child-or-skip))
+           #:with-mcp-server-child-or-skip
+           #:worker-core-for-tests
+           #:with-worker-core-or-skip))
 
 (in-package #:dsmr-mcp/tests/integration/support)
 
@@ -199,12 +201,17 @@ system. Exits 0 on success, 7 on any build/resolution error."
 (defvar *mcp-server-child-build* :unknown
   "Memoized full-dsmr-mcp-server-child build verdict, same shape as *WORKER-CHILD-BUILD*.")
 
+(defvar *worker-core-build* :unknown
+  "Memoized worker core for the tests that boot workers from one: :UNKNOWN,
+(:OK . path), or (:UNAVAILABLE . detail).")
+
 (defun reset-build-probes ()
   "Forget memoized build verdicts so the next consult re-probes. Mainly for
 interactive re-runs after fixing a registry."
   (setf *worker-child-build* :unknown
         *foreign-slynk-child-build* :unknown
-        *mcp-server-child-build* :unknown)
+        *mcp-server-child-build* :unknown
+        *worker-core-build* :unknown)
   (values))
 
 (defun %verdict (place-symbol program-fn)
@@ -236,6 +243,93 @@ alexandria + zebra in this environment."
 full dsmr-mcp system in this environment — the precondition for spawning a real
 stdio server subprocess."
   (%verdict '*mcp-server-child-build* #'%mcp-server-build-eval-program))
+
+;;; ---------------------------------------------------------------------------
+;;; Worker core for tests
+;;;
+;;; Tests that boot workers from the worker core need one built from the tree
+;;; under test, not whatever image happens to be installed. It is built once per
+;;; test process into a scratch directory, with DSMR_WORKER_EVAL_TIMEOUT set to 7
+;;; during the build: a core that froze its settings at build time would answer
+;;; 7 where the worker's own environment says otherwise, so a test can tell.
+;;; ---------------------------------------------------------------------------
+
+(defparameter *worker-core-build-timeout* 900
+  "Seconds to allow `make core-worker` to build, verify and install the test
+worker core before giving up on it.")
+
+(defun %make-scratch-directory ()
+  "Create a fresh private temporary directory and return its pathname."
+  (uiop:ensure-directory-pathname
+   (string-trim '(#\Newline #\Return #\Space)
+                (uiop:run-program '("mktemp" "-d" "-t" "dsmr-worker-core.XXXXXX")
+                                  :output :string))))
+
+(defun %build-worker-core-for-tests ()
+  "Build a worker core from this tree into a new scratch directory. Returns
+(values PATH NIL) on success, else (values NIL DETAIL) with the end of the build
+output. The directory is removed when this process exits, or at once when the
+build fails."
+  (let ((dir nil) (proc nil))
+    (handler-case
+        (let* ((repo (namestring (asdf:system-source-directory "dsmr-mcp")))
+               (scratch (setf dir (%make-scratch-directory)))
+               (core (namestring (merge-pathnames "dsmr.core.worker" scratch)))
+               (log (merge-pathnames "build.log" scratch)))
+          (setf proc (uiop:launch-program
+                      (list "env" "DSMR_WORKER_EVAL_TIMEOUT=7"
+                            "make" "-C" repo "core-worker"
+                            (format nil "WORKER_CORE=~A" core))
+                      :output log :error-output log))
+          (loop repeat (ceiling *worker-core-build-timeout* 0.5)
+                while (uiop:process-alive-p proc)
+                do (sleep 0.5))
+          (let* ((timed-out (uiop:process-alive-p proc))
+                 (rc (progn
+                       (when timed-out
+                         (ignore-errors (uiop:terminate-process proc :urgent t)))
+                       (uiop:wait-process proc)))
+                 (tail (%tail (ignore-errors (uiop:read-file-string log)) 2000)))
+            (cond ((and (not timed-out) (eql rc 0) (probe-file core))
+                   (push (lambda ()
+                           (ignore-errors
+                            (uiop:delete-directory-tree scratch :validate t)))
+                         sb-ext:*exit-hooks*)
+                   (values core nil))
+                  (t
+                   (ignore-errors (uiop:delete-directory-tree scratch :validate t))
+                   (values nil
+                           (format nil "make core-worker ~:[exited ~A~*~;exceeded ~*~Ds~]~@[~%--- output tail ---~%~A~]"
+                                   timed-out rc *worker-core-build-timeout* tail))))))
+      (error (e)
+        (when (and proc (uiop:process-alive-p proc))
+          (ignore-errors (uiop:terminate-process proc :urgent t))
+          (ignore-errors (uiop:wait-process proc)))
+        (when dir
+          (ignore-errors (uiop:delete-directory-tree dir :validate t)))
+        (values nil (princ-to-string e))))))
+
+(defun worker-core-for-tests ()
+  "A worker core for tests to boot workers from, as (values PATH DETAIL).
+
+When DSMR_TEST_WORKER_CORE names an existing file that file is used, which
+saves the build while iterating. Otherwise a core is built from this tree once
+per process and the answer memoized in *worker-core-build*; reset-build-probes
+forgets it. PATH is NIL when no core could be had, and DETAIL then says why."
+  (let ((given (uiop:getenv "DSMR_TEST_WORKER_CORE")))
+    (if (and given (plusp (length given)) (probe-file given))
+        (values given nil)
+        (progn
+          (when (eq *worker-core-build* :unknown)
+            (setf *worker-core-build*
+                  (multiple-value-bind (path detail) (%build-worker-core-for-tests)
+                    (if path
+                        (cons :ok path)
+                        (cons :unavailable (or detail "worker core build failed"))))))
+          (let ((v *worker-core-build*))
+            (if (eq (car v) :ok)
+                (values (cdr v) nil)
+                (values nil (cdr v))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Guard macros — run BODY only on a buildable environment, else SKIP it
@@ -273,3 +367,14 @@ server that misbehaves is a genuine failure and is left to fail."
        (if ,ok
            (progn ,@body)
            (skip ("dsmr-mcp server child could not build in this environment: ~A" ,detail))))))
+
+(defmacro with-worker-core-or-skip ((var) &body body)
+  "Evaluate BODY with VAR bound to the path of a worker core built from this
+tree (see worker-core-for-tests); when none can be had, zebra:skip the enclosing
+test WITHOUT evaluating BODY. Skips only when the core cannot be built: a core
+that builds but whose workers misbehave runs BODY and is free to fail."
+  (let ((detail (gensym "DETAIL")))
+    `(multiple-value-bind (,var ,detail) (worker-core-for-tests)
+       (if ,var
+           (progn ,@body)
+           (skip ("no worker core could be built here (make core-worker): ~A" ,detail))))))

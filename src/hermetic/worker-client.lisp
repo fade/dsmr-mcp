@@ -40,6 +40,8 @@
            #:*resolved-worker-startup-timeout*
            #:resolve-worker-startup-timeout
            #:effective-worker-startup-timeout
+           #:*worker-core* #:worker-core-path #:*worker-core-disabled*
+           #:worker-boot-kind #:worker-boot-milliseconds
            #:worker-liveness #:worker-liveness-basis
            #:worker-last-ping-milliseconds
            #:worker-consecutive-missed-pings
@@ -97,6 +99,49 @@ image reads the environment it was started with."
 first when nothing has."
   (or *resolved-worker-startup-timeout* (resolve-worker-startup-timeout)))
 
+(defvar *worker-core* nil
+  "Path of a worker core image to boot workers from, or NIL to read
+DSMR_WORKER_CORE. A non-NIL value wins over the environment; tests use it to
+offer a core without touching the process environment.")
+
+(defvar *worker-core-disabled* nil
+  "NIL, or a string saying why the worker core stopped being offered.
+
+spawn-worker sets it when a worker fails to boot from the core. From then on
+worker-core-path answers NIL, so this process loads every later worker from
+source instead of failing on the same image again.")
+
+(defvar *worker-core-unavailable-logged* nil
+  "True once this process has logged why it spawns workers from source, so the
+reason is reported once rather than on every spawn.")
+
+(defun %regular-file-p (path)
+  "True when PATH names an existing regular file."
+  (handler-case
+      (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:stat path)))
+    (error () nil)))
+
+(defun %offered-core (path)
+  "Judge PATH as a worker core to boot from. Returns (values PATH NIL) when it
+names an existing regular file, else (values NIL REASON) where REASON is
+\"unset\" or \"missing <path>\"."
+  (let ((p (and path (namestring path))))
+    (cond ((or (null p) (zerop (length p))) (values nil "unset"))
+          ((%regular-file-p p) (values p nil))
+          (t (values nil (format nil "missing ~A" p))))))
+
+(defun worker-core-path ()
+  "The worker core image a new worker should boot from, or NIL when workers
+load from source. Returns a second value, the reason, when the answer is NIL.
+
+*worker-core* wins when non-NIL, else DSMR_WORKER_CORE; either way the path is
+used only when it names an existing regular file. Once a worker has failed to
+boot from the core (*worker-core-disabled*) this answers NIL for the rest of
+the process. The launcher sets DSMR_WORKER_CORE only when the image is fresh."
+  (if *worker-core-disabled*
+      (values nil (format nil "disabled ~A" *worker-core-disabled*))
+      (%offered-core (or *worker-core* (uiop:getenv "DSMR_WORKER_CORE")))))
+
 (defvar *worker-id-counter* 0
   "Monotonically increasing worker ID counter.")
 
@@ -136,6 +181,11 @@ Each thread terminates and self-removes after reaping its process.")
   (last-crash-reason nil)
   (last-exit-status nil)
   (last-exit-code nil)
+  ;; How this worker came up: :core when booted from the worker core, :source
+  ;; when its systems were loaded at spawn. spawn-worker writes both once.
+  (boot-kind nil)
+  ;; Milliseconds from process launch to an authenticated connection.
+  (boot-milliseconds nil)
   ;; Liveness, kept beside the worker it describes so a status read never has
   ;; to correlate two structures. :unknown until something has actually asked
   ;; the worker a question; the pool's health monitor owns every write here.
@@ -316,8 +366,19 @@ loaded in the current image, or NIL otherwise."
               (namestring (merge-pathnames "setup.lisp"
                                            (namestring home))))))))))
 
-(defun %build-sbcl-args ()
+(defun %build-sbcl-args (&key core)
   "Build command-line arguments for spawning a worker via bare SBCL.
+
+With CORE, the path of a worker core image, the worker boots from that image,
+which already holds the worker system, so nothing is loaded before start. The
+image carries the source registry as it stood when it was built; the arguments
+discard it, so the worker sees the workspace as it is now, and add this project
+directory to the central registry, so the project's systems are found even
+when it sits outside the configured registry. Discarding rather than
+re-scanning matters: a scan of a large workspace takes seconds, and ASDF
+repeats it lazily at the worker's first system lookup instead of before its
+handshake. Without CORE the worker loads its systems from source as described
+below.
 
 --no-userinit prevents the user's ~/.sbclrc from running in the child.
 Without this flag, .sbclrc (which quickloads bordeaux-threads and slynk)
@@ -333,6 +394,14 @@ rebinding; start() restores *standard-output* to it before emitting the
 handshake JSON line."
   (let ((source-dir (namestring (asdf:system-source-directory :dsmr-mcp)))
         (ql-setup (%quicklisp-setup-path)))
+    (when core
+      (return-from %build-sbcl-args
+        (list "--core" (namestring core)
+              "--noinform" "--disable-debugger" "--no-userinit"
+              "--eval" (format nil
+                               "(progn (asdf:clear-source-registry) (pushnew (pathname ~S) asdf:*central-registry* :test (function equal)))"
+                               source-dir)
+              "--eval" "(dsmr-mcp/src/hermetic/worker/main:start)")))
     (append
      (list "--noinform" "--non-interactive" "--no-userinit")
      (when ql-setup
@@ -351,14 +420,15 @@ handshake JSON line."
       "--eval" "(asdf:load-system :dsmr-mcp/src/hermetic/worker/main)"
       "--eval" "(dsmr-mcp/src/hermetic/worker/main:start)"))))
 
-(defun %launch-worker-process (secret id)
-  "Launch a worker child process via sb-ext:run-program.
+(defun %launch-worker-process (secret id &key core)
+  "Launch a worker child process via sb-ext:run-program, booting it from the
+worker core image CORE when given, else loading it from source.
 Returns the sb-ext:process object with stdout and stderr as streams.
 Always uses bare SBCL; dsmr-mcp is SBCL-only (no ros run wrapper)."
   (let ((env (%build-environment secret id))
         (sbcl-path (%find-sbcl-path)))
     (sb-ext:run-program sbcl-path
-                        (%build-sbcl-args)
+                        (%build-sbcl-args :core core)
                         :output :stream :error :stream :wait nil
                         :search t :environment env)))
 
@@ -521,8 +591,9 @@ Stores the thread in the worker's stderr-thread slot for cleanup."
 ;;; Public API — spawn
 ;;; ---------------------------------------------------------------------------
 
-(defun spawn-worker ()
-  "Launch a worker child process and return a WORKER struct.
+(defun %spawn-worker-once (core)
+  "Launch one worker child process and return a WORKER struct, booting it
+from the worker core image CORE when non-NIL, else loading it from source.
 The worker is launched via sb-ext:run-program (bare SBCL only).
 Reads the JSON handshake to discover tcp_port/pid/swank_port, connects
 to the TCP port, authenticates with a shared secret, and returns the
@@ -533,11 +604,14 @@ the handshake fails, or authentication is rejected."
   (let ((id (%next-worker-id))
         (secret (%generate-worker-secret))
         (process nil)
-        (socket nil))
+        (socket nil)
+        (started (get-internal-real-time)))
     (handler-case
         (progn
-          (log-event :info "worker.spawning" "id" id)
-          (setf process (%launch-worker-process secret id))
+          (log-event :info "worker.spawning" "id" id
+                     "boot" (if core "core" "source"))
+          (setf started (get-internal-real-time)
+                process (%launch-worker-process secret id :core core))
           (multiple-value-bind (tcp-port pid swank-port)
               (%read-handshake process (effective-worker-startup-timeout))
             (log-event :info "worker.handshake.received"
@@ -570,12 +644,18 @@ the handshake fails, or authentication is rejected."
                            :socket socket
                            :tcp-port tcp-port
                            :swank-port swank-port
-                           :pid pid)))
+                           :pid pid
+                           :boot-kind (if core :core :source)
+                           :boot-milliseconds
+                           (round (* 1000 (- (get-internal-real-time) started))
+                                  internal-time-units-per-second))))
               (%start-stderr-drain worker)
               (log-event :info "worker.spawned"
                          "id" id
                          "tcp_port" tcp-port
-                         "pid" pid)
+                         "pid" pid
+                         "boot" (if core "core" "source")
+                         "boot_ms" (worker-boot-milliseconds worker))
               worker)))
       (error (e)
         ;; Clean up on failure
@@ -596,6 +676,43 @@ the handshake fails, or authentication is rejected."
             (error e)
             (error 'worker-spawn-failed
                    :message (princ-to-string e)))))))
+
+(defun spawn-worker (&key (core nil core-p))
+  "Launch a worker child process and return a WORKER struct in :standby state.
+
+CORE is the worker core image to boot from; when it is not given,
+worker-core-path decides. A worker from the core starts in a fraction of a
+second, against tens of seconds to load its systems from source, which is why
+the pool can afford to spawn on demand and keep nothing warm.
+
+When no usable core is offered the worker loads from source, and the reason is
+logged once per process as worker.core.unavailable. When a core is offered but
+the worker fails to boot from it, the failure is logged as a warning,
+*worker-core-disabled* records it so this process does not try the core again,
+and the spawn is retried once from source.
+
+worker-boot-kind on the result says which way it came up, and
+worker-boot-milliseconds how long it took. Signals WORKER-SPAWN-FAILED when
+the worker cannot be brought up at all."
+  (multiple-value-bind (path reason)
+      (if core-p
+          (if core (%offered-core core) (values nil "not requested"))
+          (worker-core-path))
+    (cond
+      (path
+       (handler-case (%spawn-worker-once path)
+         (worker-spawn-failed (e)
+           (let ((why (princ-to-string e)))
+             (log-event :warn "worker.core.boot-failed"
+                        "core" path
+                        "error" why)
+             (setf *worker-core-disabled* why)
+             (%spawn-worker-once nil)))))
+      (t
+       (unless *worker-core-unavailable-logged*
+         (setf *worker-core-unavailable-logged* t)
+         (log-event :info "worker.core.unavailable" "reason" reason))
+       (%spawn-worker-once nil)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Internal helpers — crash handling
