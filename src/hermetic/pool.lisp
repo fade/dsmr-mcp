@@ -1668,7 +1668,10 @@ waited on has not finished within %transition-wait-seconds."
              (let ((limit (effective-max-pool-size)))
                (when (>= (%effective-pool-size) limit)
                  (error 'pool-capacity-exceeded :limit limit)))
+             ;; The cause of an earlier failure belongs to that attempt: only
+             ;; this attempt deferring may give its waiters a cause.
              (setf (worker-state entry) :resuming
+                   (worker-resume-failure entry) nil
                    to-resume entry)
              (%condition-broadcast *pool-transition-condvar*))
             ;; Path 1b: existing dead/crashed worker, removed and reassigned

@@ -35,7 +35,8 @@
                 #:check-and-clear-reset-notification
                 #:worker-runtime-path #:worker-runtime-identity
                 #:runtime-identity #:*resolved-worker-resume-timeout*
-                #:worker-resume-deferrals)
+                #:worker-resume-deferrals #:worker-resume-failure
+                #:resume-worker)
   (:import-from #:dsmr-mcp/src/hermetic/pool-records
                 #:server-stem #:owner-directory #:hibernate-root
                 #:failed-core-directory)
@@ -475,6 +476,53 @@ failure. No crash is counted."
         (true (search "code=worker-resume-failed" log) "~A" log))
       (true (%answers-p (%answer-in "stuck" "(+ 1 1)") 2))
       (%no-crash-recorded "stuck"))))
+
+(define-test a-request-waiting-on-a-cut-off-resume-resumes-the-world-itself
+  "A request that waits on a resume which is then cut off, as by an interrupt,
+is never handed the cause of an earlier failed attempt: it resumes the world
+itself and gets the same worker back with its world."
+  (%pool-case ()
+    (%eval "cut" "(defvar *kept* 9)")
+    (let* ((w (%session-worker "cut"))
+           (first nil))
+      (%hibernated-core "cut")
+      ;; An earlier attempt failed in a way that may pass and left its cause.
+      (bt:with-lock-held (pool::*pool-lock*)
+        (setf (worker-resume-failure w) "an earlier attempt's cause"))
+      ;; The first request's resume stalls until it is cut off; any other
+      ;; thread's resume runs as it would.
+      (sb-int:encapsulate
+       'resume-worker 'stall-first
+       (lambda (original &rest args)
+         (when (eq (bt:current-thread) first)
+           (sleep 60))
+         (apply original args)))
+      (unwind-protect
+           (progn
+             (setf first (bt:make-thread
+                          (lambda ()
+                            (setf first (bt:current-thread))
+                            (catch 'cut
+                              (get-or-assign-worker "cut")
+                              :finished))
+                          :name "first-resume"))
+             (true (%wait-until 10 (lambda () (eq :resuming (worker-state w))))
+                   "the first resume never started")
+             (let ((waiter (bt:make-thread
+                            (lambda ()
+                              (handler-case (get-or-assign-worker "cut")
+                                (error (e) e)))
+                            :name "waiting-request")))
+               ;; Let the second request reach its wait on the first resume.
+               (sleep 0.5)
+               (bt:interrupt-thread first (lambda () (throw 'cut :cut-off)))
+               (is eq :cut-off (%join-within first 20))
+               (let ((result (%join-within waiter 60)))
+                 (is eq w result "the waiting request got ~A" result))))
+        (sb-int:unencapsulate 'resume-worker 'stall-first))
+      (is eq :bound (worker-state w))
+      (true (%answers-p (%answer-in "cut" "*kept*") 9))
+      (%no-crash-recorded "cut"))))
 
 (define-test a-resume-starts-the-runtime-that-wrote-the-core
   "A worker records the runtime it was started with, and its saved world is

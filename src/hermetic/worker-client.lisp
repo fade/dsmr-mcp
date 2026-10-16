@@ -311,7 +311,8 @@ Each thread terminates and self-removes after reaping its process.")
   (runtime-path nil)
   (runtime-identity nil)
   ;; Why the last resume of this worker's saved world failed in a way worth
-  ;; retrying, while its core is still on disk; NIL once a resume succeeds.
+  ;; retrying, while its core is still on disk; NIL while a new resume runs
+  ;; and once one succeeds.
   (resume-failure nil)
   ;; How many resumes of this worker's saved world in a row have failed in a
   ;; way worth retrying; 0 once a resume succeeds.
