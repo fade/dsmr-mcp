@@ -309,9 +309,11 @@
   (let ((at (getf worker :refused-at)))
     (and (realp at) (< (- now at) refusal-seconds))))
 
-(defun %candidate (stem worker now pending refusal-seconds min-kill-age)
+(defun %candidate (stem worker now pending refusal-seconds min-kill-age
+                   &key hibernate-full)
   "WORKER of the server STEM as a candidate plist, or NIL when it may not be
-   offered at NOW."
+   offered at NOW. With HIBERNATE-FULL, the server keeps all the hibernated
+   workers it may, so a stateful worker is not offered."
   (let* ((id (getf worker :id))
          (spawned (let ((at (getf worker :spawned-at)))
                     (and (realp at) at)))
@@ -322,6 +324,7 @@
                (not (getf worker :busy))
                (not (%recently-refused-p worker now refusal-seconds))
                (not (member (cons stem id) pending :test #'equal))
+               (not (and stateful hibernate-full))
                (or stateful
                    (>= (if spawned (- now spawned) 0) min-kill-age)))
       (list :stem stem
@@ -368,6 +371,8 @@
    refused fewer than REFUSAL-SECONDS ago, is named in PENDING, a list of
    (stem . worker-id) with requests outstanding, or belongs to a server
    OWNER-ALIVE-P, called with the server's pid and start time, says has gone.
+   A stateful worker is not offered either when its server's record says
+   :HIBERNATE-FULL, since that server would refuse to save another world.
    A fresh worker spawned fewer than MIN-KILL-AGE seconds ago, or with no
    spawn time, is not offered for stopping, so a worker spawned for a call
    still being set up is left alone. PSS-FN reads a pid's proportional memory
@@ -382,7 +387,9 @@
           (let ((stem (format nil "~D-~D" pid start)))
             (dolist (worker (getf record :workers))
               (let ((candidate (%candidate stem worker now pending
-                                           refusal-seconds min-kill-age)))
+                                           refusal-seconds min-kill-age
+                                           :hibernate-full
+                                           (getf record :hibernate-full))))
                 (when candidate
                   (let ((worker-pid (getf candidate :pid)))
                     (setf (getf candidate :pss-kb)

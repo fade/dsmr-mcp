@@ -88,12 +88,14 @@ directory removed afterwards."
          (ignore-errors
           (uiop:delete-directory-tree *state-home* :validate t))))))
 
-(defmacro %pool-case ((&key (max-pool-size 4) (health-interval 10.0d0))
+(defmacro %pool-case ((&key (max-pool-size 4) (health-interval 10.0d0)
+                            (max-hibernated 8))
                       &body body)
   "Evaluate BODY against a running pool whose workers boot from the test
-worker core, with no standbys, at most MAX-POOL-SIZE workers and a health
-check every HEALTH-INTERVAL seconds, inside a private state home. The pool is
-shut down afterwards whatever happens. Skips when no core can be built."
+worker core, with no standbys, at most MAX-POOL-SIZE workers, at most
+MAX-HIBERNATED of them hibernated, and a health check every HEALTH-INTERVAL
+seconds, inside a private state home. The pool is shut down afterwards
+whatever happens. Skips when no core can be built."
   (let ((core (gensym "CORE")))
     `(with-worker-core-or-skip (,core)
        (%with-state-home
@@ -102,6 +104,7 @@ shut down afterwards whatever happens. Skips when no core can be built."
                (*worker-core* ,core)
                (*worker-pool-warmup* 0)
                (*max-pool-size* ,max-pool-size)
+               (pool:*max-hibernated-workers* ,max-hibernated)
                (*health-check-interval-seconds* ,health-interval))
            (configure-log4cl-for-server :warn)
            (initialize-pool)
@@ -469,6 +472,26 @@ the new session gets a worker."
           "a third session was given a worker at the limit")
     (is eq :hibernated (hibernate-session-worker "cap-a"))
     (is eq :bound (worker-state (get-or-assign-worker "cap-c")))))
+
+(define-test at-the-hibernated-limit-a-save-is-refused-and-the-record-says-so
+  "With the limit at one hibernated worker, a second save is refused with
+at-limit and the worker keeps serving, the published record says the server
+is full, and once the first world resumes the second worker can be saved."
+  (%pool-case (:max-hibernated 1)
+    (%eval "first" "(defvar *kept* 1)")
+    (%eval "second" "(defvar *kept* 2)")
+    (let ((second (%session-worker "second")))
+      (is eq :hibernated (hibernate-session-worker "first"))
+      (multiple-value-bind (outcome reason) (hibernate-session-worker "second")
+        (is eq :at-limit outcome)
+        (is equal "at-limit" reason))
+      (is eq :bound (worker-state second))
+      (is equal "at-limit" (worker-refused-reason second))
+      (true (getf (pool:build-worker-record (pool::%unix-now)) :hibernate-full))
+      (true (%answers-p (%answer-in "second" "*kept*") 2))
+      (true (%answers-p (%answer-in "first" "*kept*") 1))
+      (false (getf (pool:build-worker-record (pool::%unix-now)) :hibernate-full))
+      (is eq :hibernated (hibernate-session-worker "second")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Ending a worker in the middle of a save

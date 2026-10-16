@@ -462,7 +462,7 @@ so failures cannot fill the disk."
 (defun write-worker-record (stem plist)
   "Publish PLIST as the server STEM's worker record, owner-only, replacing the
    last one in a single rename. Keys: :SERVER-PID :SERVER-START :WRITTEN-AT
-   :SERVICE-SEEN :WORKERS :LAST-ACTION, where each worker is a plist of :ID :PID
+   :SERVICE-SEEN :WORKERS :LAST-ACTION :HIBERNATE-FULL, where each worker is a plist of :ID :PID
    :STATE :SESSION :STATEFUL :BUSY :SPAWNED-AT :LAST-ACTIVITY :REFUSED-REASON
    :REFUSED-AT :CORE-BYTES, and the last action, when there is one, is a plist
    of :WORKER-ID :ACTION :RESULT :AT."

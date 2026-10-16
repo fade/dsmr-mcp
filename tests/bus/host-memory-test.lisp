@@ -341,3 +341,15 @@
                                   (declare (ignore start))
                                   (/= pid 11)))))
     (is equal '(3) (ranked-ids ranked))))
+
+(define-test a-server-at-its-hibernated-limit-is-asked-for-no-save
+  "A server whose record says it keeps all the hibernated workers it may has
+   none of its stateful workers offered, while its fresh worker can still be
+   stopped and another server's stateful worker can still be saved."
+  (let ((ranked (rank (list (append (pool-record 11
+                                                 (worker 1 :last-activity 100)
+                                                 (worker 2 :stateful t :last-activity 10))
+                                    (list :hibernate-full t))
+                            (pool-record 12 (worker 3 :stateful t :last-activity 50))))))
+    (is equal '(1 3) (ranked-ids ranked))
+    (is equal '(:kill :hibernate) (mapcar (lambda (c) (getf c :action)) ranked))))

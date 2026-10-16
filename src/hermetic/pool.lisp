@@ -92,6 +92,8 @@
            #:pool-settings-warmup #:pool-settings-max-pool-size
            #:pool-settings-kill-grace-seconds
            #:pool-settings-pressure-kill-min-age-seconds
+           #:pool-settings-max-hibernated-workers
+           #:*max-hibernated-workers* #:effective-max-hibernated-workers
            #:*resolved-pool-settings* #:resolve-pool-settings
            #:effective-worker-pool-warmup #:effective-max-pool-size
            #:effective-worker-kill-grace-seconds
@@ -318,6 +320,19 @@ non-NIL value, set globally or bound in the thread that starts the pool, wins
 over the environment; a binding visible to the thread deciding a stop wins
 there too.")
 
+(defvar *max-hibernated-workers* nil
+  "The most workers this server keeps hibernated at once, or NIL to read the
+environment when the pool starts. A hibernated worker holds no memory and no
+place in the pool, so without a limit a server whose sessions come and go
+without being released would fill the disk with their worlds. At the limit a
+request to hibernate is refused with :at-limit and the host service turns to
+another worker.
+
+NIL (the default) means resolve-pool-settings reads
+DSMR_MAX_HIBERNATED_WORKERS, a non-negative integer defaulting to 8; 0 turns
+hibernation off. A non-NIL value, set globally or bound in the thread that
+starts the pool, wins over the environment.")
+
 ;;; ---------------------------------------------------------------------------
 ;;; Settings resolved when the pool starts
 ;;; ---------------------------------------------------------------------------
@@ -333,7 +348,8 @@ given, and initialize-pool reports an invalid one with its own error."
   (warmup 0)
   (max-pool-size 16)
   (kill-grace-seconds 5)
-  (pressure-kill-min-age-seconds 10))
+  (pressure-kill-min-age-seconds 10)
+  (max-hibernated-workers 8))
 
 (defvar *resolved-pool-settings* nil
   "The pool-settings record from the last resolve-pool-settings call, or NIL
@@ -349,7 +365,8 @@ environment, else its default: *worker-pool-warmup* or DSMR_WORKER_POOL_WARMUP
 (default 0), *max-pool-size* or DSMR_MAX_POOL_SIZE (default 16),
 *worker-kill-grace-seconds* or DSMR_WORKER_KILL_GRACE_SECONDS (default 5), and
 *pressure-kill-min-age-seconds* or DSMR_PRESSURE_MIN_KILL_AGE_SECONDS (default
-10). An unparseable or out-of-range environment value warns and falls back to
+10), and *max-hibernated-workers* or DSMR_MAX_HIBERNATED_WORKERS (default 8).
+An unparseable or out-of-range environment value warns and falls back to
 the default.
 
 It also resolves the worker handshake timeouts, for a fresh worker and for a
@@ -369,7 +386,10 @@ prebuilt image honours the environment it is started with."
                                              5 :min 1))
            :pressure-kill-min-age-seconds
            (or *pressure-kill-min-age-seconds*
-               (%env-int "DSMR_PRESSURE_MIN_KILL_AGE_SECONDS" 10 :min 0)))))
+               (%env-int "DSMR_PRESSURE_MIN_KILL_AGE_SECONDS" 10 :min 0))
+           :max-hibernated-workers
+           (or *max-hibernated-workers*
+               (%env-int "DSMR_MAX_HIBERNATED_WORKERS" 8 :min 0)))))
     (setf *resolved-pool-settings* settings)
     (resolve-worker-startup-timeout)
     (resolve-worker-resume-timeout)
@@ -399,6 +419,10 @@ a binding of *pressure-kill-min-age-seconds* visible here, else the value last
 resolved."
   (or *pressure-kill-min-age-seconds*
       (pool-settings-pressure-kill-min-age-seconds (%current-pool-settings))))
+
+(defun effective-max-hibernated-workers ()
+  "The most workers this server keeps hibernated at once, as last resolved."
+  (pool-settings-max-hibernated-workers (%current-pool-settings)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Global pool state
@@ -1143,7 +1167,11 @@ subprocess launches beyond the one-time fasl compile on a cold cache."
       (let ((min-age (pool-settings-pressure-kill-min-age-seconds settings)))
         (unless (and (integerp min-age) (>= min-age 0))
           (error "Invalid *pressure-kill-min-age-seconds*: must be a non-negative integer, got ~S"
-                 min-age))))
+                 min-age)))
+      (let ((limit (pool-settings-max-hibernated-workers settings)))
+        (unless (and (integerp limit) (>= limit 0))
+          (error "Invalid *max-hibernated-workers*: must be a non-negative integer, got ~S"
+                 limit))))
     (when *pool-running*
       (shutdown-pool))
     ;; Pre-warm the worker system's fasl cache so concurrent child spawns
@@ -1190,7 +1218,8 @@ subprocess launches beyond the one-time fasl compile on a cold cache."
     (%schedule-replenish)
     (log-event :info "pool.initialized"
                "warmup_target" (effective-worker-pool-warmup)
-               "max_pool_size" (effective-max-pool-size))))
+               "max_pool_size" (effective-max-pool-size)
+               "max_hibernated_workers" (effective-max-hibernated-workers))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Public API — shutdown
@@ -2040,6 +2069,12 @@ the outcome and reason for hibernate-session-worker."
                  (%finish-hibernation session-id worker path nil milliseconds)
                  (%lose-worker-during-hibernation session-id worker)))))))))
 
+(defun %saved-worker-count ()
+  "How many of this pool's workers are hibernated or being saved. Must be
+called with *pool-lock* held."
+  (count-if (lambda (w) (member (worker-state w) '(:hibernated :hibernating)))
+            *all-workers*))
+
 (defun hibernate-session-worker (session-id &key ((:worker expected)))
   "Have SESSION-ID's worker save its whole world to disk and end its process,
 so it holds no memory until the session needs it again.
@@ -2056,8 +2091,10 @@ Returns (values OUTCOME REASON), OUTCOME being one of:
                  the session started threads of its own, fork-failed when the
                  saving child could not be started, a save that failed, or
                  bad-path); it is left serving.
+  :at-limit      this server already keeps *max-hibernated-workers* workers
+                 hibernated or saving; it is left serving.
   :disk          less than twice the expected core size is free; it is left
-                 serving.
+                 serving. This check applies under the limit as well.
   :timeout       no answer in time and no finished core. The worker may still
                  have been saving, so it is ended, never put back to serving;
                  its session gets a fresh worker and a reset notice saying so
@@ -2068,7 +2105,8 @@ Returns (values OUTCOME REASON), OUTCOME being one of:
 
 A worker is refused rather than saved whenever saving it could lose work it is
 doing or make a short host worse: a call in flight, a thread of the session's
-own, or a disk without room for the core. The reason and time of a refusal are
+own, a server already keeping as many saved worlds as it may, or a disk
+without room for the core. The reason and time of a refusal are
 kept on the worker. The worker is marked :hibernating under *pool-lock*, which
 is never held across the save; no call can be handed the worker meanwhile, and
 none of these outcomes counts as a crash."
@@ -2093,6 +2131,11 @@ none of these outcomes counts as a crash."
            (setf (worker-refused-reason entry) "busy"
                  (worker-refused-at entry) (%unix-now))
            (return-from hibernate-session-worker (values :busy "busy")))
+          ((>= (%saved-worker-count) (effective-max-hibernated-workers))
+           (setf (worker-refused-reason entry) "at-limit"
+                 (worker-refused-at entry) (%unix-now))
+           (return-from hibernate-session-worker
+             (values :at-limit "at-limit")))
           (t
            (setf (worker-state entry) :hibernating
                  worker entry)
@@ -2221,19 +2264,29 @@ id, pid, state, session, whether it holds state or is serving a call, when it
 was spawned and last active, its last refusal and the size of its saved core.
 SERVICE-SEEN says whether the pool last found the host service alive, and
 LAST-ACTION is the last request answered, as (:worker-id :action :result :at),
-or NIL. Nothing is written; the caller publishes the plist."
-  (let ((entries (if workers-p
-                     (mapcar (lambda (w) (%worker-record-entry w now)) workers)
-                     (bt:with-lock-held (*pool-lock*)
-                       (mapcar (lambda (w) (%worker-record-entry w now))
-                               *all-workers*)))))
+or NIL. :HIBERNATE-FULL is true while the server keeps as many workers
+hibernated or saving as *max-hibernated-workers* allows, so the service asks
+it for no more saves until one resumes or goes. Nothing is written; the caller
+publishes the plist."
+  (multiple-value-bind (entries saved)
+      (flet ((read-workers (list)
+               (values (mapcar (lambda (w) (%worker-record-entry w now)) list)
+                       (count-if (lambda (w)
+                                   (member (worker-state w)
+                                           '(:hibernated :hibernating)))
+                                 list))))
+        (if workers-p
+            (read-workers workers)
+            (bt:with-lock-held (*pool-lock*)
+              (read-workers *all-workers*))))
     (multiple-value-bind (pid start) (parse-server-stem (server-stem))
       (list :server-pid pid
             :server-start start
             :written-at now
             :service-seen (and service-seen t)
             :workers entries
-            :last-action last-action))))
+            :last-action last-action
+            :hibernate-full (>= saved (effective-max-hibernated-workers))))))
 
 (defun %stop-idle-worker (session-id worker &key (now (%unix-now)))
   "Stop WORKER, SESSION-ID's worker, only if it is still idle, holds no state
@@ -2293,7 +2346,7 @@ answer is:
                    another server.
   :stale           the request is older than *pressure-request-max-age-seconds*
                    or carries no time.
-  :hibernated, :refused, :disk, :timeout, :died
+  :hibernated, :refused, :at-limit, :disk, :timeout, :died
                    as hibernate-session-worker answers a :hibernate.
 A stale or unknown request is logged as a warning and nothing is done. A
 request only ever names a worker by its id; where a world is saved is decided
@@ -2608,7 +2661,8 @@ and that rendering belongs to the verb doing the reporting, not to the pool."
   "Return a hash-table with pool diagnostic information for the pool-status MCP tool.
 Keys: pool_running, total_workers, standby_count, bound_count,
 max_pool_size, warmup_target, workers (vector of per-worker hashes),
-hibernated_count (workers saved to disk, holding no memory), resident_count
+hibernated_count (workers saved to disk, holding no memory),
+max_hibernated_workers (the most this server keeps hibernated), resident_count
 (workers with a running process), pressure_relief (\"active\" when the pool is
 answering a live host service, else \"inactive\"), worker_core (the core new
 workers boot from, or JSON null) and worker_core_status (\"in use\", \"unset\",
@@ -2640,6 +2694,8 @@ workers boot from, or JSON null) and worker_core_status (\"in use\", \"unset\",
               (gethash "warmup_target" info) (effective-worker-pool-warmup)
               (gethash "workers" info) workers
               (gethash "hibernated_count" info) hibernated-count
+              (gethash "max_hibernated_workers" info)
+                (effective-max-hibernated-workers)
               (gethash "resident_count" info) resident-count
               (gethash "pressure_relief" info) (if relief "active" "inactive")
               (gethash "worker_core" info) core

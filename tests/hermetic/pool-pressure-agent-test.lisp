@@ -18,7 +18,9 @@
                 #:pool-worker-info #:pool-status-info
                 #:*pressure-kill-min-age-seconds*
                 #:*resolved-pool-settings* #:resolve-pool-settings
-                #:pool-settings-pressure-kill-min-age-seconds)
+                #:pool-settings-pressure-kill-min-age-seconds
+                #:*max-hibernated-workers*
+                #:pool-settings-max-hibernated-workers)
   (:import-from #:dsmr-mcp/src/hermetic/worker-client
                 #:make-worker #:*worker-core* #:*worker-core-disabled*)
   (:import-from #:dsmr-mcp/src/hermetic/pool-records
@@ -250,3 +252,31 @@ a bound special wins, and so does the environment."
       (if old
           (sb-posix:setenv "DSMR_PRESSURE_MIN_KILL_AGE_SECONDS" old 1)
           (sb-posix:unsetenv "DSMR_PRESSURE_MIN_KILL_AGE_SECONDS")))))
+
+(define-test the-hibernated-limit-defaults-to-eight-and-reaches-the-record
+  "With nothing set a server keeps at most eight workers hibernated; a bound
+special wins, and so does the environment. The published record says the
+server is full once that many are hibernated, and not before."
+  (let ((old (sb-posix:getenv "DSMR_MAX_HIBERNATED_WORKERS"))
+        (*resolved-pool-settings* nil))
+    (unwind-protect
+         (progn
+           (sb-posix:unsetenv "DSMR_MAX_HIBERNATED_WORKERS")
+           (let ((*max-hibernated-workers* nil))
+             (is = 8 (pool-settings-max-hibernated-workers (resolve-pool-settings))))
+           (let ((*max-hibernated-workers* 0))
+             (is = 0 (pool-settings-max-hibernated-workers (resolve-pool-settings))))
+           (sb-posix:setenv "DSMR_MAX_HIBERNATED_WORKERS" "3" 1)
+           (let ((*max-hibernated-workers* nil))
+             (is = 3 (pool-settings-max-hibernated-workers (resolve-pool-settings))))
+           (let ((now (%unix-now)))
+             (%with-workers ((%fresh-worker) (%hibernated-worker now))
+               (let ((*max-hibernated-workers* 1))
+                 (resolve-pool-settings)
+                 (is eq t (getf (build-worker-record now) :hibernate-full)))
+               (let ((*max-hibernated-workers* 2))
+                 (resolve-pool-settings)
+                 (is eq nil (getf (build-worker-record now) :hibernate-full))))))
+      (if old
+          (sb-posix:setenv "DSMR_MAX_HIBERNATED_WORKERS" old 1)
+          (sb-posix:unsetenv "DSMR_MAX_HIBERNATED_WORKERS")))))

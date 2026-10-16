@@ -152,6 +152,7 @@ fields:
 | =standby_count=      | Warm workers ready for immediate assignment. Zero unless =DSMR_WORKER_POOL_WARMUP= asks for some.                                           |
 | =bound_count=        | Workers currently bound to a session.                                                                                                       |
 | =hibernated_count=   | Workers whose world is saved to disk and whose process has ended.                                                                           |
+| =max_hibernated_workers= | The most workers this server keeps hibernated (=DSMR_MAX_HIBERNATED_WORKERS=, default 8).                                                  |
 | =resident_count=     | Workers with a running process.                                                                                                             |
 | =max_pool_size=      | Configured ceiling (=DSMR_MAX_POOL_SIZE=, default 16). Resident workers count against it; hibernated ones do not.                           |
 | =warmup_target=      | Configured standby target (=DSMR_WORKER_POOL_WARMUP=, default 0).                                                                           |
@@ -353,6 +354,15 @@ is kept, and the service logs =owner-state-unknown=.
 Hibernation is refused when free space on that filesystem is below twice the
 worker's expected core size, so a save cannot fill the disk. The worker stays
 resident and =pool-status= shows why in its =refused_reason=.
+
+Each server also keeps at most =DSMR_MAX_HIBERNATED_WORKERS= workers (default
+8) hibernated or saving at once. Without a limit, a server whose sessions come
+and go without being released would keep saving their worlds until the disk
+check alone stopped it, with the disk nearly full. At the limit a request to
+hibernate is refused with =at-limit=, the server's record tells the host
+service it is full so the service asks it for no more saves, and the service
+turns to other workers. The free-space check above still applies below the
+limit.
 
 ** Capacity
 
