@@ -25,7 +25,7 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 
 .PHONY: bridge bus-watch bus-host install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
         install-skills check-skills install-harness check-harness install-sisters check-sisters \
-        preflight check-preflight self-test-preflight install-hooks check-hooks
+        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -279,6 +279,14 @@ install-hooks:
 	  mv -f "$$dest/.$$f.tmp" "$$dest/$$f"; \
 	done; \
 	echo "installed hooks into $$dest"
+
+## test-hooks: drive real commits through the hooks in a scratch repository.
+##
+##   Each blocking style rule is checked from both sides, a commit it must refuse
+##   and one it must let through, so a lint that refuses everything fails as
+##   surely as one that refuses nothing.
+test-hooks:
+	@bash tests/githooks/workproduct-style-test.sh
 
 ## check-hooks: report where a deployed hook differs from this tree.
 ##
