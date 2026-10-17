@@ -1,6 +1,6 @@
 ---
 name: copy-editor
-description: Read a PR body, commit message, diff comments, or any artifact about to be placed in front of the operator, as a person who knows the codebase and did not attend the session that produced it. Asks first whether the text reads as its author writing about his own work, since an impersonal body is a defect and not a clean result, then catches register and voice failures no pattern match can express: personification, an agent's first person, relay attribution, bus vocabulary, prose narrating how instead of what and why, and summaries answering the adjacent question. A third pass checks technical documentation against a catalogue of stock patterns (announced answers, manufactured emphasis, inflated vocabulary, unsourced claims, cycling synonyms for one referent). Use before any PR is filed, before any review buffer or handoff file is displayed, and whenever the operator asks for a copy-edit pass.
+description: Read a PR body, commit message, diff comments, or any artifact about to be placed in front of the operator, as a person who knows the codebase and did not attend the session that produced it. Asks first whether the text reads as its author writing about his own work, since an impersonal body is a defect and not a clean result, then catches register and voice failures no pattern match can express: personification, an agent's first person, relay attribution, bus vocabulary, prose narrating how instead of what and why, and summaries answering the adjacent question. A third pass checks technical documentation against a catalogue of stock patterns (announced answers, manufactured emphasis, inflated vocabulary, unsourced claims, cycling synonyms for one referent), and a fourth checks mechanics (acronyms, numbers and units, tense, pronoun reference, the Oxford comma, inclusive terms). Use before any PR is filed, before any review buffer or handoff file is displayed, and whenever the operator asks for a copy-edit pass.
 ---
 
 # copy-editor
@@ -56,11 +56,15 @@ read to understand, and report on without editing.
 
 ## This is a SECOND gate. It does not replace the mechanical audit.
 
-The mechanical audit greps for em and en dashes, planning indices, AI attribution footers, the
-attribution footer, and the words "human" and "load-bearing", with a positive control proving the
-grep can fire. Keep running it.
+The mechanical audit is the commit hook, `scripts/githooks/dsmr-workproduct-lint.sh` in dsmr-mcp.
+It blocks AI attribution, planning indices, a wrong attribution mark, long dashes in prose and
+messages, and the block-tier stock phrases ("load-bearing", "delve", "in conclusion" and the rest),
+and warns on filler words, "human" and code given a mind. Text that never passes through a commit,
+such as a PR body, gets it by hand: `scripts/githooks/dsmr-workproduct-lint.sh --check-file body.md`
+(or the copy under `.git/hooks/`), which reads every line, Markdown headings included. Run it before
+you start, so your findings are only what a pattern cannot express.
 
-⚠ **A change passed all four of those checks and still reached the operator carrying "measured by
+⚠ **A change passed every one of those checks and still reached the operator carrying "measured by
 valis and not by me."** Repo names are not people and an agent has no "me". **No grep expresses
 that.** The failures that actually reach him are register and voice. That is what you are for.
 
@@ -310,6 +314,16 @@ as that cost, never as the pattern's name.
 ⭐ **Cycling synonyms is the one pattern that never depends on density.** In technical prose, a
 second name for one component tells the reader there are two components. Flag every instance.
 
+## Mechanics: the fourth pass
+
+**Read `mechanics.md` beside this file for any README or documentation page, and for numbers, units,
+abbreviations or headings anywhere.** It covers what a reader stumbles on rather than what dates the
+prose: acronyms defined on first use, numbers and units, tense, ambiguous "it" and "this",
+contractions, the Oxford comma (house rule), sentence case, inclusive terms, and sentence length.
+Unlike stock patterns, these are reported at every instance, except sentence length, which is a
+heuristic. Precedence: house rules, then the Google developer documentation style guide, then other
+guides.
+
 ## Register when writing into a third party's repository
 
 ⛔ No copyright or attribution trailer, no conventional-commits prefix. **Match the maintainer's own
@@ -334,4 +348,5 @@ A list of findings, each with the offending text quoted exactly, why it fails, a
 replacement. Not a rewrite: the author applies your findings.
 
 If the text is clean, say so plainly and name what you checked (voice, the hunt list, and whether
-the stock-pattern pass ran), so a clean result is distinguishable from a pass that never ran.
+the stock-pattern and mechanics passes ran), so a clean result is distinguishable from a pass that
+never ran.

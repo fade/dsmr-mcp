@@ -43,6 +43,36 @@ UNIVERSAL='co-authored-by:[[:space:]]*(claude|codex|chatgpt|gpt-|copilot|gemini|
 # generic "option-N".
 STRICT='(^|[^[:alnum:]])(phase|wave|plan|task|milestone)-[0-9]|(^|[^[:alnum:]])(RSLV|SERV|FACT|ZXFR|COH)-[0-9]|joint kickoff|co-owned|frozen seam|held for operator (merge|tag)'
 
+# The style tier: long dashes and stock phrases.
+#
+# I added this tier because machine-written cliches go stale fast. A phrase that
+# reads as fresh in one season reads as gauche the next, and a reader who spots
+# one starts discounting everything around it. "load-bearing" was the first word
+# banned and the worst offender; these lists carry the rest of the catalogue that
+# a pattern can express. The full catalogue, with when each pattern is
+# legitimate, is skills/copy-editor/stock-patterns.md in dsmr-mcp.
+#
+# Non-ASCII characters are built from escapes so this file never carries the
+# characters it rejects.
+EM_DASH=$(printf '\xe2\x80\x94'); EN_DASH=$(printf '\xe2\x80\x93')
+CURLY=$(printf '\xe2\x80\x9c|\xe2\x80\x9d|\xe2\x80\x98|\xe2\x80\x99')
+ARROWS=$(printf '\xe2\x86\x92|\xe2\x87\x92|\xe2\x86\x90')
+STYLE_DASH="$EM_DASH|$EN_DASH"
+
+# Blocked in prose files and commit messages: no legitimate use in this
+# project's technical writing.
+STYLE_BLOCK="load[- ]bearing|\\<delv(e|es|ed|ing)\\>|\\<tapestry\\>|(it'?s|it is) worth noting|worth noting that|it bears mentioning|\\<in conclusion\\>|\\<to sum up\\>|here'?s the (thing|kicker|catch)|let'?s (dive|delve|unpack|break (this|it) down)|game[- ]changer|\\<seamless(ly)?\\>|ever[- ]evolving"
+
+# Warned everywhere: words that are sometimes the right technical term, so one
+# instance is prose and several are the defect. A commit message with that
+# many lines carrying them (dsmr.workproductlint.styledensity, default 3) is
+# blocked.
+STYLE_WARN="\\<robust(ly|ness)?\\>|\\<leverag(e|es|ed|ing)\\>|\\<landscape\\>|\\<paradigm|\\<synerg|\\<quietly\\>|\\<fundamentally\\>|\\<remarkably\\>|\\<arguably\\>|\\<(serves|stands) as\\>|\\<(importantly|interestingly|notably),|\\<in summary\\>|think of it (as|like)|imagine a world|\\<streamlin|\\<utiliz|\\<harness(es|ed|ing)\\>|\\<humans?\\>|$CURLY|$ARROWS"
+
+# Warned: code given a mind. A verb of perception or judgment after a code
+# subject is the author's decision or the mechanism's effect misassigned.
+STYLE_MIND="\\<(server|gate|hook|check|worker|watcher|broker|daemon|service|image|core|function|parser|code|program|script|lint|tool|launcher|listener|probe)s? (never |always |now |still |also )?(knows|sees|wants|decides|believes|agrees|trusts|notices|remembers|insists|claims|admits|promises|cares|thinks)\\>"
+
 # Which attribution mark belongs in this repository's commit trailers.
 #
 # Derived from the licence on disk so it cannot drift from the thing it
@@ -109,6 +139,106 @@ strict_on() {
   return 0
 }
 
+style_on() {
+  local v
+  v=$(git config --bool --get dsmr.workproductlint.style 2>/dev/null)
+  [ "$v" = "false" ] && return 1
+  return 0
+}
+
+style_density() {
+  local v
+  v=$(git config --int --get dsmr.workproductlint.styledensity 2>/dev/null)
+  printf '%s' "${v:-3}"
+}
+
+# Which style treatment a staged path gets: "prose" takes the block tier, "source"
+# only warns (a string literal or a test fixture can legitimately hold any of
+# these), "exempt" is skipped. Licence texts are not ours to restyle, and skill
+# files are agent-facing instructions written for the agent that reads them
+# (skills/ is where this site keeps them, in any repository). The hook's own
+# directory is skipped because its patterns spell every phrase it rejects.
+style_class() {
+  local f="$1" g
+  while IFS= read -r g; do
+    [ -n "$g" ] || continue
+    # shellcheck disable=SC2254  # the configured value is a glob on purpose
+    case "$f" in $g) printf 'exempt'; return 0 ;; esac
+  done < <(git config --get-all dsmr.workproductlint.styleexempt 2>/dev/null)
+  case "$f" in
+    LICENSE*|LICENCE*|COPYING*|*/LICENSE*|*/LICENCE*|*/COPYING*) printf 'exempt' ;;
+    skills/*|scripts/githooks/*) printf 'exempt' ;;
+    *.md|*.markdown|*.org|*.txt|*.rst|*.adoc|README*|*/README*|NEWS*|CHANGELOG*) printf 'prose' ;;
+    *) printf 'source' ;;
+  esac
+}
+
+# Prints "LINE: text" for each added line of one staged path, numbered as in
+# the new file so a reader can jump straight to it.
+added_lines_numbered() {
+  git diff --cached --no-color -U0 -- "$1" 2>/dev/null | awk '
+    /^@@/ { split($3, a, ","); n = substr(a[1], 2) + 0; next }
+    /^\+\+\+/ { next }
+    /^\+/ { print n ": " substr($0, 2); n++ }'
+}
+
+# Sets STYLE_BLOCKED=1 when anything blocks; prints every finding.
+STYLE_BLOCKED=0
+style_report() {
+  local label="$1" pattern="$2" text="$3" where="$4" hits
+  hits=$(printf '%s\n' "$text" | LC_ALL=C grep -Ei -- "$pattern" 2>/dev/null) || true
+  [ -n "$hits" ] || return 1
+  echo "$label"
+  printf '%s\n' "$hits" | sed "s|^|    ${where}|"
+  return 0
+}
+
+run_style_staged() {
+  local f cls text
+  while IFS= read -r -d '' f; do
+    cls=$(style_class "$f")
+    [ "$cls" = "exempt" ] && continue
+    text=$(added_lines_numbered "$f")
+    [ -n "$text" ] || continue
+    if [ "$cls" = "prose" ]; then
+      style_report "✗ style: long dash in prose (use a hyphen, comma, colon, or full stop):" \
+        "$STYLE_DASH" "$text" "$f:" && STYLE_BLOCKED=1
+      style_report "✗ style: stock phrase (say it plainly):" \
+        "$STYLE_BLOCK" "$text" "$f:" && STYLE_BLOCKED=1
+    else
+      style_report "⚠ style: long dash or stock phrase in source (not blocking; check comments and docstrings):" \
+        "$STYLE_DASH|$STYLE_BLOCK" "$text" "$f:"
+    fi
+    style_report "⚠ style: word that is often filler or a cliche (not blocking alone):" \
+      "$STYLE_WARN" "$text" "$f:"
+    style_report "⚠ style: code described as having a mind (give the decision to the author):" \
+      "$STYLE_MIND" "$text" "$f:"
+  done < <(git diff --cached --name-only --diff-filter=ACMR -z 2>/dev/null)
+  return 0
+}
+
+run_style_msg() {
+  local text="$1" warns n
+  text=$(printf '%s\n' "$text" | grep -n '')
+  style_report "✗ style: long dash in the message (use a hyphen, comma, colon, or full stop):" \
+    "$STYLE_DASH" "$text" "line " && STYLE_BLOCKED=1
+  style_report "✗ style: stock phrase in the message (say it plainly):" \
+    "$STYLE_BLOCK" "$text" "line " && STYLE_BLOCKED=1
+  style_report "⚠ style: code described as having a mind (give the decision to the author):" \
+    "$STYLE_MIND" "$text" "line "
+  warns=$(printf '%s\n' "$text" | LC_ALL=C grep -Eic -- "$STYLE_WARN" 2>/dev/null) || true
+  n=$(style_density)
+  if [ "${warns:-0}" -ge "$n" ]; then
+    style_report "✗ style: $warns lines carry filler or cliche words (refused at $n per message):" \
+      "$STYLE_WARN" "$text" "line "
+    STYLE_BLOCKED=1
+  else
+    style_report "⚠ style: word that is often filler or a cliche (not blocking alone):" \
+      "$STYLE_WARN" "$text" "line "
+  fi
+  return 0
+}
+
 # Returns 0 = clean, 1 = blocked. Prints a report on block.
 run_workproduct_lint() {
   local mode="$1"; local text=""
@@ -130,12 +260,24 @@ run_workproduct_lint() {
              | grep -E '^\+' | grep -Ev '^\+\+\+' | sed 's/^+//')
       ;;
     msg)
-      text=$(cat "$2" 2>/dev/null | grep -v '^#')
+      # Stop at the scissors line: `git commit -v` appends the diff below it,
+      # and that diff is the staged content, already checked in staged mode.
+      text=$(awk '/^# -+ >8 -+$/ { exit } !/^#/ { print }' "$2" 2>/dev/null)
+      ;;
+    file)
+      # A file checked directly keeps every line: in a Markdown PR body a line
+      # opening with # is a heading, not a git comment.
+      text=$(cat "$2" 2>/dev/null)
       ;;
   esac
   [ -z "$text" ] && return 0
 
-  local blocked=0 vocab_blocked=0 uni str
+  local blocked=0 vocab_blocked=0 style_blocked=0 uni str
+  if style_on; then
+    STYLE_BLOCKED=0
+    if [ "$mode" = "staged" ]; then run_style_staged; else run_style_msg "$text"; fi
+    if [ "$STYLE_BLOCKED" = 1 ]; then blocked=1; style_blocked=1; fi
+  fi
   uni=$(printf '%s\n' "$text" | grep -nEi "$UNIVERSAL" 2>/dev/null) || true
   if [ -n "$uni" ]; then
     echo "✗ work-product lint: AI-attribution or .planning/ reference (never allowed):"
@@ -158,7 +300,7 @@ run_workproduct_lint() {
   # defect actually seen. A MISSING trailer only warns: a merge commit written
   # by the forge carries no body, and making those uncommittable would break
   # landing a pull request to enforce a footer nobody typed.
-  if [ "$mode" = "msg" ]; then
+  if [ "$mode" != "staged" ]; then
     local want; want=$(attribution_glyph)
     local wrong_mark wrong_name
     if [ "$want" = "copyright" ]; then
@@ -195,6 +337,16 @@ These belong in planning state / coordination channels, never in shipped files
 or commit messages. Rewrite to describe the behavior and the why.
 EOF
     fi
+    if [ "$style_blocked" = 1 ]; then
+      cat <<'EOF'
+
+Rewrite with the plain word, or restructure the sentence. A dash becomes a
+hyphen, comma, colon, parentheses, or a full stop.
+  Exempt a path here:          git config --add dsmr.workproductlint.styleexempt 'tests/fixtures/*'
+  Raise the refusal count:     git config --int dsmr.workproductlint.styledensity 5
+  Disable style tier here:     git config --bool dsmr.workproductlint.style false
+EOF
+    fi
     cat <<'EOF'
   Bypass (rare, deliberate):   git commit --no-verify
   Disable strict tier here:    git config --bool dsmr.workproductlint.strict false
@@ -223,3 +375,18 @@ run_lint() {
   fi
   return "$status"
 }
+
+# Run directly to check text that never passes through a commit, such as a pull
+# request body: dsmr-workproduct-lint.sh --check-file body.md
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-}" in
+    --check-file)
+      if [ -z "${2:-}" ] || [ ! -r "$2" ]; then
+        echo "usage: $0 --check-file FILE" >&2; exit 2
+      fi
+      run_workproduct_lint file "$2"; exit $? ;;
+    *)
+      echo "usage: $0 --check-file FILE   (check a PR body or any message file)" >&2
+      exit 2 ;;
+  esac
+fi

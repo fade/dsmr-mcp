@@ -21,7 +21,15 @@ says how to tell the two apart.
   can name what it costs the reader in that sentence. The exception is cycling synonyms (section 5),
   which you flag at every instance.
 - **The house bans stay absolute and are not repeated here.** Em and en dashes, "load-bearing",
-  "human" for a person, planning indices, AI attribution: the mechanical audit handles those.
+  "human" for a person, planning indices, AI attribution: the mechanical audit blocks dashes and
+  "load-bearing" in prose and messages and warns on them in source; "human" only warns.
+- **The commit hook enforces part of this catalogue.** In prose files and commit messages it
+  blocks the phrases with no legitimate use here ("delve", "tapestry", "it's worth noting", "in
+  conclusion", "to sum up", "here's the catch", "let's dive in", "seamless", "game-changer",
+  "ever-evolving"). It warns on words that are sometimes real terms ("robust", "leverage",
+  "landscape", "serves as", "quietly") and blocks a commit message carrying three or more lines of
+  them. Everything else here is review-only. ⚠ A passing hook is not a clean pass: density,
+  structure, and every discriminator above still need you.
 - **Name the cost, not the category.** "This sentence announces the answer instead of giving it"
   helps the author. Naming a pattern and calling it an AI tell does not: the author is a person,
   and the label says nothing about the sentence.
