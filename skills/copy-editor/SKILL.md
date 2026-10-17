@@ -157,6 +157,11 @@ exception and may be amended before it lands, because main's history is the dura
 Each register has an independent anchor in the standard references, which is worth knowing because
 it tells you what to do at the edges rather than only in the clear cases.
 
+⭐ **Where external standards disagree, follow the Google developer documentation style guide**
+(operator, 2026-10-17). It outranks academic engineering guides such as USU's on contractions (use
+common ones), headings, and inclusive terminology. The house rules in this file still outrank it,
+notably the author's first person for motive.
+
 - **Behaviour in active, second person** is the Google developer documentation style guide, stated
   outright: make the doer the subject, "use the second person to address what the reader does, but
   use the third person for what the software or an end user does". Its own example pair is
