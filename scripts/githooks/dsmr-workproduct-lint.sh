@@ -319,7 +319,11 @@ run_workproduct_lint() {
       echo "    Override if the derivation is wrong here:"
       echo "      git config dsmr.attribution.glyph copyleft|copyright"
       blocked=1
-    elif ! printf '%s\n' "$text" | grep -qi "o'reilly"; then
+    # A trailer is a line that opens with an attribution mark and the name. The
+    # name alone anywhere in the text is not one: an Author: header or a body
+    # that mentions it would otherwise hide a missing trailer.
+    elif ! printf '%s\n' "$text" \
+           | grep -qiE "^($(printf '\xf0\x9f\x84\xaf')|$(printf '\xc2\xa9'))[[:space:]]+Brian O'Reilly"; then
       echo "⚠ work-product lint: no attribution trailer found (not blocking)."
       echo "    Expected a line naming Brian O'Reilly with the $( [ "$want" = copyright ] && echo 'copyright sign' || echo 'copyleft mark' )."
     fi

@@ -84,6 +84,23 @@ else
   fail=$((fail + 1)); echo "FAIL  code-with-a-mind warning not printed"
 fi
 
+# The attribution trailer is a mark-and-name line, not the name anywhere.
+TRAILER=$(printf '\xf0\x9f\x84\xaf Brian O'"'"'Reilly <fade@deepsky.com>, 2026')
+printf 'docs: tidy\n\nAuthor: Brian O'"'"'Reilly wrote this.\n' > "$scratch/notrailer.txt"
+if (cd "$repo" && bash .git/hooks/dsmr-workproduct-lint.sh --check-file "$scratch/notrailer.txt") 2>&1 \
+     | grep -q 'no attribution trailer'; then
+  pass=$((pass + 1)); echo "ok    name in the body does not count as a trailer"
+else
+  fail=$((fail + 1)); echo "FAIL  name in the body hid a missing trailer"
+fi
+printf 'docs: tidy\n\nPlain body.\n\n%s\n' "$TRAILER" > "$scratch/trailer.txt"
+if (cd "$repo" && bash .git/hooks/dsmr-workproduct-lint.sh --check-file "$scratch/trailer.txt") 2>&1 \
+     | grep -q 'no attribution trailer'; then
+  fail=$((fail + 1)); echo "FAIL  a real trailer was reported missing"
+else
+  pass=$((pass + 1)); echo "ok    a real trailer is recognized"
+fi
+
 # The tier can be switched off per repository.
 git -C "$repo" config --bool dsmr.workproductlint.style false
 expect "style tier disabled"         accepted docs/off.md "A ${EM} dash."
