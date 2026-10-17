@@ -73,6 +73,9 @@ identifier is never renamed by you; raise it as a question.
 
 - **House: the Oxford comma, always** (operator, 2026-10-17: Canadian style). A list of three or more
   takes a comma before the final "and" or "or". Google agrees, but this stands on the house rule.
+  ⚠ In a docstring or code comment, a series of four or more items, or of three where any item contains a verb, is a
+  structural flag: split the sentence or set the items out one per line (SKILL.md, technical
+  register). A short series kept there still takes the comma.
 - Google: a comma before "which" opening a nonrestrictive clause. A restrictive clause takes "that"
   with no comma ("the core that the launcher built").
 
