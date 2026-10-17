@@ -45,6 +45,8 @@ this directory. New here? Read [[file:introduction.org]] first, then
 
 - [[file:testing.org][Testing]] — the canonical test entrypoints, the fast-versus-gated suite
   split, the pinned SBCL build, and the project-local cache guard.
+- [[file:writing-style.org][Writing style]]: voice, docstrings, commit messages, stale phrases, and
+  mechanics for every piece of prose in the repository, with the commit hooks that check them.
 
 * Installing as an MCP server
 
