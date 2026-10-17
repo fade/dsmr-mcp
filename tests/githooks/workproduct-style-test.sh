@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Out of band test for the style tier of the work-product commit lint.
 #
-# Real commits go through this tree's hooks in a scratch repository, because
-# the lint's job is to stop a commit, and only a commit attempt shows whether
-# it does. Every blocking rule is checked from both sides, a case that must be
-# refused and a case that must go through, so a lint that refuses everything
-# fails here as surely as one that refuses nothing. Warn-only rules are checked
-# for the warning they print.
+# Drives real commits through this tree's hooks in a scratch repository: only a
+# commit attempt shows whether the lint stops it. Each blocking rule has a case
+# that must be refused and one that must be accepted, so a lint that refuses
+# everything fails here, as does one that refuses nothing. Warn-only rules are
+# checked for the warning they print.
 #
 # Usage: bash tests/githooks/workproduct-style-test.sh
 set -u
