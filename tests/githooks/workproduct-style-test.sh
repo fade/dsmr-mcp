@@ -66,6 +66,7 @@ fi
 # Exemptions.
 expect "skill file exempt"           accepted skills/x/SKILL.md "Delve ${EM} load-bearing."
 expect "licence file exempt"         accepted LICENSE "Copyright ${EM} all rights."
+expect "style guide exempt"          accepted docs/writing-style.org "Never write load-bearing or delve."
 git -C "$repo" config --add dsmr.workproductlint.styleexempt 'fixtures/*'
 expect "configured exemption"        accepted fixtures/f.md "A ${EM} fixture."
 git -C "$repo" config --unset-all dsmr.workproductlint.styleexempt

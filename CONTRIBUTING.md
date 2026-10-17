@@ -19,14 +19,22 @@ or infix. Name the symbol for what it does:
 - `verify-id-survival` — not `verify-req-09`
 - `attach-object-registry` — not `phase-5-registry`
 
-**Comments and docstrings.** Write the *what* and *why* in plain prose. Never
-point at a planning artifact ("see PROJECT.md decision row", "wired by Plan
-01-01", "per research Q1") — the file isn't published, so the pointer goes
-nowhere. If the rationale matters, write the rationale.
+**Comments and docstrings.** Keep them terse: what the code does or returns,
+its contract, and a reason only when it isn't obvious. Never point at a
+planning artifact ("see PROJECT.md decision row", "wired by Plan 01-01", "per
+research Q1"). The file isn't published, so the pointer goes nowhere; if the
+rationale matters, write the rationale.
 
 **Allowed:** naming a real external product the code interoperates with — e.g.
 a comment noting an error code "matches what Claude Code / Codex MCP clients
 expect" — is domain context, not scaffolding. Keep it.
+
+## Writing style
+
+Commit messages, pull request descriptions, documentation, docstrings, and
+comments all follow [docs/writing-style.org](docs/writing-style.org): the voice
+to write in, the stale phrases to avoid, Canadian spelling, and the commit hooks
+(`make install-hooks`) that check your text before it lands.
 
 ## Code conventions
 

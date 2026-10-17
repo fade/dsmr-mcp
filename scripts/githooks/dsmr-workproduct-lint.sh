@@ -155,7 +155,8 @@ style_density() {
 # these), "exempt" is skipped. Licence texts are not ours to restyle, and skill
 # files are agent-facing instructions written for the agent that reads them
 # (skills/ is where this site keeps them, in any repository). The hook's own
-# directory is skipped because its patterns spell every phrase it rejects.
+# directory and the public writing-style guide are skipped because they spell
+# every phrase the hook rejects.
 style_class() {
   local f="$1" g
   while IFS= read -r g; do
@@ -165,7 +166,7 @@ style_class() {
   done < <(git config --get-all dsmr.workproductlint.styleexempt 2>/dev/null)
   case "$f" in
     LICENSE*|LICENCE*|COPYING*|*/LICENSE*|*/LICENCE*|*/COPYING*) printf 'exempt' ;;
-    skills/*|scripts/githooks/*) printf 'exempt' ;;
+    skills/*|scripts/githooks/*|docs/writing-style.org) printf 'exempt' ;;
     *.md|*.markdown|*.org|*.txt|*.rst|*.adoc|README*|*/README*|NEWS*|CHANGELOG*) printf 'prose' ;;
     *) printf 'source' ;;
   esac

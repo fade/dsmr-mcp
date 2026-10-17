@@ -1,0 +1,189 @@
+#+TITLE: dsmr-mcp: Writing style
+#+OPTIONS: toc:2 num:nil
+
+This page sets out how I want prose in this repository to read: commit messages, pull request
+descriptions, issue and review comments, documentation, docstrings, and code comments. Follow it
+when you contribute, so review can concentrate on what your change does.
+
+Where this page is silent, follow the [[https://developers.google.com/style][Google developer documentation style guide]]. Where the
+two disagree, this page wins.
+
+See also: [[file:index.org][Manual]], [[file:../CONTRIBUTING.md][Contributing]], [[file:testing.org][Testing]].
+
+* Voice
+
+Whoever makes a change writes about it in their own first person: I explain my decisions as "I",
+and I ask the same of you. The job a sentence does decides its grammatical person:
+
+| The sentence                     | Person                          | Example                                                                                         |
+|----------------------------------+---------------------------------+-------------------------------------------------------------------------------------------------|
+| explains a decision or a reason  | first person, the change's author | "I made enumeration signal because a caller could not tell an empty store from an unreadable one." |
+| tells you what you do or get     | second person                   | "Pass it a store it cannot read and you get a condition, not an empty list."                     |
+| describes what the software does | third person, present tense     | "The server sends an acknowledgment."                                                            |
+| explains how the code works      | none: the code already shows it | "Wraps the call in a handler, logs the error, and returns NIL." (leave this out)            |
+
+- Write what a change does and why, not how it is implemented. The diff already shows how, and a
+  prose account of it stays plausible long after a refactor has made it wrong.
+- Do not open two sentences in a row with "I". Once the body says who acted, let the reason, the
+  reader's result, or the behaviour lead.
+- A commit or pull request body with no author in it is a defect, not a neutral style: the reader
+  cannot tell who decided what. Write the decision in your own first person.
+- The passive is right in three cases from the Google guide: to de-emphasize an actor, for example
+  one whose naming would accuse the reader ("Over 50 conflicts were found in the file"); to
+  emphasize the object ("The file is saved."); and when the reader does not need the actor ("The
+  database was purged in January.").
+
+** Code has no mind
+
+Code does nothing outside execution, and nothing it does while running needs a mind. To check a
+sentence whose subject is code, recast it as "when X runs, ...". If what remains is an effect you
+could observe (reads, writes, returns, sends, rejects, refuses, retries), the sentence stands. If
+it needs a mind (knows, sees, decides, wants, trusts, agrees, tries), give the decision to the
+author, the perception to the mechanism, and a precondition to the caller ("takes a list", "call it
+with the lock held").
+
+A =because= or =so that= clause giving a design reason after a code subject hands your motive to
+the code; give it back to the author. A =because= that stays true with nobody intending it is ordinary
+causation and stands: "the read returns NIL because the stream is at end of file".
+
+| Instead of                                                      | Write                                                                 |
+|-----------------------------------------------------------------+-----------------------------------------------------------------------|
+| "The server sees DSMR_WORKER_CORE only when..."                 | "The server reads DSMR_WORKER_CORE only when..."                      |
+| "It never trusts a value it inherits."                          | "It always replaces a value it inherits."                             |
+| "The gate refuses the image, because a frozen value would win." | "I made the gate refuse the image, because a frozen value would win." |
+| "This commit fixes the race."                                   | "I fixed the race."                                                   |
+
+A real technical term stands: a TLS client trusts a certificate authority, and a kernel refuses a
+fork. A file or a commit may contain, define, declare, list, match, require, or permit. It never
+decides, guards, or fixes anything.
+
+* Docstrings and code comments
+
+A docstring is read at the call site by someone who wants the contract, so keep it terse and
+technical.
+
+- Lead with what the function does or returns, in the present tense or the imperative. Match the
+  rest of the file.
+- Then give the contract: arguments, return value, conditions signalled, and side effects.
+- Give a reason only when it is not obvious, in one sentence stated as the constraint.
+- Leave out the first person and the history of how the code got this way. The history belongs in
+  the commit message.
+- Split a series of four or more items, or of three where any item contains a verb, into separate
+  sentences or one item per line.
+
+#+begin_example
+Instead of:  "I made this probe skip busy workers because we found that probing
+              them would block the monitor."
+Write:       "Skip busy workers: worker-rpc takes the stream lock outside its
+              timeout."
+#+end_example
+
+* Commit messages and pull requests
+
+- Write the subject in the imperative mood, in about 50 characters and 72 at most, with no full
+  stop. A conventional-commits prefix is welcome, and its scope names a module: =fix(bus): ...=.
+  Git's own =Documentation/SubmittingPatches= asks for the imperative, as in "make xyzzy do frotz".
+- Use the body for the why. The same file puts it plainly: "the goal of your log message is to
+  convey the /why/ behind your change to help future developers." Skip the body when the subject
+  says everything.
+- In a pull request description, say what changes for the operator, why, and what a reviewer
+  should look at. Leave out the story of how the work went.
+
+* Stale phrases
+
+Some phrases are worn smooth by overuse, and a reader who meets one starts discounting the text
+around it. Use the plain word.
+
+| Instead of                            | Write                                                              |
+|---------------------------------------+--------------------------------------------------------------------|
+| load-bearing                          | what breaks without it: "required", "removing it breaks the build" |
+| delve into                            | look into, read, examine                                           |
+| tapestry                              | the actual parts, named                                            |
+| it's worth noting that                | nothing: state the point                                           |
+| in conclusion, to sum up              | nothing: end on the point                                          |
+| here's the catch, here's the thing    | nothing: state the point                                           |
+| let's dive in, let's unpack this      | nothing                                                            |
+| seamless, game-changer, ever-evolving | what the software actually does                                    |
+
+Some words are softer: each is occasionally the right word (a robust estimator, landscape
+orientation), so one alone draws only a warning, but several in one paragraph are a sign the
+paragraph is padding: robust, leverage, landscape, paradigm, quietly, fundamentally, arguably, streamline,
+utilize, harness, and "serves as" or "stands as" where "is" will do.
+
+Some patterns no word list can catch:
+
+- Announcing instead of saying. "Two constraints shape the design." Start with the first
+  constraint.
+- A contrast nobody asked for. "It isn't technical, it's organizational." A contrast earns its
+  place only when the reader would otherwise believe the first half: "you get a condition, not an
+  empty list" tells a caller something they would assume.
+- Fragments for drama and questions you answer yourself. "Flaky tests. A slow build." "The result?
+  Total failure." Write the sentence.
+- One thing under several names. In technical writing a second name reads as a second component,
+  so pick one term per thing and repeat it.
+- Authority with no source. "Experts say", "famously", "as everyone knows". Name the source, or
+  make the claim on your own evidence.
+
+** Typography and headings
+
+- No em or en dashes. Use a hyphen, comma, colon, parentheses, or a full stop. A range takes a
+  hyphen with no spaces: 3-7.
+- Straight quotes, and =->= rather than an arrow character.
+- Headings in sentence case, naming the content or, for a procedure, the task: "Install the
+  server", not "What you need to know".
+
+* Mechanics
+
+- Spelling :: Canadian: colour, behaviour, centre, defence, licence as the noun and license as the
+  verb, practice and practise likewise, travelled, cheque, grey. Use -ize (organize, recognize).
+  Analyse and analyze are both Canadian; pick one per document. A code identifier, filename, or
+  quoted output keeps its own spelling.
+- Commas :: The Oxford comma, before the final "and" or "or" in a series of three or more.
+- Numbers :: Spell out zero through nine and use numerals from 10. Always use numerals for
+  technical quantities and versions. Write 1,000 with a comma. Do not open a sentence with a
+  numeral.
+- Units :: Put a space between number and unit: 64 GB. Use binary units (KiB, MiB, GiB) where the
+  software counts in powers of 1024, and decimal units (kB, MB, GB) where it counts in powers of
+  1000.
+- Abbreviations :: Spell a term out on first use, with the abbreviation in parentheses, unless
+  most readers already know it (API, URL).
+- Tense :: Present tense for what the software does. Future tense only for something that happens
+  later, never for how an unreleased feature will work.
+- Pronouns :: Follow "this" with a noun ("this value"), and restate the noun when "it" could mean
+  more than one thing.
+- Contractions :: Common ones are fine: you're, don't, isn't.
+- Inclusive terms :: Allowlist for whitelist, replica for slave, placeholder for dummy, final check
+  for sanity check. Drop "simple", "easy", and "quick"; state the step instead. Name the role
+  rather than "human": developer, operator, reader. A test only a person can run is a manual test.
+
+* Checking your text
+
+Run =make install-hooks= to install the commit hooks. They refuse a commit that adds a long dash or
+one of the phrases in the stale-phrase table to a documentation file (for example =.md=, =.org=,
+=.txt=, or =README=), or that carries one in its message. They warn on the softer words, on
+"human", and on code described as having a mind, and they refuse a message with three or more
+lines of the softer words. I made source files draw only a warning, because a string literal or a
+test fixture can legitimately contain any of these.
+
+The same hooks refuse a commit that credits a code-generation tool as an author, or that carries
+the planning indices or file pointers described in [[file:../CONTRIBUTING.md][Contributing]]. They also warn when a commit message has
+no attribution line. My commits end with one naming me. You will see the warning on yours and can
+ignore it, but leave out a © copyright line: the hook refuses a message carrying the © sign,
+because this project is AGPL.
+
+Check a pull request description before you post it:
+
+#+begin_src sh
+scripts/githooks/dsmr-workproduct-lint.sh --check-file body.md
+#+end_src
+
+You can tune the hooks for your clone through git config:
+
+#+begin_src sh
+git config --add dsmr.workproductlint.styleexempt 'tests/fixtures/*'   # skip a path
+git config --int dsmr.workproductlint.styledensity 5                   # refuse at 5 lines
+git config --bool dsmr.workproductlint.style false                     # turn off the dash and phrase checks
+#+end_src
+
+=make test-hooks= drives real commits through the hooks: each blocking rule must refuse one commit
+and accept another.
