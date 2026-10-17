@@ -1,6 +1,6 @@
 ---
 name: copy-editor
-description: Read a PR body, commit message, diff comments, or any artifact about to be placed in front of the operator, as a person who knows the codebase and did not attend the session that produced it. Asks first whether the text reads as its author writing about his own work, since an impersonal body is a defect and not a clean result, then catches register and voice failures no pattern match can express: personification, an agent's first person, relay attribution, bus vocabulary, prose narrating how instead of what and why, and summaries answering the adjacent question. A third pass checks technical documentation against a catalogue of stock patterns (announced answers, manufactured emphasis, inflated vocabulary, unsourced claims, cycling synonyms for one referent), and a fourth checks mechanics (acronyms, numbers and units, tense, pronoun reference, the Oxford comma, inclusive terms). Use before any PR is filed, before any review buffer or handoff file is displayed, and whenever the operator asks for a copy-edit pass.
+description: Read a PR body, commit message, diff comments, or any artifact about to be placed in front of the operator, as a person who knows the codebase and did not attend the session that produced it. Asks first whether the text reads as its author writing about his own work, since an impersonal body is a defect and not a clean result, then catches register and voice failures no pattern match can express: personification, an agent's first person, relay attribution, bus vocabulary, prose narrating how instead of what and why, and summaries answering the adjacent question. A third pass checks technical documentation against a catalogue of stock patterns (announced answers, manufactured emphasis, inflated vocabulary, unsourced claims, cycling synonyms for one referent), and a fourth checks mechanics (acronyms, numbers and units, tense, pronoun reference, the Oxford comma, Canadian spelling, inclusive terms). Use before any PR is filed, before any review buffer or handoff file is displayed, and whenever the operator asks for a copy-edit pass.
 ---
 
 # copy-editor
@@ -316,10 +316,11 @@ second name for one component tells the reader there are two components. Flag ev
 
 ## Mechanics: the fourth pass
 
-**Read `mechanics.md` beside this file for any README or documentation page, and for numbers, units,
-abbreviations or headings anywhere.** It covers what a reader stumbles on rather than what dates the
-prose: acronyms defined on first use, numbers and units, tense, ambiguous "it" and "this",
-contractions, the Oxford comma (house rule), sentence case, inclusive terms, and sentence length.
+**Read `mechanics.md` beside this file for every review of outward prose: commit and PR bodies as
+well as README and documentation pages.** It covers what a reader stumbles on rather than what
+dates the prose: acronyms defined on first use, numbers and units, tense, ambiguous "it" and "this",
+contractions, the Oxford comma and Canadian spelling (house rules), sentence case, inclusive terms,
+and sentence length.
 Unlike stock patterns, these are reported at every instance, except sentence length, which is a
 heuristic. Precedence: house rules, then the Google developer documentation style guide, then other
 guides.
