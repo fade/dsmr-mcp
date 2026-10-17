@@ -45,12 +45,10 @@ STRICT='(^|[^[:alnum:]])(phase|wave|plan|task|milestone)-[0-9]|(^|[^[:alnum:]])(
 
 # The style tier: long dashes and stock phrases.
 #
-# I added this tier because machine-written cliches go stale fast. A phrase that
-# reads as fresh in one season reads as gauche the next, and a reader who spots
-# one starts discounting everything around it. "load-bearing" was the first word
-# banned and the worst offender; these lists carry the rest of the catalogue that
-# a pattern can express. The full catalogue, with when each pattern is
-# legitimate, is skills/copy-editor/stock-patterns.md in dsmr-mcp.
+# Stock phrases date prose and cost the reader's trust. These lists hold the
+# part of the catalogue a pattern can express; the full catalogue, with when
+# each pattern is legitimate, is skills/copy-editor/stock-patterns.md in
+# dsmr-mcp.
 #
 # Non-ASCII characters are built from escapes so this file never carries the
 # characters it rejects.

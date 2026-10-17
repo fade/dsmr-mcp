@@ -282,9 +282,8 @@ install-hooks:
 
 ## test-hooks: drive real commits through the hooks in a scratch repository.
 ##
-##   Each blocking style rule is checked from both sides, a commit it must refuse
-##   and one it must let through, so a lint that refuses everything fails as
-##   surely as one that refuses nothing.
+##   Each blocking rule has a commit it must refuse and one it must accept, so a
+##   lint that refuses everything fails, as does one that refuses nothing.
 test-hooks:
 	@bash tests/githooks/workproduct-style-test.sh
 

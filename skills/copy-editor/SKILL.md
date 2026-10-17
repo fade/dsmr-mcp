@@ -118,10 +118,20 @@ which is what the reader actually needs: *"I made order-fetch tolerant of broker
 dashboard stays usable during an outage."* Same for the second-person register: describe what the
 reader gets, never the mechanism that produces it.
 
-⚠ The exception is unchanged and narrow: where the how is genuinely non-obvious (a hidden
-constraint, a workaround, a subtle invariant) an inline code comment is the right home, and only
-when the why is non-obvious too. That is a comment, not prose, and it still explains why the
-implementation took that path rather than restating the path.
+⛔ **Docstrings and code comments take a different register: terse, direct, technical**
+(operator, 2026-10-17). The register table above is for prose a person reads as prose; a docstring
+is read by a programmer at the call site.
+- No first person, no motive narrative, no history ("used to", "changed because").
+- Lead with what it does or returns, in the present tense or the imperative (match the file's
+  existing mood), then the contract: arguments, return value, conditions signalled, side effects.
+- A why only when it is non-obvious (a hidden constraint, a workaround, an invariant), in one
+  sentence stated as the constraint, never restating the implementation.
+- Code with a mind, stock patterns, Canadian spelling, and the Oxford comma still apply.
+- Bad: "I made this probe skip busy workers because we found that probing them would block the
+  monitor." Good: "Skip busy workers: worker-rpc takes the stream lock outside its timeout."
+- ⚠ An impersonal docstring is correct, not a finding: the impersonal-body finding is for the
+  prose listed under Scope below. Flag a docstring that has an "I", tells a story, or runs past its
+  contract plus one sentence of why.
 
 ⛔ **AN IMPERSONAL BODY IS A FINDING. Report it as one, by that name.** This is the failure you will
 otherwise walk straight past, and the reason is structural: **there was never an "I" to remove, so
@@ -145,8 +155,8 @@ found. "I made the enumeration signal" is correct;
 "I measured this on a scratch tree" from an agent is not, and neither is "valis measured it".
 
 ⚠ **Scope, and it is narrower than "prose".** In: commit bodies, PR bodies, issue and review
-comments, README and shipped docs, docstrings and code comments (in scope to FLAG, never to edit;
-see the authority limit above), release notes. Out: subject lines
+comments, README and shipped docs, release notes. Docstrings and code comments are in scope to
+FLAG, never to edit (see the authority limit above), against the technical register, not this one. Out: subject lines
 and PR titles, which are active and descriptive and too short to carry a voice (operator,
 2026-08-22). Also out, and never euphemise these: `.planning/`, `BLOCKED.md`, `PARK.md`, `STATE.md`,
 memory files, bus messages, briefs, and skill files and other agent-facing instructions, which are
