@@ -43,7 +43,7 @@
 #define ADVICE_TAIL "This hook arms the next listener itself when your turn ends; do not start one."
 #define DEFAULT_WAKE_SECONDS 6600ULL
 #define HOOK_INPUT_MS 2000
-#define HOOK_INPUT_MAX (16u * 1024u * 1024u)
+#define HOOK_INPUT_MAX ((size_t)16 * 1024 * 1024)
 #define MAX_BUS_NAME 32
 #define DEFAULT_OUTAGE_GRACE 300ULL
 #define OUTAGE_STAMP_SECONDS 3600
@@ -518,7 +518,7 @@ static void buf_field(struct buf *b, const char *key, const char *value) {
         if (unreserved_octet_p(*p)) {
             buf_add(b, (const char *)p, 1);
         } else {
-            char escape[3] = {'%', hex[*p >> 4], hex[*p & 15]};
+            char escape[3] = {'%', hex[((unsigned)*p >> 4u) & 15u], hex[(unsigned)*p & 15u]};
             buf_add(b, escape, 3);
         }
     }
@@ -543,19 +543,26 @@ static void build_request(struct buf *b, const struct options *o, const char *cw
     buf_str(b, "\n");
 }
 
-/* Decode the percent escapes of FIELD in place; a malformed escape is kept
-   as it stands. */
+/* The value of the hex digit C, or -1 when C is not one. */
+static int hex_value(char c) {
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+/* Decode the percent escapes of FIELD in place. A malformed escape, and an
+   escape for the NUL byte, are kept as they stand, so the result is still
+   one C string. */
 static void percent_decode(char *field) {
     char *out = field;
     for (char *in = field; *in;) {
-        int hi, lo;
-        if (in[0] == '%' && in[1] && in[2] &&
-            (hi = (in[1] >= '0' && in[1] <= '9') ? in[1] - '0'
-                  : (in[1] >= 'A' && in[1] <= 'F') ? in[1] - 'A' + 10
-                  : (in[1] >= 'a' && in[1] <= 'f') ? in[1] - 'a' + 10 : -1) >= 0 &&
-            (lo = (in[2] >= '0' && in[2] <= '9') ? in[2] - '0'
-                  : (in[2] >= 'A' && in[2] <= 'F') ? in[2] - 'A' + 10
-                  : (in[2] >= 'a' && in[2] <= 'f') ? in[2] - 'a' + 10 : -1) >= 0) {
+        int hi = in[0] == '%' && in[1] ? hex_value(in[1]) : -1;
+        int lo = hi >= 0 && in[2] ? hex_value(in[2]) : -1;
+        if (lo >= 0 && (hi != 0 || lo != 0)) {
             *out++ = (char)(hi * 16 + lo);
             in += 3;
         } else {
@@ -694,9 +701,12 @@ static int connect_service(const struct client *c) {
     memset(&addr, 0, sizeof addr);
     addr.sun_family = AF_UNIX;
     memcpy(addr.sun_path, c->socket_path, n + 1);
-    int flags;
-    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0 ||
-        (flags = fcntl(fd, F_GETFL)) < 0 || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) != 0) {
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        close(fd);
+        return -1;
+    }
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) != 0) {
         close(fd);
         return -1;
     }
