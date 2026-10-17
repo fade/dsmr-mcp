@@ -431,3 +431,63 @@
       (is eq nil baseline)
       (is eq :no-cursor action))
     (false (probe-file cursor))))
+
+;;; -------------------------------------------------------------- wake clients
+
+(define-test wake-fields-round-trip-through-percent-encoding
+  "Every octet outside the unreserved set is escaped, a bare hyphen is always
+   escaped so it can mark an absent field, and decoding restores the text."
+  (let ((accented (coerce (list #\a (code-char #xE9)) 'string)))
+    (is string= "a%20b%3Dc%2Cd%25" (hostfiles:percent-encode-field "a b=c,d%"))
+    (is string= "%2D" (hostfiles:percent-encode-field "-"))
+    (is string= "/home/fade/x_y.z~" (hostfiles:percent-encode-field "/home/fade/x_y.z~"))
+    (is string= "a%C3%A9" (hostfiles:percent-encode-field accented))
+    (is string= "" (hostfiles:percent-encode-field ""))
+    (dolist (text (list "a b=c,d%" "-" "/home/fade/x_y.z~" accented ""))
+      (is string= text (hostfiles:percent-decode-field
+                        (hostfiles:percent-encode-field text))))))
+
+(define-test wake-field-decoding-is-strict-about-escapes
+  "The bare hyphen decodes to absent, invalid UTF-8 becomes the replacement
+   character, and a malformed escape or a raw byte outside the field alphabet
+   signals."
+  (is eq nil (hostfiles:percent-decode-field "-"))
+  (is string= (string (code-char #xFFFD)) (hostfiles:percent-decode-field "%FF"))
+  (is string= "a/b" (hostfiles:percent-decode-field "a%2fb"))
+  (fail (hostfiles:percent-decode-field "%G1"))
+  (fail (hostfiles:percent-decode-field "ab%4"))
+  (fail (hostfiles:percent-decode-field "ab%"))
+  (fail (hostfiles:percent-decode-field "a b")))
+
+(define-test delivered-position-survives-a-reread
+  "A delivered position reads back as written, privately, and only under the
+   log generation it was recorded against."
+  (with-state-home (home)
+    (hostfiles:write-delivered-position "s" 41 :generation 3 :service-pid 77 :now 1000)
+    (is eql 41 (hostfiles:read-delivered-position "s"))
+    (is eql 41 (hostfiles:read-delivered-position "s" :generation 3))
+    (is eq nil (hostfiles:read-delivered-position "s" :generation 4))
+    (is = #o600 (mode-bits (hostfiles:delivered-position-path "s")))
+    (is equal '(:seq 41 :generation 3 :service-pid 77 :written-at 1000)
+        (hostfiles:read-plist-file (hostfiles:delivered-position-path "s")))))
+
+(define-test a-damaged-delivered-position-reads-as-absent
+  "A missing file, a seq that is not a non-negative integer, and garbage all
+   read as no position, never as zero."
+  (with-state-home (home)
+    (is eq nil (hostfiles:read-delivered-position "s"))
+    (write-text (hostfiles:delivered-position-path "s") "(:seq -3)")
+    (is eq nil (hostfiles:read-delivered-position "s"))
+    (write-text (hostfiles:delivered-position-path "s") "(:seq \"x\")")
+    (is eq nil (hostfiles:read-delivered-position "s"))
+    (write-text (hostfiles:delivered-position-path "s") "#.(oops) ((")
+    (is eq nil (hostfiles:read-delivered-position "s"))))
+
+(define-test the-wake-socket-sits-in-the-host-directory
+  "Wake clients and the host service meet at one socket under the state home."
+  (with-env ("XDG_STATE_HOME" "/tmp/x")
+    (is string= "/tmp/x/dsmr-mcp/host/wake.sock"
+        (uiop:native-namestring (hostfiles:wake-socket-path)))
+    (true (pathnamep (hostfiles:wake-socket-path)))
+    (is string= "/tmp/x/dsmr-mcp/watch/s.delivered"
+        (uiop:native-namestring (hostfiles:delivered-position-path "s")))))

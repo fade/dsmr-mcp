@@ -82,7 +82,14 @@
    #:fleet-line-p
    #:append-fleet-line
    ;; stranded cursors
-   #:heal-stranded-baseline))
+   #:heal-stranded-baseline
+   ;; wake clients
+   #:wake-socket-path
+   #:delivered-position-path
+   #:read-delivered-position
+   #:write-delivered-position
+   #:percent-encode-field
+   #:percent-decode-field))
 
 (in-package #:dsmr-mcp/src/bus/hostfiles)
 
@@ -700,3 +707,97 @@
                   (error (e)
                     (values head :clamped
                             (append report (list :error (princ-to-string e)))))))))))))
+
+;;; -------------------------------------------------------------- wake clients
+
+(defun wake-socket-path ()
+  "The Unix socket wake clients connect to: wake.sock in the host directory."
+  (merge-pathnames "wake.sock" (host-dir)))
+
+(defun delivered-position-path (stem)
+  "The file recording the last wake position delivered under STEM:
+   STEM.delivered in the watch state directory."
+  (watch-state-file stem "delivered"))
+
+(defun read-delivered-position (stem &key generation)
+  "The delivered position recorded under STEM, as a non-negative integer, or
+   NIL.
+
+   NIL when the file is absent or unreadable, when :SEQ is not a non-negative
+   integer, or when GENERATION is given and differs from the recorded
+   :GENERATION: a position in a rotated log says nothing about the new one."
+  (multiple-value-bind (plist status) (read-plist-file (delivered-position-path stem))
+    (when (eq status :ok)
+      (let ((seq (getf plist :seq)))
+        (and (integerp seq)
+             (>= seq 0)
+             (or (null generation) (eql generation (getf plist :generation)))
+             seq)))))
+
+(defun write-delivered-position (stem seq &key generation service-pid now)
+  "Record SEQ as the delivered position under STEM and return the plist written:
+   (:SEQ SEQ :GENERATION GENERATION :SERVICE-PID SERVICE-PID :WRITTEN-AT NOW),
+   NOW defaulting to the current Unix time. Written owner-only through
+   WRITE-PLIST-FILE; signals on failure."
+  (write-plist-file (delivered-position-path stem)
+                    (list :seq seq
+                          :generation generation
+                          :service-pid service-pid
+                          :written-at (or now (%unix-time)))))
+
+(defun %unreserved-octet-p (octet)
+  "True when OCTET stands for itself in a request field: A-Z, a-z, 0-9, `.`,
+   `_`, `~` or `/`."
+  (or (<= 48 octet 57)
+      (<= 65 octet 90)
+      (<= 97 octet 122)
+      (member octet '(46 95 126 47))))
+
+(defun percent-encode-field (string)
+  "STRING as one wake request field: its UTF-8 octets, each outside
+   [A-Za-z0-9._~/] written as %XX in uppercase hex.
+
+   `-` is always encoded, so a field that is exactly `-` can only mean absent."
+  (with-output-to-string (out)
+    (loop for octet across (sb-ext:string-to-octets string :external-format :utf-8)
+          do (if (%unreserved-octet-p octet)
+                 (write-char (code-char octet) out)
+                 (format out "%~2,'0X" octet)))))
+
+(defun percent-decode-field (string)
+  "The text a wake request field STRING carries, or NIL for the bare absent
+   marker `-`.
+
+   Escapes decode to octets and the octets decode as UTF-8, an invalid sequence
+   becoming U+FFFD. Signals ERROR on a `%` not followed by two hex digits and on
+   any raw character outside printable ASCII or equal to a space, since an
+   encoder never emits one."
+  (if (string= string "-")
+      nil
+      (let ((octets (make-array (length string) :element-type '(unsigned-byte 8)
+                                                :fill-pointer 0))
+            (length (length string))
+            (index 0))
+        (loop while (< index length)
+              do (let ((ch (char string index)))
+                   (cond
+                     ((char= ch #\%)
+                      (let ((high (and (< (+ index 2) length)
+                                       (digit-char-p (char string (+ index 1)) 16)))
+                            (low (and (< (+ index 2) length)
+                                      (digit-char-p (char string (+ index 2)) 16))))
+                        (unless (and high low)
+                          (error "Malformed escape at position ~D of the field ~S."
+                                 index string))
+                        (vector-push (+ (* 16 high) low) octets)
+                        (incf index 3)))
+                     ((< 32 (char-code ch) 127)
+                      (vector-push (char-code ch) octets)
+                      (incf index))
+                     (t
+                      (error "The field ~S holds the raw character ~S at position ~D."
+                             string ch index)))))
+        (coerce (sb-ext:octets-to-string
+                 (coerce octets '(simple-array (unsigned-byte 8) (*)))
+                 :external-format '(:utf-8 :replacement #\Replacement_Character))
+                '(simple-array character (*))))))
