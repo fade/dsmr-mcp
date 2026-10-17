@@ -28,7 +28,8 @@
   (:use #:cl #:zebra)
   (:local-nicknames (#:listeners #:dsmr-bus-host/src/bus/host/listeners)
                     (#:hostfiles #:dsmr-mcp/src/bus/hostfiles)
-                    (#:selector #:dsmr-mcp/src/bus/selector)))
+                    (#:selector #:dsmr-mcp/src/bus/selector)
+                    (#:ppcre #:cl-ppcre)))
 
 (in-package #:dsmr-mcp/tests/bus/host-listeners-test)
 
@@ -176,6 +177,168 @@
 (defun mode-bits (path)
   "The permission bits of PATH."
   (logand #o777 (sb-posix:stat-mode (sb-posix:stat (uiop:native-namestring path)))))
+
+;;; -------------------------------------------------------------- reply texts
+
+(defparameter *advice*
+  "This hook arms the next listener itself when your turn ends; do not start one."
+  "The advice closing every hook-mode text, as the client prints it.")
+
+(defun text (&rest parts)
+  "PARTS concatenated, each :LF standing for one newline."
+  (apply #'concatenate 'string
+         (mapcar (lambda (part) (if (eq part :lf) (string #\Newline) part)) parts)))
+
+(defparameter *reply-grammar*
+  "^EXIT [012] [a-z-]{1,16} (-|([A-Za-z0-9._~/]|%[0-9A-F]{2})+) (-|([A-Za-z0-9._~/]|%[0-9A-F]{2})+)$"
+  "The final reply line the client accepts, without its newline.")
+
+(defun octets (string)
+  "The length of STRING in UTF-8 octets."
+  (length (sb-ext:string-to-octets string :external-format :utf-8)))
+
+(defun decoded (reply index)
+  "The text field INDEX of REPLY carries, decoded, or NIL for `-`. Index 3 is
+   the stdout text and 4 the stderr text."
+  (hostfiles:percent-decode-field (nth index (uiop:split-string reply :separator " "))))
+
+(defun fits-grammar-p (reply)
+  "True when REPLY matches the client's reply grammar, the line is under 32768
+   octets, and each decoded text is at most 4096 octets holding no control
+   character other than TAB and LF."
+  (flet ((printable-p (ch)
+           (let ((code (char-code ch)))
+             (or (= code 9) (= code 10) (<= 32 code 126) (>= code 128)))))
+    (and (stringp reply)
+         (ppcre:scan *reply-grammar* reply)
+         (< (octets reply) 32768)
+         (every (lambda (index)
+                  (let ((field (decoded reply index)))
+                    (or (null field)
+                        (and (<= (octets field) 4096) (every #'printable-p field)))))
+                '(3 4))
+         t)))
+
+(define-test event-replies-carry-the-finished-text
+  "An event reply carries the wake line for stdout with exit 0 by default, and
+   the line and the drain advice for stderr with exit 2 in hook mode."
+  (let ((line "bus:7 from=x,y to=a"))
+    (is string= (format nil "EXIT 0 event ~A -"
+                        (hostfiles:percent-encode-field (format nil "~A~%" line)))
+        (listeners:event-reply nil "b" line))
+    (is string= (text line :lf) (decoded (listeners:event-reply nil "b" line) 3))
+    (is eq nil (decoded (listeners:event-reply nil "b" line) 4)))
+  (let ((reply (listeners:event-reply t "b" "bus:7")))
+    (true (uiop:string-prefix-p "EXIT 2 event - " reply))
+    (is eq nil (decoded reply 3))
+    (is string= (text "bus:7" :lf "dsmr-bus-watch: mail has arrived for you on bus b. "
+                      "Drain the bus now with bus-receive and act on what it holds. "
+                      *advice* :lf)
+        (decoded reply 4))))
+
+(define-test nowatcher-replies-follow-the-mode-and-the-notice
+  "A background client always gets the warning and the nowatcher line with
+   exit 1; a hook client gets the line and the advice with exit 2 when the
+   hourly notice is due, and nothing with exit 0 when it is not."
+  (dolist (due '(t nil))
+    (let ((reply (listeners:nowatcher-reply nil "default" "ns/a b" due)))
+      (true (uiop:string-prefix-p "EXIT 1 nowatcher " reply))
+      (is string= (text "nowatcher bus=default" :lf) (decoded reply 3))
+      (is string= (text "dsmr-bus-watch: no detached watcher is running for ns/a b "
+                        "on bus default; start one with --detach, then wake again" :lf)
+          (decoded reply 4))))
+  (let ((reply (listeners:nowatcher-reply t "*" "ns/a" t)))
+    (is string= (format nil "EXIT 2 nowatcher - ~A"
+                        (hostfiles:percent-encode-field
+                         (text "nowatcher bus=*" :lf
+                               "dsmr-bus-watch: no detached watcher is running for ns/a "
+                               "on bus *, so no mail can wake you. Start one with "
+                               "dsmr-bus-watch --detach and your usual --bus and "
+                               "identity flags. " *advice* :lf)))
+        reply))
+  (is string= "EXIT 0 nowatcher - -" (listeners:nowatcher-reply t "b" "ns/a" nil))
+  (true (search "running for - on bus b;"
+                (decoded (listeners:nowatcher-reply nil "b" nil t) 4))))
+
+(define-test a-superseded-reply-prints-nothing
+  "A replaced hook client exits 0 and prints nothing."
+  (is string= "EXIT 0 superseded - -" (listeners:superseded-reply)))
+
+(define-test reply-text-replaces-control-characters
+  "NUL, CR, ESC and DEL in a line, a label or an id become `?`; TAB and
+   non-ASCII text are kept, the latter as its UTF-8 octets."
+  (let* ((controls (map 'string #'code-char '(0 13 27 127)))
+         (e-acute (string (code-char 233)))
+         (line (text "bus:1 " controls (string #\Tab) e-acute))
+         (reply (listeners:event-reply nil "b" line)))
+    (is string= (text "bus:1 ????" (string #\Tab) e-acute :lf) (decoded reply 3))
+    (true (search "%09%C3%A9%0A" reply))
+    (let ((hook (decoded (listeners:event-reply t (text "b" controls) line) 4)))
+      (true (search "on bus b????. " hook))
+      (false (find (code-char 27) hook)))
+    (true (search "running for ns/a???? on bus b????;"
+                  (decoded (listeners:nowatcher-reply nil (text "b" controls)
+                                                      (text "ns/a" controls) t)
+                           4)))))
+
+(define-test an-over-long-event-line-falls-back-to-its-seq
+  "An event line whose text would pass 4096 octets is replaced by its leading
+   seq token, in both modes."
+  (let ((line (text "bus:9 from=" (make-string 5000 :initial-element #\a))))
+    (is string= (text "bus:9" :lf) (decoded (listeners:event-reply nil "b" line) 3))
+    (let ((hook (decoded (listeners:event-reply t "b" line) 4)))
+      (true (uiop:string-prefix-p (text "bus:9" :lf "dsmr-bus-watch: ") hook))
+      (true (<= (octets hook) 4096)))))
+
+(define-test an-over-long-id-is-clipped
+  "An id or label longer than 256 characters is cut to its first 256, which
+   keeps every text within 4096 octets."
+  (let ((id (text (make-string 256 :initial-element #\a)
+                  (make-string 8744 :initial-element #\b))))
+    (dolist (hook-p '(nil t))
+      (let ((err (decoded (listeners:nowatcher-reply hook-p "b" id t) 4)))
+        (true (<= (octets err) 4096))
+        (true (search (text (subseq id 0 256) " on bus b") err))
+        (false (search (subseq id 0 257) err))))
+    (let ((err (decoded (listeners:nowatcher-reply t id id t) 4)))
+      (true (<= (octets err) 4096)))
+    (let ((err (decoded (listeners:event-reply t id "bus:1") 4)))
+      (true (<= (octets err) 4096))
+      (false (search (subseq id 0 257) err)))))
+
+(define-test exit-reply-refuses-what-the-client-would-reject
+  "EXIT-REPLY renders NIL and empty texts as `-`, and signals for a status
+   outside 0-2, a kind outside [a-z-]{1,16}, a text over 4096 octets, or a text
+   holding a control character other than TAB and LF."
+  (is string= "EXIT 0 event - -" (listeners:exit-reply 0 "event" "" nil))
+  (is string= "EXIT 1 x-y a%0A -" (listeners:exit-reply 1 "x-y" (text "a" :lf) nil))
+  (fail (listeners:exit-reply 3 "event" nil nil))
+  (fail (listeners:exit-reply 0 "Event" nil nil))
+  (fail (listeners:exit-reply 0 (make-string 17 :initial-element #\a) nil nil))
+  (fail (listeners:exit-reply 0 "" nil nil))
+  (fail (listeners:exit-reply 0 "event" (make-string 4097 :initial-element #\a) nil))
+  (fail (listeners:exit-reply 0 "event" nil (make-string 2049 :initial-element (code-char 233))))
+  (fail (listeners:exit-reply 0 "event" (string (code-char 27)) nil)))
+
+(define-test every-reply-fits-the-client-grammar
+  "Every reply the builders produce, for ordinary, hostile and over-long
+   input in both modes, is a line the client accepts."
+  (let* ((controls (map 'string #'code-char '(0 7 13 27 127 9)))
+         (long (make-string 9000 :initial-element (code-char 233)))
+         (lines (list "bus:7 from=x,y to=a" (text "bus:1 " controls)
+                      (text "bus:9 from=" long) long ""))
+         (names (list "b" "*" (text "b" controls) long nil))
+         (replies (list (listeners:superseded-reply))))
+    (dolist (hook-p '(nil t))
+      (dolist (label names)
+        (dolist (line lines)
+          (push (listeners:event-reply hook-p label line) replies))
+        (dolist (id names)
+          (dolist (due '(nil t))
+            (push (listeners:nowatcher-reply hook-p label id due) replies)))))
+    (dolist (reply replies)
+      (true (fits-grammar-p reply) "~S does not fit the grammar"
+            (subseq reply 0 (min 80 (length reply)))))))
 
 ;;; ------------------------------------------------------------- the requests
 

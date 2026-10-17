@@ -57,6 +57,12 @@
    ;; requests
    #:parse-request
    #:request-identity
+   ;; replies
+   #:+max-reply-text-octets+
+   #:exit-reply
+   #:event-reply
+   #:nowatcher-reply
+   #:superseded-reply
    ;; the hub
    #:hub
    #:hub-p
@@ -301,6 +307,143 @@
 (defun %label (conn stem)
   "The label CONN's events for STEM carry."
   (cdr (assoc stem (conn-targets conn) :test #'string=)))
+
+;;; --------------------------------------------------------------- reply texts
+
+(defconstant +max-reply-text-octets+ 4096
+  "The longest text a final reply carries for one stream, in UTF-8 octets.")
+
+(defconstant +max-name-characters+ 256
+  "The most characters of a label or an id a reply text carries.")
+
+(defparameter *hook-advice*
+  "This hook arms the next listener itself when your turn ends; do not start one."
+  "The sentence closing every hook-mode text. The hook re-arms itself at the
+   end of a turn, so the woken session must not start a listener.")
+
+(defun %reply-character-p (ch)
+  "True when CH may appear in a reply text: TAB, LF, or any code point from 32
+   up other than 127."
+  (let ((code (char-code ch)))
+    (or (= code 9) (= code 10) (and (>= code 32) (/= code 127)))))
+
+(defun %printable (text)
+  "TEXT, or `-` for NIL, with every character %REPLY-CHARACTER-P rejects
+   replaced by `?`."
+  (substitute-if-not #\? #'%reply-character-p (or text "-")))
+
+(defun %clip (text)
+  "TEXT through %PRINTABLE, cut to its first +MAX-NAME-CHARACTERS+ characters."
+  (let ((text (%printable text)))
+    (subseq text 0 (min (length text) +max-name-characters+))))
+
+(defun %utf-8-length (text)
+  "The length of TEXT in UTF-8 octets."
+  (length (sb-ext:string-to-octets text :external-format :utf-8)))
+
+(defun exit-reply (status kind out err)
+  "The final reply line ending a wake client, without its newline:
+     EXIT <status> <kind> <out> <err>
+
+   STATUS is the exit code the client ends with: 0, 1 or 2. KIND names the
+   outcome, 1 to 16 of [a-z-]. OUT and ERR are the texts the client writes
+   verbatim to stdout and stderr, each percent-encoded, or `-` when NIL or
+   empty. With each text at most +MAX-REPLY-TEXT-OCTETS+ octets, the line stays
+   under 32768 octets.
+
+   Signals ERROR when the client would reject the reply:
+     - STATUS or KIND outside those sets;
+     - a text over +MAX-REPLY-TEXT-OCTETS+ octets;
+     - a text holding a control character other than TAB and LF."
+  (unless (member status '(0 1 2))
+    (error "The exit status ~S is not 0, 1 or 2." status))
+  (unless (and (stringp kind) (<= 1 (length kind) 16)
+               (every (lambda (ch) (or (char<= #\a ch #\z) (char= ch #\-))) kind))
+    (error "The reply kind ~S is not 1 to 16 of [a-z-]." kind))
+  (flet ((field (text)
+           (let ((bad (and text (find-if-not #'%reply-character-p text))))
+             (cond ((or (null text) (zerop (length text))) "-")
+                   (bad
+                    (error "A reply text holds the control character ~D." (char-code bad)))
+                   ((> (%utf-8-length text) +max-reply-text-octets+)
+                    (error "A reply text is ~D octets; the limit is ~D."
+                           (%utf-8-length text) +max-reply-text-octets+))
+                   (t (hostfiles:percent-encode-field text))))))
+    (format nil "EXIT ~D ~A ~A ~A" status kind (field out) (field err))))
+
+(defun %event-text (hook-p label line)
+  "The text an event client prints: LINE and LF, followed in hook mode by the
+   advice to drain bus LABEL."
+  (if hook-p
+      (format nil "~A~%dsmr-bus-watch: mail has arrived for you on bus ~A. ~
+                   Drain the bus now with bus-receive and act on what it holds. ~A~%"
+              line label *hook-advice*)
+      (format nil "~A~%" line)))
+
+(defun %first-token (line)
+  "LINE up to its first space, the `bus:<seq>` token of a wake line, cut to
+   +MAX-NAME-CHARACTERS+ characters."
+  (let ((token (subseq line 0 (position #\Space line))))
+    (subseq token 0 (min (length token) +max-name-characters+))))
+
+(defun event-reply (hook-p label line)
+  "The final reply handing a client the wake LINE that arrived on bus LABEL,
+   worded for its mode:
+     default  exit 0, LINE on stdout;
+     hook     exit 2, LINE and the drain advice on stderr.
+
+   Control characters in LINE and LABEL become `?` and LABEL is cut to 256
+   characters. A LINE whose text would pass +MAX-REPLY-TEXT-OCTETS+ octets is
+   replaced by its leading `bus:<seq>` token."
+  (let* ((label (%clip label))
+         (line (%printable line))
+         (text (%event-text hook-p label line)))
+    (when (> (%utf-8-length text) +max-reply-text-octets+)
+      (setf text (%event-text hook-p label (%first-token line))))
+    (if hook-p
+        (exit-reply 2 "event" nil text)
+        (exit-reply 0 "event" text nil))))
+
+(defun %no-watcher-diagnostic (id label tail)
+  "The stderr line saying no detached watcher runs for ID on bus LABEL,
+   finished by TAIL and LF."
+  (format nil "dsmr-bus-watch: no detached watcher is running for ~A on bus ~A~A~%"
+          id label tail))
+
+(defun nowatcher-reply (hook-p label id due)
+  "The final reply telling a client that no detached watcher serves ID on bus
+   LABEL, worded for its mode:
+     default         exit 1, the nowatcher line on stdout, the warning on stderr;
+     hook, DUE       exit 2, the nowatcher line and the advice on stderr;
+     hook, not DUE   exit 0, nothing.
+
+   DUE says the hourly notice is due; it applies to hook clients alone. A NIL
+   ID renders as `-`. Control characters in LABEL and ID become `?`, and each
+   is cut to 256 characters."
+  (let* ((label (%clip label))
+         (id (%clip id))
+         (line (format nil "nowatcher bus=~A~%" label)))
+    (cond
+      ((not hook-p)
+       (exit-reply 1 "nowatcher" line
+                   (%no-watcher-diagnostic id label
+                                           "; start one with --detach, then wake again")))
+      (due
+       (exit-reply 2 "nowatcher" nil
+                   (concatenate 'string line
+                                (%no-watcher-diagnostic
+                                 id label
+                                 (format nil ", so no mail can wake you. Start one with ~
+                                              dsmr-bus-watch --detach and your usual --bus ~
+                                              and identity flags. ~A"
+                                         *hook-advice*)))))
+      (t
+       (exit-reply 0 "nowatcher" nil nil)))))
+
+(defun superseded-reply ()
+  "The final reply to a hook client a newer one replaced: exit 0, nothing
+   printed."
+  (exit-reply 0 "superseded" nil nil))
 
 ;;; ------------------------------------------------------------------- writing
 
