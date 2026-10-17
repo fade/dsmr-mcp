@@ -126,7 +126,11 @@ is read by a programmer at the call site.
   existing mood), then the contract: arguments, return value, conditions signalled, side effects.
 - A why only when it is non-obvious (a hidden constraint, a workaround, an invariant), in one
   sentence stated as the constraint, never restating the implementation.
-- Code with a mind, stock patterns, Canadian spelling, and the Oxford comma still apply.
+- Code with a mind, stock patterns, and Canadian spelling still apply.
+- ⚠ A series of four or more items, or of three where any item contains a verb, is a
+  structural flag in this register, not a punctuation question (operator, 2026-10-17): split the
+  sentence, or set the items out one per line. A short series kept in a docstring still takes the
+  Oxford comma.
 - Bad: "I made this probe skip busy workers because we found that probing them would block the
   monitor." Good: "Skip busy workers: worker-rpc takes the stream lock outside its timeout."
 - ⚠ An impersonal docstring is correct, not a finding: the impersonal-body finding is for the
