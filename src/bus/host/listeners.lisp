@@ -25,22 +25,33 @@
 ;;;; polls it.
 ;;;;
 ;;;; Wire protocol, version 1: one LF-terminated line each way, fields
-;;;; key=value separated by single spaces, every value percent-encoded or the
-;;;; bare `-` for absent.
+;;;; separated by single spaces, every value percent-encoded or the bare `-`
+;;;; for absent.
 ;;;;
-;;;; Requests:
+;;;; Requests, fields as key=value:
 ;;;;   WAKE 1 hook= allbuses= agent= ns= agentid= envagent= bus= envbus= cwd= pid=
 ;;;;   READERS 1 id= bus=
 ;;;;
 ;;;; Replies:
-;;;;   EVENT <label> <line>
-;;;;   NOWATCHER <label> <id> due=<0|1>
-;;;;   SUPERSEDED
+;;;;   EXIT <status> <kind> <out> <err>
 ;;;;   READERS <n>
 ;;;;   ERR bad-request <text>
 ;;;;   ERR version <text>
 ;;;;   ERR busy <text>
 ;;;;   ERR bad-bus <text>
+;;;;
+;;;; EXIT is the final reply to a wake client. OUT and ERR are the texts the
+;;;; client writes verbatim to stdout and stderr, already worded for its mode
+;;;; (default or hook), and STATUS, 0, 1 or 2, is the code it exits with. KIND
+;;;; is event, nowatcher or superseded, and matches [a-z-]{1,16}. A text is `-`
+;;;; for nothing, else its UTF-8 octets with each outside [A-Za-z0-9._~/]
+;;;; written %XX in uppercase hex. Bounds:
+;;;;   - a decoded text is at most 4096 octets;
+;;;;   - a decoded text holds only octets 0x09, 0x0A, 0x20-0x7E and 0x80-0xFF;
+;;;;   - the reply line is at most 32768 octets with its LF.
+;;;; The client prints no ERR text: it retries on busy, version and
+;;;; bad-request, and on bad-bus runs the Lisp watcher program, which reports
+;;;; the refusal itself.
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :sb-posix)
@@ -489,13 +500,13 @@
   (%end-conn conn))
 
 (defun %send-nowatcher (hub conn id label)
-  "Answer CONN that no watcher serves ID on LABEL, with whether the hourly
-   notice is due, and end it."
+  "Answer CONN that no watcher serves ID on LABEL, worded for CONN's mode and
+   for whether NOWATCHER-FN says the hourly notice is due, and end it."
   (let ((due (handler-case (funcall (hub-nowatcher-fn hub) id (conn-hook-p conn))
                (error (e)
                  (%report hub :warn "wake-nowatcher-failed" :id id :msg (princ-to-string e))
                  nil))))
-    (%send-line conn (format nil "NOWATCHER ~A ~A due=~D" label (%field id) (if due 1 0)))
+    (%send-line conn (nowatcher-reply (conn-hook-p conn) label id due))
     (%end-conn conn)))
 
 ;;; -------------------------------------------------------------------- queues
@@ -518,8 +529,8 @@
     (nreverse headed)))
 
 (defun %deliver (hub stem conn label seq line now)
-  "Send LINE to CONN as the event for STEM, under the hub mutex, and return true
-   when it went.
+  "Send CONN the event reply for LINE, the event for STEM, worded for CONN's
+   mode, under the hub mutex, and return true when it went.
 
    Sent or not, CONN is ended and leaves every queue, and each other queue it
    headed hands its gap to its next client; STEM's own queue is left to the
@@ -527,7 +538,7 @@
      - STEM's delivered position rises to SEQ and the time is noted;
      - DELIVERED-FN receives the stem, its position and the time;
      - the send is reported as wake-delivered."
-  (let ((sent (%send-line conn (format nil "EVENT ~A ~A" label line))))
+  (let ((sent (%send-line conn (event-reply (conn-hook-p conn) label line))))
     (%end-conn conn)
     (let ((headed (remove stem (%remove-conn hub conn) :test #'string=)))
       (when sent
@@ -577,7 +588,7 @@
 (defun %supersede (hub old keep-stems)
   "Tell the hook client OLD it has been replaced, end it and take it out of
    every queue, handing the gap on in each queue it headed outside KEEP-STEMS."
-  (%send-line old "SUPERSEDED")
+  (%send-line old (superseded-reply))
   (%end-conn old)
   (dolist (stem (set-difference (%remove-conn hub old) keep-stems :test #'string=))
     (%hand-gap hub stem)))
@@ -860,8 +871,9 @@
 ;;; ---------------------------------------------------------- the service side
 
 (defun hub-offer (hub stem label seq line &key (now (%unix-time)))
-  "Send LINE, the event at SEQ for STEM, to the head of STEM's queue as
-   EVENT LABEL LINE, and return true when a client took it.
+  "Send LINE, the event at SEQ for STEM on bus LABEL, to the head of STEM's
+   queue as the event reply for its mode, and return true when a client took
+   it.
 
    A head whose write fails is ended and the next tried. The client that took
    it leaves every queue at once and STEM's next client is offered its gap.
@@ -875,8 +887,8 @@
                (return t))))
 
 (defun hub-release-stem (hub stem label id)
-  "Let STEM go: every client waiting on STEM alone is answered NOWATCHER LABEL
-   ID and ended, and a client also waiting on another stem keeps waiting there.
+  "Let STEM go: every client waiting on STEM alone is answered that no
+   watcher serves ID on LABEL, in its mode, and ended, and a client also waiting on another stem keeps waiting there.
    Returns the number of clients the stem held."
   (with-hub-lock (hub)
     (let ((queue (gethash stem (hub-queues hub))))

@@ -6,6 +6,7 @@
 ;;;;   - head-only delivery, and promotion with the gap handed to the next client;
 ;;;;   - the delivered position reported on every send;
 ;;;;   - the hook replace rule;
+;;;;   - the finished reply texts for each outcome and mode, and their bounds;
 ;;;;   - the readers answer and the other replies;
 ;;;;   - refused requests;
 ;;;;   - an orderly stop.
@@ -413,11 +414,11 @@
         (send-text b (wake-line :pid 2))
         (true (queued hub "s1" 2))
         (true (listeners:hub-offer hub "s1" "b" 7 "bus:7 from=x"))
-        (is string= "EVENT b bus:7 from=x" (read-reply a))
+        (is string= (listeners:event-reply nil "b" "bus:7 from=x") (read-reply a))
         (is eq :timeout (read-reply b 0.3))
         (is = 1 (listeners:hub-reader-count hub "s1"))
         (true (listeners:hub-offer hub "s1" "b" 8 "bus:8 from=x"))
-        (is string= "EVENT b bus:8 from=x" (read-reply b))
+        (is string= (listeners:event-reply nil "b" "bus:8 from=x") (read-reply b))
         (is eq :eof (read-reply a))
         (false (listeners:hub-offer hub "s1" "b" 9 "bus:9"))))))
 
@@ -439,7 +440,7 @@
       (true (queued hub "s1" 2))
       (setf gap-ready t)
       (hang-up a)
-      (is string= "EVENT b bus:9 from=y" (read-reply b))
+      (is string= (listeners:event-reply nil "b" "bus:9 from=y") (read-reply b))
       (is eql 9 (listeners:hub-delivered hub "s1"))
       (is = 0 (listeners:hub-reader-count hub "s1"))
       (true (member '("s1" nil) asked :test #'equal)))))
@@ -529,11 +530,11 @@
       (true (queued hub "s1" 1))
       (let ((h2 (connect)))
         (send-text h2 (wake-line :hook 1 :pid 2))
-        (is string= "SUPERSEDED" (read-reply h1))
+        (is string= "EXIT 0 superseded - -" (read-reply h1))
         (is eq :eof (read-reply h1))
         (is = 1 (listeners:hub-reader-count hub "s1"))
         (true (listeners:hub-offer hub "s1" "b" 3 "bus:3"))
-        (is string= "EVENT b bus:3" (read-reply h2))))))
+        (is string= (listeners:event-reply t "b" "bus:3") (read-reply h2))))))
 
 (define-test a-hook-is-served-ahead-of-background-clients
   "A hook client goes to the head of the queue; background clients keep their
@@ -550,10 +551,10 @@
             (mapcar (lambda (entry) (subseq entry 0 2))
                     (rest (first (listeners:hub-snapshot hub)))))
         (true (listeners:hub-offer hub "s1" "b" 4 "bus:4"))
-        (is string= "EVENT b bus:4" (read-reply h))
+        (is string= (listeners:event-reply t "b" "bus:4") (read-reply h))
         (is eq :timeout (read-reply b 0.3))
         (true (listeners:hub-offer hub "s1" "b" 5 "bus:5"))
-        (is string= "EVENT b bus:5" (read-reply b))))))
+        (is string= (listeners:event-reply nil "b" "bus:5") (read-reply b))))))
 
 ;;; ------------------------------------------------------------------- answers
 
@@ -593,9 +594,11 @@
       (listeners:hub-retry-pending hub)
       (true (queued hub "s1" 1)))))
 
-(define-test nowatcher-answers-carry-the-due-flag
-  "An identity with no watcher is answered NOWATCHER with the label, the
-   encoded id and whether the hourly notice is due."
+(define-test nowatcher-answers-follow-the-mode-and-the-notice
+  "An identity with no watcher is answered with the nowatcher text for the
+   client's mode: a background client always gets the warning with exit 1, a
+   hook client the advice with exit 2 when the hourly notice is due and
+   nothing with exit 0 when it is not."
   (with-state (state)
     (let ((due t)
           (asked '()))
@@ -605,34 +608,46 @@
                       :nowatcher-fn (lambda (id hook-p)
                                       (push (list id hook-p) asked)
                                       due))
-      (let ((c (connect)))
-        (send-text c (wake-line :hook 1))
-        (is string= "NOWATCHER b ns/a%20b due=1" (read-reply c))
-        (is eq :eof (read-reply c)))
-      (setf due nil)
-      (let ((c (connect)))
-        (send-text c (wake-line))
-        (is string= "NOWATCHER b ns/a%20b due=0" (read-reply c)))
-      (is equal '(("ns/a b" nil) ("ns/a b" t)) asked))))
+      (flet ((answer (hook)
+               (let ((c (connect)))
+                 (send-text c (wake-line :hook hook))
+                 (prog1 (read-reply c)
+                   (is eq :eof (read-reply c))))))
+        (is string= (listeners:nowatcher-reply t "b" "ns/a b" t) (answer 1))
+        (true (uiop:string-prefix-p "EXIT 2 nowatcher - " (answer 1)))
+        (is string= (listeners:nowatcher-reply nil "b" "ns/a b" t) (answer 0))
+        (setf due nil)
+        (is string= "EXIT 0 nowatcher - -" (answer 1))
+        (let ((reply (answer 0)))
+          (is string= (listeners:nowatcher-reply nil "b" "ns/a b" nil) reply)
+          (true (uiop:string-prefix-p "EXIT 1 nowatcher " reply))))
+      (is equal '(("ns/a b" nil) ("ns/a b" t) ("ns/a b" nil) ("ns/a b" t) ("ns/a b" t))
+          asked))))
 
 (define-test releasing-a-stem-ends-only-clients-left-with-nothing
-  "A released identity tells a client waiting on it alone that no watcher
-   remains; a client still waiting on another identity keeps waiting."
+  "A released identity tells each client waiting on it alone that no watcher
+   remains, in that client's mode; a client still waiting on another identity
+   keeps waiting."
   (with-state (state)
     (let* ((hub (start-test-hub
                  :resolve-fn (lambda (request)
-                               (if (eql 1 (getf request :pid))
+                               (if (member (getf request :pid) '(1 3))
                                    (list :targets '(("s1" . "b")))
                                    (list :targets '(("s1" . "b") ("s2" . "c")))))))
            (one (connect))
-           (two (connect)))
+           (two (connect))
+           (hook (connect)))
       (send-text one (wake-line :pid 1))
       (true (queued hub "s1" 1))
       (send-text two (wake-line :pid 2))
       (true (queued hub "s2" 1))
+      (send-text hook (wake-line :hook 1 :pid 3))
+      (true (queued hub "s1" 3))
       (listeners:hub-release-stem hub "s1" "b" "ns/a")
-      (is string= "NOWATCHER b ns/a due=0" (read-reply one))
+      (is string= (listeners:nowatcher-reply nil "b" "ns/a" nil) (read-reply one))
       (is eq :eof (read-reply one))
+      (is string= "EXIT 0 nowatcher - -" (read-reply hook))
+      (is eq :eof (read-reply hook))
       (is eq :timeout (read-reply two 0.3))
       (is = 0 (listeners:hub-reader-count hub "s1"))
       (is = 1 (listeners:hub-reader-count hub "s2")))))
@@ -678,7 +693,7 @@
           (true (and (stringp reply) (uiop:string-prefix-p "ERR bad-request " reply)))))
       (is = 1 (listeners:hub-reader-count hub "s1"))
       (true (listeners:hub-offer hub "s1" "b" 1 "bus:1"))
-      (is string= "EVENT b bus:1" (read-reply waiting)))))
+      (is string= (listeners:event-reply nil "b" "bus:1") (read-reply waiting)))))
 
 (define-test a-slow-request-is-closed-after-the-window
   "A client that sends half a line and waits is answered ERR bad-request and
@@ -724,12 +739,12 @@
         (true (queued hub "s1" 2))
         (hang-up b)
         (true (listeners:hub-offer hub "s1" "b" 2 "bus:2"))
-        (is string= "EVENT b bus:2" (read-reply c)))
+        (is string= (listeners:event-reply nil "b" "bus:2") (read-reply c)))
       (let ((d (connect)))
         (send-text d (wake-line :pid 4))
         (true (queued hub "s1" 1))
         (true (listeners:hub-offer hub "s1" "b" 3 "bus:3"))
-        (is string= "EVENT b bus:3" (read-reply d))))))
+        (is string= (listeners:event-reply nil "b" "bus:3") (read-reply d))))))
 
 ;;; -------------------------------------------------------- the socket itself
 
