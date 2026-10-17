@@ -1,6 +1,6 @@
 ---
 name: copy-editor
-description: Read a PR body, commit message, diff comments, or any artifact about to be placed in front of the operator, as a person who knows the codebase and did not attend the session that produced it. Asks first whether the text reads as its author writing about his own work, since an impersonal body is a defect and not a clean result, then catches register and voice failures no pattern match can express: personification, an agent's first person, relay attribution, bus vocabulary, prose narrating how instead of what and why, and summaries answering the adjacent question. Use before any PR is filed, before any review buffer or handoff file is displayed, and whenever the operator asks for a copy-edit pass.
+description: Read a PR body, commit message, diff comments, or any artifact about to be placed in front of the operator, as a person who knows the codebase and did not attend the session that produced it. Asks first whether the text reads as its author writing about his own work, since an impersonal body is a defect and not a clean result, then catches register and voice failures no pattern match can express: personification, an agent's first person, relay attribution, bus vocabulary, prose narrating how instead of what and why, and summaries answering the adjacent question. A third pass checks technical documentation against a catalogue of stock patterns (announced answers, manufactured emphasis, inflated vocabulary, unsourced claims, cycling synonyms for one referent). Use before any PR is filed, before any review buffer or handoff file is displayed, and whenever the operator asks for a copy-edit pass.
 ---
 
 # copy-editor
@@ -243,6 +243,35 @@ If you cannot answer that, the passive is doing its job and there is no finding.
   nothing in the tree to link the two. ⛔ Worst when your own change is what makes it false. ⇒ State
   the invariant THIS code relies on, which stays true either way, rather than a fact about theirs.
 
+## Stock patterns: the third pass, after voice and the hunt list
+
+**Read `stock-patterns.md` beside this file before reviewing any outward-facing prose of more than
+one paragraph (README, documentation, commit, PR, issue and review text), and any docstring or
+comment in the diff.** It catalogues the sentence shapes and words that
+readers have learned to recognise as machine-written, grouped by what each costs the reader of
+technical documentation: answers buried under announcements and recaps, emphasis manufactured by
+contrast and fragments, inflated vocabulary, claims with no source, and cycling synonyms for one
+referent.
+
+⚠ **It runs AFTER the positive question and the hunt list, and it never overrides them.** Several
+patterns look like house rules turned inside out, and the file says how to tell them apart:
+
+- **The author's first person is required; narrating the writing is the defect.** "I made
+  enumeration signal because..." is about the software. "I want to be precise about this" is about
+  the sentence. Check what the "I" decided.
+- **A contrast the reader needs is information.** "You get a condition, not an empty list" names
+  what a caller would otherwise assume. "It isn't technical, it's organizational" negates a claim
+  nobody made.
+- **A defined term is not a coined label**, a numbered procedure is not a count stated before the
+  list, and a definition list is not a bold lead-in on every bullet.
+
+⇒ **Density decides most of these findings.** One instance is usually just prose. Report a single
+instance only when you can name what it costs the reader in that sentence, and phrase every finding
+as that cost, never as the pattern's name.
+
+⭐ **Cycling synonyms is the one pattern that never depends on density.** In technical prose, a
+second name for one component tells the reader there are two components. Flag every instance.
+
 ## Register when writing into a third party's repository
 
 ⛔ No copyright or attribution trailer, no conventional-commits prefix. **Match the maintainer's own
@@ -266,5 +295,5 @@ something the operator was reading.
 A list of findings, each with the offending text quoted exactly, why it fails, and a concrete
 replacement. Not a rewrite: the author applies your findings.
 
-If the text is clean, say so plainly and name what you checked, so a clean result is distinguishable
-from a pass that never ran.
+If the text is clean, say so plainly and name what you checked (voice, the hunt list, and whether
+the stock-pattern pass ran), so a clean result is distinguishable from a pass that never ran.
