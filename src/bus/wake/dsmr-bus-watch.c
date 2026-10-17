@@ -23,6 +23,7 @@
 #endif
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
 #include <signal.h>
@@ -32,7 +33,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -42,6 +45,11 @@
 #define HOOK_INPUT_MS 2000
 #define HOOK_INPUT_MAX (16u * 1024u * 1024u)
 #define MAX_BUS_NAME 32
+#define DEFAULT_OUTAGE_GRACE 300ULL
+#define OUTAGE_STAMP_SECONDS 3600
+#define MAX_SOCKET_PATH 107
+#define MAX_REPLY 8192
+#define SETTLE_MS 1000
 
 /* ------------------------------------------------------------- flag tables */
 
@@ -434,9 +442,14 @@ struct client {
     char **argv;
     int hook;
     const char *label;
-    unsigned long long wake_seconds;
+    int64_t wake_ms;
     const char *wake_text;
-    char *state_home;
+    int64_t grace_ms;
+    char grace_text[24];
+    char *socket_path;
+    char *host_dir;
+    char *stamp_path;
+    struct buf request;
 };
 
 static void on_sigterm(int signo) {
@@ -474,6 +487,86 @@ static char *state_home(void) {
     return b.p;
 }
 
+/* Milliseconds in SECONDS, capped far below overflow. */
+static int64_t seconds_to_ms(unsigned long long seconds) {
+    unsigned long long cap = (unsigned long long)INT64_MAX / 4000;
+    return (int64_t)(seconds > cap ? cap : seconds) * 1000;
+}
+
+/* ------------------------------------------------------------------ request */
+
+/* True when OCTET stands for itself in a request field: [A-Za-z0-9._~/]. */
+static int unreserved_octet_p(unsigned char octet) {
+    return (octet >= 'a' && octet <= 'z') || (octet >= 'A' && octet <= 'Z') ||
+           (octet >= '0' && octet <= '9') || octet == '.' || octet == '_' ||
+           octet == '~' || octet == '/';
+}
+
+/* Append " KEY=VALUE" to B, VALUE percent-encoded byte by byte with
+   uppercase hex, or the bare `-` when VALUE is NULL. `-` inside a value is
+   always encoded, so a bare `-` can only mean absent. */
+static void buf_field(struct buf *b, const char *key, const char *value) {
+    static const char hex[] = "0123456789ABCDEF";
+    buf_str(b, " ");
+    buf_str(b, key);
+    buf_str(b, "=");
+    if (!value) {
+        buf_str(b, "-");
+        return;
+    }
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        if (unreserved_octet_p(*p)) {
+            buf_add(b, (const char *)p, 1);
+        } else {
+            char escape[3] = {'%', hex[*p >> 4], hex[*p & 15]};
+            buf_add(b, escape, 3);
+        }
+    }
+}
+
+/* The wake request line for O, LF-terminated. */
+static void build_request(struct buf *b, const struct options *o, const char *cwd) {
+    char pid[24];
+    snprintf(pid, sizeof pid, "%ld", (long)getpid());
+    buf_str(b, "WAKE 1");
+    buf_str(b, o->hook ? " hook=1" : " hook=0");
+    buf_str(b, o->all_buses ? " allbuses=1" : " allbuses=0");
+    buf_field(b, "agent", o->agent);
+    buf_field(b, "ns", o->namespace);
+    buf_field(b, "agentid", o->agent_id);
+    buf_field(b, "envagent", getenv("DSMR_BUS_AGENT"));
+    buf_field(b, "bus", o->bus);
+    buf_field(b, "envbus", getenv("DSMR_BUS_SELECTOR"));
+    buf_field(b, "cwd", cwd);
+    buf_str(b, " pid=");
+    buf_str(b, pid);
+    buf_str(b, "\n");
+}
+
+/* Decode the percent escapes of FIELD in place; a malformed escape is kept
+   as it stands. */
+static void percent_decode(char *field) {
+    char *out = field;
+    for (char *in = field; *in;) {
+        int hi, lo;
+        if (in[0] == '%' && in[1] && in[2] &&
+            (hi = (in[1] >= '0' && in[1] <= '9') ? in[1] - '0'
+                  : (in[1] >= 'A' && in[1] <= 'F') ? in[1] - 'A' + 10
+                  : (in[1] >= 'a' && in[1] <= 'f') ? in[1] - 'a' + 10 : -1) >= 0 &&
+            (lo = (in[2] >= '0' && in[2] <= '9') ? in[2] - '0'
+                  : (in[2] >= 'A' && in[2] <= 'F') ? in[2] - 'A' + 10
+                  : (in[2] >= 'a' && in[2] <= 'f') ? in[2] - 'a' + 10 : -1) >= 0) {
+            *out++ = (char)(hi * 16 + lo);
+            in += 3;
+        } else {
+            *out++ = *in++;
+        }
+    }
+    *out = '\0';
+}
+
+/* ------------------------------------------------------------------ outputs */
+
 /* Print the idle line for the mode and exit: 0 by default, 2 in hook mode
    with the renewal advice. */
 static _Noreturn void idle_exit(const struct client *c) {
@@ -488,17 +581,252 @@ static _Noreturn void idle_exit(const struct client *c) {
     _exit(0);
 }
 
-/* Wait for the wake deadline alone; no service is contacted. A deadline of
-   0 waits for ever. */
+/* Print the wake LINE that arrived on bus LABEL and exit: 0 by default, 2 in
+   hook mode with the drain advice. */
+static _Noreturn void event_exit(const struct client *c, const char *label, const char *line) {
+    if (c->hook) {
+        say(2, line, "\ndsmr-bus-watch: mail has arrived for you on bus ", label,
+            ". Drain the bus now with bus-receive and act on what it holds. ", ADVICE_TAIL,
+            "\n", (char *)NULL);
+        _exit(2);
+    }
+    say(1, line, "\n", (char *)NULL);
+    _exit(0);
+}
+
+/* Report that no watcher serves ID on bus LABEL and exit: 1 by default; in
+   hook mode 2 with advice when DUE, else 0 in silence. */
+static _Noreturn void nowatcher_exit(const struct client *c, const char *label, const char *id,
+                                     int due) {
+    if (!c->hook) {
+        say(2, "dsmr-bus-watch: no detached watcher is running for ", id, " on bus ", label,
+            "; start one with --detach, then wake again\n", (char *)NULL);
+        say(1, "nowatcher bus=", label, "\n", (char *)NULL);
+        _exit(1);
+    }
+    if (!due)
+        _exit(0);
+    say(2, "nowatcher bus=", label, "\ndsmr-bus-watch: no detached watcher is running for ", id,
+        " on bus ", label,
+        ", so no mail can wake you. Start one with dsmr-bus-watch --detach and your usual "
+        "--bus and identity flags. ",
+        ADVICE_TAIL, "\n", (char *)NULL);
+    _exit(2);
+}
+
+/* Create each missing directory of PATH with mode 0700. */
+static void make_directories(const char *path) {
+    struct buf b = {0};
+    buf_str(&b, path);
+    for (char *p = b.p + 1; *p; p++) {
+        if (*p != '/')
+            continue;
+        *p = '\0';
+        mkdir(b.p, 0700);
+        *p = '/';
+    }
+    mkdir(b.p, 0700);
+    free(b.p);
+}
+
+/* True when the outage notice is due for this identity: its stamp is absent
+   or at least an hour old, or dated in the future. A due notice refreshes the
+   stamp, creating the host directory when it is missing. */
+static int outage_notice_due_p(const struct client *c) {
+    struct stat st;
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    if (stat(c->stamp_path, &st) == 0) {
+        long long age = (long long)now.tv_sec - (long long)st.st_mtime;
+        if (age >= 0 && age < OUTAGE_STAMP_SECONDS)
+            return 0;
+    }
+    int fd = open(c->stamp_path, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0 && errno == ENOENT) {
+        make_directories(c->host_dir);
+        fd = open(c->stamp_path, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    }
+    if (fd >= 0) {
+        futimens(fd, NULL);
+        close(fd);
+    }
+    return 1;
+}
+
+/* Report a service outage that has lasted the whole grace and exit: 1 by
+   default with `nowatcher`; in hook mode 2 with advice when the hourly notice
+   is due, else 0 in silence. */
+static _Noreturn void outage_exit(const struct client *c) {
+    if (!c->hook) {
+        say(2, "dsmr-bus-watch: the host bus service has not answered for ", c->grace_text,
+            " seconds, so no mail can wake you; check it with systemctl --user status "
+            "dsmr-bus-host, then wake again\n",
+            (char *)NULL);
+        say(1, "nowatcher bus=", c->label, "\n", (char *)NULL);
+        _exit(1);
+    }
+    if (!outage_notice_due_p(c))
+        _exit(0);
+    say(2, "nowatcher bus=", c->label,
+        "\ndsmr-bus-watch: the host bus service has not answered for ", c->grace_text,
+        " seconds, so no mail can wake you. Check it with systemctl --user status "
+        "dsmr-bus-host. ",
+        ADVICE_TAIL, "\n", (char *)NULL);
+    _exit(2);
+}
+
+/* -------------------------------------------------------------- the service */
+
+/* A connected socket to the service, or -1. The path must hold a socket
+   owned by this uid and fit a unix-domain address; anything else counts as
+   the service being unreachable. The connect itself never blocks, so a
+   service with a full backlog is an outage, not a hang. */
+static int connect_service(const struct client *c) {
+    size_t n = strlen(c->socket_path);
+    struct stat st;
+    if (n > MAX_SOCKET_PATH || stat(c->socket_path, &st) != 0 || !S_ISSOCK(st.st_mode) ||
+        st.st_uid != getuid())
+        return -1;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0)
+        return -1;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    memcpy(addr.sun_path, c->socket_path, n + 1);
+    int flags;
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0 ||
+        (flags = fcntl(fd, F_GETFL)) < 0 || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Act on one reply LINE (without its LF). Every answer the contract defines
+   ends the process; return means the reply counts as an outage: ERR busy,
+   version or bad-request, or anything unrecognised. ERR bad-bus hands the
+   original argv to the SBCL program, whose refusal names the problem. */
+static void handle_reply(const struct client *c, char *line) {
+    if (strncmp(line, "EVENT ", 6) == 0) {
+        char *label = line + 6;
+        char *space = strchr(label, ' ');
+        if (!space || space == label)
+            return;
+        *space = '\0';
+        event_exit(c, label, space + 1);
+    }
+    if (strncmp(line, "NOWATCHER ", 10) == 0) {
+        char *label = line + 10;
+        char *id = strchr(label, ' ');
+        if (!id || id == label)
+            return;
+        *id++ = '\0';
+        char *due = strchr(id, ' ');
+        if (!due || due == id)
+            return;
+        *due++ = '\0';
+        if (strcmp(due, "due=0") != 0 && strcmp(due, "due=1") != 0)
+            return;
+        percent_decode(id);
+        nowatcher_exit(c, label, id, due[4] == '1');
+    }
+    if (strcmp(line, "SUPERSEDED") == 0)
+        _exit(0);
+    if (strcmp(line, "ERR bad-bus") == 0 || strncmp(line, "ERR bad-bus ", 12) == 0)
+        run_lisp_program(c->argv);
+}
+
+/* Send the request on FD and wait for the reply, up to DEADLINE (-1 for
+   none). A reply the contract defines ends the process, as does the
+   deadline. Returns when the connection fails, ends or carries an outage
+   reply: 1 when it had stayed open for SETTLE_MS after the request went,
+   else 0. */
+static int converse(const struct client *c, int fd, int64_t deadline) {
+    if (!write_all(fd, c->request.p, c->request.len))
+        return 0;
+    int64_t sent_at = now_ms();
+    int settled = 0;
+    char reply[MAX_REPLY + 1];
+    size_t len = 0;
+    for (;;) {
+        int64_t t = now_ms();
+        if (!settled && t - sent_at >= SETTLE_MS)
+            settled = 1;
+        if (deadline >= 0 && t >= deadline)
+            idle_exit(c);
+        int64_t wait = deadline >= 0 ? deadline - t : -1;
+        if (!settled && (wait < 0 || sent_at + SETTLE_MS - t < wait))
+            wait = sent_at + SETTLE_MS - t;
+        struct pollfd p = {.fd = fd, .events = POLLIN};
+        int r = poll(&p, 1, wait > INT_MAX ? INT_MAX : (int)wait);
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r < 0)
+            return settled;
+        if (r == 0)
+            continue;
+        ssize_t n = read(fd, reply + len, MAX_REPLY - len);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN))
+            continue;
+        if (n <= 0)
+            return settled;
+        char *lf = memchr(reply + len, '\n', (size_t)n);
+        len += (size_t)n;
+        if (lf) {
+            *lf = '\0';
+            handle_reply(c, reply);
+            return settled;
+        }
+        if (len == MAX_REPLY)
+            return settled;
+    }
+}
+
+/* Wait for the next wake line and print it. A refused connection, an end of
+   file or an outage reply is never an exit: the client reconnects after 100,
+   250, 500, then 1000 ms and sends its request again. The idle line arrives
+   at the wake deadline whatever the service does, and an outage that lasts
+   the whole grace ends in `nowatcher`. */
 static _Noreturn void wait_for_wake(const struct client *c) {
-    if (c->wake_seconds == 0)
-        for (;;)
-            pause();
-    unsigned long long cap = (unsigned long long)INT64_MAX / 1000 / 2;
-    int64_t deadline = now_ms() + (int64_t)(c->wake_seconds > cap ? cap : c->wake_seconds) * 1000;
-    for (int64_t t; (t = now_ms()) < deadline;)
-        sleep_ms(deadline - t);
-    idle_exit(c);
+    static const int64_t backoff[] = {100, 250, 500, 1000};
+    size_t step = 0;
+    int64_t deadline = c->wake_ms ? now_ms() + c->wake_ms : -1;
+    int64_t outage_since = -1;
+    for (;;) {
+        int64_t t = now_ms();
+        if (deadline >= 0 && t >= deadline)
+            idle_exit(c);
+        if (outage_since >= 0 && t - outage_since >= c->grace_ms)
+            outage_exit(c);
+        int fd = connect_service(c);
+        if (fd >= 0) {
+            int settled = converse(c, fd, deadline);
+            close(fd);
+            if (settled) {
+                outage_since = -1;
+                step = 0;
+            }
+        }
+        t = now_ms();
+        if (outage_since < 0)
+            outage_since = t;
+        int64_t pause_ms = backoff[step];
+        if (step + 1 < sizeof backoff / sizeof backoff[0])
+            step++;
+        if (deadline >= 0 && deadline - t < pause_ms)
+            pause_ms = deadline - t;
+        if (outage_since + c->grace_ms - t < pause_ms)
+            pause_ms = outage_since + c->grace_ms - t;
+        sleep_ms(pause_ms);
+    }
+}
+
+/* 32-bit FNV-1a of the N bytes at DATA, continuing from HASH. */
+static uint32_t fnv1a(uint32_t hash, const char *data, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        hash = (hash ^ (unsigned char)data[i]) * 16777619u;
+    return hash;
 }
 
 static int run_client(int argc, char **argv) {
@@ -516,19 +844,18 @@ static int run_client(int argc, char **argv) {
     const char *name = present(o.agent) ? o.agent : present(getenv("DSMR_BUS_AGENT"));
     int explicit_id = present(o.agent_id) != NULL;
     char *cwd = getcwd(NULL, 0);
+    struct buf cwd_dir = {0};
+    buf_str(&cwd_dir, cwd ? cwd : "");
+    if (cwd_dir.len == 0 || cwd_dir.p[cwd_dir.len - 1] != '/')
+        buf_str(&cwd_dir, "/");
     if (!explicit_id && name && !o.namespace) {
         struct buf w = {0};
-        struct buf dir = {0};
-        buf_str(&dir, cwd ? cwd : "");
-        if (dir.len == 0 || dir.p[dir.len - 1] != '/')
-            buf_str(&dir, "/");
         buf_str(&w, "dsmr-bus-watch: no --namespace given; inferring ");
-        buf_quoted(&w, dir.p);
+        buf_quoted(&w, cwd_dir.p);
         buf_str(&w, " from the working directory. It must match the project root the MCP "
                     "session uses, or this watcher reads the wrong cursor.\n");
         write_all(2, w.p, w.len);
         free(w.p);
-        free(dir.p);
     }
     if (!explicit_id && !name) {
         if (o.hook)
@@ -542,20 +869,55 @@ static int run_client(int argc, char **argv) {
     if (o.hook && hook_input_names_subagent_p())
         _exit(0);
 
-    struct client c = {
-        .argv = argv,
-        .hook = o.hook,
-        .label = o.all_buses ? "*" : (bus ? bus : "default"),
-        .wake_seconds = o.wake_seconds,
-        .wake_text = o.wake_text,
-        .state_home = state_home(),
-    };
-    if (!c.state_home) {
+    char *home = state_home();
+    if (!home) {
         put(2, "dsmr-bus-watch: neither XDG_STATE_HOME nor HOME is set; cannot find the "
                "host bus service\n");
         _exit(64);
     }
+
+    struct client c = {
+        .argv = argv,
+        .hook = o.hook,
+        .label = o.all_buses ? "*" : (bus ? bus : "default"),
+        .wake_ms = seconds_to_ms(o.wake_seconds),
+        .wake_text = o.wake_text,
+    };
+    unsigned long long grace;
+    const char *grace_env = getenv("DSMR_WAKE_OUTAGE_GRACE_SECONDS");
+    if (!grace_env || !parse_nonneg(grace_env, &grace, c.grace_text, sizeof c.grace_text)) {
+        grace = DEFAULT_OUTAGE_GRACE;
+        snprintf(c.grace_text, sizeof c.grace_text, "%llu", grace);
+    }
+    c.grace_ms = seconds_to_ms(grace);
+
+    struct buf path = {0};
+    buf_str(&path, home);
+    buf_str(&path, "/dsmr-mcp/host");
+    c.host_dir = path.p;
+    path = (struct buf){0};
+    buf_str(&path, c.host_dir);
+    buf_str(&path, "/wake.sock");
+    c.socket_path = path.p;
+
+    /* The outage stamp is keyed on the identity as typed: the explicit id
+       alone, else the name, a NUL and the namespace given or inferred. */
+    const char *key_name = explicit_id ? o.agent_id : name;
+    const char *key_namespace = explicit_id ? "" : (o.namespace ? o.namespace : cwd_dir.p);
+    uint32_t hash = fnv1a(2166136261u, key_name, strlen(key_name));
+    hash = fnv1a(hash, "", 1);
+    hash = fnv1a(hash, key_namespace, strlen(key_namespace));
+    char stamp[40];
+    snprintf(stamp, sizeof stamp, "/wake-outage-%08x.stamp", (unsigned)hash);
+    path = (struct buf){0};
+    buf_str(&path, c.host_dir);
+    buf_str(&path, stamp);
+    c.stamp_path = path.p;
+
+    build_request(&c.request, &o, cwd);
     free(cwd);
+    free(cwd_dir.p);
+    free(home);
     wait_for_wake(&c);
 }
 
