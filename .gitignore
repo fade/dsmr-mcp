@@ -59,6 +59,14 @@ dsmr.core.tmp
 dsmr.core.tmp.manifest
 dsmr.core.prev
 dsmr.core.manifest.prev
+# The worker core and its staged and superseded copies; *.core does not match a
+# name ending in .worker.
+dsmr.core.worker
+dsmr.core.worker.manifest
+dsmr.core.worker.tmp
+dsmr.core.worker.tmp.manifest
+dsmr.core.worker.prev
+dsmr.core.worker.manifest.prev
 
 # Per-developer direnv config (points at a local LISP_WORKSPACE / Slynk port).
 # dsmr-mcp can write one from its template via the launch-time consent prompt;

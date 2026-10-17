@@ -30,6 +30,8 @@
                "dsmr-bus-host/src/bus/host/registry"
                "dsmr-bus-host/src/bus/host/buswatch"
                "dsmr-bus-host/src/bus/host/brokers"
+               "dsmr-mcp/src/hermetic/pool-records"
+               "dsmr-bus-host/src/bus/host/memory"
                "dsmr-bus-host/src/bus/host/main")
   :build-operation "program-op"
   :build-pathname "bin/dsmr-bus-host"

@@ -45,9 +45,13 @@ variable.
 | =DSMR_ATTACH_CONCURRENCY=      | Attach-call policy: =serialised= / =parallel=                       | =serialised=     | =src/run.lisp= / =src/attach/dispatch.lisp= |
 | =DSMR_HTTP_SESSION_TIMEOUT=    | HTTP idle-session eviction (seconds)                               | =3600=           | =src/run.lisp= -> =serve-http=       |
 | =DSMR_HTTP_CLEANUP_INTERVAL=   | HTTP idle-sweep interval (seconds)                                 | =60=             | =src/run.lisp= -> =serve-http=       |
-| =DSMR_WORKER_POOL_WARMUP=      | Standby hermetic workers to keep warm                              | =1= (min 0)      | =src/hermetic/pool.lisp=           |
+| =DSMR_WORKER_POOL_WARMUP=      | Standby hermetic workers to keep warm. Off by default, because a worker boots from the worker core when a session first needs one; a value you set is still honoured | =0= (min 0), read at server start | =src/hermetic/pool.lisp=  |
+| =DSMR_WORKER_CORE=             | Worker core image new hermetic workers boot from. The launcher sets it when =dsmr.core.worker= is fresh and unsets it otherwise, so leave it alone; unset means workers load from source | set by the launcher | =src/hermetic/worker-client.lisp= (set by =scripts/dsmr-mcp-launch.sh=) |
 | =DSMR_MAX_POOL_SIZE=           | Max total hermetic workers (bound + standby)                       | =16= (min 1)     | =src/hermetic/pool.lisp=           |
+| =DSMR_MAX_HIBERNATED_WORKERS=  | The most hermetic workers one server keeps hibernated at once. A hibernated worker holds no memory and no place in the pool, so this is what bounds the disk its saved worlds take; at the limit a request to hibernate is refused and the host service turns to another worker. =0= turns hibernation off | =8= (min 0), read at server start | =src/hermetic/pool.lisp= |
+| =DSMR_MAX_RESUME_ATTEMPTS=     | How many resumes of one hibernated worker in a row may fail in a way that may pass (a timeout, a process that ended before its handshake) before its world is given up: the core is kept under =hibernate/failed/= and the session gets a fresh worker with a notice saying why | =3= (min 1), read at server start | =src/hermetic/pool.lisp= |
 | =DSMR_WORKER_STARTUP_TIMEOUT=  | Seconds to await a worker handshake                               | =30=             | =src/hermetic/worker-client.lisp=  |
+| =DSMR_WORKER_RESUME_TIMEOUT=   | Seconds to await the handshake of a worker resumed from its saved core. A large world read from a busy disk can take far longer than a fresh boot, and a resume that runs out of time keeps the world and is retried on the next call | =120= (min 1), read at server start | =src/hermetic/worker-client.lisp= |
 | =DSMR_WORKER_KILL_GRACE_SECONDS= | Grace before the parent SIGKILLs a hung worker                  | =5= (min 1)      | =src/hermetic/pool.lisp=           |
 | =DSMR_ALIVE_LSP_DIR=           | alive-lsp source checkout to spawn for LSP-backed verbs            | unset (attach-only) | =src/lsp/client.lisp=           |
 | =DSMR_LSP_STARTUP_TIMEOUT=     | Seconds to await a spawned alive-lsp startup line                  | =30=             | =src/lsp/client.lisp=              |
@@ -60,11 +64,42 @@ variable.
 | =DSMR_MCP_HOST=                | stdio<->TCP bridge target host (when =--host= is absent)          | =127.0.0.1=      | =scripts/stdio-tcp-bridge.lisp=    |
 | =DSMR_MCP_PORT=                | stdio<->TCP bridge target port (when =--port= is absent)          | from argv        | =scripts/stdio-tcp-bridge.lisp=    |
 | =DSMR_CORE_OUTPUT=             | Output path for the prebuilt core image (=make core=)             | =dsmr.core=      | =scripts/build-core.lisp=          |
+| =DSMR_CORE_KIND=               | Which image =scripts/build-core.lisp= builds: =server= (=dsmr.core=) or =worker= (=dsmr.core.worker=); =make core-worker= sets it for you | =server= | =scripts/build-core.lisp= |
+
+Every pool and worker setting above is read when the process starts, not when
+its code loads, so a server or worker booted from a prebuilt image honours the
+environment it is started with.
 
 =DSMR_ALLOW_REMOTE= is true only for the literal values =1=, =true=, or
 =yes=. =DSMR_RELATED_PROJECTS= is consulted at re-root time inside the
 filesystem sandbox — *not* in =src/run.lisp='s startup config (see
 [[Filesystem sandbox]]).
+
+** Memory-pressure settings of the host service
+
+The host bus service (=dsmr-bus-host=) reads the host's memory once a second
+and, when memory runs short, asks session pools to stop or hibernate idle
+hermetic workers (see [[file:operations.org][Operations]]). These settings
+decide when it does. The service reads them once, when it starts.
+
+| Variable                                | Purpose                                                                                     | Default | Read by |
+|-----------------------------------------+---------------------------------------------------------------------------------------------+---------+---------|
+| =DSMR_PRESSURE_ENTER_SOME=              | Enter pressure when the kernel's "some" memory stall figure (=/proc/pressure/memory=, ten-second average, percent) reaches this on two readings in a row. The default is an unmeasured starting point that I chose to sit well below systemd-oomd's limit, and I expect to retune it once it has been measured under a full fleet | =10= | =src/bus/host/memory.lisp= (host service) |
+| =DSMR_PRESSURE_ENTER_FULL=              | Enter pressure when the "full" memory stall figure (ten-second average, percent) reaches this on two readings in a row. The default is an unmeasured starting point that I chose to sit well below systemd-oomd's limit, and I expect to retune it once it has been measured under a full fleet | =2= | =src/bus/host/memory.lisp= (host service) |
+| =DSMR_PRESSURE_ENTER_AVAILABLE_PERCENT= | Enter pressure at once when =MemAvailable= falls below this percentage of memory. The default is an unmeasured starting point that I chose to sit well below systemd-oomd's limit, and I expect to retune it once it has been measured under a full fleet | =12= | =src/bus/host/memory.lisp= (host service) |
+| =DSMR_PRESSURE_LEAVE_SOME=              | Pressure can clear only while the "some" stall figure stays below this. The default is an unmeasured starting point that I chose to sit well below systemd-oomd's limit, and I expect to retune it once it has been measured under a full fleet | =3= | =src/bus/host/memory.lisp= (host service) |
+| =DSMR_PRESSURE_LEAVE_AVAILABLE_PERCENT= | Pressure can clear only while =MemAvailable= stays above this percentage of memory. The default is an unmeasured starting point that I chose to sit well below systemd-oomd's limit, and I expect to retune it once it has been measured under a full fleet | =20= | =src/bus/host/memory.lisp= (host service) |
+| =DSMR_PRESSURE_HOLD_SECONDS=            | How long both leave conditions must hold before pressure clears (whole seconds, at least 1). The default is an unmeasured starting point that I chose to sit well below systemd-oomd's limit, and I expect to retune it once it has been measured under a full fleet | =30= | =src/bus/host/memory.lisp= (host service) |
+| =DSMR_PRESSURE_MIN_KILL_AGE_SECONDS=    | A fresh idle worker younger than this is never stopped. Both the host service and every MCP server's pool read it, and both must see the same value: the service skips a worker this young when it chooses, and the pool's check is the one that decides, since it answers a stop request for a younger worker by refusing it. Set it in the service's environment and in each dsmr-mcp server's environment alike. The default is an unmeasured starting point that I chose to sit well below systemd-oomd's limit, and I expect to retune it once it has been measured under a full fleet | =10= | =src/bus/host/memory.lisp= (host service) and =src/hermetic/pool.lisp= (every pool) |
+
+Set these in the host service unit's environment, not in a shell: run
+=systemctl --user edit dsmr-bus-host=, add one =Environment=NAME=value= line
+per setting under =[Service]=, then =systemctl --user restart dsmr-bus-host=.
+The edit lands in a drop-in file beside the unit, so =make install-host-unit=
+and =make check-host-unit= leave it alone. A value the service cannot use
+keeps its default and is reported once in the fleet error log under
+=memory-threshold-ignored=, naming the variable. Stall figures and percentages
+take a number from 0 to 100.
 
 ** Worker-internal variables (not operator knobs)
 

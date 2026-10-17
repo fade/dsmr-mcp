@@ -25,7 +25,7 @@
                 #:make-condition-variable #:condition-wait #:condition-notify
                 #:make-thread #:thread-alive-p #:join-thread #:current-thread)
   (:import-from #:dsmr-mcp/src/hermetic/pool
-                #:*max-pool-size*)
+                #:effective-max-pool-size)
   (:import-from #:dsmr-mcp/src/log #:log-event)
   (:export #:dispatch-promise #:make-dispatch-promise
            #:dispatch-promise-lock #:dispatch-promise-condvar
@@ -38,7 +38,8 @@
            #:make-dispatch-pool #:dispatch-pool-submit
            #:dispatch-pool-shutdown
            #:ensure-dispatch-pool
-           #:*dispatch-pool-size* #:*dispatch-pool*))
+           #:*dispatch-pool-size* #:effective-dispatch-pool-size
+           #:*dispatch-pool*))
 
 (in-package #:dsmr-mcp/src/transport/dispatch-pool)
 
@@ -142,13 +143,24 @@ hermetic child-process bound — over-subscribing it would block every dispatch
 thread on get-or-assign-worker."
   (min (or requested max) max))
 
-(defvar *dispatch-pool-size*
-  (%clamp-pool-size (%dispatch-env-int "DSMR_DISPATCH_POOL_SIZE" nil :min 1)
-                    *max-pool-size*)
-  "Number of worker threads in the dispatch pool. Defaults to *max-pool-size*
-so each dispatch thread has a guaranteed hermetic worker slot (1:1 mapping),
-and is clamped to never exceed *max-pool-size*. Override with the
-DSMR_DISPATCH_POOL_SIZE env var (a smaller value when memory is constrained).")
+(defvar *dispatch-pool-size* nil
+  "Requested number of worker threads in the dispatch pool, or NIL to read the
+environment when the pool is created.
+
+NIL (the default) means effective-dispatch-pool-size reads
+DSMR_DISPATCH_POOL_SIZE (a positive integer; set a smaller value when memory
+is constrained), and with that unset uses the maximum hermetic pool size, so
+each dispatch thread has a guaranteed hermetic worker slot (1:1 mapping).
+Whatever the source, the size is clamped to never exceed the maximum hermetic
+pool size resolved at start.")
+
+(defun effective-dispatch-pool-size ()
+  "The number of dispatch worker threads to run, read when called: the
+non-NIL *dispatch-pool-size*, else DSMR_DISPATCH_POOL_SIZE, else the maximum
+hermetic pool size, always clamped to that maximum as resolved at start."
+  (%clamp-pool-size (or *dispatch-pool-size*
+                        (%dispatch-env-int "DSMR_DISPATCH_POOL_SIZE" nil :min 1))
+                    (effective-max-pool-size)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Bounded FIFO worker pool
@@ -233,10 +245,10 @@ pool is shutting down and the queue has drained."
       (when task
         (%run-task task)))))
 
-(defun make-dispatch-pool (&key (size *dispatch-pool-size*))
+(defun make-dispatch-pool (&key (size (effective-dispatch-pool-size)))
   "Create a dispatch pool and spawn SIZE worker threads, each draining the
-shared FIFO queue. SIZE defaults to *dispatch-pool-size* (already clamped to
-*max-pool-size*)."
+shared FIFO queue. SIZE defaults to effective-dispatch-pool-size, read when
+the pool is created and clamped to the maximum hermetic pool size."
   (let ((pool (%make-dispatch-pool :size size)))
     (setf (dispatch-pool-workers pool)
           (loop for i from 0 below size

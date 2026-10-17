@@ -28,16 +28,17 @@
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht #:text-content #:result #:rpc-error)
   (:import-from #:dsmr-mcp/src/hermetic/pool
-                #:get-or-assign-worker #:pool-shutting-down
+                #:with-session-worker #:pool-shutting-down
                 #:pool-capacity-exceeded #:pool-rpc-with-hard-kill
                 #:circuit-breaker-active
-                #:circuit-breaker-active-remaining-seconds)
+                #:circuit-breaker-active-remaining-seconds
+                #:pool-resume-deferred)
   (:import-from #:dsmr-mcp/src/hermetic/worker-client
                 #:worker-crashed
                 #:check-and-clear-reset-notification
                 #:worker-id)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
-                #:*default-eval-timeout*)
+                #:effective-eval-timeout)
   (:import-from #:dsmr-mcp/src/attach/registry
                 #:decode-object-id)
   (:export #:dispatch-hermetic-call
@@ -73,13 +74,28 @@ dispatcher-side tools fall through to the local tool dispatch."
        (member name +worker-routed-tools+ :test #'string=)
        t))
 
+(defun %reset-notice (reason)
+  "The text a session is given on its first call after its worker was replaced.
+REASON, when non-NIL, says why the previous worker was lost; without one the
+worker crashed."
+  (if reason
+      (format nil "Worker was reset: ~A. In-image state has been lost. ~
+Retry your call." reason)
+      "Worker was reset after a crash. \
+In-image state has been lost. Retry your call."))
+
 (defun dispatch-hermetic-call (session id name args)
   "Route one tools/call to the session's dedicated hermetic worker.
 
-Implements the one-notification pattern: if the worker was just reset after
-a crash, the agent receives a structured isError reset notification as the
-response to THIS call, and the call is NOT forwarded to the worker. The next
-call from the same session proceeds normally.
+The whole call runs while the session's worker is held through
+with-session-worker, so it can never land on a worker that is being saved to
+disk or stopped.
+
+Implements the one-notification pattern: if the worker was just reset, after
+a crash or for a reason the pool recorded (which the notice then names), the
+agent receives a structured isError reset notification as the response to
+THIS call, and the call is NOT forwarded to the worker. The next call from the
+same session proceeds normally.
 
 Routes by NAME:
   \"inspect-object\" -> worker method \"worker/inspect-object\" with a
@@ -102,6 +118,8 @@ Routes by NAME:
 Structured conditions are caught and returned as isError / rpc-error
 responses so the MCP serve loop never sees an unhandled condition:
   worker-crashed      -> isError with crash message
+  pool-resume-deferred -> isError saying the saved world is intact and the
+                          next call tries again
   pool-shutting-down  -> rpc-error -32000
   pool-capacity-exceeded -> rpc-error -32000
   error (circuit breaker) -> rpc-error -32000
@@ -112,19 +130,19 @@ name string. ARGS is the tool arguments hash-table, or NIL when the client
 sent no arguments."
   (let ((session-root (session-project-root session)))
     (handler-case
-        (let* ((worker    (get-or-assign-worker *current-session-id*))
-               (had-reset (check-and-clear-reset-notification worker)))
-          (when had-reset
-            (log-event :warn "dispatch.worker-reset"
-                       "session" *current-session-id*
-                       "tool" name)
-            (return-from dispatch-hermetic-call
-              (result id
-                      (make-ht "isError" t
-                               "content"
-                               (text-content
-                                "Worker was reset after a crash. \
-In-image state has been lost. Retry your call.")))))
+        (with-session-worker (worker *current-session-id*)
+          (multiple-value-bind (had-reset reset-reason)
+              (check-and-clear-reset-notification worker)
+            (when had-reset
+              (log-event :warn "dispatch.worker-reset"
+                         "session" *current-session-id*
+                         "tool" name
+                         "reason" (or reset-reason "crash"))
+              (return-from dispatch-hermetic-call
+                (result id
+                        (make-ht "isError" t
+                                 "content"
+                                 (text-content (%reset-notice reset-reason)))))))
           ;; Name-based routing.
           (cond
             ;; ----------------------------------------------------------------
@@ -176,7 +194,7 @@ crash; the object id is no longer valid.")))))
                        (setf (gethash "max_elements" worker-params) max-elements)))
                    (let ((resp (pool-rpc-with-hard-kill worker "worker/inspect-object"
                                                         worker-params
-                                                        :soft-timeout *default-eval-timeout*)))
+                                                        :soft-timeout (effective-eval-timeout))))
                      (result id resp))))))
             ;; ----------------------------------------------------------------
             ;; Code-intelligence branch: route to worker/<name> and inject the
@@ -188,7 +206,7 @@ crash; the object id is no longer valid.")))))
              (let* ((params (or args (make-hash-table :test 'equal)))
                     (soft   (let ((v (gethash "timeout_seconds" params)))
                               (if (and v (integerp v) (plusp v))
-                                  v *default-eval-timeout*))))
+                                  v (effective-eval-timeout)))))
                ;; Inject project_root when the session has one set; the worker
                ;; handler reads it and passes it as :root to the code-core engine.
                (when session-root
@@ -208,7 +226,7 @@ crash; the object id is no longer valid.")))))
              (let* ((params (or args (make-hash-table :test 'equal)))
                     (soft   (let ((v (gethash "timeout_seconds" params)))
                               (if (and v (integerp v) (plusp v))
-                                  v *default-eval-timeout*)))
+                                  v (effective-eval-timeout))))
                     (resp   (pool-rpc-with-hard-kill worker
                                                      (format nil "worker/~A" name)
                                                      params
@@ -225,7 +243,7 @@ crash; the object id is no longer valid.")))))
              (let* ((params (or args (make-hash-table :test 'equal)))
                     (soft   (let ((v (gethash "timeout_seconds" params)))
                               (if (and v (integerp v) (plusp v))
-                                  v *default-eval-timeout*)))
+                                  v (effective-eval-timeout))))
                     (resp   (pool-rpc-with-hard-kill worker
                                                      (format nil "worker/~A" name)
                                                      params
@@ -245,7 +263,7 @@ crash; the object id is no longer valid.")))))
                     (soft   (let ((v (gethash "timeout_seconds" params)))
                               (if (and v (integerp v) (plusp v))
                                   v
-                                  *default-eval-timeout*)))
+                                  (effective-eval-timeout))))
                     (resp   (pool-rpc-with-hard-kill worker "worker/eval" params
                                                      :soft-timeout soft)))
                (result id resp)))))
@@ -273,6 +291,15 @@ crash; the object id is no longer valid.")))))
                                      e
                                      (circuit-breaker-active-remaining-seconds
                                       e))))))
+      (pool-resume-deferred (e)
+        (log-event :warn "dispatch.resume-deferred"
+                   "session" *current-session-id*
+                   "tool" name
+                   "reason" (princ-to-string e))
+        (result id (make-ht "isError" t
+                            "error_type" "resume_deferred"
+                            "content"
+                            (text-content (princ-to-string e)))))
       (pool-shutting-down ()
         (rpc-error id -32000 "Worker pool is shutting down"))
       (pool-capacity-exceeded ()

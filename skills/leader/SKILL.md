@@ -516,6 +516,13 @@ degradation that you put right. Check it at every bring-up, after your own ears:
   host. Skip the rest of this subsection.
 - `service state=alive pid=<p> beat-age=<n> status-age=<n>`: the service is up.
   Read each `bus <name> owner=...` line; `owner=host` is in order.
+- `memory state=<s> hibernated=<n> resident=<n> since=<t> some=<x> available=<y> last-action=<t>`:
+  how the host's memory stands. `state=ok` is in order. `state=pressure` means
+  the service is asking session pools to stop fresh idle hermetic workers and
+  hibernate stateful idle ones; put it in your footer with `since` and
+  `available`. A hibernated worker resumes with its world on its session's next
+  call, so nothing is asked of the sister who owns it. The line never changes
+  the exit status, and a service that predates memory relief prints none.
 - ⛔ **`owner=client` on any bus: restore order.** A client elected that bus's
   broker while the service was not serving it, so some agent's own MCP server is
   carrying a broker, which is the overhead the service exists to remove. Hand
@@ -559,6 +566,15 @@ a second for your identity answers `already-armed`.
 `FLEET ERROR code=service-failed` means the service failed and systemd is
 restarting it; the operator also gets a desktop notification for it. It stays in
 your footer until `--host-status` reads `alive` again.
+Memory relief writes three codes a leader acts on.
+`FLEET WARN code=memory-pressure` says the host entered pressure and relief
+began: note it in your footer until its `recovered` line arrives.
+`FLEET ERROR code=memory-pressure-unrelieved`, or `code=breaker-tripped` whose
+message names memory-pressure, says relief has run out or is running hot:
+carry it to the operator at once, who decides what to park or stop.
+`FLEET ERROR code=worker-resume-failed id=<session>` says a hibernated world
+could not be resumed: tell the sister whose session it was that her in-image
+state is gone (she has already had a reset notice), and report it if it repeats.
 
 ### Can each sister hear you? The reader check, at bring-up and before dispatching
 
@@ -655,8 +671,9 @@ Report to the operator, in this order and nothing else:
    line clears. `parked=1` is a park, not deafness. The watcher's desktop notification covers the
    operator between your replies; the footer is what makes sure he never has to have seen it.
    The footer also carries the host bus service, from `~/.local/bin/dsmr-bus-watch --host-status`
-   (Step 4) at every reply, reduced to three things: every bus that reads `owner=client`, the
-   service line's state and `beat-age`, and any fleet-log line you have not yet seen resolved. On
+   (Step 4) at every reply, reduced to four things: every bus that reads `owner=client`, the
+   service line's state and `beat-age`, the memory line while it reads `state=pressure`, and any
+   fleet-log line you have not yet seen resolved. On
    a host where it reads `not-installed`, leave it out.
 4. What you are doing next.
 

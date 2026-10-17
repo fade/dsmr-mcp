@@ -101,8 +101,8 @@ means whichever one is watching for you.
   pid). The service adopts that watcher within about 5 seconds, so you stay
   heard, but the next arm repeats it until the current binary is installed
   (`make install-bus-watch`).
-- **`--host-status` reports the service**, its buses and its registrations, and
-  needs no identity. `service state=not-installed` means everything here about
+- **`--host-status` reports the service**, how the host's memory stands (its
+  `memory` line), its buses and its registrations, and needs no identity. `service state=not-installed` means everything here about
   the detached watcher applies as written.
 
 ⚠ **A line means CHECK THE BUS, not "one message with this seq is waiting."**

@@ -17,7 +17,13 @@ export XDG_CACHE_HOME ?= $(CURDIR)/.ci-cache
 # whenever the dependencies, the SBCL build, or the project source change.
 CORE ?= dsmr.core
 
-.PHONY: bridge bus-watch bus-host install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify test-warm \
+# Prebuilt worker core image: only the hermetic worker system, its dependencies
+# and Quicklisp. Hermetic workers boot from it instead of loading the system on
+# every spawn. WORKER_CORE_IMAGE is the image `core-verify-worker` checks.
+WORKER_CORE ?= dsmr.core.worker
+WORKER_CORE_IMAGE ?= $(WORKER_CORE)
+
+.PHONY: bridge bus-watch bus-host install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
         install-skills check-skills install-harness check-harness install-sisters check-sisters \
         preflight check-preflight self-test-preflight install-hooks check-hooks
 
@@ -403,6 +409,19 @@ install-harness:
 	done
 	@echo "installed into $(AGENTDIR)"
 
+## TEST_STATE_HOME: the shell prefix that gives a test run its own state.
+##
+##   I run the unit and integration suites under a fresh XDG_STATE_HOME made with mktemp and
+##   removed when the recipe ends, however it ends. The suites start a session
+##   pool, and a pool sweeps state and publishes its worker records under
+##   $XDG_STATE_HOME/dsmr-mcp/host/, which is exactly where a running host
+##   service looks for workers to stop or hibernate. A test run must never be
+##   something the live service acts on. XDG_CACHE_HOME is left alone, so the
+##   fasl cache stays shared between runs.
+TEST_STATE_HOME = state=$$(mktemp -d /tmp/dsmr-test-state.XXXXXX) || exit 1; \
+	trap 'rm -rf "$$state"' EXIT; trap 'exit 130' HUP INT TERM; \
+	XDG_STATE_HOME=$$state; export XDG_STATE_HOME;
+
 ## test: fast in-process unit suite (the push hot-path).
 ##
 ##   Runs the dsmr-mcp/tests umbrella — true in-process units, no child SBCLs.
@@ -413,8 +432,10 @@ install-harness:
 ##   suite loads slynk (a test dependency) which installs a debugger hook, and
 ##   without the wrapper an unhandled :perform error is caught by that hook and
 ##   the process hangs waiting for a debugger connection instead of failing.
+##
+##   Each run gets a fresh state home of its own (TEST_STATE_HOME below).
 test:
-	$(SBCL) --noinform --disable-debugger --non-interactive \
+	$(TEST_STATE_HOME) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests")' \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))'
@@ -422,10 +443,11 @@ test:
 ## test-integration: slow cross-process suite (gated, off the push hot-path).
 ##
 ##   Runs dsmr-mcp/tests/integration — each leaf spawns a real child SBCL and
-##   skips cleanly when none can be spawned. Same CL_SOURCE_REGISTRY and
-##   fail-fast contract as `test`. Run on a schedule / label, not every push.
+##   skips cleanly when none can be spawned. Same CL_SOURCE_REGISTRY,
+##   fail-fast contract and private state home as `test`, because several
+##   leaves start a pool too. Run on a schedule / label, not every push.
 test-integration:
-	$(SBCL) --noinform --disable-debugger --non-interactive \
+	$(TEST_STATE_HOME) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests/integration")' \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests/integration") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))'
@@ -453,6 +475,10 @@ test-integration:
 ##   it, so $(CORE) names a valid image at every instant: the final rename
 ##   replaces one complete file with another and there is no window where the
 ##   path is missing. Rollback is `mv $(CORE).prev $(CORE)`.
+##
+##   Once $(CORE) is installed it builds the worker core too (core-worker), so a
+##   worker core that fails to build or verify does so after $(CORE) is already
+##   in place and cannot touch it.
 core:
 	@rm -f "$(CORE).tmp" "$(CORE).tmp.manifest"
 	DSMR_CORE_OUTPUT=$(CORE).tmp $(SBCL) --noinform --disable-debugger \
@@ -467,6 +493,7 @@ core:
 	@mv -f "$(CORE).tmp.manifest" "$(CORE).manifest"
 	@echo "installed $(CORE) (previous image kept as $(CORE).prev)"
 	@echo "running servers keep the previous core until each restarts"
+	@$(MAKE) --no-print-directory core-worker
 
 ## core-verify: boot a core image and assert it is a complete, working build.
 ##
@@ -492,12 +519,58 @@ core-verify:
 	@$(SBCL) --core "$(CORE_IMAGE)" --noinform --disable-debugger --non-interactive \
 	     --load scripts/verify-core.lisp
 
+## core-worker: build the hermetic worker core image ($(WORKER_CORE)).
+##
+##   A hermetic worker booted from this image reaches its handshake in well
+##   under a second instead of loading the worker system from source on every
+##   spawn, and every worker on the host shares the image's pages. That spawn
+##   cost was the only reason to keep a warm standby worker around.
+##
+##   The image holds the worker system, its dependencies and Quicklisp, and no
+##   test systems: a worker image that carried them would carry them into every
+##   image a worker saves. It is built with --no-userinit so nothing from a
+##   personal init file is frozen into it, and core-verify-worker refuses an
+##   image that holds a setting taken from the build host's environment.
+##
+##   Same staged, verified, atomic install as `core`: build to .tmp, boot the
+##   staged image and check it from the inside, keep the outgoing image as
+##   .prev by hard link, then rename into place. A failed build or a rejected
+##   image leaves the installed worker core untouched. `make core` runs this
+##   after it has installed $(CORE); run on its own, this target never touches
+##   $(CORE).
+core-worker:
+	@rm -f "$(WORKER_CORE).tmp" "$(WORKER_CORE).tmp.manifest"
+	DSMR_CORE_KIND=worker DSMR_CORE_OUTPUT=$(WORKER_CORE).tmp $(SBCL) --noinform --disable-debugger \
+	     --no-userinit --non-interactive --load scripts/build-core.lisp
+	@test -s "$(WORKER_CORE).tmp" || { echo "worker core build produced no image; $(WORKER_CORE) left untouched" >&2; exit 1; }
+	@test -s "$(WORKER_CORE).tmp.manifest" || { echo "worker core build produced no manifest; $(WORKER_CORE) left untouched" >&2; exit 1; }
+	@$(MAKE) --no-print-directory core-verify-worker WORKER_CORE_IMAGE="$(WORKER_CORE).tmp"
+	@rm -f "$(WORKER_CORE).prev" "$(WORKER_CORE).manifest.prev"
+	@if [ -e "$(WORKER_CORE)" ]; then ln "$(WORKER_CORE)" "$(WORKER_CORE).prev" 2>/dev/null || cp -p "$(WORKER_CORE)" "$(WORKER_CORE).prev"; fi
+	@if [ -e "$(WORKER_CORE).manifest" ]; then ln "$(WORKER_CORE).manifest" "$(WORKER_CORE).manifest.prev" 2>/dev/null || cp -p "$(WORKER_CORE).manifest" "$(WORKER_CORE).manifest.prev"; fi
+	@mv -f "$(WORKER_CORE).tmp" "$(WORKER_CORE)"
+	@mv -f "$(WORKER_CORE).tmp.manifest" "$(WORKER_CORE).manifest"
+	@echo "installed $(WORKER_CORE) (previous image kept as $(WORKER_CORE).prev)"
+
+## core-verify-worker: boot a worker core image and assert it is fit for workers.
+##
+##   Run by `make core-worker` against the staged image before it is installed.
+##   Checks from inside the image that the worker entry point is there, that no
+##   test system and no environment-derived setting is, and that Quicklisp can
+##   still find a system. Useful on its own against the installed image or any
+##   other (`make core-verify-worker WORKER_CORE_IMAGE=some.core`).
+core-verify-worker:
+	@test -s "$(WORKER_CORE_IMAGE)" || { echo "no worker core image at $(WORKER_CORE_IMAGE)" >&2; exit 1; }
+	@$(SBCL) --core "$(WORKER_CORE_IMAGE)" --noinform --disable-debugger --non-interactive \
+	     --no-userinit --load scripts/verify-core-worker.lisp
+
 ## test-warm: run the fast suite against the prebuilt core ($(CORE)).
 ##
 ##   Skips the Quicklisp load and the recompile entirely — the core already
 ##   holds dsmr-mcp + the test leaves — so only the assertions run. Build the
 ##   core first with `make core`. `make test` remains the no-core load path and
-##   works whether or not a core is present.
+##   works whether or not a core is present. Like `test`, each run gets a fresh
+##   state home of its own (TEST_STATE_HOME).
 test-warm:
-	$(SBCL) --core $(CORE) --noinform --disable-debugger --non-interactive \
+	$(TEST_STATE_HOME) $(SBCL) --core $(CORE) --noinform --disable-debugger --non-interactive \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))'

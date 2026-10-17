@@ -5,6 +5,23 @@
 
 Fixes on =main= after the v0.1.0 tag, ahead of the next release:
 
+- *Hermetic workers boot from a core and survive memory pressure.* A hermetic
+  worker now boots from its own prebuilt image, =dsmr.core.worker=, in about a
+  tenth of a second, so the pool keeps no warm standby: a worker starts on a
+  session's first hermetic call (=DSMR_WORKER_POOL_WARMUP= now defaults to 0 and
+  is still honoured when set). =make core= builds the worker image after
+  =dsmr.core=, and the launcher keeps it fresh. A worker is held for as long as
+  its session lives and is never reaped for being idle. When the host runs short
+  of memory, the host bus service asks a pool to stop a fresh idle worker or to
+  hibernate a stateful one: its whole Lisp world is saved to disk and resumed,
+  intact, on the session's next call. =pool-status= shows hibernated workers and
+  why a hibernation was refused, =--host-status= prints a =memory= line, and the
+  fleet error log reports pressure no idle worker can relieve. Pool and worker
+  settings are now read when the server starts, so a server booted from a
+  prebuilt image honours its environment. The memory-pressure thresholds
+  (seven =DSMR_PRESSURE_*= settings) are unmeasured starting points that I will
+  retune once they have been measured on a host running a full fleet. See
+  [[file:operations.org][Operations]] and [[file:configuration.org][Configuration]].
 - *Agent coordination bus.* A new single-host message bus lets several agents —
   one per Lisp project, plus subagents — coordinate through a durable,
   broker-mediated log. Three verbs (=bus-publish=, =bus-receive=, =bus-status=)

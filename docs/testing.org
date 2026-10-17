@@ -51,6 +51,36 @@ The cost of a full run lives almost entirely in that integration system's
 process spawning; keeping it off the push hot-path is what makes the fast suite
 fast.
 
+** A state home of its own for each unit run
+
+=make test= and =make test-warm= run under a fresh =XDG_STATE_HOME= made for
+the run and removed when it ends, however it ends. Several unit leaves start a
+session pool, and a pool publishes a record of its workers where the host bus
+service looks for workers to stop or hibernate. A test run must never be
+something a live service on your machine acts on. The fasl cache is shared
+between runs as before.
+
+** Hermetic workers from the worker core
+
+Integration leaves that need workers booted from the worker core get one from
+the fixture =worker-core-for-tests= in =tests/integration/support.lisp=. It
+builds a worker core from this tree into a scratch directory once per test
+process, removes it when the process exits, and never touches the
+=dsmr.core.worker= in the checkout. A leaf that cannot get a core skips and says
+why, through =with-worker-core-or-skip=. The build takes about ten seconds on a
+warm fasl cache; to skip it while iterating, build one yourself and point
+=DSMR_TEST_WORKER_CORE= at it:
+
+#+begin_src sh
+make core-worker WORKER_CORE=/tmp/my-worker.core
+DSMR_TEST_WORKER_CORE=/tmp/my-worker.core make test-integration
+#+end_src
+
+The leaves that save and resume worlds (=worker-hibernate-test=,
+=pool-hibernate-test=, =pool-resume-test=, =pool-requests-test= and the end to
+end =pressure-relief-test=) spawn real workers and live in
+=make test-integration= only; =make test= never hibernates anything.
+
 * Pinned SBCL build, and why it matters
 
 CI pins the SBCL build to the upstream prebuilt binary (=sbcl-bin/2.5.5=). That
@@ -106,6 +136,7 @@ Development box:
 | Cold fast suite (empty cache) | =make test= | ~2 min 33 s | 1364 pass / 0 fail |
 | Warm fast suite (core image) | =make test-warm= | ~1 min 25 s | 1364 pass / 0 fail |
 | Core image build | =make core= | ~14 s (warm) | 175 MB =dsmr.core= |
+| Worker core build | =make core-worker= | ~12 s (warm fasl cache) | 149 MB =dsmr.core.worker= |
 
 CI runner (observed on the first pull-request run):
 

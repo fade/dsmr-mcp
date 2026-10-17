@@ -14,6 +14,17 @@
 ;;;; others, and what cannot be healed reaches the fleet error log a leader
 ;;;; watches.
 ;;;;
+;;;; The service also decides when the host gives memory back. It already comes
+;;;; round once a second for every agent, so it reads the host's memory on the
+;;;; same beat and, under pressure, asks the session pools to stop or hibernate
+;;;; their idle workers, one worker at a time, a fresh one before a stateful
+;;;; one, and never two at once, so the saving itself never deepens the
+;;;; shortage. It asks through files beside the pools' worker records and acts
+;;;; only on records of servers that are still running; once a minute it sweeps
+;;;; away the cores, records and requests of servers that have gone. Pressure,
+;;;; its relief and pressure nothing can relieve all reach the fleet log, and
+;;;; the status summary says how memory stands.
+;;;;
 ;;;; Every duty is a function of the time it is handed, so one tick can be run in
 ;;;; a test against a clock the test chooses. The loop around it is the only
 ;;;; place that reads the wall clock, and the only place that converts between
@@ -41,7 +52,13 @@
                     (#:ident #:dsmr-bus-host/src/bus/host/identity)
                     (#:registry #:dsmr-bus-host/src/bus/host/registry)
                     (#:buswatch #:dsmr-bus-host/src/bus/host/buswatch)
-                    (#:brokers #:dsmr-bus-host/src/bus/host/brokers))
+                    (#:brokers #:dsmr-bus-host/src/bus/host/brokers)
+                    (#:memory #:dsmr-bus-host/src/bus/host/memory)
+                    (#:pool-records #:dsmr-mcp/src/hermetic/pool-records))
+  (:import-from #:dsmr-bus-host/src/bus/host/conditions
+                #:memory-pressure
+                #:memory-pressure-unrelieved
+                #:request-hibernation)
   (:import-from #:dsmr-bus-watch/src/bus/watch
                 #:%unix-time)
   (:export
@@ -81,6 +98,35 @@
   "Seconds the supervisor loop may go without coming round before the service
    ends itself so that it is restarted.")
 
+(defconstant +memory-action-spacing+ 2
+  "Seconds that must pass after a pool was asked to give memory back before
+   another pool, or the same one, is asked again. Saving a world costs memory
+   for a moment, so two saves at once could deepen the very shortage they are
+   meant to relieve.")
+
+(defconstant +memory-request-timeout+ 300
+  "Seconds a request may wait for its pool to answer before it is taken back,
+   so a pool that stopped listening cannot hold up relief for every other.")
+
+(defconstant +unanswered-backoff-seconds+ 300
+  "Seconds a pool whose request was withdrawn unanswered is passed over, so
+   relief moves on to other pools instead of asking the same silent one
+   again at once.")
+
+(defconstant +record-max-age+ 30
+  "Seconds after which a pool's worker record is too old to act on. A pool
+   that is listening rewrites its record at least every five seconds, so one
+   this old belongs to a pool that has stopped listening, whatever its
+   server's process says, and nothing is asked of it.")
+
+(defconstant +unrelieved-seconds+ 60
+  "Seconds pressure may last with no worker left to ask before it is reported
+   as unrelieved, for a leader to act on.")
+
+(defconstant +owner-sweep-seconds+ 60
+  "Seconds between sweeps of the cores, worker records and requests that
+   servers which have gone left behind.")
+
 (defparameter *tick-seconds* 0.25
   "How long the supervisor loop sleeps between ticks. Registrations are scanned
    on every tick.")
@@ -106,12 +152,11 @@ not start, 75 when its supervisor loop stalled.
 
 ;;; ---------------------------------------------------------------- the service
 
-(defstruct (service (:constructor make-service
-                        (&key (pid (sb-posix:getpid))
-                              (report-fn #'ident:report-to-logs)
-                              (feed-p t)
+(defstruct (service (:constructor %make-service
+                        (&key pid report-fn feed-p memory-reader memory-thresholds
+                              memory-threshold-warnings
                          &aux (registry (registry:make-registry :service-pid pid)))))
-  "One running host service.
+  "One running host service. Made by MAKE-SERVICE.
 
    PID is the pid its records name and REGISTRY the agents it serves. MUTEX is
    held whenever those agents are changed or handed records, by the supervisor
@@ -123,7 +168,20 @@ not start, 75 when its supervisor loop stalled.
    second and once every five seconds duties last ran, in Unix seconds.
    SCANNED says the registrations have been read once, READY-P that systemd
    has been told the service is ready. STOPPING asks every thread to end;
-   STOPPED says the orderly stop has run. LOCK-FD holds the service lock."
+   STOPPED says the orderly stop has run. LOCK-FD holds the service lock.
+
+   MEMORY-READER returns the host's memory readings when called with no
+   arguments. MEMORY-THRESHOLDS say where pressure starts and stops, and
+   MEMORY-THRESHOLD-WARNINGS are what was wrong with the environment they were
+   read from, until they have been reported. MEMORY-STATE is where the
+   classifier stands, MEMORY-SINCE when the current verdict began and
+   LAST-MEMORY-SUMMARY the last verdict with the readings behind it.
+   LAST-MEMORY-ACTION is when a pool was last asked to give memory back,
+   UNANSWERING maps the stem of each pool whose request was withdrawn
+   unanswered to when that happened, so the pool is passed over for a while,
+   UNRELIEVED-REPORTED-P says this episode of pressure has been reported as
+   unrelieved, and LAST-OWNER-SWEEP is when gone servers' files were last
+   swept. All times are Unix seconds."
   pid
   registry
   (mutex (sb-thread:make-mutex :name "host service"))
@@ -138,7 +196,38 @@ not start, 75 when its supervisor loop stalled.
   (ready-p nil)
   (stopping nil)
   (stopped nil)
-  lock-fd)
+  lock-fd
+  memory-reader
+  memory-thresholds
+  memory-threshold-warnings
+  (memory-state (memory:make-memory-state))
+  (memory-since nil)
+  (last-memory-summary nil)
+  (last-memory-action nil)
+  (unanswering (make-hash-table :test 'equal))
+  (unrelieved-reported-p nil)
+  (last-owner-sweep nil))
+
+(defun make-service (&key (pid (sb-posix:getpid))
+                          (report-fn #'ident:report-to-logs)
+                          (feed-p t)
+                          (memory-reader #'memory:read-memory-readings)
+                          memory-thresholds)
+  "A host service for the process PID that reports through REPORT-FN, its bus
+   readers subscribing to the brokers' publications when FEED-P is true.
+
+   MEMORY-READER is called once a second for the host's memory. The pressure
+   thresholds are MEMORY-THRESHOLDS when given, else read from the environment
+   here, once; what the environment got wrong is reported on the first memory
+   check, through REPORT-FN like every other finding."
+  (multiple-value-bind (thresholds warnings)
+      (if memory-thresholds
+          (values memory-thresholds '())
+          (memory:thresholds-from-environment))
+    (%make-service :pid pid :report-fn report-fn :feed-p feed-p
+                   :memory-reader memory-reader
+                   :memory-thresholds thresholds
+                   :memory-threshold-warnings warnings)))
 
 (defmacro with-service-lock ((svc) &body body)
   "Run BODY holding SVC's mutex, the one the bus readers hold while they hand
@@ -322,6 +411,243 @@ not start, 75 when its supervisor loop stalled.
                       :bus bus :subject (%subject bus)))
              (service-brokers svc))))
 
+(defun %live-worker-records (svc &key prune)
+  "The worker records the pools of live servers have published, as plists.
+
+   A record is read only when the server its file name names is still the
+   process it was, and used only when the server named inside agrees with that
+   name, so nothing is ever asked of a server on the strength of a record filed
+   under another's name. With PRUNE, a gone server's record is removed and a
+   record that disagrees with its name is reported; without it, both are only
+   passed over."
+  (let ((report-fn (service-report-fn svc))
+        (records '()))
+    (dolist (stem (pool-records:worker-record-stems) (nreverse records))
+      (multiple-value-bind (pid start) (pool-records:parse-server-stem stem)
+        (if (not (hostfiles:process-matches-p pid start))
+            (when (and prune (pool-records:remove-worker-record stem))
+              (funcall report-fn :info "worker-record-swept" :subject stem
+                       :msg (format nil "server ~A is gone; its worker record was removed"
+                                    stem)))
+            (multiple-value-bind (plist status)
+                (pool-records:read-worker-record (pool-records:worker-record-path stem))
+              (cond ((not (eq status :ok)))
+                    ((and (eql (getf plist :server-pid) pid)
+                          (eql (getf plist :server-start) start))
+                     (push plist records))
+                    (prune
+                     (funcall report-fn :warn "worker-record-mismatch" :subject stem
+                              :msg (format nil "the record filed as ~A names server ~A-~A; ~
+                                                nothing is asked on its strength"
+                                           stem (getf plist :server-pid)
+                                           (getf plist :server-start)))))))))))
+
+(defun %worker-counts (records)
+  "The hibernated and the resident workers in RECORDS, as two values."
+  (let ((hibernated 0) (resident 0))
+    (dolist (record records)
+      (dolist (worker (getf record :workers))
+        (when (listp worker)
+          (if (eq (getf worker :state) :hibernated)
+              (incf hibernated)
+              (incf resident)))))
+    (values hibernated resident)))
+
+(defun %report-threshold-warnings (svc)
+  "Report, once, each pressure threshold the environment set to something the
+   service cannot use, so a mistyped setting is seen rather than quietly
+   replaced by its default."
+  (let ((warnings (service-memory-threshold-warnings svc)))
+    (setf (service-memory-threshold-warnings svc) '())
+    (dolist (text warnings)
+      (funcall (service-report-fn svc) :warn "memory-threshold-ignored"
+               :subject (subseq text 0 (or (position #\= text) (length text)))
+               :msg text))))
+
+(defun %standing-requests (svc now)
+  "The requests still waiting for a live pool at NOW, as (path . plist).
+
+   A request whose server has gone is removed. One left unanswered for longer
+   than the request timeout is withdrawn and reported, because its pool has
+   stopped listening and would otherwise hold up relief for every other; that
+   pool is then remembered as not answering."
+  (let ((report-fn (service-report-fn svc))
+        (standing '()))
+    (dolist (entry (pool-records:pending-requests) (nreverse standing))
+      (destructuring-bind (path . plist) entry
+        (let ((name (file-namestring path))
+              (at (getf plist :requested-at)))
+          (cond ((not (hostfiles:process-matches-p (getf plist :server-pid)
+                                                   (getf plist :server-start)))
+                 (when (pool-records:remove-request path)
+                   (funcall report-fn :info "hibernate-request-swept" :subject name
+                            :msg "its server is gone; the request was removed")))
+                ((or (null at) (> (- now at) +memory-request-timeout+))
+                 (pool-records:remove-request path)
+                 (setf (gethash (format nil "~D-~D" (getf plist :server-pid)
+                                        (getf plist :server-start))
+                                (service-unanswering svc))
+                       now)
+                 (funcall report-fn :warn "memory-request-stale" :subject name
+                          :msg (format nil "no answer within ~D s; the request was withdrawn ~
+                                            and its pool is passed over for ~D s"
+                                       +memory-request-timeout+
+                                       +unanswered-backoff-seconds+)))
+                (t (push entry standing))))))))
+
+(defun %answering-records (svc records now)
+  "The RECORDS of pools that may be asked for relief at NOW, and how many pools
+   were passed over, as two values.
+
+   A pool is passed over while its record is older than the record age limit,
+   or carries no time, because a pool that listens rewrites its record every
+   few seconds; and for a while after one of its requests was withdrawn
+   unanswered. One pool that has stopped answering, with its server still
+   running, then never holds up relief for the rest of the host."
+  (let ((unanswering (service-unanswering svc))
+        (kept '())
+        (skipped 0))
+    (maphash (lambda (stem at)
+               (when (>= (- now at) +unanswered-backoff-seconds+)
+                 (remhash stem unanswering)))
+             unanswering)
+    (dolist (record records)
+      (let ((written (getf record :written-at))
+            (stem (format nil "~D-~D" (getf record :server-pid)
+                          (getf record :server-start))))
+        (if (or (not (realp written))
+                (> (- now written) +record-max-age+)
+                (gethash stem unanswering))
+            (incf skipped)
+            (push record kept))))
+    (values (nreverse kept) skipped)))
+
+(defun %relieve-pressure (svc now)
+  "Ask one pool to give memory back, when that may be done at NOW, and return
+   what was done: :REQUESTED, :IN-FLIGHT, :SPACED, or NIL when nothing was
+   asked.
+
+   Nothing is asked while any request stands anywhere on the host, nor within
+   the action spacing of the last request. Otherwise the first candidate among
+   the workers of live servers whose pools are answering is asked for,
+   through the memory-pressure fault, so the healing table's breaker bounds
+   how often the service acts however long the pressure lasts. A pool that
+   has stopped answering is passed over (%answering-records), so relief moves
+   on to the others. With no candidate, pressure that has lasted past the
+   unrelieved limit is reported once for the episode, saying how many pools
+   were passed over."
+  (when (%standing-requests svc now)
+    (return-from %relieve-pressure :in-flight))
+  (unless (%due-p (service-last-memory-action svc) now +memory-action-spacing+)
+    (return-from %relieve-pressure :spaced))
+  (let* ((thresholds (service-memory-thresholds svc))
+         (records (%live-worker-records svc :prune t))
+         (since (memory:memory-state-since (service-memory-state svc))))
+    (multiple-value-bind (answering passed-over) (%answering-records svc records now)
+      (let ((candidate (first (memory:rank-candidates
+                               answering now
+                               :min-kill-age (memory:memory-thresholds-min-kill-age-seconds
+                                              thresholds)))))
+        (cond
+          (candidate
+           (let ((stem (getf candidate :stem))
+                 (id (getf candidate :worker-id))
+                 (action (getf candidate :action)))
+             (restart-case
+                 (progn
+                   (conditions:raise-fault 'memory-pressure
+                                           :subject "host"
+                                           :detail (format nil "~(~A~) worker ~D of server ~A"
+                                                           action id stem))
+                   nil)
+               (request-hibernation ()
+                 :report "Ask the owning pool to hibernate or stop one idle worker."
+                 (pool-records:write-hibernate-request stem id action
+                                                       :now now :reason "memory-pressure")
+                 (setf (service-last-memory-action svc) now)
+                 :requested))))
+          ((and (not (service-unrelieved-reported-p svc))
+                since
+                (> (- now since) +unrelieved-seconds+))
+           (setf (service-unrelieved-reported-p svc) t)
+           (multiple-value-bind (hibernated resident) (%worker-counts records)
+             (conditions:raise-fault 'memory-pressure-unrelieved
+                                     :subject "host"
+                                     :detail (format nil "short of memory for ~D s with no idle ~
+                                                          worker left to ask; ~D resident, ~
+                                                          ~D hibernated~[~:;; ~:*~D pool~:P ~
+                                                          not answering~]"
+                                                     (- now since) resident hibernated
+                                                     passed-over)))
+           nil))))))
+
+(defun %check-memory (svc now)
+  "Read the host's memory at NOW, in Unix seconds, decide whether it is under
+   pressure, and while it is, ask one pool at a time to give memory back.
+   Returns the verdict, :OK or :PRESSURE.
+
+   Entering pressure is reported at WARN with the readings that showed it, and
+   leaving it writes the recovered line that closes the episode. The first
+   check also reports any threshold the environment set to something
+   unusable. Run under the healing protocol, as the supervisor runs it, since
+   relief is asked for by raising a fault."
+  (%report-threshold-warnings svc)
+  (let ((readings (funcall (service-memory-reader svc)))
+        (before (memory:memory-state-verdict (service-memory-state svc))))
+    (multiple-value-bind (verdict state)
+        (memory:classify-memory readings (service-memory-state svc) now
+                                (service-memory-thresholds svc))
+      (let* ((some (memory:memory-readings-some-avg10 readings))
+             (available (memory:available-fraction readings))
+             (percent (and available (round (* 100 available)))))
+        (setf (service-memory-state svc) state
+              (service-last-memory-summary svc) (list :state verdict
+                                                      :some-avg10 some
+                                                      :available-percent percent))
+        (when (or (null (service-memory-since svc)) (not (eq verdict before)))
+          (setf (service-memory-since svc) now))
+        (cond ((and (eq verdict :pressure) (eq before :ok))
+               (funcall (service-report-fn svc) :warn "memory-pressure" :subject "host"
+                        :msg (format nil "the host is short of memory: some avg10=~
+                                          ~:[-~;~:*~,1F~] available=~:[-~;~:*~D%~]"
+                                     some percent)))
+              ((and (eq verdict :ok) (eq before :pressure))
+               (fleetlog:fleet-recovered "memory-pressure" :subject "host")
+               (when (service-unrelieved-reported-p svc)
+                 (fleetlog:fleet-recovered "memory-pressure-unrelieved" :subject "host"))
+               (setf (service-unrelieved-reported-p svc) nil)))
+        (when (eq verdict :pressure)
+          (%relieve-pressure svc now))
+        verdict))))
+
+(defun %sweep-owners (svc now)
+  "Once every owner-sweep interval, remove what servers that have gone left
+   behind: hibernated cores, worker records and requests. A pool clears its
+   own files when it stops; this catches every pool that never got to."
+  (when (%due-p (service-last-owner-sweep svc) now +owner-sweep-seconds+)
+    (setf (service-last-owner-sweep svc) now)
+    (%duty svc "owner-sweep"
+           (lambda ()
+             (pool-records:sweep-dead-owners :report-fn (service-report-fn svc)))
+           :subject "host")))
+
+(defun %memory-summary (svc)
+  "How memory stands, for the status summary: the verdict and since when, the
+   readings behind it, the hibernated and resident workers of live servers,
+   and when a pool was last asked to give memory back. Times are universal
+   time, as everywhere else in the summary."
+  (let ((summary (service-last-memory-summary svc))
+        (since (service-memory-since svc))
+        (last (service-last-memory-action svc)))
+    (multiple-value-bind (hibernated resident) (%worker-counts (%live-worker-records svc))
+      (list :state (or (getf summary :state) :unknown)
+            :since (and since (+ since +unix-epoch+))
+            :some-avg10 (getf summary :some-avg10)
+            :available-percent (getf summary :available-percent)
+            :hibernated hibernated
+            :resident resident
+            :last-action (and last (+ last +unix-epoch+))))))
+
 (defun %ready-now-p (svc)
   "True once the registrations have been read and every bus's broker serves
    its bus or has recorded that a broker a client elected holds it."
@@ -401,28 +727,32 @@ not start, 75 when its supervisor loop stalled.
 (defun %write-status (svc now)
   "Write the status summary --host-status reads: the service's pid, when it was
    written (universal time), each bus with its owner, each registration with
-   its state, and the gaps between each bus's roster and its registrations."
+   its state, the gaps between each bus's roster and its registrations, and
+   how memory stands."
   (let* ((buses (%served-buses svc))
          (findings (%duty svc "roster"
                           (lambda ()
                             (with-service-lock (svc)
                               (registry:roster-gap-findings
                                (service-registry svc) buses #'%roster-dir
-                               :report-fn (service-report-fn svc)))))))
+                               :report-fn (service-report-fn svc))))))
+         (memory (%duty svc "memory-status" (lambda () (%memory-summary svc))
+                        :subject "host")))
     (%duty svc "status"
            (lambda ()
              (hostfiles:ensure-host-dir)
              (hostfiles:write-plist-file
               (hostfiles:service-status-path)
-              (list :pid (service-pid svc)
-                    :written-at (+ now +unix-epoch+)
-                    :buses (loop for bus in buses
-                                 collect (brokers:bus-broker-snapshot
-                                          (gethash bus (service-brokers svc))
-                                          (service-pid svc)))
-                    :registrations (with-service-lock (svc)
-                                     (registry:registry-snapshot (service-registry svc)))
-                    :findings (if (listp findings) findings '())))))))
+              (list* :pid (service-pid svc)
+                     :written-at (+ now +unix-epoch+)
+                     :buses (loop for bus in buses
+                                  collect (brokers:bus-broker-snapshot
+                                           (gethash bus (service-brokers svc))
+                                           (service-pid svc)))
+                     :registrations (with-service-lock (svc)
+                                      (registry:registry-snapshot (service-registry svc)))
+                     :findings (if (listp findings) findings '())
+                     (and (listp memory) memory (list :memory memory))))))))
 
 (defun %due-p (last now interval)
   "True when a duty last run at LAST is due again at NOW."
@@ -432,25 +762,29 @@ not start, 75 when its supervisor loop stalled.
   "Do SVC's duties for one tick at NOW, in Unix seconds, and return SVC.
 
    Every tick reads the registrations. Once every five seconds the service
-   takes over any detached watcher left running and looks for buses to serve,
-   starting a broker and a reader for each new one. Once a second it refreshes
-   its beat, looks at every agent's session and does every agent's duties,
-   checks every broker, and tells systemd it is ready and alive. Last, it
-   writes its status summary, every five seconds and also on the tick it
-   becomes ready, so the summary never says a bus is unserved for five seconds
-   after it is served. The first tick does all of it."
+   takes over any detached watcher left running, looks for buses to serve,
+   starting a broker and a reader for each new one, and, when a minute has
+   passed since it last did, removes what servers that have gone left behind.
+   Once a second it refreshes its beat, looks at every agent's session and
+   does every agent's duties, checks every broker, reads the host's memory and
+   relieves pressure one worker at a time, and tells systemd it is ready and
+   alive. Last, it writes its status summary, every five seconds and also on
+   the tick it becomes ready, so the summary never says a bus is unserved for
+   five seconds after it is served. The first tick does all of it."
   (let ((five (%due-p (service-last-five svc) now 5))
         (second (%due-p (service-last-second svc) now 1))
         (was-ready (service-ready-p svc)))
     (%scan-registrations svc now)
     (when five
       (%adopt svc now)
-      (%discover svc))
+      (%discover svc)
+      (%sweep-owners svc now))
     (when second
       (setf (service-last-second svc) now)
       (%duty svc "beat" (lambda () (%write-beat now)))
       (%tick-identities svc now)
       (%check-brokers svc now)
+      (%duty svc "memory" (lambda () (%check-memory svc now)) :subject "host")
       (%tell-systemd svc now))
     (when five
       (setf (service-last-five svc) now))

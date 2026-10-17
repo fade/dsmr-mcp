@@ -34,6 +34,9 @@
   (:local-nicknames (#:jzon #:com.inuoe.jzon))
   (:import-from #:dsmr-mcp/src/tools/status-fields
                 #:field-contract-violations)
+  ;; Loads the verb itself, so the leaf registers the tool it drives when it
+  ;; is run on its own and not only inside the whole suite.
+  (:import-from #:dsmr-mcp/src/tools/backend-status)
   (:import-from #:dsmr-mcp/src/dispatch
                 #:handle-tools-call)
   (:import-from #:dsmr-mcp/src/tools/helpers

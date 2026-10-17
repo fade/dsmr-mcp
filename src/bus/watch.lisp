@@ -1363,7 +1363,11 @@ detached watcher, its pid file.
    service is down. A degraded record is laid over the summary's bus list
    because the summary is only rewritten every few seconds and a leader acting
    on an older summary would hand back a bus that is already degraded again,
-   or miss one that just became so."
+   or miss one that just became so.
+
+   A memory line follows the service line when the summary says how memory
+   stands. Memory pressure is reported, never failed on: the status still
+   depends only on the service being alive and no bus being degraded."
   (unless (hostfiles:service-installed-p)
     (return-from %host-status-lines
       (values (list "service state=not-installed pid=- beat-age=-") 0)))
@@ -1400,6 +1404,18 @@ detached watcher, its pid file.
                            (%status-token beat-age)
                            (%status-token (and (integerp written)
                                                (max 0 (- now written))))))
+             (let ((memory (getf snapshot :memory)))
+               (when (and memory (listp memory))
+                 (list (format nil "memory state=~A hibernated=~A resident=~A since=~A ~
+                                    some=~A available=~A last-action=~A"
+                               (%status-token (getf memory :state))
+                               (%status-token (getf memory :hibernated))
+                               (%status-token (getf memory :resident))
+                               (%status-token (%status-epoch (getf memory :since)))
+                               (%status-token (getf memory :some-avg10))
+                               (%status-token (getf memory :available-percent))
+                               (%status-token (%status-epoch
+                                               (getf memory :last-action)))))))
              (loop for (name . entry) in buses
                    collect (format nil "bus ~A owner=~A incumbent=~A degraded-since=~A"
                                    (%status-token name)
