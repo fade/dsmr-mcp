@@ -15,12 +15,12 @@ See also: [[file:index.org][Manual]], [[file:../CONTRIBUTING.md][Contributing]],
 Whoever makes a change writes about it in their own first person: I explain my decisions as "I",
 and I ask the same of you. The job a sentence does decides its grammatical person:
 
-| The sentence                     | Person                          | Example                                                                                         |
-|----------------------------------+---------------------------------+-------------------------------------------------------------------------------------------------|
+| The sentence                     | Person                            | Example                                                                                            |
+|----------------------------------+-----------------------------------+----------------------------------------------------------------------------------------------------|
 | explains a decision or a reason  | first person, the change's author | "I made enumeration signal because a caller could not tell an empty store from an unreadable one." |
-| tells you what you do or get     | second person                   | "Pass it a store it cannot read and you get a condition, not an empty list."                     |
-| describes what the software does | third person, present tense     | "The server sends an acknowledgment."                                                            |
-| explains how the code works      | none: the code already shows it | "Wraps the call in a handler, logs the error, and returns NIL." (leave this out)            |
+| tells you what you do or get     | second person                     | "Pass it a store it cannot read and you get a condition, not an empty list."                       |
+| describes what the software does | third person, present tense       | "The server sends an acknowledgment."                                                              |
+| explains how the code works      | none: the code already shows it   | "Wraps the call in a handler, logs the error, and returns NIL." (leave this out)                   |
 
 - Write what a change does and why, not how it is implemented. The diff already shows how, and a
   prose account of it stays plausible long after a refactor has made it wrong.
