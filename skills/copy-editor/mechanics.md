@@ -4,9 +4,10 @@ A reference for the copy-editor, read after SKILL.md and `stock-patterns.md`. Sa
 prose in work product (README, docs, docstrings and comments, commit, PR, issue and review text).
 Agent-facing files are out of scope.
 
-**Precedence (operator, 2026-10-17):** house rules > Google developer documentation style guide > other
-guides (USU's engineering standards were the comparison point). Every Google position below was read
-from its page on 2026-10-17; do not attribute anything else to Google without reading it.
+**Precedence (operator, 2026-10-17):** house rules (including Canadian spelling, section 12) >
+Google developer documentation style guide > other guides (USU's engineering standards were the
+comparison point). Every Google position below was read from its page on 2026-10-17; do not
+attribute anything else to Google without reading it.
 
 **Counting:** unlike stock patterns, these are consistency and correctness findings: report every
 instance, except sentence length, which is a heuristic (section 11).
@@ -103,6 +104,25 @@ identifier is never renamed by you; raise it as a question.
 - Flag a sentence over about 30 words in a procedure or reference page, and a paragraph carrying more
   than one idea. Do not flag length in a commit body or design rationale when the sentence carries one
   connected argument; splitting it into fragments is the stock-pattern defect instead.
+
+## 12. Spelling: Canadian (house rule)
+
+**Canadian spelling, in general** (operator, 2026-10-17). It is the author's own spelling, so US forms
+are the ones he is likely to miss; Google's US spelling is overridden here. Canadian is not British:
+
+- **-our, -re, -ce nouns:** colour, behaviour, favour, neighbour; centre, metre (the unit; a gas
+  meter is still a meter), fibre; defence,
+  offence; licence and practice as nouns, license and practise as verbs ("a licence file"; "licensed
+  under the AGPL").
+- **-ize, not -ise:** organize, recognize, realize, normalize (the Canadian Oxford Dictionary's
+  preference). **-yze or -yse:** both are Canadian (the Language Portal of Canada notes a trend to
+  -yze); accept either, never both in one document.
+- **Doubled l before a suffix:** travelled, modelling, cancelled, labelled.
+- **Others:** cheque, grey, catalogue, dialogue; "program" for both software and a schedule.
+- ⚠ **Names keep their spelling.** A code identifier, keyword, filename, API field, CSS property,
+  command or quoted output is never respelled: `:license` in an `.asd`, `LICENSE`, `color:`,
+  `normalize-path`. Prose that chooses the word is the finding; quoting a name is not.
+- Report every US form in prose, and every instance of mixed spelling within one document.
 
 ## Enforcement
 
