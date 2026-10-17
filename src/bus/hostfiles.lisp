@@ -723,9 +723,11 @@
   "The delivered position recorded under STEM, as a non-negative integer, or
    NIL.
 
-   NIL when the file is absent or unreadable, when :SEQ is not a non-negative
-   integer, or when GENERATION is given and differs from the recorded
-   :GENERATION: a position in a rotated log says nothing about the new one."
+   NIL when:
+     - the file is absent or unreadable;
+     - :SEQ is not a non-negative integer;
+     - GENERATION is given and differs from the recorded :GENERATION, since a
+       position in a rotated log says nothing about the new one."
   (multiple-value-bind (plist status) (read-plist-file (delivered-position-path stem))
     (when (eq status :ok)
       (let ((seq (getf plist :seq)))
@@ -746,8 +748,8 @@
                           :written-at (or now (%unix-time)))))
 
 (defun %unreserved-octet-p (octet)
-  "True when OCTET stands for itself in a request field: A-Z, a-z, 0-9, `.`,
-   `_`, `~` or `/`."
+  "True when OCTET stands for itself in a request field: one of the ASCII
+   characters [A-Za-z0-9._~/]."
   (or (<= 48 octet 57)
       (<= 65 octet 90)
       (<= 97 octet 122)

@@ -472,8 +472,8 @@
         (hostfiles:read-plist-file (hostfiles:delivered-position-path "s")))))
 
 (define-test a-damaged-delivered-position-reads-as-absent
-  "A missing file, a seq that is not a non-negative integer, and garbage all
-   read as no position, never as zero."
+  "A missing file reads as no position, never as zero. So does a seq that is
+   not a non-negative integer, and so does a file of garbage."
   (with-state-home (home)
     (is eq nil (hostfiles:read-delivered-position "s"))
     (write-text (hostfiles:delivered-position-path "s") "(:seq -3)")
