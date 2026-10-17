@@ -750,7 +750,8 @@ static void handle_reply(const struct client *c, char *line) {
 /* Send the request on FD and wait for the reply, up to DEADLINE (-1 for
    none). A reply the contract defines ends the process, as does the
    deadline. Returns when the connection fails, ends or carries an outage
-   reply: 1 when it had stayed open for SETTLE_MS after the request went,
+   reply, which includes a reply over MAX_REPLY bytes and one holding a NUL
+   byte: 1 when it had stayed open for SETTLE_MS after the request went,
    else 0. */
 static int converse(const struct client *c, int fd, int64_t deadline) {
     if (!write_all(fd, c->request.p, c->request.len))
@@ -784,6 +785,8 @@ static int converse(const struct client *c, int fd, int64_t deadline) {
         char *lf = memchr(reply + len, '\n', (size_t)n);
         len += (size_t)n;
         if (lf) {
+            if (memchr(reply, '\0', (size_t)(lf - reply)))
+                return settled;
             *lf = '\0';
             handle_reply(c, reply);
             return settled;
