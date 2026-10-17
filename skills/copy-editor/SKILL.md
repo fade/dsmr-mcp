@@ -95,7 +95,7 @@ voice. Ask the positive question and answer it before you look for anything to r
 | motive, decision, action taken (**the WHY**) | **first person, his** | "I made enumeration signal because a caller could not tell an empty store from an unreadable one." |
 | what a reader gets from it (**the WHAT**) | **active, second person** | "Pass it a store it cannot read and you get a condition, not an empty list." |
 | how it is implemented (**the HOW**) | ⛔ **no register. It does not go in prose at all.** | ⛔ "Wraps the call in try/except, logs the exception, and returns None." |
-| an actor who is not the author | ⛔ never, **unless the passive carve-out below applies** | "It was determined that…", "measured by \<repo\>" |
+| an actor who is not the author | ⛔ never as **the one who decided, measured or found**, and never **code with a mind** (hunt list); only the passive carve-out below excepts it | "It was determined that…", "measured by \<repo\>", "the server sees" |
 
 ⚠ **The WHAT row says "what a reader gets", not "how the thing behaves", and the distinction decides
 findings.** Second person is for what the READER does and receives. What the SOFTWARE does takes the
@@ -136,7 +136,8 @@ Both come back clean. Only a positive question separates them, which is why this
 
 ⚠ **Distinguish whose "I" it is, because the old rule collapsed them and that is what inverted.**
 His first person is REQUIRED in the motive register. An AGENT's "I", "me" or "we" is still banned
-outright, as is a repo name as a grammatical subject. "I made the enumeration signal" is correct;
+outright, as is a repo name as a subject, or an agent or tool as the one who decided, measured or
+found. "I made the enumeration signal" is correct;
 "I measured this on a scratch tree" from an agent is not, and neither is "valis measured it".
 
 ⚠ **Scope, and it is narrower than "prose".** In: commit bodies, PR bodies, issue and review
@@ -144,7 +145,8 @@ comments, README and shipped docs, docstrings and code comments (in scope to FLA
 see the authority limit above), release notes. Out: subject lines
 and PR titles, which are active and descriptive and too short to carry a voice (operator,
 2026-08-22). Also out, and never euphemise these: `.planning/`, `BLOCKED.md`, `PARK.md`, `STATE.md`,
-bus messages, briefs. The boundary is committed-and-exterior.
+memory files, bus messages, briefs, and skill files and other agent-facing instructions, which are
+structured for the agent reading them (operator, 2026-10-17). The boundary is committed-and-exterior.
 
 ⛔ **Going forward only. Never rewrite published history for voice.** Same disposition as the dash
 rule: fix a file when it is already being edited for a real reason. An UNPUBLISHED branch is the
@@ -154,6 +156,11 @@ exception and may be amended before it lands, because main's history is the dura
 
 Each register has an independent anchor in the standard references, which is worth knowing because
 it tells you what to do at the edges rather than only in the clear cases.
+
+⭐ **Where external standards disagree, follow the Google developer documentation style guide**
+(operator, 2026-10-17). It outranks academic engineering guides such as USU's on contractions (use
+common ones), headings, and inclusive terminology. The house rules in this file still outrank it,
+notably the author's first person for motive.
 
 - **Behaviour in active, second person** is the Google developer documentation style guide, stated
   outright: make the doer the subject, "use the second person to address what the reader does, but
@@ -205,6 +212,37 @@ If you cannot answer that, the passive is doing its job and there is no finding.
 - **Personification.** A repo name as a grammatical subject. An AGENT with a "me", an "I" or a "we".
   ⚠ Not the author's own first person, which the motive register requires: check whose voice it is
   before flagging it.
+- **Code with a mind** (operator, 2026-10-17, after repeated instances in one month). Code is inert
+  outside execution and has no mind inside it.
+  - ⇒ **The test decides.** Recast the sentence as "when X runs, ...". If it still states an effect
+    a reader could observe (examples: reads, writes, returns, sends, exits, rejects, refuses,
+    retries, logs, blocks a commit), it stands. If it needs a mind, give the decision to the author,
+    the perception to the mechanism, and a precondition to the caller ("takes a list", "call it with
+    the lock held").
+  - **The suspects that usually fail it:** knows, sees, wants, decides, chooses, believes, agrees,
+    trusts, expects, assumes, notices, remembers, tries, insists, claims, admits, promises, lies,
+    cares. A suspect that names a real technical term is never a finding (stock-patterns.md, "A real
+    technical term"): TLS trusting a CA, key agreement, CL `signal` and `warn`, a test framework's
+    `expect`, a kernel refusing a fork, a watcher watching a file.
+  - ⛔ **A `because` that states a purpose or design reason after a code subject** hands the
+    author's motive to the code. A `because` that stays true with nobody intending it is runtime
+    causation and stands ("the read returns NIL because the stream is at EOF"). A `so that` after a
+    code subject always states purpose: flag it. "The gate refuses an image holding a timeout,
+    because a frozen value would win" becomes "I made the gate refuse an image holding a timeout,
+    because a frozen value would win."
+  - ⛔ **Static artifacts may hold states and relations (contain, define, declare, list, match,
+    require, permit). They never decide, guard, fix, ensure or prevent.** "This commit fixes X" becomes "I fixed X".
+  - Real instances from our own log: "the server sees DSMR_WORKER_CORE" (reads), "never trusts one
+    it inherits" (always replaces), "decides where a world is written" (sets), "the image agrees
+    with your working tree" (matches), "never decides who is served" (never changes).
+- **Chained first-person declaratives** (operator, 2026-10-17). Once a body has established who
+  acted, two consecutive sentences, or consecutive paragraphs, opening with "I" are a finding. Let
+  the reason, the reader's result or the observable behaviour lead. Bad: *"I made enumeration signal.
+  I chose a condition over NIL. I added a restart."* Good: *"I made enumeration signal because a
+  caller could not tell an empty store from an unreadable one. You now get a condition where NIL
+  used to come back, and a restart lets you continue with an empty list."* ⚠ The counterweight to
+  the impersonal-body finding, never a licence for it: the author stays present and stops
+  announcing himself in every sentence.
 - **Relay attribution.** "Measured by X and not by me", "reported by Y". Drop the OTHER actor; the
   author still speaks as himself. *"I established reachability in the consuming codebase separately,
   and this change does not prove it"* rather than an impersonal recast that removes him too.

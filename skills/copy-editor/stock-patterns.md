@@ -88,7 +88,8 @@ a reader who notices the device starts discounting the claim it decorates.
   before a point that needed none. State the point.
 - **Triplets and repeated openings.** One tricolon reads fine. Three in a row, or four sentences
   opening with "They could...", reads as rhythm for its own sake. Vary the structure or collapse the
-  series into one sentence.
+  series into one sentence. ⚠ Sentences chained on "I" have their own stricter threshold in
+  SKILL.md's hunt list ("Chained first-person declaratives"): report them there, not again here.
 - **The quotable line.** A standalone aphorism built to be lifted out ("Every metric that rewards
   volume punishes leverage"). If it carries no information a reader can act on, cut it.
 - **A trailing clipped phrase.** A short phrase added after a comma to give the sentence a closing
@@ -163,7 +164,8 @@ word to mean a new thing.
   Usually less clear than the thing itself, and patronising to a reader who came for the thing. Use
   an analogy only when the concept is unfamiliar and the analogy maps precisely.
 - **Forced figures.** A simile or metaphor chosen because it sounds clever rather than because it
-  clarifies. Say the literal thing.
+  clarifies. Say the literal thing. ⚠ A mind given to code ("the server sees", "the gate decides")
+  is never weighed by density: it is a hunt-list finding in SKILL.md ("Code with a mind").
 
 ## 6. Headings, lists and typography
 
