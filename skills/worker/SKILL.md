@@ -473,6 +473,15 @@ you have.
   the service's, means an older binary armed you. The service adopts it within
   about 5 seconds, so you are still heard, but say so in your report: the fix is
   `make install-bus-watch` on this host.
+- **The other stale-binary tell:** `file ~/.local/bin/dsmr-bus-watch` does not
+  say `statically linked`. The installed `--wake` is a small static client of
+  the host bus service (every other mode runs the SBCL program
+  `dsmr-bus-watch-lisp` beside it); an SBCL `--wake` in its place still hears
+  you but answers `already-armed` and does not ride through a service restart.
+  Report it; the fix is the same.
+- ⚠ **`--wake` needs the service.** With `service state=not-installed`, a
+  watcher of your own answers `live` but no wake can hear it; a waiting wake
+  answers `nowatcher` after about five minutes. Tell your leader.
 
 Then the standing listener: **one background Bash command** (`run_in_background:
 true`), NOT the Monitor tool. It exits on the next `bus:`/`error:` line from any of
@@ -490,9 +499,13 @@ permanent** (operator, 2026-10-01): a quiet bus is normal, and a runner kill at 
 time limit is a wake too, so drain and re-arm whatever its note says. An idle
 sister wakes once every 110 minutes and does nothing else.
 
-`nowatcher` can also mean the host bus service is restarting. systemd brings it
-back within seconds; run `--detach` again, which registers you or, if the
-service is still down, starts a watcher of your own.
+A waiting wake rides through a host bus service restart on its own: it
+reconnects and is handed anything that arrived meanwhile. So `nowatcher` has
+two causes, and its stderr line says which. `no detached watcher is running`
+means the service holds no registration for you: re-run `--detach`, then
+re-arm. `the host bus service has not answered for <N> seconds` means the
+service has been down for about five minutes: run
+`systemctl --user status dsmr-bus-host`, tell your leader, then re-arm.
 
 ⭐ **If the session Stop hook is installed** (`grep -c -- '--wake --hook'
 ~/.claude/settings.json` prints 1 or more), it re-arms itself at every turn end,
@@ -500,8 +513,12 @@ but an interrupted turn runs no Stop hook. So run the background line above as
 `~/.local/bin/dsmr-bus-watch --wake --wait-for-arm --all-buses --agent <your-name> --namespace /absolute/path/to/this/repo/`,
 keep exactly one armed at all times, and re-arm it after each time it fires
 (drain, re-arm). Never re-arm after a hook wake: the turn end does that. The
-waiting wake stays silent while the hook listens and takes over when the hook's
-listener has fired; `already-armed` is no longer an answer it gives. The
+host bus service queues your listeners: the hook's listener stands first (a
+newer one replaces the older, which exits silently) and the background wake
+waits behind it, so it hears the next message whenever no hook listener is
+waiting, after an interrupted turn included. `--wait-for-arm` is accepted and
+changes nothing, `already-armed` is no longer an answer any wake gives, and a
+plain `--wake` resumes from what the service last handed over. The
 **bus-watch** skill has the full rules.
 
 Use the literal `~/.local/bin/dsmr-bus-watch` path and a literal name (never
@@ -568,13 +585,11 @@ the field was added.
   operator has had a desktop notification saying so. Drain every joined bus now,
   then arm a listener, then check again; the field clears once something reads
   the log. `deaf=unknown` means the marker could not be read: treat it the same.
-- `readers=0` with no `deaf=`: nothing is following your log at this moment. That
-  is normal during a turn the listener's own wake started, before your first turn
-  ends under the session hook (see **bus-watch**), and between a background
-  `--wake` exiting and your re-arm. It means deaf only if it persists while you are
-  idle with no listener armed, which is exactly what `deaf=` reports. Before you go
-  silent with no session hook installed, re-arm the background `--wake` and check
-  again.
+- `readers=0` with no `deaf=`: the host bus service holds no wake client for you
+  at this moment (`readers=` counts the ones it holds). That is normal between a
+  background `--wake` firing and your re-arm. It means deaf only if it persists
+  while you are idle with no listener armed, which is exactly what `deaf=`
+  reports. Before you go silent, re-arm the background `--wake` and check again.
 - `parked=1`: your park marker is still set, so the alarm for you is off. A
   `--detach` at bring-up clears it; run that (or `--unpark --all-buses`) before
   you go silent.

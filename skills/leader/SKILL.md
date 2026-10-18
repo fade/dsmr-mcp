@@ -412,7 +412,12 @@ you it answers `running` and is yours again:
 Where the host bus service is installed, that line registers you with the
 service rather than starting a watcher, and names the service's pid. Everything
 below works the same; *The host bus service*, later in this step, says what the
-service adds for a leader.
+service adds for a leader. The installed `--wake` is a small static client of
+the service: it waits on the service's socket
+(`<state>/dsmr-mcp/host/wake.sock`), while every other mode runs the SBCL
+program `dsmr-bus-watch-lisp` beside it. If `file ~/.local/bin/dsmr-bus-watch`
+does not say `statically linked`, this host's binary is stale:
+`make install-bus-watch`, then re-arm.
 
 Then the standing listener: **one background Bash command** (`run_in_background:
 true`), NOT the Monitor tool. It exits on the next `bus:`/`error:` line from any of
@@ -425,7 +430,12 @@ your detached logs, and that exit is the wake:
 Launch it with `timeout: 7200000`; the 30-minute default kills it first.
 On wake, an `idle wake-seconds=<N>` line included: drain **every** joined bus with
 `bus-receive`, then re-arm the same line, then one catch-up `bus-receive`. On
-`nowatcher bus=<b>` (exit 1): re-run `--detach`, then re-arm. ⛔ **The watch is
+`nowatcher bus=<b>` (exit 1) with `no detached watcher is running` on stderr:
+re-run `--detach`, then re-arm. A waiting wake rides through a service restart
+on its own, so `nowatcher` with `the host bus service has not answered for <N>
+seconds` means the service has been down for about five minutes: check
+`systemctl --user status dsmr-bus-host`, put it in your footer for the
+operator, and re-arm. ⛔ **The watch is
 permanent** (operator, 2026-10-01): a quiet bus is normal, and a runner kill at the
 time limit is a wake too, so drain and re-arm whatever its note says. Use the
 literal `~/.local/bin/dsmr-bus-watch` path and a literal name: the path is what the
@@ -441,10 +451,14 @@ for it: that turn end arms the next listener. An interrupted turn runs no Stop
 hook, so with the hook installed run the background line above as
 `~/.local/bin/dsmr-bus-watch --wake --wait-for-arm --all-buses --agent <your-name> --namespace <absolute-project-root>/`,
 keep exactly one armed at all times, and re-arm it after each time it fires
-(drain, re-arm). It waits silently while the hook's listener holds your identity
-and takes over when that listener has fired; `already-armed` is no longer an
-answer it gives. `stop_hook_active` is true on every hook-started turn and is no
-loop guard. The **bus-watch** skill has the full rules.
+(drain, re-arm). The host bus service queues your listeners: the hook's
+listener stands first (a newer one replaces the older, which exits silently)
+and the background wake waits behind it, so it hears the next message whenever
+no hook listener is waiting, after an interrupted turn included.
+`--wait-for-arm` is accepted and changes nothing, `already-armed` is no longer
+an answer any bus wake gives, and a plain `--wake` resumes from what the
+service last handed over. `stop_hook_active` is true on every hook-started turn
+and is no loop guard. The **bus-watch** skill has the full rules.
 
 ⚠ **Why not the Monitor: the re-arm was the point of failure, twice.** Until
 2026-09-29 every 30-minute Monitor expiry meant a fresh watcher-launch command, which
@@ -487,14 +501,16 @@ fallback loop missing `--recycle-seconds`. It answers `live` for a bare watcher
 exactly as it does for a correct one, so it will
 confirm your improvisation rather than catch it. It proves the watcher PROCESS
 is running; it says nothing about whether the arm line is right. Its `readers=`
-count says only that something holds the log open, which your `--wake` does.
+count is the number of wake clients the host bus service holds for you, which
+your waiting `--wake` is one of.
 
 ⛔ **It must print `live`, a `bus=` field naming the bus you armed, AND `readers=1`
 or more.** A `dead`/`stale` result means the leader itself is deaf. A `bus=` naming
 a different bus means the same thing while looking healthy, which is worse.
 **`deaf=<epoch>` means mail sat unread for ten minutes: you are deaf, drain and arm
-a listener.** `readers=0` at bring-up, before the background `--wake` is up, means
-arm it; mid-turn under the session hook it is normal. No `bus=` field (or no `readers=` field) means the PATH binary
+a listener.** `readers=0` means the service holds no wake for you: at bring-up,
+before the background `--wake` is up, arm it; between a wake firing and its
+re-arm it is normal. No `bus=` field (or no `readers=` field) means the PATH binary
 predates named buses (or `--wake`): `make install-bus-watch`, then re-arm. A leader
 that missed its own re-arm and lost inbound mail is exactly the failure this guards.
 On `dead`/`stale`, run `--detach` again and re-arm the `--wake`.
@@ -562,7 +578,9 @@ the same line. `idle wake-seconds=<N>` is a wake with nothing in it: re-arm.
 `noservice` (exit 1) means this host has never had the service; do not re-arm.
 It resumes where the last one stopped reading, so a line written between two
 arms is still reported, and it never blocks your bus listener. Arm exactly one:
-a second for your identity answers `already-armed`.
+a second for your identity answers `already-armed`. This listener is the SBCL
+program with a lock of its own, deliberately not a client of the host bus
+service, because it must hear the service's own failure.
 `FLEET ERROR code=service-failed` means the service failed and systemd is
 restarting it; the operator also gets a desktop notification for it. It stays in
 your footer until `--host-status` reads `alive` again.
@@ -597,14 +615,14 @@ are host-local files, so the probe works for any agent on this host:
   wait; do not publish a "please re-arm" she cannot hear.
 - `parked=1`: she marked a park. Silence is intended and no alarm fires; check
   the park record, and do not dispatch work into a park.
-- `readers=0` with no `deaf=`: not a finding by itself. Under the session hook
-  nothing reads her log during a turn her own wake started, and a background
-  `--wake` leaves a gap before its re-arm. If it lasts with mail waiting, the
-  watcher raises `deaf=` within ten minutes; that field is the finding.
+- `readers=0` with no `deaf=`: not a finding by itself. `readers=` counts the
+  wake clients the host bus service holds for her, and a background `--wake`
+  leaves a gap between firing and its re-arm. If it lasts with mail waiting,
+  the watcher raises `deaf=` within ten minutes; that field is the finding.
 - `dead`/`stale`: she has no watcher. Same disposition: surface it; she needs a
   bring-up, not a message.
-- `readers=unknown` or no `readers=` field: unproven; say so rather than scoring it
-  as heard.
+- `readers=unknown` (the service did not answer the count) or no `readers=`
+  field: unproven; say so rather than scoring it as heard.
 
 ⚠ A wrong `<sister-root>` answers `dead`, which reads as a finding about her rather
 than about your probe. Take the root from `docs/CONSTELLATION.org` or the repo on

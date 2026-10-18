@@ -1,6 +1,6 @@
 ---
 name: bus-watch
-description: "Stay reachable on the dsmr-mcp coordination bus without polling: launch ONE detached watcher per joined bus once per session, then let ONE listener wait on it: the session Stop hook, which re-arms itself at every turn end, beside one background Bash `--wake --wait-for-arm` kept armed at all times, which you drain and re-arm; without the hook, the background `--wake` alone. Use when you need to listen for bus messages in the background, wake on a bus event, or stay attached across a session (lead or sister). Covers the detach-then-listen arm, the one-listener lock and --wait-for-arm, why the Monitor tail is retired, marking a park and keeping the watcher across it (reap only on leaving the fleet), naming the bus with --bus, draining on wake, the stable-identity rule, and the --check-live probe whose bus=, readers=, parked= and deaf= fields say whether you can actually hear. Companion to fleet and fleet-restart."
+description: "Stay reachable on the dsmr-mcp coordination bus without polling: launch ONE detached watcher per joined bus once per session, then let ONE listener wait on it: the session Stop hook, which re-arms itself at every turn end, beside one background Bash `--wake --wait-for-arm` kept armed at all times, which you drain and re-arm; without the hook, the background `--wake` alone. Use when you need to listen for bus messages in the background, wake on a bus event, or stay attached across a session (lead or sister). Covers the detach-then-listen arm, the service-side listener queue and --wait-for-arm, why the Monitor tail is retired, marking a park and keeping the watcher across it (reap only on leaving the fleet), naming the bus with --bus, draining on wake, the stable-identity rule, and the --check-live probe whose bus=, readers=, parked= and deaf= fields say whether you can actually hear. Companion to fleet and fleet-restart."
 ---
 
 # /bus-watch
@@ -14,10 +14,9 @@ when it exits; you drain and re-arm the same line.
 When the operator has installed the session Stop hook, that hook arms the same
 `--wake` at the end of every turn. An interrupted turn runs no Stop hook, though,
 so beside it you keep **one background `--wake --wait-for-arm` armed at all
-times** and re-arm it after each time it fires. It waits silently while the
-hook's listener holds your identity, and takes over the moment that listener
-has fired and nothing else is armed, which is exactly what an interrupt leaves
-behind.
+times** and re-arm it after each time it fires. The host bus service queues it
+behind the hook's listener, and it hears the next message whenever no hook
+listener is waiting, which is exactly what an interrupt leaves behind.
 
 Launch the watcher once per session (it is adopted if already running). Re-arm
 the background `--wake` only after it fires, so an idle agent never re-arms at
@@ -62,18 +61,35 @@ turned up anything new for you, carrying the highest such seq, and keeps running
 on an idle window it prints `recycle:` and exits (a supervisor restarts it).
 Signal goes to stdout; diagnostics to stderr. With `--detach` it becomes its own
 supervisor: it runs detached, re-arms itself in place at each recycle, and writes
-its signal lines to a per-(bus, agent) log file. `--wake` waits on that log and
-exits with the next `bus:`/`error:` line written to it.
+its signal lines to a per-(bus, agent) log file.
+
+The installed `~/.local/bin/dsmr-bus-watch` is a small statically linked
+program. In `--wake` mode (with or without `--hook`) it is a client of the host
+bus service: it connects to the service's socket,
+`<state>/dsmr-mcp/host/wake.sock`, waits there, and exits with the next
+`bus:`/`error:` line the service hands it. Every other mode, and
+`--wake --fleet-log`, runs the SBCL program `dsmr-bus-watch-lisp`, installed
+beside it, with the same arguments. Every line a waiting wake prints on a reply
+comes from the service, worded for the hook or the background mode; the client
+words only what it must say when the service is not consulted or cannot be
+reached: no identity, the idle line, the outage notice, and argument warnings.
 
 ## The host bus service: one process listening for every agent
 
 Where the operator has installed the host bus service (`dsmr-bus-host`, a
 systemd user unit), one process on the host runs every bus's broker and watches
 every registered agent. It writes the same `bus:` and `error:` lines to the same
-per-agent log a detached watcher would, so `--wake`, the session hook and
-`--check-live` behave exactly as this file describes, and you never need to know
-which of the two is writing. Elsewhere in this file, "the detached watcher"
-means whichever one is watching for you.
+per-agent log a detached watcher would, and it serves every `--wake` from its
+socket, so the session hook and the background wake both wait on the service.
+Elsewhere in this file, "the detached watcher" means whichever one is watching
+for you.
+
+⚠ **`--wake` needs the service.** On a host where `--host-status` prints
+`service state=not-installed`, `--detach` still starts a watcher of your own and
+`--check-live` still answers `live`, but no wake can hear it: a waiting wake
+answers `nowatcher` after about five minutes, as for an outage. Tell your
+leader (a worker) or the operator (the leader); installing the service is the
+operator's call.
 
 - **`--detach` registers you with the service** instead of starting a watcher.
   It prints the same `detached`/`running` line and the same `monitor:` line; the
@@ -91,10 +107,18 @@ means whichever one is watching for you.
   watching your cursor and raises the deafness alarm if mail waits unread, but
   writes no wake lines. Either way, the `--detach` at your next bring-up
   registers you again and removes the park marker.
-- **`nowatcher` can also mean the service is restarting.** systemd brings it back
-  within seconds. Run `--detach` again: it registers you, or starts a watcher of
-  your own if the service is still down.
-- **The stale-binary tell.** While the service is up, a `--detached-child`
+- **A waiting wake rides through a service restart on its own.** systemd brings
+  the service back within seconds; the wake reconnects, asks again, and is
+  handed anything that arrived in between. Only when the service has been
+  unreachable for about five minutes does it give up with `nowatcher` (see
+  *When the background `--wake` wakes you*).
+- **The stale-binary tell.** `file ~/.local/bin/dsmr-bus-watch` does not say
+  `statically linked`: that host still runs the older SBCL listener in place of
+  the wake client. It still hears you, because the service keeps writing your
+  log, but it holds a lock instead of queueing, answers `already-armed`, and
+  does not ride through a service restart. `make install-bus-watch` fixes it;
+  tell your leader (a worker) or the operator (the leader).
+- **The stale-watcher tell.** While the service is up, a `--detached-child`
   process running for your identity means an older `dsmr-bus-watch` armed you,
   one that does not know the service. You see it as `--detach` or `--check-live`
   naming a pid that is not the service's (`--host-status` prints the service's
@@ -103,7 +127,8 @@ means whichever one is watching for you.
   (`make install-bus-watch`).
 - **`--host-status` reports the service**, how the host's memory stands (its
   `memory` line), its buses and its registrations, and needs no identity. `service state=not-installed` means everything here about
-  the detached watcher applies as written.
+  the detached watcher applies as written, except that no `--wake` can hear it
+  (see above).
 
 ⚠ **A line means CHECK THE BUS, not "one message with this seq is waiting."**
 `bus-receive` drains everything pending in a single call, so when several records
@@ -226,15 +251,15 @@ namespace** or the child did not come up; exit 2 means no identity resolved.
 Neither armed anything for you. The pass-through flags (`--poll-ms`,
 `--recycle-seconds`, …) reach the detached watcher.
 
-**Step 2: one listener at a time: the session hook, with a background `--wake --wait-for-arm` beside it.**
+**Step 2: the session hook, with a background `--wake --wait-for-arm` queued behind it.**
 
 The primary listener is a Stop hook that the operator installs once in
 `~/.claude/settings.json` (he holds the paste-ready block; ⛔ no agent writes a
 settings file). At the end of every turn it runs
 `dsmr-bus-watch --wake --hook --all-buses` under your identity, in the
-background, and waits. When mail reaches your detached log it exits and its
-message wakes you as "Stop hook feedback". That feedback is not a blocked stop:
-it is your wake. It says which of three things happened:
+background, and waits. When the host bus service hands it a line it exits,
+and its message wakes you as "Stop hook feedback". That feedback is not a
+blocked stop: it is your wake. It says which of four things happened:
 
 - `dsmr-bus-watch: mail has arrived for you on bus <b>. Drain the bus now ...`:
   drain every joined bus with `bus-receive`, act on what it holds, and end your
@@ -244,25 +269,33 @@ it is your wake. It says which of three things happened:
 - `dsmr-bus-watch: no detached watcher is running for <id> on bus <b> ...`: run
   step 1 (`--detach`) for that bus, then end your turn. This one comes at most
   once an hour.
+- `dsmr-bus-watch: the host bus service has not answered for <N> seconds ...`:
+  the service has been down for about five minutes. Run
+  `systemctl --user status dsmr-bus-host`, tell your leader (a worker) or the
+  operator (the leader), then end your turn. This one also comes at most once
+  an hour.
 
-In all three, **you do nothing to re-arm.** The end of the turn runs the hook
+In all four, **you do nothing to re-arm.** The end of the turn runs the hook
 again, and it arms the next listener itself; your background `--wait-for-arm`
-wake did not fire, so leave it waiting. It resumes reading where the last
-listener stopped, so mail that landed while you worked wakes you at once rather
-than being skipped. A subagent's turn end never arms one.
+wake did not fire, so leave it waiting. The service hands the next listener
+anything that arrived after the last line it handed over, so mail that landed
+while you worked wakes you at once rather than being skipped. A subagent's turn end never arms one.
 
 The hook is installed when
 `grep -c -- '--wake --hook' ~/.claude/settings.json` prints 1 or more. Check it
 once at bring-up and remember the answer.
 
-⛔ **One listener per identity.** Every `--wake` takes a lock on your identity,
-and only the holder reads your log. The hook steps aside silently while another
-listener holds the lock. A background `--wake --wait-for-arm` started while the
-hook's listener holds it prints nothing and waits, holding no log open, so
-`readers=` still counts one; when the hook's listener fires, the waiting wake
-takes the lock and reports the next line from where the hook stopped reading.
-`already-armed` is no longer an answer it gives; seeing it means the line was
-run without `--wait-for-arm`.
+⛔ **The host bus service queues your listeners.** The client holds no lock;
+the service keeps a queue of waiting wakes for each identity. The hook's
+listener stands first, and a newer hook listener replaces the older one, which
+exits 0 and prints nothing. Background wakes wait behind it in the order they
+arrived. Each line goes to one listener only, the one at the head of the queue,
+and when that listener leaves, the next in line is handed anything that arrived
+in between: nothing is lost and nothing is told twice. So a background wake
+hears the next message whenever no hook listener is waiting, after an
+interrupted turn included. `--wait-for-arm` is accepted and changes nothing,
+because every wake queues, and `already-armed` is no longer an answer any wake
+gives. A plain `--wake` resumes from what the service last handed over for you.
 
 With the hook installed, **keep one background
 `~/.local/bin/dsmr-bus-watch --wake --wait-for-arm --all-buses --agent <name> --namespace <root>/`
@@ -270,20 +303,21 @@ armed at all times**, and re-arm it after each time it fires: drain, then
 re-arm. Arm it at bring-up, before your first turn ends, and pass the reader
 check. A background command outlives an interrupted turn, so this is the
 listener that is still there when Esc stops a turn and no Stop hook runs.
-Arm exactly one: never a second while the first is still running. A binary
-whose `--help` lacks `--wait-for-arm` ignores the flag and answers
-`already-armed`; that host's binary is stale, so tell your leader (a worker) or
-the operator (the leader) rather than working around it.
+Arm exactly one: never a second while the first is still running, since a
+second only queues behind the first. If a wake ever answers `already-armed`,
+or `file ~/.local/bin/dsmr-bus-watch` does not say `statically linked`, that
+host's binary is stale (see *The host bus service*), so tell your leader (a
+worker) or the operator (the leader) rather than working around it.
 
 Know the remaining gaps:
 
 - **`stop_hook_active` is true on every turn the hook's wake started.** It is not
   a loop guard here and the hook does not read it. Never add a check that stops
   on it: a listener that did would never re-arm after its first wake.
-- **A moment of `readers=0` is normal**: between a listener firing and the next
-  one taking the lock, and through your own turn when no background
-  `--wait-for-arm` wake is armed. Deafness is the `deaf=` field, not a reader
-  count.
+- **A moment of `readers=0` is normal** only between a wake firing and its
+  re-arm, when no other listener is queued for you. With the background wake
+  armed, `readers=` stays at 1 or more through a turn the hook's wake started.
+  Deafness is the `deaf=` field, not a reader count.
 
 **The background listener: a Bash `--wake`, re-armed after each wake.** With
 the hook installed it carries `--wait-for-arm`, as above. Without the hook (the
@@ -306,30 +340,39 @@ and tells you not to restart it. **The watch is permanent (operator ruling,
 stop listening.** If a kill ever does arrive, treat it as a wake anyway: drain,
 then re-arm.
 
-`--wake` waits for the next `bus:` or `error:` line to reach your detached
-log(s), prints it exactly as the watcher wrote it, and **exits 0**. The harness
-notifies you on that exit: that is the wake. `--all-buses` waits on every
-detached watcher you have a pid file for and returns the first line any of them
-gets, so one `--wake` covers every joined bus; `--bus <tag>` in its place waits
-on one. Other exits:
+`--wake` waits for the host bus service to hand it the next `bus:` or `error:`
+line written for you, prints it exactly as the watcher wrote it, and **exits
+0**. The harness notifies you on that exit: that is the wake. `--all-buses`
+waits on every bus the service watches for you and returns the first line any
+of them gets, so one `--wake` covers every joined bus; `--bus <tag>` in its
+place waits on one. Other exits:
 
 - **`idle wake-seconds=<N>` and exit 0**: nothing arrived in N seconds (default
   6600, set with `--wake-seconds`). This is a wake like any other: drain every
   joined bus, then re-arm. It exists so the wait ends inside the runner's
   two-hour ceiling and re-arming stays the ordinary path.
-- **`nowatcher bus=<name>` and exit 1** (`bus=*` under `--all-buses` when you
-  have none): no live detached watcher to wait on, at the start or while
-  waiting. Run step 1 (`--detach`) again, then re-arm the `--wake`.
+- **`nowatcher bus=<name>` and exit 1** (`bus=*` under `--all-buses`) has two
+  causes, and the stderr line says which:
+  - `no detached watcher is running for <id> on bus <b>`: the service holds no
+    registration for you on that bus, at the start or while waiting. Run step 1
+    (`--detach`) again, then re-arm the `--wake`.
+  - `the host bus service has not answered for <N> seconds`: the service has
+    been down for about five minutes (the wake rode through anything shorter).
+    Run `systemctl --user status dsmr-bus-host`, tell your leader (a worker) or
+    the operator (the leader), then re-arm the `--wake`; it reconnects as soon
+    as the service is back.
 - **exit 2**: no identity resolved; pass the `--agent`/`--namespace` you
   detached with.
-- **exit 143**: it was sent SIGTERM (you, a restart, a reap). Re-arm if you are
-  still meant to be listening.
+- **exit 143**: it was sent SIGTERM, by you or by something that stops your
+  session's processes. Re-arm if you are still meant to be listening. A service
+  restart never causes it: the wake reconnects through the restart and keeps
+  waiting.
 
-Lines already in the log are never reported, so a re-arm never replays an old
-wake into your context. A message that lands between one `--wake` exiting and
-the next being armed is not lost: the watcher arms from your durable cursor at
-each recycle and announces anything undrained again, and the catch-up
-`bus-receive` in the wake procedure below closes the gap at once.
+A line the service has already handed over is never handed over again, so a
+re-arm, or a service restart, never replays an old wake into your context. A
+message that lands between one `--wake` exiting and the next being armed is not
+lost: the service hands the next wake anything that arrived in between, and the
+catch-up `bus-receive` in the wake procedure below closes the gap at once.
 
 Why each piece:
 
@@ -368,8 +411,7 @@ Why each piece:
   self-heals, never how fast a message wakes you.
 - **`--stall-seconds N` (default 120)** — a watcher whose poll loop stops cycling
   exits with status 75, so a wedged watcher reads as `dead`/`stale` rather than
-  alive and deaf, and a waiting `--wake` answers `nowatcher`. SIGTERM ends a
-  watcher at once.
+  alive and deaf. SIGTERM ends a watcher at once.
 
 Drop `--bus <tag>` from `--detach` only when you are deliberately on the shared
 host-wide bus (its log stem is `default--<name>--<hash>`). Spelling it out on a named bus
@@ -524,13 +566,17 @@ On **`bus:<SEQ>`**:
    to the operator. Publish any replies now. The `--detach` watcher is never
    re-launched for a wake; it is still running.
 
-On **`nowatcher bus=<name>`** (exit 1): the detached watcher is gone. Run
-`--detach` again for that bus (or for each joined bus on `bus=*`), then re-arm
-the `--wake`, then drain.
-With the host bus service installed it can also mean the service is
-restarting: systemd brings it back within seconds, and the same `--detach`
-registers you again, or starts a watcher of your own if the service is still
-down after 5 seconds.
+On **`nowatcher bus=<name>`** (exit 1), read the stderr line beside it:
+
+- **No registration** (`no detached watcher is running for <id> on bus <b>`):
+  run `--detach` again for that bus (or for each joined bus on `bus=*`), then
+  re-arm the `--wake`, then drain.
+- **About five minutes without the service** (`the host bus service has not
+  answered for <N> seconds`): the service has been down that long. A restart
+  never produces this, because a waiting wake rides through one. Run
+  `systemctl --user status dsmr-bus-host` and tell your leader (a worker) or
+  the operator (the leader); then re-arm the `--wake`, which reconnects as soon
+  as the service is back, and drain.
 
 On **`error:…`**: the detached watcher hit a fault (it retries on its own and
 writes the same fault once): run `--check-live`, and if it answers
@@ -551,9 +597,9 @@ clean exit, so "am I still listening?" is a cheap local check, not a `ps` grep:
   `deaf=<epoch>` when they apply (exit 0): a watcher is running for you now,
   **on the bus it names**. Check that name against the bus you meant to arm,
   **then read the rest**:
-  - **`readers=1` or more**: something (a waiting `--wake`, the hook's or your
-    own) holds the log open. You can hear. This is the only answer that proves
-    it.
+  - **`readers=1` or more**: the host bus service holds that many waiting wake
+    clients for you (the hook's listener, your background wake, or both). You
+    can hear. This is the only answer that proves it.
   - ⛔ **`deaf=<epoch>`: DEAF since that Unix time.** Mail reached the log and
     nothing read it for ten minutes (`--deaf-seconds` on `--detach`, default
     600). The watcher has already sent the operator a desktop notification
@@ -562,12 +608,13 @@ clean exit, so "am I still listening?" is a cheap local check, not a `ps` grep:
     could not be read: treat it as deaf.
   - `parked=1`: you marked a park, so silence is intended and no alarm fires.
     Seen after bring-up, it means `--detach` did not run for that bus: run it.
-  - `readers=0` with no `deaf=`: nothing follows the log at this moment. That is
-    normal during a turn the hook's own wake started, and between a background
-    `--wake` exiting and your re-arm. It becomes deafness only if it lasts with
-    mail waiting, which is what `deaf=` reports. Without the hook, before you go
-    silent, `readers=0` means re-arm the `--wake`.
-  - `readers=unknown`: `/proc` could not say. Treat as unproven, not as heard.
+  - `readers=0` with no `deaf=`: the service holds no wake for you at this
+    moment. That is normal between a background `--wake` firing and your
+    re-arm. It becomes deafness only if it lasts with mail waiting, which is
+    what `deaf=` reports. Before you go silent, `readers=0` means re-arm the
+    background `--wake`.
+  - `readers=unknown`: the service did not answer the count. Treat as
+    unproven, not as heard.
 - `dead bus=<name> readers=<n>` (exit 1): no heartbeat on that bus, nothing
   listening. **Run `--detach` again, then re-arm the `--wake`.**
 - `stale pid=<pid> age_s=<n> bus=<name> readers=<n>` (exit 1): heartbeat not
@@ -603,7 +650,8 @@ counts open readers only; it never consumes a message or touches your cursor.
 3. **Arm**: `--detach` once per joined bus (expect `running` if a watcher
    survived a park or restart; it is adopted and its park marker cleared), then
    the background `--wake` once. With the session hook installed this is the
-   only background `--wake` you start; the hook takes over after it fires. A
+   only background `--wake` you start, and each turn end queues the hook's
+   listener ahead of it. A
    `bus-receive` right after the `--wake` is up closes any gap between the two.
 4. `--check-live` per bus. `live` **with the `bus=` field naming the bus you
    armed AND `readers=1` or more** means you are actually listening to it.
@@ -634,10 +682,10 @@ bus it uses an `ephemeral` identity, which never advances the main cursor.
 |---|---|
 | Start listening (whole session) | `--detach` once per joined bus (answers `detached` or `running`), then `~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <name> --namespace <root>/` as a **background Bash** command (`run_in_background`). Never the Monitor. With the session hook installed, add `--wait-for-arm` after `--wake` and keep that one armed at all times. |
 | Session hook wakes you ("Stop hook feedback" from `dsmr-bus-watch`) | mail: drain every joined bus and act; idle: nothing; no watcher: `--detach`. Then end the turn. **Never re-arm** for it: the hook arms the next listener at turn end, and your background `--wait-for-arm` wake is still waiting. |
-| A `--wake` prints `already-armed` | another listener holds the arm and this line ran without `--wait-for-arm` (or on a binary too old to know it). Do not retry the same line; with the hook installed, arm the `--wait-for-arm` form once. |
-| Resumed after an interrupt (Esc) | nothing to do: your background `--wait-for-arm` wake outlives the interrupt and takes over once the hook's listener has fired. |
+| A `--wake` prints `already-armed` | the wake client never says this, so the host runs a stale binary (`file ~/.local/bin/dsmr-bus-watch` does not say `statically linked`). Tell your leader or the operator; the fix is `make install-bus-watch`. |
+| Resumed after an interrupt (Esc) | nothing to do: your background `--wait-for-arm` wake outlives the interrupt, queued behind any hook listener, and hears the next message whenever none is waiting. |
 | `--wake` exited with `bus:<SEQ>` | `bus-receive` every joined bus (stable id) → re-arm the same `--wake` line (with `--wait-for-arm` when the session hook is installed) → catch-up `bus-receive` → handle. |
-| `--wake` exited with `nowatcher bus=…` | `--detach` again (each bus on `bus=*`), then re-arm the `--wake`. With the host bus service installed it may be mid-restart; the same `--detach` covers that. |
+| `--wake` exited with `nowatcher bus=<b>` | no registration: `--detach` again (each bus on `bus=*`), then re-arm the `--wake`. After about five minutes without the service (its stderr says so): `systemctl --user status dsmr-bus-host`, tell your leader or the operator, re-arm. A service restart alone never ends a wait. |
 | `--detach` or `--check-live` names a pid that is not the host service's while the service is up | an old binary armed you with a watcher of its own. The service adopts it within seconds; `make install-bus-watch` so the next arm registers instead. |
 | `--wake` exited with `error:…` | the detached watcher hit a fault — `--check-live`; on `dead`/`stale` run `--detach` again; re-arm the `--wake`. |
 | Idle for hours | nothing. No timer, no re-arm; the `--wake` waits indefinitely. |

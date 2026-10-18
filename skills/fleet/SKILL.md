@@ -169,7 +169,10 @@ self-heal that re-arms a watch which has gone silently deaf. `--detach` carries
 that recycle itself: the detached watcher re-arms in place and outlives the
 session. `--wake` is one-shot: it exits on the next message, the harness wakes
 the sister on that exit, and she drains every bus and re-arms the same line
-(`nowatcher`, exit 1, means re-run `--detach` first). Keep the literal
+(`nowatcher`, exit 1, means re-run `--detach` first; when its stderr says the
+host bus service has not answered for about five minutes, it means instead that
+the service has been down that long: she runs
+`systemctl --user status dsmr-bus-host`, tells the leader, and re-arms). Keep the literal
 `~/.local/bin/...` path: it matches the narrow Bash allow rule, which resolves
 before the classifier in auto mode. The Monitor tail this step used to print is
 retired: Monitor allow rules are dropped in auto mode (it runs through the
@@ -212,7 +215,11 @@ listener and the probe above are unchanged. `--detach` starts a watcher of her
 own only while the service is down, and the service takes it over when it
 returns. Her registration ends when a parked session ends (mail waits at her
 cursor, and `--check-live` reads `dead ... parked=1`), and `--reap` deregisters
-her. `nowatcher` can also mean the service is restarting: `--detach` again. A
+her. Every `--wake` is a client of the service, which queues her listeners:
+the session hook's listener first (a newer one replaces the older), her
+background wake behind it. `--wait-for-arm` on her line is accepted and changes
+nothing. A waiting wake rides through a service restart on its own, and
+`readers=` counts the wake clients the service holds for her. A
 `--detached-child` watcher for her while the service is up means an old binary
 armed her; the service adopts it, and `make install-bus-watch` stops it
 recurring. The leader checks the service with `--host-status` (see **leader**).
@@ -271,6 +278,7 @@ findings to a project it is not a member of.
 | "Is this sister connected?" | `--check-live --bus <tag> --agent <sister> --namespace <sister-root>/`, wanting `live` and `readers=1`+ (`deaf=` = deaf: the operator types in her terminal; `parked=1` = parked). **Not** the roster |
 | Enroll came back `enrolled: false` | the gate is shut. That agent still uses the bus; nothing failed |
 | Sister says `live` with no `bus=` field | its `dsmr-bus-watch` binary predates named buses and armed on the shared bus. `make install-bus-watch`, then re-arm |
+| `file ~/.local/bin/dsmr-bus-watch` does not say `statically linked` | the host runs the older SBCL listener in place of the wake client: it answers `already-armed` and does not ride through a service restart. `make install-bus-watch`, then re-arm |
 | Two fleets on one machine | two tags, two declared leaders, two closed gates. There is no further guard and none is coming |
 
 Companion skills: **bus-watch** (how a watch is armed and proved), **worker** (how

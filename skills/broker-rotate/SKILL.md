@@ -264,9 +264,11 @@ older binary. Still worth a rollcall afterwards rather than an assumption.
 
 Under the host bus service the agents' watches live in the same process as the
 brokers, so a service restart ends them too. The service picks every registration
-up again when it starts, writing to the same logs, and a background `--wake`
-waiting through the restart may answer `nowatcher`, which its owner handles by
-running `--detach` again. The rollcall afterwards matters more, not less.
+up again when it starts, writing to the same logs. A background `--wake` waiting
+through the restart rides through it instead of answering `nowatcher`: it
+reconnects, asks again, and is handed anything that arrived meanwhile. It gives
+up with `nowatcher` only if the service stays unreachable for about five
+minutes. The rollcall afterwards matters more, not less.
 
 ## Expect the cursor reaper to fire, and expect it to be loud
 

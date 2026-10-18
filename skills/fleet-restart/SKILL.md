@@ -151,9 +151,10 @@ re-announces.
    <absolute-project-root>/`, re-armed only after each wake (drain, re-arm; see **bus-watch**).
    When the session Stop hook is installed (`grep -c -- '--wake --hook' ~/.claude/settings.json`
    prints 1 or more), add `--wait-for-arm` after `--wake` in that line and keep exactly one armed
-   at all times, re-armed after each time it fires. Each turn end arms the hook's listener; the
-   waiting wake stays silent beside it and takes over after an interrupted turn, which runs no
-   Stop hook.
+   at all times, re-armed after each time it fires. `--wait-for-arm` is accepted and
+   changes nothing: the host bus service holds the turn-end hook listener first (a newer one
+   replaces the older) and the background wake behind it, so the background wake still hears
+   the next message after an interrupted turn, which runs no Stop hook.
    Where the host bus service is installed, `--detach` registers you with it rather than adopting
    a watcher, so after a park expect `detached` naming the service's pid, not `running`. Then
    check the service with `--host-status` and restore order as the **leader** skill says (Step 4,
@@ -181,7 +182,10 @@ re-announces.
 4. Send **one line**: `RESUMED <repo> @<short-sha>`
 5. Arm your watch (`--detach` once, which adopts the watcher your park left running and clears
    your park marker, then the background `--wake`, with `--wait-for-arm` and re-armed after each
-   fire when the session Stop hook is installed) and **confirm it with `--check-live` (must print `live`, your `bus=`, and
+   fire when the session Stop hook is installed; `--wait-for-arm` is accepted and changes nothing,
+   because the host bus service holds the turn-end hook listener first, a newer one replacing the
+   older, and the background wake behind it, so the background wake still hears the next message
+   after an interrupted turn) and **confirm it with `--check-live` (must print `live`, your `bus=`, and
    `readers=1` or more, and no `parked=1`) before going silent.** **Go silent.** Await dispatch
    by name. A worker that goes silent on a `dead`/`stale` watch, or with no listener armed, is
    deaf to its own dispatch, and no one learns until the operator notices the wait.
@@ -220,7 +224,11 @@ not summarise last session — it is in your files.
   standing listener is a background Bash (`run_in_background`, `timeout: 7200000`) command,
   `~/.local/bin/dsmr-bus-watch --wake --all-buses --agent <name> --namespace
   <absolute-project-root>/`, which exits on the next message; drain every bus, then re-arm the
-  same line. On `nowatcher` (exit 1) re-run `--detach`, then re-arm. The literal path matches the
+  same line. On `nowatcher` (exit 1) with `no detached watcher is running` on stderr, re-run
+  `--detach`, then re-arm; a waiting wake rides through a host bus service restart on its own, so
+  `nowatcher` after about five minutes (`the host bus service has not answered`) means the service
+  has been down that long: `systemctl --user status dsmr-bus-host`, tell the leader (the leader
+  tells the operator), then re-arm. The literal path matches the
   narrow Bash allow rule, which resolves before the classifier. ⛔ **Not the Monitor:** Monitor
   allow rules are dropped in auto mode (it runs through the shell) and it expires every 30
   minutes, so each re-arm faced the classifier and an outage left agents deaf with their watcher
