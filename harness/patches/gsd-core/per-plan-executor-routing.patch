@@ -1,0 +1,31 @@
+--- a/gsd-core/workflows/execute-phase/steps/per-plan-executor-routing.md
++++ b/gsd-core/workflows/execute-phase/steps/per-plan-executor-routing.md
+@@ -16,6 +16,8 @@
+   `gsd-executor`.
+ - The resolved `EXECUTOR_TYPE` is used as `subagent_type` in BOTH worktree and
+   sequential dispatch (sequential reuses the worktree-mode `Agent()` template).
++- dsmr-local: project executor default. When `planning.agents.specialized` is
++  `true`, an empty hint defaults to `planning.agents.executor`.
+ 
+ ## Resolution
+ 
+@@ -27,11 +29,19 @@
+ EXECUTOR_TYPE="gsd-executor"
+ if [ "${AGENT_HINT_ROUTING:-true}" != "false" ]; then
+   PLAN_HINT=$(jq -r '.agent_hint // empty' <<<"$plan_json" 2>/dev/null | tr -d '"')
++  # dsmr-local: project executor default. An empty hint takes planning.agents.executor
++  # when planning.agents.specialized is true; resolve-agent below still validates it.
++  if [ -z "$PLAN_HINT" ] && [ "$(gsd_run query config-get planning.agents.specialized --raw 2>/dev/null)" = "true" ]; then
++    PLAN_HINT=$(gsd_run query config-get planning.agents.executor --raw 2>/dev/null | tr -d '"')
++  fi
+   if [ -n "$PLAN_HINT" ]; then
+     EXECUTOR_TYPE=$(gsd_run query resolve-agent --name "$PLAN_HINT" --raw 2>/dev/null || echo "gsd-executor")
+   fi
+ fi
+ 
++# dsmr-local: project executor default. Skills follow the resolved executor for each plan.
++AGENT_SKILLS=$(gsd_run query agent-skills "$EXECUTOR_TYPE" ${GSD_WS:+--ws=${GSD_WS##* }})
++
+ # #1689 v1 routes only the Agent()-based dispatch. On the orchestrator-worktree
+ # backend (process-spawn; no subagent_type) a resolved hint cannot be honored
+ # yet — surface it so a set hint is never silently ignored.
