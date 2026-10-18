@@ -6,8 +6,12 @@
 ;;;; performs the config install, optionally copies the scaffold skill into
 ;;;; the operator's skills directory, and prints a concise summary.
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-posix))
+
 (defpackage #:dsmr-mcp/src/install
   (:use #:cl)
+  (:import-from #:sb-posix)
   (:local-nicknames (#:jzon #:com.inuoe.jzon)
                     (#:config #:dsmr-mcp/src/install/config)
                     (#:claude #:dsmr-mcp/src/install/claude)
@@ -60,36 +64,83 @@ or NIL when the skill source is not present in the repo."
 ;;; Bus-watch binary source / destination -----------------------------------
 
 (defparameter +bus-watch-name+ "dsmr-bus-watch"
-  "Filename of the coordination-bus wakeup watcher binary, both as built in the
-repo's bin/ and as installed on PATH.")
+  "Filename of the bus watcher command's static C front end, both as built in the
+repo's bin/ and as installed on PATH. It runs a wake itself and every other mode
+through the SBCL program named by +BUS-WATCH-LISP-NAME+ in its own directory.")
+
+(defparameter +bus-watch-lisp-name+ "dsmr-bus-watch-lisp"
+  "Filename of the bus watcher's SBCL program. It sits beside the front end, in
+the repo's bin/ as built and on PATH as installed.")
 
 (defun %bus-watch-source ()
-  "Return the pathname of the built watcher binary in the repo (bin/dsmr-bus-watch)."
+  "Return the pathname of the built front end in the repo (bin/dsmr-bus-watch).
+The SBCL program is expected beside it, as bin/dsmr-bus-watch-lisp."
   (merge-pathnames (format nil "bin/~A" +bus-watch-name+) (%repo-root)))
 
 (defun default-bin-dir ()
   "Return the default operator bin directory, ~/.local/bin/."
   (merge-pathnames ".local/bin/" (user-homedir-pathname)))
 
+(defun %place-binary (src bin-dir name)
+  "Install the file SRC as BIN-DIR/NAME, mode 755, replacing any file there in
+one rename.
+
+Copy SRC to BIN-DIR/.NAME.tmp, set its mode, then rename it over the
+destination, so a session that runs NAME meanwhile gets the old file or the
+new one, never a partial copy. Return the destination pathname. When any step
+fails, remove the temp file, write one line naming the destination and the
+error to *ERROR-OUTPUT*, leave the destination as it was, and return NIL."
+  (let* ((dir (uiop:ensure-directory-pathname bin-dir))
+         (tmp (merge-pathnames (format nil ".~A.tmp" name) dir))
+         (dest (merge-pathnames name dir)))
+    (handler-case
+        (progn
+          (ensure-directories-exist dir)
+          (uiop:copy-file src tmp)
+          ;; sb-posix rather than chmod and mv children: a failed step signals,
+          ;; and rename(2) fails on a directory at the destination where mv
+          ;; would move the file into it.
+          (sb-posix:chmod (uiop:native-namestring tmp) #o755)
+          (sb-posix:rename (uiop:native-namestring tmp)
+                           (uiop:native-namestring dest))
+          dest)
+      (error (e)
+        (ignore-errors (delete-file tmp))
+        (format *error-output* "~&dsmr-mcp install: could not install ~A: ~A~%"
+                (uiop:native-namestring dest) e)
+        nil))))
+
 (defun %copy-binary (bin-dir &optional (src (%bus-watch-source)))
-  "Copy the built watcher binary SRC into BIN-DIR/dsmr-bus-watch and mark it
-executable, so a sister repo can arm it by bare command name. Returns the
-destination pathname, or NIL when SRC is absent (i.e. `make bus-watch` has not
-been run) — keeping install non-fatal. SRC defaults to the repo's built binary
-and is overridable for testing."
-  (let* ((dest (merge-pathnames +bus-watch-name+
-                                (uiop:ensure-directory-pathname bin-dir))))
-    (unless (probe-file src)
+  "Install the built front end SRC and the SBCL program beside it into BIN-DIR,
+so a sister repo can arm the watcher by bare command name.
+
+SRC defaults to the repo's built front end and is overridable for testing; the
+SBCL program is the file named +BUS-WATCH-LISP-NAME+ in SRC's directory. The
+SBCL program is placed first and the front end second, each through
+%PLACE-BINARY, because the front end runs the program for every mode but a
+wake.
+
+Return the front end's destination pathname, or NIL when nothing new reached
+PATH:
+- SRC is absent (`make bus-watch` has not been run); nothing is printed.
+- The SBCL program is absent beside SRC; one line on *ERROR-OUTPUT* names it,
+  and neither binary is installed.
+- The SBCL program could not be placed; any existing front end is left as it
+  was.
+- The front end could not be placed, after the SBCL program was.
+Never signals for these, which keeps install non-fatal."
+  (unless (probe-file src)
+    (return-from %copy-binary nil))
+  (let ((lisp-src (merge-pathnames +bus-watch-lisp-name+
+                                   (uiop:pathname-directory-pathname src))))
+    (unless (probe-file lisp-src)
+      (format *error-output*
+              "~&dsmr-mcp install: ~A is missing, so neither watcher binary was ~
+installed; run 'make bus-watch' to build both.~%"
+              (uiop:native-namestring lisp-src))
       (return-from %copy-binary nil))
-    (ensure-directories-exist dest)
-    (uiop:copy-file src dest)
-    ;; Set the execute bit without assuming sb-posix is loaded (the minimal
-    ;; install path does not pull in bus.lisp / its sb-posix users). A chmod
-    ;; failure (absent binary, odd platform) must not abort an already-completed
-    ;; file copy — ignore its status and let the operator chmod by hand if needed.
-    (uiop:run-program (list "chmod" "+x" (namestring dest))
-                      :ignore-error-status t)
-    dest))
+    (and (%place-binary lisp-src bin-dir +bus-watch-lisp-name+)
+         (%place-binary src bin-dir +bus-watch-name+))))
 
 ;;; Print-mode renderer ------------------------------------------------------
 
@@ -221,9 +272,14 @@ augmented with :skill-dir), or NIL for :print."
   (format t "  skill:        ~A~%"
           (let ((s (getf result :skill-dir)))
             (if s (namestring s) "(not installed)")))
-  (format t "  bus-watch:    ~A~%"
-          (let ((b (getf result :bus-watch-path)))
-            (if b (namestring b) "(not installed — run 'make bus-watch' first)")))
+  ;; The front end and the SBCL program it runs are installed as a pair.
+  (let ((b (getf result :bus-watch-path)))
+    (if b
+        (format t "  bus-watch:    ~A (front end)~%                ~A (SBCL program)~%"
+                (namestring b)
+                (namestring (merge-pathnames +bus-watch-lisp-name+
+                                             (uiop:pathname-directory-pathname b))))
+        (format t "  bus-watch:    (not installed - run 'make bus-watch' first)~%")))
   (format t "  envrc tmpl:   ~A~%"
           (let ((e (getf result :envrc-template-dir)))
             (if e (namestring e) "(site-wide defaults skipped)")))
