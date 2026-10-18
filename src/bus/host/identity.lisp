@@ -86,6 +86,8 @@
    #:identity-cursor-mtime
    #:identity-pending-p
    #:identity-service-pid
+   #:identity-announce-hook
+   #:identity-heard-at
    ;; claim and release
    #:lock-pid-file
    #:finish-claim
@@ -121,7 +123,11 @@
    under it. DEAF-WATCH and DEAF-STATE are the deafness alarm's, exactly as the
    detached watcher keeps them. CURSOR-MTIME is the agent's cursor file's write
    date when it was last looked at, and PENDING-P whether mail the agent would be
-   handed sits above its cursor. SERVICE-PID is the pid the pid file records."
+   handed sits above its cursor. SERVICE-PID is the pid the pid file records.
+
+   ANNOUNCE-HOOK is NIL or a function of (IDENTITY SEQ LINE NOW), called with
+   every wake line once it is in the log; a true return says a client took the
+   line. HEARD-AT is the Unix time a client was last handed a line, or NIL."
   id bus stem token session-pid session-start
   (state :serving)
   pid-stream log-stream log-path pid-path beat-path
@@ -137,7 +143,9 @@
   (pending-p nil)
   pending-key
   pid-ino
-  service-pid)
+  service-pid
+  (announce-hook nil)
+  (heard-at nil))
 
 (defparameter *fleet-findings* '("roster-gap")
   "Codes reported at INFO that still belong in the fleet log. They are
@@ -237,11 +245,13 @@
   "Serve the agent REGISTRATION names, given FD, a descriptor already holding
    the write lock on its pid file. Returns the identity.
 
-   Takes the agent's baseline from its cursor, records SERVICE-PID and the full
-   id in the pid file through FD, opens the log for appending, writes the
-   heartbeat, and removes a deafness marker an earlier holder left. WAL-PATH and
-   CURSORS-DIR default to the bus's own. Used both for a fresh claim and for a
-   lock taken over from a watcher that let it go.
+   Takes the agent's baseline from its cursor, raised to the delivered position
+   persisted for the log's current generation when that is higher (see
+   %RAISE-TO-DELIVERED), records SERVICE-PID and the full id in the pid file
+   through FD, opens the log for appending, writes the heartbeat, and removes a
+   deafness marker an earlier holder left. WAL-PATH and CURSORS-DIR default to
+   the bus's own. Used both for a fresh claim and for a lock taken over from a
+   watcher that let it go.
 
    When anything fails the descriptors are closed, which lets the lock go, and
    the failure is passed on."
@@ -272,6 +282,7 @@
     (unwind-protect
          (progn
            (identity-baseline identity wal-path cursors-dir :report-fn report-fn)
+           (%raise-to-delivered identity wal-path)
            (setf (identity-cursor-mtime identity) (%mtime (identity-cursor-path identity)))
            (%take-pid-file identity fd)
            (let ((log-fd (sb-posix:open (%native (identity-log-path identity))
@@ -506,18 +517,38 @@
     (terpri stream)
     (finish-output stream)))
 
-(defun %announce (identity records now readers)
-  "Write the one wake line for RECORDS, all of them mail IDENTITY's agent would
-   be handed, and note it for the deafness alarm."
+(defun %wake-line (identity records)
+  "The one wake line for RECORDS, all of them mail IDENTITY's agent would be
+   handed: the highest seq, who the mail came from and who it was for."
   (multiple-value-bind (froms tos) (%batch-parties records (%own-namespace identity))
-    (%write-line identity (%signal-line (reduce #'max records :key #'wal:record-seq)
-                                        froms tos)))
-  (%observe-deaf identity now
-                 :readers (%readers identity readers)
-                 :parked-p (%parked-p identity)
-                 :line-written-p t))
+    (%signal-line (reduce #'max records :key #'wal:record-seq) froms tos)))
 
-(defun identity-deliver (identity records now &key readers)
+(defun %announce (identity records now readers report-fn)
+  "Write the one wake line for RECORDS, all of them mail IDENTITY's agent would
+   be handed, offer it to IDENTITY's announce hook when it has one, and note it
+   for the deafness alarm.
+
+   A line the hook says a client took counts as heard. A hook that signals is
+   reported through REPORT-FN as announce-hook-failed; the line stays written."
+  (let ((seq (reduce #'max records :key #'wal:record-seq))
+        (line (%wake-line identity records))
+        (hook (identity-announce-hook identity))
+        (taken nil))
+    (%write-line identity line)
+    (when hook
+      (handler-case (setf taken (funcall hook identity seq line now))
+        (error (e)
+          (ignore-errors
+           (funcall report-fn :error "announce-hook-failed"
+                    :bus (identity-bus identity) :id (identity-id identity)
+                    :subject (identity-stem identity) :msg (princ-to-string e))))))
+    (%observe-deaf identity now
+                   :readers (if taken 1 (%readers identity readers))
+                   :parked-p (%parked-p identity)
+                   :line-written-p t)))
+
+(defun identity-deliver (identity records now &key readers
+                                                   (report-fn #'report-to-logs))
   "Hand IDENTITY the bus's new RECORDS, oldest first, at NOW (Unix seconds).
    Returns true when a wake line was written.
 
@@ -530,7 +561,7 @@
 
    READERS is the count of processes following the log, when the caller has
    just measured it for many identities at once; otherwise it is measured
-   here."
+   here. REPORT-FN takes a failure of the announce hook."
   (let* ((floor (identity-floor identity))
          (fresh (remove-if-not (lambda (record) (> (wal:record-seq record) floor))
                                records)))
@@ -543,7 +574,7 @@
                                   fresh)))
         (when mail
           (if (eq (identity-state identity) :serving)
-              (progn (%announce identity mail now readers) t)
+              (progn (%announce identity mail now readers report-fn) t)
               (progn (setf (identity-pending-p identity) t) nil)))))))
 
 ;;; --------------------------------------------------------------------- ticks
@@ -646,7 +677,7 @@
           (if (< baseline old-floor)
               (identity-deliver identity
                                 (values (%poll-forward wal-path (wal:make-reader) baseline))
-                                now :readers readers)
+                                now :readers readers :report-fn report-fn)
               (setf (identity-floor identity) old-floor)))))))
 
 (defun %unread-mail (identity wal-path)
@@ -672,10 +703,16 @@
           pending))))
 
 (defun %offset-time (identity)
-  "When a listener last saved its read offset for IDENTITY's log, in Unix
-   seconds, or NIL when it never has."
-  (let ((date (%mtime (%watch-file identity "offset"))))
-    (and date (%unix-time date))))
+  "When IDENTITY's agent was last heard, in Unix seconds, or NIL when it never
+   has: the later of the write date of a listener's saved read offset and the
+   time a wake client was last handed a line. A listener that saves an offset
+   and one that waits on the service both count."
+  (let* ((date (%mtime (%watch-file identity "offset")))
+         (offset (and date (%unix-time date)))
+         (heard (identity-heard-at identity)))
+    (if (and offset heard)
+        (max offset heard)
+        (or offset heard))))
 
 (defun %reannounce (identity now readers wal-path cursors-dir report-fn)
   "Once a recycle window has passed with the log quiet under IDENTITY, announce
@@ -694,7 +731,7 @@
       (%recheck-cursor identity now readers wal-path cursors-dir report-fn :force t)
       (let ((mail (%unread-mail identity wal-path)))
         (when mail
-          (%announce identity mail now readers))))))
+          (%announce identity mail now readers report-fn))))))
 
 (defun %lapsed-tick (identity now readers wal-path)
   "One tick of a lapsed IDENTITY: no lines, only the question of whether mail
@@ -783,3 +820,18 @@
           (identity-pending-p identity) nil
           (identity-pending-key identity) nil))
   identity)
+
+;;; -------------------------------------------------------- delivered position
+
+(defun %raise-to-delivered (identity wal-path)
+  "Raise IDENTITY's floor to the position the service last handed a wake
+   client for it, when that position was recorded against the current
+   generation of the log at WAL-PATH and is higher. Returns the floor.
+
+   A seq handed over before a restart is then not handed over again; a
+   position from a rotated log says nothing about the new one and is ignored."
+  (let ((delivered (hostfiles:read-delivered-position
+                    (identity-stem identity) :generation (wal:generation wal-path))))
+    (when (and delivered (> delivered (identity-floor identity)))
+      (setf (identity-floor identity) delivered))
+    (identity-floor identity)))

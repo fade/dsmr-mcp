@@ -59,6 +59,7 @@
    #:bus-watch-growth-without-nudge
    #:bus-watch-lock
    #:bus-watch-last-seq
+   #:bus-watch-readers-fn
    #:bus-watch-thread
    #:open-bus-watch
    #:close-bus-watch
@@ -87,8 +88,10 @@
    wait, and GROWTH-WITHOUT-NUDGE the steps in a row in which the log grew while
    the feed said nothing. LOCK is held while agents are handed records or armed
    again; the supervisor shares it for its own changes to the same agents.
-   THREAD runs the steps, and STOPPING asks it to end."
+   READERS-FN, when set, gives an agent's reader count in place of the /proc
+   census. THREAD runs the steps, and STOPPING asks it to end."
   name paths wal-path cursors-dir reader feed
+  (readers-fn nil)
   (feed-wanted t)
   (generation 0)
   (last-seq 0)
@@ -120,10 +123,12 @@
   (tz:make-feed (broker:bus-paths-pub-endpoint (bus-watch-paths bw))
                 :timeout-ms +backstop-ms+))
 
-(defun open-bus-watch (name &key (feed t) lock)
+(defun open-bus-watch (name &key (feed t) lock readers-fn)
   "A watch of the bus NAME (NIL for the unnamed bus), subscribed to its
    broker's publications when FEED is true. LOCK is the mutex shared with the
-   supervisor; a new one is made when none is given.
+   supervisor; a new one is made when none is given. READERS-FN, a function of
+   an identity returning its reader count, replaces the /proc census of log
+   readers when given.
 
    Nothing is read here. The first step reads the log from its head and hands
    each agent what lies above its own floor, so mail that landed before the
@@ -137,6 +142,7 @@
               :cursors-dir (broker:bus-paths-cursors-dir paths)
               :reader (wal:make-reader)
               :feed-wanted (and feed t)
+              :readers-fn readers-fn
               :generation (wal:generation wal-path)
               :lock (or lock (sb-thread:make-mutex
                               :name (format nil "bus watch ~A" (or name "default")))))))
@@ -276,29 +282,40 @@
                              (ident:identity-floor identity)))
       records))
 
-(defun %deliver (bw identities records now before)
+(defun %deliver (bw identities records now before
+                 &optional (report-fn #'ident:report-to-logs))
   "Hand every agent in IDENTITIES on BW's bus what it is owed this step: the
-   RECORDS just read, or more for one armed below BEFORE (see %OWED). The
-   readers of every log are counted in one pass, and only when there is
-   something to hand over. A batch is worked out under the lock and handed over
-   under it again; a record at or below an agent's floor by then is ignored, so
-   nothing is announced twice."
+   RECORDS just read, or more for one armed below BEFORE (see %OWED). A batch
+   is worked out under the lock and handed over under it again; a record at or
+   below an agent's floor by then is ignored, so nothing is announced twice.
+   REPORT-FN takes a failure of an agent's announce hook.
+
+   Each agent's reader count comes from BW's readers function, asked under the
+   lock just before the hand-over, when BW has one. Otherwise the readers of
+   every log are counted in one pass over /proc, and only when there is
+   something to hand over."
   (let* ((served (remove-if-not (lambda (identity) (%on-bus-p bw identity))
                                 identities))
+         (readers-fn (bus-watch-readers-fn bw))
          (batches (sb-thread:with-recursive-lock ((bus-watch-lock bw))
                     (mapcar (lambda (identity) (%owed bw identity records before))
                             served))))
     (when (some #'identity batches)
-      (let ((counts (ident:log-reader-counts (mapcar #'ident:identity-log-path served))))
+      (let ((counts (and (null readers-fn)
+                         (ident:log-reader-counts
+                          (mapcar #'ident:identity-log-path served)))))
         (sb-thread:with-recursive-lock ((bus-watch-lock bw))
           (loop for identity in served
                 for batch in batches
                 when batch
                   do (ident:identity-deliver
                       identity batch now
-                      :readers (gethash (uiop:native-namestring
-                                         (ident:identity-log-path identity))
-                                        counts))))))))
+                      :readers (if readers-fn
+                                   (funcall readers-fn identity)
+                                   (gethash (uiop:native-namestring
+                                             (ident:identity-log-path identity))
+                                            counts))
+                      :report-fn report-fn)))))))
 
 (defun bus-watch-step (bw identities now &key (report-fn #'ident:report-to-logs))
   "One step of BW: wait for a nudge or the backstop, read the log forward once,
@@ -321,7 +338,7 @@
               (bus-watch-last-seq bw) last)
         (when rotated
           (%rotated bw identities report-fn))
-        (%deliver bw identities records now before)
+        (%deliver bw identities records now before report-fn)
         (%watch-gap bw nudged grew)
         (incf (bus-watch-progress bw))
         (length records)))))
