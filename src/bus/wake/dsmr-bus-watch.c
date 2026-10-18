@@ -6,9 +6,18 @@
  *   - a front end that runs the SBCL program, dsmr-bus-watch-lisp in the
  *     same directory, for every mode except a plain wake, passing argv on
  *     unchanged;
- *   - the wake client, which waits for the next wake line addressed to one
- *     identity and prints exactly what the SBCL listener prints, with the
- *     same exit statuses.
+ *   - the wake client, which sends one request for one identity to the host
+ *     bus service and waits for its reply.
+ *
+ * The service words every reply. The client writes the two texts a reply
+ * carries to stderr and stdout as given and exits with the status the reply
+ * names. It prints fixed text of its own only where the service is never
+ * consulted or cannot be reached: no identity, argument warnings, its own
+ * deadline, an outage past the grace, no state home, the SBCL program not
+ * runnable, and out of memory.
+ *
+ * A reply is untrusted input. One outside the reply grammar (handle_reply)
+ * prints nothing and counts as an outage.
  *
  * The wake client parses its arguments as leniently as the SBCL program:
  * an unknown flag, a dangling value or a bad number earns one warning and
@@ -48,7 +57,8 @@
 #define DEFAULT_OUTAGE_GRACE 300ULL
 #define OUTAGE_STAMP_SECONDS 3600
 #define MAX_SOCKET_PATH 107
-#define MAX_REPLY 8192
+#define MAX_REPLY 32768 /* bytes in a reply line, its LF included */
+#define MAX_TEXT 4096   /* octets in one decoded reply text */
 #define SETTLE_MS 1000
 
 /* ------------------------------------------------------------- flag tables */
@@ -543,33 +553,49 @@ static void build_request(struct buf *b, const struct options *o, const char *cw
     buf_str(b, "\n");
 }
 
-/* The value of the hex digit C, or -1 when C is not one. */
+/* The value of the uppercase hex digit C, or -1 when C is not one. */
 static int hex_value(char c) {
     if (c >= '0' && c <= '9')
         return c - '0';
     if (c >= 'A' && c <= 'F')
         return c - 'A' + 10;
-    if (c >= 'a' && c <= 'f')
-        return c - 'a' + 10;
     return -1;
 }
 
-/* Decode the percent escapes of FIELD in place. A malformed escape, and an
-   escape for the NUL byte, are kept as they stand, so the result is still
-   one C string. */
-static void percent_decode(char *field) {
-    char *out = field;
-    for (char *in = field; *in;) {
-        int hi = in[0] == '%' && in[1] ? hex_value(in[1]) : -1;
-        int lo = hi >= 0 && in[2] ? hex_value(in[2]) : -1;
-        if (lo >= 0 && (hi != 0 || lo != 0)) {
-            *out++ = (char)(hi * 16 + lo);
-            in += 3;
+/* Decode one reply text FIELD, appending its octets to OUT. `-` is the
+   empty text; any other FIELD is one or more of [A-Za-z0-9._~/] or `%`
+   followed by two uppercase hex digits. Returns 1 when FIELD fits that
+   grammar and decodes to at most MAX_TEXT octets, none of them below 0x20
+   other than TAB and LF, and none 0x7F; otherwise 0, OUT holding whatever
+   was appended before the fault. */
+static int decode_text(const char *field, struct buf *out) {
+    if (strcmp(field, "-") == 0)
+        return 1;
+    if (*field == '\0')
+        return 0;
+    size_t count = 0;
+    for (const char *p = field; *p;) {
+        unsigned char octet;
+        if (*p == '%') {
+            int hi = hex_value(p[1]);
+            int lo = hi >= 0 ? hex_value(p[2]) : -1;
+            if (lo < 0)
+                return 0;
+            octet = (unsigned char)(hi * 16 + lo);
+            p += 3;
+        } else if (unreserved_octet_p((unsigned char)*p)) {
+            octet = (unsigned char)*p++;
         } else {
-            *out++ = *in++;
+            return 0;
         }
+        if ((octet < 0x20 && octet != '\t' && octet != '\n') || octet == 0x7F)
+            return 0;
+        if (++count > MAX_TEXT)
+            return 0;
+        char byte = (char)octet;
+        buf_add(out, &byte, 1);
     }
-    *out = '\0';
+    return 1;
 }
 
 /* ------------------------------------------------------------------ outputs */
@@ -586,39 +612,6 @@ static _Noreturn void idle_exit(const struct client *c) {
     }
     say(1, "idle wake-seconds=", c->wake_text, "\n", (char *)NULL);
     _exit(0);
-}
-
-/* Print the wake LINE that arrived on bus LABEL and exit: 0 by default, 2 in
-   hook mode with the drain advice. */
-static _Noreturn void event_exit(const struct client *c, const char *label, const char *line) {
-    if (c->hook) {
-        say(2, line, "\ndsmr-bus-watch: mail has arrived for you on bus ", label,
-            ". Drain the bus now with bus-receive and act on what it holds. ", ADVICE_TAIL,
-            "\n", (char *)NULL);
-        _exit(2);
-    }
-    say(1, line, "\n", (char *)NULL);
-    _exit(0);
-}
-
-/* Report that no watcher serves ID on bus LABEL and exit: 1 by default; in
-   hook mode 2 with advice when DUE, else 0 in silence. */
-static _Noreturn void nowatcher_exit(const struct client *c, const char *label, const char *id,
-                                     int due) {
-    if (!c->hook) {
-        say(2, "dsmr-bus-watch: no detached watcher is running for ", id, " on bus ", label,
-            "; start one with --detach, then wake again\n", (char *)NULL);
-        say(1, "nowatcher bus=", label, "\n", (char *)NULL);
-        _exit(1);
-    }
-    if (!due)
-        _exit(0);
-    say(2, "nowatcher bus=", label, "\ndsmr-bus-watch: no detached watcher is running for ", id,
-        " on bus ", label,
-        ", so no mail can wake you. Start one with dsmr-bus-watch --detach and your usual "
-        "--bus and identity flags. ",
-        ADVICE_TAIL, "\n", (char *)NULL);
-    _exit(2);
 }
 
 /* Create each missing directory of PATH with mode 0700. */
@@ -713,46 +706,92 @@ static int connect_service(const struct client *c) {
     return fd;
 }
 
-/* Act on one reply LINE (without its LF). Every answer the contract defines
-   ends the process; return means the reply counts as an outage: ERR busy,
-   version or bad-request, or anything unrecognised. ERR bad-bus hands the
-   original argv to the SBCL program, whose refusal names the problem. */
-static void handle_reply(const struct client *c, char *line) {
-    if (strncmp(line, "EVENT ", 6) == 0) {
-        char *label = line + 6;
-        char *space = strchr(label, ' ');
-        if (!space || space == label)
-            return;
+enum reply_outcome { REPLY_RETRY, REPLY_MALFORMED };
+
+/* Split LINE in place at single spaces into at most MAX tokens, stored in
+   TOKENS. Returns the number of tokens, or 0 when LINE holds an empty token
+   (a leading, trailing or doubled space, or an empty line) or more than MAX
+   tokens. */
+static size_t split_tokens(char *line, char **tokens, size_t max) {
+    size_t n = 0;
+    for (char *p = line;;) {
+        char *space = strchr(p, ' ');
+        if (n == max || (space ? space == p : *p == '\0'))
+            return 0;
+        tokens[n++] = p;
+        if (!space)
+            return n;
         *space = '\0';
-        event_exit(c, label, space + 1);
+        p = space + 1;
     }
-    if (strncmp(line, "NOWATCHER ", 10) == 0) {
-        char *label = line + 10;
-        char *id = strchr(label, ' ');
-        if (!id || id == label)
-            return;
-        *id++ = '\0';
-        char *due = strchr(id, ' ');
-        if (!due || due == id)
-            return;
-        *due++ = '\0';
-        if (strcmp(due, "due=0") != 0 && strcmp(due, "due=1") != 0)
-            return;
-        percent_decode(id);
-        nowatcher_exit(c, label, id, due[4] == '1');
+}
+
+/* True when KIND is 1 to 16 of [a-z-]. */
+static int reply_kind_p(const char *kind) {
+    size_t n = 0;
+    for (; kind[n]; n++)
+        if (!((kind[n] >= 'a' && kind[n] <= 'z') || kind[n] == '-'))
+            return 0;
+    return n >= 1 && n <= 16;
+}
+
+/* Act on one reply LINE, its LF removed. The grammar, every byte printable
+   ASCII (0x20-0x7E), tokens separated by single spaces:
+     EXIT <status> <kind> <out> <err>   status 0, 1 or 2; kind [a-z-]{1,16};
+                                        out and err texts (decode_text)
+     ERR busy|version|bad-request <text>
+     ERR bad-bus <text>
+   A valid EXIT reply has both texts decoded before anything is written;
+   then err goes to stderr, out to stdout, and the process exits with
+   STATUS. ERR bad-bus runs the SBCL program with the original argv.
+   Returns REPLY_RETRY for the three retry codes and REPLY_MALFORMED for
+   any other line. */
+static enum reply_outcome handle_reply(const struct client *c, char *line) {
+    for (const unsigned char *p = (const unsigned char *)line; *p; p++)
+        if (*p < 0x20 || *p > 0x7E)
+            return REPLY_MALFORMED;
+    char *tokens[5];
+    size_t n = split_tokens(line, tokens, 5);
+    if (n == 3 && strcmp(tokens[0], "ERR") == 0) {
+        struct buf text = {0};
+        int text_ok = decode_text(tokens[2], &text);
+        free(text.p);
+        if (!text_ok)
+            return REPLY_MALFORMED;
+        if (strcmp(tokens[1], "bad-bus") == 0)
+            run_lisp_program(c->argv);
+        if (strcmp(tokens[1], "busy") == 0 || strcmp(tokens[1], "version") == 0 ||
+            strcmp(tokens[1], "bad-request") == 0)
+            return REPLY_RETRY;
+        return REPLY_MALFORMED;
     }
-    if (strcmp(line, "SUPERSEDED") == 0)
-        _exit(0);
-    if (strcmp(line, "ERR bad-bus") == 0 || strncmp(line, "ERR bad-bus ", 12) == 0)
-        run_lisp_program(c->argv);
+    if (n != 5 || strcmp(tokens[0], "EXIT") != 0)
+        return REPLY_MALFORMED;
+    const char *status = tokens[1];
+    if (!(status[0] >= '0' && status[0] <= '2' && status[1] == '\0') ||
+        !reply_kind_p(tokens[2]))
+        return REPLY_MALFORMED;
+    struct buf out = {0};
+    struct buf err = {0};
+    if (!decode_text(tokens[3], &out) || !decode_text(tokens[4], &err)) {
+        free(out.p);
+        free(err.p);
+        return REPLY_MALFORMED;
+    }
+    if (err.len)
+        write_all(2, err.p, err.len);
+    if (out.len)
+        write_all(1, out.p, out.len);
+    _exit(status[0] - '0');
 }
 
 /* Send the request on FD and wait for the reply, up to DEADLINE (-1 for
-   none). A reply the contract defines ends the process, as does the
-   deadline. Returns when the connection fails, ends or carries an outage
-   reply, which includes a reply over MAX_REPLY bytes and one holding a NUL
-   byte: 1 when it had stayed open for SETTLE_MS after the request went,
-   else 0. */
+   none). A valid EXIT reply ends the process, as does the deadline. Returns
+   when the connection fails or ends, or a retry or malformed reply arrives:
+   1 when the connection had stayed open SETTLE_MS after the request went
+   and no malformed reply came, else 0. A malformed reply, which includes a
+   line over MAX_REPLY bytes and one holding a NUL byte, so never resets the
+   outage clock. */
 static int converse(const struct client *c, int fd, int64_t deadline) {
     if (!write_all(fd, c->request.p, c->request.len))
         return 0;
@@ -786,21 +825,22 @@ static int converse(const struct client *c, int fd, int64_t deadline) {
         len += (size_t)n;
         if (lf) {
             if (memchr(reply, '\0', (size_t)(lf - reply)))
-                return settled;
+                return 0;
             *lf = '\0';
-            handle_reply(c, reply);
+            if (handle_reply(c, reply) == REPLY_MALFORMED)
+                return 0;
             return settled;
         }
         if (len == MAX_REPLY)
-            return settled;
+            return 0;
     }
 }
 
-/* Wait for the next wake line and print it. A refused connection, an end of
-   file or an outage reply is never an exit: the client reconnects after 100,
-   250, 500, then 1000 ms and sends its request again. The idle line arrives
-   at the wake deadline whatever the service does, and an outage that lasts
-   the whole grace ends in `nowatcher`. */
+/* Wait for the service's final reply and act on it. A refused connection,
+   an end of file, a retry reply or a malformed one is never an exit: the
+   client reconnects after 100, 250, 500, then 1000 ms and sends its request
+   again. The idle line arrives at the wake deadline whatever the service
+   does, and an outage that lasts the whole grace ends in `nowatcher`. */
 static _Noreturn void wait_for_wake(const struct client *c) {
     static const int64_t backoff[] = {100, 250, 500, 1000};
     size_t step = 0;
