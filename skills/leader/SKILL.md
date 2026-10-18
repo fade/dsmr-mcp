@@ -109,6 +109,45 @@ that the record is stale and the repo wins. That paragraph is a symptom. Writing
 remedy, and if you publish it without repairing the file, you have committed the exact error you are
 describing.
 
+### Is this repo running through GSD? Check it at bring-up
+
+**A repo can stop running through GSD for days with every record still reading as current.** The two
+checks below catch that, and the one way the shared GSD install silently stops routing Lisp work to
+the Lisp executor. Both are read-only unless you pass `--apply`. Run them now, before Step 2.
+
+**(a) The Lisp routing patch.**
+
+```bash
+bash ~/.claude/scripts/gsd-routing-gate.sh
+```
+
+- **exit 0** `Lisp routing patch present`: nothing to report.
+- **exit 1** `Lisp routing patch missing`: put that line in your FIRST reply. A gsd-core update is the
+  usual cause: it replaces the routing step and drops the patch, so plans with no `agent_hint` go to
+  the generic executor. Re-apply with `bash ~/.claude/scripts/gsd-routing-gate.sh --apply` **only when
+  no GSD executor is running on EITHER fleet**: the install is shared by both, and a step rewritten
+  under a live orchestrator is a step it may read half-written. If `--apply` refuses (a hunk no longer
+  fits), report its output; never hand-edit the step.
+- **exit 2** `gsd-core absent`: gsd-core is not installed on this host. Report it.
+
+**(b) Off-process drift.**
+
+```bash
+bash ~/.claude/skills/leader/gsd-drift.sh "$PWD"
+```
+
+Run it for your own repo, then the same line with each repo path you discover in Step 2 in place of
+`"$PWD"`. It reads `git log` and `.planning` and writes nothing, like the other file reads there.
+
+- **Every `OFF-PROCESS` line is off-process drift and is NAMED in your first reply to the operator,
+  with its sha and subject.** It is a commit on the working branch, newer than the newest commit a
+  GSD summary accounts for, with no plan in flight that could own it.
+- **`UNACCOUNTED` lines** come with `in-flight` lines naming the plans that may own them. Check each
+  against the named plan before calling it drift: a running plan commits before its summary exists.
+- **`NO-GSD` is an answer, not a gap.** That repo does not keep GSD planning state; do not fabricate it.
+- A `window since` line means no summary named any commit and the check fell back to file times,
+  which a synced `.planning` makes unreliable. Say so when you report its result.
+
 ## Step 2 — The fleet roster, DISCOVERED, then read from files
 
 ⛔ **Never hardcode the roster or its size — and never derive it from the filesystem alone.**
@@ -662,7 +701,9 @@ yourself. Surface store drift to the operator only when it is not clean.
 
 Report to the operator, in this order and nothing else:
 
-1. **Phase N**, the cursor, and the single next action.
+1. **Phase N**, the cursor, and the single next action. Beside Phase N, every `OFF-PROCESS` commit
+   from the drift check (sha and subject) and `Lisp routing patch missing` when the gate printed it
+   (Step 1, *Is this repo running through GSD?*).
 2. The roster table — one line per repo, OK / MISMATCH / unresolved.
 3. **Blocked list**, consolidated, with exact grants, and **every deaf sister**: run the reader
    check (`--check-live`, Step 4) for every sister at EVERY reply, not only at bring-up, and list
