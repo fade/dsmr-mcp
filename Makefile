@@ -30,6 +30,15 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
+# The compiler and flags for the static C front end of the bus watcher (see
+# bus-watch). They carry their own names so the environment's CC, CFLAGS and
+# LDFLAGS never reach this build: the front end must stay static, and a newer
+# compiler's warnings must never break the per-host install build. The strict
+# warning set and the analysers belong to the C test target, not here.
+WAKE_CC ?= cc
+WAKE_CFLAGS ?= -std=c11 -Os -Wall -Wextra -D_GNU_SOURCE
+WAKE_LDFLAGS ?= -static -s
+
 # Where this site's Lisp checkouts live, and therefore where a fleet's member
 # repositories are resolved from. The environment wins so a clone elsewhere
 # needs no edit here.
@@ -68,16 +77,29 @@ bridge:
 	     --eval '(asdf:make :dsmr-mcp-bridge)' \
 	     --eval '(quit)'
 
-## bus-watch: build the standalone coordination-bus wakeup watcher binary.
+## bus-watch: build the bus watcher command, both of its binaries.
 ##
-##   Produces bin/dsmr-bus-watch via ASDF program-op (save-lisp-and-die).
-##   A sister repo arms it by bare command name; the machine needs no SBCL or
-##   Python of its own. Build artefact is .gitignored; rebuild with
-##   'make bus-watch' after any change to src/bus/watch.lisp.
+##   Produces two executables, both .gitignored:
 ##
-##   Built with --no-userinit/--no-sysinit so the saved image carries ONLY the
-##   WAL leaf + watcher (no Quicklisp/slynk) — the watcher's closure needs
-##   nothing beyond CL, so both .asd files are registered explicitly.
+##   - bin/dsmr-bus-watch-lisp, the SBCL program, via ASDF program-op
+##     (save-lisp-and-die). Built with --no-userinit/--no-sysinit so the saved
+##     image carries only the bus leaves and the watcher (no Quicklisp, no
+##     slynk); its closure needs nothing beyond CL, so both .asd files are
+##     registered explicitly.
+##   - bin/dsmr-bus-watch, the static C front end built from
+##     src/bus/wake/dsmr-bus-watch.c. It runs --wake and --wake --hook itself
+##     against the host bus service and hands every other mode, argv unchanged,
+##     to dsmr-bus-watch-lisp in its own directory. A waiting wake is that one
+##     small process, with no SBCL image behind it.
+##
+##   A sister repo arms the front end by bare command name; the machine needs
+##   no SBCL or Python of its own. Rebuild after any change to
+##   src/bus/watch.lisp or the C source. The front end is removed and rebuilt
+##   on every run, so a binary carried in from another host is never taken as
+##   up to date, and the build fails unless it is statically linked. It uses
+##   WAKE_CC, WAKE_CFLAGS and WAKE_LDFLAGS rather than CC, CFLAGS and LDFLAGS,
+##   so an ambient CFLAGS cannot drop -static, and it names no -m flag that
+##   ties the binary to one processor model.
 bus-watch:
 	@mkdir -p bin
 	sbcl --noinform --no-sysinit --no-userinit --disable-debugger \
@@ -86,6 +108,11 @@ bus-watch:
 	     --eval '(asdf:load-asd (truename "dsmr-bus-watch.asd"))' \
 	     --eval '(asdf:make :dsmr-bus-watch)' \
 	     --eval '(quit)'
+	@test -x bin/dsmr-bus-watch-lisp || { echo "bin/dsmr-bus-watch-lisp was not written" >&2; exit 1; }
+	@rm -f bin/dsmr-bus-watch bin/dsmr-bus-watch.tmp
+	$(WAKE_CC) $(WAKE_CFLAGS) -o bin/dsmr-bus-watch.tmp src/bus/wake/dsmr-bus-watch.c $(WAKE_LDFLAGS)
+	@mv -f bin/dsmr-bus-watch.tmp bin/dsmr-bus-watch
+	@file bin/dsmr-bus-watch | grep -q 'statically linked' || { echo "bin/dsmr-bus-watch is not statically linked" >&2; rm -f bin/dsmr-bus-watch; exit 1; }
 
 ## bus-host: build the host bus service binary.
 ##
@@ -128,21 +155,29 @@ bus-host:
 	     --eval '(quit)'
 	@test -x bin/dsmr-bus-host || { echo "bin/dsmr-bus-host was not written" >&2; exit 1; }
 
-## install-bus-watch: publish the built watcher onto PATH.
+## install-bus-watch: publish both watcher binaries onto PATH.
 ##
-##   Agents invoke 'dsmr-bus-watch' by name, so the copy under $(BINDIR) — not
-##   bin/ — is the one every session actually runs. Skipping this step leaves
+##   Agents invoke 'dsmr-bus-watch' by name, so the copies under $(BINDIR), not
+##   bin/, are the ones every session actually runs. Skipping this step leaves
 ##   the operator docs describing flags the deployed binary rejects, and a
 ##   watcher that exits on them is deaf to the bus rather than noisy about it.
-##   Install atomically: agents arm watchers continuously, and cp over a running
-##   binary's inode can hand a session a half-written image.
+##
+##   The SBCL program is installed first and the front end second, because the
+##   front end runs dsmr-bus-watch-lisp from its own directory for every mode
+##   but a wake: a front end on PATH without it would fail every such mode.
+##   Each is installed atomically: agents arm watchers continuously, and cp over
+##   a running binary's inode can hand a session a half-written image.
 install-bus-watch: bus-watch
 	@mkdir -p "$(BINDIR)"
+	@cp bin/dsmr-bus-watch-lisp "$(BINDIR)/.dsmr-bus-watch-lisp.tmp"
+	@chmod 755 "$(BINDIR)/.dsmr-bus-watch-lisp.tmp"
+	@mv -f "$(BINDIR)/.dsmr-bus-watch-lisp.tmp" "$(BINDIR)/dsmr-bus-watch-lisp"
 	@cp bin/dsmr-bus-watch "$(BINDIR)/.dsmr-bus-watch.tmp"
 	@chmod 755 "$(BINDIR)/.dsmr-bus-watch.tmp"
 	@mv -f "$(BINDIR)/.dsmr-bus-watch.tmp" "$(BINDIR)/dsmr-bus-watch"
+	@echo "installed $(BINDIR)/dsmr-bus-watch-lisp"
 	@echo "installed $(BINDIR)/dsmr-bus-watch"
-	@echo "running watchers keep the previous image until each is re-armed"
+	@echo "running listeners and watchers keep the previous image until each is re-armed"
 
 ## install-bus-host: publish the built host bus service binary onto PATH.
 ##

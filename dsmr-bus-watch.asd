@@ -1,12 +1,16 @@
 ;;;; dsmr-bus-watch.asd
 ;;;;
-;;;; Cross-agent bus wakeup watcher: a standalone binary that watches the
+;;;; The SBCL program behind the bus watcher command: it watches the
 ;;;; coordination-bus WAL and signals a new foreign message so a dormant sister
-;;;; agent can be re-armed/woken without an operator nudge.
+;;;; agent can be re-armed or woken without an operator nudge.
 ;;;;
-;;;; Produces bin/dsmr-bus-watch via (asdf:make :dsmr-bus-watch) / `make bus-watch`.
-;;;; It is a Lisp-only executable so a sister repo's machine needs no Python or
-;;;; SBCL of its own to arm the watcher.
+;;;; Produces bin/dsmr-bus-watch-lisp via (asdf:make :dsmr-bus-watch) / `make
+;;;; bus-watch`. The installed `dsmr-bus-watch` is a small static C front end
+;;;; (src/bus/wake/dsmr-bus-watch.c): it runs `--wake` and `--wake --hook`
+;;;; itself against the host bus service and hands every other mode, argv
+;;;; unchanged, to dsmr-bus-watch-lisp in its own directory. Both are
+;;;; self-contained executables, so a sister repo's machine needs no Python or
+;;;; SBCL of its own to arm a watcher.
 ;;;;
 ;;;; This lives in its own .asd (rather than alongside dsmr-mcp.asd) so its
 ;;;; primary system name matches the file and its lean dependency closure stays
@@ -35,5 +39,5 @@
                "dsmr-mcp/src/bus/hostfiles"
                "dsmr-bus-watch/src/bus/watch")
   :build-operation "program-op"
-  :build-pathname "bin/dsmr-bus-watch"
+  :build-pathname "bin/dsmr-bus-watch-lisp"
   :entry-point "dsmr-bus-watch/src/bus/watch:main")
