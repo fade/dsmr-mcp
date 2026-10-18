@@ -47,9 +47,10 @@ change to make when no bring-up depends on the old names.
 Not everything in an agent's skills directory belongs to this project, and adopting a
 third-party skill would fork an artifact whose own installer will later overwrite the fork.
 
-- **The `gsd-*` planning system** (67 skills) is the `get-shit-done-cc` package, installed and
-  upgraded by its own tooling and tracked by its own file manifest. Local adjustments to it
-  belong in that package's patch directory, not here.
+- **The `gsd-*` planning system** (72 skills) is the `@opengsd/gsd-core` package, installed
+  with `--config-dir ~/.claude` and upgraded by its own tooling, which tracks it in its own file
+  manifest. The one local adjustment it carries lives in `harness/patches/gsd-core/`, and
+  `harness/scripts/gsd-routing-gate.sh` reports when an upgrade drops it.
 - **`graphify`** is ours, and that is exactly why it is not here. We carry a substantial
   Common Lisp patch set on a fork at `SourceCode/python/graphify` (`origin` is the fork,
   `upstream` is tracked with its push URL disabled, and the fork's version is deliberately set
