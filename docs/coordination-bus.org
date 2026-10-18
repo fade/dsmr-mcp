@@ -250,29 +250,88 @@ installer (=~/.local/bin/dsmr-bus-watch=).
   drains everything pending in one call, so records below the signalled seq get
   no line of their own. Consecutive lines may therefore SKIP sequence numbers.
   A gap is normal and never a dropped record, so anything parsing these lines
-  must expect one. This is the STANDING listener: run it under a persistent *Monitor*
-  (the Claude Code harness primitive that turns each printed line into a live
-  notification), armed once at bring-up, and every message wakes the agent with
-  no per-turn re-arm. See the =bus-watch= skill for the exact Monitor command.
-- *Exit-on-event* (default) — polls until a new message arrives, prints one
-  =bus:<SEQ>= line, and *exits 0*. Now used only for the SessionStart bootstrap
-  prime (below): a one-shot that ensures a watcher and heartbeat exist before
-  turn one.
+  must expect one. You do not run this mode yourself: the detached watcher that
+  =--detach= starts runs it, and so does the host bus service for every agent
+  registered with it. Each writes its lines to that agent's log.
+- *Exit-on-event* (default) polls until a new message arrives, prints one
+  =bus:<SEQ>= line, and *exits 0*. It is used only for the SessionStart
+  bootstrap prime (below): a one-shot that ensures a watcher and heartbeat exist
+  before turn one.
+- *Wake* (=--wake=) is the standing listener. It waits for the host bus service
+  to hand it the next line for your identity, prints it, and exits, so its exit
+  is the wake. The next section says how it reaches you.
 
-*Do not* run the standing watch as a =run_in_background= shell task. The harness
-notifies on process *exit*, and a streaming watch — or a =while true= around the
-one-shot — never exits, so its signal is never delivered and the agent goes
-silently deaf. That mismatch is the right watcher on the wrong harness primitive.
-The Monitor tool, which fires per printed line, is the connector that actually
-wakes you.
+Run the standing listener as a background shell task (=run_in_background=) and
+re-arm it after each wake. Never background a streaming watch: the harness
+notifies on process exit, and a streaming watch, or a =while true= around a
+one-shot, never exits, so its signal is never delivered and the agent goes
+silently deaf. I retired the persistent Monitor the earlier design stood on.
+Its allow rules do not apply in auto mode and it expires after 30 minutes, so
+every re-arm had to pass the permission classifier again, and during a
+classifier outage agents went deaf with their watcher still running.
 
-** The re-arm rule (historical — the persistent Monitor removes it)
+** The wake client and the host bus service
 
-With the standing listener now a persistent Monitor armed once at bring-up, there
-is no per-turn re-arm at all, so the discipline below is no longer something an
-agent performs. It is kept here because it explains *why* self-wake cannot happen
-(the next section), which is still load-bearing. Read it as background, not as a
-step to follow.
+The installed =~/.local/bin/dsmr-bus-watch= is a small statically linked front
+end. With =--wake=, and with =--wake --hook= as the session Stop hook runs it,
+it is the listener itself: it connects to the host bus service's socket,
+=<state>/dsmr-mcp/host/wake.sock= (=<state>= is =$XDG_STATE_HOME=, by default
+=~/.local/state=), sends one request naming your identity, and waits for one
+reply. Every other mode, and =--wake --fleet-log=, runs the SBCL program
+=dsmr-bus-watch-lisp=, installed beside it, with the arguments unchanged. I made
+the waiting listener a static client because every session keeps one waiting
+all the time, and an SBCL image for each cost about 30 MB of proportional set
+size (PSS), where the client costs under 100 kB.
+
+- *One queue per identity.* The service keeps a queue of waiting clients for
+  each identity. The Stop hook's listener stands first, and a newer hook
+  listener replaces the older one, which exits 0 without printing anything.
+  Background listeners wait behind it in the order they arrived. Each line goes
+  to one client, the one at the head of the queue, and when that client leaves,
+  the next is handed anything that arrived in between. =--wait-for-arm= is
+  accepted and changes nothing, and no wake answers =already-armed= any more.
+- *The service records what it handed over.* For each identity it keeps the
+  position of the last line it handed to a client in =<stem>.delivered=, beside
+  that identity's log in the watch state directory. A client that arrives
+  later is caught up from there, and a service restart never hands the same
+  line over twice.
+- *A restart is not an outage.* A waiting client reconnects through a service
+  restart and asks again, so a restart by systemd costs you nothing. Only after
+  about five minutes (300 seconds) without the service does it give up: it
+  prints =nowatcher bus=<label>= and exits 1, with a notice on stderr naming
+  =systemctl --user status dsmr-bus-host=. In hook mode it exits 2 with that
+  notice at most once an hour for each identity, and exits 0 in silence
+  otherwise, so a long outage wakes a session without waking it every turn.
+- *The service words the replies.* Every line a waiting listener prints on a
+  reply comes from the service, worded for the hook or the background mode: the
+  wake line, the advice to drain, and the notice that no watcher is registered.
+  The client prints fixed text of its own only where the service may be
+  unreachable or was never asked: no identity, the idle line at its own
+  deadline, the outage notice, and warnings about its arguments. I kept the
+  wording in the service so the C client has as little text handling to test
+  and audit as possible.
+- *=readers== counts clients.* =--check-live= reports =readers=<n>= as the
+  number of wake clients the service holds for that identity, or
+  =readers=unknown= when the service does not answer. =deaf== and =parked==
+  mean what they did.
+- *The fleet-log listener is the exception.* =--wake --fleet-log= stays the SBCL
+  program, with a lock of its own and its own =already-armed= answer. I kept it
+  out of the service on purpose: it has to hear
+  =FLEET ERROR code=service-failed=, which is written exactly when the service
+  is dead.
+
+On a host without the service, =--wake= has nothing to wait on and answers
+=nowatcher= after the same five minutes. Install the service first; the order
+is in [[file:operations.org::*Coordination bus][Operations]]. The =bus-watch=
+skill has the rules an agent follows: the arm lines, what each answer means,
+and how to drain.
+
+** The re-arm rule (historical)
+
+The discipline below is no longer something an agent performs: a wake starts
+from what the host bus service last handed over, never from a baseline you
+choose. It is kept here because it explains *why* self-wake cannot happen (the
+next section). Read it as background, not as a step to follow.
 
 The watcher seeds a /baseline/ sequence number when it arms and fires only on a
 seq strictly greater than that baseline. With no author field in the WAL, the
@@ -391,12 +450,11 @@ a harness restart heals itself: the next arm starts a fresh watch. Treat
 
 ** Standing shape (no operator nudge)
 
-Both ends — the leader and every sister — run the SAME standing listener: one
-=dsmr-bus-watch --stream= under a persistent *Monitor*, armed once at bring-up.
-Each streamed message wakes the agent, which receives, acts, and publishes, then
-returns to work; the Monitor keeps listening, so there is no re-arm step. The loop
-self-drives with no operator in the middle. See the =bus-watch= skill for the
-Monitor command and the drain-on-wake loop.
+Every agent runs the same standing listener: a background =--wake=, re-armed
+after each wake, beside the session Stop hook where the operator has installed
+it. Each wake makes the agent receive, act, and publish, then return to work.
+The loop drives itself with no operator in the middle. See the =bus-watch= skill
+for the arm lines and the drain-on-wake loop.
 
 ** Auto-arm on bringup
 
@@ -441,7 +499,7 @@ the safe form lives in one place.
 *** Cadence
 
 The prime uses a fixed cadence (=--poll-ms 250=, =--recycle-seconds 120=): poll
-fast so a message arriving in the window before the agent arms its Monitor is seen
+fast so a message arriving in the window before the agent arms its listener is seen
 promptly, recycle modestly so a quiet prime self-exits rather than lingering
 beside the standing watch. Responsiveness comes from =--poll-ms=, never from
 =--recycle-seconds=.
@@ -453,11 +511,11 @@ is now just the one-shot prime, with no cadence state to track.
 
 *** What the hook does, and what it leaves to the loop
 
-The hook only fires the *first* watcher — the one-shot bootstrap prime. The
-standing listener is the persistent Monitor the agent arms at bring-up (see the
-=bus-watch= skill); the hook does not arm it, and there is no per-turn re-arm to
-drive. The hook is purely how a watcher and heartbeat exist before turn one; it
-does not change the standing loop's mechanics.
+The hook only fires the *first* watcher: the one-shot bootstrap prime. The
+standing listener is the background =--wake= the agent arms at bring-up, with
+the session Stop hook beside it where installed (see the =bus-watch= skill);
+this hook arms neither. It is purely how a watcher and heartbeat exist before
+turn one, and it does not change the standing loop.
 
 Identity and the WAL location come from the environment that is already in place —
 no new configuration. The arm inherits the project's =DSMR_BUS_AGENT= (so the

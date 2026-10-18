@@ -535,6 +535,70 @@ the field cases.
 - *Single host only.* The bus is machine-local (=flock= election, =ipc://=
   sockets); there is no cross-host transport.
 
+** Install or upgrade the listener on a host that runs the service
+
+The installed =~/.local/bin/dsmr-bus-watch= is a small static front end. Its
+=--wake= mode, which every agent keeps waiting, is a client of the host bus
+service and waits on the service's socket; every other mode runs the SBCL
+program =dsmr-bus-watch-lisp= installed beside it. See
+[[file:coordination-bus.org::*The wake client and the host bus service][The
+wake client and the host bus service]].
+
+Install in this order, because the new =--wake= waits only on a service that
+serves it. A front end installed ahead of its service leaves every new
+listener answering =nowatcher= after about five minutes.
+
+1. Install the service and restart it, so the running service serves wake
+   clients:
+
+   #+begin_src sh
+   make install-bus-host
+   systemctl --user restart dsmr-bus-host
+   #+end_src
+
+   Listeners already waiting ride through the restart.
+2. Keep a copy of the watcher you are replacing, for a rollback:
+
+   #+begin_src sh
+   cp ~/.local/bin/dsmr-bus-watch ~/.local/bin/dsmr-bus-watch.prev-$(date +%F)
+   #+end_src
+
+3. Install the watcher: =make install-bus-watch= puts =dsmr-bus-watch-lisp= in
+   place first, then the front end. Running listeners keep the previous image
+   until each is re-armed.
+4. Run =make check-skills= to see whether any deployed skill is ahead of the
+   tree, then =make install-skills=, so agents read an account of the listener
+   that matches the binary.
+
+Confirm with =file ~/.local/bin/dsmr-bus-watch=: it says =statically linked=.
+If it does not, the host still runs the SBCL listener in place of the wake
+client.
+
+** Roll back the listener
+
+Copy the saved image back over =~/.local/bin/dsmr-bus-watch= and have each
+agent re-arm its listener. The SBCL listener works against the new service,
+because the service keeps writing each identity's log; it takes a lock per
+identity again, so a second listener answers =already-armed=, and a service
+restart can end a waiting listener with =nowatcher=.
+
+** A listener reports that the service has not answered
+
+When a listener prints =nowatcher bus=<label>= with
+=the host bus service has not answered for <N> seconds= on stderr, the service
+has been unreachable for about five minutes. A restart by systemd alone
+never produces it, because a waiting listener rides through one. Check the
+service:
+
+#+begin_src sh
+systemctl --user status dsmr-bus-host
+#+end_src
+
+Once it is back, each agent re-arms its listener, which is caught up on
+anything that arrived meanwhile. =nowatcher= with
+=no detached watcher is running= on stderr is different: the service holds no
+registration for that agent, and the agent's own =--detach= fixes it.
+
 * See also
 
 - [[file:index.org]] — documentation index.

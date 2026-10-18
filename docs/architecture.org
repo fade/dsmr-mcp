@@ -751,6 +751,57 @@ read as a wake. And the exit codes are meaningful: 0 for a fired or recycled wat
 or a live heartbeat, 1 for a stale or absent heartbeat, 2 for a liveness probe with
 no resolvable identity, and 64 for an unusable bus name.
 
+** The waiting listener is a static client of the host bus service
+
+The watcher program described above is installed as =dsmr-bus-watch-lisp=. The
+command agents run, =~/.local/bin/dsmr-bus-watch=, is a small statically linked
+front end beside it. In =--wake= mode, the listener every session keeps waiting
+and the one the session Stop hook runs, the front end is the listener: it
+connects to the host bus service's socket, =<state>/dsmr-mcp/host/wake.sock=,
+sends one request naming its identity, and waits for one reply. Every other mode
+runs =dsmr-bus-watch-lisp= with the arguments unchanged, so the arm lines and
+the permission rules that match them stayed exactly as they were.
+
+I moved the waiting into the service because the service already computes every
+registered identity's wake lines, and an SBCL image per waiting listener cost
+about 30 MB of proportional set size (PSS), on a host where twenty sessions
+each kept at least one waiting. The static client costs under 100 kB and starts
+in under a millisecond.
+
+The service keeps a queue of waiting clients for each identity. The hook's
+client stands first, and a newer hook client replaces the older one, which
+exits 0 in silence; background clients wait behind it in arrival order. Each
+line goes to the client at the head. The service records the position of the
+last line it handed over in =<stem>.delivered= beside the identity's log, so
+the next client in line, or a client that arrives after a service restart, is
+handed exactly what arrived since: nothing is lost and nothing is handed over
+twice. This
+replaces the per-identity lock the SBCL listener took, which is why
+=--wait-for-arm= is now accepted and changes nothing.
+
+A dropped or refused connection never ends a waiting client. It reconnects
+with a short backoff and asks again, so a service restart costs a listener
+nothing. It keeps its own deadline for the idle line, so that line arrives on
+time even when the service never answers, and after 300 seconds with no
+service it exits with =nowatcher=, so a long outage reaches the session as a
+wake instead of leaving it silently deaf.
+
+Every text a waiting client prints on a reply arrives finished from the
+service, worded for the hook or the background mode, and the client writes it
+as given. The client holds fixed text only for what it must say when the
+service is unreachable or was never asked: no identity, the idle line, the
+outage notice, and warnings about its arguments. I kept the wording in Lisp so
+that the C program has as little string handling to test and audit as
+possible, and so that the wording an agent reads is reviewed with the rest of
+the Lisp source.
+
+The fleet-log listener, =--wake --fleet-log=, is the deliberate exception. It
+stays the SBCL program with its own lock, because it must hear
+=FLEET ERROR code=service-failed=, which is written exactly when the service is
+dead. That costs an SBCL image for each session that keeps a fleet-log
+listener, which I accept for a listener whose whole purpose is the service's
+own failure.
+
 * Recovery
 
 A wedged server cannot be recovered through its own MCP read loop, because that
