@@ -31,6 +31,7 @@
                 #:default-cursors-dir
                 #:%lock-holder)
   (:export #:watcher-binary
+           #:lisp-watcher-binary
            #:host-binary
            #:stub-dir
            #:install-notify-stub
@@ -65,6 +66,12 @@
            #:write-cursor
            #:lock-holder
            #:processes-under-state
+           #:process-exe
+           #:process-comm
+           #:process-status-field
+           #:process-pss-kb
+           #:median-pss-kb
+           #:process-fd-targets
            #:start-publisher
            #:publisher-lines
            #:start-foreign-broker
@@ -81,8 +88,14 @@
     (when (probe-file p) p)))
 
 (defun watcher-binary ()
-  "The built watcher binary, or NIL if it has not been built."
+  "The built watcher command, the static front end, or NIL if it has not been
+   built."
   (%repo-file "bin/dsmr-bus-watch"))
+
+(defun lisp-watcher-binary ()
+  "The built SBCL program the front end runs for every mode but a wake, or NIL
+   if it has not been built."
+  (%repo-file "bin/dsmr-bus-watch-lisp"))
 
 (defun host-binary ()
   "The built host service binary, or NIL if it has not been built."
@@ -416,16 +429,18 @@
     (sb-posix:kill pid signal)
     (await-exit process seconds)))
 
-(defun launch-wake (state args &key hook-input)
-  "Start the watcher binary with ARGS under STATE as RUN-IN would, without
-   waiting, and return the process. HOOK-INPUT, a string, is written to its
-   standard input, which is then closed, as the harness hands a Stop hook its
-   event. STDOUT and STDERR are kept apart for FINISH-WAKE."
+(defun launch-wake (state args &key hook-input (binary (watcher-binary)))
+  "Start BINARY, the watcher command by default, with ARGS under STATE as RUN-IN
+   would, without waiting, and return the process. Through `env`, which execs
+   it, so the process's pid is BINARY's own. HOOK-INPUT, a string, is written to
+   its standard input, which is then closed, as the harness hands a Stop hook
+   its event. STDOUT and STDERR are kept apart for FINISH-WAKE. The process is
+   stopped with the case."
   (let ((process (uiop:launch-program
                   (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR"
                                 "-u" "CLAUDE_PID")
                           (watcher-env state)
-                          (list (uiop:native-namestring (watcher-binary)))
+                          (list (uiop:native-namestring binary))
                           args)
                   :input :stream :output :stream :error-output :stream)))
     (%note-started process)
@@ -536,6 +551,62 @@
             collect (cons pid (substitute #\Space (code-char 0)
                                           (string-right-trim
                                            nul (or (%proc-text pid "cmdline") "")))))))
+
+(defun process-exe (pid)
+  "The path of the executable PID runs, the target of /proc/PID/exe, or NIL
+   when it cannot be read."
+  (ignore-errors (sb-posix:readlink (format nil "/proc/~D/exe" pid))))
+
+(defun process-comm (pid)
+  "The command name the kernel shows for PID, /proc/PID/comm without its line
+   end, or NIL when it cannot be read."
+  (let ((comm (%proc-text pid "comm")))
+    (and comm (string-right-trim '(#\Newline) comm))))
+
+(defun %proc-number (pid file name)
+  "The first integer after `NAME:` on the line of /proc/PID/FILE that starts
+   with it, or NIL when there is no such line or it cannot be read."
+  (let ((prefix (concatenate 'string name ":")))
+    (loop for line in (uiop:split-string (or (%proc-text pid file) "")
+                                         :separator (string #\Newline))
+          when (uiop:string-prefix-p prefix line)
+            do (return (ignore-errors
+                        (parse-integer line :start (length prefix)
+                                            :junk-allowed t))))))
+
+(defun process-status-field (pid name)
+  "The integer value of the field NAME in /proc/PID/status, such as \"VmRSS\"
+   (in kB) or \"Threads\", or NIL when it cannot be read."
+  (%proc-number pid "status" name))
+
+(defun process-pss-kb (pid)
+  "PID's proportional set size in kB, the Pss line of /proc/PID/smaps_rollup,
+   or NIL when it cannot be read."
+  (%proc-number pid "smaps_rollup" "Pss"))
+
+(defun median-pss-kb (pid &key (samples 5) (interval 0.2))
+  "The median of SAMPLES readings of PID's PSS in kB, taken INTERVAL seconds
+   apart, or NIL when any reading fails."
+  (let ((readings (loop for n from 0 below samples
+                        unless (zerop n) do (sleep interval)
+                        collect (process-pss-kb pid))))
+    (unless (member nil readings)
+      (nth (floor samples 2) (sort readings #'<)))))
+
+(defun process-fd-targets (pid)
+  "The open descriptors of PID as a list of (FD . TARGET), ascending by FD,
+   TARGET being what /proc/PID/fd/FD links to, such as a path, pipe:[N] or
+   socket:[N]. NIL when they cannot be read."
+  (sort (loop for entry in (ignore-errors
+                            (directory (format nil "/proc/~D/fd/*" pid)
+                                       :resolve-symlinks nil))
+              for fd = (ignore-errors (parse-integer (file-namestring entry)))
+              for target = (and fd (ignore-errors
+                                    (sb-posix:readlink
+                                     (format nil "/proc/~D/fd/~D" pid fd))))
+              when target
+                collect (cons fd target))
+        #'< :key #'car))
 
 ;;; a publishing client ---------------------------------------------------------
 
