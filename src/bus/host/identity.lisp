@@ -95,6 +95,8 @@
    #:release-identity
    ;; serving
    #:identity-deliver
+   #:identity-gap-line
+   #:identity-note-delivered
    #:identity-tick
    #:identity-baseline
    #:clamp-baseline
@@ -690,6 +692,30 @@
       (remove-if (lambda (record) (> (wal:record-seq record) floor))
                  (values (poll-new-records wal-path cursor (identity-id identity)))))))
 
+(defun identity-gap-line (identity delivered &key wal-path)
+  "The wake line owed to a wake client that has just reached the head of
+   IDENTITY's queue, as (values line seq), or NIL when nothing is owed.
+
+   Owed is the mail IDENTITY's agent would be handed with a seq above the
+   higher of DELIVERED, the position last handed a client, and the agent's
+   cursor, and at or below the floor; mail above the floor is announced by the
+   next delivery. A DELIVERED above the floor belongs to a log since rotated
+   and is ignored. With neither a usable DELIVERED nor a readable cursor
+   nothing is owed. The line is the one IDENTITY-DELIVER would write for the
+   same records. WAL-PATH defaults to the bus's own."
+  (let* ((wal-path (or wal-path (default-wal-path (identity-bus identity))))
+         (floor (identity-floor identity))
+         (delivered (and (integerp delivered) (<= delivered floor) delivered))
+         (cursor (ignore-errors (%cursor-seq identity wal-path)))
+         (base (if (and delivered cursor) (max delivered cursor) (or delivered cursor))))
+    (when (and base (< base floor))
+      (let ((mail (remove-if (lambda (record) (> (wal:record-seq record) floor))
+                             (values (poll-new-records wal-path base
+                                                       (identity-id identity))))))
+        (when mail
+          (values (%wake-line identity mail)
+                  (reduce #'max mail :key #'wal:record-seq)))))))
+
 (defun %pending-p (identity wal-path)
   "True when mail IDENTITY's agent would be handed sits above its cursor. The
    log is read only when the cursor or the floor has moved since the last
@@ -822,6 +848,19 @@
   identity)
 
 ;;; -------------------------------------------------------- delivered position
+
+(defun identity-note-delivered (identity seq now &key service-pid wal-path)
+  "Record that a wake client was handed IDENTITY's mail up to SEQ at NOW (Unix
+   seconds): IDENTITY counts as heard from NOW, and SEQ is persisted as its
+   delivered position against the current generation of the log at WAL-PATH,
+   the bus's own by default, naming SERVICE-PID. Signals when the position
+   cannot be written."
+  (setf (identity-heard-at identity) now)
+  (hostfiles:write-delivered-position
+   (identity-stem identity) seq
+   :generation (wal:generation (or wal-path (default-wal-path (identity-bus identity))))
+   :service-pid service-pid
+   :now now))
 
 (defun %raise-to-delivered (identity wal-path)
   "Raise IDENTITY's floor to the position the service last handed a wake

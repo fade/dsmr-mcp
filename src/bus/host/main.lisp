@@ -52,6 +52,9 @@
                     (#:ident #:dsmr-bus-host/src/bus/host/identity)
                     (#:registry #:dsmr-bus-host/src/bus/host/registry)
                     (#:buswatch #:dsmr-bus-host/src/bus/host/buswatch)
+                    (#:listeners #:dsmr-bus-host/src/bus/host/listeners)
+                    (#:wal #:dsmr-mcp/src/bus/wal)
+                    (#:selector #:dsmr-mcp/src/bus/selector)
                     (#:brokers #:dsmr-bus-host/src/bus/host/brokers)
                     (#:memory #:dsmr-bus-host/src/bus/host/memory)
                     (#:pool-records #:dsmr-mcp/src/hermetic/pool-records))
@@ -60,7 +63,8 @@
                 #:memory-pressure-unrelieved
                 #:request-hibernation)
   (:import-from #:dsmr-bus-watch/src/bus/watch
-                #:%unix-time)
+                #:%unix-time
+                #:%nowatcher-wake-due-p)
   (:export
    ;; entry point
    #:main
@@ -73,6 +77,7 @@
    #:service-brokers
    #:service-watches
    #:service-ready-p
+   #:service-hub
    #:service-stopping
    #:start-service
    #:supervisor-tick
@@ -153,7 +158,7 @@ not start, 75 when its supervisor loop stalled.
 ;;; ---------------------------------------------------------------- the service
 
 (defstruct (service (:constructor %make-service
-                        (&key pid report-fn feed-p memory-reader memory-thresholds
+                        (&key pid report-fn feed-p listen-p memory-reader memory-thresholds
                               memory-threshold-warnings
                          &aux (registry (registry:make-registry :service-pid pid)))))
   "One running host service. Made by MAKE-SERVICE.
@@ -181,7 +186,12 @@ not start, 75 when its supervisor loop stalled.
    unanswered to when that happened, so the pool is passed over for a while,
    UNRELIEVED-REPORTED-P says this episode of pressure has been reported as
    unrelieved, and LAST-OWNER-SWEEP is when gone servers' files were last
-   swept. All times are Unix seconds."
+   swept. All times are Unix seconds.
+
+   LISTEN-P says whether START-SERVICE starts a wake-client hub. HUB is the
+   hub while it runs, NIL otherwise. SERVED-STATES maps each stem the hub has
+   been told about to (STATE LABEL ID) as last seen, so a lapse ending and a
+   stem going are noticed."
   pid
   registry
   (mutex (sb-thread:make-mutex :name "host service"))
@@ -206,15 +216,21 @@ not start, 75 when its supervisor loop stalled.
   (last-memory-action nil)
   (unanswering (make-hash-table :test 'equal))
   (unrelieved-reported-p nil)
-  (last-owner-sweep nil))
+  (last-owner-sweep nil)
+  (listen-p t)
+  (hub nil)
+  (served-states (make-hash-table :test 'equal)))
 
 (defun make-service (&key (pid (sb-posix:getpid))
                           (report-fn #'ident:report-to-logs)
                           (feed-p t)
+                          (listen-p t)
                           (memory-reader #'memory:read-memory-readings)
                           memory-thresholds)
   "A host service for the process PID that reports through REPORT-FN, its bus
-   readers subscribing to the brokers' publications when FEED-P is true.
+   readers subscribing to the brokers' publications when FEED-P is true, and
+   holding wake clients on the host's wake socket once started when LISTEN-P
+   is true.
 
    MEMORY-READER is called once a second for the host's memory. The pressure
    thresholds are MEMORY-THRESHOLDS when given, else read from the environment
@@ -225,6 +241,7 @@ not start, 75 when its supervisor loop stalled.
           (values memory-thresholds '())
           (memory:thresholds-from-environment))
     (%make-service :pid pid :report-fn report-fn :feed-p feed-p
+                   :listen-p listen-p
                    :memory-reader memory-reader
                    :memory-thresholds thresholds
                    :memory-threshold-warnings warnings)))
@@ -314,9 +331,10 @@ not start, 75 when its supervisor loop stalled.
   (and stamp (<= (- now (cdr stamp)) window) t))
 
 (defun %threads-progressing-p (svc now)
-  "Note how far every serving broker thread and every bus reader thread has got
-   at NOW, and answer true when each has moved within the progress window. A
-   broker waiting for the role is not counted: it is meant to be still."
+  "Note how far every serving broker thread, every bus reader thread and the
+   wake hub's accept loop have got at NOW, and answer true when each has moved
+   within the progress window. A broker waiting for the role is not counted: it
+   is meant to be still."
   (let ((table (service-progress svc))
         (all t))
     (flet ((note (key progress)
@@ -331,8 +349,167 @@ not start, 75 when its supervisor loop stalled.
                (service-brokers svc))
       (maphash (lambda (bus bw)
                  (note (cons :watch bus) (buswatch:bus-watch-progress bw)))
-               (service-watches svc)))
+               (service-watches svc))
+      (if (service-hub svc)
+          (note '(:hub) (listeners:hub-progress (service-hub svc)))
+          (remhash '(:hub) table)))
     all))
+
+;;; -------------------------------------------------------------- wake clients
+;;;
+;;; The hub holds each agent's waiting wake clients on the host's wake socket.
+;;; The service plugs its agents into it: a request resolves against the
+;;; identities served, every wake line an identity writes is offered to the
+;;; head of its queue, a newly promoted head is handed the mail it missed from
+;;; the log, and each send is persisted as the identity's delivered position.
+;;; Every callback runs under the service mutex, which the hub shares.
+
+(defun %wake-label (bus)
+  "The label wake replies carry for BUS: its name, `default` for the unnamed
+   bus."
+  (or (%bus-key bus) "default"))
+
+(defun %served-identity (svc stem)
+  "The identity SVC serves under STEM, or NIL when there is none or it has been
+   let go."
+  (let ((identity (gethash stem (registry:registry-identities (service-registry svc)))))
+    (and identity
+         (not (eq (ident:identity-state identity) :released))
+         identity)))
+
+(defun %hub-readers (svc identity)
+  "How many wake clients wait on IDENTITY in SVC's hub, or NIL when SVC runs
+   no hub."
+  (let ((hub (service-hub svc)))
+    (and hub (listeners:hub-reader-count hub (ident:identity-stem identity)))))
+
+(defun %start-hub (svc)
+  "Start SVC's wake-client hub on the host's wake socket, sharing SVC's mutex,
+   and keep it as SVC's hub. Returns the hub, or NIL when it could not start:
+   the hub reports why, and the service runs on without wake clients, still
+   writing every agent's log."
+  (let ((hub (listeners:make-hub
+              :mutex (service-mutex svc)
+              :service-pid (service-pid svc)
+              :report-fn (service-report-fn svc)
+              :resolve-fn (lambda (request) (%resolve-wake svc request))
+              :gap-fn (lambda (stem delivered) (%wake-gap svc stem delivered))
+              :nowatcher-fn #'%wake-nowatcher-due-p
+              :delivered-fn (lambda (stem seq now) (%note-delivered svc stem seq now)))))
+    (setf (service-hub svc) (listeners:start-hub hub))))
+
+(defun %resolve-wake (svc request)
+  "What the hub does with the wake REQUEST, a parsed request plist:
+     (:UNREADY)                    until the registrations have been read once;
+     (:BAD-BUS TEXT)               for a bus name that cannot name a bus;
+     (:NOWATCHER ID LABEL)         when no served identity matches, ID `-` when
+                                   the request names no agent;
+     (:TARGETS ((STEM . LABEL)))   otherwise.
+   A request for every bus waits on each served identity with the agent's id,
+   and its no-watcher answer is labelled `*`."
+  (if (not (service-scanned svc))
+      (list :unready)
+      (handler-case
+          (multiple-value-bind (id bus all-buses-p) (listeners:request-identity request)
+            (let ((label (if all-buses-p "*" (%wake-label bus))))
+              (cond
+                ((null id)
+                 (list :nowatcher "-" label))
+                (all-buses-p
+                 (let ((targets '()))
+                   (maphash (lambda (stem identity)
+                              (when (and (equal (ident:identity-id identity) id)
+                                         (%served-identity svc stem))
+                                (push (cons stem (%wake-label (ident:identity-bus identity)))
+                                      targets)))
+                            (registry:registry-identities (service-registry svc)))
+                   (if targets
+                       (list :targets (sort targets #'string< :key #'car))
+                       (list :nowatcher id "*"))))
+                (t
+                 (let ((stem (hostfiles:detach-stem bus id)))
+                   (if (%served-identity svc stem)
+                       (list :targets (list (cons stem label)))
+                       (list :nowatcher id label)))))))
+        (selector:invalid-bus-name (e)
+          (list :bad-bus (princ-to-string e))))))
+
+(defun %wake-nowatcher-due-p (id hook-p)
+  "True when a client told that no watcher serves ID should hear it now. A hook
+   client hears it at most once an hour per agent, recorded in the agent's
+   no-watcher stamp; a background client always hears it and leaves the stamp
+   alone. A request naming no agent has no stamp, and its hook client hears
+   nothing."
+  (cond ((not hook-p) t)
+        ((or (null id) (equal id "-")) nil)
+        (t (%nowatcher-wake-due-p id))))
+
+(defun %wake-gap (svc stem delivered)
+  "The wake line and seq owed to the client just promoted to the head of
+   STEM's queue, given DELIVERED, the stem's delivered position, or NIL when
+   nothing is owed. Only a serving identity is owed anything: a lapsed one
+   writes no lines, and catches up when its lapse ends."
+  (let ((identity (%served-identity svc stem)))
+    (when (and identity (eq (ident:identity-state identity) :serving))
+      (ident:identity-gap-line identity delivered))))
+
+(defun %note-delivered (svc stem seq now)
+  "Record that the hub handed STEM's mail up to SEQ to a client at NOW: the
+   identity counts as heard and the position is persisted with the log's
+   generation, so a restart does not hand the same seq over again."
+  (let ((identity (%served-identity svc stem)))
+    (when (and identity (integerp seq))
+      (ident:identity-note-delivered identity seq now :service-pid (service-pid svc)))))
+
+(defun %reconcile-hub (svc)
+  "Bring SVC's wake hub into line with the identities SVC serves, under SVC's
+   mutex. Does nothing while SVC runs no hub.
+     - Each served identity without an announce hook gets one offering its
+       lines to the head of its queue, and the hub takes its floor as the
+       stem's starting delivered position.
+     - An identity whose lapse has ended has its queue's head handed the gap.
+     - Each stem no longer served has its clients told so, in their mode.
+     - Once the registrations have been read, held clients are resolved again.
+   The floor at claim is already the higher of the cursor and the persisted
+   delivered position, and no line is delivered between a claim and this call
+   because both hold the mutex."
+  (let ((hub (service-hub svc)))
+    (when hub
+      (with-service-lock (svc)
+        (let ((states (service-served-states svc))
+              (gone '()))
+          (maphash
+           (lambda (stem identity)
+             (let ((state (ident:identity-state identity))
+                   (label (%wake-label (ident:identity-bus identity))))
+               (unless (eq state :released)
+                 (unless (ident:identity-announce-hook identity)
+                   (setf (ident:identity-announce-hook identity)
+                         (lambda (who seq line now)
+                           (declare (ignore who))
+                           (listeners:hub-offer hub stem label seq line :now now)))
+                   (listeners:hub-ensure-delivered hub stem (ident:identity-floor identity)))
+                 (when (and (eq state :serving)
+                            (eq (first (gethash stem states)) :lapsed))
+                   (listeners:hub-refresh hub stem))
+                 (setf (gethash stem states)
+                       (list state label (ident:identity-id identity))))))
+           (registry:registry-identities (service-registry svc)))
+          (maphash (lambda (stem entry)
+                     (declare (ignore entry))
+                     (unless (%served-identity svc stem)
+                       (push stem gone)))
+                   states)
+          (dolist (stem (listeners:hub-stems hub))
+            (unless (or (%served-identity svc stem) (member stem gone :test #'string=))
+              (push stem gone)))
+          (dolist (stem gone)
+            (destructuring-bind (&optional state (label "default") id) (gethash stem states)
+              (declare (ignore state))
+              (listeners:hub-release-stem hub stem label id))
+            (remhash stem states))
+          (when (service-scanned svc)
+            (listeners:hub-retry-pending hub)))))))
 
 ;;; ----------------------------------------------------------------- the duties
 
@@ -356,13 +533,16 @@ not start, 75 when its supervisor loop stalled.
                  (%identities svc))))))
 
 (defun %scan-registrations (svc now)
-  "Bring the agents SVC serves into line with the registration files."
-  (%duty svc "registrations"
-         (lambda ()
-           (with-service-lock (svc)
+  "Bring the agents SVC serves into line with the registration files, then
+   bring the wake hub into line with the agents, under one hold of the mutex so
+   no wake line is written between a claim and its hook."
+  (with-service-lock (svc)
+    (%duty svc "registrations"
+           (lambda ()
              (registry:scan-registrations (service-registry svc) now
-                                          :report-fn (service-report-fn svc)))))
-  (setf (service-scanned svc) t))
+                                          :report-fn (service-report-fn svc))))
+    (setf (service-scanned svc) t)
+    (%duty svc "wake-clients" (lambda () (%reconcile-hub svc)))))
 
 (defun %write-beat (now)
   "Refresh the service's beat file, whose write date says it is running."
@@ -372,24 +552,30 @@ not start, 75 when its supervisor loop stalled.
     (format out "~D~%" now)))
 
 (defun %tick-identities (svc now)
-  "Look at every agent's session, then do every agent's duties for this tick,
-   with one count of the readers of every agent's log."
+  "Look at every agent's session and bring the wake hub into line, then do
+   every agent's duties for this tick. Each agent's readers are its waiting
+   wake clients while a hub runs; without one, one /proc count of the readers
+   of every agent's log is taken."
   (let ((reg (service-registry svc))
         (report-fn (service-report-fn svc)))
     (with-service-lock (svc)
       (%duty svc "sessions"
              (lambda () (registry:check-sessions reg now :report-fn report-fn)))
+      (%duty svc "wake-clients" (lambda () (%reconcile-hub svc)))
       (let* ((identities (%identities svc))
-             (counts (ident:log-reader-counts
-                      (mapcar #'ident:identity-log-path identities))))
+             (counts (and (null (service-hub svc))
+                          (ident:log-reader-counts
+                           (mapcar #'ident:identity-log-path identities)))))
         (dolist (identity identities)
           (%duty svc "identity"
                  (lambda ()
                    (let ((result (ident:identity-tick
                                   identity now
-                                  :readers (gethash (uiop:native-namestring
-                                                     (ident:identity-log-path identity))
-                                                    counts)
+                                  :readers (if counts
+                                               (gethash (uiop:native-namestring
+                                                         (ident:identity-log-path identity))
+                                                        counts)
+                                               (%hub-readers svc identity))
                                   :report-fn report-fn)))
                      (registry:settle-tick reg identity result :report-fn report-fn)))
                  :bus (ident:identity-bus identity)
@@ -671,7 +857,8 @@ not start, 75 when its supervisor loop stalled.
       (%notify svc "WATCHDOG=1"))))
 
 (defun %serve-bus (svc bus)
-  "Start BUS's broker and its reader when SVC has neither yet."
+  "Start BUS's broker and its reader when SVC has neither yet. While SVC runs a
+   wake hub, the reader counts each agent's readers as its waiting clients."
   (let ((report-fn (service-report-fn svc))
         (stop-fn (lambda () (service-stopping svc))))
     (unless (gethash bus (service-brokers svc))
@@ -685,8 +872,14 @@ not start, 75 when its supervisor loop stalled.
     (unless (gethash bus (service-watches svc))
       (let ((bw (%duty svc "bus-watch-start"
                        (lambda ()
-                         (buswatch:open-bus-watch bus :feed (service-feed-p svc)
-                                                      :lock (service-mutex svc)))
+                         (buswatch:open-bus-watch
+                          bus :feed (service-feed-p svc)
+                              :lock (service-mutex svc)
+                              :readers-fn (let ((hub (service-hub svc)))
+                                            (and hub
+                                                 (lambda (identity)
+                                                   (listeners:hub-reader-count
+                                                    hub (ident:identity-stem identity)))))))
                        :bus bus :subject (%subject bus))))
         (when (buswatch:bus-watch-p bw)
           (buswatch:start-bus-watch-thread bw stop-fn
@@ -709,12 +902,14 @@ not start, 75 when its supervisor loop stalled.
     buses))
 
 (defun %adopt (svc now)
-  "Take over every detached watcher still running on this state root."
-  (%duty svc "adoption"
-         (lambda ()
-           (with-service-lock (svc)
+  "Take over every detached watcher still running on this state root, then
+   bring the wake hub into line with the agents taken over."
+  (with-service-lock (svc)
+    (%duty svc "adoption"
+           (lambda ()
              (registry:adopt-legacy-watchers (service-registry svc) now
-                                             :report-fn (service-report-fn svc))))))
+                                             :report-fn (service-report-fn svc))))
+    (%duty svc "wake-clients" (lambda () (%reconcile-hub svc)))))
 
 (defun %served-buses (svc)
   "The buses SVC runs a broker for, the unnamed one first, then by name."
@@ -808,7 +1003,8 @@ not start, 75 when its supervisor loop stalled.
    file but no clean-stop marker, it ended without an orderly stop, and that is
    reported to the fleet log as an unclean restart and counted in the state
    record. The marker is then removed, so a crash of this run reads the same
-   way to the next."
+   way to the next. When SVC listens, its wake-client hub is started last; a
+   hub that cannot start is reported and the service runs on without it."
   (hostfiles:ensure-host-dir)
   (let* ((previous-pid (hostfiles:read-service-pid))
          (clean (probe-file (hostfiles:clean-stop-path)))
@@ -834,18 +1030,26 @@ not start, 75 when its supervisor loop stalled.
                :msg (format nil "the previous run, pid ~D, ended without an orderly ~
                                  stop; ~D such restart~:P recorded"
                             previous-pid count))))
+  (when (and (service-listen-p svc) (null (service-hub svc)))
+    (%start-hub svc))
   svc)
 
 (defun stop-service (svc &key (mark-clean t))
   "Stop SVC in order, and return it. Safe to call more than once.
 
-   Every thread is asked to end; each broker lets its role go without
-   archiving, then each reader closes, then every agent's descriptors are
+   Every thread is asked to end; the wake hub stops first, so each waiting
+   client reads end of file and the socket file goes, then each broker lets its
+   role go without archiving, then each reader closes, then every agent's
+   descriptors are
    closed with its pid file, heartbeat and registration left in place for the
    service that follows. With MARK-CLEAN, the clean-stop marker is written last,
    so the next start knows this was not a crash."
   (unless (service-stopped svc)
     (setf (service-stopping svc) t)
+    (let ((hub (service-hub svc)))
+      (when hub
+        (ignore-errors (listeners:stop-hub hub :join-seconds 1))
+        (setf (service-hub svc) nil)))
     (maphash (lambda (bus bb)
                (declare (ignore bus))
                (ignore-errors (brokers:stop-bus-broker bb :join-seconds 1)))
