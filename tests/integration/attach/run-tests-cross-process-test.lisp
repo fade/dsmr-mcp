@@ -107,6 +107,35 @@ backing file."
     (write-string +probe-suite-b+ s))
   dir)
 
+(defparameter +errored-probe-asd+
+  "(defsystem \"dsmr-xproc-errored-probe\"
+  :depends-on (\"zebra\")
+  :components ((:file \"errored-suite\")))
+"
+  "Single-file probe system holding one test that errors after its checks pass.")
+
+(defparameter +errored-probe-suite+
+  "(defpackage #:dsmr-xproc-errored-probe (:use #:cl))
+(in-package #:dsmr-xproc-errored-probe)
+(zebra:define-test errors-after-passing-checks
+  (zebra:true t)
+  (zebra:true t)
+  (error \"errored-after-checks\"))
+"
+  "Probe suite: two passing checks, then an unhandled error outside any check.")
+
+(defun %write-errored-probe-system (dir)
+  "Write dsmr-xproc-errored-probe.asd and errored-suite.lisp into DIR,
+superseding any existing files, and return DIR."
+  (ensure-directories-exist dir)
+  (with-open-file (s (merge-pathnames "dsmr-xproc-errored-probe.asd" dir)
+                     :direction :output :if-exists :supersede)
+    (write-string +errored-probe-asd+ s))
+  (with-open-file (s (merge-pathnames "errored-suite.lisp" dir)
+                     :direction :output :if-exists :supersede)
+    (write-string +errored-probe-suite+ s))
+  dir)
+
 (defun %free-tcp-port ()
   "Bind an OS-assigned loopback port, read it back, release it, return it.
 Same benign-race caveats as the wire cross-process leaf: the sanity eval
@@ -248,3 +277,36 @@ second call succeeds through the bootstrap's :CURRENT path."
           (false (gethash "isError" res2))
           (is = 1 (gethash "passed" res2))
           (is = 1 (gethash "failed" res2)))))))
+
+(define-test errored-test-counts-as-failed-in-a-foreign-image
+  "Attached run-tests in an image that never loaded dsmr-mcp counts a test
+that passes two checks and then signals an unhandled error as one failure:
+passed 2, failed 1, the test named in failed_tests and in the summary, the
+error text in its reason.  The engine reaches the child by source bootstrap,
+as it does an operator image."
+  (with-foreign-slynk-child-or-skip
+    (with-foreign-test-image (conn probe-dir)
+      (is = 3 (eval-in-image '(+ 1 2) conn :label "foreign errored-probe link probe"))
+      (%write-errored-probe-system probe-dir)
+      (let* ((tool (%attach-repl-tool "xproc-run-tests-errored" conn))
+             (params (make-ht "system" "dsmr-xproc-errored-probe"
+                              "timeout_seconds" 120))
+             (res (%dispatch-attach-run-tests tool 1 params)))
+        (true (hash-table-p res))
+        (false (equal "NETWORK_ERROR" (gethash "error_type" res))
+               "run-tests dropped the wire (NETWORK_ERROR)")
+        (false (gethash "isError" res) "run-tests returned isError")
+        (is equal "zebra" (gethash "framework" res))
+        (is = 2 (gethash "passed" res))
+        (is = 1 (gethash "failed" res))
+        (let* ((fails (gethash "failed_tests" res))
+               (entry (and fails (= 1 (length fails)) (aref fails 0))))
+          (is = 1 (length fails))
+          (true (and entry (search "ERRORS-AFTER-PASSING-CHECKS"
+                                   (gethash "test_name" entry ""))))
+          (true (and entry (search "errored-after-checks"
+                                   (gethash "reason" entry "")))))
+        (let* ((content (gethash "content" res))
+               (summary (and content (plusp (length content))
+                             (gethash "text" (aref content 0)))))
+          (true (search "ERRORS-AFTER-PASSING-CHECKS" (or summary ""))))))))
