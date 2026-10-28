@@ -269,10 +269,13 @@ prior position's claims (`awaiting`, `pending`, `next is`, the old phase number)
 and fix every one, or you have moved the problem rather than solved it.
 
 **3. The frontmatter must parse TRUE — and much of it is GENERATED FROM THE BODY,
-so fixing the frontmatter alone is silently undone.** ⚠ **If the project uses
-`gsd-sdk`, its phase operations STRIP the frontmatter and REBUILD it from the
-body** rather than merging into it. Fields outside its schema are dropped, not
-preserved-and-ignored.
+so fixing the frontmatter alone is silently undone.** ⚠ The retired
+get-shit-done-cc `gsd-sdk` STRIPPED comments and REBUILT the frontmatter from
+the body rather than merging into it, dropping every field outside its schema.
+**gsd-core's state verbs (`gsd_run query state.*`) preserve comments, but they
+RE-DERIVE the progress counters** from the phase headings inside the milestone's
+ROADMAP section, so a hand-set counter holds only until the next state write. If
+the counters come out wrong, fix the ROADMAP headings, not the counters.
 
 ⛔ **"PARSES TRUE" IS NECESSARY AND NOT SUFFICIENT, and the exception is a
 hand-edit hazard that rotation walks straight into.** An unquoted YAML scalar
