@@ -78,6 +78,57 @@
 (defpackage #:dsmr-scratch-runner-tests
   (:use #:cl #:zebra))
 
+(defmacro with-zebra-probe-package ((pkg-var name source) &body body)
+  "Run BODY with PKG-VAR bound to the scratch package NAME holding the zebra
+tests SOURCE defines, then remove those tests and delete the package.
+NAME is a string; the package uses COMMON-LISP only and is created when
+absent.  Tests already registered in it are removed first.  SOURCE is read
+and evaluated with *PACKAGE* bound to the package.  Probe names start with
+DSMR-SCRATCH- so the project's own suite never walks them."
+  (let ((name-var (gensym "NAME-")))
+    `(let* ((,name-var ,name)
+            (,pkg-var (or (find-package ,name-var)
+                          (make-package ,name-var :use '("COMMON-LISP")))))
+       (unwind-protect
+            (progn
+              (remove-all-tests-in-package ,pkg-var)
+              (let ((*package* ,pkg-var))
+                (eval (read-from-string ,source)))
+              ,@body)
+         (ignore-errors (remove-all-tests-in-package ,pkg-var))
+         (ignore-errors (delete-package ,pkg-var))))))
+
+(defun %run-zebra-probe (name source)
+  "Return the RUN-TESTS envelope for the zebra tests SOURCE defines in the
+scratch package NAME, run without reload."
+  (with-zebra-probe-package (pkg name source)
+    (run-tests (string-downcase name) :framework "zebra" :reload nil)))
+
+(defun %failed-test-named (envelope fragment)
+  "Return the failed_tests entry of ENVELOPE whose test_name contains
+FRAGMENT, or NIL.  Safe on an empty or absent failed_tests."
+  (find-if (lambda (f)
+             (and (hash-table-p f)
+                  (stringp (gethash "test_name" f))
+                  (search fragment (gethash "test_name" f))))
+           (or (gethash "failed_tests" envelope) #())))
+
+(defun %envelope-summary (envelope)
+  "Return the text of ENVELOPE's first content block, or the empty string."
+  (let ((content (gethash "content" envelope)))
+    (or (and (vectorp content)
+             (plusp (length content))
+             (hash-table-p (aref content 0))
+             (gethash "text" (aref content 0)))
+        "")))
+
+(defparameter *errored-probe-source*
+  "(zebra:define-test errors-after-passing-checks
+     (zebra:true t)
+     (zebra:true t)
+     (error \"errored-after-checks\"))"
+  "A zebra test that passes two checks, then signals an error outside any check.")
+
 ;;; ---------------------------------------------------------------------------
 ;;; File-defined failing test in the scratch package
 ;;;
@@ -879,6 +930,23 @@ alone once hid a target-resolution crash."
     (let ((summary (gethash "text" (aref (gethash "content" ht) 0))))
       (true (search "REASONS-PROBE-FAILS" summary))
       (true (search "—" summary)))))
+
+(define-test errored-zebra-test-counts-as-failed
+  "A zebra test that passes two checks and then signals an unhandled error
+counts as one failure: failed_tests names it, its reason carries the error
+text, and the summary names it.  The passed count of 2 shows the probe ran."
+  (let* ((ht (%run-zebra-probe "DSMR-SCRATCH-ERRORED-PROBE"
+                               *errored-probe-source*))
+         (entry (%failed-test-named ht "ERRORS-AFTER-PASSING-CHECKS"))
+         (summary (%envelope-summary ht)))
+    (is = 2 (gethash "passed" ht))
+    (is = 1 (gethash "failed" ht))
+    (is = 1 (length (gethash "failed_tests" ht)))
+    (true entry)
+    (true (and entry
+               (search "errored-after-checks" (gethash "reason" entry ""))))
+    (true (search "2 passed, 1 failed" summary))
+    (true (search "ERRORS-AFTER-PASSING-CHECKS" summary))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The system a run is dispatched against, and what a result may claim
