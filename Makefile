@@ -24,7 +24,7 @@ WORKER_CORE ?= dsmr.core.worker
 WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 
 .PHONY: bridge bus-watch bus-host install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
-        install-skills check-skills install-harness check-harness install-sisters check-sisters \
+        install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
         preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks
 
 PREFIX ?= $(HOME)/.local
@@ -48,6 +48,11 @@ SKILLDIR ?= $(HOME)/.claude/skills
 # that every session is expected to share, is wrong the moment it is scoped to
 # one project: it cannot reach the others, and a fleet restart cannot widen it.
 AGENTDIR ?= $(HOME)/.claude
+
+# Where subagent definitions are deployed: the agents directory under the agent
+# configuration root. Global for the same reason as AGENTDIR, since a plan in
+# any project can be routed to one of these agents.
+SUBAGENTDIR ?= $(AGENTDIR)/agents
 
 # Where the host bus service's systemd user units are deployed. The user
 # manager reads its own units from here, and the service is a per-user one: it
@@ -382,6 +387,49 @@ install-skills:
 	  echo "  deployed $$f"; \
 	done
 	@echo "installed into $(SKILLDIR)"
+
+## check-agents: report where the deployed agent definitions differ from this tree.
+##
+##   An agents directory is flat, so README.md at the top of agents/ is
+##   documentation and is never deployed: in the deployed directory it would be
+##   read as an agent. Only agents tracked here are inspected. The gsd-* roster
+##   and lisp-developer are deployed by other means and are never reported.
+##
+##   Reports drift in both directions: a tracked agent missing or different in
+##   the deployed directory, and a deployed backup sibling of a tracked agent
+##   (<name>.md.<suffix>) that this tree does not carry. Never edits, so it is
+##   safe to run against a live fleet.
+check-agents:
+	@status=0; \
+	for f in $$(cd agents && find . -maxdepth 1 -type f -name '*.md' ! -name README.md | sed 's|^\./||'); do \
+	  if [ ! -f "$(SUBAGENTDIR)/$$f" ]; then \
+	    echo "  NOT DEPLOYED  $$f"; status=1; \
+	  elif ! cmp -s "agents/$$f" "$(SUBAGENTDIR)/$$f"; then \
+	    echo "  DIFFERS       $$f"; status=1; \
+	  fi; \
+	  for b in "$(SUBAGENTDIR)/$$f".*; do \
+	    [ -e "$$b" ] || continue; \
+	    echo "  DEPLOYED ONLY $$(basename "$$b")"; status=1; \
+	  done; \
+	done; \
+	if [ $$status -eq 0 ]; then echo "agents in sync with $(SUBAGENTDIR)"; \
+	else echo "run 'make install-agents' to deploy this tree, or port the other way first"; fi; \
+	exit $$status
+
+## install-agents: deploy this tree's agent definitions to the agent that reads them.
+##
+##   ⛔ The migration direction is deployed -> repo. If a deployed definition
+##   has been edited in place, that edit is the newer one and this target would
+##   destroy it. Run check-agents first and port the other way before deploying.
+##   Deployment is per-file over the agents tracked here, so the gsd-* roster
+##   and lisp-developer are left alone.
+install-agents:
+	@for f in $$(cd agents && find . -maxdepth 1 -type f -name '*.md' ! -name README.md | sed 's|^\./||'); do \
+	  mkdir -p "$(SUBAGENTDIR)"; \
+	  cp -p "agents/$$f" "$(SUBAGENTDIR)/$$f"; \
+	  echo "  deployed $$f"; \
+	done
+	@echo "installed into $(SUBAGENTDIR)"
 
 ## check-harness: report drift between harness/ and the deployed agent root.
 ##
