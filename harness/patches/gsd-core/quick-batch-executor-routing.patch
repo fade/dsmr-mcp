@@ -1,0 +1,44 @@
+--- a/gsd-core/workflows/quick-batch/steps/worktree-dispatch.md
++++ b/gsd-core/workflows/quick-batch/steps/worktree-dispatch.md
+@@ -86,8 +86,29 @@
+    ```bash
+    SLUG=$(gsd_run query generate-slug "$description" --raw)
+    ITEM_DIR="${quick_dir}/${quick_id}-${SLUG}"
++   # dsmr-local: quick-batch executor routing
++   AGENT_HINT_ROUTING=$(gsd_run query config-get workflow.agent_hint_routing --raw 2>/dev/null || true)
++   EXECUTOR_TYPE="gsd-executor"
++   if [ "${AGENT_HINT_ROUTING:-true}" != "false" ]; then
++     PLAN_HINT=$(gsd_run query frontmatter.get "${ITEM_DIR}/${quick_id}-PLAN.md" --field agent_hint --raw 2>/dev/null | jq -r 'strings' 2>/dev/null | tr -d '"' || true)
++     if [ -z "$PLAN_HINT" ] && [ "$(gsd_run query config-get planning.agents.specialized --raw 2>/dev/null)" = "true" ]; then
++       PLAN_HINT=$(gsd_run query config-get planning.agents.executor --raw 2>/dev/null | tr -d '"')
++     fi
++     if [ -n "$PLAN_HINT" ]; then
++       EXECUTOR_TYPE=$(gsd_run query resolve-agent --name "$PLAN_HINT" --raw 2>/dev/null || echo "gsd-executor")
++       [ -n "$EXECUTOR_TYPE" ] || EXECUTOR_TYPE="gsd-executor"
++     fi
++   fi
++   if [ "$ISOLATION" = "orchestrator-worktree" ] && [ "$EXECUTOR_TYPE" != "gsd-executor" ]; then
++     echo "note: ${quick_id} resolved executor ${EXECUTOR_TYPE}; process-spawned dispatch does not route subagent types, using gsd-executor" >&2
++     EXECUTOR_TYPE="gsd-executor"
++   fi
++   AGENT_SKILLS_EXECUTOR=$(gsd_run query agent-skills "$EXECUTOR_TYPE" ${GSD_WS:+--ws=${GSD_WS##* }})
+    ```
+ 
++   dsmr-local: quick-batch executor routing. `EXECUTOR_TYPE` and `AGENT_SKILLS_EXECUTOR` from this
++   block are the item's executor and skills in every isolation mode below.
++
+    **`isolation == "harness-worktree"`:** one `Agent()` per message,
+    `run_in_background: true`. Same prompt shape as `/gsd-quick`'s own
+    executor dispatch (Step 6 of `quick.md`) — required_reading, agent skills,
+@@ -119,7 +140,10 @@
+    - Do NOT commit docs artifacts (SUMMARY.md, STATE.md, PLAN.md) — the orchestrator commits them at completion
+    </constraints>
+    ",
+-     subagent_type="gsd-executor",
++     subagent_type="${EXECUTOR_TYPE}",
++     # dsmr-local: quick-batch executor routing. Omit the model line when executor_model == "inherit"
++     # OR EXECUTOR_TYPE != "gsd-executor": a per-call model overrides the specialist's own
++     # `model:` key (a specialist that declares none inherits the orchestrator's model).
+      model="{executor_model}",
+      {harnessFlag}
+      description="Execute ${quick_id}: ${description}"

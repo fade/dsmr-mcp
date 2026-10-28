@@ -50,10 +50,11 @@ third-party skill would fork an artifact whose own installer will later overwrit
 
 - **The `gsd-*` planning system** (72 skills) is the `@opengsd/gsd-core` package, installed
   with `--config-dir ~/.claude` and upgraded by its own tooling, which tracks it in its own file
-  manifest. It carries three local adjustments, kept in `harness/patches/gsd-core/`: the
+  manifest. It carries five local adjustments, kept in `harness/patches/gsd-core/`: the
   project executor default for phase execution, a specialist executor keeping its own model,
-  and routing for `/gsd-quick`. `harness/scripts/gsd-routing-gate.sh` reports when an upgrade
-  drops any of them.
+  routing for `/gsd-quick`, routing for `/gsd-quick-batch`, and the project executor default
+  for `/gsd-audit-fix`. `harness/scripts/gsd-routing-gate.sh` reports when an upgrade drops
+  any of them.
 - **`graphify`** is ours, and that is exactly why it is not here. We carry a substantial
   Common Lisp patch set on a fork at `SourceCode/python/graphify` (`origin` is the fork,
   `upstream` is tracked with its push URL disabled, and the fork's version is deliberately set

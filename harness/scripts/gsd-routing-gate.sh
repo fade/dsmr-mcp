@@ -6,9 +6,11 @@
 # ${CLAUDE_CONFIG_DIR:-$HOME/.claude}.
 #
 # Units (patch basename, target under gsd-core, backup suffix):
-#   per-plan-executor-routing    project executor default for execute-phase plans
-#   quick-executor-routing       /gsd-quick routes to the executor its plan names
-#   specialist-executor-model    a specialist executor keeps its own model
+#   per-plan-executor-routing     project executor default for execute-phase plans
+#   quick-executor-routing        /gsd-quick routes to the executor its plan names
+#   specialist-executor-model     a specialist executor keeps its own model
+#   quick-batch-executor-routing  /gsd-quick-batch items route as /gsd-quick does
+#   audit-fix-executor-routing    /gsd-audit-fix routes to the project executor
 #
 # --apply dry-runs every missing unit first and writes nothing unless all fit;
 # each target is then backed up with its unit's suffix. --self-test runs the
@@ -41,11 +43,13 @@ self=$(readlink -f "$0")
 patch_dir=$(dirname "$self")/../patches/gsd-core
 
 # unit|target under gsd-core|marker 1|marker 2|backup suffix
-# shellcheck disable=SC2016 # marker 2 of quick-executor-routing is literal template text
+# shellcheck disable=SC2016 # a marker 2 holding ${...} is literal template text, never expanded
 units=(
   'per-plan-executor-routing|gsd-core/workflows/execute-phase/steps/per-plan-executor-routing.md|dsmr-local: project executor default|planning.agents.executor|.pre-lisp-routing'
   'quick-executor-routing|gsd-core/workflows/quick.md|dsmr-local: quick executor routing|subagent_type="${EXECUTOR_TYPE}"|.pre-quick-executor-routing'
   'specialist-executor-model|gsd-core/workflows/execute-phase.md|dsmr-local: specialist executor model|EXECUTOR_TYPE != "gsd-executor"|.pre-specialist-executor-model'
+  'quick-batch-executor-routing|gsd-core/workflows/quick-batch/steps/worktree-dispatch.md|dsmr-local: quick-batch executor routing|subagent_type="${EXECUTOR_TYPE}"|.pre-quick-batch-executor-routing'
+  'audit-fix-executor-routing|gsd-core/workflows/audit-fix.md|dsmr-local: audit-fix executor routing|subagent_type="${EXECUTOR_TYPE}"|.pre-audit-fix-executor-routing'
 )
 
 # unit_field ROW N: print field N (1-based) of a unit row.

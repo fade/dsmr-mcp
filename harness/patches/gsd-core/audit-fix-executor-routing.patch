@@ -1,0 +1,32 @@
+--- a/gsd-core/workflows/audit-fix.md
++++ b/gsd-core/workflows/audit-fix.md
+@@ -102,6 +102,17 @@
+ 
+ ```bash
+ EXECUTOR_MODEL=$(gsd_run query resolve-model gsd-executor --raw)
++# dsmr-local: audit-fix executor routing. A finding has no plan and so no agent_hint;
++# the project default executor applies.
++AGENT_HINT_ROUTING=$(gsd_run query config-get workflow.agent_hint_routing --raw 2>/dev/null || true)
++EXECUTOR_TYPE="gsd-executor"
++if [ "${AGENT_HINT_ROUTING:-true}" != "false" ] && [ "$(gsd_run query config-get planning.agents.specialized --raw 2>/dev/null)" = "true" ]; then
++  PROJECT_EXECUTOR=$(gsd_run query config-get planning.agents.executor --raw 2>/dev/null | tr -d '"')
++  if [ -n "$PROJECT_EXECUTOR" ]; then
++    EXECUTOR_TYPE=$(gsd_run query resolve-agent --name "$PROJECT_EXECUTOR" --raw 2>/dev/null || echo "gsd-executor")
++    [ -n "$EXECUTOR_TYPE" ] || EXECUTOR_TYPE="gsd-executor"
++  fi
++fi
+ ```
+ 
+ <!-- #2517 model-omit-on-inherit -->
+@@ -112,7 +123,10 @@
+ ```
+ Agent(
+   prompt="Fix finding {ID}: {description}. Files: {file_refs}. Make the minimal change to resolve this specific finding. Do not refactor surrounding code.",
+-  subagent_type="gsd-executor",
++  subagent_type="${EXECUTOR_TYPE}",
++  # dsmr-local: audit-fix executor routing. Omit the model line when EXECUTOR_MODEL is "inherit"
++  # or empty OR EXECUTOR_TYPE != "gsd-executor": a per-call model overrides the specialist's own
++  # `model:` key (a specialist that declares none inherits the orchestrator's model).
+   model="{EXECUTOR_MODEL}"
+ )
+ ```
