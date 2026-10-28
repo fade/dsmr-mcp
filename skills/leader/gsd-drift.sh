@@ -55,7 +55,8 @@ if [ -f "$state" ]; then
     /^last_activity:/ { sub(/^last_activity:[ \t]*/, ""); gsub(/^"|"$/, ""); print; exit }' "$state")
 fi
 
-commits=$(git -C "$top" log --no-merges --first-parent -n 500 --format='%H%x09%ct%x09%s' HEAD 2>/dev/null)
+# All parents: work that lands through a merge must be checked too, not only commits made on HEAD's branch.
+commits=$(git -C "$top" log --no-merges -n 500 --format='%H%x09%ct%x09%s' HEAD 2>/dev/null)
 
 # Walk newest-first. A commit is accounted when some prefix of length 7..40 of its
 # sha is a token, so short and full shas both match and a stray hex word matching
