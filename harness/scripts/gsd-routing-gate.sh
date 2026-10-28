@@ -8,6 +8,7 @@
 # Units (patch basename, target under gsd-core, backup suffix):
 #   per-plan-executor-routing    project executor default for execute-phase plans
 #   quick-executor-routing       /gsd-quick routes to the executor its plan names
+#   specialist-executor-model    a specialist executor keeps its own model
 #
 # --apply dry-runs every missing unit first and writes nothing unless all fit;
 # each target is then backed up with its unit's suffix. --self-test runs the
@@ -44,6 +45,7 @@ patch_dir=$(dirname "$self")/../patches/gsd-core
 units=(
   'per-plan-executor-routing|gsd-core/workflows/execute-phase/steps/per-plan-executor-routing.md|dsmr-local: project executor default|planning.agents.executor|.pre-lisp-routing'
   'quick-executor-routing|gsd-core/workflows/quick.md|dsmr-local: quick executor routing|subagent_type="${EXECUTOR_TYPE}"|.pre-quick-executor-routing'
+  'specialist-executor-model|gsd-core/workflows/execute-phase.md|dsmr-local: specialist executor model|EXECUTOR_TYPE != "gsd-executor"|.pre-specialist-executor-model'
 )
 
 # unit_field ROW N: print field N (1-based) of a unit row.
