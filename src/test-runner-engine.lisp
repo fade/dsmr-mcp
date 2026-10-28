@@ -614,10 +614,18 @@ the nested copy (which carries its test's name) before the flat duplicate,
 so the surviving entry is the well-named one."
   (let ((failures nil)
         (seen (make-hash-table :test 'eq)))
-    (labels ((record (r effective-sym)
+    (labels ((record (r effective-sym &optional uncarried)
                ;; Push one failure detail for R, named by EFFECTIVE-SYM when
-               ;; non-nil, else by R's printed expression.
+               ;; non-nil, else by R's printed expression.  When UNCARRIED,
+               ;; R is a failed parent and its DESCRIPTION (the error or
+               ;; time-limit text) is the reason: the :EXTENSIVE text opens
+               ;; with a "0/N tests failed" counter line that pushes the
+               ;; cause past the summary's 80-character cut.
                (let* ((pkg (%zebra-package))
+                      (desc-fn (and uncarried pkg
+                                    (find-symbol "DESCRIPTION" pkg)))
+                      (desc (and desc-fn
+                                 (ignore-errors (funcall desc-fn r))))
                       (expr-fn (and pkg (find-symbol "EXPRESSION" pkg)))
                       (expr (and expr-fn (ignore-errors (funcall expr-fn r))))
                       (test-name (cond
@@ -627,13 +635,16 @@ so the surviving entry is the well-named one."
                                    (t "unknown")))
                       (source (when effective-sym
                                 (%test-source-location effective-sym)))
-                      (reason-str (ignore-errors
-                                    (let* ((fmt-fn (and pkg
-                                                        (find-symbol "FORMAT-RESULT"
-                                                                     pkg)))
-                                           (ext-kw (intern "EXTENSIVE" :keyword)))
-                                      (and fmt-fn
-                                           (funcall fmt-fn r ext-kw))))))
+                      (reason-str
+                        (if (and (stringp desc) (plusp (length desc)))
+                            desc
+                            (ignore-errors
+                              (let* ((fmt-fn (and pkg
+                                                  (find-symbol "FORMAT-RESULT"
+                                                               pkg)))
+                                     (ext-kw (intern "EXTENSIVE" :keyword)))
+                                (and fmt-fn
+                                     (funcall fmt-fn r ext-kw)))))))
                  (push (make-failure-detail
                         :test-name test-name
                         :reason (or reason-str "failed")
@@ -664,7 +675,7 @@ so the surviving entry is the well-named one."
                                                node-name
                                                parent-test-sym)))
                        (when (%zebra-uncarried-failure-p status children status-fn)
-                         (record r node-test-sym))
+                         (record r node-test-sym t))
                        (dotimes (i (length children))
                          (walk (aref children i) node-test-sym)))
                      ;; Leaf result: record if failed.

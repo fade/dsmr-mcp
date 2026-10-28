@@ -63,7 +63,8 @@
                 #:make-ht)
   (:import-from #:dsmr-mcp/src/tools/run-tests
                 #:run-tests-tool
-                #:%dispatch-attach-run-tests)
+                #:%dispatch-attach-run-tests
+                #:%decode-run-tests-result)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
                 #:%handle-run-tests))
 
@@ -918,7 +919,7 @@ alone once hid a target-resolution crash."
   (let* ((form (%build-run-tests-form
                 "dsmr-scratch-reasons-probe" "zebra" nil nil 60 nil))
          (raw (eval form))
-         (ht (dsmr-mcp/src/tools/run-tests::%decode-run-tests-result
+         (ht (%decode-run-tests-result
               raw "dsmr-scratch-reasons-probe" (get-internal-real-time))))
     (is = 1 (gethash "passed" ht))
     (is = 1 (gethash "failed" ht))
@@ -936,7 +937,8 @@ alone once hid a target-resolution crash."
 (define-test errored-zebra-test-counts-as-failed
   "A zebra test that passes two checks and then signals an unhandled error
 counts as one failure: failed_tests names it, its reason carries the error
-text, and the summary names it.  The passed count of 2 shows the probe ran."
+text, and the summary names it and shows the error text.  The passed count
+of 2 shows the probe ran."
   (let* ((ht (%run-zebra-probe "DSMR-SCRATCH-ERRORED-PROBE"
                                *errored-probe-source*))
          (entry (%failed-test-named ht "ERRORS-AFTER-PASSING-CHECKS"))
@@ -948,7 +950,8 @@ text, and the summary names it.  The passed count of 2 shows the probe ran."
     (true (and entry
                (search "errored-after-checks" (gethash "reason" entry ""))))
     (true (search "2 passed, 1 failed" summary))
-    (true (search "ERRORS-AFTER-PASSING-CHECKS" summary))))
+    (true (search "ERRORS-AFTER-PASSING-CHECKS" summary))
+    (true (search "errored-after-checks" summary))))
 
 (defun %attached-probe-envelope (system package-name source)
   "Return the envelope %DISPATCH-ATTACH-RUN-TESTS gives for SYSTEM over an
@@ -985,23 +988,24 @@ afterwards."
 
 (define-test errored-zebra-test-counts-alike-on-every-path
   "The errored-after-checks probe reads passed 2, failed 1, and one named
-failed_tests entry carrying the error text through the engine, the hermetic
-worker handler, the injected form with its decode, and the Slynk wire.
-Attached reasons stay within 200 characters."
+failed_tests entry carrying the error text, with a summary that shows the
+error text, through the engine, the worker handler called in-process, the
+injected form with its decode, and the Slynk wire.  Attached reasons stay
+within 200 characters."
   (let ((system "dsmr-scratch-errored-probe"))
     (with-zebra-probe-package (pkg "DSMR-SCRATCH-ERRORED-PROBE"
                                    *errored-probe-source*)
       (let* ((engine (run-tests system :framework "zebra" :reload nil))
-             (hermetic (%handle-run-tests
+             (handler (%handle-run-tests
                         (make-ht "system" system "framework" "zebra"
                                  "reload" nil "timeout_seconds" 60)
                         nil))
-             (injected (dsmr-mcp/src/tools/run-tests::%decode-run-tests-result
+             (injected (%decode-run-tests-result
                         (eval (%build-run-tests-form system "zebra" nil nil 60 nil))
                         system (get-internal-real-time)))
              (wire (%attached-probe-envelope system "DSMR-SCRATCH-ERRORED-PROBE"
                                              *errored-probe-source*))
-             (envelopes (list engine hermetic injected wire))
+             (envelopes (list engine handler injected wire))
              (names (mapcar (lambda (ht)
                               (let ((entry (%failed-test-named
                                             ht "ERRORS-AFTER-PASSING-CHECKS")))
@@ -1016,7 +1020,8 @@ Attached reasons stay within 200 characters."
             (true (and entry
                        (search "errored-after-checks"
                                (gethash "reason" entry ""))))
-            (true (search "ERRORS-AFTER-PASSING-CHECKS" (%envelope-summary ht)))))
+            (true (search "ERRORS-AFTER-PASSING-CHECKS" (%envelope-summary ht)))
+            (true (search "errored-after-checks" (%envelope-summary ht)))))
         (dolist (ht (list injected wire))
           (let ((entry (%failed-test-named ht "ERRORS-AFTER-PASSING-CHECKS")))
             (false (gethash "isError" ht))
