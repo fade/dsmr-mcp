@@ -550,6 +550,16 @@ package-inferred layout."
                          (when (stringp dep-name) (walk-system dep-name)))))))))
       (walk-system system-name))))
 
+(defun %zebra-uncarried-failure-p (status children status-fn)
+  "True when STATUS is :FAILED and no element of the CHILDREN vector has
+status :FAILED, as when a test signals an error outside a check after its
+checks pass, or overruns its time limit.  STATUS-FN reads a child's status;
+a child whose status cannot be read counts as not failed."
+  (and (eq status :failed)
+       (notany (lambda (child)
+                 (eq :failed (ignore-errors (funcall status-fn child))))
+               children)))
+
 (defun %zebra-result-counts (result-obj)
   "Walk a Zebra test-result or parent-result tree and return
 (values passed failed pending) counts.
@@ -557,7 +567,10 @@ package-inferred layout."
 A report's RESULTS vector lists every recorded result FLAT while each
 test-result also nests its own children, so the same comparison-result is
 reachable twice; the EQ visited set counts each result exactly once
-(without it a 1-pass/1-fail suite reads as 2/2)."
+(without it a 1-pass/1-fail suite reads as 2/2).
+
+A failed parent with no failed direct child counts once itself, since no
+leaf below it records the failure."
   (let ((passed 0) (failed 0) (pending 0)
         (seen (make-hash-table :test 'eq)))
     (labels ((count-result (r)
@@ -569,9 +582,13 @@ reachable twice; the EQ visited set counts each result exactly once
                         (status (and status-fn (ignore-errors (funcall status-fn r))))
                         (children (ignore-errors (funcall results-fn r))))
                    (if (and children (plusp (length children)))
-                       ;; Parent result: recurse into children.
-                       (dotimes (i (length children))
-                         (count-result (aref children i)))
+                       ;; Parent result: count an uncarried failure, then
+                       ;; recurse into children.
+                       (progn
+                         (when (%zebra-uncarried-failure-p status children status-fn)
+                           (incf failed))
+                         (dotimes (i (length children))
+                           (count-result (aref children i))))
                        ;; Leaf result: count it.
                        (case status
                          (:passed (incf passed))
@@ -583,7 +600,8 @@ reachable twice; the EQ visited set counts each result exactly once
 
 (defun %zebra-extract-failures (result-obj)
   "Walk a Zebra test-result tree and collect failure details for each
-:failed leaf result.  Returns a list of make-failure-detail hash-tables.
+:failed leaf result and each failed parent that no direct child carries.
+Returns a list of make-failure-detail hash-tables.
 
 Parent result nodes carry the test name symbol as the NAME of their expression
 (a ZEBRA:TEST object).  That symbol is propagated down to leaf failures so
@@ -596,7 +614,43 @@ the nested copy (which carries its test's name) before the flat duplicate,
 so the surviving entry is the well-named one."
   (let ((failures nil)
         (seen (make-hash-table :test 'eq)))
-    (labels ((walk (r parent-test-sym)
+    (labels ((record (r effective-sym &optional uncarried)
+               ;; Push one failure detail for R, named by EFFECTIVE-SYM when
+               ;; non-nil, else by R's printed expression.  When UNCARRIED,
+               ;; R is a failed parent and its DESCRIPTION (the error or
+               ;; time-limit text) is the reason: the :EXTENSIVE text opens
+               ;; with a "0/N tests failed" counter line that pushes the
+               ;; cause past the summary's 80-character cut.
+               (let* ((pkg (%zebra-package))
+                      (desc-fn (and uncarried pkg
+                                    (find-symbol "DESCRIPTION" pkg)))
+                      (desc (and desc-fn
+                                 (ignore-errors (funcall desc-fn r))))
+                      (expr-fn (and pkg (find-symbol "EXPRESSION" pkg)))
+                      (expr (and expr-fn (ignore-errors (funcall expr-fn r))))
+                      (test-name (cond
+                                   (effective-sym
+                                    (princ-to-string effective-sym))
+                                   (expr (princ-to-string expr))
+                                   (t "unknown")))
+                      (source (when effective-sym
+                                (%test-source-location effective-sym)))
+                      (reason-str
+                        (if (and (stringp desc) (plusp (length desc)))
+                            desc
+                            (ignore-errors
+                              (let* ((fmt-fn (and pkg
+                                                  (find-symbol "FORMAT-RESULT"
+                                                               pkg)))
+                                     (ext-kw (intern "EXTENSIVE" :keyword)))
+                                (and fmt-fn
+                                     (funcall fmt-fn r ext-kw)))))))
+                 (push (make-failure-detail
+                        :test-name test-name
+                        :reason (or reason-str "failed")
+                        :source source)
+                       failures)))
+             (walk (r parent-test-sym)
                (when (gethash r seen)
                  (return-from walk))
                (setf (gethash r seen) t)
@@ -610,45 +664,30 @@ so the surviving entry is the well-named one."
                                   (and results-fn (funcall results-fn r)))))
                  (if (and children (plusp (length children)))
                      ;; Parent result: extract this node's test symbol (when its
-                     ;; expression has a non-nil symbol name) and pass it into
-                     ;; children so leaf failures can report the containing test.
+                     ;; expression has a non-nil symbol name), record the node
+                     ;; itself when no child carries its failure, and pass the
+                     ;; symbol into children so leaf failures can report the
+                     ;; containing test.
                      (let* ((expr (and expr-fn (ignore-errors (funcall expr-fn r))))
                             (node-name (and expr name-fn
                                             (ignore-errors (funcall name-fn expr))))
                             (node-test-sym (if (and node-name (symbolp node-name))
                                                node-name
                                                parent-test-sym)))
+                       (when (%zebra-uncarried-failure-p status children status-fn)
+                         (record r node-test-sym t))
                        (dotimes (i (length children))
                          (walk (aref children i) node-test-sym)))
                      ;; Leaf result: record if failed.
                      (when (eq status :failed)
                        (let* ((expr     (and expr-fn (ignore-errors (funcall expr-fn r))))
                               (leaf-name (and expr name-fn
-                                              (ignore-errors (funcall name-fn expr))))
-                              ;; Prefer a non-nil symbol from the leaf itself; fall
-                              ;; back to the nearest ancestor test symbol.
-                              (effective-sym (cond
-                                               ((and leaf-name (symbolp leaf-name)) leaf-name)
-                                               (t parent-test-sym)))
-                              (test-name (cond
-                                           (effective-sym
-                                            (princ-to-string effective-sym))
-                                           (expr (princ-to-string expr))
-                                           (t "unknown")))
-                              (source (when effective-sym
-                                        (%test-source-location effective-sym)))
-                              (reason-str (ignore-errors
-                                            (let* ((fmt-fn (and pkg
-                                                                (find-symbol "FORMAT-RESULT"
-                                                                             pkg)))
-                                                   (ext-kw (intern "EXTENSIVE" :keyword)))
-                                              (and fmt-fn
-                                                   (funcall fmt-fn r ext-kw))))))
-                         (push (make-failure-detail
-                                :test-name test-name
-                                :reason (or reason-str "failed")
-                                :source source)
-                               failures)))))))
+                                              (ignore-errors (funcall name-fn expr)))))
+                         ;; Prefer a non-nil symbol from the leaf itself; fall
+                         ;; back to the nearest ancestor test symbol.
+                         (record r (if (and leaf-name (symbolp leaf-name))
+                                       leaf-name
+                                       parent-test-sym))))))))
       (walk result-obj nil))
     (nreverse failures)))
 

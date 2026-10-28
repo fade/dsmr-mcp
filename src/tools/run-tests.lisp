@@ -54,7 +54,8 @@
   (:import-from #:bordeaux-threads
                 #:with-lock-held)
   (:export #:run-tests-tool
-           #:%dispatch-attach-run-tests))
+           #:%dispatch-attach-run-tests
+           #:%decode-run-tests-result))
 
 (in-package #:dsmr-mcp/src/tools/run-tests)
 
