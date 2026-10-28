@@ -136,6 +136,35 @@ superseding any existing files, and return DIR."
     (write-string +errored-probe-suite+ s))
   dir)
 
+(defparameter +carried-probe-asd+
+  "(defsystem \"dsmr-xproc-carried-probe\"
+  :depends-on (\"zebra\")
+  :components ((:file \"carried-suite\")))
+"
+  "Single-file probe system holding one test that fails a check, then errors.")
+
+(defparameter +carried-probe-suite+
+  "(defpackage #:dsmr-xproc-carried-probe (:use #:cl))
+(in-package #:dsmr-xproc-carried-probe)
+(zebra:define-test fails-a-long-check-then-errors
+  (zebra:is equal (make-string 150 :initial-element (code-char 97)) \"short\")
+  (error \"carried-own-error\"))
+"
+  "Probe suite: a failed check whose reason runs past 200 characters, then an
+unhandled error outside any check.")
+
+(defun %write-carried-probe-system (dir)
+  "Write dsmr-xproc-carried-probe.asd and carried-suite.lisp into DIR,
+superseding any existing files, and return DIR."
+  (ensure-directories-exist dir)
+  (with-open-file (s (merge-pathnames "dsmr-xproc-carried-probe.asd" dir)
+                     :direction :output :if-exists :supersede)
+    (write-string +carried-probe-asd+ s))
+  (with-open-file (s (merge-pathnames "carried-suite.lisp" dir)
+                     :direction :output :if-exists :supersede)
+    (write-string +carried-probe-suite+ s))
+  dir)
+
 (defun %free-tcp-port ()
   "Bind an OS-assigned loopback port, read it back, release it, return it.
 Same benign-race caveats as the wire cross-process leaf: the sanity eval
@@ -310,3 +339,39 @@ as it does an operator image."
                (summary (and content (plusp (length content))
                              (gethash "text" (aref content 0)))))
           (true (search "ERRORS-AFTER-PASSING-CHECKS" (or summary ""))))))))
+
+(define-test carried-failure-shows-its-own-error-in-a-foreign-image
+  "Attached run-tests in an image that never loaded dsmr-mcp counts a test
+that fails a long check and then signals an unhandled error as one failure:
+passed 0, failed 1, and one failed_tests entry whose reason, within 200
+characters, and the summary both carry the error text.  The check's own
+reason runs past 200 characters, so the error text survives the cut only
+when it leads."
+  (with-foreign-slynk-child-or-skip
+    (with-foreign-test-image (conn probe-dir)
+      (is = 3 (eval-in-image '(+ 1 2) conn :label "foreign carried-probe link probe"))
+      (%write-carried-probe-system probe-dir)
+      (let* ((tool (%attach-repl-tool "xproc-run-tests-carried" conn))
+             (params (make-ht "system" "dsmr-xproc-carried-probe"
+                              "framework" "zebra"
+                              "timeout_seconds" 120))
+             (res (%dispatch-attach-run-tests tool 1 params)))
+        (true (hash-table-p res))
+        (false (equal "NETWORK_ERROR" (gethash "error_type" res))
+               "run-tests dropped the wire (NETWORK_ERROR)")
+        (false (gethash "isError" res) "run-tests returned isError")
+        (is equal "zebra" (gethash "framework" res))
+        (is = 0 (gethash "passed" res))
+        (is = 1 (gethash "failed" res))
+        (let* ((fails (gethash "failed_tests" res))
+               (entry (and fails (= 1 (length fails)) (aref fails 0)))
+               (reason (if entry (gethash "reason" entry "") "")))
+          (is = 1 (length fails))
+          (true (and entry (search "FAILS-A-LONG-CHECK-THEN-ERRORS"
+                                   (gethash "test_name" entry ""))))
+          (true (search "carried-own-error" reason))
+          (true (<= (length reason) 200)))
+        (let* ((content (gethash "content" res))
+               (summary (and content (plusp (length content))
+                             (gethash "text" (aref content 0)))))
+          (true (search "carried-own-error" (or summary ""))))))))

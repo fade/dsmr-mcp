@@ -132,6 +132,13 @@ FRAGMENT, or NIL.  Safe on an empty or absent failed_tests."
      (error \"errored-after-checks\"))"
   "A zebra test that passes two checks, then signals an error outside any check.")
 
+(defparameter *carried-probe-source*
+  "(zebra:define-test fails-a-long-check-then-errors
+     (zebra:is equal (make-string 150 :initial-element (code-char 97)) \"short\")
+     (error \"carried-own-error\"))"
+  "A zebra test whose failed check reports past 200 characters, then signals
+an error outside any check.")
+
 ;;; ---------------------------------------------------------------------------
 ;;; File-defined failing test in the scratch package
 ;;;
@@ -485,9 +492,9 @@ cannot haunt results after reload."
 ;;; ---------------------------------------------------------------------------
 ;;; run-tests-attached-returns-structured-counts
 ;;;
-;;; The attached path injects a ghost-purge + reload + run form via Slynk.
-;;; Running the scratch runner-tests package through the attached path must
-;;; return an envelope with the standard passed/failed/framework fields.
+;;; The attached path injects a ghost-purge, reload, and run form via Slynk.
+;;; With reload false it runs the tests already in the image and returns their
+;;; real counts; with reload absent it reloads first.
 ;;; ---------------------------------------------------------------------------
 
 (defun %make-run-tests-attach-session (id conn)
@@ -499,44 +506,51 @@ cannot haunt results after reload."
     (values session repl-tool)))
 
 (define-test run-tests-attached-returns-structured-counts
-  "Calling %dispatch-attach-run-tests via the in-process Slynk fixture against
-the always-loaded 'dsmr-scratch-runner-tests' package returns an envelope with
-integer 'passed', 'failed', 'pending' fields and a string 'framework' field —
-NOT a NETWORK_ERROR.
-The attached path injects a ghost-purge + run form into the live image; the form
-must survive the Slynk wire protocol round-trip and return a structured result.
-Target the scratch package, NOT this test's own package: pointing run-tests at
-the package the outer harness is currently running would re-enter this very test
-in-image and recurse until the call-lock deadline fires."
-  (with-temporary-slynk-listener (conn)
-    (multiple-value-bind (session repl-tool)
-        (%make-run-tests-attach-session "rt-attach-counts" conn)
-      (declare (ignore session))
-      ;; Use reload=nil: the scratch package is already loaded in the image;
-      ;; skipping ASDF reload keeps this test fast and avoids compile noise in
-      ;; the test runner's own output.
-      (let* ((params (make-ht "system"          "dsmr-scratch-runner-tests"
-                              "framework"       "zebra"
-                              "reload"          nil
-                              "timeout_seconds" 300))
-             (result (%dispatch-attach-run-tests repl-tool nil params)))
-        (true (hash-table-p result))
-        ;; Must NOT be a NETWORK_ERROR — that would mean the injected form failed
-        ;; to survive the Slynk wire protocol (e.g. #() literal in the form is
-        ;; incompatible with Slynk's translating-read protocol parser).
-        ;; A NETWORK_ERROR here indicates the attached path is broken.
-        (false (string= "NETWORK_ERROR" (gethash "error_type" result "")))
-        ;; On success: structured counts envelope.
-        (false (gethash "isError" result))
-        (true (integerp (gethash "passed"    result)))
-        (true (integerp (gethash "failed"    result)))
-        (true (integerp (gethash "pending"   result)))
-        (true (stringp  (gethash "framework" result)))
-        ;; The client renders results through content alone — the summary
-        ;; text block must be present alongside the structured counts.
-        (let ((content (gethash "content" result)))
-          (true (vectorp content))
-          (true (search "passed" (gethash "text" (aref content 0)))))))))
+  "Over an in-process Slynk listener, %dispatch-attach-run-tests with reload
+false returns passed 1, failed 1, and the failing probe test by name, with no
+SYSTEM-LOAD entry and no NETWORK_ERROR.  The same call with reload absent
+returns a SYSTEM-LOAD entry: the default still reloads first.
+The probe package is deliberately no ASDF system, so real counts prove no
+reload ran.  Never target this test's own package: the outer harness is
+running it, so the injected run would re-enter this test in-image and recurse
+until the call-lock deadline fires."
+  (with-zebra-probe-package (pkg "DSMR-SCRATCH-ATTACHED-COUNTS"
+                                 "(progn
+                                    (zebra:define-test attached-probe-passes
+                                      (zebra:true t))
+                                    (zebra:define-test attached-probe-fails
+                                      (zebra:true nil)))")
+    (with-temporary-slynk-listener (conn)
+      (multiple-value-bind (session repl-tool)
+          (%make-run-tests-attach-session "rt-attach-counts" conn)
+        (declare (ignore session))
+        (let* ((no-reload (%dispatch-attach-run-tests
+                           repl-tool nil
+                           (make-ht "system"          "dsmr-scratch-attached-counts"
+                                    "framework"       "zebra"
+                                    "reload"          nil
+                                    "timeout_seconds" 60)))
+               (default (%dispatch-attach-run-tests
+                         repl-tool nil
+                         (make-ht "system"          "dsmr-scratch-attached-counts"
+                                  "framework"       "zebra"
+                                  "timeout_seconds" 60)))
+               (failures (and (hash-table-p no-reload)
+                              (gethash "failed_tests" no-reload))))
+          (true (hash-table-p no-reload))
+          (when (hash-table-p no-reload)
+            (false (equal "NETWORK_ERROR" (gethash "error_type" no-reload)))
+            (false (gethash "isError" no-reload))
+            (is equal "zebra" (gethash "framework" no-reload))
+            (is eql 1 (gethash "passed" no-reload))
+            (is eql 1 (gethash "failed" no-reload))
+            (is eql 1 (and (vectorp failures) (length failures)))
+            (true (%failed-test-named no-reload "ATTACHED-PROBE-FAILS"))
+            (false (%failed-test-named no-reload "SYSTEM-LOAD"))
+            (true (search "1 passed, 1 failed" (%envelope-summary no-reload))))
+          (true (hash-table-p default))
+          (true (and (hash-table-p default)
+                     (%failed-test-named default "SYSTEM-LOAD"))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; run-tests-inline-returns-mode-error
@@ -953,16 +967,20 @@ of 2 shows the probe ran."
     (true (search "ERRORS-AFTER-PASSING-CHECKS" summary))
     (true (search "errored-after-checks" summary))))
 
+(defun %attached-probe-directory ()
+  "Return a scratch directory pathname under the system temporary directory, unique per call."
+  (merge-pathnames (format nil "dsmr-attached-probe-~D-~36R/"
+                           (get-universal-time)
+                           (random (expt 36 8) (make-random-state t)))
+                   (uiop:temporary-directory)))
+
 (defun %attached-probe-envelope (system package-name source)
   "Return the envelope %DISPATCH-ATTACH-RUN-TESTS gives for SYSTEM over an
-in-process Slynk listener, with reload NIL.
-The dispatcher reads a NIL reload as absent and reloads, so SYSTEM is
-registered from a temporary .asd whose load-op re-defines SOURCE's tests in
-the existing package PACKAGE-NAME.  The system and directory are removed
-afterwards."
-  (let* ((dir (merge-pathnames (format nil "dsmr-attached-probe-~D/"
-                                       (get-universal-time))
-                               (uiop:temporary-directory)))
+in-process Slynk listener, dispatched with reload absent.
+The default reload runs, so SYSTEM is registered from a temporary .asd whose
+load-op re-defines SOURCE's tests in the existing package PACKAGE-NAME during
+that reload.  The system and directory are removed afterwards."
+  (let* ((dir (%attached-probe-directory))
          (asd (merge-pathnames (format nil "~A.asd" system) dir)))
     (unwind-protect
          (progn
@@ -981,10 +999,16 @@ afterwards."
                (%dispatch-attach-run-tests
                 repl-tool nil
                 (make-ht "system" system "framework" "zebra"
-                         "reload" nil "timeout_seconds" 60)))))
+                         "timeout_seconds" 60)))))
       (ignore-errors (asdf:clear-system system))
       (ignore-errors (uiop:delete-directory-tree
                       dir :validate t :if-does-not-exist :ignore)))))
+
+(define-test attached-probe-directories-are-unique
+  "Two runs in one second share no attached probe directory: five names
+generated back to back are pairwise distinct."
+  (let ((dirs (loop repeat 5 collect (%attached-probe-directory))))
+    (is = 5 (length (remove-duplicates dirs :test #'equal)))))
 
 (define-test errored-zebra-test-counts-alike-on-every-path
   "The errored-after-checks probe reads passed 2, failed 1, and one named
@@ -1032,6 +1056,48 @@ within 200 characters."
                          (mapcar (lambda (ht) (gethash "failed" ht)) envelopes))))
         (true (and (every #'stringp names)
                    (every (lambda (n) (string= n (first names))) names)))))))
+
+(define-test carried-failure-shows-its-own-error-on-every-path
+  "A test that fails a long check and then signals an error reads passed 0,
+failed 1, and one failed_tests entry whose reason and summary carry the
+error text, through the engine, the worker handler called in-process, the
+injected form with its decode, and the Slynk wire.  The check's own reason
+runs past 200 characters, so the error text survives the attached path's
+200-character cut only when it leads.  Attached reasons stay within 200
+characters."
+  (let ((system "dsmr-scratch-carried-probe")
+        (name "FAILS-A-LONG-CHECK-THEN-ERRORS"))
+    (with-zebra-probe-package (pkg "DSMR-SCRATCH-CARRIED-PROBE"
+                                   *carried-probe-source*)
+      (let* ((engine (run-tests system :framework "zebra" :reload nil))
+             (handler (%handle-run-tests
+                        (make-ht "system" system "framework" "zebra"
+                                 "reload" nil "timeout_seconds" 60)
+                        nil))
+             (injected (%decode-run-tests-result
+                        (eval (%build-run-tests-form system "zebra" nil nil 60 nil))
+                        system (get-internal-real-time)))
+             (wire (%attached-probe-envelope system "DSMR-SCRATCH-CARRIED-PROBE"
+                                             *carried-probe-source*)))
+        (dolist (ht (list engine handler injected wire))
+          (let ((entry (%failed-test-named ht name)))
+            (is = 0 (gethash "passed" ht))
+            (is = 1 (gethash "failed" ht))
+            (is = 1 (length (gethash "failed_tests" ht)))
+            (true entry)
+            (true (and entry
+                       (search "carried-own-error" (gethash "reason" entry ""))))
+            (true (search "carried-own-error" (%envelope-summary ht)))))
+        (dolist (ht (list engine handler))
+          (let ((entry (%failed-test-named ht name)))
+            (true (and entry
+                       (search "was expected to be"
+                               (gethash "reason" entry ""))))))
+        (dolist (ht (list injected wire))
+          (let ((entry (%failed-test-named ht name)))
+            (false (gethash "isError" ht))
+            (true (and entry
+                       (<= (length (gethash "reason" entry "")) 200)))))))))
 
 (defun %counted-zebra-probe (case-name source)
   "Run SOURCE's zebra tests in the scratch package DSMR-SCRATCH-COUNT-CASE-NAME,
@@ -1098,47 +1164,102 @@ plain failed one counts 2."
     (true (%failed-test-named ht "FAILS-A-CHECK"))))
 
 (define-test carried-failures-keep-their-counts
-  "A failure that a check or nested test already records keeps its count.
-An error before any check, an error inside a check, a failed check, a failed
-nested child, and a failed check followed by an error each count 1.  A
-passing test counts 0 with no failed_tests entry."
-  (let ((ht (%counted-zebra-probe
-             "EARLY"
-             "(zebra:define-test errors-before-any-check (error \"early\"))")))
-    (is = 1 (gethash "failed" ht))
-    (true (%failed-test-named ht "ERRORS-BEFORE-ANY-CHECK")))
-  (is = 1 (gethash "failed"
-                   (%counted-zebra-probe
-                    "INSIDE"
-                    "(zebra:define-test errors-inside-a-check
-                       (zebra:true t)
-                       (zebra:true (error \"inside\")))")))
-  (is = 1 (gethash "failed"
-                   (%counted-zebra-probe
-                    "PLAIN"
-                    "(zebra:define-test fails-a-plain-check
-                       (zebra:true t)
-                       (zebra:true nil))")))
-  (is = 1 (gethash "failed"
-                   (%counted-zebra-probe
-                    "NESTED-CHECK"
-                    "(progn
-                       (zebra:define-test carried-parent (zebra:true t))
-                       (zebra:define-test (carried-parent carried-child)
-                         (zebra:true nil)))")))
-  (is = 1 (gethash "failed"
-                   (%counted-zebra-probe
-                    "FAILED-THEN-ERROR"
-                    "(zebra:define-test fails-then-errors
-                       (zebra:true t)
-                       (zebra:true nil)
-                       (error \"after-a-failed-check\"))")))
-  (let ((ht (%counted-zebra-probe
-             "PASSING"
-             "(zebra:define-test passes-only (zebra:true t))")))
-    (is = 1 (gethash "passed" ht))
-    (is = 0 (gethash "failed" ht))
-    (is = 0 (length (gethash "failed_tests" ht)))))
+  "A failure that a check or nested test already records keeps a count of 1.
+The cases are an error before any check, an error inside a check, a failed
+check, a failed nested child, a failed check followed by an error, a failed
+check followed by a time-limit overrun, and a failed nested child under an
+overrunning parent.  The test's own error or overrun text leads the carried
+entry's reason, and an entry named for a nested child names the parent the
+text belongs to.  A carried failure with neither reads as before, and a test
+docstring never appears as an error.  A passing test counts 0 with no
+failed_tests entry."
+  (flet ((reason-of (ht name)
+           (let ((entry (%failed-test-named ht name)))
+             (if entry (gethash "reason" entry "") "")))
+         (own-text-p (reason)
+           (or (search "failed to evaluate properly" reason)
+               (search "limit of" reason))))
+    (let ((ht (%counted-zebra-probe
+               "EARLY"
+               "(zebra:define-test errors-before-any-check (error \"early\"))")))
+      (is = 1 (gethash "failed" ht))
+      (true (%failed-test-named ht "ERRORS-BEFORE-ANY-CHECK")))
+    (is = 1 (gethash "failed"
+                     (%counted-zebra-probe
+                      "INSIDE"
+                      "(zebra:define-test errors-inside-a-check
+                         (zebra:true t)
+                         (zebra:true (error \"inside\")))")))
+    (let ((ht (%counted-zebra-probe
+               "PLAIN"
+               "(zebra:define-test fails-a-plain-check
+                  (zebra:true t)
+                  (zebra:true nil))")))
+      (is = 1 (gethash "failed" ht))
+      (true (%failed-test-named ht "FAILS-A-PLAIN-CHECK"))
+      (false (own-text-p (reason-of ht "FAILS-A-PLAIN-CHECK"))))
+    (let ((ht (%counted-zebra-probe
+               "NESTED-CHECK"
+               "(progn
+                  (zebra:define-test carried-parent (zebra:true t))
+                  (zebra:define-test (carried-parent carried-child)
+                    (zebra:true nil)))")))
+      (is = 1 (gethash "failed" ht))
+      (true (%failed-test-named ht "CARRIED-CHILD"))
+      (false (own-text-p (reason-of ht "CARRIED-CHILD"))))
+    (let* ((ht (%counted-zebra-probe
+                "FAILED-THEN-ERROR"
+                "(zebra:define-test fails-then-errors
+                   (zebra:true t)
+                   (zebra:true nil)
+                   (error \"after-a-failed-check\"))"))
+           (reason (reason-of ht "FAILS-THEN-ERRORS")))
+      (is = 1 (gethash "failed" ht))
+      (is = 1 (length (gethash "failed_tests" ht)))
+      (true (%failed-test-named ht "FAILS-THEN-ERRORS"))
+      (true (search "after-a-failed-check" reason))
+      (true (search "was expected to be" reason))
+      (true (and (search "after-a-failed-check" reason)
+                 (search "was expected to be" reason)
+                 (< (search "after-a-failed-check" reason)
+                    (search "was expected to be" reason)))))
+    (let* ((ht (%counted-zebra-probe
+                "FAILED-THEN-OVERRUN"
+                "(zebra:define-test fails-then-overruns :time-limit 0.01
+                   (zebra:true nil)
+                   (sleep 0.25))"))
+           (reason (reason-of ht "FAILS-THEN-OVERRUNS")))
+      (is = 1 (gethash "failed" ht))
+      (true (search "limit of" reason))
+      (true (search "was expected to be" reason)))
+    (let* ((ht (%counted-zebra-probe
+                "NESTED-OVERRUN"
+                "(progn
+                   (zebra:define-test overrunning-parent :time-limit 0.01
+                     (sleep 0.25))
+                   (zebra:define-test (overrunning-parent overrun-child)
+                     (zebra:true nil)))"))
+           (reason (reason-of ht "OVERRUN-CHILD")))
+      (is = 1 (gethash "failed" ht))
+      (is = 1 (length (gethash "failed_tests" ht)))
+      (true (%failed-test-named ht "OVERRUN-CHILD"))
+      (true (search "limit of" reason))
+      (true (search "OVERRUNNING-PARENT" reason)))
+    (let ((ht (%counted-zebra-probe
+               "DOCUMENTED"
+               "(zebra:define-test documented-failure
+                  \"documented-sentinel-text\"
+                  (zebra:true nil))")))
+      (is = 1 (gethash "failed" ht))
+      (true (%failed-test-named ht "DOCUMENTED-FAILURE"))
+      (false (search "documented-sentinel-text"
+                     (reason-of ht "DOCUMENTED-FAILURE"))))
+    (let ((ht (%counted-zebra-probe
+               "PASSING"
+               "(zebra:define-test passes-only (zebra:true t))")))
+      (is = 1 (gethash "passed" ht))
+      (is = 0 (gethash "failed" ht))
+      (is = 0 (length (gethash "failed_tests" ht))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The system a run is dispatched against, and what a result may claim
