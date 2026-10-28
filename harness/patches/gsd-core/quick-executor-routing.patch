@@ -1,6 +1,6 @@
 --- a/gsd-core/workflows/quick.md
 +++ b/gsd-core/workflows/quick.md
-@@ -412,7 +412,29 @@
+@@ -422,7 +422,29 @@
  fi
  ```
  
@@ -31,7 +31,7 @@
  
  ```
  Agent(
-@@ -509,7 +531,10 @@
+@@ -524,7 +546,10 @@
  - Do NOT update ROADMAP.md (quick tasks are separate from planned phases)
  </constraints>
  ",
