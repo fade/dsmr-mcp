@@ -1,0 +1,45 @@
+--- a/gsd-core/workflows/quick.md
++++ b/gsd-core/workflows/quick.md
+@@ -412,7 +412,29 @@
+ fi
+ ```
+ 
+-Spawn gsd-executor with plan reference:
++Resolve the executor for this task. The quick plan's `agent_hint` wins; without one, the project
++default `planning.agents.executor` applies when `planning.agents.specialized` is `true`. The name is
++validated against the installed agents and falls back to `gsd-executor`.
++
++```bash
++# dsmr-local: quick executor routing
++AGENT_HINT_ROUTING=$(gsd_run query config-get workflow.agent_hint_routing --raw 2>/dev/null || true)
++EXECUTOR_TYPE="gsd-executor"
++if [ "${AGENT_HINT_ROUTING:-true}" != "false" ]; then
++  QUICK_PLAN_PATH="${QUICK_DIR}/${quick_id}-PLAN.md"
++  PLAN_HINT=$(gsd_run query frontmatter.get "$QUICK_PLAN_PATH" --field agent_hint --raw 2>/dev/null | jq -r 'strings' 2>/dev/null | tr -d '"' || true)
++  if [ -z "$PLAN_HINT" ] && [ "$(gsd_run query config-get planning.agents.specialized --raw 2>/dev/null)" = "true" ]; then
++    PLAN_HINT=$(gsd_run query config-get planning.agents.executor --raw 2>/dev/null | tr -d '"')
++  fi
++  if [ -n "$PLAN_HINT" ]; then
++    EXECUTOR_TYPE=$(gsd_run query resolve-agent --name "$PLAN_HINT" --raw 2>/dev/null || echo "gsd-executor")
++    [ -n "$EXECUTOR_TYPE" ] || EXECUTOR_TYPE="gsd-executor"
++  fi
++fi
++AGENT_SKILLS_EXECUTOR=$(gsd_run query agent-skills "$EXECUTOR_TYPE" ${GSD_WS:+--ws=${GSD_WS##* }})
++```
++
++Spawn the resolved executor (`EXECUTOR_TYPE`) with plan reference:
+ 
+ ```
+ Agent(
+@@ -509,7 +531,10 @@
+ - Do NOT update ROADMAP.md (quick tasks are separate from planned phases)
+ </constraints>
+ ",
+-  subagent_type="gsd-executor",
++  subagent_type="${EXECUTOR_TYPE}",
++  # dsmr-local: quick executor routing. Omit the model line when executor_model == "inherit"
++  # OR EXECUTOR_TYPE != "gsd-executor": a per-call model overrides the specialist's own
++  # `model:` key (a specialist that declares none inherits the orchestrator's model).
+   model="{executor_model}",
+   {harnessFlag}
+   description="Execute: ${DESCRIPTION}"
