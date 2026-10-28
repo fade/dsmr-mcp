@@ -485,9 +485,9 @@ cannot haunt results after reload."
 ;;; ---------------------------------------------------------------------------
 ;;; run-tests-attached-returns-structured-counts
 ;;;
-;;; The attached path injects a ghost-purge + reload + run form via Slynk.
-;;; Running the scratch runner-tests package through the attached path must
-;;; return an envelope with the standard passed/failed/framework fields.
+;;; The attached path injects a ghost-purge, reload, and run form via Slynk.
+;;; With reload false it runs the tests already in the image and returns their
+;;; real counts; with reload absent it reloads first.
 ;;; ---------------------------------------------------------------------------
 
 (defun %make-run-tests-attach-session (id conn)
@@ -499,44 +499,51 @@ cannot haunt results after reload."
     (values session repl-tool)))
 
 (define-test run-tests-attached-returns-structured-counts
-  "Calling %dispatch-attach-run-tests via the in-process Slynk fixture against
-the always-loaded 'dsmr-scratch-runner-tests' package returns an envelope with
-integer 'passed', 'failed', 'pending' fields and a string 'framework' field —
-NOT a NETWORK_ERROR.
-The attached path injects a ghost-purge + run form into the live image; the form
-must survive the Slynk wire protocol round-trip and return a structured result.
-Target the scratch package, NOT this test's own package: pointing run-tests at
-the package the outer harness is currently running would re-enter this very test
-in-image and recurse until the call-lock deadline fires."
-  (with-temporary-slynk-listener (conn)
-    (multiple-value-bind (session repl-tool)
-        (%make-run-tests-attach-session "rt-attach-counts" conn)
-      (declare (ignore session))
-      ;; Use reload=nil: the scratch package is already loaded in the image;
-      ;; skipping ASDF reload keeps this test fast and avoids compile noise in
-      ;; the test runner's own output.
-      (let* ((params (make-ht "system"          "dsmr-scratch-runner-tests"
-                              "framework"       "zebra"
-                              "reload"          nil
-                              "timeout_seconds" 300))
-             (result (%dispatch-attach-run-tests repl-tool nil params)))
-        (true (hash-table-p result))
-        ;; Must NOT be a NETWORK_ERROR — that would mean the injected form failed
-        ;; to survive the Slynk wire protocol (e.g. #() literal in the form is
-        ;; incompatible with Slynk's translating-read protocol parser).
-        ;; A NETWORK_ERROR here indicates the attached path is broken.
-        (false (string= "NETWORK_ERROR" (gethash "error_type" result "")))
-        ;; On success: structured counts envelope.
-        (false (gethash "isError" result))
-        (true (integerp (gethash "passed"    result)))
-        (true (integerp (gethash "failed"    result)))
-        (true (integerp (gethash "pending"   result)))
-        (true (stringp  (gethash "framework" result)))
-        ;; The client renders results through content alone — the summary
-        ;; text block must be present alongside the structured counts.
-        (let ((content (gethash "content" result)))
-          (true (vectorp content))
-          (true (search "passed" (gethash "text" (aref content 0)))))))))
+  "Over an in-process Slynk listener, %dispatch-attach-run-tests with reload
+false returns passed 1, failed 1, and the failing probe test by name, with no
+SYSTEM-LOAD entry and no NETWORK_ERROR.  The same call with reload absent
+returns a SYSTEM-LOAD entry: the default still reloads first.
+The probe package is deliberately no ASDF system, so real counts prove no
+reload ran.  Never target this test's own package: the outer harness is
+running it, so the injected run would re-enter this test in-image and recurse
+until the call-lock deadline fires."
+  (with-zebra-probe-package (pkg "DSMR-SCRATCH-ATTACHED-COUNTS"
+                                 "(progn
+                                    (zebra:define-test attached-probe-passes
+                                      (zebra:true t))
+                                    (zebra:define-test attached-probe-fails
+                                      (zebra:true nil)))")
+    (with-temporary-slynk-listener (conn)
+      (multiple-value-bind (session repl-tool)
+          (%make-run-tests-attach-session "rt-attach-counts" conn)
+        (declare (ignore session))
+        (let* ((no-reload (%dispatch-attach-run-tests
+                           repl-tool nil
+                           (make-ht "system"          "dsmr-scratch-attached-counts"
+                                    "framework"       "zebra"
+                                    "reload"          nil
+                                    "timeout_seconds" 60)))
+               (default (%dispatch-attach-run-tests
+                         repl-tool nil
+                         (make-ht "system"          "dsmr-scratch-attached-counts"
+                                  "framework"       "zebra"
+                                  "timeout_seconds" 60)))
+               (failures (and (hash-table-p no-reload)
+                              (gethash "failed_tests" no-reload))))
+          (true (hash-table-p no-reload))
+          (when (hash-table-p no-reload)
+            (false (equal "NETWORK_ERROR" (gethash "error_type" no-reload)))
+            (false (gethash "isError" no-reload))
+            (is equal "zebra" (gethash "framework" no-reload))
+            (is eql 1 (gethash "passed" no-reload))
+            (is eql 1 (gethash "failed" no-reload))
+            (is eql 1 (and (vectorp failures) (length failures)))
+            (true (%failed-test-named no-reload "ATTACHED-PROBE-FAILS"))
+            (false (%failed-test-named no-reload "SYSTEM-LOAD"))
+            (true (search "1 passed, 1 failed" (%envelope-summary no-reload))))
+          (true (hash-table-p default))
+          (true (and (hash-table-p default)
+                     (%failed-test-named default "SYSTEM-LOAD"))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; run-tests-inline-returns-mode-error
@@ -955,11 +962,10 @@ of 2 shows the probe ran."
 
 (defun %attached-probe-envelope (system package-name source)
   "Return the envelope %DISPATCH-ATTACH-RUN-TESTS gives for SYSTEM over an
-in-process Slynk listener, with reload NIL.
-The dispatcher reads a NIL reload as absent and reloads, so SYSTEM is
-registered from a temporary .asd whose load-op re-defines SOURCE's tests in
-the existing package PACKAGE-NAME.  The system and directory are removed
-afterwards."
+in-process Slynk listener, dispatched with reload absent.
+The default reload runs, so SYSTEM is registered from a temporary .asd whose
+load-op re-defines SOURCE's tests in the existing package PACKAGE-NAME during
+that reload.  The system and directory are removed afterwards."
   (let* ((dir (merge-pathnames (format nil "dsmr-attached-probe-~D/"
                                        (get-universal-time))
                                (uiop:temporary-directory)))
@@ -981,7 +987,7 @@ afterwards."
                (%dispatch-attach-run-tests
                 repl-tool nil
                 (make-ht "system" system "framework" "zebra"
-                         "reload" nil "timeout_seconds" 60)))))
+                         "timeout_seconds" 60)))))
       (ignore-errors (asdf:clear-system system))
       (ignore-errors (uiop:delete-directory-tree
                       dir :validate t :if-does-not-exist :ignore)))))

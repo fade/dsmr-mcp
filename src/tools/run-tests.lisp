@@ -206,9 +206,12 @@ Returns a hash-table (without the result wrapper) so the caller can wrap it."
          (test            (and params (gethash "test"            params)))
          (tests           (and params (gethash "tests"           params)))
          (timeout-seconds (or (and params (gethash "timeout_seconds" params)) 300))
-         ;; reload defaults true when absent.
-         (reload          (let ((v (and params (gethash "reload" params))))
-                            (if (null v) t v))))
+         ;; reload: an absent key means true; a JSON false means no reload.
+         (reload          (if params
+                              (multiple-value-bind (v presentp)
+                                  (gethash "reload" params)
+                                (if presentp v t))
+                              t)))
     (unless (and (stringp sys-name) (plusp (length sys-name)))
       (return-from %dispatch-attach-run-tests
         (make-ht "isError" t
