@@ -967,15 +967,20 @@ of 2 shows the probe ran."
     (true (search "ERRORS-AFTER-PASSING-CHECKS" summary))
     (true (search "errored-after-checks" summary))))
 
+(defun %attached-probe-directory ()
+  "Return a scratch directory pathname under the system temporary directory, unique per call."
+  (merge-pathnames (format nil "dsmr-attached-probe-~D-~36R/"
+                           (get-universal-time)
+                           (random (expt 36 8) (make-random-state t)))
+                   (uiop:temporary-directory)))
+
 (defun %attached-probe-envelope (system package-name source)
   "Return the envelope %DISPATCH-ATTACH-RUN-TESTS gives for SYSTEM over an
 in-process Slynk listener, dispatched with reload absent.
 The default reload runs, so SYSTEM is registered from a temporary .asd whose
 load-op re-defines SOURCE's tests in the existing package PACKAGE-NAME during
 that reload.  The system and directory are removed afterwards."
-  (let* ((dir (merge-pathnames (format nil "dsmr-attached-probe-~D/"
-                                       (get-universal-time))
-                               (uiop:temporary-directory)))
+  (let* ((dir (%attached-probe-directory))
          (asd (merge-pathnames (format nil "~A.asd" system) dir)))
     (unwind-protect
          (progn
@@ -998,6 +1003,12 @@ that reload.  The system and directory are removed afterwards."
       (ignore-errors (asdf:clear-system system))
       (ignore-errors (uiop:delete-directory-tree
                       dir :validate t :if-does-not-exist :ignore)))))
+
+(define-test attached-probe-directories-are-unique
+  "Two runs in one second share no attached probe directory: five names
+generated back to back are pairwise distinct."
+  (let ((dirs (loop repeat 5 collect (%attached-probe-directory))))
+    (is = 5 (length (remove-duplicates dirs :test #'equal)))))
 
 (define-test errored-zebra-test-counts-alike-on-every-path
   "The errored-after-checks probe reads passed 2, failed 1, and one named
