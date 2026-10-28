@@ -8,6 +8,7 @@ loads has a history and a review path like the rest of the code.
 
 | Agent | Purpose |
 |---|---|
+| `Explore` | Read-only fan-out search on Haiku, replacing the built-in Explore agent, which otherwise runs on whatever model the calling session uses |
 | `shell-developer` | Writes the shell that builds, installs, and tests our systems: Makefiles, install scripts, git hooks, test drivers, and CI workflows |
 
 I gave shell work its own executor because it does not need the strongest model, and Lisp work
