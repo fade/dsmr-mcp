@@ -598,6 +598,21 @@ leaf below it records the failure."
       (count-result result-obj))
     (values passed failed pending)))
 
+(defun %zebra-own-failure-text (result)
+  "Return RESULT's DESCRIPTION when it is zebra's unhandled-error text, which
+begins \"The test failed to evaluate properly\", or its time-limit text, which
+begins \"The limit of\"; else NIL.  Zebra also copies a test's docstring into
+DESCRIPTION, so a non-empty DESCRIPTION alone does not mark an error."
+  (let* ((pkg (%zebra-package))
+         (desc-fn (and pkg (find-symbol "DESCRIPTION" pkg)))
+         (desc (and desc-fn (ignore-errors (funcall desc-fn result)))))
+    (and (stringp desc)
+         (some (lambda (prefix)
+                 (and (>= (length desc) (length prefix))
+                      (string= prefix desc :end2 (length prefix))))
+               '("The test failed to evaluate properly" "The limit of"))
+         desc)))
+
 (defun %zebra-extract-failures (result-obj)
   "Walk a Zebra test-result tree and collect failure details for each
 :failed leaf result and each failed parent that no direct child carries.
@@ -611,7 +626,14 @@ expression is an assertion form rather than a test object.
 A report lists every result FLAT while test-results also nest the same
 children; the EQ visited set records each failure once.  The walk reaches
 the nested copy (which carries its test's name) before the flat duplicate,
-so the surviving entry is the well-named one."
+so the surviving entry is the well-named one.
+
+A failed parent that a child carries adds no entry.  When that parent's own
+result holds an error or time-limit text, the text leads the reason of the
+earliest entry recorded under it, prefixed with the parent's name when the
+entry is named for a nested test.  It leads because the attached path cuts
+each reason to 200 characters and the summary shows 80, so trailing text
+vanishes whenever the check's own reason is long."
   (let ((failures nil)
         (seen (make-hash-table :test 'eq)))
     (labels ((record (r effective-sym &optional uncarried)
@@ -674,10 +696,37 @@ so the surviving entry is the well-named one."
                             (node-test-sym (if (and node-name (symbolp node-name))
                                                node-name
                                                parent-test-sym)))
-                       (when (%zebra-uncarried-failure-p status children status-fn)
-                         (record r node-test-sym t))
-                       (dotimes (i (length children))
-                         (walk (aref children i) node-test-sym)))
+                       (let ((uncarried (%zebra-uncarried-failure-p
+                                         status children status-fn))
+                             (before failures))
+                         (when uncarried
+                           (record r node-test-sym t))
+                         (dotimes (i (length children))
+                           (walk (aref children i) node-test-sym))
+                         ;; A carried failure: the node's own error or
+                         ;; time-limit text leads the earliest entry recorded
+                         ;; under it, named for the node when that entry
+                         ;; belongs to a nested test.
+                         (let ((own (and (eq status :failed)
+                                         (not uncarried)
+                                         (%zebra-own-failure-text r)))
+                               (earliest nil))
+                           (when own
+                             (do ((tail failures (cdr tail)))
+                                 ((or (null tail) (eq tail before)))
+                               (setf earliest (car tail)))
+                             (when (hash-table-p earliest)
+                               (let ((label (and node-test-sym
+                                                 (princ-to-string node-test-sym))))
+                                 (setf (gethash "reason" earliest)
+                                       (format nil "~:[~*~;~A: ~]~A~%~A"
+                                               (and label
+                                                    (not (equal label
+                                                                (gethash "test_name"
+                                                                         earliest))))
+                                               label
+                                               own
+                                               (gethash "reason" earliest "")))))))))
                      ;; Leaf result: record if failed.
                      (when (eq status :failed)
                        (let* ((expr     (and expr-fn (ignore-errors (funcall expr-fn r))))

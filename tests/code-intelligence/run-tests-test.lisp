@@ -132,6 +132,13 @@ FRAGMENT, or NIL.  Safe on an empty or absent failed_tests."
      (error \"errored-after-checks\"))"
   "A zebra test that passes two checks, then signals an error outside any check.")
 
+(defparameter *carried-probe-source*
+  "(zebra:define-test fails-a-long-check-then-errors
+     (zebra:is equal (make-string 150 :initial-element (code-char 97)) \"short\")
+     (error \"carried-own-error\"))"
+  "A zebra test whose failed check reports past 200 characters, then signals
+an error outside any check.")
+
 ;;; ---------------------------------------------------------------------------
 ;;; File-defined failing test in the scratch package
 ;;;
@@ -1039,6 +1046,48 @@ within 200 characters."
         (true (and (every #'stringp names)
                    (every (lambda (n) (string= n (first names))) names)))))))
 
+(define-test carried-failure-shows-its-own-error-on-every-path
+  "A test that fails a long check and then signals an error reads passed 0,
+failed 1, and one failed_tests entry whose reason and summary carry the
+error text, through the engine, the worker handler called in-process, the
+injected form with its decode, and the Slynk wire.  The check's own reason
+runs past 200 characters, so the error text survives the attached path's
+200-character cut only when it leads.  Attached reasons stay within 200
+characters."
+  (let ((system "dsmr-scratch-carried-probe")
+        (name "FAILS-A-LONG-CHECK-THEN-ERRORS"))
+    (with-zebra-probe-package (pkg "DSMR-SCRATCH-CARRIED-PROBE"
+                                   *carried-probe-source*)
+      (let* ((engine (run-tests system :framework "zebra" :reload nil))
+             (handler (%handle-run-tests
+                        (make-ht "system" system "framework" "zebra"
+                                 "reload" nil "timeout_seconds" 60)
+                        nil))
+             (injected (%decode-run-tests-result
+                        (eval (%build-run-tests-form system "zebra" nil nil 60 nil))
+                        system (get-internal-real-time)))
+             (wire (%attached-probe-envelope system "DSMR-SCRATCH-CARRIED-PROBE"
+                                             *carried-probe-source*)))
+        (dolist (ht (list engine handler injected wire))
+          (let ((entry (%failed-test-named ht name)))
+            (is = 0 (gethash "passed" ht))
+            (is = 1 (gethash "failed" ht))
+            (is = 1 (length (gethash "failed_tests" ht)))
+            (true entry)
+            (true (and entry
+                       (search "carried-own-error" (gethash "reason" entry ""))))
+            (true (search "carried-own-error" (%envelope-summary ht)))))
+        (dolist (ht (list engine handler))
+          (let ((entry (%failed-test-named ht name)))
+            (true (and entry
+                       (search "was expected to be"
+                               (gethash "reason" entry ""))))))
+        (dolist (ht (list injected wire))
+          (let ((entry (%failed-test-named ht name)))
+            (false (gethash "isError" ht))
+            (true (and entry
+                       (<= (length (gethash "reason" entry "")) 200)))))))))
+
 (defun %counted-zebra-probe (case-name source)
   "Run SOURCE's zebra tests in the scratch package DSMR-SCRATCH-COUNT-CASE-NAME,
 check that failed_tests holds as many entries as the failed count, and
@@ -1104,47 +1153,102 @@ plain failed one counts 2."
     (true (%failed-test-named ht "FAILS-A-CHECK"))))
 
 (define-test carried-failures-keep-their-counts
-  "A failure that a check or nested test already records keeps its count.
-An error before any check, an error inside a check, a failed check, a failed
-nested child, and a failed check followed by an error each count 1.  A
-passing test counts 0 with no failed_tests entry."
-  (let ((ht (%counted-zebra-probe
-             "EARLY"
-             "(zebra:define-test errors-before-any-check (error \"early\"))")))
-    (is = 1 (gethash "failed" ht))
-    (true (%failed-test-named ht "ERRORS-BEFORE-ANY-CHECK")))
-  (is = 1 (gethash "failed"
-                   (%counted-zebra-probe
-                    "INSIDE"
-                    "(zebra:define-test errors-inside-a-check
-                       (zebra:true t)
-                       (zebra:true (error \"inside\")))")))
-  (is = 1 (gethash "failed"
-                   (%counted-zebra-probe
-                    "PLAIN"
-                    "(zebra:define-test fails-a-plain-check
-                       (zebra:true t)
-                       (zebra:true nil))")))
-  (is = 1 (gethash "failed"
-                   (%counted-zebra-probe
-                    "NESTED-CHECK"
-                    "(progn
-                       (zebra:define-test carried-parent (zebra:true t))
-                       (zebra:define-test (carried-parent carried-child)
-                         (zebra:true nil)))")))
-  (is = 1 (gethash "failed"
-                   (%counted-zebra-probe
-                    "FAILED-THEN-ERROR"
-                    "(zebra:define-test fails-then-errors
-                       (zebra:true t)
-                       (zebra:true nil)
-                       (error \"after-a-failed-check\"))")))
-  (let ((ht (%counted-zebra-probe
-             "PASSING"
-             "(zebra:define-test passes-only (zebra:true t))")))
-    (is = 1 (gethash "passed" ht))
-    (is = 0 (gethash "failed" ht))
-    (is = 0 (length (gethash "failed_tests" ht)))))
+  "A failure that a check or nested test already records keeps a count of 1.
+The cases are an error before any check, an error inside a check, a failed
+check, a failed nested child, a failed check followed by an error, a failed
+check followed by a time-limit overrun, and a failed nested child under an
+overrunning parent.  The test's own error or overrun text leads the carried
+entry's reason, and an entry named for a nested child names the parent the
+text belongs to.  A carried failure with neither reads as before, and a test
+docstring never appears as an error.  A passing test counts 0 with no
+failed_tests entry."
+  (flet ((reason-of (ht name)
+           (let ((entry (%failed-test-named ht name)))
+             (if entry (gethash "reason" entry "") "")))
+         (own-text-p (reason)
+           (or (search "failed to evaluate properly" reason)
+               (search "limit of" reason))))
+    (let ((ht (%counted-zebra-probe
+               "EARLY"
+               "(zebra:define-test errors-before-any-check (error \"early\"))")))
+      (is = 1 (gethash "failed" ht))
+      (true (%failed-test-named ht "ERRORS-BEFORE-ANY-CHECK")))
+    (is = 1 (gethash "failed"
+                     (%counted-zebra-probe
+                      "INSIDE"
+                      "(zebra:define-test errors-inside-a-check
+                         (zebra:true t)
+                         (zebra:true (error \"inside\")))")))
+    (let ((ht (%counted-zebra-probe
+               "PLAIN"
+               "(zebra:define-test fails-a-plain-check
+                  (zebra:true t)
+                  (zebra:true nil))")))
+      (is = 1 (gethash "failed" ht))
+      (true (%failed-test-named ht "FAILS-A-PLAIN-CHECK"))
+      (false (own-text-p (reason-of ht "FAILS-A-PLAIN-CHECK"))))
+    (let ((ht (%counted-zebra-probe
+               "NESTED-CHECK"
+               "(progn
+                  (zebra:define-test carried-parent (zebra:true t))
+                  (zebra:define-test (carried-parent carried-child)
+                    (zebra:true nil)))")))
+      (is = 1 (gethash "failed" ht))
+      (true (%failed-test-named ht "CARRIED-CHILD"))
+      (false (own-text-p (reason-of ht "CARRIED-CHILD"))))
+    (let* ((ht (%counted-zebra-probe
+                "FAILED-THEN-ERROR"
+                "(zebra:define-test fails-then-errors
+                   (zebra:true t)
+                   (zebra:true nil)
+                   (error \"after-a-failed-check\"))"))
+           (reason (reason-of ht "FAILS-THEN-ERRORS")))
+      (is = 1 (gethash "failed" ht))
+      (is = 1 (length (gethash "failed_tests" ht)))
+      (true (%failed-test-named ht "FAILS-THEN-ERRORS"))
+      (true (search "after-a-failed-check" reason))
+      (true (search "was expected to be" reason))
+      (true (and (search "after-a-failed-check" reason)
+                 (search "was expected to be" reason)
+                 (< (search "after-a-failed-check" reason)
+                    (search "was expected to be" reason)))))
+    (let* ((ht (%counted-zebra-probe
+                "FAILED-THEN-OVERRUN"
+                "(zebra:define-test fails-then-overruns :time-limit 0.01
+                   (zebra:true nil)
+                   (sleep 0.25))"))
+           (reason (reason-of ht "FAILS-THEN-OVERRUNS")))
+      (is = 1 (gethash "failed" ht))
+      (true (search "limit of" reason))
+      (true (search "was expected to be" reason)))
+    (let* ((ht (%counted-zebra-probe
+                "NESTED-OVERRUN"
+                "(progn
+                   (zebra:define-test overrunning-parent :time-limit 0.01
+                     (sleep 0.25))
+                   (zebra:define-test (overrunning-parent overrun-child)
+                     (zebra:true nil)))"))
+           (reason (reason-of ht "OVERRUN-CHILD")))
+      (is = 1 (gethash "failed" ht))
+      (is = 1 (length (gethash "failed_tests" ht)))
+      (true (%failed-test-named ht "OVERRUN-CHILD"))
+      (true (search "limit of" reason))
+      (true (search "OVERRUNNING-PARENT" reason)))
+    (let ((ht (%counted-zebra-probe
+               "DOCUMENTED"
+               "(zebra:define-test documented-failure
+                  \"documented-sentinel-text\"
+                  (zebra:true nil))")))
+      (is = 1 (gethash "failed" ht))
+      (true (%failed-test-named ht "DOCUMENTED-FAILURE"))
+      (false (search "documented-sentinel-text"
+                     (reason-of ht "DOCUMENTED-FAILURE"))))
+    (let ((ht (%counted-zebra-probe
+               "PASSING"
+               "(zebra:define-test passes-only (zebra:true t))")))
+      (is = 1 (gethash "passed" ht))
+      (is = 0 (gethash "failed" ht))
+      (is = 0 (length (gethash "failed_tests" ht))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The system a run is dispatched against, and what a result may claim
