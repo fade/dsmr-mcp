@@ -18,6 +18,7 @@ they live now.
 | `broker-rotate` | Retire a running broker and start a fresh one without losing messages |
 | `rotate-context-window` | Snapshot in-flight state so the next instance resumes cleanly |
 | `scaffold-project` | Generate a new Common Lisp project from this project's skeleton |
+| `executor-routing` | Tells the planner which plans the shell executor takes |
 
 ## Deploying, and the direction that matters
 
