@@ -178,6 +178,32 @@ if [ "$rc" -eq 3 ] && [ "$out" = $'8307533\t5000000\tover' ]; then ok cap-trips-
 out=$(probe cap-check "$PARENT" 2>&1); rc=$?
 if [ "$rc" -eq 0 ] && [ "$out" = $'2409799\t5000000\tunder' ]; then ok cap-quiet-under; else bad cap-quiet-under "rc=$rc: $out"; fi
 
+# A session killed mid-write leaves a torn last line. The recorded execute-phase
+# session, copied with one torn assistant record appended to its orchestrator
+# transcript and another to a subagent's, must still total and trip the cap.
+TORN=$WORK/torn
+mkdir -p "$TORN"
+cp "$EXEC_PARENT" "$TORN/"
+cp -a "${EXEC_PARENT%.jsonl}" "$TORN/"
+TORN_PARENT=$TORN/${EXEC_PARENT##*/}
+TORN_SUBS=("${TORN_PARENT%.jsonl}"/subagents/agent-*.jsonl)
+TORN_SUB=${TORN_SUBS[0]}
+torn_line='{"type":"assistant","message":{"id":"msg_torn","model":"claude-opus-5-5","usage":{"cache_read_input_tokens":9'
+printf '%s' "$torn_line" >> "$TORN_PARENT"
+printf '%s' "$torn_line" >> "$TORN_SUB"
+out=$(probe cap-check "$TORN_PARENT" 2>/dev/null); rc=$?
+if [ "$rc" -eq 3 ] && [ "$out" = $'8307533\t5000000\tover' ]; then ok cap-torn-line-still-trips; else bad cap-torn-line-still-trips "rc=$rc: $out"; fi
+
+# A transcript that cannot be read at all is over the cap, never under it.
+chmod 000 "$TORN_SUB"
+out=$(probe cap-check "$TORN_PARENT" 2>&1); rc=$?
+chmod 600 "$TORN_SUB"
+if [ "$rc" -eq 3 ] && ! grep -q under <<<"$out" && grep -q 'cannot read' <<<"$out"; then
+    ok cap-unreadable-is-over
+else
+    bad cap-unreadable-is-over "rc=$rc: $out"
+fi
+
 printf '\nbus-silent\n'
 
 BUS_ROOT=$WORK/probe-cell/repo
@@ -296,27 +322,32 @@ fi
 
 printf '\nrun-arm orchestrator model\n'
 
-STUBS=$WORK/stubs
-mkdir -p "$STUBS"
-# Stand-in for the bus watcher: refuses for want of an identity, as the real one does.
-printf '#!/bin/sh\nexit 2\n' > "$STUBS/dsmr-bus-watch"
-# Stand-in for claude: records its arguments, then plays back the recorded tracer session.
-cat > "$STUBS/claude" <<STUB
+# mk_stubs DIR SESSION: stand-ins on a PATH directory. The bus watcher refuses
+# for want of an identity, as the real one does; claude records its arguments,
+# then plays back the recorded SESSION transcript and its subagents.
+mk_stubs() {
+    local dir=$1 session=$2
+    mkdir -p "$dir"
+    printf '#!/bin/sh\nexit 2\n' > "$dir/dsmr-bus-watch"
+    cat > "$dir/claude" <<STUB
 #!/bin/bash
 printf '%s\n' "\$*" >> "$WORK/claude-args.txt"
 while [ \$# -gt 0 ]; do
     case "\$1" in --session-id) sid=\$2; shift 2 ;; *) shift ;; esac
 done
 mkdir -p "\$CLAUDE_CONFIG_DIR/projects/-stub"
-cp "$PARENT" "\$CLAUDE_CONFIG_DIR/projects/-stub/\$sid.jsonl"
-cp -a "${PARENT%.jsonl}" "\$CLAUDE_CONFIG_DIR/projects/-stub/\$sid"
+cp "$session" "\$CLAUDE_CONFIG_DIR/projects/-stub/\$sid.jsonl"
+cp -a "${session%.jsonl}" "\$CLAUDE_CONFIG_DIR/projects/-stub/\$sid"
 STUB
-chmod +x "$STUBS/dsmr-bus-watch" "$STUBS/claude"
+    chmod +x "$dir/dsmr-bus-watch" "$dir/claude"
+}
+STUBS=$WORK/stubs
+mk_stubs "$STUBS" "$PARENT"
 
 run_arm() {
     local name=$1; shift
     rm -f "$WORK/claude-args.txt"
-    PATH=$STUBS:$PATH XDG_CACHE_HOME=$WORK/cache-$name CLAUDE_CONFIG_DIR=$WORK/stub-live \
+    PATH=${ARM_STUBS:-$STUBS}:$PATH XDG_CACHE_HOME=$WORK/cache-$name CLAUDE_CONFIG_DIR=$WORK/stub-live \
         probe run-arm "$name" --gsd-core global --evidence "$WORK/ev-$name" \
         --config-dir "$WORK/cfg-$name" --plugin-dir none --only quick:shell "$@" > "$WORK/arm-$name.out" 2>&1
 }
@@ -336,6 +367,15 @@ if [ "$rc" -eq 0 ] && grep -q -- '--model claude-opus-5-5 ' "$WORK/claude-args.t
     ok run-arm-default-model
 else
     bad run-arm-default-model "rc=$rc, model column '$last': $(tail -n 3 "$WORK/arm-dflt.out")"
+fi
+
+# A cell that plays back the torn execute-phase session stops the arm on the cap.
+mk_stubs "$WORK/stubs-torn" "$TORN_PARENT"
+ARM_STUBS=$WORK/stubs-torn run_arm torn; rc=$?
+if [ "$rc" -eq 3 ] && grep -q 'read 8307533 cached tokens, over the 5000000 cap; arm stopped' "$WORK/arm-torn.out"; then
+    ok run-arm-torn-session-stops
+else
+    bad run-arm-torn-session-stops "rc=$rc: $(tail -n 3 "$WORK/arm-torn.out")"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"

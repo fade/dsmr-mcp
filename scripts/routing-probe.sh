@@ -37,7 +37,8 @@
 #       output and models, each counted once per distinct message id.
 #   cap-check TRANSCRIPT
 #       Print cache_read summed over the transcript and its subagent
-#       transcripts, the cap, and over or under; exit 3 when over.
+#       transcripts, the cap, and over or under; exit 3 when over or when a
+#       transcript cannot be read. A torn line is skipped and reported.
 #   check ARM EXPECTED_TSV [--dropped PATH,...]
 #       Compare the arm's report files, in the directory holding EXPECTED_TSV,
 #       with the expected routing; exit 1 on any mismatch. An expected cell of
@@ -766,11 +767,17 @@ cmd_report() {
 # ledger_body FILE...: one TSV row per transcript. Records of one API message
 # repeat its usage once per content block, so each field is summed once per
 # distinct message id. Synthetic records are not API messages and are left out.
+# A line that does not parse (a session killed mid-write) is skipped and
+# counted on stderr; a file that cannot be read is fatal.
 ledger_body() {
-    local f
+    local - f torn
+    set -o pipefail
     for f in "$@"; do
         [ -f "$f" ] || die "no such transcript: $f"
-        jq -rs --arg p "$f" '
+        [ -r "$f" ] || die "cannot read $f"
+        torn=$(jq -nR '[inputs | try (fromjson | 0) catch 1] | add // 0' "$f") || die "cannot read $f"
+        [ "$torn" -eq 0 ] || echo "$PROGNAME: $f: skipped $torn unparsable lines" >&2
+        jq -R 'fromjson? // empty' "$f" | jq -rs --arg p "$f" '
             [ .[] | select(.type == "assistant" and .message.id != null
                            and .message.model != "<synthetic>") ]
             | unique_by(.message.id) as $m
@@ -779,7 +786,7 @@ ledger_body() {
                 sum("cache_creation_input_tokens"), sum("output_tokens"),
                 (($m | map(.message.model // "unknown") | group_by(.)
                   | map("\(.[0]):\(length)") | join(",")) | if . == "" then "-" else . end) ]
-            | map(tostring) | @tsv' "$f" || die "cannot read $f"
+            | map(tostring) | @tsv' || die "cannot read $f"
     done
 }
 
@@ -798,18 +805,28 @@ session_files() {
 }
 
 # session_cache_read TRANSCRIPT: cache-read tokens summed over the session's
-# transcripts, one count per message id.
+# transcripts, one count per message id. Fails, printing nothing, when any
+# transcript cannot be read.
 session_cache_read() {
+    local - total
     local -a files
+    set -o pipefail
     mapfile -t files < <(session_files "$1")
-    ledger_body "${files[@]}" | awk -F'\t' '{ s += $3 } END { print s + 0 }'
+    total=$(ledger_body "${files[@]}" | awk -F'\t' '{ s += $3 } END { print s + 0 }') || return 1
+    [[ $total =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$total"
 }
 
-# cap-check TRANSCRIPT: prints cache_read, the cap and over or under; exits 3 when over.
+# cap-check TRANSCRIPT: prints cache_read, the cap and over or under; exits 3
+# when over, or when the session cannot be totalled (printed as unknown, over).
 cmd_cap_check() {
     [ $# -eq 1 ] || usage_error "cap-check needs one TRANSCRIPT"
     local total
-    total=$(session_cache_read "$1") || exit 1
+    if ! total=$(session_cache_read "$1"); then
+        echo "$PROGNAME: cannot total the cache reads of $1; treated as over the cap" >&2
+        printf 'unknown\t%s\tover\n' "$CACHE_READ_CAP"
+        return 3
+    fi
     if [ "$total" -gt "$CACHE_READ_CAP" ]; then
         printf '%s\t%s\tover\n' "$total" "$CACHE_READ_CAP"
         return 3
@@ -1112,7 +1129,10 @@ cmd_run_arm() {
         for item in "$subdir"/agent-*.jsonl; do [ -f "$item" ] && ledger_files+=("$item"); done
         ledger_body "${ledger_files[@]}" | sed "s/^/$tag\t$path\t/" >> "$ev/tokens.txt"
         total=$(awk -F'\t' 'NR > 1 && $6 ~ /^[0-9]+$/ { s += $6 } END { print s + 0 }' "$ev/report-$tag.tsv")
-        cache_read=$(session_cache_read "$transcript")
+        if ! cache_read=$(session_cache_read "$transcript"); then
+            echo "$PROGNAME: $tag: cannot total its cache reads, so it may be over the $CACHE_READ_CAP cap; arm stopped" >&2
+            return 3
+        fi
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\tclaude exit %s\t%s\n' "$sid" "$path" "$tag" "$transcript" "$start" "$end" "$total" "$rc" "$model" >> "$ev/sessions.tsv"
         echo "$tag: session $sid, subagent tokens $total, cache read $cache_read, claude exit $rc"
         if [ "$cache_read" -gt "$CACHE_READ_CAP" ]; then
