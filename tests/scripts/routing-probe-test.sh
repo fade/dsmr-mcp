@@ -15,17 +15,25 @@
 # recording. States with no recording (a plan hint that differs from the
 # planner's intent, quick-batch, audit-fix) have no case here.
 #
+# A second real session, the patched-mod execute-phase cell (session
+# 1e4c2fc2-cfeb-477c-ac00-3bde132f04f6, run through `routing-probe.sh run-arm`
+# with the mod loaded), is copied the same way under DIR/execute-phase, with
+# the arm's report-execute-phase.tsv, sessions.tsv and expected.tsv under
+# evidence/. It reads 8307533 cache-read tokens over its orchestrator and
+# subagents, the tracer 2409799.
+#
 # Usage: ROUTING_PROBE_RECORDED=DIR tests/scripts/routing-probe-test.sh
-#   DIR holds the recorded session under DIR/tracer.
+#   DIR holds the recorded sessions under DIR/tracer and DIR/execute-phase.
 
 set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PROBE=${ROUTING_PROBE_SCRIPT:-$REPO_ROOT/scripts/routing-probe.sh}
 
-if [ -z "${ROUTING_PROBE_RECORDED:-}" ] || [ ! -d "$ROUTING_PROBE_RECORDED/tracer" ]; then
+if [ -z "${ROUTING_PROBE_RECORDED:-}" ] || [ ! -d "$ROUTING_PROBE_RECORDED/tracer" ] \
+        || [ ! -d "$ROUTING_PROBE_RECORDED/execute-phase" ]; then
     echo "usage: ROUTING_PROBE_RECORDED=DIR $0" >&2
-    echo "  DIR must hold the recorded session under DIR/tracer; no recorded transcripts, no test" >&2
+    echo "  DIR must hold the recorded sessions under DIR/tracer and DIR/execute-phase; no recorded transcripts, no test" >&2
     exit 64
 fi
 
@@ -34,7 +42,9 @@ SID=2e3819fe-8005-4816-8db0-c1d9671529bd
 PARENT=$REC/projects/-tracer/$SID.jsonl
 SUBDIR=$REC/projects/-tracer/$SID/subagents
 EXECUTOR_LOG=$SUBDIR/agent-ab638530750441bc9.jsonl
-for f in "$PARENT" "$EXECUTOR_LOG" "$REC/expected-report.tsv" "$REC/logs/subagent-routing/$SID.jsonl"; do
+EXEC=$(cd "$ROUTING_PROBE_RECORDED/execute-phase" && pwd)
+EXEC_PARENT=$(echo "$EXEC"/projects/*/1e4c2fc2-cfeb-477c-ac00-3bde132f04f6.jsonl)
+for f in "$EXEC_PARENT" "$EXEC/evidence/expected.tsv" "$PARENT" "$EXECUTOR_LOG" "$REC/expected-report.tsv" "$REC/logs/subagent-routing/$SID.jsonl"; do
     [ -f "$f" ] || { echo "recorded fixture missing: $f" >&2; exit 64; }
 done
 
@@ -115,6 +125,51 @@ mk_evidence "$E"
 printf 'quick\tscripts/probe.sh\t-\tlisp-developer\tclaude-opus\n' > "$E/expected.tsv"
 out=$(probe check recorded "$E/expected.tsv" 2>&1); rc=$?
 if [ "$rc" -eq 0 ] && grep -q '^planner-deviation quick scripts/probe.sh' <<<"$out"; then ok check-planner-deviation; else bad check-planner-deviation "rc=$rc: $out"; fi
+
+# Expected cells that did not run: dropped only when the list names their path.
+E=$WORK/ev-dropped
+mk_evidence "$E"
+printf 'quick-batch\tsrc/probe.lisp\t-\tlisp-developer\tclaude-opus\n' >> "$E/expected.tsv"
+out=$(probe check recorded "$E/expected.tsv" --dropped quick-batch 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && grep -q '^dropped-by-ruling quick-batch src/probe.lisp' <<<"$out" \
+        && ! grep -q '^FAIL' <<<"$out"; then
+    ok check-dropped-by-ruling
+else
+    bad check-dropped-by-ruling "rc=$rc: $out"
+fi
+
+out=$(probe check recorded "$E/expected.tsv" --dropped quick 2>&1); rc=$?
+if [ "$rc" -eq 1 ] && grep -q '^FAIL quick-batch src/probe.lisp: no matching executor row' <<<"$out"; then
+    ok check-dropped-other-cell-fails
+else
+    bad check-dropped-other-cell-fails "rc=$rc: $out"
+fi
+
+# A listed cell that did run is judged, not dropped.
+E=$WORK/ev-dropped-ran
+mk_evidence "$E"
+printf 'quick\tscripts/probe.sh\tshell-developer\tlisp-developer\tclaude-sonnet\n' > "$E/expected.tsv"
+out=$(probe check recorded "$E/expected.tsv" --dropped quick 2>&1); rc=$?
+if [ "$rc" -eq 1 ] && grep -q '^FAIL quick scripts/probe.sh' <<<"$out"; then
+    ok check-dropped-ran-cell-judged
+else
+    bad check-dropped-ran-cell-judged "rc=$rc: $out"
+fi
+
+out=$(probe check patched-mod "$EXEC/evidence/expected.tsv" 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && [ "$(grep -c '^ok execute-phase' <<<"$out")" -eq 4 ]; then
+    ok check-recorded-execute-phase
+else
+    bad check-recorded-execute-phase "rc=$rc: $out"
+fi
+
+printf '\ncap-check\n'
+
+out=$(probe cap-check "$EXEC_PARENT" 2>&1); rc=$?
+if [ "$rc" -eq 3 ] && [ "$out" = $'8307533\t5000000\tover' ]; then ok cap-trips-over; else bad cap-trips-over "rc=$rc: $out"; fi
+
+out=$(probe cap-check "$PARENT" 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = $'2409799\t5000000\tunder' ]; then ok cap-quiet-under; else bad cap-quiet-under "rc=$rc: $out"; fi
 
 printf '\nbus-silent\n'
 

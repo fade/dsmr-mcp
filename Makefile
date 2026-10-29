@@ -301,9 +301,9 @@ test-hooks:
 test-restart-session:
 	@bash tests/scripts/restart-session-in-place-test.sh
 
-## test-routing-probe: check the routing probe readers against a recorded session.
+## test-routing-probe: check the routing probe readers against recorded sessions.
 ##
-##   Needs ROUTING_PROBE_RECORDED, the directory holding the recorded session
+##   Needs ROUTING_PROBE_RECORDED, the directory holding the recorded sessions
 ##   (without it the target stops with a usage line). Runs no live session and
 ##   never reads the live bus. Every planted mismatch is an edit of the recording
 ##   and must make check exit 1.

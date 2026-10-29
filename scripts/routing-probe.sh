@@ -23,9 +23,14 @@
 #   ledger-row TRANSCRIPT...
 #       Print one TSV row per transcript: path, turns, cache_read, cache_write,
 #       output and models, each counted once per distinct message id.
-#   check ARM EXPECTED_TSV
+#   cap-check TRANSCRIPT
+#       Print cache_read summed over the transcript and its subagent
+#       transcripts, the cap, and over or under; exit 3 when over.
+#   check ARM EXPECTED_TSV [--dropped PATH,...]
 #       Compare the arm's report files, in the directory holding EXPECTED_TSV,
-#       with the expected routing; exit 1 on any mismatch.
+#       with the expected routing; exit 1 on any mismatch. An expected cell of
+#       a listed PATH that did not run is reported dropped-by-ruling and does
+#       not fail.
 #   bus-silent ROOT
 #       Exit 1 and list the files when the bus state mentions ROOT.
 #   replay RECORDINGS_DIR [--mod DIR]
@@ -53,8 +58,9 @@ LOG_DIR=logs/subagent-routing
 PROBE_MODEL=claude-opus-5-5
 LEADER_MODEL=claude-sonnet-5-5
 PROBE_TIMEOUT=1800
-# A session whose subagents sum past this many tokens stops the arm.
-TOKEN_CAP=400000
+# A session whose orchestrator and subagent transcripts sum past this many
+# cache-read tokens (ledger-row accounting) stops the arm. Never raised.
+CACHE_READ_CAP=5000000
 PROBE_FILES=(scripts/probe.sh src/probe.lisp Makefile docs/probe.md)
 SHAPES=(shell lisp mixed docs)
 # Agent types whose rows are routed executors; the rest must run as requested.
@@ -73,7 +79,8 @@ usage: $PROGNAME make-repo DIR --gsd-core global|local-pristine [--specialized t
                  [--only PATH[:SHAPE],...] [--env KEY=VAL]...
        $PROGNAME report TRANSCRIPT
        $PROGNAME ledger-row TRANSCRIPT...
-       $PROGNAME check ARM EXPECTED_TSV
+       $PROGNAME cap-check TRANSCRIPT
+       $PROGNAME check ARM EXPECTED_TSV [--dropped PATH,...]
        $PROGNAME bus-silent ROOT
        $PROGNAME replay RECORDINGS_DIR [--mod DIR]
        $PROGNAME record-history --out DIR [--types LIST] [--max-per-session N] TRANSCRIPT...
@@ -649,6 +656,34 @@ cmd_ledger_row() {
     ledger_body "$@"
 }
 
+# session_files TRANSCRIPT: the transcript and every subagent transcript of its session.
+session_files() {
+    local t=$1 f
+    printf '%s\n' "$t"
+    for f in "${t%.jsonl}"/subagents/agent-*.jsonl; do [ -f "$f" ] && printf '%s\n' "$f"; done
+    return 0
+}
+
+# session_cache_read TRANSCRIPT: cache-read tokens summed over the session's
+# transcripts, one count per message id.
+session_cache_read() {
+    local -a files
+    mapfile -t files < <(session_files "$1")
+    ledger_body "${files[@]}" | awk -F'\t' '{ s += $3 } END { print s + 0 }'
+}
+
+# cap-check TRANSCRIPT: prints cache_read, the cap and over or under; exits 3 when over.
+cmd_cap_check() {
+    [ $# -eq 1 ] || usage_error "cap-check needs one TRANSCRIPT"
+    local total
+    total=$(session_cache_read "$1") || exit 1
+    if [ "$total" -gt "$CACHE_READ_CAP" ]; then
+        printf '%s\t%s\tover\n' "$total" "$CACHE_READ_CAP"
+        return 3
+    fi
+    printf '%s\t%s\tunder\n' "$total" "$CACHE_READ_CAP"
+}
+
 # --- check -------------------------------------------------------------------
 
 # norm_target LIST: a + joined target with its items sorted, so the order a
@@ -681,8 +716,20 @@ model_matches_alias() {
 }
 
 cmd_check() {
-    [ $# -eq 2 ] || usage_error "check needs ARM and EXPECTED_TSV"
-    local arm=$1 expected=$2
+    local arm="" expected="" dropped=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dropped) [ $# -ge 2 ] || usage_error "--dropped needs a value"; dropped=$2; shift 2 ;;
+            -*) usage_error "unknown option $1" ;;
+            *)
+                if [ -z "$arm" ]; then arm=$1
+                elif [ -z "$expected" ]; then expected=$1
+                else usage_error "check takes ARM and EXPECTED_TSV only"
+                fi
+                shift ;;
+        esac
+    done
+    [ -n "$expected" ] || usage_error "check needs ARM and EXPECTED_TSV"
     [[ $arm =~ ^[a-z0-9][a-z0-9-]*$ ]] || usage_error "ARM is a lowercase name"
     [ -f "$expected" ] || die "no such file: $expected"
     local ev
@@ -752,6 +799,10 @@ cmd_check() {
 
     local want_type want_family verdict reason
     for ((i = 0; i < n; i++)); do
+        if [ "${hits[i]}" -eq 0 ] && [[ ",$dropped," == *",${e_path[i]},"* ]]; then
+            echo "dropped-by-ruling ${e_path[i]} ${e_target[i]}"
+            continue
+        fi
         if [ "${hits[i]}" -eq 0 ]; then
             echo "FAIL ${e_path[i]} ${e_target[i]}: no matching executor row"
             fail=1
@@ -872,7 +923,7 @@ cmd_run_arm() {
     local -a only_list=() cells=(execute-phase: quick:shell quick:lisp quick:mixed quick:docs quick-batch: audit-fix: execute-phase-leader:)
     IFS=, read -ra only_list <<<"$only"
     local -A built=()
-    local cell path shape tag repo sid prompt model transcript start end rc total subdir item
+    local cell path shape tag repo sid prompt model transcript start end rc total cache_read subdir item
     local -a ledger_files
     for cell in "${cells[@]}"; do
         path=${cell%%:*}; shape=${cell#*:}
@@ -926,10 +977,11 @@ cmd_run_arm() {
         for item in "$subdir"/agent-*.jsonl; do [ -f "$item" ] && ledger_files+=("$item"); done
         ledger_body "${ledger_files[@]}" | sed "s/^/$tag\t$path\t/" >> "$ev/tokens.txt"
         total=$(awk -F'\t' 'NR > 1 && $6 ~ /^[0-9]+$/ { s += $6 } END { print s + 0 }' "$ev/report-$tag.tsv")
+        cache_read=$(session_cache_read "$transcript")
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\tclaude exit %s\n' "$sid" "$path" "$tag" "$transcript" "$start" "$end" "$total" "$rc" >> "$ev/sessions.tsv"
-        echo "$tag: session $sid, subagent tokens $total, claude exit $rc"
-        if [ "$total" -gt "$TOKEN_CAP" ]; then
-            echo "$PROGNAME: $tag used $total subagent tokens, over the $TOKEN_CAP cap; arm stopped" >&2
+        echo "$tag: session $sid, subagent tokens $total, cache read $cache_read, claude exit $rc"
+        if [ "$cache_read" -gt "$CACHE_READ_CAP" ]; then
+            echo "$PROGNAME: $tag read $cache_read cached tokens, over the $CACHE_READ_CAP cap; arm stopped" >&2
             return 3
         fi
     done
@@ -1155,6 +1207,7 @@ case "$sub" in
     run-arm) cmd_run_arm "$@" ;;
     report) cmd_report "$@" ;;
     ledger-row) cmd_ledger_row "$@" ;;
+    cap-check) cmd_cap_check "$@" ;;
     check) cmd_check "$@" ;;
     bus-silent) cmd_bus_silent "$@" ;;
     replay) cmd_replay "$@" ;;
