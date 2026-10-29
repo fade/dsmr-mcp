@@ -59,9 +59,9 @@ prompt just before its own restart, and --dry-run checks them all. In a real run
 the first refusal or failure stops it, and later targets are reported not-run.
 
 A session is refused, with nothing typed, when it is the calling window, shows
-"esc to interrupt", has background agents or a task panel open, shows no Claude
-Code prompt frame, or holds typed text (dim suggestions do not count). The only
-keystrokes ever sent are a command and Enter.
+a running-turn spinner, has background agents or a task panel open, shows no Claude
+Code prompt frame, or holds typed text (dim suggestions do not count). Background
+shells are not checked. The only keystrokes ever sent are a command and Enter.
 
 Standard output, one line per target:
   NAME SOCKET WINDOW old=ID new=ID VERDICT
@@ -192,6 +192,7 @@ wait_for() {
 
 PROMPT_GLYPH=$'\xe2\x9d\xaf'
 RULE_CH=$'\xe2\x94\x80'
+ELLIPSIS=$'\xe2\x80\xa6'
 NBSP=$'\xc2\xa0'
 
 # Remove terminal escape sequences from stdin.
@@ -255,12 +256,15 @@ window_idle() {
         IDLE_WHY="no Claude Code prompt frame on screen"
         return 1
     fi
-    # The three non-blank lines above the frame, nearest first.
-    for ((j = a - 1; j >= 0 && ${#ctx[@]} < 3; j--)); do
+    # The twelve non-blank lines above the frame, nearest first.
+    for ((j = a - 1; j >= 0 && ${#ctx[@]} < 12; j--)); do
         [[ -n ${pl[j]//[[:space:]]/} ]] && ctx+=("${pl[j]}")
     done
-    for line in "${ctx[@]}" "${pl[@]:b+1}"; do
-        if [[ $line == *"esc to interrupt"* ]]; then
+    # A running turn draws a spinner line: a glyph, a word ending in an
+    # ellipsis, then a parenthesised timer. A todo list can sit between it and
+    # the frame, and a spinner-shaped line in the conversation refuses too.
+    for line in "${ctx[@]}"; do
+        if [[ $line =~ ^[[:space:]]*[^[:space:][:alnum:]]{1,4}[[:space:]]+[^\(\)]{1,60}${ELLIPSIS}[[:space:]]+\( ]]; then
             IDLE_WHY="a turn is running"
             return 1
         fi

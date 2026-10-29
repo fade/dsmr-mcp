@@ -40,7 +40,15 @@ for parking. A session that is busy or holds typed input is refused, never inter
 Always run with `--dry-run` first. It resolves every target, runs the idle test on each, and
 types nothing. A session counts as idle only when Claude Code's own prompt frame is on screen
 with nothing typed in it (a dim suggested prompt is not typed input), no turn is running, and
-no background agents or task panel are open. Anything doubtful is refused.
+no background agents or task panel are open. Anything doubtful is refused. A running turn is
+recognized by its spinner line (a glyph, a word ending in an ellipsis, then a timer in
+parentheses) above the prompt frame.
+
+Background shells are not checked. The status line counts them (`1 shell`, `2 shells`), but an
+idle session with only its bus listener shows the same counts as one running a build, so no
+count separates the two. A shell survives `/clear`, and its completion notice then lands in a
+conversation that never asked for it. Park the target, or make sure nothing long is running in
+it, before you restart it.
 
 A restart takes minutes: each target waits for a new transcript, an idle prompt, and the
 follow-up's answer, each bounded by `--timeout`. Run the script in the background

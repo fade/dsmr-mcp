@@ -43,7 +43,6 @@ export PATH=$WORK/bin:$PATH
 
 GLYPH=$'\xe2\x9d\xaf'
 NBSP=$'\xc2\xa0'
-RULE=$'\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80'
 
 cat > "$WORK/bin/kitten" <<'STUB'
 #!/usr/bin/env bash
@@ -129,8 +128,9 @@ reset() {
     screen_with_busy_line > "$FX/busy-screen"
 }
 
-# Screens come from real captures (get-text --ansi on live Claude Code and zsh
-# windows). Variants are cut from those captures; none is hand-drawn.
+# Screens come from real captures: get-text --ansi on live Claude Code and zsh
+# windows, and start-sisters session recordings replayed through a terminal
+# emulator. Variants are cut from those captures; none is hand-drawn.
 FIXTURES=$REPO_ROOT/tests/scripts/fixtures
 PROMPT_EMPTY=$GLYPH$NBSP
 
@@ -142,26 +142,21 @@ screen_typed_text() {
     printf '%s\n' "${c/"$PROMPT_EMPTY"$'\n'/"$PROMPT_EMPTY$1"$'\n'}"
 }
 
-# The idle capture with a spinner line above the prompt frame.
+# A mid-turn capture, rendered from a recorded session: spinner line, empty
+# prompt, no panel.
 screen_with_busy_line() {
-    local c rule
-    c=$(<"$FIXTURES/claude-idle.ansi")
-    rule=$'\n\e[m\e[38:2:136:136:136m'$RULE
-    printf '%s\n' "${c/"$rule"/$'\n\e[m* Working (12s, esc to interrupt)\n'$rule}"
+    cat "$FIXTURES/claude-turn-running.ansi"
 }
 
-# The idle capture with a line above the frame reporting agents still running.
+# The leader capture cut to the waiting-for-agents line and the frame, with the
+# panel below the status lines removed.
 screen_with_waiting_line() {
-    local c rule
-    c=$(<"$FIXTURES/claude-idle.ansi")
-    rule=$'\n\e[m\e[38:2:136:136:136m'$RULE
-    printf '%s\n' "${c/"$rule"/$'\n\e[mWaiting for 2 background agents to finish\n'$rule}"
+    head -n 7 "$FIXTURES/claude-agents-running.ansi"
 }
 
-# The idle capture with a task list under the status lines.
+# The same capture without its waiting-for-agents line: a panel and nothing else.
 screen_with_panel() {
-    cat "$FIXTURES/claude-idle.ansi"
-    printf '%s\n' '  main' '  shell-developer  Execute: a task' '  lisp-developer   Execute: another'
+    tail -n +2 "$FIXTURES/claude-agents-running.ansi"
 }
 
 mksock() {
@@ -287,8 +282,16 @@ try "[self-foreign-is-self] same window id on another socket is not the caller" 
 one_sister
 screen_busy A 16
 run "${FAST[@]}" zebra
-try "[busy-esc] running turn refused, nothing typed" "rc=$RC err=$ERR out=$OUT" \
-    test "$RC" = 1 -a -z "$(sendlog)"
+try "[busy-spinner] mid-turn with an empty prompt refused, nothing typed" "rc=$RC err=$ERR out=$OUT" \
+    test "$RC" = 1 -a -z "$(sendlog)" -a -n "$(grep 'a turn is running' <<<"$OUT")"
+
+for f in claude-turn-running-thinking.ansi claude-turn-running-hooks.ansi; do
+    one_sister
+    screen_from A 16 "$f"
+    run "${FAST[@]}" zebra
+    try "[busy-spinner] other glyph and wording ($f) refused" "rc=$RC err=$ERR out=$OUT" \
+        test "$RC" = 1 -a -z "$(sendlog)" -a -n "$(grep 'a turn is running' <<<"$OUT")"
+done
 
 one_sister
 screen_typed A 16 "half typed"
