@@ -7,8 +7,10 @@
 // as <tool_use_id>.json for replay.
 //
 // The spawn hook never denies. A spawn the rules cannot place, or one whose
-// hook fails, proceeds exactly as requested; the log line says why, and the
-// first such spawn of each kind in a session raises a toast.
+// hook fails, proceeds exactly as requested; so does a changed spawn the
+// engine refuses, run once more as requested (action `fallback`). The log
+// line says why, and the first such spawn of each kind in a session raises a
+// toast.
 
 import type { EngineInterface, Register } from 'claude-code'
 import { decide, ioDirs, type Action, type Decision, type RouteIo } from './route'
@@ -18,12 +20,13 @@ const LOG_DIR = 'logs/subagent-routing'
 const SAFE_NAME = /^[A-Za-z0-9_-]+$/
 const ERROR_TEXT_LIMIT = 200
 /** Actions that raise a toast, once per session each. */
-const LOUD: ReadonlySet<string> = new Set(['cannot-decide', 'error'])
-const COUNTED = ['rewrote', 'cleared-model', 'unchanged', 'cannot-decide', 'error'] as const
+const LOUD: ReadonlySet<string> = new Set(['cannot-decide', 'fallback', 'error'])
+const COUNTED = ['rewrote', 'cleared-model', 'unchanged', 'cannot-decide', 'fallback', 'error'] as const
 /** When this module was registered; the status line falls back to it. */
 const MODULE_LOADED_AT = new Date().toISOString()
 
-type LogAction = Action | 'error'
+/** `fallback`: the engine refused the changed spawn, so it ran as requested. */
+type LogAction = Action | 'fallback' | 'error'
 type Agent = { type: string; model: string | null }
 
 /** One engine call the decision depended on, with what it answered. */
@@ -135,7 +138,12 @@ async function record($: EngineInterface, configDir: string, line: SpawnLogLine)
   if (!LOUD.has(line.action)) return
   if (logLines(before).some(l => l.action === line.action)) return
   const asRequested = line.set.type === line.requested.type && line.set.model === line.requested.model
-  const what = asRequested ? 'left a spawn as requested' : `passed a spawn on as ${line.set.type}, then failed`
+  const what =
+    line.action === 'fallback'
+      ? 'ran a spawn as requested after the engine refused its change'
+      : asRequested
+        ? 'left a spawn as requested'
+        : `passed a spawn on as ${line.set.type}, then failed`
   try {
     $.ui.toast(`subagent-routing ${what}: ${line.reason}. Log: ${path}`)
   } catch {
@@ -149,11 +157,11 @@ export function statusText(path: string, text: string): string {
   const loaded = lines.filter(l => l.event === 'loaded').at(-1)?.ts
   const spawns = lines.filter(l => typeof l.toolUseId === 'string')
   const count = (action: string): number => spawns.filter(l => l.action === action).length
-  const [rewrote, cleared, unchanged, undecided, failed] = COUNTED.map(count)
+  const [rewrote, cleared, unchanged, undecided, fellBack, failed] = COUNTED.map(count)
   return (
     `subagent-routing ${VERSION} loaded ${typeof loaded === 'string' ? loaded : MODULE_LOADED_AT}; log ${path}; ` +
     `this session: ${spawns.length} spawns, ${rewrote} rewrote, ${cleared} cleared-model, ` +
-    `${unchanged} unchanged, ${undecided} cannot-decide, ${failed} error`
+    `${unchanged} unchanged, ${undecided} cannot-decide, ${fellBack} fallback, ${failed} error`
   )
 }
 
@@ -228,7 +236,17 @@ export const register: Register = on => {
     const changes = decision.action === 'rewrote' || decision.action === 'cleared-model'
     const down = changes ? { ...e, subagentType: decision.subagentType, model: decision.model } : e
     passedDown.set(e.tool_use_id, { type: down.subagentType, model: down.model ?? null })
-    const result = await next(down)
+    let result = await next(down)
+    let refused: string | undefined
+    if (changes && result.deny !== undefined) {
+      refused = result.deny
+      passedDown.set(e.tool_use_id, { type: e.subagentType, model: e.model ?? null })
+      result = await next(e)
+    }
+    const set: Agent =
+      refused === undefined
+        ? { type: decision.subagentType, model: decision.model ?? null }
+        : { type: e.subagentType, model: e.model ?? null }
 
     const session = await $.session.id()
     tape.push({ op: 'session.id', arg: '', result: session })
@@ -240,11 +258,14 @@ export const register: Register = on => {
       shape: decision.shape,
       plan: decision.planPath,
       requested: { type: e.subagentType, model: e.model ?? null },
-      set: { type: decision.subagentType, model: decision.model ?? null },
+      set,
       resolvedModel: result.deny === undefined ? result.model : null,
       agentId: result.deny === undefined ? (result.agentId ?? null) : null,
-      action: failure === undefined ? decision.action : 'error',
-      reason: decision.reason,
+      action: failure !== undefined ? 'error' : refused !== undefined ? 'fallback' : decision.action,
+      reason:
+        refused === undefined
+          ? decision.reason
+          : `${decision.reason}; the engine refused ${decision.subagentType} (${clip(refused)}), so it ran as requested`,
       version: VERSION,
       ...(failure === undefined ? {} : { error: failure }),
     }

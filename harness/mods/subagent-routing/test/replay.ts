@@ -174,5 +174,36 @@ export function replay(recordings: readonly Recording[]): void {
       expect(mine[0]?.set).toEqual({ type: down?.subagentType, model: down?.model ?? null })
       expect(mine[0]?.error).toBe(undefined)
     })
+
+    if (rec.expected.action !== 'rewrote' && rec.expected.action !== 'cleared-model') continue
+
+    test(`${label}: a changed spawn the engine refuses runs once more as requested`, async ($, on) => {
+      const tape = new Tape(rec.tape, label)
+      const log: LogFile = { text: '' }
+      const beneath: AgentSpawnInput[] = []
+      standIns(on, tape, log, beneath, (e, n) =>
+        n === 1 ? { deny: `Agent type ${e.subagentType} not found` } : { model: e.model ?? 'definition', agentId: 'replay' },
+      )
+      const toasts: string[] = []
+      on('ui.toast', (_$, e) => {
+        toasts.push(String(e.text))
+        return { value: undefined }
+      })
+
+      const result = await $.agent.spawn(spawnInput(rec))
+
+      const requested = { type: rec.input.subagentType, model: rec.input.model ?? null }
+      expect(result.deny).toBe(undefined)
+      expect(beneath.map(e => ({ type: e.subagentType, model: e.model ?? null }))).toEqual([
+        { type: rec.expected.subagentType, model: rec.expected.model },
+        requested,
+      ])
+      const mine = logLinesFor(log.text, rec.input.tool_use_id)
+      expect(mine.length).toBe(1)
+      expect(mine[0]?.action).toBe('fallback')
+      expect(mine[0]?.set).toEqual(requested)
+      expect(mine[0]?.error).toBe(undefined)
+      expect(toasts.length).toBe(1)
+    })
   }
 }
