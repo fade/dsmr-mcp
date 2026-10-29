@@ -1,6 +1,6 @@
 ---
 name: executor-routing
-description: The rule a GSD planner applies when choosing which executor runs a plan; it sets `agent_hint: shell-developer` on a plan whose every modified file is shell, Makefile, CI or git-hook, and is read by gsd-planner through agent_skills rather than invoked directly.
+description: The rule a GSD planner applies when choosing which executor runs a plan; it sets `agent_hint: shell-developer` on a plan whose every modified file is shell, Makefile, CI or git-hook, and is read by gsd-planner through agent_skills rather than invoked directly. Also carries two rules for every plan, hinted or not - tests of another program's output use recorded output, and a plan that builds something ends before installing it outside the repository.
 ---
 
 # Executor routing
@@ -45,6 +45,23 @@ explicitly, and never write any name other than `shell-developer`.
 - Every `<verify>` command in a hinted plan must be shell: make targets, `shellcheck`, `bash -n`,
   `sh -n`, a script's own self-test. shell-developer cannot drive a Lisp image, so a verify step
   that needs one makes the plan unroutable; leave the hint off.
+
+## Every plan, hinted or not
+
+1. **Tests of another program's output use recorded output.** When the change reads output it does
+   not produce (a terminal screen, a CLI's text, a log, a JSON reply, a transcript), the plan's test
+   task names where real captures come from and requires every state the code must tell apart.
+   Never write a fixture into the plan from memory. On 2026-10-29 a plan specified a busy screen
+   containing "esc to interrupt"; the Claude Code build in use never draws it, and the tests passed
+   against a guard that could not fire.
+2. **A plan that builds something ends at build, test and commit: no install task outside the
+   repository**, even when the brief asks for one. Every deploy target reaches every session on the
+   host. Note the deferred install in the plan; the leader deploys after the code review passes. On
+   2026-10-29 a brief asked for deployment, the plan installed a session-restart script before
+   review, and it stayed installed, with four blockers, until the review withdrew it.
+
+Both rules are also in global `~/.claude/CLAUDE.md`, so the executor reads them whichever agent
+this skill routes the plan to.
 
 ## Why
 
