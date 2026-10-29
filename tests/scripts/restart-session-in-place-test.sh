@@ -265,6 +265,153 @@ new=$(newfile_stem A 7 2>/dev/null || echo none)
 try "[slug-map] underscore and dot map to hyphens in the transcript directory" "rc=$RC err=$ERR out=$OUT" \
     test "$RC" = 0 -a "$new" != none -a "$OUT" = "sys_scripts.d unix:$SD/kitty-A 7 old=old-session new=$new ok"
 
+# Three sisters on one socket: alpha, beta, gamma.
+three() {
+    reset
+    mksock A
+    mkls A "alpha|11|5000010|/h/lisp/alpha|claude" "beta|12|5000020|/h/lisp/beta|claude" "gamma|13|5000030|/h/lisp/gamma|claude"
+    seed A 11 -h-lisp-alpha
+    seed A 12 -h-lisp-beta
+    seed A 13 -h-lisp-gamma
+}
+
+note "options and refusals"
+
+one_sister
+run "${FAST[@]}" --then /leader zebra
+try "[then-leader] follow-up replaced" "rc=$RC err=$ERR log=$(sendlog)" \
+    test "$RC" = 0
+try "[then-leader] log" "$(sendlog)" log_is 'kitty-A 16 0 /clear\r' 'kitty-A 16 0 /leader\r'
+
+one_sister
+run "${FAST[@]}" --then '' zebra
+new=$(newfile_stem A 16 2>/dev/null || echo none)
+try "[then-empty] clear only, new transcript still reported" "rc=$RC out=$OUT log=$(sendlog)" \
+    test "$RC" = 0 -a "$new" != none -a "$OUT" = "zebra unix:$SD/kitty-A 16 old=old-session new=$new ok" \
+    -a "$(sendlog)" = 'kitty-A 16 0 /clear\r'
+
+one_sister
+run "${FAST[@]}" --then worker zebra
+rc1=$RC log1=$(sendlog)
+run "${FAST[@]}" --then '/a\b' zebra
+try "[then-invalid] no leading slash and a backslash both exit 2, nothing sent" "rc=$rc1/$RC log=$log1$(sendlog)" \
+    test "$rc1" = 2 -a "$RC" = 2 -a -z "$log1$(sendlog)"
+
+one_sister
+touch "$FX/notranscript/kitty-A-16"
+run --poll 0.05 --timeout 1 zebra
+try "[no-new-transcript] failed at the stage, follow-up never sent" "rc=$RC out=$OUT log=$(sendlog)" \
+    test "$RC" = 1 -a "$(sendlog)" = 'kitty-A 16 0 /clear\r' -a -n "$(grep 'failed: no new transcript' <<<"$OUT")"
+
+one_sister
+echo 100000 > "$FX/afterclear/kitty-A-16"
+run --poll 0.05 --timeout 1 zebra
+try "[timeout-idle] failed at the stage, follow-up never sent" "rc=$RC out=$OUT log=$(sendlog)" \
+    test "$RC" = 1 -a "$(sendlog)" = 'kitty-A 16 0 /clear\r' -a -n "$(grep 'failed: prompt not idle' <<<"$OUT")"
+
+one_sister
+run "${FAST[@]}" --expect FIXTURE-INSTRUCTIONS-TEXT zebra
+try "[expect-found] pattern present in the new transcript" "rc=$RC out=$OUT" test "$RC" = 0
+
+one_sister
+printf 'NOT-IN-TRANSCRIPT\n' > "$CLAUDE_CONFIG_DIR/CLAUDE.md"
+run "${FAST[@]}" --expect NOT-IN-TRANSCRIPT zebra
+try "[expect-missing] a fresh file elsewhere does not satisfy the check" "rc=$RC out=$OUT" \
+    test "$RC" = 1 -a -n "$(grep 'failed: expect pattern not found' <<<"$OUT")"
+
+one_sister
+run "${FAST[@]}" --expect X --then '' zebra
+try "[expect-clear-only] exit 2, nothing sent" "rc=$RC err=$ERR" test "$RC" = 2 -a -z "$(sendlog)"
+
+reset
+mksock A
+mkls A "zebra|16|5000010|/h/lisp/other|claude"
+seed A 16 -h-lisp-other
+run "${FAST[@]}" zebra
+try "[zero-candidates] refused with the candidate listed, nothing sent" "rc=$RC err=$ERR out=$OUT" \
+    test "$RC" = 1 -a -z "$(sendlog)" \
+    -a "$(grep -c "candidate: unix:$SD/kitty-A window=16 tab=zebra cwd=/h/lisp/other claude=yes" <<<"$ERR")" = 1 \
+    -a -n "$(grep 'refused: no matching session' <<<"$OUT")"
+
+reset
+mksock A
+mksock B
+mkls A "zebra|16|5000010|/h/lisp/zebra|claude"
+mkls B "zebra|17|5000020|/h/lisp/zebra|claude"
+seed A 16 -h-lisp-zebra
+seed B 17 -h-lisp-zebra
+run "${FAST[@]}" zebra
+try "[several-candidates] ambiguous name refused with both listed, nothing sent" "rc=$RC err=$ERR out=$OUT" \
+    test "$RC" = 1 -a -z "$(sendlog)" \
+    -a "$(grep -c 'candidate:' <<<"$ERR")" = 2 \
+    -a -n "$(grep 'refused: 2 matching sessions' <<<"$OUT")"
+
+reset
+mksock A
+mksock B
+mkdir -p "$WORK/d1/zebra" "$WORK/d2/zebra"
+p1=$(cd -P "$WORK/d1/zebra" && pwd -P)
+p2=$(cd -P "$WORK/d2/zebra" && pwd -P)
+mkls A "zebra|16|5000010|$p1|claude"
+mkls B "zebra|17|5000020|$p2|claude"
+seed A 16 "$(printf '%s' "$p1" | tr -c 'A-Za-z0-9' '-')"
+seed B 17 "$(printf '%s' "$p2" | tr -c 'A-Za-z0-9' '-')"
+run "${FAST[@]}" "$p1"
+try "[path-target] directory picks the one window of two same-named tabs" "rc=$RC err=$ERR out=$OUT log=$(sendlog)" \
+    test "$RC" = 0 -a -n "$(sendlog)" -a -z "$(grep '^kitty-B' "$FX/sendlog")"
+
+three
+screen_text A 12 "${GLYPH}${NBSP}half typed"
+run "${FAST[@]}" alpha beta gamma
+try "[multi-sequential] stops at the first refusal, later target not-run" "rc=$RC out=$OUT log=$(sendlog)" \
+    test "$RC" = 1 -a "$(sed -n 1p <<<"$OUT" | awk '{print $NF}')" = ok \
+    -a -n "$(sed -n 2p <<<"$OUT" | grep '^beta .* refused: ')" \
+    -a "$(sed -n 3p <<<"$OUT")" = "gamma unix:$SD/kitty-A 13 old=- new=- not-run" \
+    -a "$(wc -l <<<"$OUT")" = 3 \
+    -a "$(sendlog)" = "$(printf '%s\n' 'kitty-A 11 0 /clear\r' 'kitty-A 11 0 /worker\r')"
+
+three
+run "${FAST[@]}" alpha beta ghost
+try "[multi-resolve-first] one unresolved target types nothing anywhere" "rc=$RC out=$OUT log=$(sendlog)" \
+    test "$RC" = 1 -a -z "$(sendlog)" \
+    -a -n "$(sed -n 1p <<<"$OUT" | grep ' not-run$')" \
+    -a -n "$(sed -n 2p <<<"$OUT" | grep ' not-run$')" \
+    -a -n "$(sed -n 3p <<<"$OUT" | grep '^ghost .* refused: no matching session$')"
+
+three
+run "${FAST[@]}" --dry-run alpha beta
+try "[dry-run] every target would restart, nothing typed" "rc=$RC out=$OUT" \
+    test "$RC" = 0 -a -z "$(sendlog)" -a "$(grep -c 'would-restart$' <<<"$OUT")" = 2 \
+    -a -n "$(grep '^alpha .* old=old-session new=- would-restart$' <<<"$OUT")"
+
+three
+screen_text A 12 "${GLYPH}${NBSP}half typed"
+run "${FAST[@]}" -n alpha beta
+try "[dry-run-busy] the busy target is refused, nothing typed" "rc=$RC out=$OUT" \
+    test "$RC" = 1 -a -z "$(sendlog)" -a -n "$(grep '^beta .* refused: ' <<<"$OUT")" \
+    -a -n "$(grep '^alpha .* would-restart$' <<<"$OUT")"
+
+reset
+run "${FAST[@]}" zebra
+try "[unsupported-no-socket] no kitty socket exits 3" "rc=$RC err=$ERR" \
+    test "$RC" = 3 -a -n "$(grep 'unsupported' <<<"$ERR" | grep kitty)"
+
+one_sister
+DSMR_KITTEN=$WORK/no-such-kitten run "${FAST[@]}" zebra
+try "[unsupported-no-kitten] missing kitten exits 3, nothing sent" "rc=$RC err=$ERR" \
+    test "$RC" = 3 -a -n "$(grep unsupported <<<"$ERR")" -a -z "$(sendlog)"
+
+one_sister
+mksock B
+run "${FAST[@]}" zebra
+try "[unreachable-socket] a dead socket is noted and skipped" "rc=$RC err=$ERR out=$OUT" \
+    test "$RC" = 0 -a -n "$(grep 'skipping.*kitty-B' <<<"$ERR")"
+
+one_sister
+run "${FAST[@]}" zebra zebra
+try "[duplicate-target] same target twice exits 2, nothing sent" "rc=$RC err=$ERR" \
+    test "$RC" = 2 -a -z "$(sendlog)"
+
 note "start-sisters socket discovery"
 
 reset

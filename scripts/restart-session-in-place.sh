@@ -24,12 +24,59 @@ KITTEN=${DSMR_KITTEN:-kitten}
 TIMEOUT=120
 POLL=1
 THEN_CMD=/worker
+EXPECT=""
+EXPECT_SET=0
+DRY_RUN=0
 
 usage() {
     cat <<EOF
-Usage: $PROGNAME [--timeout SECONDS] [--poll SECONDS] NAME
+Usage: $PROGNAME [options] TARGET...
 
-Restart the Claude Code session in the kitty tab titled NAME.
+Restart the Claude Code session running in each named kitty tab: type /clear,
+wait for a new transcript and an idle prompt, then type a follow-up command and
+wait for its first turn. No new window is opened.
+
+A TARGET is a tab title NAME, or a path. A name matches the one window whose tab
+title is NAME and whose claude process runs in a directory called NAME, across
+every kitty instance. A path (anything holding a slash) matches the window whose
+claude process runs in exactly that directory and whose tab is titled with its
+last component; use it when a name is ambiguous.
+
+Options:
+  --then CMD         follow-up command, default /worker. Must start with "/" and
+                     hold no backslash or control character. '' clears only.
+  --expect PATTERN   after the follow-up's first turn, require PATTERN (a fixed
+                     string) in the new transcript, else fail. Not allowed with
+                     --then ''. File times are never consulted.
+  --timeout SECONDS  bound on each wait, default 120
+  --poll SECONDS     interval between checks, default 1
+  -n, --dry-run      resolve and check every target, type nothing
+  -h, --help         this text
+
+Several targets are restarted strictly one at a time, in argument order. Every
+target is resolved and checked before anything is typed. The first refusal or
+failure stops the run, and later targets are reported not-run.
+
+A session is refused, with nothing typed, when it is the calling window, shows
+"esc to interrupt", or holds typed text after the prompt glyph. The only
+keystrokes ever sent are a command and Enter.
+
+Standard output, one line per target:
+  NAME SOCKET WINDOW old=ID new=ID VERDICT
+old is the newest transcript before the restart, new the one it started; "-"
+marks an unknown field. VERDICT is one of:
+  ok                restarted, follow-up ran (and PATTERN was found)
+  would-restart     --dry-run: every check passed
+  refused: REASON   nothing was typed
+  failed: REASON    typing began and a stage did not complete
+  not-run           an earlier target stopped the run
+
+Exit status: 0 every target ok, 1 any refused or failed, 2 usage error,
+3 unsupported environment (no kitten, jq, or reachable kitty socket).
+
+Environment: DSMR_KITTEN names the kitten binary, DSMR_KITTY_SOCKET_DIR the
+directory searched for kitty-* sockets (default /tmp), CLAUDE_CONFIG_DIR the
+Claude Code configuration root (default ~/.claude).
 EOF
 }
 
@@ -55,10 +102,15 @@ TARGETS=()
 while (($#)); do
     case $1 in
         -h|--help)      usage; exit 0 ;;
+        -n|--dry-run)   DRY_RUN=1; shift ;;
         --timeout)      (($# >= 2)) || die_usage "$1 needs a value"; TIMEOUT=$2; shift 2 ;;
         --timeout=*)    TIMEOUT=${1#*=}; shift ;;
         --poll)         (($# >= 2)) || die_usage "$1 needs a value"; POLL=$2; shift 2 ;;
         --poll=*)       POLL=${1#*=}; shift ;;
+        --then)         (($# >= 2)) || die_usage "$1 needs a value"; THEN_CMD=$2; shift 2 ;;
+        --then=*)       THEN_CMD=${1#*=}; shift ;;
+        --expect)       (($# >= 2)) || die_usage "$1 needs a value"; EXPECT=$2; EXPECT_SET=1; shift 2 ;;
+        --expect=*)     EXPECT=${1#*=}; EXPECT_SET=1; shift ;;
         --)             shift; TARGETS+=("$@"); break ;;
         -*)             die_usage "unknown option: $1" ;;
         *)              TARGETS+=("$1"); shift ;;
@@ -67,7 +119,23 @@ done
 
 is_number "$TIMEOUT" || die_usage "--timeout needs a number of seconds: $TIMEOUT"
 is_number "$POLL" || die_usage "--poll needs a number of seconds: $POLL"
-((${#TARGETS[@]} == 1)) || die_usage "name exactly one target"
+# kitty decodes backslash escapes in send-text, so a backslash in the command
+# would not arrive as typed.
+if [[ -n $THEN_CMD ]]; then
+    [[ $THEN_CMD == /* ]] || die_usage "--then must start with / or be empty: $THEN_CMD"
+    [[ $THEN_CMD != *\\* ]] || die_usage "--then must not contain a backslash"
+    [[ ! $THEN_CMD =~ [[:cntrl:]] ]] || die_usage "--then must not contain a control character"
+fi
+if ((EXPECT_SET)); then
+    [[ -n $THEN_CMD ]] || die_usage "--expect needs a follow-up command: --then '' writes no turn to check"
+    [[ -n $EXPECT ]] || die_usage "--expect needs a non-empty pattern"
+fi
+((${#TARGETS[@]})) || die_usage "name at least one target (see --help)"
+for ((i = 0; i < ${#TARGETS[@]}; i++)); do
+    for ((j = i + 1; j < ${#TARGETS[@]}; j++)); do
+        [[ ${TARGETS[i]} != "${TARGETS[j]}" ]] || die_usage "target named twice: ${TARGETS[i]}"
+    done
+done
 
 # The shared socket library sits beside this script in a checkout and under
 # ../lib/dsmr-mcp once installed.
@@ -184,17 +252,21 @@ window_is_self() {
 
 # Window rows for one target across one socket's ls output, tab separated:
 # candidate, match, title, window id, window pid, foreground pids, cwd, claude.
+# $2 is a tab title for a name target (isp 0), or a directory for a path target
+# (isp 1), whose tab title is that directory's last component.
 window_rows() {
-    local json=$1 name=$2
-    jq -r --arg name "$name" '
+    local json=$1 key=$2 isp=$3
+    jq -r --arg key "$key" --arg isp "$isp" '
         def base: split("/") | map(select(length > 0)) | last // "";
-        .[] | .tabs[]? as $t | $t.windows[]? | . as $w
+        def here($cwd): if $isp == "1" then $cwd == $key else ($cwd | base) == $key end;
+        ($key | base) as $bn
+        | .[] | .tabs[]? as $t | $t.windows[]? | . as $w
         | [ $w.foreground_processes[]? ] as $fg
         | [ $fg[] | select(any((.cmdline // [])[]; (split("/") | last) == "claude")) | .cwd ] as $cc
         | ($cc | first // "") as $ccwd
         | ($t.title // "") as $title
-        | [ ($title == $name or any($fg[]; (.cwd // "" | base) == $name)),
-            ($title == $name and $ccwd != "" and ($ccwd | base) == $name),
+        | [ ($title == $bn or any($fg[]; here(.cwd // ""))),
+            ($title == $bn and $ccwd != "" and here($ccwd)),
             $title, ($w.id | tostring), ($w.pid | tostring),
             ([ $fg[].pid | tostring ] | join(",")),
             ($ccwd | if . == "" then ($fg[0].cwd // $w.cwd // "-") else . end),
@@ -202,8 +274,8 @@ window_rows() {
         | @tsv' <<<"$json"
 }
 
-# Result of restart_target, set by the functions below.
-VERDICT="" OLD_ID="-" NEW_ID="-" T_SOCK="-" T_WIN="-"
+# Result of restart_target.
+VERDICT="" OLD_ID="-" NEW_ID="-"
 
 latest_stem() {
     local dir=$1 f best="" newest=0 m
@@ -250,6 +322,7 @@ SNAPSHOT=""
 # effect. Sets VERDICT and NEW_ID.
 restart_target() {
     local addr=$1 win=$2 dir=$3 file
+    OLD_ID=- NEW_ID=-
     window_idle "$addr" "$win" || { VERDICT="refused: session is busy or has typed input"; return 1; }
     SNAPSHOT=$(jsonl_names "$dir")
     OLD_ID=$(latest_stem "$dir")
@@ -275,63 +348,143 @@ restart_target() {
             return 1
         fi
     fi
+    if ((EXPECT_SET)) && ! grep -aq -F -e "$EXPECT" -- "$file"; then
+        VERDICT="failed: expect pattern not found in transcript $NEW_ID"
+        return 1
+    fi
     VERDICT=ok
     return 0
 }
 
 # ---- resolve ----------------------------------------------------------------
 
-name=${TARGETS[0]}
-[[ $name != */* ]] || die_usage "path targets are not supported yet: $name"
-
 declare -a socks=()
 kitty_socket_paths socks
 ((${#socks[@]})) || unsupported "no kitty socket under ${DSMR_KITTY_SOCKET_DIR:-/tmp}; kitty remote control is required"
 
-matches=()
+declare -A LS_JSON=()
 reachable=0
 for s in "${socks[@]}"; do
-    addr=unix:$s
-    if ! json=$(kit "$addr" ls 2>/dev/null); then
-        note "skipping $addr: ls failed"
-        continue
+    if json=$(kit "unix:$s" ls 2>/dev/null); then
+        LS_JSON["unix:$s"]=$json
+        reachable=1
+    else
+        note "skipping unix:$s: ls failed"
     fi
-    reachable=1
-    while IFS=$'\t' read -r _ match _ win wpid fpids cwd _; do
-        [[ $match == true ]] || continue
-        matches+=("$addr"$'\t'"$win"$'\t'"$wpid"$'\t'"$fpids"$'\t'"$cwd")
-    done < <(window_rows "$json" "$name")
 done
 ((reachable)) || unsupported "no kitty socket answered ls"
 
-emit() {
-    printf '%s %s %s old=%s new=%s %s\n' "$name" "$T_SOCK" "$T_WIN" "$OLD_ID" "$NEW_ID" "$VERDICT"
+# Per-target state, indexed like TARGETS.
+T_SOCK=() T_WIN=() T_WPID=() T_FPIDS=() T_CWD=() T_TDIR=()
+T_OLD=() T_NEW=() T_VERDICT=() T_STATE=()
+
+# Resolve target $1 to a window, or record why it is refused. Candidate windows
+# go to stderr when the match is not exactly one.
+resolve_target() {
+    local i=$1 target=${TARGETS[$1]} key isp=0 addr json match title win wpid fpids cwd claude cand
+    local -a found=() cands=()
+    T_SOCK[i]=- T_WIN[i]=- T_OLD[i]=- T_NEW[i]=-
+    key=$target
+    if [[ $target == */* ]]; then
+        isp=1
+        if ! key=$(cd -P -- "$target" 2>/dev/null && pwd -P); then
+            T_STATE[i]=refused T_VERDICT[i]="refused: no such directory"
+            return 0
+        fi
+    fi
+    for addr in "${!LS_JSON[@]}"; do
+        json=${LS_JSON[$addr]}
+        while IFS=$'\t' read -r cand match title win wpid fpids cwd claude; do
+            [[ $cand == true ]] || continue
+            cands+=("  candidate: $addr window=$win tab=$title cwd=$cwd claude=$([[ $claude == true ]] && echo yes || echo no)")
+            [[ $match == true ]] && found+=("$addr"$'\t'"$win"$'\t'"$wpid"$'\t'"$fpids"$'\t'"$cwd")
+        done < <(window_rows "$json" "$key" "$isp")
+    done
+    if ((${#found[@]} != 1)); then
+        note "$target: ${#found[@]} matching sessions"
+        ((${#cands[@]})) && printf '%s\n' "${cands[@]}" | sort >&2
+        if ((${#found[@]} == 0)); then
+            T_VERDICT[i]="refused: no matching session"
+        else
+            T_VERDICT[i]="refused: ${#found[@]} matching sessions"
+        fi
+        T_STATE[i]=refused
+        return 0
+    fi
+    IFS=$'\t' read -r 'T_SOCK[i]' 'T_WIN[i]' 'T_WPID[i]' 'T_FPIDS[i]' 'T_CWD[i]' <<<"${found[0]}"
+    if window_is_self "${T_SOCK[i]}" "${T_WIN[i]}" "${T_WPID[i]}" "${T_FPIDS[i]}"; then
+        T_STATE[i]=refused T_VERDICT[i]="refused: this is the calling window"
+        return 0
+    fi
+    T_TDIR[i]=$(transcript_dir "${T_CWD[i]}")
+    if [[ ! -d ${T_TDIR[i]} ]]; then
+        T_STATE[i]=refused T_VERDICT[i]="refused: no transcript directory ${T_TDIR[i]}"
+        return 0
+    fi
+    T_STATE[i]=pending
 }
 
-if ((${#matches[@]} != 1)); then
-    VERDICT="refused: ${#matches[@]} matching sessions"
-    emit
+emit() {
+    local i=$1
+    printf '%s %s %s old=%s new=%s %s\n' "${TARGETS[i]}" "${T_SOCK[i]}" "${T_WIN[i]}" \
+        "${T_OLD[i]}" "${T_NEW[i]}" "${T_VERDICT[i]}"
+}
+
+count=${#TARGETS[@]}
+for ((i = 0; i < count; i++)); do
+    resolve_target "$i"
+done
+
+# One window cannot be restarted twice in a run.
+for ((i = 0; i < count; i++)); do
+    [[ ${T_STATE[i]} == pending ]] || continue
+    for ((j = i + 1; j < count; j++)); do
+        [[ ${T_STATE[j]} == pending ]] || continue
+        if [[ ${T_SOCK[i]} == "${T_SOCK[j]}" && ${T_WIN[i]} == "${T_WIN[j]}" ]]; then
+            die_usage "${TARGETS[i]} and ${TARGETS[j]} resolve to the same window"
+        fi
+    done
+done
+
+status=0
+halted=0
+for ((i = 0; i < count; i++)); do
+    [[ ${T_STATE[i]} == refused ]] && halted=1
+done
+if ((halted)); then
+    # Nothing is typed when any target fails to resolve.
+    for ((i = 0; i < count; i++)); do
+        if [[ ${T_STATE[i]} == pending ]]; then
+            T_STATE[i]=notrun T_VERDICT[i]=not-run
+        fi
+        emit "$i"
+    done
     exit 1
 fi
 
-IFS=$'\t' read -r T_SOCK T_WIN wpid fpids cwd <<<"${matches[0]}"
-
-if window_is_self "$T_SOCK" "$T_WIN" "$wpid" "$fpids"; then
-    VERDICT="refused: this is the calling window"
-    emit
-    exit 1
+if ((DRY_RUN)); then
+    for ((i = 0; i < count; i++)); do
+        if window_idle "${T_SOCK[i]}" "${T_WIN[i]}"; then
+            T_OLD[i]=$(latest_stem "${T_TDIR[i]}")
+            T_VERDICT[i]=would-restart
+        else
+            T_VERDICT[i]="refused: session is busy or has typed input"
+            status=1
+        fi
+        emit "$i"
+    done
+    exit "$status"
 fi
 
-tdir=$(transcript_dir "$cwd")
-if [[ ! -d $tdir ]]; then
-    VERDICT="refused: no transcript directory $tdir"
-    emit
-    exit 1
-fi
-
-if restart_target "$T_SOCK" "$T_WIN" "$tdir"; then
-    emit
-    exit 0
-fi
-emit
-exit 1
+for ((i = 0; i < count; i++)); do
+    if ((status)); then
+        T_VERDICT[i]=not-run
+        emit "$i"
+        continue
+    fi
+    VERDICT="" OLD_ID=- NEW_ID=-
+    if restart_target "${T_SOCK[i]}" "${T_WIN[i]}" "${T_TDIR[i]}"; then :; else status=1; fi
+    T_OLD[i]=$OLD_ID T_NEW[i]=$NEW_ID T_VERDICT[i]=$VERDICT
+    emit "$i"
+done
+exit "$status"
