@@ -74,6 +74,35 @@ You cannot unsee your own intent. The phrase above read as fine to the author wh
 the entire reason this gate exists as a distinct pass rather than a checklist item. If you are the
 agent that wrote the text, you are not the agent that can review it.
 
+## ⛔ One pass. Read the references before you judge anything.
+
+**Read `stock-patterns.md` and `mechanics.md` in this directory IN FULL before you judge a word**,
+whether or not your brief mentions them. They are the third and fourth passes below; a pass you did
+not load is a pass that never ran (operator, 2026-10-29).
+
+**You get ONE pass** (operator, 2026-10-29). Order your findings: claims the code contradicts, logic
+faults or bugs you notice while checking, then voice, then stock patterns and mechanics, then
+planning leaks. How many you report follows three rules, not a count:
+
+1. **Correctness findings are never capped.** Report every claim the code contradicts, every logic
+   fault and every bug, however many there are.
+2. **A style finding must not add length, and one cause is one finding.** Skip a style fix that
+   would make the text longer; a replacement in prose is never longer than what it replaces.
+   Several findings with one cause are reported once, as the pattern, with one example.
+3. **A flood is itself the finding.** When most sentences of a short artifact need fixing, the
+   problem is the thinking behind it: say it needs rewriting from its purpose, give the two or three
+   worst examples, and stop listing.
+
+**Why no count:** over 2026-09-28 to 10-25 the passes that found anything on a PR reported a median
+of 4 findings and at most 10, so a cap does nothing on normal work, and on a large document it drops
+real defects to fit.
+
+⛔ **Never ask for, or agree to, a re-run "until clean".** A fresh reader always finds something, and
+every accuracy fix adds words: on 2026-10-28/29 one PR took 84 passes and came out almost unreadable.
+Style is settled in this pass. Only a fact earns another round: a claim the code contradicts or a
+bug found later gets its own round, scoped to that defect. Your findings are proposals the author
+weighs, not mandates.
+
 ## What you read, in this order
 
 1. **The commit message and the PR body.** These are what a stranger reads first and what survives
@@ -359,8 +388,10 @@ something the operator was reading.
 
 ## What you return
 
-A list of findings, each with the offending text quoted exactly, why it fails, and a concrete
-replacement. Not a rewrite: the author applies your findings.
+A list of findings, in the order and under the three rules above, each with where it is (PR body,
+commit, or file:line), the offending text quoted exactly, why it fails, and a concrete replacement
+(for a docstring or comment, a question for the author instead). Not a rewrite: the author applies
+your findings.
 
 If the text is clean, say so plainly and name what you checked (voice, the hunt list, and whether
 the stock-pattern and mechanics passes ran), so a clean result is distinguishable from a pass that
