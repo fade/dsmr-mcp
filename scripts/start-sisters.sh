@@ -23,6 +23,8 @@
 set -euo pipefail
 
 PROGNAME=${0##*/}
+# shellcheck source=/dev/null  # path is computed from this script's own location
+source "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/kitty-sockets.sh"
 # The directory to scan defaults to where the caller is standing, NOT to where
 # this script lives: it ships with the harness and is run against whichever
 # fleet directory is meant.
@@ -362,9 +364,7 @@ fi
 # what would happen before committing to it, often from somewhere else entirely.
 if [[ -z $KITTY_SOCKET ]]; then
     candidates=()
-    for sock in /tmp/kitty-*; do
-        [[ -S $sock ]] && candidates+=("$sock")
-    done
+    kitty_socket_paths candidates
     case ${#candidates[@]} in
         1)
             KITTY_SOCKET="unix:${candidates[0]}"

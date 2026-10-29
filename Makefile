@@ -25,7 +25,7 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 
 .PHONY: bridge bus-watch bus-host install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
-        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks
+        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -291,6 +291,14 @@ install-hooks:
 ##   lint that refuses everything fails, as does one that refuses nothing.
 test-hooks:
 	@bash tests/githooks/workproduct-style-test.sh
+
+## test-restart-session: drive the in-place session restart against a stub kitten.
+##
+##   No kitty is involved. Each refusal has a case that would fail if the
+##   refusal were removed, and a positive control that proves the same fixture
+##   restarts when nothing is wrong.
+test-restart-session:
+	@bash tests/scripts/restart-session-in-place-test.sh
 
 ## check-hooks: report where a deployed hook differs from this tree.
 ##
