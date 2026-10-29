@@ -2,7 +2,8 @@
 // answer /subagent-routing with what this session's spawns came to.
 //
 // Log: <config>/logs/subagent-routing/<session>.jsonl, one JSON line per spawn
-// and one `loaded` line per session start. When SUBAGENT_ROUTING_CAPTURE names
+// and one `loaded` line per session start; a log near its size limit is moved
+// aside to <session>.jsonl.<n>, oldest first. When SUBAGENT_ROUTING_CAPTURE names
 // a directory, each spawn's input, io tape and decision are also written there
 // as <tool_use_id>.json for replay.
 //
@@ -19,6 +20,13 @@ const VERSION = '0.2.0'
 const LOG_DIR = 'logs/subagent-routing'
 const SAFE_NAME = /^[A-Za-z0-9_-]+$/
 const ERROR_TEXT_LIMIT = 200
+/**
+ * A log this many characters long is moved aside before the next line. At
+ * most 3 bytes a character, it stays under the 4 MiB limit of a read or write.
+ */
+const LOG_ROTATE_CHARS = 1024 * 1024
+/** Highest numbered segment a log is moved aside to. */
+const LOG_SEGMENTS = 99
 /** Actions that raise a toast, once per session each. */
 const LOUD: ReadonlySet<string> = new Set(['cannot-decide', 'fallback', 'error'])
 const COUNTED = ['rewrote', 'cleared-model', 'unchanged', 'cannot-decide', 'fallback', 'error'] as const
@@ -61,21 +69,73 @@ let logChain: Promise<void> = Promise.resolve()
 // What each in-flight spawn was passed down as, for the failure handler.
 const passedDown = new Map<string, Agent>()
 
-/** Appends `record` to `path`; resolves to the file's text before the append. */
-function appendLine($: EngineInterface, path: string, record: unknown): Promise<string> {
-  const step = logChain.then(async () => {
-    const before = await $.fs.read(path).then(
-      t => (typeof t === 'string' ? t : ''),
-      () => '',
-    )
-    await $.fs.write(path, `${before}${JSON.stringify(record)}\n`)
-    return before
+// Toasts already raised, keyed by session and kind, so a log that cannot be
+// read or written does not repeat them.
+const toasted = new Set<string>()
+
+/**
+ * The log's text before the append, null when it could not be read, and the
+ * reason the line was not written, when it was not.
+ */
+type Appended = { before: string | null; failure?: string }
+
+function messageOf(err: unknown): string {
+  return clip(err instanceof Error ? err.message : String(err))
+}
+
+/** The first numbered segment beside `path` that does not exist yet. */
+async function freeSegment($: EngineInterface, path: string): Promise<string> {
+  for (let n = 1; n <= LOG_SEGMENTS; n++) {
+    if (!(await $.fs.exists(`${path}.${n}`))) return `${path}.${n}`
+  }
+  throw new Error(`${LOG_SEGMENTS} moved-aside segments already exist`)
+}
+
+/**
+ * Appends `record` to `path`. A log that exists is never written unless it
+ * was read whole first; one that would pass LOG_ROTATE_CHARS is moved aside
+ * to a free numbered segment and the line starts a fresh log.
+ */
+function appendLine($: EngineInterface, path: string, record: unknown): Promise<Appended> {
+  const step = logChain.then(async (): Promise<Appended> => {
+    const line = `${JSON.stringify(record)}\n`
+    let before: string
+    try {
+      const exists = await $.fs.exists(path)
+      const text = exists ? await $.fs.read(path) : ''
+      if (typeof text !== 'string') throw new Error('the log read as bytes')
+      before = text
+    } catch (err) {
+      return { before: null, failure: `cannot read ${path}: ${messageOf(err)}` }
+    }
+    try {
+      if (before.length + line.length > LOG_ROTATE_CHARS) {
+        await $.fs.write(await freeSegment($, path), before)
+        await $.fs.write(path, line)
+      } else {
+        await $.fs.write(path, `${before}${line}`)
+      }
+    } catch (err) {
+      return { before, failure: `cannot write ${path}: ${messageOf(err)}` }
+    }
+    return { before }
   })
   logChain = step.then(
     () => undefined,
     () => undefined,
   )
-  return step.catch(() => '')
+  return step.catch(err => ({ before: null, failure: messageOf(err) }))
+}
+
+/** Raises `text` as a toast unless `key` already raised one. */
+function toastOnce($: EngineInterface, key: string, text: string): void {
+  if (toasted.has(key)) return
+  toasted.add(key)
+  try {
+    $.ui.toast(text)
+  } catch {
+    // A surface with no toast still has the log line.
+  }
 }
 
 function logLines(text: string): Record<string, unknown>[] {
@@ -128,15 +188,27 @@ function tapedIo($: EngineInterface, dirs: Pick<RouteIo, 'configDir' | 'projectD
 }
 
 /**
- * Writes `line` to the session's log and, when its action is loud and no
- * earlier line of the session has that action, raises a toast.
+ * Writes `line` to the session's log. Raises a toast, once per session each,
+ * when the line could not be written, and when its action is loud and no
+ * earlier line or toast of the session had that action.
  */
 async function record($: EngineInterface, configDir: string, line: SpawnLogLine): Promise<void> {
   if (!SAFE_NAME.test(line.session)) return
   const path = logPath(configDir, line.session)
-  const before = await appendLine($, path, line)
+  const appended = await appendLine($, path, line)
+  if (appended.failure !== undefined) {
+    toastOnce(
+      $,
+      `${line.session}\tlog`,
+      `subagent-routing could not write its log, so spawns go unrecorded: ${appended.failure}`,
+    )
+  }
   if (!LOUD.has(line.action)) return
-  if (logLines(before).some(l => l.action === line.action)) return
+  const key = `${line.session}\t${line.action}`
+  if (appended.before !== null && logLines(appended.before).some(l => l.action === line.action)) {
+    toasted.add(key)
+    return
+  }
   const asRequested = line.set.type === line.requested.type && line.set.model === line.requested.model
   const what =
     line.action === 'fallback'
@@ -144,11 +216,7 @@ async function record($: EngineInterface, configDir: string, line: SpawnLogLine)
       : asRequested
         ? 'left a spawn as requested'
         : `passed a spawn on as ${line.set.type}, then failed`
-  try {
-    $.ui.toast(`subagent-routing ${what}: ${line.reason}. Log: ${path}`)
-  } catch {
-    // A surface with no toast still has the log line.
-  }
+  toastOnce($, key, `subagent-routing ${what}: ${line.reason}. Log: ${path}`)
 }
 
 /** The status line for /subagent-routing, counted from the session's log text. */
