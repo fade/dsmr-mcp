@@ -11,7 +11,8 @@
 #       Build a throwaway Claude Code config directory with an unpatched
 #       gsd-core copied from the live one and proven against the installer's
 #       manifest. It holds no credentials and no bus hook; the live install is
-#       read only and proven unchanged.
+#       read only and proven unchanged. DIR must be new, empty, or one an
+#       earlier make-config built (it holds .routing-probe-config).
 #   check-config DIR
 #       Re-check a config directory: every gsd-core and scripts manifest entry
 #       matches, and the routing gate reports five units missing under DIR.
@@ -67,6 +68,8 @@ GATE=$SCRIPT_DIR/../harness/scripts/gsd-routing-gate.sh
 CONFIG_HOME=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 # The planning directory gsd-core reads, named once.
 PLANNING_DIR=.planning
+# Written by make-config into each directory it builds; reuse requires it.
+CONFIG_MARKER=.routing-probe-config
 LOG_DIR=logs/subagent-routing
 PROBE_MODEL=claude-opus-5-5
 LEADER_MODEL=claude-sonnet-5-5
@@ -436,6 +439,12 @@ cmd_make_config() {
         "$repo"|"$repo"/*) die "refusing $dir: it is inside the repository $repo" ;;
     esac
     case "$live" in "$dir"/*) die "refusing $dir: it contains the live config directory $live" ;; esac
+    case "$repo" in "$dir"/*) die "refusing $dir: it contains the repository $repo" ;; esac
+    [ ! -e "$dir" ] || [ -d "$dir" ] || die "refusing $dir: it is not a directory"
+    if [ -d "$dir" ] && [ ! -f "$dir/$CONFIG_MARKER" ] \
+            && [ -n "$(find "$dir" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+        die "refusing $dir: it is not empty and make-config did not build it (no $CONFIG_MARKER)"
+    fi
     [ -d "$live/gsd-core" ] || die "gsd-core not installed under $live"
     [ -f "$live/gsd-file-manifest.json" ] || die "installer manifest not found under $live"
     [ -f "$live/settings.json" ] || die "no settings.json under $live"
@@ -447,6 +456,8 @@ cmd_make_config() {
 
     mkdir -p "$dir" || die "cannot create $dir"
     chmod 700 "$dir" || die "cannot chmod $dir"
+    [ -f "$dir/$CONFIG_MARKER" ] || printf 'built by routing-probe.sh make-config\n' > "$dir/$CONFIG_MARKER" \
+        || die "cannot write $dir/$CONFIG_MARKER"
     # Only the paths named here are replaced; a login already in DIR stays.
     for sub in agents skills hooks gsd-core; do
         rm -rf "${dir:?}/$sub"

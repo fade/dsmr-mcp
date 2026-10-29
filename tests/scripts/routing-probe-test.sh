@@ -307,6 +307,38 @@ else
     bad config-refuses-live "rc=$rc: $out"
 fi
 
+if [ -f "$CFG/.routing-probe-config" ]; then ok config-marker-written; else bad config-marker-written "no marker in $CFG"; fi
+
+# Control for the refusals below: a directory make-config built is rebuilt in place.
+out=$(probe make-config "$CFG" 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'config directory ready' <<<"$out"; then ok config-reuses-own; else bad config-reuses-own "rc=$rc: $(tail -n 3 <<<"$out")"; fi
+
+# A directory make-config did not build is refused before anything in it changes.
+FOREIGN=$WORK/foreign
+mkdir -p "$FOREIGN/agents"
+printf 'keep\n' > "$FOREIGN/agents/keep.md"
+chmod 755 "$FOREIGN"
+out=$(probe make-config "$FOREIGN" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && [ -f "$FOREIGN/agents/keep.md" ] && [ "$(stat -c %a "$FOREIGN")" = 755 ] \
+        && [ ! -e "$FOREIGN/settings.json" ] && grep -q 'make-config did not build it' <<<"$out"; then
+    ok config-refuses-foreign
+else
+    bad config-refuses-foreign "rc=$rc: $(tail -n 3 <<<"$out")"
+fi
+
+# A directory that holds the repository is refused. The script is copied under
+# a stand-in repository so the directory under test is a scratch one.
+OUTER=$WORK/outer
+mkdir -p "$OUTER/repo/scripts" "$OUTER/repo/harness"
+cp "$PROBE" "$OUTER/repo/scripts/routing-probe.sh"
+cp -a "$REPO_ROOT/harness/scripts" "$OUTER/repo/harness/scripts"
+out=$(bash "$OUTER/repo/scripts/routing-probe.sh" make-config "$OUTER" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && [ ! -e "$OUTER/settings.json" ] && grep -q 'contains the repository' <<<"$out"; then
+    ok config-refuses-repo-parent
+else
+    bad config-refuses-repo-parent "rc=$rc: $(tail -n 3 <<<"$out")"
+fi
+
 printf '\ntree-hash\n'
 
 mkdir -p "$WORK/tree/sub"
