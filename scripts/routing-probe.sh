@@ -14,6 +14,10 @@
 #   replay RECORDINGS_DIR [--mod DIR]
 #       Run the mod's replay tests over every recorded spawn in RECORDINGS_DIR,
 #       against a temporary copy of the mod (default: this repository's).
+#   record-history --out DIR [--types LIST] [--max-per-session N] TRANSCRIPT...
+#       Write one recording per Agent call of a listed subagent type found in
+#       each TRANSCRIPT, with a tape of the files the decision reads as they
+#       stand now. An `expected` block already in DIR for that call is kept.
 #
 # Exit status: 0 success, 1 failure, 64 usage.
 
@@ -36,6 +40,7 @@ usage: $PROGNAME make-repo DIR --gsd-core local-pristine
                  [--capture DIR] [--debug-file FILE] [--append-system-prompt TEXT] -- PROMPT
        $PROGNAME report TRANSCRIPT
        $PROGNAME replay RECORDINGS_DIR [--mod DIR]
+       $PROGNAME record-history --out DIR [--types LIST] [--max-per-session N] TRANSCRIPT...
 EOF
 }
 
@@ -371,6 +376,176 @@ cmd_replay() {
     return "$rc"
 }
 
+# --- record-history ----------------------------------------------------------
+
+# resolve_plan PATH CWD PROMPT: absolute form of a plan path as the mod's
+# decision resolves it; prints nothing for a tilde path when HOME is unset.
+resolve_plan() {
+    local path=$1 cwd=${2%/} prompt=$3 root rest
+    # shellcheck disable=SC2016 # the literal variable reference a dispatch prompt carries
+    case "$path" in
+        '${PROJECT_ROOT}/'*|'$PROJECT_ROOT/'*)
+            rest=/${path#*/}
+            root=$(printf '%s\n' "$prompt" \
+                   | sed -n "s/^[[:space:]]*PROJECT_ROOT=['\"]\{0,1\}\(\/[^'\"[:space:]]*\)['\"]\{0,1\}[[:space:]]*\$/\1/p" \
+                   | head -n 1)
+            path=${root:-$cwd}
+            path=${path%/}$rest
+            ;;
+    esac
+    case "$path" in
+        /*) printf '%s\n' "$path" ;;
+        \~/*) [ -n "${HOME:-}" ] && printf '%s\n' "${HOME%/}${path#\~}" ;;
+        *) while [ "${path#./}" != "$path" ]; do path=${path#./}; done
+           printf '%s/%s\n' "$cwd" "$path" ;;
+    esac
+}
+
+# frontmatter_hint FILE: the agent_hint value in FILE's frontmatter, unquoted.
+frontmatter_hint() {
+    awk 'NR == 1 { if ($0 !~ /^---[[:space:]]*$/) exit; next }
+         /^---[[:space:]]*$/ { exit }
+         /^agent_hint:/ { sub(/^agent_hint:[[:space:]]*/, ""); sub(/[[:space:]]+#.*$/, "");
+                          gsub(/^["'\'']|["'\'']$/, ""); print; exit }' "$1"
+}
+
+# tape_read PATH: one fs.read tape entry; the result is null for a missing file.
+tape_read() {
+    if [ -f "$1" ] && [ -r "$1" ]; then
+        jq -n --arg p "$1" --rawfile t "$1" '{op: "fs.read", arg: $p, result: $t}'
+    else
+        jq -n --arg p "$1" '{op: "fs.read", arg: $p, result: null}'
+    fi
+}
+
+tape_exists() {
+    local found=false
+    [ -e "$1" ] && found=true
+    jq -n --arg p "$1" --argjson f "$found" '{op: "fs.exists", arg: $p, result: $f}'
+}
+
+# record_one TRANSCRIPT CALL OUTDIR CAPTURED: write OUTDIR/<tool_use_id>.json.
+record_one() {
+    local transcript=$1 call=$2 out=$3 captured=$4
+    local id cwd prompt sid config_home config_file plan resolved hint name meta
+    local entries=() names=(gsd-executor shell-developer lisp-developer) seen=" "
+    id=$(jq -r .id <<<"$call")
+    [[ $id =~ ^[A-Za-z0-9_-]+$ ]] || { echo "skipping unsafe id $id" >&2; return 0; }
+    cwd=$(jq -r '.cwd // ""' <<<"$call")
+    cwd=${cwd%/}
+    prompt=$(jq -r .prompt <<<"$call")
+    sid=$(jq -r '.session // ""' <<<"$call")
+    [ -n "$sid" ] || { sid=${transcript##*/}; sid=${sid%.jsonl}; }
+    # The tape answers CLAUDE_CONFIG_DIR unset, so the decision reads $HOME/.claude.
+    config_home=${HOME%/}/.claude
+
+    entries+=("$(jq -n --arg h "${HOME:-}" '{op: "env.get", arg: "CLAUDE_CONFIG_DIR", result: null},
+                                           {op: "env.get", arg: "HOME", result: $h}')")
+    entries+=("$(jq -n --arg c "$cwd" '{op: "session.cwd", arg: "", result: $c}')")
+    entries+=("$(jq -n --arg s "$sid" '{op: "session.id", arg: "", result: $s}')")
+
+    config_file=$cwd/$PLANNING_DIR/config.json
+    entries+=("$(tape_read "$config_file")")
+    if [ -f "$config_file" ]; then
+        name=$(jq -r '.planning.agents.executor // "" | strings' "$config_file" 2>/dev/null)
+        [ -n "$name" ] && names+=("$name")
+    fi
+
+    while IFS= read -r plan; do
+        [ -n "$plan" ] || continue
+        resolved=$(resolve_plan "$plan" "$cwd" "$prompt")
+        [ -n "$resolved" ] || continue
+        case "$seen" in *" $resolved "*) continue ;; esac
+        seen="$seen$resolved "
+        entries+=("$(tape_read "$resolved")")
+        if [ -f "$resolved" ]; then
+            hint=$(frontmatter_hint "$resolved")
+            [ -n "$hint" ] && names+=("$hint")
+        fi
+    done < <(printf '%s\n' "$prompt" | grep -oE "[^[:space:]\`'\"()<>]+-PLAN\.md")
+
+    seen=" "
+    for name in "${names[@]}"; do
+        [[ $name =~ ^[a-z0-9][a-z0-9-]*$ ]] || continue
+        case "$seen" in *" $name "*) continue ;; esac
+        seen="$seen$name "
+        entries+=("$(tape_exists "$config_home/agents/$name.md")")
+        entries+=("$(tape_exists "$cwd/.claude/agents/$name.md")")
+    done
+
+    # What ran, from the subagent's own records, when they are still on disk.
+    local truth=null subdir=${transcript%.jsonl}/subagents f
+    if [ -d "$subdir" ]; then
+        for f in "$subdir"/*.meta.json; do
+            [ -f "$f" ] || continue
+            [ "$(jq -r '.toolUseId // ""' "$f")" = "$id" ] || continue
+            meta=$f
+            truth=$(jq -n --arg type "$(jq -r '.agentType // ""' "$meta")" \
+                --argjson models "$(jq -s '[ .[] | select(.type == "assistant" and .message.id != null) ]
+                    | unique_by(.message.id) | map(.message.model)
+                    | map(select(. != null and . != "<synthetic>")) | unique' "${meta%.meta.json}.jsonl" 2>/dev/null || echo null)" \
+                '{ranType: $type, ranModels: $models}')
+            break
+        done
+    fi
+
+    local previous=null dest=$out/$id.json
+    [ -f "$dest" ] && previous=$(jq '.expected // null' "$dest")
+
+    printf '%s\n' "${entries[@]}" | jq -s \
+        --argjson call "$call" --argjson truth "$truth" --argjson expected "$previous" \
+        --arg session "${transcript##*/}" --arg captured "$captured" '
+        { input: { subagentType: $call.type, model: $call.model, prompt: $call.prompt,
+                   description: $call.description, tool_use_id: $call.id, cwd: $call.cwd },
+          tape: .,
+          source: { kind: "transcript", session: $session, capturedAt: $captured,
+                    dispatchedAt: $call.ts, parentModel: $call.parentModel },
+          truth: $truth }
+        + (if $expected == null then {} else { expected: $expected } end)' > "$dest.tmp" \
+        || { rm -f "$dest.tmp"; die "cannot build $dest"; }
+    mv "$dest.tmp" "$dest" || die "cannot write $dest"
+    echo "recorded $id ($(jq -r .type <<<"$call"), $sid)"
+}
+
+cmd_record_history() {
+    local out="" types=gsd-executor,shell-developer,lisp-developer max=0 transcripts=() t
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --out) [ $# -ge 2 ] || usage_error "--out needs a value"; out=$2; shift 2 ;;
+            --types) [ $# -ge 2 ] || usage_error "--types needs a value"; types=$2; shift 2 ;;
+            --max-per-session) [ $# -ge 2 ] || usage_error "--max-per-session needs a value"; max=$2; shift 2 ;;
+            -h|--help) usage; exit 0 ;;
+            -*) usage_error "unknown option $1" ;;
+            *) transcripts+=("$1"); shift ;;
+        esac
+    done
+    [ -n "$out" ] || usage_error "record-history needs --out DIR"
+    [ "${#transcripts[@]}" -gt 0 ] || usage_error "record-history needs at least one TRANSCRIPT"
+    [[ $max =~ ^[0-9]+$ ]] || usage_error "--max-per-session takes a whole number"
+    mkdir -p "$out" || die "cannot create $out"
+    local captured count=0 call
+    captured=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    for t in "${transcripts[@]}"; do
+        [ -f "$t" ] || die "no such transcript: $t"
+        while IFS= read -r call; do
+            record_one "$t" "$call" "$out" "$captured"
+            count=$((count + 1))
+        done < <(jq -c --arg types "$types" '
+                select(.type == "assistant") | . as $r | .message.content[]?
+                | select(.type == "tool_use" and (.name == "Agent" or .name == "Task")
+                         and ((.input.subagent_type // "") as $s | $types | split(",") | index($s)))
+                | { id, type: .input.subagent_type, model: (.input.model // null),
+                    prompt: (.input.prompt // ""), description: (.input.description // ""),
+                    cwd: ($r.cwd // null), session: ($r.sessionId // null),
+                    ts: ($r.timestamp // null), parentModel: ($r.message.model // null) }' "$t" \
+                 | jq -sc --argjson max "$max" '
+                     reduce .[] as $c ([]; if any(.[]; .id == $c.id) then . else . + [$c] end)
+                     | if $max > 0 then .[:$max] else . end | .[]')
+    done
+    echo "recorded $count calls into $out"
+}
+
 # --- main --------------------------------------------------------------------
 
 [ $# -ge 1 ] || usage_error
@@ -380,6 +555,7 @@ case "$sub" in
     run) cmd_run "$@" ;;
     report) cmd_report "$@" ;;
     replay) cmd_replay "$@" ;;
+    record-history) cmd_record_history "$@" ;;
     -h|--help) usage ;;
     *) usage_error "unknown subcommand $sub" ;;
 esac

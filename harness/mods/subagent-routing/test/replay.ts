@@ -1,22 +1,28 @@
 // Replays recorded spawns against the routing decision and the hooks module.
 //
-// A recording is what register.ts writes under SUBAGENT_ROUTING_CAPTURE: the
-// spawn input, the tape of engine calls the decision depended on, the decision
-// made at the time, plus an `expected` block added by hand. Recordings hold
-// real dispatch prompts, so they stay outside the repository; a test file
-// written beside a temporary copy of the mod passes them in.
+// A recording is either what register.ts writes under SUBAGENT_ROUTING_CAPTURE
+// (`source.kind` "hook") or what routing-probe.sh record-history builds from a
+// session transcript (`source.kind` "transcript"): the spawn input, a tape of
+// engine answers looked up by call and argument, and an `expected` block added
+// by hand. Recordings hold real dispatch prompts, so they stay outside the
+// repository; a test file written beside a temporary copy of the mod passes
+// them in.
 
 import { expect, test } from 'claude-code/testing'
 import type { AgentSpawnInput } from 'claude-code'
 import type { TapeEntry } from '../hooks/register'
 import { decide, ioDirs, type RouteIo } from '../hooks/route'
 
+/** A recorded spawn input; a transcript holds only some of the engine's fields. */
+export type RecordedInput = Partial<AgentSpawnInput> &
+  Pick<AgentSpawnInput, 'tool_use_id' | 'prompt' | 'subagentType'> & { model?: string | null; cwd?: string }
+
 export type Recording = {
-  input: AgentSpawnInput
+  input: RecordedInput
   tape: TapeEntry[]
-  decision: unknown
-  expected: { subagentType: string; model: string | null; why: string }
-  source: { kind: string; claudeCode: string | null; capturedAt: string }
+  decision?: unknown
+  expected: { subagentType: string; model: string | null; action: string; why: string }
+  source: { kind: string; capturedAt: string }
 }
 
 const LOG_PATH = /\/logs\/subagent-routing\/[^/]+\.jsonl$/
@@ -50,6 +56,24 @@ function labelOf(rec: Recording): string {
   return `${rec.input.subagentType} ${rec.input.tool_use_id}`
 }
 
+/**
+ * The recorded input as the engine hands it to a hook: a null model becomes
+ * absent, and the fields a transcript does not hold (none of which the
+ * decision reads) take the values of a plain foreground subagent spawn.
+ */
+function spawnInput(rec: Recording): AgentSpawnInput {
+  const { model, ...rest } = rec.input
+  return {
+    description: '',
+    provider: { plugin: 'user', tier: 'user' },
+    parentModel: 'unknown',
+    background: false,
+    fork: false,
+    ...rest,
+    ...(model === null || model === undefined ? {} : { model }),
+  } as AgentSpawnInput
+}
+
 function tapeIo(rec: Recording, tape: Tape): RouteIo {
   const cwd = rec.input.cwd ?? tape.text('session.cwd', '') ?? ''
   return {
@@ -73,10 +97,11 @@ export function replay(recordings: readonly Recording[]): void {
 
     test(`${label}: decide() returns the expected type and model`, async () => {
       const tape = new Tape(rec.tape, label)
-      const d = await decide(rec.input, tapeIo(rec, tape))
+      const d = await decide(spawnInput(rec), tapeIo(rec, tape))
       expect(tape.misses).toEqual([])
       expect(d.subagentType).toBe(rec.expected.subagentType)
       expect(d.model ?? null).toBe(rec.expected.model)
+      expect(d.action).toBe(rec.expected.action)
     })
 
     test(`${label}: the hooks module passes the expected spawn down`, async ($, on) => {
@@ -102,7 +127,7 @@ export function replay(recordings: readonly Recording[]): void {
         return { model: e.model ?? 'definition', agentId: 'replay' }
       })
 
-      await $.agent.spawn({ ...rec.input })
+      await $.agent.spawn(spawnInput(rec))
 
       expect(tape.misses).toEqual([])
       expect(beneath?.subagentType).toBe(rec.expected.subagentType)
