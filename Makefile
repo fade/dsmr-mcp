@@ -357,20 +357,21 @@ check-sisters:
 ## install-restart-session: publish the in-place session restart onto PATH.
 ##
 ##   The script finds its socket library beside itself in a checkout and under
-##   ../lib/dsmr-mcp once installed, so both files are deployed together.
+##   ../lib/dsmr-mcp once installed, so both files are deployed together, the
+##   library first. That lookup assumes BINDIR is $$(PREFIX)/bin.
 ##   Install atomically: a half-written script is run by a leader that is
 ##   about to type into live sessions.
 install-restart-session:
 	@set -e; \
 	mkdir -p "$(BINDIR)" "$(LIBDIR)"; \
-	cp scripts/restart-session-in-place.sh "$(BINDIR)/.restart-session-in-place.sh.tmp"; \
-	chmod 755 "$(BINDIR)/.restart-session-in-place.sh.tmp"; \
-	mv -f "$(BINDIR)/.restart-session-in-place.sh.tmp" "$(BINDIR)/restart-session-in-place.sh"; \
-	echo "installed $(BINDIR)/restart-session-in-place.sh"; \
 	cp scripts/kitty-sockets.sh "$(LIBDIR)/.kitty-sockets.sh.tmp"; \
 	chmod 644 "$(LIBDIR)/.kitty-sockets.sh.tmp"; \
 	mv -f "$(LIBDIR)/.kitty-sockets.sh.tmp" "$(LIBDIR)/kitty-sockets.sh"; \
 	echo "installed $(LIBDIR)/kitty-sockets.sh"; \
+	cp scripts/restart-session-in-place.sh "$(BINDIR)/.restart-session-in-place.sh.tmp"; \
+	chmod 755 "$(BINDIR)/.restart-session-in-place.sh.tmp"; \
+	mv -f "$(BINDIR)/.restart-session-in-place.sh.tmp" "$(BINDIR)/restart-session-in-place.sh"; \
+	echo "installed $(BINDIR)/restart-session-in-place.sh"; \
 	command -v restart-session-in-place.sh >/dev/null 2>&1 \
 	  || echo "NOTE: $(BINDIR) is not on this shell's PATH, so 'restart-session-in-place.sh' will not resolve by name"
 

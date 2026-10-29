@@ -13,7 +13,7 @@
 set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-SCRIPT=$REPO_ROOT/scripts/restart-session-in-place.sh
+SCRIPT=${RSIP_SCRIPT:-$REPO_ROOT/scripts/restart-session-in-place.sh}
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/rsip-test.XXXXXX")
 # AF_UNIX paths are limited to 107 bytes, which a scratch TMPDIR can exceed.
 SD=$(mktemp -d /tmp/rsip.XXXXXX)
@@ -56,7 +56,10 @@ shift 4
 sock=${addr#unix:}
 case $sock in "$DSMR_KITTY_SOCKET_DIR"/*) ;; *) exit 1 ;; esac
 sb=${sock##*/}
-win=${2:-}; win=${win#id:}
+# get-text and send-text carry --match id:N after the subcommand name.
+[[ ${1:-} == --ansi ]] && shift
+win=${2:-}
+win=${win#id:}
 key=$sb-$win
 busyf=$FX/state/$key.busy
 case $sub in
@@ -65,6 +68,11 @@ case $sub in
         cat "$FX/ls/$sb.json"
         ;;
     get-text)
+        # A foreground change that lands between the idle test and the send.
+        if [[ -f $FX/lsonget/$key ]]; then
+            cp "$FX/lsonget/$key" "$FX/ls/$sb.json"
+            rm -f "$FX/lsonget/$key"
+        fi
         if [[ -f $busyf ]]; then
             n=$(<"$busyf")
             if ((n > 0)); then
@@ -84,13 +92,23 @@ case $sub in
             if [[ ! -f $FX/notranscript/$key ]]; then
                 uuid=$(</proc/sys/kernel/random/uuid)
                 d=$(<"$FX/tdir/$key")
-                printf '{"type":"mode"}\n' > "$d/$uuid.jsonl"
+                printf '%s\n' '{"type":"mode"}' \
+                    '{"type":"user","message":{"content":"<command-name>/clear</command-name>"}}' > "$d/$uuid.jsonl"
                 echo "$d/$uuid.jsonl" > "$FX/state/$key.file"
+                # A second session in the same directory starts its own transcript.
+                [[ -f $FX/decoy/$key ]] && printf '{"type":"mode"}\n' > "$d/aaaa-decoy.jsonl"
+                # A turn the session starts on its own, before the follow-up.
+                if [[ -f $FX/wake/$key ]]; then
+                    printf '%s\n' '{"type":"attachment","attachment":{"type":"instructions","content":"FIXTURE-INSTRUCTIONS-TEXT"}}' \
+                        '{"type":"assistant","message":"wake"}' >> "$d/$uuid.jsonl"
+                fi
             fi
             [[ -f $FX/afterclear/$key ]] && cp "$FX/afterclear/$key" "$busyf"
+            [[ -f $FX/lsafterclear/$key ]] && cp "$FX/lsafterclear/$key" "$FX/ls/$sb.json"
         elif [[ ! -f $FX/noturn/$key && -f $FX/state/$key.file ]]; then
             f=$(<"$FX/state/$key.file")
-            printf '%s\n' '{"type":"user","message":"x"}' \
+            cmd=${text%'\r'}
+            printf '%s\n' "{\"type\":\"user\",\"message\":{\"content\":\"<command-name>${cmd%% *}</command-name>\"}}" \
                 '{"type":"attachment","attachment":{"type":"instructions","content":"FIXTURE-INSTRUCTIONS-TEXT"}}' \
                 '{"type":"assistant","message":"y"}' >> "$f"
         fi
@@ -104,14 +122,46 @@ chmod +x "$WORK/bin/kitten"
 # Start every case from nothing: no sockets, no fixtures, no transcripts.
 reset() {
     rm -rf "$FX" "$CLAUDE_CONFIG_DIR" "$SD"/kitty-*
-    mkdir -p "$FX"/{ls,screen,state,tdir,notranscript,noturn,afterclear} "$CLAUDE_CONFIG_DIR/projects"
+    mkdir -p "$FX"/{ls,screen,state,tdir,notranscript,noturn,afterclear,decoy,wake,lsafterclear,lsonget} \
+        "$CLAUDE_CONFIG_DIR/projects"
     : > "$FX/sendlog"
     unset KITTY_WINDOW_ID KITTY_LISTEN_ON
-    screen_busy_template
+    screen_with_busy_line > "$FX/busy-screen"
 }
 
-screen_busy_template() {
-    printf '%s\n' 'working' "$RULE" "${GLYPH}${NBSP}" "$RULE" '  esc to interrupt' > "$FX/busy-screen"
+# Screens come from real captures (get-text --ansi on live Claude Code and zsh
+# windows). Variants are cut from those captures; none is hand-drawn.
+FIXTURES=$REPO_ROOT/tests/scripts/fixtures
+PROMPT_EMPTY=$GLYPH$NBSP
+
+# The idle capture with $1 appended after the empty prompt, in normal intensity.
+screen_typed_text() {
+    local c
+    c=$(<"$FIXTURES/claude-idle.ansi")
+    [[ $c == *"$PROMPT_EMPTY"$'\n'* ]] || { echo "fixture lost its prompt line" >&2; exit 1; }
+    printf '%s\n' "${c/"$PROMPT_EMPTY"$'\n'/"$PROMPT_EMPTY$1"$'\n'}"
+}
+
+# The idle capture with a spinner line above the prompt frame.
+screen_with_busy_line() {
+    local c rule
+    c=$(<"$FIXTURES/claude-idle.ansi")
+    rule=$'\n\e[m\e[38:2:136:136:136m'$RULE
+    printf '%s\n' "${c/"$rule"/$'\n\e[m* Working (12s, esc to interrupt)\n'$rule}"
+}
+
+# The idle capture with a line above the frame reporting agents still running.
+screen_with_waiting_line() {
+    local c rule
+    c=$(<"$FIXTURES/claude-idle.ansi")
+    rule=$'\n\e[m\e[38:2:136:136:136m'$RULE
+    printf '%s\n' "${c/"$rule"/$'\n\e[mWaiting for 2 background agents to finish\n'$rule}"
+}
+
+# The idle capture with a task list under the status lines.
+screen_with_panel() {
+    cat "$FIXTURES/claude-idle.ansi"
+    printf '%s\n' '  main' '  shell-developer  Execute: a task' '  lisp-developer   Execute: another'
 }
 
 mksock() {
@@ -119,9 +169,13 @@ mksock() {
 }
 
 # mkls SOCK SPEC...: write the `ls` fixture for kitty-SOCK. SPEC is
-# title|window-id|window-pid|cwd|kind[|self] with kind claude, sbcl or shell.
+# title|window-id|window-pid|cwd|kind[|self] with kind claude, sbcl, vim or shell.
 mkls() {
-    local sock=$1
+    mkls_to "$FX/ls/kitty-$1.json" "${@:2}"
+}
+
+mkls_to() {
+    local out=$1
     shift
     printf '%s\n' "$@" | jq -R -s '
         split("\n") | map(select(length > 0) | split("|"))
@@ -136,9 +190,11 @@ mkls() {
                               "direnv", "exec", .[3], "claude", "--permission-mode", "auto", "/worker"] }
                 elif .[4] == "sbcl" then
                   { pid: ((.[2] | tonumber) + 1), cwd: .[3], cmdline: ["sbcl"] }
+                elif .[4] == "vim" then
+                  { pid: ((.[2] | tonumber) + 1), cwd: .[3], cmdline: ["vim", "claude"] }
                 else
                   { pid: ((.[2] | tonumber) + 1), cwd: .[3], cmdline: ["-zsh"] }
-                end ] } ] }) } ]' > "$FX/ls/kitty-$sock.json"
+                end ] } ] }) } ]' > "$out"
 }
 
 # seed SOCK WIN SLUG: transcript directory (slug written by hand) holding one
@@ -153,13 +209,12 @@ seed() {
     screen_idle "$sock" "$win"
 }
 
-screen_idle() {
-    printf '%s\n' 'earlier output' "$RULE" "${GLYPH}${NBSP}" "$RULE" '  status line' > "$FX/screen/kitty-$1-$2"
-}
-
-screen_text() {
-    printf '%s\n' 'earlier output' "$RULE" "$3" "$RULE" '  status line' > "$FX/screen/kitty-$1-$2"
-}
+screen_idle()   { cp "$FIXTURES/claude-idle.ansi" "$FX/screen/kitty-$1-$2"; }
+screen_typed()  { screen_typed_text "$3" > "$FX/screen/kitty-$1-$2"; }
+screen_from()   { cp "$FIXTURES/$3" "$FX/screen/kitty-$1-$2"; }
+screen_busy()   { screen_with_busy_line > "$FX/screen/kitty-$1-$2"; }
+screen_waiting() { screen_with_waiting_line > "$FX/screen/kitty-$1-$2"; }
+screen_panel()  { screen_with_panel > "$FX/screen/kitty-$1-$2"; }
 
 FAST=(--poll 0.05 --timeout 5)
 OUT="" ERR="" RC=0
@@ -230,20 +285,19 @@ try "[self-foreign-is-self] same window id on another socket is not the caller" 
     test "$RC" = 0 -a -n "$(sendlog)"
 
 one_sister
-screen_text A 16 "${GLYPH}${NBSP}"
-printf '%s\n' 'working' "$RULE" "${GLYPH}${NBSP}" "$RULE" '  esc to interrupt' > "$FX/screen/kitty-A-16"
+screen_busy A 16
 run "${FAST[@]}" zebra
 try "[busy-esc] running turn refused, nothing typed" "rc=$RC err=$ERR out=$OUT" \
     test "$RC" = 1 -a -z "$(sendlog)"
 
 one_sister
-screen_text A 16 "${GLYPH}${NBSP}half typed"
+screen_typed A 16 "half typed"
 run "${FAST[@]}" zebra
 try "[busy-typed] half-typed prompt refused, nothing typed" "rc=$RC err=$ERR out=$OUT" \
     test "$RC" = 1 -a -z "$(sendlog)"
 
 one_sister
-screen_text A 16 "${GLYPH}${NBSP}"
+screen_idle A 16
 run "${FAST[@]}" zebra
 try "[idle-nbsp] prompt holding only U+00A0 is idle" "rc=$RC err=$ERR out=$OUT" \
     test "$RC" = 0 -a -n "$(sendlog)"
@@ -361,7 +415,7 @@ try "[path-target] directory picks the one window of two same-named tabs" "rc=$R
     test "$RC" = 0 -a -n "$(sendlog)" -a -z "$(grep '^kitty-B' "$FX/sendlog")"
 
 three
-screen_text A 12 "${GLYPH}${NBSP}half typed"
+screen_typed A 12 "half typed"
 run "${FAST[@]}" alpha beta gamma
 try "[multi-sequential] stops at the first refusal, later target not-run" "rc=$RC out=$OUT log=$(sendlog)" \
     test "$RC" = 1 -a "$(sed -n 1p <<<"$OUT" | awk '{print $NF}')" = ok \
@@ -385,7 +439,7 @@ try "[dry-run] every target would restart, nothing typed" "rc=$RC out=$OUT" \
     -a -n "$(grep '^alpha .* old=old-session new=- would-restart$' <<<"$OUT")"
 
 three
-screen_text A 12 "${GLYPH}${NBSP}half typed"
+screen_typed A 12 "half typed"
 run "${FAST[@]}" -n alpha beta
 try "[dry-run-busy] the busy target is refused, nothing typed" "rc=$RC out=$OUT" \
     test "$RC" = 1 -a -z "$(sendlog)" -a -n "$(grep '^beta .* refused: ' <<<"$OUT")" \
@@ -415,13 +469,128 @@ try "[duplicate-target] same target twice exits 2, nothing sent" "rc=$RC err=$ER
 note "installed layout"
 
 one_sister
-make --no-print-directory -C "$REPO_ROOT" install-restart-session PREFIX="$WORK/prefix" >"$WORK/make.out" 2>&1
+# BINDIR and LIBDIR in the environment must not redirect the install onto the
+# operator's deployed copies.
+mkdir -p "$WORK/decoy"
+BINDIR=$WORK/decoy LIBDIR=$WORK/decoy make --no-print-directory -C "$REPO_ROOT" install-restart-session \
+    PREFIX="$WORK/prefix" BINDIR="$WORK/prefix/bin" LIBDIR="$WORK/prefix/lib/dsmr-mcp" >"$WORK/make.out" 2>&1
 "$WORK/prefix/bin/restart-session-in-place.sh" "${FAST[@]}" --dry-run zebra > "$WORK/out" 2> "$WORK/err"
 RC=$?
 OUT=$(<"$WORK/out")
 ERR=$(<"$WORK/err")
 try "[installed-layout] installed copy finds its library and runs" "rc=$RC err=$ERR out=$OUT" \
-    test "$RC" = 0 -a -f "$WORK/prefix/lib/dsmr-mcp/kitty-sockets.sh" -a -n "$(grep 'would-restart$' <<<"$OUT")" -a -z "$(sendlog)"
+    test "$RC" = 0 -a -f "$WORK/prefix/lib/dsmr-mcp/kitty-sockets.sh" -a -n "$(grep 'would-restart$' <<<"$OUT")" -a -z "$(sendlog)" -a -z "$(ls -A "$WORK/decoy")"
+
+note "idle test against real captures"
+
+one_sister
+screen_from A 16 claude-idle-suggestion.ansi
+run "${FAST[@]}" zebra
+try "[ghost-suggestion-idle] a dim suggested prompt is not typed input" "rc=$RC err=$ERR out=$OUT" \
+    test "$RC" = 0 -a -n "$(sendlog)"
+
+one_sister
+screen_from A 16 zsh-prompt.ansi
+run "${FAST[@]}" zebra
+try "[zsh-prompt] a shell's bare prompt glyph is not an idle Claude prompt" "rc=$RC err=$ERR out=$OUT" \
+    test "$RC" = 1 -a -z "$(sendlog)" -a -n "$(grep 'no Claude Code prompt frame' <<<"$OUT")"
+
+one_sister
+screen_from A 16 claude-agents-running.ansi
+run "${FAST[@]}" zebra
+try "[agents-running] a session with agents in flight is refused" "rc=$RC err=$ERR out=$OUT" \
+    test "$RC" = 1 -a -z "$(sendlog)"
+
+one_sister
+screen_waiting A 16
+run "${FAST[@]}" zebra
+try "[waiting-line] the waiting-for-agents line alone refuses" "rc=$RC err=$ERR out=$OUT" \
+    test "$RC" = 1 -a -z "$(sendlog)" -a -n "$(grep 'background agents are running' <<<"$OUT")"
+
+one_sister
+screen_panel A 16
+run "${FAST[@]}" zebra
+try "[panel-open] a task panel under the status lines alone refuses" "rc=$RC err=$ERR out=$OUT" \
+    test "$RC" = 1 -a -z "$(sendlog)" -a -n "$(grep 'panel is open' <<<"$OUT")"
+
+note "claude process guard"
+
+for kind in sbcl shell vim; do
+    reset
+    mksock A
+    mkls A "zebra|16|5000010|/h/lisp/zebra|$kind"
+    seed A 16 -h-lisp-zebra
+    run "${FAST[@]}" zebra
+    try "[claude-guard-$kind] title and cwd match but the process is not claude" "rc=$RC err=$ERR out=$OUT" \
+        test "$RC" = 1 -a -z "$(sendlog)" -a -n "$(grep 'refused: no matching session' <<<"$OUT")"
+done
+
+one_sister
+mkls_to "$FX/lsonget/kitty-A-16" "zebra|16|5000010|/h/lisp/zebra|shell"
+run "${FAST[@]}" zebra
+try "[foreground-recheck-first] window turned into a shell before /clear: refused" "rc=$RC err=$ERR out=$OUT" \
+    test "$RC" = 1 -a -z "$(sendlog)" -a -n "$(grep 'foreground process changed' <<<"$OUT")"
+
+one_sister
+mkls_to "$FX/lsafterclear/kitty-A-16" "zebra|16|5000010|/h/lisp/zebra|shell"
+run "${FAST[@]}" zebra
+try "[foreground-recheck-followup] window turned into a shell after /clear: follow-up never sent" "rc=$RC err=$ERR out=$OUT log=$(sendlog)" \
+    test "$RC" = 1 -a "$(sendlog)" = 'kitty-A 16 0 /clear\r' -a -n "$(grep 'foreground process changed after /clear' <<<"$OUT")"
+
+note "transcript attribution"
+
+one_sister
+touch "$FX/decoy/kitty-A-16"
+run "${FAST[@]}" zebra
+new=$(newfile_stem A 16 2>/dev/null || echo none)
+try "[transcript-decoy] a transcript without the /clear record is not this window's" "rc=$RC err=$ERR out=$OUT" \
+    test "$RC" = 0 -a "$new" != none -a "$OUT" = "zebra unix:$SD/kitty-A 16 old=old-session new=$new ok"
+
+one_sister
+touch "$FX/wake/kitty-A-16" "$FX/noturn/kitty-A-16"
+run --poll 0.05 --timeout 1 zebra
+try "[wake-turn-not-followup] a turn the session started itself does not confirm the follow-up" "rc=$RC err=$ERR out=$OUT" \
+    test "$RC" = 1 -a -n "$(grep 'not answered' <<<"$OUT")"
+
+one_sister
+touch "$FX/wake/kitty-A-16"
+run "${FAST[@]}" --expect FIXTURE-INSTRUCTIONS-TEXT zebra
+try "[wake-turn-then-followup] the follow-up's own record after a wake turn is confirmed" "rc=$RC err=$ERR out=$OUT" \
+    test "$RC" = 0
+
+three
+touch "$FX/notranscript/kitty-A-11"
+run --poll 0.05 --timeout 1 alpha beta
+try "[multi-failure-stops] a failure after typing stops the next target" "rc=$RC out=$OUT log=$(sendlog)" \
+    test "$RC" = 1 -a "$(sendlog)" = 'kitty-A 11 0 /clear\r' \
+    -a -n "$(sed -n 1p <<<"$OUT" | grep '^alpha .* failed: ')" \
+    -a "$(sed -n 2p <<<"$OUT")" = "beta unix:$SD/kitty-A 12 old=- new=- not-run"
+
+one_sister
+KITTY_WINDOW_ID=16 run "${FAST[@]}" zebra
+try "[self-env-no-listen] window id alone, with no socket named, refuses" "rc=$RC err=$ERR out=$OUT" \
+    test "$RC" = 1 -a -z "$(sendlog)"
+
+one_sister
+run "${FAST[@]}" --then $'/a\tb' zebra
+try "[then-control-char] a control character in --then exits 2" "rc=$RC err=$ERR" test "$RC" = 2 -a -z "$(sendlog)"
+
+note "interrupted run"
+
+one_sister
+echo 100000 > "$FX/afterclear/kitty-A-16"
+"$SCRIPT" "${FAST[@]}" zebra > "$WORK/out" 2> "$WORK/err" &
+pid=$!
+for _ in $(seq 100); do
+    grep -q '/clear' "$FX/sendlog" && break
+    sleep 0.05
+done
+kill -TERM "$pid"
+wait "$pid"
+RC=$?
+OUT=$(<"$WORK/out")
+try "[interrupted] a killed run reports the half-restarted target" "rc=$RC out=$OUT" \
+    test "$RC" = 1 -a -n "$(grep '^zebra .* failed: interrupted after /clear was sent$' <<<"$OUT")"
 
 note "start-sisters socket discovery"
 
@@ -440,6 +609,25 @@ try "[start-sisters-socket] one socket addressed, several and none left as place
     test "$(grep -c -- "--to unix:$SD/kitty-A" <<<"$one")" -ge 1 \
     -a "$(grep -c -- '<several-sockets-found>' <<<"$two")" -ge 1 \
     -a "$(grep -c -- '<no-socket-found>' <<<"$none")" -ge 1
+
+note "start-sisters without a checkout beside it"
+
+reset
+mkdir -p "$WORK/ss/bin" "$WORK/ss/lib/dsmr-mcp" "$WORK/lone"
+cp "$REPO_ROOT/scripts/start-sisters.sh" "$WORK/lone/"
+cp "$REPO_ROOT/scripts/start-sisters.sh" "$WORK/ss/bin/"
+cp "$REPO_ROOT/scripts/kitty-sockets.sh" "$WORK/ss/lib/dsmr-mcp/"
+mkdir -p "$WORK/fleet/solo/.git" "$WORK/fleet/solo/.planning"
+ss_args=(--no-scan --extra "$WORK/fleet/solo" --no-direnv --no-stagger --dry-run)
+lone_to=$(KITTY_LISTEN_ON=unix:$SD/kitty-A "$WORK/lone/start-sisters.sh" "${ss_args[@]}" 2>&1); lone_rc=$?
+mksock A
+lone_find=$("$WORK/lone/start-sisters.sh" "${ss_args[@]}" 2>&1); lone_find_rc=$?
+inst=$("$WORK/ss/bin/start-sisters.sh" "${ss_args[@]}" 2>&1); inst_rc=$?
+try "[start-sisters-no-library] a given socket needs no library" "rc=$lone_rc out=$lone_to" test "$lone_rc" = 0
+try "[start-sisters-no-library] discovery without a library says so" "rc=$lone_find_rc out=$lone_find" \
+    test "$lone_find_rc" != 0 -a -n "$(grep 'kitty-sockets.sh not found' <<<"$lone_find")"
+try "[start-sisters-installed-layout] library found under ../lib/dsmr-mcp" "rc=$inst_rc out=$inst" \
+    test "$inst_rc" = 0 -a -n "$(grep -- "--to unix:$SD/kitty-A" <<<"$inst")"
 
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 ((FAILED == 0))

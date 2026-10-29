@@ -11,7 +11,7 @@
 # The only keystrokes sent are a command followed by Enter. Nothing interrupts a
 # turn, and a session that is busy or holds half-typed input is refused.
 #
-# This is general tooling and knows no fleet. The caller names the targets.
+# General tooling with no fleet roster: the caller names the targets.
 
 set -euo pipefail
 # Byte-wise string handling: the prompt glyph is matched as bytes, and
@@ -34,7 +34,7 @@ Usage: $PROGNAME [options] TARGET...
 
 Restart the Claude Code session running in each named kitty tab: type /clear,
 wait for a new transcript and an idle prompt, then type a follow-up command and
-wait for its first turn. No new window is opened.
+wait for it to be answered. No new window is opened.
 
 A TARGET is a tab title NAME, or a path. A name matches the one window whose tab
 title is NAME and whose claude process runs in a directory called NAME, across
@@ -45,7 +45,7 @@ last component; use it when a name is ambiguous.
 Options:
   --then CMD         follow-up command, default /worker. Must start with "/" and
                      hold no backslash or control character. '' clears only.
-  --expect PATTERN   after the follow-up's first turn, require PATTERN (a fixed
+  --expect PATTERN   once the follow-up is answered, require PATTERN (a fixed
                      string) in the new transcript, else fail. Not allowed with
                      --then ''. File times are never consulted.
   --timeout SECONDS  bound on each wait, default 120
@@ -54,11 +54,13 @@ Options:
   -h, --help         this text
 
 Several targets are restarted strictly one at a time, in argument order. Every
-target is resolved and checked before anything is typed. The first refusal or
-failure stops the run, and later targets are reported not-run.
+target is resolved before anything is typed; each session is checked for an idle
+prompt just before its own restart, and --dry-run checks them all. In a real run
+the first refusal or failure stops it, and later targets are reported not-run.
 
 A session is refused, with nothing typed, when it is the calling window, shows
-"esc to interrupt", or holds typed text after the prompt glyph. The only
+"esc to interrupt", has background agents or a task panel open, shows no Claude
+Code prompt frame, or holds typed text (dim suggestions do not count). The only
 keystrokes ever sent are a command and Enter.
 
 Standard output, one line per target:
@@ -71,8 +73,9 @@ marks an unknown field. VERDICT is one of:
   failed: REASON    typing began and a stage did not complete
   not-run           an earlier target stopped the run
 
-Exit status: 0 every target ok, 1 any refused or failed, 2 usage error,
-3 unsupported environment (no kitten, jq, or reachable kitty socket).
+Exit status: 0 every target ok (would-restart under --dry-run), 1 any refused or
+failed, 2 usage error or two targets resolving to one window, 3 unsupported environment
+(no kitten, jq, or reachable kitty socket).
 
 Environment: DSMR_KITTEN names the kitten binary, DSMR_KITTY_SOCKET_DIR the
 directory searched for kitty-* sockets (default /tmp), CLAUDE_CONFIG_DIR the
@@ -119,6 +122,7 @@ done
 
 is_number "$TIMEOUT" || die_usage "--timeout needs a number of seconds: $TIMEOUT"
 is_number "$POLL" || die_usage "--poll needs a number of seconds: $POLL"
+[[ $POLL =~ ^0*\.0[0-4] || $POLL =~ ^0+(\.0*)?$ ]] && die_usage "--poll must be at least 0.05 seconds: $POLL"
 # kitty decodes backslash escapes in send-text, so a backslash in the command
 # would not arrive as typed.
 if [[ -n $THEN_CMD ]]; then
@@ -187,23 +191,100 @@ wait_for() {
 }
 
 PROMPT_GLYPH=$'\xe2\x9d\xaf'
-BOX_BAR=$'\xe2\x94\x82'
+RULE_CH=$'\xe2\x94\x80'
 NBSP=$'\xc2\xa0'
 
-# Succeeds when the window shows an empty prompt and no running turn.
-# The prompt line is the last one whose first non-blank character, after an
-# optional box-drawing bar, is the prompt glyph; anything after the glyph other
-# than ASCII whitespace and U+00A0 is typed input.
+# Remove terminal escape sequences from stdin.
+strip_ansi() {
+    sed -E 's/\x1b\[[0-9;:?]*[A-Za-z]//g; s/\x1b\][^\x07\x1b]*(\x07|\x1b\\)//g'
+}
+
+# Remove escape sequences from stdin and drop text rendered dim (SGR 2): Claude
+# Code paints its suggested next prompt that way, and it is not typed input.
+visible_text() {
+    awk '
+    { s = $0; out = ""; dim = 0
+      while (s != "") {
+        if (match(s, /^\033\[[0-9;:]*m/)) {
+            seq = substr(s, 3, RLENGTH - 3); s = substr(s, RLENGTH + 1)
+            n = split(seq, p, ";")
+            if (seq == "") dim = 0
+            for (k = 1; k <= n; k++) {
+                v = p[k]
+                if (v ~ /:/) continue
+                if (v == 38 || v == 48 || v == 58) { k += (p[k + 1] == 5) ? 2 : 4; continue }
+                if (v == "" || v == 0 || v == 22) dim = 0
+                else if (v == 2) dim = 1
+            }
+        } else if (match(s, /^\033\[[0-9;:?]*[A-Za-z]/)) {
+            s = substr(s, RLENGTH + 1)
+        } else if (match(s, /^\033\][^\007\033]*(\007|\033\\)/)) {
+            s = substr(s, RLENGTH + 1)
+        } else {
+            if (!dim) out = out substr(s, 1, 1)
+            s = substr(s, 2)
+        }
+      }
+      print out }'
+}
+
+# Why window_idle last said no.
+IDLE_WHY=""
+
+# Succeeds when the window shows Claude Code's own idle prompt: a rule line, one
+# prompt line holding nothing but dim suggestion text, a rule line, and nothing
+# below them but the two status lines. A bare prompt glyph with no such frame is
+# a shell, and a panel below the frame means agents or tasks are in flight, so
+# both refuse. Anything doubtful refuses.
 window_idle() {
-    local addr=$1 win=$2 text line
-    text=$(kit "$addr" get-text --match "id:$win") || return 1
-    [[ $text == *"esc to interrupt"* ]] && return 1
-    line=$(grep -a -E -- "^[[:space:]]*(${BOX_BAR}[[:space:]]*)?${PROMPT_GLYPH}" <<<"$text" | tail -n 1) || true
-    [[ -n $line ]] || return 1
+    local addr=$1 win=$2 raw i j a b nb=0 line
+    local -a rl=() pl=() rules=() ctx=()
+    IDLE_WHY=""
+    raw=$(kit "$addr" get-text --ansi --match "id:$win") || { IDLE_WHY="screen unreadable"; return 1; }
+    mapfile -t rl <<<"$raw"
+    mapfile -t pl < <(strip_ansi <<<"$raw")
+    for ((i = 0; i < ${#pl[@]}; i++)); do
+        [[ ${pl[i]} =~ ^[[:space:]]*(${RULE_CH}){10,}[[:space:]]*$ ]] && rules+=("$i")
+    done
+    if ((${#rules[@]} < 2)); then
+        IDLE_WHY="no Claude Code prompt frame on screen"
+        return 1
+    fi
+    a=${rules[-2]} b=${rules[-1]}
+    if ((b - a != 2)) || [[ ! ${pl[a + 1]} =~ ^[[:space:]]*${PROMPT_GLYPH} ]]; then
+        IDLE_WHY="no Claude Code prompt frame on screen"
+        return 1
+    fi
+    # The three non-blank lines above the frame, nearest first.
+    for ((j = a - 1; j >= 0 && ${#ctx[@]} < 3; j--)); do
+        [[ -n ${pl[j]//[[:space:]]/} ]] && ctx+=("${pl[j]}")
+    done
+    for line in "${ctx[@]}" "${pl[@]:b+1}"; do
+        if [[ $line == *"esc to interrupt"* ]]; then
+            IDLE_WHY="a turn is running"
+            return 1
+        fi
+    done
+    if ((${#ctx[@]})) && [[ ${ctx[0]} =~ Waiting\ for\ [0-9]+\ background\ agent ]]; then
+        IDLE_WHY="background agents are running"
+        return 1
+    fi
+    for line in "${pl[@]:b+1}"; do
+        [[ -n ${line//[[:space:]]/} ]] && nb=$((nb + 1))
+    done
+    if ((nb > 2)); then
+        IDLE_WHY="a task or agent panel is open"
+        return 1
+    fi
+    line=$(visible_text <<<"${rl[a + 1]}")
     line=${line#*"$PROMPT_GLYPH"}
     line=${line//"$NBSP"/}
     line=${line//[[:space:]]/}
-    [[ -z $line ]]
+    if [[ -n $line ]]; then
+        IDLE_WHY="the prompt holds typed input"
+        return 1
+    fi
+    return 0
 }
 
 # Session cwd to the directory Claude Code keeps its transcripts in.
@@ -213,7 +294,7 @@ transcript_dir() {
 }
 
 # Ancestor pids of this process, one per line, so the window this script runs in
-# can be recognised whichever kitty instance it belongs to.
+# can be recognized whichever kitty instance it belongs to.
 ancestry() {
     local pid=$$ stat
     while [[ $pid =~ ^[0-9]+$ ]] && ((pid > 1)) && [[ -r /proc/$pid/stat ]]; do
@@ -250,32 +331,67 @@ window_is_self() {
     return 1
 }
 
+# jq: a foreground process is the claude session when argv[0] is claude, or when
+# it is script(1) wrapping claude (optionally under "direnv exec DIR"). An
+# argument that merely says "claude" (vim claude) does not count.
+# shellcheck disable=SC2016  # jq program text; $ is not a shell expansion
+JQ_CLAUDE='
+def base: split("/") | map(select(length > 0)) | last // "";
+def nz: if . == "" then "-" else . end;
+def isclaude:
+  (.cmdline // []) as $c
+  | ($c[0] // "" | base) as $a0
+  | if $a0 == "claude" then true
+    elif $a0 == "script" then
+      (($c | index("--")) as $d
+       | if $d == null then false
+         else ($c[$d + 1:]) as $r
+           | (if ($r[0] // "" | base) == "direnv" and ($r[1] // "") == "exec" then $r[3:] else $r end)
+           | ((.[0] // "") | base) == "claude"
+         end)
+    else false end;
+'
+
 # Window rows for one target across one socket's ls output, tab separated:
 # candidate, match, title, window id, window pid, foreground pids, cwd, claude.
 # $2 is a tab title for a name target (isp 0), or a directory for a path target
 # (isp 1), whose tab title is that directory's last component.
 window_rows() {
     local json=$1 key=$2 isp=$3
-    jq -r --arg key "$key" --arg isp "$isp" '
-        def base: split("/") | map(select(length > 0)) | last // "";
+    jq -r --arg key "$key" --arg isp "$isp" "$JQ_CLAUDE"'
         def here($cwd): if $isp == "1" then $cwd == $key else ($cwd | base) == $key end;
         ($key | base) as $bn
         | .[] | .tabs[]? as $t | $t.windows[]? | . as $w
         | [ $w.foreground_processes[]? ] as $fg
-        | [ $fg[] | select(any((.cmdline // [])[]; (split("/") | last) == "claude")) | .cwd ] as $cc
+        | [ $fg[] | select(isclaude) | .cwd ] as $cc
         | ($cc | first // "") as $ccwd
         | ($t.title // "") as $title
         | [ ($title == $bn or any($fg[]; here(.cwd // ""))),
             ($title == $bn and $ccwd != "" and here($ccwd)),
-            $title, ($w.id | tostring), ($w.pid | tostring),
-            ([ $fg[].pid | tostring ] | join(",")),
+            ($title | nz), ($w.id | tostring), ($w.pid | tostring),
+            ([ $fg[].pid | tostring ] | join(",") | nz),
             ($ccwd | if . == "" then ($fg[0].cwd // $w.cwd // "-") else . end),
             ($ccwd != "") ]
         | @tsv' <<<"$json"
 }
 
+# Succeeds when window $2 on socket $1 still has tab title $3 and the foreground
+# processes $4 it had at resolution, and one of them is the claude session.
+# Windows outlive their process: a claude started by hand from a shell leaves
+# the shell behind when it exits, and typing /clear there would run it.
+still_claude() {
+    local addr=$1 win=$2 title=$3 fpids=$4 json
+    json=$(kit "$addr" ls 2>/dev/null) || return 1
+    jq -e --arg w "$win" --arg t "$title" --arg f "$fpids" "$JQ_CLAUDE"'
+        [ .[] | .tabs[]? | (.title // "" | nz) as $tt | .windows[]? | select((.id | tostring) == $w)
+          | { tt: $tt, fg: (.foreground_processes // []) } ] as $m
+        | ($m | length) == 1 and $m[0].tt == $t
+          and ([ $m[0].fg[].pid | tostring ] | join(",") | nz) == $f
+          and ($m[0].fg | any(isclaude))' <<<"$json" >/dev/null
+}
+
 # Result of restart_target.
-VERDICT="" OLD_ID="-" NEW_ID="-"
+VERDICT="" OLD_ID="-" NEW_ID="-" STAGE=""
 
 latest_stem() {
     local dir=$1 f best="" newest=0 m
@@ -299,52 +415,83 @@ jsonl_names() {
 }
 
 NEW_FILES=()
-# Succeeds when the directory holds at least one *.jsonl absent from SNAPSHOT.
+# Succeeds when the directory holds a *.jsonl absent from SNAPSHOT that records
+# the /clear command. Another session in the same directory can start a
+# transcript of its own at the same moment; only the command record ties a file
+# to this window.
 # shellcheck disable=SC2329  # run through wait_for
 new_transcript_present() {
     local dir=$1 n
     NEW_FILES=()
     while IFS= read -r n; do
         [[ -n $n ]] || continue
-        [[ $'\n'"$SNAPSHOT"$'\n' == *$'\n'"$n"$'\n'* ]] || NEW_FILES+=("$n")
+        [[ $'\n'"$SNAPSHOT"$'\n' == *$'\n'"$n"$'\n'* ]] && continue
+        if grep -aq -F -e '<command-name>/clear</command-name>' -- "$dir/$n"; then
+            NEW_FILES+=("$n")
+        fi
     done < <(jsonl_names "$dir")
     ((${#NEW_FILES[@]} > 0))
 }
 
+# Succeeds when transcript $1 records command $2 (its first word) and an
+# assistant record follows. A turn the bus listener starts on its own writes an
+# assistant record too, so the command record has to come first.
 # shellcheck disable=SC2329  # run through wait_for
-has_assistant_record() {
-    [[ -f $1 ]] && grep -aq -F -e '"type":"assistant"' -- "$1"
+followup_answered() {
+    local file=$1 name=${2%% *} n
+    [[ -f $file ]] || return 1
+    n=$(grep -an -F -m1 -e "<command-name>$name</command-name>" -- "$file" | cut -d: -f1) || true
+    [[ -n $n ]] || return 1
+    grep -aq -F -e '"type":"assistant"' <(tail -n +$((n + 1)) -- "$file")
 }
 
 SNAPSHOT=""
 
 # Type /clear and the follow-up into the resolved window, waiting for each
-# effect. Sets VERDICT and NEW_ID.
+# effect. Sets VERDICT, OLD_ID, NEW_ID and STAGE. The idle test and the
+# foreground check run immediately before every keystroke.
 restart_target() {
-    local addr=$1 win=$2 dir=$3 file
-    OLD_ID=- NEW_ID=-
-    window_idle "$addr" "$win" || { VERDICT="refused: session is busy or has typed input"; return 1; }
+    local addr=$1 win=$2 dir=$3 title=$4 fpids=$5 file
+    OLD_ID=- NEW_ID=- STAGE=""
+    if ! window_idle "$addr" "$win"; then
+        VERDICT="refused: session is not idle: $IDLE_WHY"
+        return 1
+    fi
+    if ! still_claude "$addr" "$win" "$title" "$fpids"; then
+        VERDICT="refused: foreground process changed since resolution"
+        return 1
+    fi
     SNAPSHOT=$(jsonl_names "$dir")
     OLD_ID=$(latest_stem "$dir")
-    kit "$addr" send-text --match "id:$win" '/clear\r' || { VERDICT="failed: send-text /clear"; return 1; }
+    note "$title: typing /clear"
+    STAGE="while /clear was being sent"
+    kit "$addr" send-text --match "id:$win" '/clear\r' || { VERDICT="failed: send-text /clear (delivery unknown)"; return 1; }
+    STAGE="after /clear was sent"
     if ! wait_for new_transcript_present "$dir"; then
-        VERDICT="failed: no new transcript within ${TIMEOUT}s after /clear"
+        VERDICT="failed: no new transcript recording /clear within ${TIMEOUT}s"
         return 1
     fi
     if ((${#NEW_FILES[@]} > 1)); then
-        VERDICT="failed: ${#NEW_FILES[@]} new transcripts appeared after /clear, cannot attribute"
+        VERDICT="failed: ${#NEW_FILES[@]} new transcripts recorded /clear, cannot attribute"
         return 1
     fi
     file=$dir/${NEW_FILES[0]}
     NEW_ID=${NEW_FILES[0]%.jsonl}
     if ! wait_for window_idle "$addr" "$win"; then
-        VERDICT="failed: prompt not idle within ${TIMEOUT}s after /clear"
+        VERDICT="failed: prompt not idle within ${TIMEOUT}s after /clear ($IDLE_WHY)"
         return 1
     fi
     if [[ -n $THEN_CMD ]]; then
-        kit "$addr" send-text --match "id:$win" "$THEN_CMD"'\r' || { VERDICT="failed: send-text $THEN_CMD"; return 1; }
-        if ! wait_for has_assistant_record "$file"; then
-            VERDICT="failed: no assistant record within ${TIMEOUT}s after $THEN_CMD"
+        if ! still_claude "$addr" "$win" "$title" "$fpids"; then
+            VERDICT="failed: foreground process changed after /clear, $THEN_CMD not sent"
+            return 1
+        fi
+        note "$title: typing $THEN_CMD"
+        STAGE="while $THEN_CMD was being sent"
+        kit "$addr" send-text --match "id:$win" "$THEN_CMD"'\r' || { VERDICT="failed: send-text $THEN_CMD (delivery unknown)"; return 1; }
+        STAGE="after $THEN_CMD was sent"
+        if ! wait_for followup_answered "$file" "$THEN_CMD"; then
+            VERDICT="failed: $THEN_CMD not answered in the new transcript within ${TIMEOUT}s"
             return 1
         fi
     fi
@@ -375,7 +522,7 @@ done
 ((reachable)) || unsupported "no kitty socket answered ls"
 
 # Per-target state, indexed like TARGETS.
-T_SOCK=() T_WIN=() T_WPID=() T_FPIDS=() T_CWD=() T_TDIR=()
+T_SOCK=() T_WIN=() T_WPID=() T_FPIDS=() T_CWD=() T_TDIR=() T_TITLE=()
 T_OLD=() T_NEW=() T_VERDICT=() T_STATE=()
 
 # Resolve target $1 to a window, or record why it is refused. Candidate windows
@@ -397,7 +544,7 @@ resolve_target() {
         while IFS=$'\t' read -r cand match title win wpid fpids cwd claude; do
             [[ $cand == true ]] || continue
             cands+=("  candidate: $addr window=$win tab=$title cwd=$cwd claude=$([[ $claude == true ]] && echo yes || echo no)")
-            [[ $match == true ]] && found+=("$addr"$'\t'"$win"$'\t'"$wpid"$'\t'"$fpids"$'\t'"$cwd")
+            [[ $match == true ]] && found+=("$addr"$'\t'"$win"$'\t'"$wpid"$'\t'"$fpids"$'\t'"$cwd"$'\t'"$title")
         done < <(window_rows "$json" "$key" "$isp")
     done
     if ((${#found[@]} != 1)); then
@@ -411,7 +558,7 @@ resolve_target() {
         T_STATE[i]=refused
         return 0
     fi
-    IFS=$'\t' read -r 'T_SOCK[i]' 'T_WIN[i]' 'T_WPID[i]' 'T_FPIDS[i]' 'T_CWD[i]' <<<"${found[0]}"
+    IFS=$'\t' read -r 'T_SOCK[i]' 'T_WIN[i]' 'T_WPID[i]' 'T_FPIDS[i]' 'T_CWD[i]' 'T_TITLE[i]' <<<"${found[0]}"
     if window_is_self "${T_SOCK[i]}" "${T_WIN[i]}" "${T_WPID[i]}" "${T_FPIDS[i]}"; then
         T_STATE[i]=refused T_VERDICT[i]="refused: this is the calling window"
         return 0
@@ -468,7 +615,7 @@ if ((DRY_RUN)); then
             T_OLD[i]=$(latest_stem "${T_TDIR[i]}")
             T_VERDICT[i]=would-restart
         else
-            T_VERDICT[i]="refused: session is busy or has typed input"
+            T_VERDICT[i]="refused: session is not idle: $IDLE_WHY"
             status=1
         fi
         emit "$i"
@@ -476,15 +623,36 @@ if ((DRY_RUN)); then
     exit "$status"
 fi
 
+# A run killed mid-sequence still reports the target it was typing into and
+# the ones it never reached, so a half-restarted window is never silent.
+CUR=-1
+# shellcheck disable=SC2329  # run by the trap
+on_signal() {
+    local k
+    trap '' INT TERM HUP
+    if ((CUR >= 0)); then
+        T_OLD[CUR]=$OLD_ID T_NEW[CUR]=$NEW_ID
+        T_VERDICT[CUR]="failed: interrupted ${STAGE:-before typing}"
+        emit "$CUR"
+        for ((k = CUR + 1; k < count; k++)); do
+            T_VERDICT[k]=not-run
+            emit "$k"
+        done
+    fi
+    exit 1
+}
+trap on_signal INT TERM HUP
+
 for ((i = 0; i < count; i++)); do
     if ((status)); then
         T_VERDICT[i]=not-run
         emit "$i"
         continue
     fi
-    VERDICT="" OLD_ID=- NEW_ID=-
-    if restart_target "${T_SOCK[i]}" "${T_WIN[i]}" "${T_TDIR[i]}"; then :; else status=1; fi
+    CUR=$i VERDICT="" OLD_ID=- NEW_ID=- STAGE=""
+    if restart_target "${T_SOCK[i]}" "${T_WIN[i]}" "${T_TDIR[i]}" "${T_TITLE[i]}" "${T_FPIDS[i]}"; then :; else status=1; fi
     T_OLD[i]=$OLD_ID T_NEW[i]=$NEW_ID T_VERDICT[i]=$VERDICT
+    CUR=-1
     emit "$i"
 done
 exit "$status"
