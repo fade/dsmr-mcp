@@ -2,15 +2,32 @@
 #
 # Live probes and transcript reports for the subagent-routing mod.
 #
-#   make-repo DIR --gsd-core local-pristine
-#       Build a scratch git repository that /gsd-quick can run in, holding a
-#       project-local gsd-core copy restored to the installer's files.
+#   make-repo DIR --gsd-core global|local-pristine [--specialized true|false]
+#       [--shapes LIST] [--executor-model opus|inherit]
+#       Build a scratch git repository that the GSD commands can run in, with
+#       the frozen probe fixtures. local-pristine adds a project-local gsd-core
+#       copy restored to the installer's files; global leaves the live install.
+#   describe SHAPE
+#       Print the task description for a probe shape: shell, lisp, mixed, docs.
 #   run REPO --session-id UUID [--config-dir DIR] [--plugin-dir DIR]
-#       [--capture DIR] [--debug-file FILE] [--append-system-prompt TEXT] -- PROMPT
+#       [--capture DIR] [--debug-file FILE] [--append-system-prompt TEXT]
+#       [--model MODEL] [--env KEY=VAL]... -- PROMPT
 #       Run one headless Claude Code session in REPO and print its transcript.
+#   run-arm ARM --gsd-core global|local-pristine --evidence DIR [--config-dir DIR]
+#       [--plugin-dir DIR|none] [--executor-model opus|inherit] [--capture DIR]
+#       [--only PATH[:SHAPE],...] [--env KEY=VAL]...
+#       Run the probe cells one session at a time and write the evidence.
 #   report TRANSCRIPT
 #       Print one TSV row per Agent call in a session: what was asked for,
 #       what ran (from the subagent's own records) and what the mod logged.
+#   ledger-row TRANSCRIPT...
+#       Print one TSV row per transcript: path, turns, cache_read, cache_write,
+#       output and models, each counted once per distinct message id.
+#   check ARM EXPECTED_TSV
+#       Compare the arm's report files, in the directory holding EXPECTED_TSV,
+#       with the expected routing; exit 1 on any mismatch.
+#   bus-silent ROOT
+#       Exit 1 and list the files when the bus state mentions ROOT.
 #   replay RECORDINGS_DIR [--mod DIR]
 #       Run the mod's replay tests over every recorded spawn in RECORDINGS_DIR,
 #       against a temporary copy of the mod (default: this repository's).
@@ -18,6 +35,9 @@
 #       Write one recording per Agent call of a listed subagent type found in
 #       each TRANSCRIPT, with a tape of the files the decision reads as they
 #       stand now. An `expected` block already in DIR for that call is kept.
+#
+# Environment: ROUTING_PROBE_PATH_MAP=FROM=TO makes report read a plan file
+# under TO where the dispatch named one under FROM (recorded transcripts).
 #
 # Exit status: 0 success, 1 failure, 64 usage.
 
@@ -31,14 +51,30 @@ CONFIG_HOME=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 PLANNING_DIR=.planning
 LOG_DIR=logs/subagent-routing
 PROBE_MODEL=claude-opus-5-5
+LEADER_MODEL=claude-sonnet-5-5
 PROBE_TIMEOUT=1800
+# A session whose subagents sum past this many tokens stops the arm.
+TOKEN_CAP=400000
+PROBE_FILES=(scripts/probe.sh src/probe.lisp Makefile docs/probe.md)
+SHAPES=(shell lisp mixed docs)
+# Agent types whose rows are routed executors; the rest must run as requested.
+EXECUTOR_TYPES=" gsd-executor shell-developer lisp-developer "
 
 usage() {
     cat <<EOF
-usage: $PROGNAME make-repo DIR --gsd-core local-pristine
+usage: $PROGNAME make-repo DIR --gsd-core global|local-pristine [--specialized true|false]
+                 [--shapes LIST] [--executor-model opus|inherit]
+       $PROGNAME describe shell|lisp|mixed|docs
        $PROGNAME run REPO --session-id UUID [--config-dir DIR] [--plugin-dir DIR]
-                 [--capture DIR] [--debug-file FILE] [--append-system-prompt TEXT] -- PROMPT
+                 [--capture DIR] [--debug-file FILE] [--append-system-prompt TEXT]
+                 [--model MODEL] [--env KEY=VAL]... -- PROMPT
+       $PROGNAME run-arm ARM --gsd-core global|local-pristine --evidence DIR [--config-dir DIR]
+                 [--plugin-dir DIR|none] [--executor-model opus|inherit] [--capture DIR]
+                 [--only PATH[:SHAPE],...] [--env KEY=VAL]...
        $PROGNAME report TRANSCRIPT
+       $PROGNAME ledger-row TRANSCRIPT...
+       $PROGNAME check ARM EXPECTED_TSV
+       $PROGNAME bus-silent ROOT
        $PROGNAME replay RECORDINGS_DIR [--mod DIR]
        $PROGNAME record-history --out DIR [--types LIST] [--max-per-session N] TRANSCRIPT...
 EOF
@@ -68,8 +104,136 @@ link_planning() {
     fi
 }
 
+# --- fixtures ----------------------------------------------------------------
+
+# probe_line FILE: the comment line a probe appends to FILE.
+probe_line() {
+    case "$1" in
+        scripts/probe.sh|Makefile) printf '%s\n' '# routing probe' ;;
+        src/probe.lisp) printf '%s\n' ';; routing probe' ;;
+        docs/probe.md) printf '%s\n' 'Routing probe.' ;;
+        *) return 1 ;;
+    esac
+}
+
+# shape_files SHAPE: the probe files a shape touches, space separated.
+shape_files() {
+    case "$1" in
+        shell) printf '%s\n' scripts/probe.sh ;;
+        lisp) printf '%s\n' src/probe.lisp ;;
+        mixed) printf '%s\n' 'src/probe.lisp Makefile' ;;
+        docs) printf '%s\n' docs/probe.md ;;
+        *) return 1 ;;
+    esac
+}
+
+# shape_number SHAPE: the two-digit plan number of a shape in the execute-phase fixture.
+shape_number() {
+    case "$1" in
+        shell) printf '%s\n' 01 ;;
+        lisp) printf '%s\n' 02 ;;
+        mixed) printf '%s\n' 03 ;;
+        docs) printf '%s\n' 04 ;;
+        *) return 1 ;;
+    esac
+}
+
+cmd_describe() {
+    [ $# -eq 1 ] || usage_error "describe needs one SHAPE"
+    case "$1" in
+        shell) printf '%s\n' 'Append the comment line "# routing probe" as the last line of scripts/probe.sh and change nothing else.' ;;
+        lisp) printf '%s\n' 'Append the comment line ";; routing probe" as the last line of src/probe.lisp using the structure-aware Lisp tools, and change nothing else. Do not load a system or run tests.' ;;
+        mixed) printf '%s\n' 'Append the comment line ";; routing probe" as the last line of src/probe.lisp using the structure-aware Lisp tools, and the comment line "# routing probe" as the last line of Makefile, and change nothing else. Do not load a system or run tests.' ;;
+        docs) printf '%s\n' 'Append the line "Routing probe." as the last line of docs/probe.md and change nothing else.' ;;
+        *) usage_error "unknown shape $1" ;;
+    esac
+}
+
+# write_plan DIR SHAPE: the execute-phase plan for one shape.
+write_plan() {
+    local dir=$1 shape=$2 num files hint=- f line verify="" out
+    local -a list
+    num=$(shape_number "$shape") || return 1
+    files=$(shape_files "$shape")
+    read -ra list <<<"$files"
+    [ "$shape" != shell ] || hint=shell-developer
+    for f in "${list[@]}"; do
+        line=$(probe_line "$f")
+        verify+="${verify:+ && }tail -n 1 $f | grep -qxF '$line'"
+    done
+    out=$dir/$PLANNING_DIR/phases/01-probe/01-$num-PLAN.md
+    {
+        printf -- '---\nphase: 01-probe\nplan: %s\ntype: execute\nwave: 1\ndepends_on: []\nfiles_modified:\n' "$num"
+        for f in "${list[@]}"; do printf '  - %s\n' "$f"; done
+        printf 'autonomous: true\n'
+        [ "$hint" = - ] || printf 'agent_hint: %s\n' "$hint"
+        printf 'requirements: []\n\nmust_haves:\n  truths:\n'
+        for f in "${list[@]}"; do
+            # shellcheck disable=SC2016 # backticks are literal plan text
+            printf '    - "The last line of %s is exactly `%s`"\n' "$f" "$(probe_line "$f")"
+        done
+        printf -- '---\n\n<objective>\nAppend one comment line to the probe file%s named below.\n</objective>\n\n' \
+            "$([ "${#list[@]}" -eq 1 ] || printf s)"
+        printf '<tasks>\n\n<task type="auto">\n  <name>Task 1: Append the probe line</name>\n  <files>%s</files>\n  <action>\n' "$files"
+        for f in "${list[@]}"; do
+            # shellcheck disable=SC2016 # backticks are literal plan text
+            printf '    Append the line `%s` as the last line of %s.\n' "$(probe_line "$f")" "$f"
+        done
+        printf '    Change nothing else.\n'
+        case "$files" in *probe.lisp*)
+            printf '    Use the structure-aware Lisp tools for the Lisp file. Do not load a system or run tests.\n' ;;
+        esac
+        printf '  </action>\n  <verify>\n    <automated>%s</automated>\n  </verify>\n' "$verify"
+        printf '  <done>Each file named above ends with its probe line.</done>\n</task>\n\n</tasks>\n'
+    } > "$out"
+}
+
+# write_verification DIR: four high-severity findings, one per probe shape.
+write_verification() {
+    cat > "$1/$PLANNING_DIR/phases/01-probe/01-VERIFICATION.md" <<'EOF'
+---
+phase: 01-probe
+status: gaps_found
+---
+
+# Probe Verification
+
+Four gaps remain, one per probe shape. Each probe file must end with its probe line.
+
+## Gaps
+
+### F-01 (high): the shell probe lacks its trailing line
+
+Files: scripts/probe.sh
+
+The last line of scripts/probe.sh must be the comment `# routing probe`.
+
+### F-02 (high): the Lisp probe lacks its trailing line
+
+Files: src/probe.lisp
+
+The last line of src/probe.lisp must be the comment `;; routing probe`.
+
+### F-03 (high): the mixed probe lacks both trailing lines
+
+Files: src/probe.lisp, Makefile
+
+The last line of src/probe.lisp must be `;; routing probe` and the last line of Makefile must be `# routing probe`.
+
+### F-04 (high): the document lacks its trailing line
+
+Files: docs/probe.md
+
+The last line of docs/probe.md must be `Routing probe.`
+EOF
+}
+
+# write_probe_files DIR SPECIALIZED SHAPES EXECUTOR_MODEL: sources, planning
+# state, config and the frozen plan and finding fixtures. SHAPES is a comma
+# list of the execute-phase plans to write (empty for none).
 write_probe_files() {
-    local dir=$1
+    local dir=$1 specialized=$2 shapes=$3 exmodel=$4 s n=0 plans=""
+    local -a want=()
     mkdir -p "$dir/scripts" "$dir/src" "$dir/docs"
     link_planning "$dir"
     printf '#!/usr/bin/env bash\necho "probe"\n' > "$dir/scripts/probe.sh"
@@ -78,7 +242,7 @@ write_probe_files() {
     printf 'test:\n\ttrue\n' > "$dir/Makefile"
     printf '# Probe\n\nA scratch repository for routing probes.\n' > "$dir/docs/probe.md"
 
-    jq -n '{
+    jq -n --argjson specialized "$specialized" --arg exmodel "$exmodel" '{
       mode: "yolo",
       model_profile: "balanced",
       parallelization: false,
@@ -91,24 +255,47 @@ write_probe_files() {
         auto_advance: false,
         use_worktrees: false
       },
-      planning: { agents: { executor: "lisp-developer", language: "common-lisp", specialized: true } },
-      model_overrides: { "gsd-executor": "opus" },
+      planning: { agents: { executor: "lisp-developer", language: "common-lisp", specialized: $specialized } },
+      model_overrides: { "gsd-executor": $exmodel },
       agent_skills: { "gsd-planner": ["global:executor-routing"] },
       git: { branching_strategy: "none" }
     }' > "$dir/$PLANNING_DIR/config.json"
 
-    cat > "$dir/$PLANNING_DIR/STATE.md" <<'EOF'
+    mkdir -p "$dir/$PLANNING_DIR/phases/01-probe"
+    write_verification "$dir"
+    IFS=, read -ra want <<<"$shapes"
+    for s in "${want[@]}"; do
+        [ -n "$s" ] || continue
+        write_plan "$dir" "$s" || die "unknown shape $s"
+        n=$((n + 1))
+        plans+="- [ ] 01-$(shape_number "$s")-PLAN.md - $s probe"$'\n'
+    done
+
+    cat > "$dir/$PLANNING_DIR/STATE.md" <<EOF
 # Project State
 
 ## Current Position
 
-Phase: none
-Status: idle
+Phase: 1 of 1 (Probe)
+Plan: 0 of $n
+Status: Ready to execute
 EOF
-    cat > "$dir/$PLANNING_DIR/ROADMAP.md" <<'EOF'
+    cat > "$dir/$PLANNING_DIR/ROADMAP.md" <<EOF
 # Roadmap
 
-Quick tasks only.
+## Phases
+
+- [ ] **Phase 1: Probe** - append one comment line to each probe file
+
+### Phase 1: Probe
+
+**Goal:** Append one comment line to each probe file.
+**Depends on:** Nothing
+**Requirements:** none
+**Plans:** $n plans
+
+Plans:
+$plans
 EOF
     cat > "$dir/$PLANNING_DIR/PROJECT.md" <<'EOF'
 # Probe
@@ -172,17 +359,22 @@ install_pristine() {
 }
 
 cmd_make_repo() {
-    local dir="" gsd=""
+    local dir="" gsd="" specialized=true shapes=shell,lisp,mixed,docs exmodel=opus
     while [ $# -gt 0 ]; do
         case "$1" in
             --gsd-core) [ $# -ge 2 ] || usage_error "--gsd-core needs a value"; gsd=$2; shift 2 ;;
+            --specialized) [ $# -ge 2 ] || usage_error "--specialized needs a value"; specialized=$2; shift 2 ;;
+            --shapes) [ $# -ge 2 ] || usage_error "--shapes needs a value"; shapes=$2; shift 2 ;;
+            --executor-model) [ $# -ge 2 ] || usage_error "--executor-model needs a value"; exmodel=$2; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             -*) usage_error "unknown option $1" ;;
             *) [ -z "$dir" ] || usage_error "one DIR only"; dir=$1; shift ;;
         esac
     done
     [ -n "$dir" ] || usage_error "make-repo needs DIR"
-    [ "$gsd" = local-pristine ] || usage_error "--gsd-core takes local-pristine"
+    case "$gsd" in global|local-pristine) ;; *) usage_error "--gsd-core takes global or local-pristine" ;; esac
+    case "$specialized" in true|false) ;; *) usage_error "--specialized takes true or false" ;; esac
+    case "$exmodel" in opus|inherit) ;; *) usage_error "--executor-model takes opus or inherit" ;; esac
     if [ -e "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
         die "$dir exists and is not empty; remove it first"
     fi
@@ -190,8 +382,10 @@ cmd_make_repo() {
     dir=$(cd "$dir" && pwd)
 
     git -C "$dir" init -q || die "git init failed in $dir"
-    write_probe_files "$dir"
-    install_pristine "$dir" || exit 1
+    write_probe_files "$dir" "$specialized" "$shapes" "$exmodel"
+    if [ "$gsd" = local-pristine ]; then
+        install_pristine "$dir" || exit 1
+    fi
 
     # The config dir's global excludes keep .claude and the planning directory
     # out of this scratch history; only the probe files are committed.
@@ -202,8 +396,23 @@ cmd_make_repo() {
 
 # --- run ---------------------------------------------------------------------
 
+# collect_unsets: UNSET_ARGS holds an `env -u NAME` pair for every inherited
+# variable that would let a probe reach the calling session, the coordination
+# bus or the attached Lisp image.
+collect_unsets() {
+    local name
+    UNSET_ARGS=()
+    while IFS= read -r name; do
+        case "$name" in
+            DSMR_*|CLAUDECODE|CLAUDE_CODE_*|CLAUDE_PID|CLAUDE_EFFORT|CLAUDE_CONFIG_DIR|SUBAGENT_ROUTING_CAPTURE)
+                UNSET_ARGS+=(-u "$name") ;;
+        esac
+    done < <(compgen -e)
+}
+
 cmd_run() {
     local repo="" sid="" config="" plugin="" capture="" debug="" system="" prompt="" have_prompt=0
+    local model=$PROBE_MODEL extra=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --session-id) [ $# -ge 2 ] || usage_error "--session-id needs a value"; sid=$2; shift 2 ;;
@@ -212,6 +421,14 @@ cmd_run() {
             --capture) [ $# -ge 2 ] || usage_error "--capture needs a value"; capture=$2; shift 2 ;;
             --debug-file) [ $# -ge 2 ] || usage_error "--debug-file needs a value"; debug=$2; shift 2 ;;
             --append-system-prompt) [ $# -ge 2 ] || usage_error "--append-system-prompt needs a value"; system=$2; shift 2 ;;
+            --model) [ $# -ge 2 ] || usage_error "--model needs a value"; model=$2; shift 2 ;;
+            --env)
+                [ $# -ge 2 ] || usage_error "--env needs KEY=VAL"
+                [[ $2 =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || usage_error "--env takes KEY=VAL"
+                case "$2" in DSMR_*) usage_error "--env refuses DSMR_ variables" ;; esac
+                extra+=("$2"); shift 2 ;;
+            --dangerously-skip-permissions|--allow-dangerously-skip-permissions|--permission-mode)
+                usage_error "$1 is refused: probes run in auto permission mode" ;;
             --) shift; [ $# -eq 1 ] || usage_error "one PROMPT after --"; prompt=$1; have_prompt=1; shift ;;
             -h|--help) usage; exit 0 ;;
             -*) usage_error "unknown option $1" ;;
@@ -233,23 +450,17 @@ cmd_run() {
 
     # A probe is its own session: nothing of the calling session, the
     # coordination bus or a mod list reaches it except what the flags give.
-    local unset_args=() name
-    while IFS= read -r name; do
-        case "$name" in
-            DSMR_*|CLAUDECODE|CLAUDE_CODE_*|CLAUDE_PID|CLAUDE_EFFORT|CLAUDE_CONFIG_DIR|SUBAGENT_ROUTING_CAPTURE)
-                unset_args+=(-u "$name") ;;
-        esac
-    done < <(compgen -e)
-    local set_args=()
+    collect_unsets
+    local set_args=("${extra[@]}")
     [ -z "$config" ] || set_args+=("CLAUDE_CONFIG_DIR=$config")
     [ -z "$capture" ] || set_args+=("SUBAGENT_ROUTING_CAPTURE=$capture")
 
-    local claude_args=(-p --session-id "$sid" --permission-mode auto --model "$PROBE_MODEL" --debug-file "$debug")
+    local claude_args=(-p --session-id "$sid" --permission-mode auto --model "$model" --debug-file "$debug")
     [ -z "$plugin" ] || claude_args+=(--plugin-dir "$plugin")
     [ -z "$system" ] || claude_args+=(--append-system-prompt "$system")
 
     local rc
-    (cd "$repo" && env "${unset_args[@]}" "${set_args[@]}" timeout "$PROBE_TIMEOUT" claude "${claude_args[@]}" "$prompt")
+    (cd "$repo" && env "${UNSET_ARGS[@]}" "${set_args[@]}" timeout "$PROBE_TIMEOUT" claude "${claude_args[@]}" "$prompt")
     rc=$?
     echo "claude exit $rc" >&2
     echo "debug log: $debug" >&2
@@ -262,6 +473,69 @@ cmd_run() {
 }
 
 # --- report ------------------------------------------------------------------
+
+# frontmatter_files FILE: the files_modified entries of FILE's frontmatter,
+# one per line, from a block list or an inline list.
+frontmatter_files() {
+    awk 'NR == 1 { if ($0 !~ /^---[[:space:]]*$/) exit; next }
+         /^---[[:space:]]*$/ { exit }
+         /^files_modified:/ {
+             line = $0; sub(/^files_modified:[[:space:]]*/, "", line)
+             if (line ~ /^\[/) {
+                 gsub(/\[|\]|"|\047/, "", line)
+                 n = split(line, a, /,[[:space:]]*/)
+                 for (i = 1; i <= n; i++) if (a[i] != "") print a[i]
+             } else inlist = 1
+             next }
+         inlist && /^[[:space:]]+-[[:space:]]/ {
+             s = $0; sub(/^[[:space:]]+-[[:space:]]+/, "", s); sub(/[[:space:]]+#.*$/, "", s)
+             gsub(/^"|"$|^\047|\047$/, "", s); print s; next }
+         inlist && /^[^[:space:]]/ { inlist = 0 }' "$1"
+}
+
+# is_probe_file NAME: whether NAME is one of the probe files.
+is_probe_file() {
+    local f
+    for f in "${PROBE_FILES[@]}"; do [ "$f" = "$1" ] && return 0; done
+    return 1
+}
+
+# call_target PROMPT CWD: print "TARGET<TAB>HINT" for an executor dispatch: the
+# probe files its plan modifies (joined with +) and the plan's agent_hint, or
+# the files a "Fix finding" prompt lists. Each is "-" when unknown.
+call_target() {
+    local prompt=$1 cwd=$2 plan resolved f from to listed item
+    local -a found=() items=()
+    local target=- hint=-
+    if [ "${prompt#Fix finding }" != "$prompt" ]; then
+        listed=$(printf '%s\n' "$prompt" | sed -n 's/.*Files: \(.*\)\. Make the minimal change.*/\1/p' | head -n 1)
+        IFS=', ' read -ra items <<<"$listed"
+        for item in "${items[@]}"; do
+            [ -n "$item" ] && found+=("$item")
+        done
+    else
+        while IFS= read -r plan; do
+            [ -n "$plan" ] || continue
+            resolved=$(resolve_plan "$plan" "$cwd" "$prompt")
+            if [ -n "${ROUTING_PROBE_PATH_MAP:-}" ]; then
+                from=${ROUTING_PROBE_PATH_MAP%%=*}
+                to=${ROUTING_PROBE_PATH_MAP#*=}
+                [ "${resolved#"$from"}" = "$resolved" ] || resolved=$to${resolved#"$from"}
+            fi
+            [ -f "$resolved" ] || continue
+            while IFS= read -r f; do
+                is_probe_file "$f" && found+=("$f")
+            done < <(frontmatter_files "$resolved")
+            hint=$(frontmatter_hint "$resolved")
+            [ -n "$hint" ] || hint=-
+            break
+        done < <(printf '%s\n' "$prompt" | grep -oE "[^[:space:]\`'\"()<>]+-PLAN\.md")
+    fi
+    if [ "${#found[@]}" -gt 0 ]; then
+        target=$(IFS=+; printf '%s' "${found[*]}")
+    fi
+    printf '%s\t%s\n' "$target" "$hint"
+}
 
 cmd_report() {
     [ $# -eq 1 ] || usage_error "report needs one TRANSCRIPT"
@@ -302,9 +576,9 @@ cmd_report() {
         done < <(jq -r 'select(.toolUseId != null) | [.toolUseId, .action, (.set.type // "-")] | @tsv' "$modlog")
     fi
 
-    printf 'tool_use_id\trequested_type\trequested_model\tran_type\tran_models\ttokens\tlogged_action\tlogged_type\tlog_agrees\tagent_id\n'
-    local req_type req_model models tokens agent agrees la lt rt
-    while IFS=$'\t' read -r id req_type req_model; do
+    printf 'tool_use_id\trequested_type\trequested_model\tran_type\tran_models\ttokens\tlogged_action\tlogged_type\tlog_agrees\ttarget\tplan_hint\tagent_id\n'
+    local req_type req_model models tokens agent agrees la lt rt pb cb prompt cwd tt target hint
+    while IFS=$'\t' read -r id req_type req_model pb cb; do
         rt=${ran_type[$id]:--}
         models=- tokens=- agent=-
         file=${ran_file[$id]:-}
@@ -329,12 +603,336 @@ cmd_report() {
         elif [ "$lt" = "$rt" ]; then agrees=yes
         else agrees=no
         fi
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$id" "$req_type" "$req_model" "$rt" "$models" "$tokens" "$la" "$lt" "$agrees" "$agent"
-    done < <(jq -r 'select(.type == "assistant") | .message.content[]?
+        target=- hint=-
+        prompt=$(printf '%s' "${pb#x}" | base64 -d)
+        cwd=$(printf '%s' "${cb#x}" | base64 -d)
+        if case "$EXECUTOR_TYPES" in *" $req_type "*) true ;; *) false ;; esac \
+            || [ "${prompt#Fix finding }" != "$prompt" ]; then
+            tt=$(call_target "$prompt" "$cwd")
+            target=${tt%%$'\t'*}
+            hint=${tt#*$'\t'}
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$id" "$req_type" "$req_model" "$rt" "$models" "$tokens" "$la" "$lt" "$agrees" "$target" "$hint" "$agent"
+    done < <(jq -r 'select(.type == "assistant") | (.cwd // "") as $cwd | .message.content[]?
                     | select(.type == "tool_use" and (.name == "Agent" or .name == "Task"))
-                    | [.id, (.input.subagent_type // "-"), (.input.model // "-")] | @tsv' "${files[@]}" \
+                    | [.id, (.input.subagent_type // "-"), (.input.model // "-"),
+                       ("x" + ((.input.prompt // "") | @base64)), ("x" + ($cwd | @base64))] | @tsv' "${files[@]}" \
              | awk -F'\t' '!seen[$1]++')
+}
+
+# --- ledger-row --------------------------------------------------------------
+
+# ledger_body FILE...: one TSV row per transcript. Records of one API message
+# repeat its usage once per content block, so each field is summed once per
+# distinct message id. Synthetic records are not API messages and are left out.
+ledger_body() {
+    local f
+    for f in "$@"; do
+        [ -f "$f" ] || die "no such transcript: $f"
+        jq -rs --arg p "$f" '
+            [ .[] | select(.type == "assistant" and .message.id != null
+                           and .message.model != "<synthetic>") ]
+            | unique_by(.message.id) as $m
+            | def sum(k): $m | map(.message.usage[k] // 0) | add // 0;
+              [ $p, ($m | length), sum("cache_read_input_tokens"),
+                sum("cache_creation_input_tokens"), sum("output_tokens"),
+                (($m | map(.message.model // "unknown") | group_by(.)
+                  | map("\(.[0]):\(length)") | join(",")) | if . == "" then "-" else . end) ]
+            | map(tostring) | @tsv' "$f" || die "cannot read $f"
+    done
+}
+
+cmd_ledger_row() {
+    [ $# -ge 1 ] || usage_error "ledger-row needs at least one TRANSCRIPT"
+    printf 'path\tturns\tcache_read\tcache_write\toutput\tmodels\n'
+    ledger_body "$@"
+}
+
+# --- check -------------------------------------------------------------------
+
+# norm_target LIST: a + joined target with its items sorted, so the order a
+# plan or finding lists its files in does not matter.
+norm_target() {
+    printf '%s\n' "$1" | tr '+' '\n' | LC_ALL=C sort | paste -sd+
+}
+
+# model_in_family MODELS FAMILY: whether every model in a model:count list
+# starts with FAMILY.
+model_in_family() {
+    local models=$1 family=$2 m
+    local -a list
+    [ "$models" != - ] || return 1
+    IFS=, read -ra list <<<"$models"
+    for m in "${list[@]}"; do
+        [ "${m#"$family"}" != "$m" ] || return 1
+    done
+}
+
+# model_matches_alias MODELS ALIAS: whether every model in the list names ALIAS.
+model_matches_alias() {
+    local models=$1 alias=$2 m
+    local -a list
+    [ "$models" != - ] || return 1
+    IFS=, read -ra list <<<"$models"
+    for m in "${list[@]}"; do
+        case "${m%:*}" in *"$alias"*) ;; *) return 1 ;; esac
+    done
+}
+
+cmd_check() {
+    [ $# -eq 2 ] || usage_error "check needs ARM and EXPECTED_TSV"
+    local arm=$1 expected=$2
+    [[ $arm =~ ^[a-z0-9][a-z0-9-]*$ ]] || usage_error "ARM is a lowercase name"
+    [ -f "$expected" ] || die "no such file: $expected"
+    local ev
+    ev=$(cd "$(dirname "$expected")" && pwd)
+    [ -f "$ev/sessions.tsv" ] || die "no sessions.tsv beside $expected"
+
+    local -a e_path=() e_target=() e_hint=() e_type=() e_family=() e_req=()
+    local -a hits=() r_type=() r_models=() r_hint=() r_req=()
+    local n=0 p t h rt fam req i
+    while IFS=$'\t' read -r p t h rt fam req; do
+        case "$p" in ''|'#'*|path) continue ;; esac
+        e_path[n]=$p; e_target[n]=$(norm_target "$t"); e_hint[n]=$h
+        e_type[n]=$rt; e_family[n]=$fam; e_req[n]=${req:--}
+        hits[n]=0
+        n=$((n + 1))
+    done < "$expected"
+    [ "$n" -gt 0 ] || die "no expected cells in $expected"
+
+    local fail=0 sid path tag transcript rest report
+    local id rq rmodel ran models tokens la lt agrees target hint agent nt alias matched
+    while IFS=$'\t' read -r sid path tag transcript rest; do
+        case "$sid" in ''|session_id) continue ;; esac
+        report=$ev/report-$tag.tsv
+        if [ ! -f "$report" ]; then
+            echo "FAIL $path: no report-$tag.tsv for session $sid"
+            fail=1
+            continue
+        fi
+        while IFS=$'\t' read -r id rq rmodel ran models tokens la lt agrees target hint agent; do
+            [ "$id" != tool_use_id ] || continue
+            if [ "$la" != - ] && [ "$agrees" != yes ]; then
+                echo "FAIL $path $id: mod logged $lt, transcript shows $ran"
+                fail=1
+            fi
+            case "$EXECUTOR_TYPES" in
+                *" $rq "*)
+                    nt=$(norm_target "$target")
+                    matched=-1
+                    for ((i = 0; i < n; i++)); do
+                        if [ "${e_path[i]}" = "$path" ] && [ "${e_target[i]}" = "$nt" ]; then matched=$i; break; fi
+                    done
+                    if [ "$matched" -lt 0 ]; then
+                        echo "recorded $path $target requested=$rq ran=$ran models=$models"
+                        continue
+                    fi
+                    hits[matched]=$((hits[matched] + 1))
+                    r_type[matched]=$ran; r_models[matched]=$models; r_hint[matched]=$hint
+                    r_req[matched]=$rq
+                    ;;
+                *)
+                    if [ "$ran" != "$rq" ]; then
+                        echo "FAIL $path $id: requested $rq, ran $ran"
+                        fail=1
+                    fi
+                    case "$rmodel" in
+                        sonnet|opus|haiku)
+                            alias=$rmodel
+                            if ! model_matches_alias "$models" "$alias"; then
+                                echo "FAIL $path $id: requested model $rmodel, ran $models"
+                                fail=1
+                            fi ;;
+                    esac
+                    ;;
+            esac
+        done < "$report"
+    done < "$ev/sessions.tsv"
+
+    local want_type want_family verdict reason
+    for ((i = 0; i < n; i++)); do
+        if [ "${hits[i]}" -eq 0 ]; then
+            echo "FAIL ${e_path[i]} ${e_target[i]}: no matching executor row"
+            fail=1
+            continue
+        fi
+        if [ "${hits[i]}" -gt 1 ]; then
+            echo "FAIL ${e_path[i]} ${e_target[i]}: ${hits[i]} executor rows match, expected one"
+            fail=1
+            continue
+        fi
+        want_type=${e_type[i]} want_family=${e_family[i]} verdict=ok reason=""
+        if [ "${r_hint[i]}" != "${e_hint[i]}" ]; then
+            verdict=planner-deviation
+            case "${r_hint[i]}" in
+                shell-developer) want_type=shell-developer want_family=claude-sonnet ;;
+                -) want_type=lisp-developer want_family=claude-opus ;;
+                *) verdict=FAIL reason="plan hint ${r_hint[i]} has no routing rule in this table" ;;
+            esac
+        fi
+        if [ "$verdict" != FAIL ]; then
+            if [ "${r_type[i]}" != "$want_type" ]; then
+                verdict=FAIL reason="ran ${r_type[i]}, expected $want_type"
+            elif ! model_in_family "${r_models[i]}" "$want_family"; then
+                verdict=FAIL reason="models ${r_models[i]} are not in $want_family"
+            elif [ "${e_req[i]}" != - ] && [ "${r_req[i]}" != "${e_req[i]}" ]; then
+                verdict=FAIL reason="requested ${r_req[i]}, expected ${e_req[i]}"
+            fi
+        fi
+        [ "$verdict" != FAIL ] || fail=1
+        printf '%s %s %s: requested=%s hint=%s ran=%s models=%s%s\n' \
+            "$verdict" "${e_path[i]}" "${e_target[i]}" "${r_req[i]}" "${r_hint[i]}" \
+            "${r_type[i]}" "${r_models[i]}" "${reason:+ ($reason)}"
+    done
+    echo "arm $arm: $n expected cells, status $([ "$fail" -eq 0 ] && echo pass || echo FAIL)"
+    return "$fail"
+}
+
+# --- bus-silent --------------------------------------------------------------
+
+cmd_bus_silent() {
+    [ $# -eq 1 ] || usage_error "bus-silent needs ROOT"
+    local root=$1 bus=${XDG_STATE_HOME:-$HOME/.local/state}/dsmr-mcp/bus found
+    [ -d "$bus" ] || die "no bus state directory: $bus"
+    found=$(grep -rlaF -- "$root" "$bus")
+    if [ -n "$found" ]; then
+        printf '%s\n' "$found"
+        return 1
+    fi
+    return 0
+}
+
+# --- run-arm -----------------------------------------------------------------
+
+# bus_precondition REPO: whether a bus watcher started in REPO, with the bus
+# variables removed, refuses for want of an identity (exit 2).
+bus_precondition() {
+    local rc
+    collect_unsets
+    (cd "$1" && env "${UNSET_ARGS[@]}" dsmr-bus-watch --wake --wake-seconds 1) >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -eq 2 ]
+}
+
+# arm_selected PATH SHAPE ONLY...: whether a cell is named by --only (all are when none is).
+arm_selected() {
+    local path=$1 shape=$2 spec
+    shift 2
+    [ $# -gt 0 ] || return 0
+    for spec in "$@"; do
+        [ -n "$spec" ] || continue
+        if [ "${spec%%:*}" = "$path" ]; then
+            [ "$spec" = "$path" ] && return 0
+            [ "${spec#*:}" = "$shape" ] && return 0
+            [ "$path" != quick ] && return 0
+        fi
+    done
+    return 1
+}
+
+cmd_run_arm() {
+    local arm="" gsd="" evidence="" config="" plugin="" exmodel=opus capture="" only="" envs=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --gsd-core) [ $# -ge 2 ] || usage_error "--gsd-core needs a value"; gsd=$2; shift 2 ;;
+            --evidence) [ $# -ge 2 ] || usage_error "--evidence needs a value"; evidence=$2; shift 2 ;;
+            --config-dir) [ $# -ge 2 ] || usage_error "--config-dir needs a value"; config=$2; shift 2 ;;
+            --plugin-dir) [ $# -ge 2 ] || usage_error "--plugin-dir needs a value"; plugin=$2; shift 2 ;;
+            --executor-model) [ $# -ge 2 ] || usage_error "--executor-model needs a value"; exmodel=$2; shift 2 ;;
+            --capture) [ $# -ge 2 ] || usage_error "--capture needs a value"; capture=$2; shift 2 ;;
+            --only) [ $# -ge 2 ] || usage_error "--only needs a value"; only=$2; shift 2 ;;
+            --env) [ $# -ge 2 ] || usage_error "--env needs KEY=VAL"; envs+=(--env "$2"); shift 2 ;;
+            -h|--help) usage; exit 0 ;;
+            -*) usage_error "unknown option $1" ;;
+            *) [ -z "$arm" ] || usage_error "one ARM only"; arm=$1; shift ;;
+        esac
+    done
+    [[ $arm =~ ^[a-z0-9][a-z0-9-]*$ ]] || usage_error "run-arm needs a lowercase ARM name"
+    case "$gsd" in global|local-pristine) ;; *) usage_error "--gsd-core takes global or local-pristine" ;; esac
+    [ -n "$evidence" ] || usage_error "run-arm needs --evidence DIR"
+    command -v dsmr-bus-watch >/dev/null || die "dsmr-bus-watch is not on PATH: cannot assert the bus precondition"
+    command -v claude >/dev/null || die "claude is not on PATH"
+
+    [ "$plugin" != none ] || plugin=""
+    local -a run_extra=()
+    [ -z "$config" ] || run_extra+=(--config-dir "$config")
+    [ -z "$plugin" ] || run_extra+=(--plugin-dir "$plugin")
+    [ -z "$capture" ] || run_extra+=(--capture "$capture")
+    run_extra+=("${envs[@]}")
+    local home=${config:-$CONFIG_HOME}
+
+    local ev
+    mkdir -p "$evidence/mod-log" || die "cannot create $evidence"
+    ev=$(cd "$evidence" && pwd)
+    local cache=${XDG_CACHE_HOME:-$HOME/.cache}/dsmr-routing-probes/$arm
+    [ -f "$ev/sessions.tsv" ] || printf 'session_id\tpath\ttag\ttranscript\tstart\tend\ttokens\tnotes\n' > "$ev/sessions.tsv"
+    [ -f "$ev/tokens.txt" ] || printf 'tag\tcell\ttranscript\tturns\tcache_read\tcache_write\toutput\tmodels\n' > "$ev/tokens.txt"
+
+    local -a only_list=() cells=(execute-phase: quick:shell quick:lisp quick:mixed quick:docs quick-batch: audit-fix: execute-phase-leader:)
+    IFS=, read -ra only_list <<<"$only"
+    local -A built=()
+    local cell path shape tag repo sid prompt model transcript start end rc total subdir item
+    local -a ledger_files
+    for cell in "${cells[@]}"; do
+        path=${cell%%:*}; shape=${cell#*:}
+        arm_selected "$path" "$shape" "${only_list[@]}" || continue
+        tag=$path${shape:+-$shape}
+        repo=$cache/$path/repo
+
+        if [ -z "${built[$path]:-}" ]; then
+            [ ! -e "$repo" ] || die "$repo exists; move it aside before this cell runs again"
+            (
+                case "$path" in
+                    execute-phase-leader)
+                        cmd_make_repo "$repo" --gsd-core "$gsd" --specialized false --shapes lisp --executor-model "$exmodel" ;;
+                    audit-fix)
+                        cmd_make_repo "$repo" --gsd-core "$gsd" --shapes "" --executor-model "$exmodel" ;;
+                    *)
+                        cmd_make_repo "$repo" --gsd-core "$gsd" --executor-model "$exmodel" ;;
+                esac
+            ) > "$ev/make-repo-$path.txt" 2>&1 || die "make-repo failed for $path; see $ev/make-repo-$path.txt"
+            built[$path]=1
+        fi
+        bus_precondition "$repo" || die "bus precondition failed in $repo: a bus watcher did not refuse"
+
+        model=$PROBE_MODEL
+        case "$path" in
+            execute-phase|execute-phase-leader) prompt='/gsd-execute-phase 1' ;;
+            quick) prompt="/gsd-quick $(cmd_describe "$shape")" ;;
+            quick-batch)
+                prompt='/gsd-quick-batch'
+                for item in "${SHAPES[@]}"; do prompt+=$'\n'"- $(cmd_describe "$item")"; done ;;
+            audit-fix) prompt='/gsd-audit-fix --source audit-uat --severity all --max 4' ;;
+        esac
+        [ "$path" != execute-phase-leader ] || model=$LEADER_MODEL
+
+        sid=$(cat /proc/sys/kernel/random/uuid)
+        start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        transcript=$(cmd_run "$repo" --session-id "$sid" --model "$model" "${run_extra[@]}" \
+            --debug-file "$ev/debug-$tag.log" -- "$prompt" 2> "$ev/probe-$tag.err")
+        rc=$?
+        end=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        printf '%s\n' "$transcript" > "$ev/probe-$tag.out"
+        transcript=$(printf '%s\n' "$transcript" | tail -n 1)
+        if [ ! -f "$transcript" ]; then
+            printf '%s\t%s\t%s\t-\t%s\t%s\t0\tno transcript, claude exit %s\n' "$sid" "$path" "$tag" "$start" "$end" "$rc" >> "$ev/sessions.tsv"
+            die "$tag: no transcript (claude exit $rc); see $ev/probe-$tag.err"
+        fi
+        [ ! -f "$home/$LOG_DIR/$sid.jsonl" ] || cp "$home/$LOG_DIR/$sid.jsonl" "$ev/mod-log/$tag.jsonl"
+        cmd_report "$transcript" > "$ev/report-$tag.tsv" || die "$tag: report failed"
+        subdir=${transcript%.jsonl}/subagents
+        ledger_files=("$transcript")
+        for item in "$subdir"/agent-*.jsonl; do [ -f "$item" ] && ledger_files+=("$item"); done
+        ledger_body "${ledger_files[@]}" | sed "s/^/$tag\t$path\t/" >> "$ev/tokens.txt"
+        total=$(awk -F'\t' 'NR > 1 && $6 ~ /^[0-9]+$/ { s += $6 } END { print s + 0 }' "$ev/report-$tag.tsv")
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\tclaude exit %s\n' "$sid" "$path" "$tag" "$transcript" "$start" "$end" "$total" "$rc" >> "$ev/sessions.tsv"
+        echo "$tag: session $sid, subagent tokens $total, claude exit $rc"
+        if [ "$total" -gt "$TOKEN_CAP" ]; then
+            echo "$PROGNAME: $tag used $total subagent tokens, over the $TOKEN_CAP cap; arm stopped" >&2
+            return 3
+        fi
+    done
 }
 
 # --- replay ------------------------------------------------------------------
@@ -552,8 +1150,13 @@ cmd_record_history() {
 sub=$1; shift
 case "$sub" in
     make-repo) cmd_make_repo "$@" ;;
+    describe) cmd_describe "$@" ;;
     run) cmd_run "$@" ;;
+    run-arm) cmd_run_arm "$@" ;;
     report) cmd_report "$@" ;;
+    ledger-row) cmd_ledger_row "$@" ;;
+    check) cmd_check "$@" ;;
+    bus-silent) cmd_bus_silent "$@" ;;
     replay) cmd_replay "$@" ;;
     record-history) cmd_record_history "$@" ;;
     -h|--help) usage ;;
