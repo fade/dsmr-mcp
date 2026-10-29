@@ -224,15 +224,17 @@ async function hasDefinition(name: string, io: RouteIo): Promise<boolean> {
  * 1. A fork, resume, workflow agent or teammate passes unchanged.
  * 2. gsd-executor: with no readable project config it is `cannot-decide`;
  *    with `workflow.agent_hint_routing` false it stays
- *    gsd-executor, model cleared. Otherwise the prompt must name exactly one
+ *    gsd-executor. Otherwise the prompt must name exactly one
  *    readable plan: its `agent_hint`, when it is shell-developer, gsd-executor
  *    or the project executor and has an installed definition, becomes the
  *    agent type, model cleared; with no hint the project default applies. A
  *    prompt opening "Fix finding " with no plan takes the project default too.
  *    The project default is `planning.agents.executor` when
  *    `planning.agents.specialized` is true and that agent is installed, else
- *    gsd-executor; either way the model is cleared. Anything else is
- *    `cannot-decide` and passes exactly as requested.
+ *    gsd-executor. A specialist's model is cleared; gsd-executor's per-call
+ *    model is cleared only when `planning.agents.specialized` is true, and
+ *    kept otherwise. Anything else is `cannot-decide` and passes exactly as
+ *    requested.
  * 3. shell-developer, lisp-developer or the project executor keeps its type
  *    and loses any per-call model.
  * 4. Every other agent type passes unchanged.
@@ -263,10 +265,15 @@ async function route(input: SpawnFacts, io: RouteIo): Promise<Decision> {
     shape,
     planPath,
   })
-  const keepExecutor = (reason: string, planPath: string | null): Decision =>
-    hasModel(input.model)
-      ? setType(EXECUTOR, 'rewrote', `${reason}; per-call model ${input.model} cleared, gsd-executor follows the leader`, planPath)
-      : asRequested('unchanged', `${reason}; gsd-executor follows the leader`, planPath)
+  // gsd-executor follows the leader only in a specialized project; any other
+  // project keeps the model its own profile asked for. Call once `config` is read.
+  const keepExecutor = (reason: string, planPath: string | null): Decision => {
+    if (!hasModel(input.model)) return asRequested('unchanged', `${reason}; gsd-executor follows the leader`, planPath)
+    if (!config.specialized) {
+      return asRequested('unchanged', `${reason}; gsd-executor keeps the requested model ${input.model}`, planPath)
+    }
+    return setType(EXECUTOR, 'rewrote', `${reason}; per-call model ${input.model} cleared, gsd-executor follows the leader`, planPath)
+  }
 
   if (kind !== 'subagent') return asRequested('unchanged', `a ${kind} spawn is not routed`)
 
