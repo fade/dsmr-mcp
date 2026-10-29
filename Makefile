@@ -25,10 +25,11 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 
 .PHONY: bridge bus-watch bus-host install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
-        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks
+        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
+LIBDIR ?= $(PREFIX)/lib/dsmr-mcp
 
 # Where this site's Lisp checkouts live, and therefore where a fleet's member
 # repositories are resolved from. The environment wins so a clone elsewhere
@@ -292,6 +293,14 @@ install-hooks:
 test-hooks:
 	@bash tests/githooks/workproduct-style-test.sh
 
+## test-restart-session: drive the in-place session restart against a stub kitten.
+##
+##   No kitty is involved. Each refusal has a case that would fail if the
+##   refusal were removed, and a positive control that proves the same fixture
+##   restarts when nothing is wrong.
+test-restart-session:
+	@bash tests/scripts/restart-session-in-place-test.sh
+
 ## check-hooks: report where a deployed hook differs from this tree.
 ##
 ##   Never edits. Checks the SHARED files across every repository in the
@@ -344,6 +353,41 @@ check-sisters:
 	elif cmp -s scripts/sisters.sh "$(BINDIR)/sisters.sh"; then echo "match: $(BINDIR)/sisters.sh"; \
 	else echo "DIFFERS: $(BINDIR)/sisters.sh"; diff -u "$(BINDIR)/sisters.sh" scripts/sisters.sh | head -40; \
 	     echo "run 'make install-sisters' to deploy this tree, or port the other way first"; fi
+
+## install-restart-session: publish the in-place session restart onto PATH.
+##
+##   The script finds its socket library beside itself in a checkout and under
+##   ../lib/dsmr-mcp once installed, so both files are deployed together, the
+##   library first. That lookup assumes BINDIR is $$(PREFIX)/bin.
+##   Install atomically: a half-written script is run by a leader that is
+##   about to type into live sessions.
+install-restart-session:
+	@set -e; \
+	mkdir -p "$(BINDIR)" "$(LIBDIR)"; \
+	cp scripts/kitty-sockets.sh "$(LIBDIR)/.kitty-sockets.sh.tmp"; \
+	chmod 644 "$(LIBDIR)/.kitty-sockets.sh.tmp"; \
+	mv -f "$(LIBDIR)/.kitty-sockets.sh.tmp" "$(LIBDIR)/kitty-sockets.sh"; \
+	echo "installed $(LIBDIR)/kitty-sockets.sh"; \
+	cp scripts/restart-session-in-place.sh "$(BINDIR)/.restart-session-in-place.sh.tmp"; \
+	chmod 755 "$(BINDIR)/.restart-session-in-place.sh.tmp"; \
+	mv -f "$(BINDIR)/.restart-session-in-place.sh.tmp" "$(BINDIR)/restart-session-in-place.sh"; \
+	echo "installed $(BINDIR)/restart-session-in-place.sh"; \
+	command -v restart-session-in-place.sh >/dev/null 2>&1 \
+	  || echo "NOTE: $(BINDIR) is not on this shell's PATH, so 'restart-session-in-place.sh' will not resolve by name"
+
+## check-restart-session: report whether the deployed restart script and its library match this tree.
+##
+##   Never edits. The deployed copies are what a leader runs, so a tree edited
+##   without a deploy is a fix nobody is getting.
+check-restart-session:
+	@for pair in "scripts/restart-session-in-place.sh:$(BINDIR)/restart-session-in-place.sh" \
+	             "scripts/kitty-sockets.sh:$(LIBDIR)/kitty-sockets.sh"; do \
+	  src=$${pair%%:*}; dst=$${pair#*:}; \
+	  if [ ! -f "$$dst" ]; then echo "NOT DEPLOYED: $$dst"; \
+	  elif cmp -s "$$src" "$$dst"; then echo "match: $$dst"; \
+	  else echo "DIFFERS: $$dst"; diff -u "$$dst" "$$src" | head -40; \
+	       echo "run 'make install-restart-session' to deploy this tree, or port the other way first"; fi; \
+	done
 
 ## check-skills: report where the deployed skills differ from this tree.
 ##

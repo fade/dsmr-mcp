@@ -361,10 +361,18 @@ fi
 # A dry run must work with no kitty at all, since its whole purpose is to show
 # what would happen before committing to it, often from somewhere else entirely.
 if [[ -z $KITTY_SOCKET ]]; then
-    candidates=()
-    for sock in /tmp/kitty-*; do
-        [[ -S $sock ]] && candidates+=("$sock")
+    # The socket library sits beside this script in a checkout and under
+    # ../lib/dsmr-mcp once installed; it is needed only to discover a socket.
+    self_dir=$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")
+    sockets_lib=""
+    for lib in "$self_dir/kitty-sockets.sh" "$self_dir/../lib/dsmr-mcp/kitty-sockets.sh"; do
+        if [[ -r $lib ]]; then sockets_lib=$lib; break; fi
     done
+    [[ -n $sockets_lib ]] || die "kitty-sockets.sh not found beside $self_dir or under ../lib/dsmr-mcp; pass --to"
+    # shellcheck source=/dev/null  # path is computed from this script's own location
+    source "$sockets_lib"
+    candidates=()
+    kitty_socket_paths candidates
     case ${#candidates[@]} in
         1)
             KITTY_SOCKET="unix:${candidates[0]}"
