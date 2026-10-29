@@ -36,8 +36,10 @@ tests them. You do not write the systems themselves.
 - Temporary files come from `mktemp`, with a `trap` that removes them on exit.
 - Never parse `ls`. Use globs, `find`, or `find -print0` with `xargs -0`.
 - Exit with a meaningful status. Usage text and diagnostics go to stderr.
-- Every script you touch passes `shellcheck`. An inline `# shellcheck disable=SCnnnn` carries its
-  reason in a comment on the same line, as `scripts/sisters.sh` does.
+- Every script you touch passes `shellcheck --exclude=SC1091`, the flags the commit hook runs
+  (`scripts/githooks/dsmr-shell-lint.sh`), so a clean run means the hook's shell lint passes.
+  An inline `# shellcheck disable=SCnnnn` carries its reason in a comment on the same line, as
+  `scripts/sisters.sh` does.
 - zsh scripts are skipped by shellcheck because it cannot parse them; run `zsh -n` on them instead.
 - Comments are terse and technical: what the code does, and why only when it is not obvious, stated
   as the constraint. No history, no first person.
@@ -67,13 +69,41 @@ Targets that write outside the repository (`~/.claude`, `~/.local/bin`, another 
 - A `DIFFERS` line means the deployed copy may be the newer one. Never overwrite it; report the drift.
 - Deploy only the files the plan names. When an `install-*` target would also write files that differ,
   copy the named file per-file the way the target does instead of running the target.
+- ⛔ **Never install anything outside the repository in the plan that builds it.** Every deploy
+  target reaches every session on the host, so the plan that writes the code ends at commit, even
+  when the plan or the brief names an install target: report the install as the leader's step. The
+  leader deploys after the code review passes, or, where no review runs, when the leader or the
+  operator says so. The check-first and `DIFFERS` rules above govern that later deploy. (2026-10-29:
+  a session-restart script was installed by the plan that built it and stayed installed, with four
+  blockers, one of which could type `/clear` into a shell, until the review withdrew it.)
 
 ## Verification
 
 - Run the make target the plan's verify step names (`check-*`, `test-hooks`, a script's own self-test).
-- Run `shellcheck` and `bash -n` or `sh -n` on every script you touched.
+- Run `shellcheck --exclude=SC1091` and `bash -n` or `sh -n` on every script you touched.
 - Do not start Lisp test suites unless the plan's verify step says so. Never run two suites at once:
   port contention makes a busy environment read as an absent one, and the suite reports false skips.
+
+## Tests of another program's output
+
+⛔ **When code reads output it does not produce, its tests run against output recorded from the real
+program, never a sample written from memory.** That covers a terminal screen, a CLI's text, a log
+line, a JSON reply, a transcript.
+
+- Name where each fixture came from, in a comment beside it: the capture command or the recording
+  file and offset.
+- Sources that already exist: `kitten @ --to unix:/tmp/kitty-<pid> get-text --ansi --match id:<win>`
+  (read-only), the start-sisters terminal recordings under `~/.local/state/dsmr-mcp/bringup/`, a
+  program's own `--help`, a transcript under `~/.claude/projects/`.
+- Capture every state the code must tell apart (idle and busy, success and each failure), not only
+  the one you expect most.
+- If no real capture of a state exists, stop and say so in the summary. A fixture invented from an
+  assumption only proves the code matches the assumption.
+
+**Why:** on 2026-10-29 the session-restart script passed 34 of 34 tests against an invented busy
+screen containing "esc to interrupt". The Claude Code build in use never draws that string, so a
+session mid-turn read as idle. The reviewer's first pass made the same assumption; only replayed
+recorded sessions exposed it.
 
 ## Work product and commits
 
