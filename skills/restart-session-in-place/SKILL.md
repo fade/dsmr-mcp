@@ -37,8 +37,17 @@ know a roster: the caller names the targets, and the caller owns that choice.
 STATE.md). The target must therefore be parked or at a clean pause. See the fleet-restart skill
 for parking. A session that is busy or holds typed input is refused, never interrupted.
 
-Always run with `--dry-run` first. It resolves and checks every target, including the idle
-test, and types nothing.
+Always run with `--dry-run` first. It resolves every target, runs the idle test on each, and
+types nothing. A session counts as idle only when Claude Code's own prompt frame is on screen
+with nothing typed in it (a dim suggested prompt is not typed input), no turn is running, and
+no background agents or task panel are open. Anything doubtful is refused.
+
+A restart takes minutes: each target waits for a new transcript, an idle prompt, and the
+follow-up's answer, each bounded by `--timeout`. Run the script in the background
+(`run_in_background`), or give the calling shell a timeout of at least
+`targets x (3 x timeout + 30)` seconds. A shell timeout shorter than that kills the run
+mid-sequence. The script then prints a `failed: interrupted` line for the target it was typing
+into and `not-run` for the rest, but the window it was typing into is left cleared.
 
 ## How to call it
 
@@ -91,8 +100,8 @@ started. `-` marks a field that is not known.
 | `failed: ...` | typing began and a stage did not complete | look at the target; the stage and the bound are in the message |
 | `not-run` | an earlier target stopped the run, or a target failed to resolve | nothing was typed there |
 
-The run stops at the first refusal or failure, so a `not-run` line is not a problem with that
-target.
+In a real run the first refusal or failure stops the run, so a `not-run` line is not a problem
+with that target. A `--dry-run` checks every target and stops at none.
 
-Exit status: 0 every target ok, 1 any refused or failed, 2 usage error, 3 unsupported
-environment.
+Exit status: 0 every target ok (every target `would-restart` under `--dry-run`), 1 any refused
+or failed, 2 usage error or two targets that resolve to one window, 3 unsupported environment.
