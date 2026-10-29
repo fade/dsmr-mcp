@@ -412,6 +412,17 @@ run "${FAST[@]}" zebra zebra
 try "[duplicate-target] same target twice exits 2, nothing sent" "rc=$RC err=$ERR" \
     test "$RC" = 2 -a -z "$(sendlog)"
 
+note "installed layout"
+
+one_sister
+make --no-print-directory -C "$REPO_ROOT" install-restart-session PREFIX="$WORK/prefix" >"$WORK/make.out" 2>&1
+"$WORK/prefix/bin/restart-session-in-place.sh" "${FAST[@]}" --dry-run zebra > "$WORK/out" 2> "$WORK/err"
+RC=$?
+OUT=$(<"$WORK/out")
+ERR=$(<"$WORK/err")
+try "[installed-layout] installed copy finds its library and runs" "rc=$RC err=$ERR out=$OUT" \
+    test "$RC" = 0 -a -f "$WORK/prefix/lib/dsmr-mcp/kitty-sockets.sh" -a -n "$(grep 'would-restart$' <<<"$OUT")" -a -z "$(sendlog)"
+
 note "start-sisters socket discovery"
 
 reset

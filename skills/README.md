@@ -19,6 +19,7 @@ they live now.
 | `rotate-context-window` | Snapshot in-flight state so the next instance resumes cleanly |
 | `scaffold-project` | Generate a new Common Lisp project from this project's skeleton |
 | `executor-routing` | Tells the planner which plans the shell executor takes |
+| `restart-session-in-place` | Restart a running session in its own kitty tab so a configuration change reaches it |
 
 ## Deploying, and the direction that matters
 
