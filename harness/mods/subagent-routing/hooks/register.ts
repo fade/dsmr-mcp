@@ -106,13 +106,14 @@ export const register: Register = on => {
         subagentType: e.subagentType,
         model: e.model,
         reason: `decision failed: ${err instanceof Error ? err.message : String(err)}`,
-        shape: 'error',
+        kind: 'error',
+        shape: 'other',
         planPath: null,
       }
     }
 
     const result =
-      decision.action === 'rewrote'
+      decision.action === 'rewrote' || decision.action === 'cleared-model'
         ? await next({ ...e, subagentType: decision.subagentType, model: decision.model })
         : await next(e)
 
