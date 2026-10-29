@@ -7,6 +7,16 @@
 #       Build a scratch git repository that the GSD commands can run in, with
 #       the frozen probe fixtures. local-pristine adds a project-local gsd-core
 #       copy restored to the installer's files; global leaves the live install.
+#   make-config DIR
+#       Build a throwaway Claude Code config directory with an unpatched
+#       gsd-core copied from the live one and proven against the installer's
+#       manifest. It holds no credentials and no bus hook; the live install is
+#       read only and proven unchanged.
+#   check-config DIR
+#       Re-check a config directory: every gsd-core and scripts manifest entry
+#       matches, and the routing gate reports five units missing under DIR.
+#   tree-hash DIR
+#       Print a sorted SHA-256 listing of every file under DIR.
 #   describe SHAPE
 #       Print the task description for a probe shape: shell, lisp, mixed, docs.
 #   run REPO --session-id UUID [--config-dir DIR] [--plugin-dir DIR]
@@ -15,8 +25,10 @@
 #       Run one headless Claude Code session in REPO and print its transcript.
 #   run-arm ARM --gsd-core global|local-pristine --evidence DIR [--config-dir DIR]
 #       [--plugin-dir DIR|none] [--executor-model opus|inherit] [--capture DIR]
-#       [--only PATH[:SHAPE],...] [--env KEY=VAL]...
+#       [--orchestrator-model MODEL] [--only PATH[:SHAPE],...] [--env KEY=VAL]...
 #       Run the probe cells one session at a time and write the evidence.
+#       --orchestrator-model sets the model of every session in the arm and is
+#       recorded per session in sessions.tsv.
 #   report TRANSCRIPT
 #       Print one TSV row per Agent call in a session: what was asked for,
 #       what ran (from the subagent's own records) and what the mod logged.
@@ -68,7 +80,10 @@ EXECUTOR_TYPES=" gsd-executor shell-developer lisp-developer "
 
 usage() {
     cat <<EOF
-usage: $PROGNAME make-repo DIR --gsd-core global|local-pristine [--specialized true|false]
+usage: $PROGNAME make-config DIR
+       $PROGNAME check-config DIR
+       $PROGNAME tree-hash DIR
+       $PROGNAME make-repo DIR --gsd-core global|local-pristine [--specialized true|false]
                  [--shapes LIST] [--executor-model opus|inherit]
        $PROGNAME describe shell|lisp|mixed|docs
        $PROGNAME run REPO --session-id UUID [--config-dir DIR] [--plugin-dir DIR]
@@ -76,7 +91,7 @@ usage: $PROGNAME make-repo DIR --gsd-core global|local-pristine [--specialized t
                  [--model MODEL] [--env KEY=VAL]... -- PROMPT
        $PROGNAME run-arm ARM --gsd-core global|local-pristine --evidence DIR [--config-dir DIR]
                  [--plugin-dir DIR|none] [--executor-model opus|inherit] [--capture DIR]
-                 [--only PATH[:SHAPE],...] [--env KEY=VAL]...
+                 [--orchestrator-model MODEL] [--only PATH[:SHAPE],...] [--env KEY=VAL]...
        $PROGNAME report TRANSCRIPT
        $PROGNAME ledger-row TRANSCRIPT...
        $PROGNAME cap-check TRANSCRIPT
@@ -312,38 +327,32 @@ Makefile and one document.
 EOF
 }
 
-# install_pristine DIR: copy gsd-core, and the installer's scripts it loads,
-# into DIR/.claude; restore each patched target from its backup; print the
-# proof and return 1 if it does not hold.
-install_pristine() {
-    local dir=$1 src=$CONFIG_HOME/gsd-core dst=$1/.claude/gsd-core
-    local manifest=$CONFIG_HOME/gsd-file-manifest.json
-    local row target suffix entries=0 matched=0 bad=0 rel want got gate_out gate_rc nmissing
-
-    [ -d "$src" ] || die "gsd-core not installed under $CONFIG_HOME"
-    [ -f "$manifest" ] || die "installer manifest not found: $manifest"
+# pristine_restore ROOT: restore each patched gsd-core target under ROOT from
+# its backup, then delete every backup. Targets and suffixes are the gate's
+# units rows.
+pristine_restore() {
+    local root=$1 row target suffix
     [ -f "$GATE" ] || die "routing gate not found: $GATE"
-    mkdir -p "$dir/.claude"
-    cp -a "$src" "$dst" || die "cannot copy $src"
-    # gsd-tools loads files from <config>/scripts: copy the ones the installer wrote.
-    while IFS= read -r rel; do
-        mkdir -p "$dir/.claude/$(dirname "$rel")"
-        cp -a "$CONFIG_HOME/$rel" "$dir/.claude/$rel" || die "cannot copy $CONFIG_HOME/$rel"
-    done < <(jq -r '.files | keys[] | select(startswith("scripts/"))' "$manifest")
-
-    # Targets and backup suffixes are the gate's units rows.
     while IFS= read -r row; do
         target=$(printf '%s\n' "$row" | cut -d'|' -f2)
         suffix=$(printf '%s\n' "$row" | cut -d'|' -f5)
-        [ -f "$dir/.claude/$target$suffix" ] || die "no backup for $target ($suffix)"
-        cp "$dir/.claude/$target$suffix" "$dir/.claude/$target"
+        [ -f "$root/$target$suffix" ] || die "no backup for $target ($suffix)"
+        cp "$root/$target$suffix" "$root/$target"
         echo "restored $target from $suffix"
     done < <(sed -n "s/^  '\([a-z-]*|gsd-core\/[^']*\)'\$/\1/p" "$GATE")
-    find "$dst" -name '*.pre-*' -type f -delete
+    find "$root/gsd-core" -name '*.pre-*' -type f -delete
+}
 
+# pristine_prove ROOT: print the proof and return 1 if it does not hold: every
+# gsd-core and scripts entry of the installer manifest under ROOT matches by
+# SHA-256, and the gate exits 1 printing five missing lines.
+pristine_prove() {
+    local root=$1 manifest=$1/gsd-file-manifest.json
+    local entries=0 matched=0 bad=0 rel want got gate_out gate_rc nmissing
+    [ -f "$manifest" ] || { echo "no manifest: $manifest"; return 1; }
     while IFS=$'\t' read -r rel want; do
         entries=$((entries + 1))
-        got=$(sha256sum "$dir/.claude/$rel" 2>/dev/null | cut -d' ' -f1)
+        got=$(sha256sum "$root/$rel" 2>/dev/null | cut -d' ' -f1)
         if [ "$got" = "$want" ]; then
             matched=$((matched + 1))
         else
@@ -353,7 +362,7 @@ install_pristine() {
     done < <(jq -r '.files | to_entries[] | select(.key | startswith("gsd-core/") or startswith("scripts/")) | [.key, .value] | @tsv' "$manifest")
     echo "manifest $(jq -r .version "$manifest"): $matched of $entries gsd-core and scripts entries match"
 
-    gate_out=$(bash "$GATE" --root "$dir/.claude")
+    gate_out=$(bash "$GATE" --root "$root")
     gate_rc=$?
     printf '%s\n' "$gate_out"
     echo "gate exit $gate_rc"
@@ -363,6 +372,130 @@ install_pristine() {
         return 1
     }
     echo "pristine check passed"
+}
+
+# copy_installer_scripts SRC DST: copy the scripts the installer wrote under
+# SRC into DST; gsd-tools loads files from <config>/scripts.
+copy_installer_scripts() {
+    local src=$1 dst=$2 rel
+    while IFS= read -r rel; do
+        mkdir -p "$dst/$(dirname "$rel")"
+        cp -a "$src/$rel" "$dst/$rel" || die "cannot copy $src/$rel"
+    done < <(jq -r '.files | keys[] | select(startswith("scripts/"))' "$src/gsd-file-manifest.json")
+}
+
+# install_pristine DIR: copy gsd-core, and the installer's scripts it loads,
+# into DIR/.claude; restore each patched target from its backup; print the
+# proof and return 1 if it does not hold.
+install_pristine() {
+    local dir=$1 src=$CONFIG_HOME/gsd-core
+    [ -d "$src" ] || die "gsd-core not installed under $CONFIG_HOME"
+    [ -f "$CONFIG_HOME/gsd-file-manifest.json" ] || die "installer manifest not found: $CONFIG_HOME/gsd-file-manifest.json"
+    mkdir -p "$dir/.claude"
+    cp -a "$src" "$dir/.claude/gsd-core" || die "cannot copy $src"
+    cp -a "$CONFIG_HOME/gsd-file-manifest.json" "$dir/.claude/gsd-file-manifest.json" || die "cannot copy the manifest"
+    copy_installer_scripts "$CONFIG_HOME" "$dir/.claude"
+    pristine_restore "$dir/.claude"
+    pristine_prove "$dir/.claude"
+}
+
+# --- make-config -------------------------------------------------------------
+
+# tree_hash DIR: sorted SHA-256 listing of every file under DIR.
+tree_hash() {
+    [ -d "$1" ] || die "no such directory: $1"
+    (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum)
+}
+
+cmd_tree_hash() {
+    [ $# -eq 1 ] || usage_error "tree-hash needs one DIR"
+    tree_hash "$1"
+}
+
+cmd_check_config() {
+    [ $# -eq 1 ] || usage_error "check-config needs one DIR"
+    [ -d "$1" ] || die "no such directory: $1"
+    pristine_prove "$(cd "$1" && pwd)"
+}
+
+# live_gate_present: the count of present lines the gate prints for the live config.
+live_gate_present() {
+    bash "$GATE" --root "$CONFIG_HOME" | grep -c '^present '
+}
+
+cmd_make_config() {
+    [ $# -eq 1 ] || usage_error "make-config needs one DIR"
+    case "$1" in -h|--help) usage; exit 0 ;; -*) usage_error "unknown option $1" ;; esac
+    local live repo dir sub lj before after nbefore
+    live=$(realpath -m "$CONFIG_HOME")
+    repo=$(realpath -m "$SCRIPT_DIR/..")
+    dir=$(realpath -m "$1")
+    case "$dir" in
+        "$live"|"$live"/*) die "refusing $dir: it is inside the live config directory $live" ;;
+        "$repo"|"$repo"/*) die "refusing $dir: it is inside the repository $repo" ;;
+    esac
+    case "$live" in "$dir"/*) die "refusing $dir: it contains the live config directory $live" ;; esac
+    [ -d "$live/gsd-core" ] || die "gsd-core not installed under $live"
+    [ -f "$live/gsd-file-manifest.json" ] || die "installer manifest not found under $live"
+    [ -f "$live/settings.json" ] || die "no settings.json under $live"
+    if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then lj=$live/.claude.json; else lj=$HOME/.claude.json; fi
+    [ -f "$lj" ] || die "no $lj to take mcpServers from"
+
+    before=$(tree_hash "$live/gsd-core") || exit 1
+    nbefore=$(printf '%s\n' "$before" | wc -l)
+
+    mkdir -p "$dir" || die "cannot create $dir"
+    chmod 700 "$dir" || die "cannot chmod $dir"
+    # Only the paths named here are replaced; a login already in DIR stays.
+    for sub in agents skills hooks gsd-core; do
+        rm -rf "${dir:?}/$sub"
+        cp -a "$live/$sub" "$dir/$sub" || die "cannot copy $live/$sub"
+    done
+    cp -a "$live/CLAUDE.md" "$dir/CLAUDE.md" || die "cannot copy CLAUDE.md"
+    cp -a "$live/gsd-file-manifest.json" "$dir/gsd-file-manifest.json" || die "cannot copy the manifest"
+    copy_installer_scripts "$live" "$dir"
+
+    # Live paths point into DIR; bus hooks and a mod list from the environment
+    # block are dropped, so the mod loads only through --plugin-dir.
+    if ! jq --arg live "$live" --arg dir "$dir" '
+        def swap:
+            if type == "string" then (if . == $live then $dir else (split($live + "/") | join($dir + "/")) end)
+            elif type == "array" then map(swap)
+            elif type == "object" then map_values(swap)
+            else . end;
+        swap
+        | if (.hooks | type) == "object" then
+              .hooks |= map_values(
+                  map(if has("hooks") then .hooks |= map(select((.command // "") | contains("dsmr-bus-watch") | not)) else . end)
+                  | map(select((.hooks // [1]) | length > 0)))
+          else . end
+        | if (.env | type) == "object" then
+              (.env |= del(.CLAUDE_CODE_PLUGIN_DIRS)) | (if .env == {} then del(.env) else . end)
+          else . end' "$live/settings.json" > "$dir/settings.json.tmp"; then
+        rm -f "$dir/settings.json.tmp"; die "cannot build settings.json"
+    fi
+    mv -f "$dir/settings.json.tmp" "$dir/settings.json" || die "cannot write settings.json"
+    if ! jq '{mcpServers: (.mcpServers // {})}' "$lj" > "$dir/.claude.json.tmp"; then
+        rm -f "$dir/.claude.json.tmp"; die "cannot build .claude.json"
+    fi
+    mv -f "$dir/.claude.json.tmp" "$dir/.claude.json" || die "cannot write .claude.json"
+
+    pristine_restore "$dir"
+    pristine_prove "$dir" || return 1
+
+    after=$(tree_hash "$live/gsd-core") || exit 1
+    echo "live gsd-core tree: $nbefore files, listing sha256 $(printf '%s\n' "$before" | sha256sum | cut -d' ' -f1) before"
+    echo "live gsd-core tree: $(printf '%s\n' "$after" | wc -l) files, listing sha256 $(printf '%s\n' "$after" | sha256sum | cut -d' ' -f1) after"
+    [ "$before" = "$after" ] || { echo "live gsd-core CHANGED"; return 1; }
+    echo "live gsd-core identical before and after"
+    [ "$(live_gate_present)" -eq 5 ] || { echo "live gate no longer prints five present"; return 1; }
+    echo "live gate: five present"
+    if [ -e "$dir/.credentials.json" ]; then
+        echo "credentials already present in $dir (kept)"
+    else
+        echo "no credentials in $dir (sign in with CLAUDE_CONFIG_DIR=$dir claude auth login)"
+    fi
+    echo "config directory ready: $dir"
 }
 
 cmd_make_repo() {
@@ -883,7 +1016,7 @@ arm_selected() {
 }
 
 cmd_run_arm() {
-    local arm="" gsd="" evidence="" config="" plugin="" exmodel=opus capture="" only="" envs=()
+    local arm="" gsd="" evidence="" config="" plugin="" exmodel=opus capture="" only="" envs=() orch=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --gsd-core) [ $# -ge 2 ] || usage_error "--gsd-core needs a value"; gsd=$2; shift 2 ;;
@@ -892,6 +1025,7 @@ cmd_run_arm() {
             --plugin-dir) [ $# -ge 2 ] || usage_error "--plugin-dir needs a value"; plugin=$2; shift 2 ;;
             --executor-model) [ $# -ge 2 ] || usage_error "--executor-model needs a value"; exmodel=$2; shift 2 ;;
             --capture) [ $# -ge 2 ] || usage_error "--capture needs a value"; capture=$2; shift 2 ;;
+            --orchestrator-model) [ $# -ge 2 ] || usage_error "--orchestrator-model needs a value"; orch=$2; shift 2 ;;
             --only) [ $# -ge 2 ] || usage_error "--only needs a value"; only=$2; shift 2 ;;
             --env) [ $# -ge 2 ] || usage_error "--env needs KEY=VAL"; envs+=(--env "$2"); shift 2 ;;
             -h|--help) usage; exit 0 ;;
@@ -917,7 +1051,7 @@ cmd_run_arm() {
     mkdir -p "$evidence/mod-log" || die "cannot create $evidence"
     ev=$(cd "$evidence" && pwd)
     local cache=${XDG_CACHE_HOME:-$HOME/.cache}/dsmr-routing-probes/$arm
-    [ -f "$ev/sessions.tsv" ] || printf 'session_id\tpath\ttag\ttranscript\tstart\tend\ttokens\tnotes\n' > "$ev/sessions.tsv"
+    [ -f "$ev/sessions.tsv" ] || printf 'session_id\tpath\ttag\ttranscript\tstart\tend\ttokens\tnotes\tmodel\n' > "$ev/sessions.tsv"
     [ -f "$ev/tokens.txt" ] || printf 'tag\tcell\ttranscript\tturns\tcache_read\tcache_write\toutput\tmodels\n' > "$ev/tokens.txt"
 
     local -a only_list=() cells=(execute-phase: quick:shell quick:lisp quick:mixed quick:docs quick-batch: audit-fix: execute-phase-leader:)
@@ -957,6 +1091,7 @@ cmd_run_arm() {
             audit-fix) prompt='/gsd-audit-fix --source audit-uat --severity all --max 4' ;;
         esac
         [ "$path" != execute-phase-leader ] || model=$LEADER_MODEL
+        [ -z "$orch" ] || model=$orch
 
         sid=$(cat /proc/sys/kernel/random/uuid)
         start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -967,7 +1102,7 @@ cmd_run_arm() {
         printf '%s\n' "$transcript" > "$ev/probe-$tag.out"
         transcript=$(printf '%s\n' "$transcript" | tail -n 1)
         if [ ! -f "$transcript" ]; then
-            printf '%s\t%s\t%s\t-\t%s\t%s\t0\tno transcript, claude exit %s\n' "$sid" "$path" "$tag" "$start" "$end" "$rc" >> "$ev/sessions.tsv"
+            printf '%s\t%s\t%s\t-\t%s\t%s\t0\tno transcript, claude exit %s\t%s\n' "$sid" "$path" "$tag" "$start" "$end" "$rc" "$model" >> "$ev/sessions.tsv"
             die "$tag: no transcript (claude exit $rc); see $ev/probe-$tag.err"
         fi
         [ ! -f "$home/$LOG_DIR/$sid.jsonl" ] || cp "$home/$LOG_DIR/$sid.jsonl" "$ev/mod-log/$tag.jsonl"
@@ -978,7 +1113,7 @@ cmd_run_arm() {
         ledger_body "${ledger_files[@]}" | sed "s/^/$tag\t$path\t/" >> "$ev/tokens.txt"
         total=$(awk -F'\t' 'NR > 1 && $6 ~ /^[0-9]+$/ { s += $6 } END { print s + 0 }' "$ev/report-$tag.tsv")
         cache_read=$(session_cache_read "$transcript")
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\tclaude exit %s\n' "$sid" "$path" "$tag" "$transcript" "$start" "$end" "$total" "$rc" >> "$ev/sessions.tsv"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\tclaude exit %s\t%s\n' "$sid" "$path" "$tag" "$transcript" "$start" "$end" "$total" "$rc" "$model" >> "$ev/sessions.tsv"
         echo "$tag: session $sid, subagent tokens $total, cache read $cache_read, claude exit $rc"
         if [ "$cache_read" -gt "$CACHE_READ_CAP" ]; then
             echo "$PROGNAME: $tag read $cache_read cached tokens, over the $CACHE_READ_CAP cap; arm stopped" >&2
@@ -1201,6 +1336,9 @@ cmd_record_history() {
 [ $# -ge 1 ] || usage_error
 sub=$1; shift
 case "$sub" in
+    make-config) cmd_make_config "$@" ;;
+    check-config) cmd_check_config "$@" ;;
+    tree-hash) cmd_tree_hash "$@" ;;
     make-repo) cmd_make_repo "$@" ;;
     describe) cmd_describe "$@" ;;
     run) cmd_run "$@" ;;

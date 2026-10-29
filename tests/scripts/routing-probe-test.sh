@@ -22,6 +22,13 @@
 # evidence/. It reads 8307533 cache-read tokens over its orchestrator and
 # subagents, the tracer 2409799.
 #
+# The make-config cases build a config directory from the live install on this
+# host (agents, skills, hooks, gsd-core and its installer manifest) and prove it
+# against that manifest, so they need the live gsd-core 1.19.0 install. The
+# run-arm model cases put a stand-in `claude` on PATH that records its arguments
+# and copies the recorded tracer session into the config directory; they check
+# the model argument and the sessions.tsv column, not any output of claude.
+#
 # Usage: ROUTING_PROBE_RECORDED=DIR tests/scripts/routing-probe-test.sh
 #   DIR holds the recorded sessions under DIR/tracer and DIR/execute-phase.
 
@@ -210,6 +217,125 @@ if [ "$n" -eq 3 ] && [ "${rows%%$'\n'*}" = $'path\tturns\tcache_read\tcache_writ
     ok ledger-row-header
 else
     bad ledger-row-header "lines: $n"
+fi
+
+printf '\nmake-config\n'
+
+LIVE=$(realpath -m "${CLAUDE_CONFIG_DIR:-$HOME/.claude}")
+CFG=$WORK/config
+probe make-config "$CFG" > "$WORK/make-config.out" 2>&1; mc_rc=$?
+
+if [ "$mc_rc" -eq 0 ] && [ ! -e "$CFG/.credentials.json" ] && [ "$(stat -c %a "$CFG")" = 700 ] \
+        && [ -e "$LIVE/.credentials.json" ]; then
+    ok config-no-credentials
+else
+    bad config-no-credentials "rc=$mc_rc: $(tail -n 3 "$WORK/make-config.out")"
+fi
+
+# Control: the live settings do carry a bus hook, so an empty result means removal.
+bus_cmds='[.. | .command? // empty | strings | select(contains("dsmr-bus-watch"))] | length'
+live_n=$(jq "$bus_cmds" "$LIVE/settings.json")
+cfg_n=$(jq "$bus_cmds" "$CFG/settings.json" 2>/dev/null)
+if [ "$live_n" -gt 0 ] && [ "$cfg_n" = 0 ]; then ok config-no-bus-hook; else bad config-no-bus-hook "live $live_n, config $cfg_n"; fi
+
+# shellcheck disable=SC2016 # $live is a jq variable
+paths='[.. | strings | select(contains($live))] | length'
+live_p=$(jq --arg live "$LIVE" "$paths" "$LIVE/settings.json")
+cfg_p=$(jq --arg live "$LIVE" "$paths" "$CFG/settings.json" 2>/dev/null)
+# shellcheck disable=SC2016 # $c is a jq variable
+cfg_q=$(jq --arg c "$CFG/" '[.. | strings | select(contains($c))] | length' "$CFG/settings.json" 2>/dev/null)
+if [ "$live_p" -gt 0 ] && [ "$cfg_p" = 0 ] && [ "$cfg_q" -gt 0 ]; then
+    ok config-paths-rewritten
+else
+    bad config-paths-rewritten "live $live_p, config $cfg_p, rewritten $cfg_q"
+fi
+
+if grep -q 'live gsd-core identical before and after' "$WORK/make-config.out" \
+        && grep -q 'live gate: five present' "$WORK/make-config.out"; then
+    ok config-live-unchanged
+else
+    bad config-live-unchanged "$(tail -n 4 "$WORK/make-config.out")"
+fi
+
+out=$(probe check-config "$CFG" 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'pristine check passed' <<<"$out" && [ "$(grep -c '^missing ' <<<"$out")" -eq 5 ]; then
+    ok config-pristine
+else
+    bad config-pristine "rc=$rc: $(tail -n 3 <<<"$out")"
+fi
+
+# Control: one appended byte in one workflow must fail the same check, by name.
+printf 'x' >> "$CFG/gsd-core/workflows/quick.md"
+out=$(probe check-config "$CFG" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -q '^mismatch gsd-core/workflows/quick.md$' <<<"$out"; then
+    ok config-tamper
+else
+    bad config-tamper "rc=$rc: $(tail -n 3 <<<"$out")"
+fi
+
+# A target inside the live config directory is refused and nothing is created there.
+out=$(probe make-config "$LIVE/dsmr-make-config-must-not-exist" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && [ ! -e "$LIVE/dsmr-make-config-must-not-exist" ] && grep -q 'inside the live config' <<<"$out"; then
+    ok config-refuses-live
+else
+    bad config-refuses-live "rc=$rc: $out"
+fi
+
+printf '\ntree-hash\n'
+
+mkdir -p "$WORK/tree/sub"
+printf 'a' > "$WORK/tree/sub/b"; printf 'c' > "$WORK/tree/a"
+h1=$(probe tree-hash "$WORK/tree")
+printf 'd' >> "$WORK/tree/a"
+h2=$(probe tree-hash "$WORK/tree")
+if [ "$(wc -l <<<"$h1")" -eq 2 ] && [ "$h1" != "$h2" ]; then
+    ok tree-hash-sensitive
+else
+    bad tree-hash-sensitive "$h1"
+fi
+
+printf '\nrun-arm orchestrator model\n'
+
+STUBS=$WORK/stubs
+mkdir -p "$STUBS"
+# Stand-in for the bus watcher: refuses for want of an identity, as the real one does.
+printf '#!/bin/sh\nexit 2\n' > "$STUBS/dsmr-bus-watch"
+# Stand-in for claude: records its arguments, then plays back the recorded tracer session.
+cat > "$STUBS/claude" <<STUB
+#!/bin/bash
+printf '%s\n' "\$*" >> "$WORK/claude-args.txt"
+while [ \$# -gt 0 ]; do
+    case "\$1" in --session-id) sid=\$2; shift 2 ;; *) shift ;; esac
+done
+mkdir -p "\$CLAUDE_CONFIG_DIR/projects/-stub"
+cp "$PARENT" "\$CLAUDE_CONFIG_DIR/projects/-stub/\$sid.jsonl"
+cp -a "${PARENT%.jsonl}" "\$CLAUDE_CONFIG_DIR/projects/-stub/\$sid"
+STUB
+chmod +x "$STUBS/dsmr-bus-watch" "$STUBS/claude"
+
+run_arm() {
+    local name=$1; shift
+    rm -f "$WORK/claude-args.txt"
+    PATH=$STUBS:$PATH XDG_CACHE_HOME=$WORK/cache-$name CLAUDE_CONFIG_DIR=$WORK/stub-live \
+        probe run-arm "$name" --gsd-core global --evidence "$WORK/ev-$name" \
+        --config-dir "$WORK/cfg-$name" --plugin-dir none --only quick:shell "$@" > "$WORK/arm-$name.out" 2>&1
+}
+
+run_arm orch --orchestrator-model claude-sonnet-5-5; rc=$?
+last=$(awk -F'\t' 'END { print $NF }' "$WORK/ev-orch/sessions.tsv" 2>/dev/null)
+if [ "$rc" -eq 0 ] && grep -q -- '--model claude-sonnet-5-5 ' "$WORK/claude-args.txt" && [ "$last" = claude-sonnet-5-5 ]; then
+    ok run-arm-orchestrator-model
+else
+    bad run-arm-orchestrator-model "rc=$rc, model column '$last': $(tail -n 3 "$WORK/arm-orch.out")"
+fi
+
+# Control: without the option the default orchestrator model is used and recorded.
+run_arm dflt; rc=$?
+last=$(awk -F'\t' 'END { print $NF }' "$WORK/ev-dflt/sessions.tsv" 2>/dev/null)
+if [ "$rc" -eq 0 ] && grep -q -- '--model claude-opus-5-5 ' "$WORK/claude-args.txt" && [ "$last" = claude-opus-5-5 ]; then
+    ok run-arm-default-model
+else
+    bad run-arm-default-model "rc=$rc, model column '$last': $(tail -n 3 "$WORK/arm-dflt.out")"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
