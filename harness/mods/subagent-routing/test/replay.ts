@@ -9,7 +9,7 @@
 // them in.
 
 import { expect, test } from 'claude-code/testing'
-import type { AgentSpawnInput } from 'claude-code'
+import type { AgentSpawnInput, On } from 'claude-code'
 import type { TapeEntry } from '../hooks/register'
 import { decide, ioDirs, type RouteIo } from '../hooks/route'
 
@@ -74,6 +74,57 @@ function spawnInput(rec: Recording): AgentSpawnInput {
   } as AgentSpawnInput
 }
 
+/** The spawn log as the hooks module writes it during one test. */
+type LogFile = { text: string }
+
+/** Parsed lines of `text` that carry `toolUseId`. */
+function logLinesFor(text: string, toolUseId: string): Record<string, unknown>[] {
+  return text
+    .split('\n')
+    .filter(l => l.trim() !== '')
+    .map(l => JSON.parse(l) as Record<string, unknown>)
+    .filter(l => l.toolUseId === toolUseId)
+}
+
+/**
+ * Engine stand-ins for one recording: answers come from the tape, the spawn
+ * log is kept in `log`, and every spawn passed beneath is pushed to `beneath`.
+ * `answer` returns what the engine answers the spawn passed beneath.
+ */
+function standIns(
+  on: On,
+  tape: Tape,
+  log: LogFile,
+  beneath: AgentSpawnInput[],
+  answer: (e: AgentSpawnInput, n: number) => { model: string; agentId: string } | { deny: string },
+): void {
+  on('env.get', (_$, e) =>
+    e.name === 'SUBAGENT_ROUTING_CAPTURE' ? { value: undefined } : { value: tape.text('env.get', e.name) },
+  )
+  on('session.cwd', () => ({ value: tape.text('session.cwd', '') ?? '' }))
+  on('session.id', () => ({ value: tape.text('session.id', '') ?? '' }))
+  on('fs.read', (_$, e) => {
+    if (LOG_PATH.test(e.path)) {
+      if (log.text === '') throw new Error(`ENOENT: ${e.path}`)
+      return { value: log.text }
+    }
+    const v = tape.answer('fs.read', e.path)
+    if (typeof v !== 'string') throw new Error(`ENOENT: ${e.path}`)
+    return { value: v }
+  })
+  on('fs.exists', (_$, e) =>
+    LOG_PATH.test(e.path) ? { value: log.text !== '' } : { value: tape.answer('fs.exists', e.path) === true },
+  )
+  on('fs.write', (_$, e) => {
+    if (LOG_PATH.test(e.path)) log.text = e.text
+    return { value: undefined }
+  })
+  on('agent.spawn', (_$, e) => {
+    beneath.push(e)
+    return answer(e, beneath.length)
+  })
+}
+
 function tapeIo(rec: Recording, tape: Tape): RouteIo {
   const cwd = rec.input.cwd ?? tape.text('session.cwd', '') ?? ''
   return {
@@ -104,34 +155,24 @@ export function replay(recordings: readonly Recording[]): void {
       expect(d.action).toBe(rec.expected.action)
     })
 
-    test(`${label}: the hooks module passes the expected spawn down`, async ($, on) => {
+    test(`${label}: the hooks module passes the expected spawn down and logs it once`, async ($, on) => {
       const tape = new Tape(rec.tape, label)
-      let beneath: AgentSpawnInput | undefined
-
-      on('env.get', (_$, e) =>
-        e.name === 'SUBAGENT_ROUTING_CAPTURE' ? { value: undefined } : { value: tape.text('env.get', e.name) },
-      )
-      on('session.cwd', () => ({ value: tape.text('session.cwd', '') ?? '' }))
-      on('session.id', () => ({ value: tape.text('session.id', '') ?? '' }))
-      on('fs.read', (_$, e) => {
-        // The routing log is not part of the decision: it reads as empty.
-        if (LOG_PATH.test(e.path)) return { value: '' }
-        const v = tape.answer('fs.read', e.path)
-        if (typeof v !== 'string') throw new Error(`ENOENT: ${e.path}`)
-        return { value: v }
-      })
-      on('fs.exists', (_$, e) => ({ value: tape.answer('fs.exists', e.path) === true }))
-      on('fs.write', () => ({ value: undefined }))
-      on('agent.spawn', (_$, e) => {
-        beneath = e
-        return { model: e.model ?? 'definition', agentId: 'replay' }
-      })
+      const log: LogFile = { text: '' }
+      const beneath: AgentSpawnInput[] = []
+      standIns(on, tape, log, beneath, e => ({ model: e.model ?? 'definition', agentId: 'replay' }))
 
       await $.agent.spawn(spawnInput(rec))
 
       expect(tape.misses).toEqual([])
-      expect(beneath?.subagentType).toBe(rec.expected.subagentType)
-      expect(beneath?.model ?? null).toBe(rec.expected.model)
+      expect(beneath.length).toBe(1)
+      const down = beneath[0]
+      expect(down?.subagentType).toBe(rec.expected.subagentType)
+      expect(down?.model ?? null).toBe(rec.expected.model)
+      const mine = logLinesFor(log.text, rec.input.tool_use_id)
+      expect(mine.length).toBe(1)
+      expect(mine[0]?.action).toBe(rec.expected.action)
+      expect(mine[0]?.set).toEqual({ type: down?.subagentType, model: down?.model ?? null })
+      expect(mine[0]?.error).toBe(undefined)
     })
   }
 }
