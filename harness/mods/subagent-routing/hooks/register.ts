@@ -31,7 +31,7 @@ type Agent = { type: string; model: string | null }
 
 /** One engine call the decision depended on, with what it answered. */
 export type TapeEntry = {
-  op: 'env.get' | 'session.cwd' | 'session.id' | 'fs.read' | 'fs.exists'
+  op: 'env.get' | 'session.cwd' | 'session.root' | 'session.id' | 'fs.read' | 'fs.exists'
   arg: string
   result: string | boolean | null
 }
@@ -206,12 +206,14 @@ export const register: Register = on => {
     const capture = await $.env.get('SUBAGENT_ROUTING_CAPTURE')
     const tape: TapeEntry[] = []
     const { config, home } = await configDirOf($, tape)
-    let cwd = e.cwd
-    if (cwd === undefined) {
-      cwd = await $.session.cwd()
-      tape.push({ op: 'session.cwd', arg: '', result: cwd })
+    // A cwd the call sets is where the subagent runs; otherwise the project
+    // root. A shell `cd` moves the session cwd, never the root.
+    let projectDir = e.cwd
+    if (projectDir === undefined) {
+      projectDir = await $.session.root()
+      tape.push({ op: 'session.root', arg: '', result: projectDir })
     }
-    const dirs = ioDirs(config, home, cwd)
+    const dirs = ioDirs(config, home, projectDir)
 
     let decision: Decision
     let failure: { name: string; message: string } | undefined

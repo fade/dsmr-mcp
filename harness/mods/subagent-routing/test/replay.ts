@@ -46,10 +46,22 @@ class Tape {
     return hit.result
   }
 
+  has(op: TapeEntry['op'], arg: string): boolean {
+    return this.entries.some(t => t.op === op && t.arg === arg)
+  }
+
   text(op: TapeEntry['op'], arg: string): string | undefined {
     const v = this.answer(op, arg)
     return typeof v === 'string' ? v : undefined
   }
+}
+
+/**
+ * The project root the hook asks the session for. A recording made before the
+ * hook asked for the root holds the cwd it asked for instead.
+ */
+function rootOf(tape: Tape): string {
+  return (tape.has('session.root', '') ? tape.text('session.root', '') : tape.text('session.cwd', '')) ?? ''
 }
 
 function labelOf(rec: Recording): string {
@@ -102,6 +114,7 @@ function standIns(
     e.name === 'SUBAGENT_ROUTING_CAPTURE' ? { value: undefined } : { value: tape.text('env.get', e.name) },
   )
   on('session.cwd', () => ({ value: tape.text('session.cwd', '') ?? '' }))
+  on('session.root', () => ({ value: rootOf(tape) }))
   on('session.id', () => ({ value: tape.text('session.id', '') ?? '' }))
   on('fs.read', (_$, e) => {
     if (LOG_PATH.test(e.path)) {
@@ -126,9 +139,9 @@ function standIns(
 }
 
 function tapeIo(rec: Recording, tape: Tape): RouteIo {
-  const cwd = rec.input.cwd ?? tape.text('session.cwd', '') ?? ''
+  const projectDir = rec.input.cwd ?? rootOf(tape)
   return {
-    ...ioDirs(tape.text('env.get', 'CLAUDE_CONFIG_DIR'), tape.text('env.get', 'HOME'), cwd),
+    ...ioDirs(tape.text('env.get', 'CLAUDE_CONFIG_DIR'), tape.text('env.get', 'HOME'), projectDir),
     read: async path => {
       const v = tape.answer('fs.read', path)
       return typeof v === 'string' ? v : null

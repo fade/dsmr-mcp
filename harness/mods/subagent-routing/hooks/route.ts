@@ -54,6 +54,8 @@ export type Decision = {
 
 /** What the project's planning config says about routing. */
 export type ProjectConfig = {
+  /** The text was read and parses as a JSON object. */
+  found: boolean
   /** `planning.agents.specialized === true`. */
   specialized: boolean
   /** `planning.agents.executor` when it is an agent name, else null. */
@@ -83,11 +85,11 @@ const QUICK_BATCH_OPENING = 'Execute quick-batch item'
 export function ioDirs(
   configEnv: string | undefined,
   homeEnv: string | undefined,
-  cwd: string,
+  projectDir: string,
 ): Pick<RouteIo, 'configDir' | 'projectDir' | 'homeDir'> {
   const home = homeEnv ?? ''
   const configDir = configEnv && configEnv !== '' ? configEnv : `${home}/.claude`
-  return { configDir: trimSlash(configDir), projectDir: trimSlash(cwd), homeDir: trimSlash(home) }
+  return { configDir: trimSlash(configDir), projectDir: trimSlash(projectDir), homeDir: trimSlash(home) }
 }
 
 export function spawnKind(e: SpawnFacts): string {
@@ -156,8 +158,8 @@ export function frontmatterValue(text: string, key: string): string | null {
 }
 
 /**
- * Routing fields of a planning config's text; unreadable or invalid JSON
- * reads as no config.
+ * Routing fields of a planning config's text. Unreadable text, invalid JSON
+ * or a value other than an object has `found` false and every field unset.
  */
 export function parseConfig(text: string | null): ProjectConfig {
   let parsed: unknown = null
@@ -171,6 +173,7 @@ export function parseConfig(text: string | null): ProjectConfig {
   const agents = field(field(parsed, 'planning'), 'agents')
   const executor = field(agents, 'executor')
   return {
+    found: typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed),
     specialized: field(agents, 'specialized') === true,
     executor: typeof executor === 'string' && AGENT_NAME.test(executor) ? executor : null,
     routingOff: field(field(parsed, 'workflow'), 'agent_hint_routing') === false,
@@ -219,7 +222,8 @@ async function hasDefinition(name: string, io: RouteIo): Promise<boolean> {
  * Routing decision for one spawn, by these rules in order:
  *
  * 1. A fork, resume, workflow agent or teammate passes unchanged.
- * 2. gsd-executor: with `workflow.agent_hint_routing` false it stays
+ * 2. gsd-executor: with no readable project config it is `cannot-decide`;
+ *    with `workflow.agent_hint_routing` false it stays
  *    gsd-executor, model cleared. Otherwise the prompt must name exactly one
  *    readable plan: its `agent_hint`, when it is shell-developer, gsd-executor
  *    or the project executor and has an installed definition, becomes the
@@ -281,6 +285,9 @@ async function route(input: SpawnFacts, io: RouteIo): Promise<Decision> {
   }
 
   if (type === EXECUTOR) {
+    if (!config.found) {
+      return asRequested('cannot-decide', `no readable ${PLANNING_DIR}/config.json under ${clip(io.projectDir, 200)}`)
+    }
     if (config.routingOff) return keepExecutor('workflow.agent_hint_routing is false', null)
     if (named.length > 1) return asRequested('cannot-decide', `the prompt names ${named.length} plans`)
     if (named.length === 0) {
