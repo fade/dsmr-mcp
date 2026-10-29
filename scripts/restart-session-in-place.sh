@@ -264,7 +264,7 @@ window_idle() {
     # ellipsis, then a parenthesised timer. A todo list can sit between it and
     # the frame, and a spinner-shaped line in the conversation refuses too.
     for line in "${ctx[@]}"; do
-        if [[ $line =~ ^[[:space:]]*[^[:space:][:alnum:]]{1,4}[[:space:]]+[^\(\)]{1,60}${ELLIPSIS}[[:space:]]+\( ]]; then
+        if [[ $line =~ ^[[:space:]]*[^[:space:][:alnum:]]{1,4}[[:space:]]+[^\(\)]+${ELLIPSIS}[[:space:]]+\( ]]; then
             IDLE_WHY="a turn is running"
             return 1
         fi

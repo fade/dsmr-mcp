@@ -285,6 +285,13 @@ run "${FAST[@]}" zebra
 try "[busy-spinner] mid-turn with an empty prompt refused, nothing typed" "rc=$RC err=$ERR out=$OUT" \
     test "$RC" = 1 -a -z "$(sendlog)" -a -n "$(grep 'a turn is running' <<<"$OUT")"
 
+one_sister
+long_verb="Transmogrifying the entire quantum flux capacitor manifold in earnest"
+sed "s/Transmogrifying/$long_verb/" "$FIXTURES/claude-turn-running.ansi" > "$FX/screen/kitty-A-16"
+run "${FAST[@]}" zebra
+try "[busy-spinner-long] a spinner phrase over 60 bytes still refuses" "rc=$RC err=$ERR out=$OUT" \
+    test "$RC" = 1 -a -z "$(sendlog)" -a -n "$(grep 'a turn is running' <<<"$OUT")" -a "${#long_verb}" -gt 64
+
 for f in claude-turn-running-thinking.ansi claude-turn-running-hooks.ansi; do
     one_sister
     screen_from A 16 "$f"
