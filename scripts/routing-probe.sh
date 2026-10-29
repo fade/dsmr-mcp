@@ -11,6 +11,9 @@
 #   report TRANSCRIPT
 #       Print one TSV row per Agent call in a session: what was asked for,
 #       what ran (from the subagent's own records) and what the mod logged.
+#   replay RECORDINGS_DIR [--mod DIR]
+#       Run the mod's replay tests over every recorded spawn in RECORDINGS_DIR,
+#       against a temporary copy of the mod (default: this repository's).
 #
 # Exit status: 0 success, 1 failure, 64 usage.
 
@@ -32,6 +35,7 @@ usage: $PROGNAME make-repo DIR --gsd-core local-pristine
        $PROGNAME run REPO --session-id UUID [--config-dir DIR] [--plugin-dir DIR]
                  [--capture DIR] [--debug-file FILE] [--append-system-prompt TEXT] -- PROMPT
        $PROGNAME report TRANSCRIPT
+       $PROGNAME replay RECORDINGS_DIR [--mod DIR]
 EOF
 }
 
@@ -328,6 +332,45 @@ cmd_report() {
              | awk -F'\t' '!seen[$1]++')
 }
 
+# --- replay ------------------------------------------------------------------
+
+cmd_replay() {
+    local recordings="" mod=$SCRIPT_DIR/../harness/mods/subagent-routing
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --mod) [ $# -ge 2 ] || usage_error "--mod needs a value"; mod=$2; shift 2 ;;
+            -h|--help) usage; exit 0 ;;
+            -*) usage_error "unknown option $1" ;;
+            *) [ -z "$recordings" ] || usage_error "one RECORDINGS_DIR only"; recordings=$1; shift ;;
+        esac
+    done
+    [ -n "$recordings" ] || usage_error "replay needs RECORDINGS_DIR"
+    [ -d "$recordings" ] || usage_error "no such directory: $recordings"
+    local files=() f
+    for f in "$recordings"/*.json; do [ -f "$f" ] && files+=("$f"); done
+    [ "${#files[@]}" -gt 0 ] || usage_error "no recordings in $recordings"
+    [ -f "$mod/.claude-plugin/plugin.json" ] || die "not a mod folder: $mod"
+
+    # Recordings hold dispatch prompts: they are copied only into a temporary
+    # copy of the mod, never into the mod's own folder.
+    local work
+    work=$(mktemp -d) || die "mktemp failed"
+    # shellcheck disable=SC2064 # expand $work now: the trap runs after it leaves scope
+    trap "rm -rf '$work'" EXIT
+    cp -a "$mod/." "$work/" || die "cannot copy $mod"
+    rm -rf "$work/.claude-plugin/types"
+    jq -s . "${files[@]}" | { printf 'export default '; cat; printf '\n'; } > "$work/test/recordings.ts" \
+        || die "cannot read the recordings"
+    printf "import recordings from './recordings'\nimport { replay } from './replay'\nreplay(recordings)\n" \
+        > "$work/test/replay.test.ts"
+
+    local rc
+    claude plugin test "$work"
+    rc=$?
+    echo "replayed ${#files[@]} recordings"
+    return "$rc"
+}
+
 # --- main --------------------------------------------------------------------
 
 [ $# -ge 1 ] || usage_error
@@ -336,6 +379,7 @@ case "$sub" in
     make-repo) cmd_make_repo "$@" ;;
     run) cmd_run "$@" ;;
     report) cmd_report "$@" ;;
+    replay) cmd_replay "$@" ;;
     -h|--help) usage ;;
     *) usage_error "unknown subcommand $sub" ;;
 esac
