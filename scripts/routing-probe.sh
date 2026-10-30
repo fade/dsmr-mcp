@@ -441,9 +441,12 @@ cmd_make_config() {
     case "$live" in "$dir"/*) die "refusing $dir: it contains the live config directory $live" ;; esac
     case "$repo" in "$dir"/*) die "refusing $dir: it contains the repository $repo" ;; esac
     [ ! -e "$dir" ] || [ -d "$dir" ] || die "refusing $dir: it is not a directory"
-    if [ -d "$dir" ] && [ ! -f "$dir/$CONFIG_MARKER" ] \
-            && [ -n "$(find "$dir" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
-        die "refusing $dir: it is not empty and make-config did not build it (no $CONFIG_MARKER)"
+    # A directory that cannot be listed counts as not empty.
+    if [ -d "$dir" ] && [ ! -f "$dir/$CONFIG_MARKER" ]; then
+        local entries
+        { [ -r "$dir" ] && [ -x "$dir" ]; } || die "refusing $dir: it cannot be listed"
+        entries=$(find "$dir" -mindepth 1 -maxdepth 1 -print -quit) || die "refusing $dir: it cannot be listed"
+        [ -z "$entries" ] || die "refusing $dir: it is not empty and make-config did not build it (no $CONFIG_MARKER)"
     fi
     [ -d "$live/gsd-core" ] || die "gsd-core not installed under $live"
     [ -f "$live/gsd-file-manifest.json" ] || die "installer manifest not found under $live"

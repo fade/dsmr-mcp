@@ -333,6 +333,22 @@ else
     bad config-refuses-foreign "rc=$rc: $(tail -n 3 <<<"$out")"
 fi
 
+# A directory make-config did not build and cannot list is refused too, and
+# nothing in it changes.
+SEALED=$WORK/sealed
+mkdir -p "$SEALED/agents"
+printf 'keep\n' > "$SEALED/agents/keep.md"
+chmod 300 "$SEALED"
+out=$(probe make-config "$SEALED" 2>&1); rc=$?
+sealed_mode=$(stat -c %a "$SEALED")
+chmod 755 "$SEALED"
+if [ "$rc" -ne 0 ] && [ -f "$SEALED/agents/keep.md" ] && [ "$sealed_mode" = 300 ] \
+        && [ ! -e "$SEALED/settings.json" ] && grep -q 'cannot be listed' <<<"$out"; then
+    ok config-refuses-unlistable
+else
+    bad config-refuses-unlistable "rc=$rc mode=$sealed_mode: $(tail -n 3 <<<"$out")"
+fi
+
 # A directory that holds the repository is refused. The script is copied under
 # a stand-in repository so the directory under test is a scratch one.
 OUTER=$WORK/outer
