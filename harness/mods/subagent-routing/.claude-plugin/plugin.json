@@ -1,5 +1,5 @@
 {
   "name": "subagent-routing",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Sets a subagent's agent type and model by role when it spawns, and logs each decision."
 }
