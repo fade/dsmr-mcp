@@ -387,9 +387,12 @@ else
     bad config-skill-names-itself "$(grep -n 'workflows/quick.md' "$CFG/$SKILL_REL" | head -n 2)"
 fi
 
-# The workflows are the installer's bytes except where they name the root.
+# No markdown, and no file the installer did not write, names the live root;
+# the installer's scripts keep their bytes (config-installer-code-untouched).
+installer_code=$(jq -r '.files | keys[] | select(endswith(".md") | not)' "$CFG/gsd-file-manifest.json")
 # shellcheck disable=SC2016 # $HOME is a grep pattern, not an expansion
-leaks=$(grep -rIlE -e '(~|\$HOME)/\.claude([^[:alnum:]_-]|$)' "$CFG/agents" "$CFG/skills" "$CFG/hooks" "$CFG/gsd-core" "$CFG/CLAUDE.md" 2>/dev/null | head -n 3)
+leaks=$(grep -rIlE -e '(~|\$HOME)/\.claude([^[:alnum:]_-]|$)' "$CFG/agents" "$CFG/skills" "$CFG/hooks" "$CFG/gsd-core" "$CFG/CLAUDE.md" 2>/dev/null \
+    | sed "s|^$CFG/||" | grep -vxF -f <(printf '%s\n' "$installer_code") | head -n 3)
 if [ -z "$leaks" ]; then ok config-no-live-references; else bad config-no-live-references "$leaks"; fi
 
 # A fresh make-config leaves check-config passing, now with the isolation check.
@@ -402,10 +405,11 @@ else
     bad config-isolated "rc=$rc: $(tail -n 3 <<<"$out")"
 fi
 
-# Control: a copied file that names the live root again fails check-config by name.
-printf '\nRead %s/.claude/gsd-core/workflows/quick.md\n' "$TILDE" >> "$CFG/$SKILL_REL"
+# Control: a copied file that names the live root again fails check-config by
+# name. CLAUDE.md is not the installer's, so the pristine proof does not see it.
+printf '\nRead %s/.claude/gsd-core/workflows/quick.md\n' "$TILDE" >> "$CFG/CLAUDE.md"
 out=$(probe check-config "$CFG" 2>&1); rc=$?
-if [ "$rc" -ne 0 ] && grep -q "^live-root reference $SKILL_REL\$" <<<"$out"; then
+if [ "$rc" -ne 0 ] && grep -q "^live-root reference CLAUDE.md\$" <<<"$out"; then
     ok config-planted-live-reference
 else
     bad config-planted-live-reference "rc=$rc: $(tail -n 3 <<<"$out")"
@@ -428,7 +432,75 @@ if ! cmp -s "$LIVE/gsd-core/workflows/quick.md" "$CFG/gsd-core/workflows/quick.m
 else
     bad config-planted-patched-workflow "live quick.md equals the installer copy; nothing to plant"
 fi
-probe make-config "$CFG" > /dev/null 2>&1
+probe make-config "$CFG" > "$WORK/make-config3.out" 2>&1
+
+# The installer rewrites the config root in markdown only; its scripts reach
+# the root at run time. Every installer file that is not markdown is copied
+# byte for byte.
+# shellcheck disable=SC2016 # jq program
+changed=$(jq -r '.files | to_entries[] | select(.key | endswith(".md") | not) | [.key, .value] | @tsv' "$CFG/gsd-file-manifest.json" \
+    | while IFS=$'\t' read -r rel want; do
+          [ -f "$CFG/$rel" ] || continue
+          [ "$(sha256sum < "$CFG/$rel" | cut -d' ' -f1)" = "$want" ] || printf '%s\n' "$rel"
+      done)
+named=$(grep -lF "$TILDE/.claude/" "$LIVE/gsd-core/bin/lib/"*.cjs | head -n 1)
+if [ -z "$changed" ] && [ -n "$named" ]; then ok config-installer-code-untouched; else bad config-installer-code-untouched "rewritten: $(head -n 3 <<<"$changed") named: $named"; fi
+
+# Code that is not the installer's is rewritten, and listed. The planning hook
+# names scripts under the live root by absolute path.
+HOOK_REL=hooks/gsd-planning-symlinks.js
+if [ -f "$LIVE/$HOOK_REL" ] && grep -qF "$LIVE/scripts/" "$LIVE/$HOOK_REL" && ! grep -qF "$LIVE/" "$CFG/$HOOK_REL" \
+        && grep -qF "$HOOK_REL" "$WORK/make-config3.out"; then
+    ok config-other-code-rewritten-and-listed
+else
+    bad config-other-code-rewritten-and-listed "$(grep -n 'rewrote' "$WORK/make-config3.out" | head -n 3)"
+fi
+
+# Control: an installer script carrying the rewrite fails the proof by name,
+# and repoint puts the installer's bytes back.
+LIB_REL=${named#"$LIVE"/}
+CFG_REL=$(realpath -m --relative-to="$HOME" "$CFG")
+perl -pe "s{~/\\.claude(?![\\w-])}{~/$CFG_REL}g; s{\\\$HOME/\\.claude(?![\\w-])}{\\\$HOME/$CFG_REL}g" "$LIVE/$LIB_REL" > "$CFG/$LIB_REL"
+out=$(probe check-config "$CFG" 2>&1); rc=$?
+if ! cmp -s "$LIVE/$LIB_REL" "$CFG/$LIB_REL" && [ "$rc" -ne 0 ] && grep -qxF "mismatch $LIB_REL" <<<"$out"; then
+    ok config-rewritten-installer-code-fails
+else
+    bad config-rewritten-installer-code-fails "rc=$rc: $(tail -n 3 <<<"$out")"
+fi
+out=$(probe repoint "$CFG" 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && cmp -s "$LIVE/$LIB_REL" "$CFG/$LIB_REL" && grep -qF "restored $LIB_REL" <<<"$out"; then
+    ok repoint-restores-installer-code
+else
+    bad repoint-restores-installer-code "rc=$rc: $out"
+fi
+
+# The proof covers the installer's agents, skills and hooks: one appended byte
+# in each fails it by name.
+for rel in agents/gsd-executor.md skills/gsd-quick/SKILL.md hooks/gsd-path-export.js; do
+    cp -p "$CFG/$rel" "$WORK/saved"
+    printf 'x' >> "$CFG/$rel"
+    out=$(probe check-config "$CFG" 2>&1); rc=$?
+    cp -p "$WORK/saved" "$CFG/$rel"
+    if [ "$rc" -ne 0 ] && grep -qxF "mismatch $rel" <<<"$out"; then
+        ok "config-tamper-${rel%%/*}"
+    else
+        bad "config-tamper-${rel%%/*}" "rc=$rc: $(tail -n 3 <<<"$out")"
+    fi
+done
+
+# ~/.claude.json is Claude Code's own state file, not a path under the config
+# root; a sentence ending in ~/.claude. still names the root.
+OLDJ=$WORK/old-json
+mkdir -p "$OLDJ/agents"
+printf 'built\n' > "$OLDJ/.routing-probe-config"
+printf 'State lives in %s/.claude.json; agents live in %s/.claude.\n' "$TILDE" "$TILDE" > "$OLDJ/agents/a.md"
+probe repoint "$OLDJ" > /dev/null 2>&1
+OLDJ_REL=$(realpath -m --relative-to="$HOME" "$OLDJ")
+if grep -qxF "State lives in $TILDE/.claude.json; agents live in $TILDE/$OLDJ_REL." "$OLDJ/agents/a.md"; then
+    ok repoint-leaves-claude-json
+else
+    bad repoint-leaves-claude-json "$(cat "$OLDJ/agents/a.md")"
+fi
 
 # repoint on a directory built the old way: real copied files that name ~/.claude,
 # beside stand-ins for the files it must never touch.

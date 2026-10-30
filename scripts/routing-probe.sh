@@ -13,19 +13,22 @@
 #       manifest. It holds no credentials and no bus hook; the live install is
 #       read only and proven unchanged. DIR must be new, empty, or one an
 #       earlier make-config built (it holds .routing-probe-config).
-#       Copied command, skill, agent, hook and gsd-core text that names the live
-#       config root (~/.claude, $HOME/.claude, its absolute path) is rewritten
-#       to name DIR, so a session run with CLAUDE_CONFIG_DIR=DIR reads nothing
-#       from the live root.
+#       Copied markdown, and every copied file the installer did not write,
+#       that names the live config root (~/.claude, $HOME/.claude, its absolute
+#       path) is rewritten to name DIR, as the installer does for a config
+#       directory of its own; the installer's scripts keep their bytes. Each
+#       rewritten file that is not markdown is listed.
 #   repoint DIR
-#       Redo that rewrite in a directory make-config built, in place. Only
-#       agents, skills, hooks, commands, scripts, gsd-core and CLAUDE.md under
-#       DIR are touched; credentials, settings, projects and logs never are.
+#       Redo that rewrite in a directory make-config built, in place, and put
+#       back the installer's bytes in any installer script an earlier rewrite
+#       changed. Only agents, skills, hooks, commands, scripts, gsd-core and
+#       CLAUDE.md under DIR are touched; credentials, settings, projects and
+#       logs never are.
 #   check-config DIR
-#       Re-check a config directory: every gsd-core and scripts manifest entry
-#       matches once the config-root rewrite is undone, no copied file still
-#       names the live root, and the routing gate reports five units missing
-#       under DIR.
+#       Re-check a config directory: every gsd-core, scripts, agents, skills
+#       and hooks manifest entry matches (markdown once the config-root rewrite
+#       is undone, anything else byte for byte), no copied file still names the
+#       live root, and the routing gate reports five units missing under DIR.
 #   reads-outside DIR TRANSCRIPT [--live LIVE]
 #       List what a session (and its subagents) touched outside DIR and the
 #       session's working directory: file tool paths, and every command,
@@ -384,21 +387,26 @@ swap_prepare() {
     export SWAP_FROM_REL SWAP_FROM_ABS SWAP_TO_REL SWAP_TO_ABS
 }
 
+# A name of the config root ends where its path component ends: not before a
+# word character, a hyphen, or a dot that opens an extension, so
+# ~/.claude-plugin and ~/.claude.json are left alone while a sentence ending in
+# ~/.claude. is not. ~/.claude.json is Claude Code's state file, kept under
+# CLAUDE_CONFIG_DIR as .claude.json; it is not a path under the config root.
+
 # swap_root: stdin to stdout, every name of config root FROM (see swap_prepare)
-# replaced by the same form of TO: ~/REL, $HOME/REL and the absolute path. A
-# match must end its path component, so ~/.claude-plugin is left alone. Each
-# form keeps its kind, so swapping back restores the original bytes.
+# replaced by the same form of TO: ~/REL, $HOME/REL and the absolute path.
+# Each form keeps its kind, so swapping back restores the original bytes.
 swap_root() {
     perl -pe '
         BEGIN { ($fr, $fa, $tr, $ta) = @ENV{qw(SWAP_FROM_REL SWAP_FROM_ABS SWAP_TO_REL SWAP_TO_ABS)}; }
-        s{(?:(~|\$HOME)/\Q$fr\E|(?<![\w./-])\Q$fa\E)(?![\w-])}{defined $1 ? "$1/$tr" : $ta}ge;'
+        s{(?:(~|\$HOME)/\Q$fr\E|(?<![\w./-])\Q$fa\E)(?![\w-]|\.\w)}{defined $1 ? "$1/$tr" : $ta}ge;'
 }
 
-# names_root FILE: succeed when FILE names config root FROM in any form.
+# names_root FILE: succeed when FILE names config root FROM in a form swap_root rewrites.
 names_root() {
     perl -ne '
         BEGIN { ($r, $a) = @ENV{qw(SWAP_FROM_REL SWAP_FROM_ABS)}; }
-        if (/(?:(?:~|\$HOME)\/\Q$r\E|(?<![\w.\/-])\Q$a\E)(?![\w-])/) { $f = 1; last }
+        if (/(?:(?:~|\$HOME)\/\Q$r\E|(?<![\w.\/-])\Q$a\E)(?![\w-]|\.\w)/) { $f = 1; last }
         END { exit($f ? 0 : 1) }' "$1"
 }
 
@@ -412,18 +420,69 @@ artifact_files() {
     done | xargs -0 -r grep -IlZF -e "$SWAP_FROM_REL" -e "$SWAP_FROM_ABS" 2>/dev/null
 }
 
+# load_owned DIR: fill OWNED with every path the installer manifest under DIR lists.
+declare -A OWNED=()
+load_owned() {
+    local rel list
+    OWNED=()
+    [ -f "$1/gsd-file-manifest.json" ] || return 0
+    list=$(jq -r '.files | keys[]' "$1/gsd-file-manifest.json") || die "cannot read $1/gsd-file-manifest.json"
+    while IFS= read -r rel; do
+        [ -n "$rel" ] && OWNED[$rel]=1
+    done <<<"$list"
+}
+
+# rewritable REL: whether repoint rewrites REL (relative to the config dir).
+# The installer rewrites the config root in its markdown only, so its other
+# files keep their bytes; every file it did not write is rewritten.
+rewritable() {
+    case "$1" in *.md) return 0 ;; esac
+    [ -z "${OWNED[$1]:-}" ]
+}
+
+# swap_in_place FILE: replace FILE with swap_root of itself, keeping its mode.
+swap_in_place() {
+    local f=$1
+    swap_root < "$f" > "$f.repoint.tmp" || { rm -f "$f.repoint.tmp"; die "cannot rewrite $f"; }
+    if ! { chmod --reference="$f" "$f.repoint.tmp" && mv -f "$f.repoint.tmp" "$f"; }; then
+        rm -f "$f.repoint.tmp"; die "cannot replace $f"
+    fi
+}
+
+# restore_installer_code DIR FROM: put the installer's bytes back in each
+# installer file under DIR that is not markdown and matches the manifest once
+# DIR is swapped back to FROM; print each one restored.
+restore_installer_code() {
+    local dir=$1 from=$2 rel want list
+    [ -f "$dir/gsd-file-manifest.json" ] || return 0
+    list=$(jq -r '.files | to_entries[] | select(.key | endswith(".md") | not) | [.key, .value] | @tsv' \
+        "$dir/gsd-file-manifest.json") || die "cannot read $dir/gsd-file-manifest.json"
+    swap_prepare "$dir" "$from"
+    while IFS=$'\t' read -r rel want; do
+        [ -n "$rel" ] && [ -f "$dir/$rel" ] && [ ! -L "$dir/$rel" ] || continue
+        [ "$(sha256sum < "$dir/$rel" | cut -d' ' -f1)" != "$want" ] || continue
+        [ "$(swap_root < "$dir/$rel" | sha256sum | cut -d' ' -f1)" = "$want" ] || continue
+        swap_in_place "$dir/$rel"
+        echo "restored $rel"
+    done <<<"$list"
+}
+
 # repoint_tree DIR FROM: rewrite each copied artifact under DIR that names
-# config root FROM to name DIR; print the count.
+# config root FROM to name DIR (rewritable files only), and restore installer
+# files an earlier rewrite changed; print each file that is not markdown and
+# the count.
 repoint_tree() {
-    local dir=$1 from=$2 f n=0
-    swap_prepare "$from" "$dir"
+    local dir=$1 from=$2 f rel n=0
     if [ "$(realpath -m -- "$from")" != "$(realpath -m -- "$dir")" ]; then
+        load_owned "$dir"
+        restore_installer_code "$dir" "$from"
+        swap_prepare "$from" "$dir"
         while IFS= read -r -d '' f; do
+            rel=${f#"$dir"/}
+            rewritable "$rel" || continue
             names_root "$f" || continue
-            swap_root < "$f" > "$f.repoint.tmp" || { rm -f "$f.repoint.tmp"; die "cannot rewrite $f"; }
-            if ! { chmod --reference="$f" "$f.repoint.tmp" && mv -f "$f.repoint.tmp" "$f"; }; then
-                rm -f "$f.repoint.tmp"; die "cannot replace $f"
-            fi
+            swap_in_place "$f"
+            case "$rel" in *.md) ;; *) echo "rewrote $rel (not installer markdown)" ;; esac
             n=$((n + 1))
         done < <(artifact_files "$dir")
     fi
@@ -431,33 +490,47 @@ repoint_tree() {
 }
 
 # live_references DIR LIVE: print each copied artifact under DIR that still
-# names config root LIVE; return 1 when there is one.
+# names config root LIVE; return 1 when there is one. An installer file that
+# is not markdown keeps its home-relative names (the installer leaves them,
+# and they resolve under the session's HOME); only its absolute ones count.
 live_references() {
-    local dir=$1 live=$2 f n=0
+    local dir=$1 live=$2 f rel n=0
     [ "$(realpath -m -- "$live")" != "$(realpath -m -- "$dir")" ] || return 0
+    load_owned "$dir"
     swap_prepare "$live" "$dir"
     while IFS= read -r -d '' f; do
-        names_root "$f" || continue
-        echo "live-root reference ${f#"$dir"/}"
+        rel=${f#"$dir"/}
+        if rewritable "$rel"; then
+            names_root "$f" || continue
+        else
+            grep -qF -e "$SWAP_FROM_ABS" "$f" || continue
+        fi
+        echo "live-root reference $rel"
         n=$((n + 1))
     done < <(artifact_files "$dir")
     [ "$n" -eq 0 ]
 }
 
-# pristine_prove ROOT [LIVE]: print the proof and return 1 if it does not
-# hold: every gsd-core and scripts entry of the installer manifest under ROOT
-# matches by SHA-256 (a file that names ROOT matches once ROOT is swapped back
-# to LIVE, the config root the manifest was written for), and the gate exits 1
-# printing five missing lines.
+# Installer manifest subtrees check-config and make-config prove.
+PROVEN_PREFIXES=(gsd-core/ scripts/ agents/ skills/ hooks/)
+
+# pristine_prove ROOT [LIVE [PREFIX...]]: print the proof and return 1 if it
+# does not hold: every installer manifest entry under ROOT whose path starts
+# with a PREFIX (default gsd-core/ and scripts/) matches by SHA-256, and the
+# gate exits 1 printing five missing lines. Markdown that names ROOT matches
+# once ROOT is swapped back to LIVE, the config root the manifest was written
+# for; any other file must match byte for byte.
 pristine_prove() {
     local root=$1 live=${2:-$1} manifest=$1/gsd-file-manifest.json
     local entries=0 matched=0 bad=0 rel want got gate_out gate_rc nmissing
+    local -a prefixes=(gsd-core/ scripts/)
+    [ $# -le 2 ] || prefixes=("${@:3}")
     swap_prepare "$root" "$live"
     [ -f "$manifest" ] || { echo "no manifest: $manifest"; return 1; }
     while IFS=$'\t' read -r rel want; do
         entries=$((entries + 1))
         got=$(sha256sum "$root/$rel" 2>/dev/null | cut -d' ' -f1)
-        if [ "$got" != "$want" ] && [ -f "$root/$rel" ]; then
+        if [ "$got" != "$want" ] && [ -f "$root/$rel" ] && [ "${rel%.md}" != "$rel" ]; then
             got=$(swap_root < "$root/$rel" | sha256sum | cut -d' ' -f1)
         fi
         if [ "$got" = "$want" ]; then
@@ -466,8 +539,9 @@ pristine_prove() {
             bad=$((bad + 1))
             echo "mismatch $rel"
         fi
-    done < <(jq -r '.files | to_entries[] | select(.key | startswith("gsd-core/") or startswith("scripts/")) | [.key, .value] | @tsv' "$manifest")
-    echo "manifest $(jq -r .version "$manifest"): $matched of $entries gsd-core and scripts entries match"
+    done < <(jq -r '.files | to_entries[] | select(.key as $k | any($ARGS.positional[]; . as $p | $k | startswith($p)))
+                    | [.key, .value] | @tsv' --args "${prefixes[@]}" < "$manifest")
+    echo "manifest $(jq -r .version "$manifest"): $matched of $entries entries under ${prefixes[*]} match"
 
     gate_out=$(bash "$GATE" --root "$root")
     gate_rc=$?
@@ -525,7 +599,7 @@ cmd_check_config() {
     local dir live refs rc=0
     dir=$(cd "$1" && pwd)
     live=$(realpath -m "$CONFIG_HOME")
-    pristine_prove "$dir" "$live" || rc=1
+    pristine_prove "$dir" "$live" "${PROVEN_PREFIXES[@]}" || rc=1
     refs=$(live_references "$dir" "$live") || { printf '%s\n' "$refs"; echo "isolation check FAILED: copied files name $live"; rc=1; }
     [ "$rc" -ne 0 ] || echo "isolation check passed"
     return "$rc"
@@ -748,7 +822,7 @@ cmd_make_config() {
 
     pristine_restore "$dir"
     repoint_tree "$dir" "$live"
-    pristine_prove "$dir" "$live" || return 1
+    pristine_prove "$dir" "$live" "${PROVEN_PREFIXES[@]}" || return 1
     live_references "$dir" "$live" || { echo "isolation check FAILED: copied files name $live"; return 1; }
 
     after=$(tree_hash "$live/gsd-core") || exit 1
