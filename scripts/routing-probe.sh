@@ -441,11 +441,14 @@ rewritable() {
 }
 
 # swap_in_place FILE: replace FILE with swap_root of itself, keeping its mode.
+# The new content goes to a temporary file mktemp creates beside FILE, so a
+# link already standing at any fixed name there is never written through.
 swap_in_place() {
-    local f=$1
-    swap_root < "$f" > "$f.repoint.tmp" || { rm -f "$f.repoint.tmp"; die "cannot rewrite $f"; }
-    if ! { chmod --reference="$f" "$f.repoint.tmp" && mv -f "$f.repoint.tmp" "$f"; }; then
-        rm -f "$f.repoint.tmp"; die "cannot replace $f"
+    local f=$1 tmp
+    tmp=$(mktemp -- "$f.repoint.XXXXXX") || die "cannot create a temporary file beside $f"
+    swap_root < "$f" > "$tmp" || { rm -f -- "$tmp"; die "cannot rewrite $f"; }
+    if ! { chmod --reference="$f" "$tmp" && mv -f -- "$tmp" "$f"; }; then
+        rm -f -- "$tmp"; die "cannot replace $f"
     fi
 }
 
@@ -675,6 +678,24 @@ copy_installer_scripts() {
         mkdir -p "$dst/$(dirname "$rel")"
         cp -a "$src/$rel" "$dst/$rel" || die "cannot copy $src/$rel"
     done < <(jq -r '.files | keys[] | select(startswith("scripts/"))' "$src/gsd-file-manifest.json")
+}
+
+# copy_hook_scripts LIVE DIR: copy into DIR/scripts each script under
+# LIVE/scripts that a hook copied into DIR/hooks names by absolute path, so
+# the hook still finds it once repointed; print each one.
+copy_hook_scripts() {
+    local live=$1 dir=$2 rel names
+    [ -d "$dir/hooks" ] || return 0
+    # shellcheck disable=SC2016 # perl program
+    names=$(find "$dir/hooks" -type f -print0 | LIVE=$live xargs -0 -r perl -ne '
+        BEGIN { $l = $ENV{LIVE} }
+        print "$1\n" while m{\Q$l\E/(scripts/[\w.-]+)}g;' | sort -u) || die "cannot read $dir/hooks"
+    while IFS= read -r rel; do
+        [ -n "$rel" ] && [ -f "$live/$rel" ] || continue
+        mkdir -p "$dir/${rel%/*}" || die "cannot create $dir/${rel%/*}"
+        cp -a "$live/$rel" "$dir/$rel" || die "cannot copy $live/$rel"
+        echo "copied $rel (a copied hook requires it)"
+    done <<<"$names"
 }
 
 # install_pristine DIR: copy gsd-core, and the installer's scripts it loads,
@@ -922,6 +943,7 @@ cmd_make_config() {
     cp -a "$live/CLAUDE.md" "$dir/CLAUDE.md" || die "cannot copy CLAUDE.md"
     cp -a "$live/gsd-file-manifest.json" "$dir/gsd-file-manifest.json" || die "cannot copy the manifest"
     copy_installer_scripts "$live" "$dir"
+    copy_hook_scripts "$live" "$dir"
 
     # Live paths in the settings and the MCP servers point into DIR; bus hooks
     # and a mod list from the environment block are dropped, so the mod loads

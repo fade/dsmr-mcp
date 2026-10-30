@@ -565,6 +565,18 @@ else
     bad config-other-code-rewritten-and-listed "$(grep -n 'rewrote' "$WORK/make-config3.out" | head -n 3)"
 fi
 
+# A hook copied from the live tree requires scripts beside it by absolute
+# path; each one it names is copied too, so the rewritten require resolves.
+reqs=$(grep -oE "require\('[^']+'\)" "$CFG/$HOOK_REL" | sed "s/^require('//; s/')\$//" | grep '^/')
+missing=""
+for r in $reqs; do [ -f "$r" ] || missing+=" $r"; done
+if grep -qF "require('$LIVE/scripts/" "$LIVE/$HOOK_REL" && [ -n "$reqs" ] && [ -z "$missing" ] \
+        && ! grep -qvF "$(realpath -m "$CFG")/" <<<"$reqs"; then
+    ok config-hook-scripts-copied
+else
+    bad config-hook-scripts-copied "requires: $reqs; missing:$missing"
+fi
+
 # Control: an installer script carrying the rewrite fails the proof by name,
 # and repoint puts the installer's bytes back.
 LIB_REL=${named#"$LIVE"/}
@@ -641,6 +653,20 @@ h1=$(probe tree-hash "$OLD" 2>&1)
 probe repoint "$OLD" > /dev/null 2>&1
 h2=$(probe tree-hash "$OLD" 2>&1)
 if [ -n "$h1" ] && [ "$h1" = "$h2" ] && ! grep -q 'unknown subcommand' <<<"$h1"; then ok repoint-idempotent; else bad repoint-idempotent "second run changed the tree"; fi
+
+# A link already standing at a temporary name beside a file repoint rewrites
+# is never written through.
+printf 'Read %s/.claude/gsd-core/workflows/quick.md\n' "$TILDE" > "$OLD/agents/fresh.md"
+printf 'victim\n' > "$WORK/victim"
+ln -s "$WORK/victim" "$OLD/agents/fresh.md.repoint.tmp"
+out=$(probe repoint "$OLD" 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && [ "$(cat "$WORK/victim")" = victim ] && [ -L "$OLD/agents/fresh.md.repoint.tmp" ] \
+        && grep -qF "$TILDE/$OLD_REL/gsd-core/workflows/quick.md" "$OLD/agents/fresh.md"; then
+    ok repoint-never-writes-through-a-link
+else
+    bad repoint-never-writes-through-a-link "rc=$rc victim=$(cat "$WORK/victim"): $out"
+fi
+rm -f "$OLD/agents/fresh.md" "$OLD/agents/fresh.md.repoint.tmp"
 
 mkdir -p "$WORK/notmine"
 out=$(probe repoint "$WORK/notmine" 2>&1); rc=$?
