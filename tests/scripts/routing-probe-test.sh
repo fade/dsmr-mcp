@@ -70,6 +70,9 @@ trap 'rm -rf "$WORK"' EXIT
 # The recorded dispatch names its plan under the directory the probe ran in.
 export ROUTING_PROBE_PATH_MAP="/home/fade/.cache/dsmr-routing-probes/tracer/repo=$REC/repo"
 
+# A literal tilde, for patterns that name a home-relative path.
+TILDE='~'
+
 PASSED=0
 FAILED=0
 ok()  { printf '  ok [%s]\n' "$1"; PASSED=$((PASSED + 1)); return 0; }
@@ -375,7 +378,6 @@ printf '\nconfig root rewrite\n'
 
 # The copied skill names the config root; in the live install it is ~/.claude.
 SKILL_REL=skills/gsd-quick/SKILL.md
-TILDE='~'
 CFG_REL=$(realpath -m --relative-to="$HOME" "$CFG")
 if [ -f "$LIVE/$SKILL_REL" ] && grep -qF "$TILDE/.claude/gsd-core/workflows/quick.md" "$LIVE/$SKILL_REL" \
         && grep -qF "$TILDE/$CFG_REL/gsd-core/workflows/quick.md" "$CFG/$SKILL_REL" \
@@ -467,17 +469,154 @@ if [ "$rc" -ne 0 ] && grep -q 'inside the live config' <<<"$out"; then ok repoin
 
 printf '\nreads-outside\n'
 
-# Recorded control session: it Read the live quick.md. DIR is the throwaway
-# config it ran under; the live root is the home install of the recording host.
-out=$(CLAUDE_CONFIG_DIR=/home/fade/.claude probe reads-outside /home/fade/.cache/dsmr-routing-probes/config "$CTRL_PARENT" 2>&1); rc=$?
-if [ "$rc" -eq 1 ] && [ "$out" = "$(printf 'Read\t/home/fade/.claude/gsd-core/workflows/quick.md')" ]; then
+# The recorded control session, moved under a stand-in home: its paths under
+# the recording host's throwaway config, live config root and home become the
+# same paths under RO_HOME, so no case depends on this host's directories.
+RO_HOME=$WORK/ro-home
+RO_LIVE=$RO_HOME/.claude
+RO_CFG=$RO_HOME/.cache/dsmr-routing-probes/config
+mkdir -p "$RO_LIVE" "$RO_CFG"
+RO_T=$WORK/ro/${CTRL_PARENT##*/}
+mkdir -p "$WORK/ro"
+RO_CFG=$RO_CFG RO_LIVE=$RO_LIVE RO_HOME=$RO_HOME perl -pe '
+    s{/home/fade/\.cache/dsmr-routing-probes/config}{$ENV{RO_CFG}}g;
+    s{/home/fade/\.claude}{$ENV{RO_LIVE}}g;
+    s{/home/fade}{$ENV{RO_HOME}}g' "$CTRL_PARENT" > "$RO_T"
+
+ro_probe() { HOME=$RO_HOME probe reads-outside "$@"; }
+
+out=$(ro_probe "$RO_CFG" "$RO_T" 2>&1); rc=$?
+if [ "$rc" -eq 1 ] && grep -qxF "$(printf 'Read\t%s/gsd-core/workflows/quick.md' "$RO_LIVE")" <<<"$out"; then
     ok reads-outside-flags-live-read
 else
-    bad reads-outside-flags-live-read "rc=$rc: $out"
+    bad reads-outside-flags-live-read "rc=$rc: $(head -n 5 <<<"$out")"
 fi
-# Control: the same session judged against a DIR that holds the path lists nothing.
-out=$(CLAUDE_CONFIG_DIR=/home/fade/.claude probe reads-outside /home/fade/.claude "$CTRL_PARENT" 2>&1); rc=$?
-if [ "$rc" -eq 0 ] && [ -z "$out" ]; then ok reads-outside-inside-dir-clean; else bad reads-outside-inside-dir-clean "rc=$rc: $out"; fi
+
+# Claude Code loaded the live CLAUDE.md of an ancestor directory; the
+# recording carries it as an instructions attachment.
+if grep -qF "$(printf 'attachment:instructions\t%s/CLAUDE.md' "$RO_LIVE")" <<<"$out"; then
+    ok reads-outside-flags-loaded-instructions
+else
+    bad reads-outside-flags-loaded-instructions "$(head -n 5 <<<"$out")"
+fi
+
+# The recorded Bash call listed the live quick.md by its ~ name.
+if grep -qF "$(printf 'Bash\t')" <<<"$out" && grep -F "$(printf 'Bash\t')" <<<"$out" | grep -qF "$TILDE/.claude/gsd-core/workflows/quick.md"; then
+    ok reads-outside-flags-bash-command
+else
+    bad reads-outside-flags-bash-command "$(head -n 5 <<<"$out")"
+fi
+
+# The caller's CLAUDE_CONFIG_DIR does not move the live root.
+out=$(CLAUDE_CONFIG_DIR=$RO_CFG ro_probe "$RO_CFG" "$RO_T" 2>&1); rc=$?
+if [ "$rc" -eq 1 ] && grep -qxF "$(printf 'Read\t%s/gsd-core/workflows/quick.md' "$RO_LIVE")" <<<"$out"; then
+    ok reads-outside-ignores-caller-config-dir
+else
+    bad reads-outside-ignores-caller-config-dir "rc=$rc: $(head -n 5 <<<"$out")"
+fi
+
+# A session whose working directory holds the live root still has its live reads flagged.
+RO_CWD=$WORK/ro-cwd/${CTRL_PARENT##*/}
+mkdir -p "$WORK/ro-cwd"
+jq -c --arg h "$RO_HOME" 'if .cwd != null then .cwd = $h else . end' "$RO_T" > "$RO_CWD"
+out=$(ro_probe "$RO_CFG" "$RO_CWD" 2>&1); rc=$?
+if [ "$rc" -eq 1 ] && grep -qxF "$(printf 'Read\t%s/gsd-core/workflows/quick.md' "$RO_LIVE")" <<<"$out"; then
+    ok reads-outside-cwd-does-not-hide
+else
+    bad reads-outside-cwd-does-not-hide "rc=$rc: $(head -n 5 <<<"$out")"
+fi
+
+out=$(ro_probe "$RO_LIVE" "$RO_T" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -q 'refusing' <<<"$out"; then ok reads-outside-refuses-live-dir; else bad reads-outside-refuses-live-dir "rc=$rc: $out"; fi
+
+# The clean base for the planted cases: the recording with every record that
+# names the stand-in home's config root removed, except the skill listing,
+# whose built-in keybindings entry names ~/.claude in prose.
+CLEAN_DIR=$WORK/ro-clean
+mkdir -p "$CLEAN_DIR"
+CLEAN_T=$CLEAN_DIR/${CTRL_PARENT##*/}
+jq -c --arg l "$RO_LIVE" 'select((.attachment.type // "") == "skill_listing"
+        or ((tostring | contains($l) or contains("~/.claude") or contains("$HOME/.claude")) | not))' "$RO_T" > "$CLEAN_T"
+out=$(ro_probe "$RO_CFG" "$CLEAN_T" 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && ! grep -qF "$RO_LIVE" <<<"$out" && grep -q '"skill_listing"' "$CLEAN_T" \
+        && grep -qF "$TILDE/.claude/keybindings.json" "$CLEAN_T"; then
+    ok reads-outside-clean-control
+else
+    bad reads-outside-clean-control "rc=$rc: $(head -n 5 <<<"$out")"
+fi
+
+# Each planted case appends one record to a copy of the clean base, built from
+# the recording's first Bash call or first tool result.
+BASH_REC=$(jq -c 'select(.type == "assistant" and any(.message.content[]?; .type == "tool_use" and .name == "Bash"))' "$CLEAN_T" | head -n 1)
+RESULT_REC=$(jq -c 'select(.type == "user" and any(.message.content[]?; .type == "tool_result"))' "$CLEAN_T" | head -n 1)
+n=0
+
+# shellcheck disable=SC2016 # each spelling is literal text in a command
+for spelling in 'cat ~/.claude/gsd-core/workflows/quick.md' 'cat ${HOME}/.claude/gsd-core/workflows/quick.md' \
+        'cat "$HOME"/.claude/gsd-core/workflows/quick.md' 'cat ~/".claude"/gsd-core/workflows/quick.md' \
+        'node LIVE/gsd-core/bin/gsd-tools.cjs x' 'printf %s JSONLIVE/x'; do
+    n=$((n + 1))
+    cmd=${spelling//JSONLIVE/${RO_LIVE//\//\\/}}
+    cmd=${cmd//LIVE/$RO_LIVE}
+    mkdir -p "$WORK/plant-bash$n"
+    cp "$CLEAN_T" "$WORK/plant-bash$n/"
+    jq -c --arg c "$cmd" '.message.content |= map(if .type == "tool_use" then .input.command = $c else . end)' <<<"$BASH_REC" \
+        >> "$WORK/plant-bash$n/${CLEAN_T##*/}"
+    out=$(ro_probe "$RO_CFG" "$WORK/plant-bash$n/${CLEAN_T##*/}" 2>&1); rc=$?
+    if [ "$rc" -eq 1 ] && grep -q "^Bash" <<<"$out"; then
+        ok "reads-outside-bash-spelling-$n"
+    else
+        bad "reads-outside-bash-spelling-$n" "$cmd: rc=$rc: $out"
+    fi
+done
+
+mkdir -p "$WORK/plant-write"
+cp "$CLEAN_T" "$WORK/plant-write/"
+jq -c --arg p "$RO_LIVE/settings.json" '.message.content |= map(if .type == "tool_use" then .name = "Write" | .input = {file_path: $p, content: "{}"} else . end)' <<<"$BASH_REC" \
+    >> "$WORK/plant-write/${CLEAN_T##*/}"
+out=$(ro_probe "$RO_CFG" "$WORK/plant-write/${CLEAN_T##*/}" 2>&1); rc=$?
+if [ "$rc" -eq 1 ] && grep -qxF "$(printf 'Write\t%s/settings.json' "$RO_LIVE")" <<<"$out"; then
+    ok reads-outside-flags-write
+else
+    bad reads-outside-flags-write "rc=$rc: $out"
+fi
+
+mkdir -p "$WORK/plant-result"
+cp "$CLEAN_T" "$WORK/plant-result/"
+jq -c --arg t "-rw-r--r-- 1 fade fade 45621 Oct 28 05:47 $RO_LIVE/gsd-core/workflows/quick.md" \
+    '.message.content |= map(if .type == "tool_result" then .content = $t else . end)' <<<"$RESULT_REC" \
+    >> "$WORK/plant-result/${CLEAN_T##*/}"
+out=$(ro_probe "$RO_CFG" "$WORK/plant-result/${CLEAN_T##*/}" 2>&1); rc=$?
+if [ "$rc" -eq 1 ] && grep -q '^result' <<<"$out"; then ok reads-outside-flags-tool-result; else bad reads-outside-flags-tool-result "rc=$rc: $out"; fi
+
+# A torn line, before a live read in the same transcript or in a subagent's,
+# makes the check fail; it never passes on what it could not parse.
+READ_REC=$(jq -c --arg p "$RO_LIVE/gsd-core/workflows/quick.md" '.message.content |= map(if .type == "tool_use" then .name = "Read" | .input = {file_path: $p} else . end)' <<<"$BASH_REC")
+mkdir -p "$WORK/plant-torn"
+cp "$CLEAN_T" "$WORK/plant-torn/"
+printf '%s\n%s\n' '{"type":"assistant","message":{"content":[' "$READ_REC" >> "$WORK/plant-torn/${CLEAN_T##*/}"
+out=$(ro_probe "$RO_CFG" "$WORK/plant-torn/${CLEAN_T##*/}" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -q 'cannot parse' <<<"$out"; then ok reads-outside-torn-fails-closed; else bad reads-outside-torn-fails-closed "rc=$rc: $out"; fi
+
+SUB_T=$WORK/plant-sub/${CLEAN_T##*/}
+mkdir -p "${SUB_T%.jsonl}/subagents"
+cp "$CLEAN_T" "$SUB_T"
+printf '%s\n' "$READ_REC" > "${SUB_T%.jsonl}/subagents/agent-a.jsonl"
+out=$(ro_probe "$RO_CFG" "$SUB_T" 2>&1); rc=$?
+if [ "$rc" -eq 1 ] && grep -qxF "$(printf 'Read\t%s/gsd-core/workflows/quick.md' "$RO_LIVE")" <<<"$out"; then
+    ok reads-outside-reads-subagents
+else
+    bad reads-outside-reads-subagents "rc=$rc: $out"
+fi
+printf 'garbage{\n' >> "$SUB_T"
+out=$(ro_probe "$RO_CFG" "$SUB_T" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -q 'cannot parse' <<<"$out"; then ok reads-outside-torn-parent-fails-closed; else bad reads-outside-torn-parent-fails-closed "rc=$rc: $out"; fi
+
+EMPTY_T=$WORK/plant-empty/${CLEAN_T##*/}
+mkdir -p "${EMPTY_T%.jsonl}/subagents"
+cp "$CLEAN_T" "$EMPTY_T"
+out=$(ro_probe "$RO_CFG" "$EMPTY_T" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -q 'no subagent transcripts' <<<"$out"; then ok reads-outside-empty-subagents-fails; else bad reads-outside-empty-subagents-fails "rc=$rc: $out"; fi
 
 printf '\ntree-hash\n'
 

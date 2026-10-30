@@ -26,10 +26,13 @@
 #       matches once the config-root rewrite is undone, no copied file still
 #       names the live root, and the routing gate reports five units missing
 #       under DIR.
-#   reads-outside DIR TRANSCRIPT
-#       List the Read, Grep and Glob paths of a session (and its subagents)
-#       outside DIR and the session's working directory. Exit 1 when any lies
-#       under the live config root.
+#   reads-outside DIR TRANSCRIPT [--live LIVE]
+#       List what a session (and its subagents) touched outside DIR and the
+#       session's working directory: file tool paths, and every command,
+#       tool input, tool result, user message, loaded instruction file and
+#       hook run that names the live config root LIVE (default $HOME/.claude,
+#       whatever CLAUDE_CONFIG_DIR says) in any spelling. Exit 1 when anything
+#       lies under or names LIVE, or when a transcript does not parse.
 #   tree-hash DIR
 #       Print a sorted SHA-256 listing of every file under DIR.
 #   describe SHAPE
@@ -101,7 +104,7 @@ usage() {
 usage: $PROGNAME make-config DIR
        $PROGNAME repoint DIR
        $PROGNAME check-config DIR
-       $PROGNAME reads-outside DIR TRANSCRIPT
+       $PROGNAME reads-outside DIR TRANSCRIPT [--live LIVE]
        $PROGNAME tree-hash DIR
        $PROGNAME make-repo DIR --gsd-core global|local-pristine [--specialized true|false]
                  [--shapes LIST] [--executor-model opus|inherit]
@@ -543,40 +546,130 @@ cmd_repoint() {
     repoint_tree "$dir" "$live"
 }
 
-# cmd_reads_outside DIR TRANSCRIPT: Read, Grep and Glob paths of the session
-# and its subagents that lie outside DIR and the session's cwd, as tool and
-# path; exit 1 when one lies under the live config root.
+# re_quote TEXT: TEXT as a regular expression matching itself, for perl and jq.
+re_quote() {
+    printf '%s' "$1" | sed 's/[][\\.^$|?*+(){}\/]/\\&/g'
+}
+
+# live_text_re LIVE: a regular expression (perl and jq) matching config root
+# LIVE named in text: its logical and physical absolute paths, each also
+# JSON-escaped, and, when LIVE lies under $HOME, ~/REL, $HOME/REL and
+# ${HOME}/REL with optional quotes around the slash. Broader than the forms
+# repoint rewrites.
+live_text_re() {
+    local logical physical home_l home_p a rel alts=() rels=()
+    logical=$(realpath -ms -- "$1"); physical=$(realpath -m -- "$1")
+    home_l=$(realpath -ms -- "$HOME"); home_p=$(realpath -m -- "$HOME")
+    for a in "$logical" "$physical"; do
+        alts+=("$(re_quote "$a")" "$(re_quote "${a//\//\\/}")")
+        case "$a" in "$home_l"/*) rels+=("${a#"$home_l"/}") ;; esac
+        case "$a" in "$home_p"/*) rels+=("${a#"$home_p"/}") ;; esac
+    done
+    for rel in "${rels[@]}"; do
+        alts+=("(?:~|\\\$HOME|\\\$\\{HOME\\})[\"']?/[\"']?$(re_quote "$rel")")
+    done
+    local IFS='|'
+    printf '(?:%s)[\x22\x27]?(?![\\w-])' "${alts[*]}"
+}
+
+# path_under PATH ROOT...: whether PATH is one of the ROOTs or lies under one.
+path_under() {
+    local p=$1 r
+    shift
+    for r in "$@"; do
+        case "$p" in "$r"|"$r"/*) return 0 ;; esac
+    done
+    return 1
+}
+
+# cmd_reads_outside DIR TRANSCRIPT [--live LIVE]: what the session and its
+# subagents touched outside DIR and the session's cwd, one channel and value
+# per line. Paths come from Read, Grep, Glob, Edit, Write, MultiEdit and
+# NotebookEdit calls; text from every other tool call's input, tool results,
+# user messages and the paths, commands and output of attachments (loaded
+# instructions, hooks) is searched for LIVE in any spelling (live_text_re).
+# LIVE defaults to $HOME/.claude, whatever CLAUDE_CONFIG_DIR says. Exit 1
+# when anything names or lies under LIVE, or when a transcript cannot be
+# parsed.
 cmd_reads_outside() {
-    [ $# -eq 2 ] || usage_error "reads-outside needs DIR and TRANSCRIPT"
-    local dir live t cwd list p tool breach=0 files=()
-    [ -d "$1" ] || die "no such directory: $1"
-    [ -f "$2" ] || die "no such transcript: $2"
-    dir=$(realpath -m "$1")
-    live=$(realpath -m "$CONFIG_HOME")
-    t=$2
-    files=("$t")
-    [ ! -d "${t%.jsonl}/subagents" ] || files+=("${t%.jsonl}"/subagents/*.jsonl)
-    cwd=$(jq -r 'select(.cwd != null) | .cwd' "$t" | head -n 1)
-    list=$(jq -r '
-        select(.type == "assistant") | .message.content[]?
-        | select(.type == "tool_use")
-        | if .name == "Read" then [.name, .input.file_path]
-          elif .name == "Grep" then [.name, .input.path]
-          elif .name == "Glob" then [.name, .input.path, .input.pattern]
-          else empty end
-        | .[0] as $tool | .[1:][] | select(. != null and . != "") | [$tool, .] | @tsv' "${files[@]}" | sort -u) || die "cannot read $t"
-    while IFS=$'\t' read -r tool p; do
-        [ -n "$p" ] || continue
-        case "$p" in \~/*) p=$HOME/${p#\~/} ;; esac
-        case "$p" in /*) ;; *) continue ;; esac
-        p=$(realpath -m -- "$p")
-        case "$p" in
-            "$dir"|"$dir"/*) continue ;;
+    local -
+    set -o pipefail
+    local dir="" t="" live_arg="" live_l live_p cwd re out rows="" kind tool p lp pp breach=0 f
+    local -a files=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --live) [ $# -ge 2 ] || usage_error "--live needs a value"; live_arg=$2; shift 2 ;;
+            -*) usage_error "unknown option $1" ;;
+            *) if [ -z "$dir" ]; then dir=$1; elif [ -z "$t" ]; then t=$1; else usage_error "reads-outside needs DIR and TRANSCRIPT"; fi; shift ;;
         esac
-        if [ -n "$cwd" ]; then case "$p" in "$cwd"|"$cwd"/*) continue ;; esac; fi
-        printf '%s\t%s\n' "$tool" "$p"
-        case "$p" in "$live"|"$live"/*) breach=1 ;; esac
-    done <<<"$list"
+    done
+    [ -n "$dir" ] && [ -n "$t" ] || usage_error "reads-outside needs DIR and TRANSCRIPT"
+    [ -d "$dir" ] || die "no such directory: $dir"
+    [ -f "$t" ] || die "no such transcript: $t"
+    [ -n "$live_arg" ] || live_arg=$HOME/.claude
+    live_l=$(realpath -ms -- "$live_arg"); live_p=$(realpath -m -- "$live_arg")
+    dir=$(realpath -m -- "$dir")
+    if path_under "$dir" "$live_l" "$live_p" || path_under "$live_l" "$dir" || path_under "$live_p" "$dir"; then
+        die "refusing $dir: it is, holds or lies under the live config root $live_p"
+    fi
+    files=("$t")
+    if [ -d "${t%.jsonl}/subagents" ]; then
+        for f in "${t%.jsonl}"/subagents/*.jsonl; do [ -f "$f" ] && files+=("$f"); done
+        [ "${#files[@]}" -gt 1 ] || die "${t%.jsonl}/subagents holds no subagent transcripts"
+    fi
+    re=$(live_text_re "$live_arg")
+    for f in "${files[@]}"; do
+        # shellcheck disable=SC2016 # jq program
+        out=$(jq -r --arg re "$re" '
+            def hit($ch): select(type == "string" and test($re))
+                | match($re) as $m
+                | [ "hit", $ch, (.[([$m.offset - 40, 0] | max):($m.offset + $m.length + 40)] | gsub("[\t\n\r]"; " ")) ];
+            def pathrow($tool): select(type == "string" and . != "")
+                | if (startswith("/") or . == "~" or startswith("~/")) then ["path", $tool, .] else hit($tool) end;
+            if .type == "assistant" then
+                .message.content[]? | select(.type == "tool_use") | .name as $n | .input as $i
+                | if $n == "Read" then $i.file_path | pathrow($n)
+                  elif $n == "Grep" then $i.path | pathrow($n)
+                  elif $n == "Glob" then ($i.path, $i.pattern) | pathrow($n)
+                  elif ($n == "Edit" or $n == "Write" or $n == "MultiEdit") then $i.file_path | pathrow($n)
+                  elif $n == "NotebookEdit" then $i.notebook_path | pathrow($n)
+                  else $i | .. | hit($n) end
+            elif .type == "user" then
+                .message.content
+                | if type == "string" then hit("user")
+                  else .[]? | if .type == "tool_result" then .content | .. | hit("result")
+                              elif .type == "text" then .text | hit("user")
+                              else empty end
+                  end
+            elif .type == "attachment" then
+                (.attachment.type // "-") as $at
+                | .attachment | .. | objects | to_entries[]
+                | select(.key == "path" or .key == "filePath" or .key == "file_path"
+                         or .key == "command" or .key == "stdout" or .key == "stderr")
+                | .value | hit("attachment:" + $at)
+            else empty end
+            | @tsv' "$f" 2>&1) || die "cannot parse $f: $out"
+        rows+=$out$'\n'
+    done
+    cwd=$(jq -rn 'first(inputs | select(.cwd != null) | .cwd) // empty' "$t") || die "cannot parse $t"
+    while IFS=$'\t' read -r kind tool p; do
+        [ -n "$kind" ] || continue
+        if [ "$kind" = hit ]; then
+            printf '%s\t%s\n' "$tool" "$p"
+            breach=1
+            continue
+        fi
+        case "$p" in \~) p=$HOME ;; \~/*) p=$HOME/${p#\~/} ;; esac
+        lp=$(realpath -ms -- "$p"); pp=$(realpath -m -- "$p")
+        if path_under "$lp" "$live_l" "$live_p" || path_under "$pp" "$live_l" "$live_p"; then
+            printf '%s\t%s\n' "$tool" "$pp"
+            breach=1
+            continue
+        fi
+        path_under "$pp" "$dir" && continue
+        if [ -n "$cwd" ] && path_under "$pp" "$cwd"; then continue; fi
+        printf '%s\t%s\n' "$tool" "$pp"
+    done < <(printf '%s' "$rows" | LC_ALL=C sort -u)
     [ "$breach" -eq 0 ]
 }
 
