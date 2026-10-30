@@ -857,6 +857,94 @@ else
     bad tree-hash-sensitive "$h1"
 fi
 
+printf '\nrun isolation\n'
+
+# A stand-in caller home. Its live config root holds a gsd-core bin directory
+# that sits on PATH directly, through a linked directory, and through a shim
+# directory holding a link into it. The probe repository lies outside it.
+RH=$WORK/run-home
+RCFG=$RH/.cache/dsmr-routing-probes/config
+RREPO=$WORK/run-scratch/quick/repo
+RSTUB=$WORK/run-stub
+mkdir -p "$RH/.claude/gsd-core/bin" "$RH/.local/bin" "$RCFG/gsd-core/bin" "$RREPO" "$RSTUB"
+: > "$RH/.claude/gsd-core/bin/gsd-tools"
+ln -s ../../.claude/gsd-core/bin/gsd-tools "$RH/.local/bin/gsd-tools"
+ln -s "$RH/.claude/gsd-core/bin" "$RH/bin-link"
+printf 'reached\n' > "$RCFG/marker"
+git -C "$RREPO" init -q
+git -C "$RREPO" config user.name 'Probe Author'
+git -C "$RREPO" config user.email probe@example.invalid
+# The stand-in claude records what it was given and writes a transcript where
+# run looks for one. With PROBE_TRIP set it reaches for $HOME/.claude.
+cat > "$RSTUB/claude" <<STUB
+#!/bin/bash
+env > "$WORK/run-env.txt"
+if [ -e "\$HOME/.claude" ]; then echo present; else echo absent; fi > "$WORK/run-tripwire.txt"
+cat "\$HOME/.cache/dsmr-routing-probes/config/marker" > "$WORK/run-marker.txt" 2>&1
+git config --global user.name > "$WORK/run-git.txt" 2>&1
+[ -z "\${PROBE_TRIP:-}" ] || { mkdir -p "\$HOME/.claude"; : > "\$HOME/.claude/touched"; }
+while [ \$# -gt 0 ]; do case "\$1" in --session-id) sid=\$2; shift 2 ;; *) shift ;; esac; done
+mkdir -p "\$CLAUDE_CONFIG_DIR/projects/-r"
+printf '{}\n' > "\$CLAUDE_CONFIG_DIR/projects/-r/\$sid.jsonl"
+STUB
+chmod +x "$RSTUB/claude"
+RPATH=$RSTUB:$RH/.claude/gsd-core/bin:$RH/bin-link:$RH/.local/bin:/usr/bin:/bin
+run_probe() {
+    local sid=$1 repo=$2
+    shift 2
+    HOME=$RH PATH=$RPATH XDG_CONFIG_HOME=$RH/.config probe run "$repo" --session-id "$sid" --config-dir "$RCFG" \
+        --debug-file "$WORK/run-debug-$sid.log" "$@" -- hi
+}
+
+RSID=11111111-2222-4333-8444-555555555555
+out=$(run_probe "$RSID" "$RREPO" 2>&1); rc=$?
+child_home=$(sed -n 's/^HOME=//p' "$WORK/run-env.txt")
+child_path=$(sed -n 's/^PATH=//p' "$WORK/run-env.txt")
+if [ "$rc" -eq 0 ] && [ "$child_home" = "$WORK/run-scratch/quick/home/$RSID" ] \
+        && [ "$(cat "$WORK/run-tripwire.txt")" = absent ] && ! grep -q '^XDG_CONFIG_HOME=' "$WORK/run-env.txt" \
+        && grep -qxF "probe HOME: $child_home" <<<"$out"; then
+    ok run-hermetic-home
+else
+    bad run-hermetic-home "rc=$rc home=$child_home: $(tail -n 3 <<<"$out")"
+fi
+
+if [ -n "$child_path" ] && [[ ":$child_path:" != *":$RH/.claude/"* && ":$child_path:" != *":$RH/bin-link:"* \
+        && ":$child_path:" != *":$RH/.local/bin:"* && ":$child_path:" == *":$RSTUB:"* ]] \
+        && [ "${child_path%%:*}" = "$RCFG/gsd-core/bin" ] && grep -qxF "probe PATH: $child_path" <<<"$out"; then
+    ok run-path-strips-live
+else
+    bad run-path-strips-live "path=$child_path"
+fi
+
+# The config directory's home-relative names, as repoint writes them, still
+# resolve under the hermetic home.
+if [ "$(cat "$WORK/run-marker.txt")" = reached ]; then ok run-config-dir-resolves-from-home; else bad run-config-dir-resolves-from-home "$(cat "$WORK/run-marker.txt")"; fi
+
+if [ "$(cat "$WORK/run-git.txt")" = 'Probe Author' ]; then ok run-git-identity; else bad run-git-identity "$(cat "$WORK/run-git.txt")"; fi
+
+out=$(PROBE_TRIP=1 run_probe 22222222-2222-4333-8444-555555555555 "$RREPO" 2>&1); rc=$?
+if [ "$rc" -eq 5 ] && grep -q '^tripwire: ' <<<"$out" && grep -qF '.claude/touched' <<<"$out"; then
+    ok run-tripwire-trips
+else
+    bad run-tripwire-trips "rc=$rc: $(tail -n 3 <<<"$out")"
+fi
+
+# Claude Code reads CLAUDE.md under .claude in every directory above the
+# session; a repository under a home whose .claude is the live root is refused.
+mkdir -p "$RH/probe/repo"
+out=$(run_probe 33333333-2222-4333-8444-555555555555 "$RH/probe/repo" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -q "lies under $RH, whose .claude is the live config root" <<<"$out" \
+        && [ ! -e "$RH/probe/home" ]; then
+    ok run-refuses-repo-under-live-home
+else
+    bad run-refuses-repo-under-live-home "rc=$rc: $out"
+fi
+
+# With a config directory, a mod loaded from the live root is refused.
+mkdir -p "$RH/.claude/mods/m"
+out=$(run_probe 44444444-2222-4333-8444-555555555555 "$RREPO" --plugin-dir "$RH/.claude/mods/m" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -q 'refusing --plugin-dir' <<<"$out"; then ok run-refuses-live-plugin-dir; else bad run-refuses-live-plugin-dir "rc=$rc: $out"; fi
+
 printf '\nrun-arm orchestrator model\n'
 
 # mk_stubs DIR SESSION: stand-ins on a PATH directory. The bus watcher refuses
@@ -904,6 +992,16 @@ if [ "$rc" -eq 0 ] && grep -q -- '--model claude-opus-5-5 ' "$WORK/claude-args.t
     ok run-arm-default-model
 else
     bad run-arm-default-model "rc=$rc, model column '$last': $(tail -n 3 "$WORK/arm-dflt.out")"
+fi
+
+# --scratch moves the arm's repositories and session homes; each session with a
+# config directory runs under its own home there.
+run_arm scr --scratch "$WORK/scr"; rc=$?
+if [ "$rc" -eq 0 ] && [ -d "$WORK/scr/scr/quick/repo" ] && [ ! -e "$WORK/cache-scr/dsmr-routing-probes/scr" ] \
+        && grep -q "^probe HOME: $WORK/scr/scr/home/[0-9a-f-]*\$" "$WORK/ev-scr/probe-quick-shell.err"; then
+    ok run-arm-scratch-and-session-home
+else
+    bad run-arm-scratch-and-session-home "rc=$rc: $(tail -n 3 "$WORK/arm-scr.out")"
 fi
 
 # A cell that plays back the torn execute-phase session stops the arm on the cap.

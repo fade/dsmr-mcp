@@ -40,14 +40,28 @@
 #       Print a sorted SHA-256 listing of every file under DIR.
 #   describe SHAPE
 #       Print the task description for a probe shape: shell, lisp, mixed, docs.
-#   run REPO --session-id UUID [--config-dir DIR] [--plugin-dir DIR]
+#   run REPO --session-id UUID [--config-dir DIR] [--home DIR] [--plugin-dir DIR]
 #       [--capture DIR] [--debug-file FILE] [--append-system-prompt TEXT]
 #       [--model MODEL] [--env KEY=VAL]... -- PROMPT
 #       Run one headless Claude Code session in REPO and print its transcript.
+#       With --config-dir the session gets its own HOME (--home, default
+#       REPO/../home/UUID, new or empty) holding only a git identity and a
+#       link from DIR's home-relative name to DIR, and no .claude: a session
+#       reaching for ~/.claude finds nothing there, and run exits 5 when the
+#       session created it. PATH loses every entry under the live config root
+#       and every directory holding a link into it, and gains DIR/gsd-core/bin
+#       first; the HOME and PATH given are printed on stderr. A REPO with a
+#       directory above it whose .claude is the live root is refused, since
+#       Claude Code loads instructions from there, as is a --plugin-dir under
+#       the live root.
 #   run-arm ARM --gsd-core global|local-pristine --evidence DIR [--config-dir DIR]
 #       [--plugin-dir DIR|none] [--executor-model opus|inherit] [--capture DIR]
 #       [--orchestrator-model MODEL] [--only PATH[:SHAPE],...] [--env KEY=VAL]...
+#       [--scratch DIR]
 #       Run the probe cells one session at a time and write the evidence.
+#       Repositories and session homes go under DIR/ARM (default
+#       ${XDG_CACHE_HOME:-~/.cache}/dsmr-routing-probes/ARM); with --config-dir
+#       DIR must lie outside the home directory whose .claude is live.
 #       --orchestrator-model sets the model of every session in the arm and is
 #       recorded per session in sessions.tsv.
 #   report TRANSCRIPT
@@ -112,12 +126,13 @@ usage: $PROGNAME make-config DIR
        $PROGNAME make-repo DIR --gsd-core global|local-pristine [--specialized true|false]
                  [--shapes LIST] [--executor-model opus|inherit]
        $PROGNAME describe shell|lisp|mixed|docs
-       $PROGNAME run REPO --session-id UUID [--config-dir DIR] [--plugin-dir DIR]
+       $PROGNAME run REPO --session-id UUID [--config-dir DIR] [--home DIR] [--plugin-dir DIR]
                  [--capture DIR] [--debug-file FILE] [--append-system-prompt TEXT]
                  [--model MODEL] [--env KEY=VAL]... -- PROMPT
        $PROGNAME run-arm ARM --gsd-core global|local-pristine --evidence DIR [--config-dir DIR]
                  [--plugin-dir DIR|none] [--executor-model opus|inherit] [--capture DIR]
                  [--orchestrator-model MODEL] [--only PATH[:SHAPE],...] [--env KEY=VAL]...
+                 [--scratch DIR]
        $PROGNAME report TRANSCRIPT
        $PROGNAME ledger-row TRANSCRIPT...
        $PROGNAME cap-check TRANSCRIPT
@@ -1045,13 +1060,77 @@ collect_unsets() {
     done < <(compgen -e)
 }
 
+# probe_path PATH LIVE CONFIG: PATH without empty entries, entries under
+# config root LIVE (logically or once resolved) and directories holding a link
+# that resolves into LIVE, with CONFIG/gsd-core/bin first when it exists. Each
+# dropped entry is reported on stderr.
+probe_path() {
+    local live_l live_p entry real out="" reason
+    local -a entries
+    live_l=$(realpath -ms -- "$2"); live_p=$(realpath -m -- "$2")
+    IFS=: read -ra entries <<<"$1"
+    for entry in "${entries[@]}"; do
+        [ -n "$entry" ] || continue
+        reason=""
+        real=$(realpath -m -- "$entry")
+        if path_under "$(realpath -ms -- "$entry")" "$live_l" "$live_p" || path_under "$real" "$live_l" "$live_p"; then
+            reason="under the live config root"
+        elif [ -d "$entry" ] && find "$entry" -mindepth 1 -maxdepth 1 -type l -exec realpath -m -- {} + 2>/dev/null                 | awk -v a="$live_l" -v b="$live_p" '$0 == a || $0 == b || index($0, a "/") == 1 || index($0, b "/") == 1 { f = 1 } END { exit !f }'; then
+            reason="holds a link into the live config root"
+        fi
+        if [ -n "$reason" ]; then
+            echo "probe PATH drops $entry: $reason" >&2
+            continue
+        fi
+        out+=${out:+:}$entry
+    done
+    [ ! -d "$3/gsd-core/bin" ] || out=$3/gsd-core/bin${out:+:}$out
+    printf '%s\n' "$out"
+}
+
+# probe_home HOME_DIR REPO CONFIG LIVE: make HOME_DIR a session home for a
+# probe in REPO with config directory CONFIG: new or empty, outside config
+# root LIVE, with a .gitconfig carrying REPO's git identity and a link from
+# CONFIG's name relative to $HOME to CONFIG, so ~/REL still names CONFIG.
+# There is no .claude in it.
+probe_home() {
+    local home=$1 repo=$2 config=$3 live=$4 rel name email d
+    path_under "$home" "$live" && die "refusing home $home: it lies under the live config root $live"
+    path_under "$live" "$home" && die "refusing home $home: it holds the live config root $live"
+    [ "$home" != "$(realpath -m -- "$HOME")" ] || die "refusing home $home: it is the caller's home"
+    d=$repo
+    while :; do
+        [ "$(realpath -m -- "$d/.claude")" != "$live" ] \
+            || die "refusing $repo: it lies under $d, whose .claude is the live config root; Claude Code loads instructions from it (run-arm --scratch puts repositories elsewhere)"
+        [ "$d" != / ] || break
+        d=$(dirname -- "$d")
+    done
+    if [ -e "$home" ]; then
+        [ -d "$home" ] && [ -z "$(ls -A -- "$home" 2>/dev/null)" ] || die "refusing home $home: it exists and is not empty"
+    fi
+    mkdir -p "$home" || die "cannot create $home"
+    name=$(git -C "$repo" config user.name) || name=""
+    email=$(git -C "$repo" config user.email) || email=""
+    if [ -n "$name" ] && [ -n "$email" ]; then
+        printf '[user]\n\tname = %s\n\temail = %s\n' "$name" "$email" > "$home/.gitconfig" || die "cannot write $home/.gitconfig"
+    fi
+    rel=$(root_rel "$config")
+    case "$rel" in
+        ..|../*|.) echo "probe HOME: $config is outside \$HOME; ~/ names of it will not resolve" >&2 ;;
+        *)
+            mkdir -p "$home/$(dirname -- "$rel")" || die "cannot create $home/$(dirname -- "$rel")"
+            ln -s "$config" "$home/$rel" || die "cannot link $home/$rel" ;;
+    esac
+}
+
 cmd_run() {
-    local repo="" sid="" config="" plugin="" capture="" debug="" system="" prompt="" have_prompt=0
+    local repo="" sid="" config="" plugin="" capture="" debug="" system="" prompt="" have_prompt=0 home=""
     local model=$PROBE_MODEL extra=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --session-id) [ $# -ge 2 ] || usage_error "--session-id needs a value"; sid=$2; shift 2 ;;
             --config-dir) [ $# -ge 2 ] || usage_error "--config-dir needs a value"; config=$2; shift 2 ;;
+            --home) [ $# -ge 2 ] || usage_error "--home needs a value"; home=$2; shift 2 ;;
             --plugin-dir) [ $# -ge 2 ] || usage_error "--plugin-dir needs a value"; plugin=$2; shift 2 ;;
             --capture) [ $# -ge 2 ] || usage_error "--capture needs a value"; capture=$2; shift 2 ;;
             --debug-file) [ $# -ge 2 ] || usage_error "--debug-file needs a value"; debug=$2; shift 2 ;;
@@ -1086,9 +1165,25 @@ cmd_run() {
     # A probe is its own session: nothing of the calling session, the
     # coordination bus or a mod list reaches it except what the flags give.
     collect_unsets
-    local set_args=("${extra[@]}")
-    [ -z "$config" ] || set_args+=("CLAUDE_CONFIG_DIR=$config")
+    local set_args=("${extra[@]}") live
     [ -z "$capture" ] || set_args+=("SUBAGENT_ROUTING_CAPTURE=$capture")
+    if [ -n "$config" ]; then
+        live=$(realpath -m -- "$HOME/.claude")
+        if [ -n "$plugin" ] && path_under "$plugin" "$live"; then
+            die "refusing --plugin-dir $plugin: it lies under the live config root $live; pass the repository's copy"
+        fi
+        [ -n "$home" ] || home=$(dirname -- "$repo")/home/$sid
+        home=$(realpath -m -- "$home")
+        probe_home "$home" "$repo" "$config" "$live"
+        local probe_path_value name
+        probe_path_value=$(probe_path "$PATH" "$live" "$config")
+        for name in XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME GIT_CONFIG_GLOBAL; do
+            [ -z "${!name+x}" ] || UNSET_ARGS+=(-u "$name")
+        done
+        set_args+=("CLAUDE_CONFIG_DIR=$config" "HOME=$home" "PATH=$probe_path_value")
+        echo "probe HOME: $home" >&2
+        echo "probe PATH: $probe_path_value" >&2
+    fi
 
     local claude_args=(-p --session-id "$sid" --permission-mode auto --model "$model" --debug-file "$debug")
     [ -z "$plugin" ] || claude_args+=(--plugin-dir "$plugin")
@@ -1099,10 +1194,15 @@ cmd_run() {
     rc=$?
     echo "claude exit $rc" >&2
     echo "debug log: $debug" >&2
+    if [ -n "$config" ] && { [ -e "$home/.claude" ] || [ -L "$home/.claude" ]; }; then
+        echo "tripwire: the session created $home/.claude" >&2
+        find "$home/.claude" -maxdepth 3 >&2 2>/dev/null
+        rc=5
+    fi
 
-    local home=${config:-$HOME/.claude} found
-    found=$(compgen -G "$home/projects/*/$sid.jsonl" | head -n 1)
-    [ -n "$found" ] || die "no transcript for session $sid under $home/projects"
+    local cfg_root=${config:-$HOME/.claude} found
+    found=$(compgen -G "$cfg_root/projects/*/$sid.jsonl" | head -n 1)
+    [ -n "$found" ] || die "no transcript for session $sid under $cfg_root/projects"
     printf '%s\n' "$found"
     return "$rc"
 }
@@ -1527,7 +1627,7 @@ arm_selected() {
 }
 
 cmd_run_arm() {
-    local arm="" gsd="" evidence="" config="" plugin="" exmodel=opus capture="" only="" envs=() orch=""
+    local arm="" gsd="" evidence="" config="" plugin="" exmodel=opus capture="" only="" envs=() orch="" scratch=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --gsd-core) [ $# -ge 2 ] || usage_error "--gsd-core needs a value"; gsd=$2; shift 2 ;;
@@ -1538,6 +1638,7 @@ cmd_run_arm() {
             --capture) [ $# -ge 2 ] || usage_error "--capture needs a value"; capture=$2; shift 2 ;;
             --orchestrator-model) [ $# -ge 2 ] || usage_error "--orchestrator-model needs a value"; orch=$2; shift 2 ;;
             --only) [ $# -ge 2 ] || usage_error "--only needs a value"; only=$2; shift 2 ;;
+            --scratch) [ $# -ge 2 ] || usage_error "--scratch needs a value"; scratch=$2; shift 2 ;;
             --env) [ $# -ge 2 ] || usage_error "--env needs KEY=VAL"; envs+=(--env "$2"); shift 2 ;;
             -h|--help) usage; exit 0 ;;
             -*) usage_error "unknown option $1" ;;
@@ -1561,7 +1662,8 @@ cmd_run_arm() {
     local ev
     mkdir -p "$evidence/mod-log" || die "cannot create $evidence"
     ev=$(cd "$evidence" && pwd)
-    local cache=${XDG_CACHE_HOME:-$HOME/.cache}/dsmr-routing-probes/$arm
+    local cache=${scratch:-${XDG_CACHE_HOME:-$HOME/.cache}/dsmr-routing-probes}
+    cache=$(realpath -m -- "$cache")/$arm
     [ -f "$ev/sessions.tsv" ] || printf 'session_id\tpath\ttag\ttranscript\tstart\tend\ttokens\tnotes\tmodel\n' > "$ev/sessions.tsv"
     [ -f "$ev/tokens.txt" ] || printf 'tag\tcell\ttranscript\tturns\tcache_read\tcache_write\toutput\tmodels\n' > "$ev/tokens.txt"
 
@@ -1606,9 +1708,14 @@ cmd_run_arm() {
 
         sid=$(cat /proc/sys/kernel/random/uuid)
         start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-        transcript=$(cmd_run "$repo" --session-id "$sid" --model "$model" "${run_extra[@]}" \
+        local -a home_arg=()
+        [ -z "$config" ] || home_arg=(--home "$cache/home/$sid")
+        transcript=$(cmd_run "$repo" --session-id "$sid" --model "$model" "${run_extra[@]}" "${home_arg[@]}" \
             --debug-file "$ev/debug-$tag.log" -- "$prompt" 2> "$ev/probe-$tag.err")
         rc=$?
+        if grep -q '^tripwire: ' "$ev/probe-$tag.err"; then
+            echo "$PROGNAME: $tag: $(grep -m 1 '^tripwire: ' "$ev/probe-$tag.err")" >&2
+        fi
         end=$(date -u +%Y-%m-%dT%H:%M:%SZ)
         printf '%s\n' "$transcript" > "$ev/probe-$tag.out"
         transcript=$(printf '%s\n' "$transcript" | tail -n 1)
