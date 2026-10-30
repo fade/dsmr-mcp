@@ -296,5 +296,32 @@ export function replay(recordings: readonly Recording[]): void {
       expect(mine[0]?.error).toBe(undefined)
       expect(toasts.length).toBe(1)
     })
+
+    test(`${label}: a spawn refused changed and as requested is logged as starting nothing`, async ($, on) => {
+      const tape = new Tape(rec.tape, label)
+      const log: LogFile = { text: '' }
+      const beneath: AgentSpawnInput[] = []
+      standIns(on, tape, log, beneath, (e, n) => ({ deny: `refusal ${n} of ${e.subagentType}` }))
+      const toasts: string[] = []
+      on('ui.toast', (_$, e) => {
+        toasts.push(String(e.text))
+        return { value: undefined }
+      })
+
+      const result = await dispatch($, spawnInput(rec), [rec.input.subagentType, rec.expected.subagentType])
+
+      expect(result.deny).toBe(`refusal 2 of ${rec.input.subagentType}`)
+      expect(beneath.length).toBe(2)
+      const mine = logLinesFor(log.text, rec.input.tool_use_id)
+      expect(mine.length).toBe(1)
+      expect(mine[0]?.action).toBe('refused')
+      expect(mine[0]?.resolvedModel).toBe(null)
+      expect(mine[0]?.agentId).toBe(null)
+      expect(String(mine[0]?.reason)).toContain('so no agent started')
+      expect(String(mine[0]?.reason)).not.toContain('ran as requested')
+      expect(toasts.length).toBe(1)
+      expect(toasts[0]).toContain('started no agent')
+      expect(toasts[0]).not.toContain('ran a spawn')
+    })
   }
 }

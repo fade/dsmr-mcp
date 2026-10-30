@@ -13,8 +13,9 @@
 // no Agent permission rule names it: the engine checks a retyped spawn after
 // the agent.spawn chain has handed it over, and a refusal there cannot be
 // recovered inside the chain. A changed spawn a hook beneath refuses runs once
-// more as requested (action `fallback`). The log line says why, and the first
-// such spawn of each kind in a session raises a toast.
+// more as requested (action `fallback`); when that is refused too, no agent
+// starts (action `refused`). The log line says why, and the first such spawn
+// of each kind in a session raises a toast.
 
 import type { EngineInterface, Register } from 'claude-code'
 import { decide, ioDirs, permissionRuleAgainst, type Action, type Decision, type RouteIo } from './route'
@@ -31,13 +32,16 @@ const LOG_ROTATE_CHARS = 1024 * 1024
 /** Highest numbered segment a log is moved aside to. */
 const LOG_SEGMENTS = 99
 /** Actions that raise a toast, once per session each. */
-const LOUD: ReadonlySet<string> = new Set(['cannot-decide', 'fallback', 'error'])
-const COUNTED = ['rewrote', 'cleared-model', 'unchanged', 'cannot-decide', 'fallback', 'error'] as const
+const LOUD: ReadonlySet<string> = new Set(['cannot-decide', 'fallback', 'refused', 'error'])
+const COUNTED = ['rewrote', 'cleared-model', 'unchanged', 'cannot-decide', 'fallback', 'refused', 'error'] as const
 /** When this module was registered; the status line falls back to it. */
 const MODULE_LOADED_AT = new Date().toISOString()
 
-/** `fallback`: the engine refused the changed spawn, so it ran as requested. */
-type LogAction = Action | 'fallback' | 'error'
+/**
+ * - `fallback`: the changed spawn was refused, and it ran as requested.
+ * - `refused`: the changed spawn and the spawn as requested were both refused; no agent started.
+ */
+type LogAction = Action | 'fallback' | 'refused' | 'error'
 type Agent = { type: string; model: string | null }
 
 /** One engine call the decision depended on, with what it answered. */
@@ -260,8 +264,10 @@ async function record($: EngineInterface, configDir: string, line: SpawnLogLine)
   const asRequested = line.set.type === line.requested.type && line.set.model === line.requested.model
   const what =
     line.action === 'fallback'
-      ? 'ran a spawn as requested after the engine refused its change'
-      : asRequested
+      ? 'ran a spawn as requested after its change was refused'
+      : line.action === 'refused'
+        ? 'started no agent: a changed spawn and the spawn as requested were both refused'
+        : asRequested
         ? 'left a spawn as requested'
         : `passed a spawn on as ${line.set.type}, then failed`
   toastOnce($, key, `subagent-routing ${what}: ${line.reason}. Log: ${path}`)
@@ -273,11 +279,11 @@ export function statusText(path: string, text: string): string {
   const loaded = lines.filter(l => l.event === 'loaded').at(-1)?.ts
   const spawns = lines.filter(l => typeof l.toolUseId === 'string')
   const count = (action: string): number => spawns.filter(l => l.action === action).length
-  const [rewrote, cleared, unchanged, undecided, fellBack, failed] = COUNTED.map(count)
+  const [rewrote, cleared, unchanged, undecided, fellBack, refusedBoth, failed] = COUNTED.map(count)
   return (
     `subagent-routing ${VERSION} loaded ${typeof loaded === 'string' ? loaded : MODULE_LOADED_AT}; log ${path}; ` +
     `this session: ${spawns.length} spawns, ${rewrote} rewrote, ${cleared} cleared-model, ` +
-    `${unchanged} unchanged, ${undecided} cannot-decide, ${fellBack} fallback, ${failed} error`
+    `${unchanged} unchanged, ${undecided} cannot-decide, ${fellBack} fallback, ${refusedBoth} refused, ${failed} error`
   )
 }
 
@@ -405,11 +411,21 @@ export const register: Register = on => {
       set,
       resolvedModel: result.deny === undefined ? result.model : null,
       agentId: result.deny === undefined ? (result.agentId ?? null) : null,
-      action: failure !== undefined ? 'error' : refused !== undefined ? 'fallback' : decision.action,
+      action:
+        failure !== undefined
+          ? 'error'
+          : refused === undefined
+            ? decision.action
+            : result.deny === undefined
+              ? 'fallback'
+              : 'refused',
       reason:
         refused === undefined
           ? decision.reason
-          : `${decision.reason}; the engine refused ${decision.subagentType} (${clip(refused)}), so it ran as requested`,
+          : result.deny === undefined
+            ? `${decision.reason}; ${decision.subagentType} was refused (${clip(refused)}), so it ran as requested`
+            : `${decision.reason}; ${decision.subagentType} was refused (${clip(refused)}) and running it as requested ` +
+              `was refused too (${clip(result.deny)}), so no agent started`,
       version: VERSION,
       ...(failure === undefined ? {} : { error: failure }),
     }
