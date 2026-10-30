@@ -1087,6 +1087,47 @@ else
     bad run-planning-tripwire-trips "rc=$rc: $(tail -n 3 <<<"$out")"
 fi
 
+printf '\nlinks on the path\n'
+
+# repoint restores an installer file through nothing but a plain path: a
+# directory link inside the config directory leads outside it, and the file
+# behind the link keeps its bytes. The file is the live installer's own, with
+# the config-root rewrite an earlier repoint applied.
+LNK_LIB=$(grep -lF "$TILDE/.claude/" "$LIVE/gsd-core/bin/lib/"*.cjs | head -n 1)
+LNK_LIB_REL=${LNK_LIB#"$LIVE"/}
+LNK=$WORK/link-config
+LNK_OUT=$WORK/link-outside/lib
+mkdir -p "$LNK/gsd-core/bin" "$LNK_OUT"
+printf 'built\n' > "$LNK/.routing-probe-config"
+jq -n --arg k "$LNK_LIB_REL" --arg h "$(jq -r --arg k "$LNK_LIB_REL" '.files[$k]' "$LIVE/gsd-file-manifest.json")" \
+    '{version: "recorded", files: {($k): $h}}' > "$LNK/gsd-file-manifest.json"
+ln -s "$LNK_OUT" "$LNK/gsd-core/bin/lib"
+LNK_REL=$(realpath -m --relative-to="$HOME" "$LNK")
+perl -pe "s{~/\\.claude(?![\\w-])}{~/$LNK_REL}g; s{\\\$HOME/\\.claude(?![\\w-])}{\\\$HOME/$LNK_REL}g" "$LNK_LIB" > "$LNK_OUT/${LNK_LIB##*/}"
+behind_before=$(sha256sum < "$LNK_OUT/${LNK_LIB##*/}")
+out=$(probe repoint "$LNK" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -qF 'gsd-core/bin/lib' <<<"$out" && ! grep -q '^restored ' <<<"$out" \
+        && [ "$(sha256sum < "$LNK_OUT/${LNK_LIB##*/}")" = "$behind_before" ] && ! cmp -s "$LNK_LIB" "$LNK_OUT/${LNK_LIB##*/}"; then
+    ok repoint-refuses-linked-directory
+else
+    bad repoint-refuses-linked-directory "rc=$rc: $(tail -n 3 <<<"$out")"
+fi
+
+# Claude Code walks the physical ancestors of its working directory, so a
+# repository reached through a link under the live home is refused, with no
+# home created behind the link.
+mkdir -p "$RH/under/repo"
+git -C "$RH/under/repo" init -q
+ln -s "$RH/under" "$WORK/under-link"
+rm -f "$WORK/run-env.txt"
+out=$(run_probe 55555555-2222-4333-8444-555555555555 "$WORK/under-link/repo" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -q "lies under $RH, whose .claude is the live config root" <<<"$out" \
+        && [ ! -e "$RH/under/home" ] && [ ! -e "$WORK/run-env.txt" ]; then
+    ok run-refuses-repo-linked-under-live-home
+else
+    bad run-refuses-repo-linked-under-live-home "rc=$rc env=$([ -e "$WORK/run-env.txt" ] && echo ran || echo absent): $(tail -n 3 <<<"$out")"
+fi
+
 printf '\nrun-arm orchestrator model\n'
 
 # mk_stubs DIR SESSION: stand-ins on a PATH directory. The bus watcher refuses

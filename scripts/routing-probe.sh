@@ -27,7 +27,9 @@
 #       changed. Scripts that a hook under DIR requires, by the live root's name
 #       or DIR's own, and DIR lacks are copied from the live root. Only agents,
 #       skills, hooks, commands, scripts, gsd-core and CLAUDE.md under DIR are
-#       touched; credentials, settings, projects and logs never are.
+#       touched; credentials, settings, projects and logs never are. A write
+#       through a link on the path of a file it rewrites, restores or copies is
+#       refused.
 #   check-config DIR
 #       Re-check a config directory: every gsd-core, scripts, agents, skills
 #       and hooks manifest entry matches (markdown once the config-root rewrite
@@ -56,9 +58,9 @@
 #       session created it. PATH loses every entry under the live config root
 #       and every directory holding a link into it, and gains DIR/gsd-core/bin
 #       first; the HOME and PATH given are printed on stderr. A REPO with a
-#       directory above it whose .claude is the live root is refused, since
-#       Claude Code loads instructions from there, as is a --plugin-dir under
-#       the live root.
+#       directory above it, by its logical or its physical path, whose .claude
+#       is the live root is refused, since Claude Code loads instructions from
+#       there, as is a --plugin-dir under the live root.
 #       Every session, with or without --config-dir, gets XDG_CACHE_HOME=REPO.cache
 #       (beside REPO), so the session-start hook keeps the planning directory
 #       make-repo linked; the session also writes Claude Code's own cache files
@@ -500,11 +502,23 @@ rewritable() {
     [ -z "${OWNED[$1]:-}" ]
 }
 
+# refuse_linked_parent FILE: die when the directory holding FILE is, or lies
+# under, a link. Callers pass a physical config directory, so a difference
+# between the lexical and the resolved path is a link inside it, and a write
+# there lands outside the directory.
+refuse_linked_parent() {
+    local parent lex phys
+    parent=$(dirname -- "$1")
+    lex=$(realpath -ms -- "$parent"); phys=$(realpath -m -- "$parent")
+    [ "$lex" = "$phys" ] || die "refusing to write $1: its directory is, or lies under, a link to $phys"
+}
+
 # swap_in_place FILE: replace FILE with swap_root of itself, keeping its mode.
 # The new content goes to a temporary file mktemp creates beside FILE, so a
 # link already standing at any fixed name there is never written through.
 swap_in_place() {
     local f=$1 tmp
+    refuse_linked_parent "$f"
     tmp=$(mktemp -- "$f.repoint.XXXXXX") || die "cannot create a temporary file beside $f"
     swap_root < "$f" > "$tmp" || { rm -f -- "$tmp"; die "cannot rewrite $f"; }
     if ! { chmod --reference="$f" "$tmp" && mv -f -- "$tmp" "$f"; }; then
@@ -779,6 +793,8 @@ copy_hook_scripts() {
         [ -n "$rel" ] && [ -f "$live/$rel" ] || continue
         if [ "$only_missing" = missing ] && { [ -e "$dir/$rel" ] || [ -L "$dir/$rel" ]; }; then continue; fi
         mkdir -p "$dir/${rel%/*}" || die "cannot create $dir/${rel%/*}"
+        refuse_linked_parent "$dir/$rel"
+        [ ! -L "$dir/$rel" ] || die "refusing to write $dir/$rel: it is a link"
         cp -a "$live/$rel" "$dir/$rel" || die "cannot copy $live/$rel"
         echo "copied $rel (a copied hook requires it)"
     done <<<"$names"
@@ -1194,12 +1210,13 @@ probe_home() {
     path_under "$home" "$live" && die "refusing home $home: it lies under the live config root $live"
     path_under "$live" "$home" && die "refusing home $home: it holds the live config root $live"
     [ "$home" != "$(realpath -m -- "$HOME")" ] || die "refusing home $home: it is the caller's home"
-    d=$repo
-    while :; do
-        [ "$(realpath -m -- "$d/.claude")" != "$live" ] \
-            || die "refusing $repo: it lies under $d, whose .claude is the live config root; Claude Code loads instructions from it (run-arm --scratch puts repositories elsewhere)"
-        [ "$d" != / ] || break
-        d=$(dirname -- "$d")
+    for d in "$repo" "$(cd -- "$repo" && pwd -P)"; do
+        while :; do
+            [ "$(realpath -m -- "$d/.claude")" != "$live" ] \
+                || die "refusing $repo: it lies under $d, whose .claude is the live config root; Claude Code loads instructions from it (run-arm --scratch puts repositories elsewhere)"
+            [ "$d" != / ] || break
+            d=$(dirname -- "$d")
+        done
     done
     if [ -e "$home" ]; then
         [ -d "$home" ] && [ -z "$(ls -A -- "$home" 2>/dev/null)" ] || die "refusing home $home: it exists and is not empty"
