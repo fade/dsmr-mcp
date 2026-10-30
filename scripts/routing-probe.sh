@@ -543,7 +543,8 @@ scan_live() {
 
 # live_references DIR LIVE: print each copied artifact under DIR that still
 # names config root LIVE in any spelling (live_text_re), cannot be read, or is
-# binary and names it; return 1 when there is one. Installer code that is not
+# binary and names it, and each link out of the config directory (live_links);
+# return 1 when there is one. Installer code that is not
 # markdown keeps its home-relative names, as the installer leaves them, and is
 # listed without failing, as are run-time joins of the home directory with
 # LIVE's name.
@@ -570,6 +571,55 @@ live_references() {
         printf '%s\n' "$line"
         case "$line" in "installer code "*|"runtime home join "*) ;; *) n=$((n + 1)) ;; esac
     done <<<"$rows"
+    rows=$(live_links "$dir" "$live") || die "cannot scan $dir for links"
+    [ -z "$rows" ] || { printf '%s\n' "$rows"; n=$((n + 1)); }
+    [ "$n" -eq 0 ]
+}
+
+# live_links DIR LIVE: print each symbolic link under DIR that resolves into
+# config root LIVE, and each one under the copied artifacts that resolves
+# outside DIR, with its resolved target.
+live_links() {
+    local dir live_l live_p link target rel top
+    dir=$(realpath -m -- "$1"); live_l=$(realpath -ms -- "$2"); live_p=$(realpath -m -- "$2")
+    while IFS= read -r -d '' link; do
+        target=$(realpath -m -- "$link")
+        rel=${link#"$dir"/}
+        top=${rel%%/*}
+        if path_under "$target" "$live_l" "$live_p" \
+                || { [[ " ${CONFIG_ARTIFACTS[*]} " == *" $top "* ]] && ! path_under "$target" "$dir"; }; then
+            printf 'link out of the config directory %s -> %s\n' "$rel" "$target"
+        fi
+    done < <(find "$dir" -type l -print0)
+}
+
+# settings_references DIR LIVE: print the JSON path of each string in DIR's
+# settings.json, settings.local.json and .claude.json that names config root
+# LIVE in any spelling (live_text_re); return 1 when there is one. The files
+# are only read. A path into an env block stops at the block, so no variable
+# name or value is printed.
+settings_references() {
+    local dir=$1 re f rows n=0
+    re=$(live_text_re "$2")
+    for f in settings.json settings.local.json .claude.json; do
+        [ -f "$dir/$f" ] || continue
+        # shellcheck disable=SC2016 # jq program
+        if ! rows=$(jq -r --arg re "$re" '
+                [ paths(type == "string") as $p | select(getpath($p) | test($re))
+                  | ($p | index("env")) as $e
+                  | (if $e == null then $p else $p[:$e + 1] end)
+                  | map(if type == "number" then "[\(.)]" else ".\(.)" end) | join("") ]
+                | unique[]' "$dir/$f"); then
+            echo "unreadable $f"
+            n=$((n + 1))
+            continue
+        fi
+        [ -n "$rows" ] || continue
+        while IFS= read -r p; do
+            echo "settings reference $f $p"
+            n=$((n + 1))
+        done <<<"$rows"
+    done
     [ "$n" -eq 0 ]
 }
 
@@ -666,6 +716,7 @@ cmd_check_config() {
     refs=$(live_references "$dir" "$live"); lrc=$?
     [ -z "$refs" ] || printf '%s\n' "$refs"
     [ "$lrc" -eq 0 ] || { echo "isolation check FAILED: copied files name $live"; rc=1; }
+    settings_references "$dir" "$live" || { echo "isolation check FAILED: settings name $live"; rc=1; }
     [ "$rc" -ne 0 ] || echo "isolation check passed"
     return "$rc"
 }
@@ -872,14 +923,16 @@ cmd_make_config() {
     cp -a "$live/gsd-file-manifest.json" "$dir/gsd-file-manifest.json" || die "cannot copy the manifest"
     copy_installer_scripts "$live" "$dir"
 
-    # Live paths point into DIR; bus hooks and a mod list from the environment
-    # block are dropped, so the mod loads only through --plugin-dir.
-    if ! jq --arg live "$live" --arg dir "$dir" '
-        def swap:
+    # Live paths in the settings and the MCP servers point into DIR; bus hooks
+    # and a mod list from the environment block are dropped, so the mod loads
+    # only through --plugin-dir.
+    # shellcheck disable=SC2016 # jq program
+    local swap_def='def swap:
             if type == "string" then (if . == $live then $dir else (split($live + "/") | join($dir + "/")) end)
             elif type == "array" then map(swap)
             elif type == "object" then map_values(swap)
-            else . end;
+            else . end;'
+    if ! jq --arg live "$live" --arg dir "$dir" "$swap_def"'
         swap
         | if (.hooks | type) == "object" then
               .hooks |= map_values(
@@ -892,7 +945,7 @@ cmd_make_config() {
         rm -f "$dir/settings.json.tmp"; die "cannot build settings.json"
     fi
     mv -f "$dir/settings.json.tmp" "$dir/settings.json" || die "cannot write settings.json"
-    if ! jq '{mcpServers: (.mcpServers // {})}' "$lj" > "$dir/.claude.json.tmp"; then
+    if ! jq --arg live "$live" --arg dir "$dir" "$swap_def"'{mcpServers: (.mcpServers // {} | swap)}' "$lj" > "$dir/.claude.json.tmp"; then
         rm -f "$dir/.claude.json.tmp"; die "cannot build .claude.json"
     fi
     mv -f "$dir/.claude.json.tmp" "$dir/.claude.json" || die "cannot write .claude.json"
@@ -901,6 +954,7 @@ cmd_make_config() {
     repoint_tree "$dir" "$live" || return 1
     pristine_prove "$dir" "$live" "${PROVEN_PREFIXES[@]}" || return 1
     live_references "$dir" "$live" || { echo "isolation check FAILED: copied files name $live"; return 1; }
+    settings_references "$dir" "$live" || { echo "isolation check FAILED: settings name $live"; return 1; }
 
     after=$(tree_hash "$live/gsd-core") || exit 1
     echo "live gsd-core tree: $nbefore files, listing sha256 $(printf '%s\n' "$before" | sha256sum | cut -d' ' -f1) before"

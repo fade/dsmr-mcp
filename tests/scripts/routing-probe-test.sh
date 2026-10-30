@@ -465,6 +465,55 @@ else
     bad config-unreadable-reported "rc=$rc rrc=$rrc: $(tail -n 2 <<<"$out") / $(tail -n 2 <<<"$rout")"
 fi
 
+# A link from a copied subtree into the live tree is read through by a
+# session; check-config fails on it by name, for a linked file and a linked
+# directory alike.
+ln -s "$LIVE/agents/shell-developer.md" "$CFG/agents/linked.md"
+ln -s "$LIVE/skills/gsd-quick" "$CFG/skills/linked"
+out=$(probe check-config "$CFG" 2>&1); rc=$?
+rm -f "$CFG/agents/linked.md" "$CFG/skills/linked"
+if [ "$rc" -ne 0 ] && grep -qxF "link out of the config directory agents/linked.md -> $LIVE/agents/shell-developer.md" <<<"$out" \
+        && grep -qxF "link out of the config directory skills/linked -> $LIVE/skills/gsd-quick" <<<"$out"; then
+    ok config-link-into-live-flagged
+else
+    bad config-link-into-live-flagged "rc=$rc: $(tail -n 3 <<<"$out")"
+fi
+
+# Settings and Claude Code's state file in DIR are read, never edited: a hook
+# or MCP server that runs from the live root fails check-config, named by its
+# JSON path; an environment value is never printed.
+cp -p "$CFG/settings.json" "$WORK/settings.saved"
+cp -p "$CFG/.claude.json" "$WORK/claude-json.saved"
+jq --arg c "bash $TILDE/.claude/hooks/x.sh" '.statusLine = {type: "command", command: $c} | .env.PROBE_SECRET_PATH = "/x/.claude-not" | .env.PROBE_LIVE = "$HOME/.claude/y"' \
+    "$WORK/settings.saved" > "$CFG/settings.json"
+jq --arg a "$LIVE/tools/server.js" '.mcpServers.planted = {command: "node", args: [$a]}' "$WORK/claude-json.saved" > "$CFG/.claude.json"
+s_before=$(sha256sum "$CFG/settings.json" "$CFG/.claude.json")
+out=$(probe check-config "$CFG" 2>&1); rc=$?
+s_after=$(sha256sum "$CFG/settings.json" "$CFG/.claude.json")
+cp -p "$WORK/settings.saved" "$CFG/settings.json"
+cp -p "$WORK/claude-json.saved" "$CFG/.claude.json"
+if [ "$rc" -ne 0 ] && [ "$s_before" = "$s_after" ] \
+        && grep -qxF 'settings reference settings.json .statusLine.command' <<<"$out" \
+        && grep -qxF 'settings reference .claude.json .mcpServers.planted.args[0]' <<<"$out" \
+        && grep -qxF 'settings reference settings.json .env' <<<"$out" \
+        && ! grep -q 'PROBE_LIVE\|/y' <<<"$out"; then
+    ok config-settings-reference-flagged
+else
+    bad config-settings-reference-flagged "rc=$rc: $(grep -i settings <<<"$out" | head -n 4)"
+fi
+
+# make-config builds the state file's MCP servers to name DIR, as it does the
+# settings' hooks. Control: the live state file names the live root.
+LIVE_JSON=$HOME/.claude.json
+# shellcheck disable=SC2016 # $l is a jq variable
+names_live='[.mcpServers // {} | .. | strings | select(contains($l))] | length'
+if [ "$(jq --arg l "$LIVE/" "$names_live" "$LIVE_JSON")" -gt 0 ] && [ "$(jq --arg l "$LIVE/" "$names_live" "$CFG/.claude.json")" -eq 0 ] \
+        && [ "$(jq --arg l "$(realpath -m "$CFG")/" "$names_live" "$CFG/.claude.json")" -gt 0 ]; then
+    ok config-mcp-servers-name-dir
+else
+    bad config-mcp-servers-name-dir "$(jq -c '.mcpServers | map_values(.args)' "$CFG/.claude.json")"
+fi
+
 # Control: a copied file that names the live root again fails check-config by
 # name. CLAUDE.md is not the installer's, so the pristine proof does not see it.
 printf '\nRead %s/.claude/gsd-core/workflows/quick.md\n' "$TILDE" >> "$CFG/CLAUDE.md"
