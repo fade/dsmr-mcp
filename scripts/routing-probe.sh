@@ -13,9 +13,23 @@
 #       manifest. It holds no credentials and no bus hook; the live install is
 #       read only and proven unchanged. DIR must be new, empty, or one an
 #       earlier make-config built (it holds .routing-probe-config).
+#       Copied command, skill, agent, hook and gsd-core text that names the live
+#       config root (~/.claude, $HOME/.claude, its absolute path) is rewritten
+#       to name DIR, so a session run with CLAUDE_CONFIG_DIR=DIR reads nothing
+#       from the live root.
+#   repoint DIR
+#       Redo that rewrite in a directory make-config built, in place. Only
+#       agents, skills, hooks, commands, scripts, gsd-core and CLAUDE.md under
+#       DIR are touched; credentials, settings, projects and logs never are.
 #   check-config DIR
 #       Re-check a config directory: every gsd-core and scripts manifest entry
-#       matches, and the routing gate reports five units missing under DIR.
+#       matches once the config-root rewrite is undone, no copied file still
+#       names the live root, and the routing gate reports five units missing
+#       under DIR.
+#   reads-outside DIR TRANSCRIPT
+#       List the Read, Grep and Glob paths of a session (and its subagents)
+#       outside DIR and the session's working directory. Exit 1 when any lies
+#       under the live config root.
 #   tree-hash DIR
 #       Print a sorted SHA-256 listing of every file under DIR.
 #   describe SHAPE
@@ -85,7 +99,9 @@ EXECUTOR_TYPES=" gsd-executor shell-developer lisp-developer "
 usage() {
     cat <<EOF
 usage: $PROGNAME make-config DIR
+       $PROGNAME repoint DIR
        $PROGNAME check-config DIR
+       $PROGNAME reads-outside DIR TRANSCRIPT
        $PROGNAME tree-hash DIR
        $PROGNAME make-repo DIR --gsd-core global|local-pristine [--specialized true|false]
                  [--shapes LIST] [--executor-model opus|inherit]
@@ -347,16 +363,100 @@ pristine_restore() {
     find "$root/gsd-core" -name '*.pre-*' -type f -delete
 }
 
-# pristine_prove ROOT: print the proof and return 1 if it does not hold: every
-# gsd-core and scripts entry of the installer manifest under ROOT matches by
-# SHA-256, and the gate exits 1 printing five missing lines.
+# Subtrees of a config directory that hold copied artifacts naming the config
+# root; repoint and the isolation check read and rewrite nothing else.
+CONFIG_ARTIFACTS=(agents skills hooks commands scripts gsd-core CLAUDE.md)
+
+# root_rel ROOT: ROOT relative to $HOME (".claude" for ~/.claude); a root
+# outside $HOME comes out in ../..-form, which "~/" followed by it resolves.
+root_rel() {
+    realpath -m --relative-to="$HOME" -- "$1"
+}
+
+# swap_prepare FROM TO: set the exported names swap_root and names_root read,
+# computed once per call site.
+swap_prepare() {
+    SWAP_FROM_REL=$(root_rel "$1"); SWAP_FROM_ABS=$(realpath -m -- "$1")
+    SWAP_TO_REL=$(root_rel "$2"); SWAP_TO_ABS=$(realpath -m -- "$2")
+    export SWAP_FROM_REL SWAP_FROM_ABS SWAP_TO_REL SWAP_TO_ABS
+}
+
+# swap_root: stdin to stdout, every name of config root FROM (see swap_prepare)
+# replaced by the same form of TO: ~/REL, $HOME/REL and the absolute path. A
+# match must end its path component, so ~/.claude-plugin is left alone. Each
+# form keeps its kind, so swapping back restores the original bytes.
+swap_root() {
+    perl -pe '
+        BEGIN { ($fr, $fa, $tr, $ta) = @ENV{qw(SWAP_FROM_REL SWAP_FROM_ABS SWAP_TO_REL SWAP_TO_ABS)}; }
+        s{(?:(~|\$HOME)/\Q$fr\E|(?<![\w./-])\Q$fa\E)(?![\w-])}{defined $1 ? "$1/$tr" : $ta}ge;'
+}
+
+# names_root FILE: succeed when FILE names config root FROM in any form.
+names_root() {
+    perl -ne '
+        BEGIN { ($r, $a) = @ENV{qw(SWAP_FROM_REL SWAP_FROM_ABS)}; }
+        if (/(?:(?:~|\$HOME)\/\Q$r\E|(?<![\w.\/-])\Q$a\E)(?![\w-])/) { $f = 1; last }
+        END { exit($f ? 0 : 1) }' "$1"
+}
+
+# artifact_files DIR: NUL-separated text files of the copied artifacts under DIR
+# that contain config root FROM (set by swap_prepare) as a substring.
+artifact_files() {
+    local dir=$1 sub
+    for sub in "${CONFIG_ARTIFACTS[@]}"; do
+        [ -e "$dir/$sub" ] || continue
+        find "$dir/$sub" -type f -print0
+    done | xargs -0 -r grep -IlZF -e "$SWAP_FROM_REL" -e "$SWAP_FROM_ABS" 2>/dev/null
+}
+
+# repoint_tree DIR FROM: rewrite each copied artifact under DIR that names
+# config root FROM to name DIR; print the count.
+repoint_tree() {
+    local dir=$1 from=$2 f n=0
+    swap_prepare "$from" "$dir"
+    if [ "$(realpath -m -- "$from")" != "$(realpath -m -- "$dir")" ]; then
+        while IFS= read -r -d '' f; do
+            names_root "$f" || continue
+            swap_root < "$f" > "$f.repoint.tmp" || { rm -f "$f.repoint.tmp"; die "cannot rewrite $f"; }
+            if ! { chmod --reference="$f" "$f.repoint.tmp" && mv -f "$f.repoint.tmp" "$f"; }; then
+                rm -f "$f.repoint.tmp"; die "cannot replace $f"
+            fi
+            n=$((n + 1))
+        done < <(artifact_files "$dir")
+    fi
+    echo "repointed $n files to $dir"
+}
+
+# live_references DIR LIVE: print each copied artifact under DIR that still
+# names config root LIVE; return 1 when there is one.
+live_references() {
+    local dir=$1 live=$2 f n=0
+    [ "$(realpath -m -- "$live")" != "$(realpath -m -- "$dir")" ] || return 0
+    swap_prepare "$live" "$dir"
+    while IFS= read -r -d '' f; do
+        names_root "$f" || continue
+        echo "live-root reference ${f#"$dir"/}"
+        n=$((n + 1))
+    done < <(artifact_files "$dir")
+    [ "$n" -eq 0 ]
+}
+
+# pristine_prove ROOT [LIVE]: print the proof and return 1 if it does not
+# hold: every gsd-core and scripts entry of the installer manifest under ROOT
+# matches by SHA-256 (a file that names ROOT matches once ROOT is swapped back
+# to LIVE, the config root the manifest was written for), and the gate exits 1
+# printing five missing lines.
 pristine_prove() {
-    local root=$1 manifest=$1/gsd-file-manifest.json
+    local root=$1 live=${2:-$1} manifest=$1/gsd-file-manifest.json
     local entries=0 matched=0 bad=0 rel want got gate_out gate_rc nmissing
+    swap_prepare "$root" "$live"
     [ -f "$manifest" ] || { echo "no manifest: $manifest"; return 1; }
     while IFS=$'\t' read -r rel want; do
         entries=$((entries + 1))
         got=$(sha256sum "$root/$rel" 2>/dev/null | cut -d' ' -f1)
+        if [ "$got" != "$want" ] && [ -f "$root/$rel" ]; then
+            got=$(swap_root < "$root/$rel" | sha256sum | cut -d' ' -f1)
+        fi
         if [ "$got" = "$want" ]; then
             matched=$((matched + 1))
         else
@@ -419,7 +519,65 @@ cmd_tree_hash() {
 cmd_check_config() {
     [ $# -eq 1 ] || usage_error "check-config needs one DIR"
     [ -d "$1" ] || die "no such directory: $1"
-    pristine_prove "$(cd "$1" && pwd)"
+    local dir live refs rc=0
+    dir=$(cd "$1" && pwd)
+    live=$(realpath -m "$CONFIG_HOME")
+    pristine_prove "$dir" "$live" || rc=1
+    refs=$(live_references "$dir" "$live") || { printf '%s\n' "$refs"; echo "isolation check FAILED: copied files name $live"; rc=1; }
+    [ "$rc" -ne 0 ] || echo "isolation check passed"
+    return "$rc"
+}
+
+# cmd_repoint DIR: repoint_tree for a directory make-config built.
+cmd_repoint() {
+    [ $# -eq 1 ] || usage_error "repoint needs one DIR"
+    [ -d "$1" ] || die "no such directory: $1"
+    local live dir
+    live=$(realpath -m "$CONFIG_HOME")
+    dir=$(realpath -m "$1")
+    case "$dir" in
+        "$live"|"$live"/*) die "refusing $dir: it is inside the live config directory $live" ;;
+    esac
+    case "$live" in "$dir"/*) die "refusing $dir: it contains the live config directory $live" ;; esac
+    [ -f "$dir/$CONFIG_MARKER" ] || die "refusing $dir: make-config did not build it (no $CONFIG_MARKER)"
+    repoint_tree "$dir" "$live"
+}
+
+# cmd_reads_outside DIR TRANSCRIPT: Read, Grep and Glob paths of the session
+# and its subagents that lie outside DIR and the session's cwd, as tool and
+# path; exit 1 when one lies under the live config root.
+cmd_reads_outside() {
+    [ $# -eq 2 ] || usage_error "reads-outside needs DIR and TRANSCRIPT"
+    local dir live t cwd list p tool breach=0 files=()
+    [ -d "$1" ] || die "no such directory: $1"
+    [ -f "$2" ] || die "no such transcript: $2"
+    dir=$(realpath -m "$1")
+    live=$(realpath -m "$CONFIG_HOME")
+    t=$2
+    files=("$t")
+    [ ! -d "${t%.jsonl}/subagents" ] || files+=("${t%.jsonl}"/subagents/*.jsonl)
+    cwd=$(jq -r 'select(.cwd != null) | .cwd' "$t" | head -n 1)
+    list=$(jq -r '
+        select(.type == "assistant") | .message.content[]?
+        | select(.type == "tool_use")
+        | if .name == "Read" then [.name, .input.file_path]
+          elif .name == "Grep" then [.name, .input.path]
+          elif .name == "Glob" then [.name, .input.path, .input.pattern]
+          else empty end
+        | .[0] as $tool | .[1:][] | select(. != null and . != "") | [$tool, .] | @tsv' "${files[@]}" | sort -u) || die "cannot read $t"
+    while IFS=$'\t' read -r tool p; do
+        [ -n "$p" ] || continue
+        case "$p" in \~/*) p=$HOME/${p#\~/} ;; esac
+        case "$p" in /*) ;; *) continue ;; esac
+        p=$(realpath -m -- "$p")
+        case "$p" in
+            "$dir"|"$dir"/*) continue ;;
+        esac
+        if [ -n "$cwd" ]; then case "$p" in "$cwd"|"$cwd"/*) continue ;; esac; fi
+        printf '%s\t%s\n' "$tool" "$p"
+        case "$p" in "$live"|"$live"/*) breach=1 ;; esac
+    done <<<"$list"
+    [ "$breach" -eq 0 ]
 }
 
 # live_gate_present: the count of present lines the gate prints for the live config.
@@ -496,7 +654,9 @@ cmd_make_config() {
     mv -f "$dir/.claude.json.tmp" "$dir/.claude.json" || die "cannot write .claude.json"
 
     pristine_restore "$dir"
-    pristine_prove "$dir" || return 1
+    repoint_tree "$dir" "$live"
+    pristine_prove "$dir" "$live" || return 1
+    live_references "$dir" "$live" || { echo "isolation check FAILED: copied files name $live"; return 1; }
 
     after=$(tree_hash "$live/gsd-core") || exit 1
     echo "live gsd-core tree: $nbefore files, listing sha256 $(printf '%s\n' "$before" | sha256sum | cut -d' ' -f1) before"
@@ -1371,7 +1531,9 @@ cmd_record_history() {
 sub=$1; shift
 case "$sub" in
     make-config) cmd_make_config "$@" ;;
+    repoint) cmd_repoint "$@" ;;
     check-config) cmd_check_config "$@" ;;
+    reads-outside) cmd_reads_outside "$@" ;;
     tree-hash) cmd_tree_hash "$@" ;;
     make-repo) cmd_make_repo "$@" ;;
     describe) cmd_describe "$@" ;;

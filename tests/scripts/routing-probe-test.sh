@@ -22,6 +22,12 @@
 # evidence/. It reads 8307533 cache-read tokens over its orchestrator and
 # subagents, the tracer 2409799.
 #
+# A third real session, the unpatched-arm control (session
+# 62d89842-08dc-46bd-9cf6-8ab0d8c6303a, run through `routing-probe.sh run-arm`
+# in a throwaway config directory), is copied unchanged under DIR/control-inherit.
+# Its orchestrator Read the live, patched /home/fade/.claude/gsd-core/workflows/quick.md
+# because the copied skill named ~/.claude literally; the reads-outside cases replay it.
+#
 # The make-config cases build a config directory from the live install on this
 # host (agents, skills, hooks, gsd-core and its installer manifest) and prove it
 # against that manifest, so they need the live gsd-core 1.19.0 install. The
@@ -30,7 +36,8 @@
 # the model argument and the sessions.tsv column, not any output of claude.
 #
 # Usage: ROUTING_PROBE_RECORDED=DIR tests/scripts/routing-probe-test.sh
-#   DIR holds the recorded sessions under DIR/tracer and DIR/execute-phase.
+#   DIR holds the recorded sessions under DIR/tracer, DIR/execute-phase and
+#   DIR/control-inherit.
 
 set -uo pipefail
 
@@ -38,9 +45,9 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PROBE=${ROUTING_PROBE_SCRIPT:-$REPO_ROOT/scripts/routing-probe.sh}
 
 if [ -z "${ROUTING_PROBE_RECORDED:-}" ] || [ ! -d "$ROUTING_PROBE_RECORDED/tracer" ] \
-        || [ ! -d "$ROUTING_PROBE_RECORDED/execute-phase" ]; then
+        || [ ! -d "$ROUTING_PROBE_RECORDED/execute-phase" ] || [ ! -d "$ROUTING_PROBE_RECORDED/control-inherit" ]; then
     echo "usage: ROUTING_PROBE_RECORDED=DIR $0" >&2
-    echo "  DIR must hold the recorded sessions under DIR/tracer and DIR/execute-phase; no recorded transcripts, no test" >&2
+    echo "  DIR must hold the recorded sessions under DIR/tracer, DIR/execute-phase and DIR/control-inherit; no recorded transcripts, no test" >&2
     exit 64
 fi
 
@@ -49,9 +56,11 @@ SID=2e3819fe-8005-4816-8db0-c1d9671529bd
 PARENT=$REC/projects/-tracer/$SID.jsonl
 SUBDIR=$REC/projects/-tracer/$SID/subagents
 EXECUTOR_LOG=$SUBDIR/agent-ab638530750441bc9.jsonl
+CTRL=$(cd "$ROUTING_PROBE_RECORDED/control-inherit" && pwd)
+CTRL_PARENT=$CTRL/projects/-ctl/62d89842-08dc-46bd-9cf6-8ab0d8c6303a.jsonl
 EXEC=$(cd "$ROUTING_PROBE_RECORDED/execute-phase" && pwd)
 EXEC_PARENT=$(echo "$EXEC"/projects/*/1e4c2fc2-cfeb-477c-ac00-3bde132f04f6.jsonl)
-for f in "$EXEC_PARENT" "$EXEC/evidence/expected.tsv" "$PARENT" "$EXECUTOR_LOG" "$REC/expected-report.tsv" "$REC/logs/subagent-routing/$SID.jsonl"; do
+for f in "$CTRL_PARENT" "$EXEC_PARENT" "$EXEC/evidence/expected.tsv" "$PARENT" "$EXECUTOR_LOG" "$REC/expected-report.tsv" "$REC/logs/subagent-routing/$SID.jsonl"; do
     [ -f "$f" ] || { echo "recorded fixture missing: $f" >&2; exit 64; }
 done
 
@@ -361,6 +370,114 @@ if [ "$rc" -ne 0 ] && [ ! -e "$OUTER/settings.json" ] && grep -q 'contains the r
 else
     bad config-refuses-repo-parent "rc=$rc: $(tail -n 3 <<<"$out")"
 fi
+
+printf '\nconfig root rewrite\n'
+
+# The copied skill names the config root; in the live install it is ~/.claude.
+SKILL_REL=skills/gsd-quick/SKILL.md
+TILDE='~'
+CFG_REL=$(realpath -m --relative-to="$HOME" "$CFG")
+if [ -f "$LIVE/$SKILL_REL" ] && grep -qF "$TILDE/.claude/gsd-core/workflows/quick.md" "$LIVE/$SKILL_REL" \
+        && grep -qF "$TILDE/$CFG_REL/gsd-core/workflows/quick.md" "$CFG/$SKILL_REL" \
+        && ! grep -qF "$TILDE/.claude/" "$CFG/$SKILL_REL"; then
+    ok config-skill-names-itself
+else
+    bad config-skill-names-itself "$(grep -n 'workflows/quick.md' "$CFG/$SKILL_REL" | head -n 2)"
+fi
+
+# The workflows are the installer's bytes except where they name the root.
+# shellcheck disable=SC2016 # $HOME is a grep pattern, not an expansion
+leaks=$(grep -rIlE -e '(~|\$HOME)/\.claude([^[:alnum:]_-]|$)' "$CFG/agents" "$CFG/skills" "$CFG/hooks" "$CFG/gsd-core" "$CFG/CLAUDE.md" 2>/dev/null | head -n 3)
+if [ -z "$leaks" ]; then ok config-no-live-references; else bad config-no-live-references "$leaks"; fi
+
+# A fresh make-config leaves check-config passing, now with the isolation check.
+rm -f "$CFG/gsd-core/workflows/quick.md.tamper"
+probe make-config "$CFG" > "$WORK/make-config2.out" 2>&1
+out=$(probe check-config "$CFG" 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'isolation check passed' <<<"$out" && grep -q 'pristine check passed' <<<"$out"; then
+    ok config-isolated
+else
+    bad config-isolated "rc=$rc: $(tail -n 3 <<<"$out")"
+fi
+
+# Control: a copied file that names the live root again fails check-config by name.
+printf '\nRead %s/.claude/gsd-core/workflows/quick.md\n' "$TILDE" >> "$CFG/$SKILL_REL"
+out=$(probe check-config "$CFG" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -q "^live-root reference $SKILL_REL\$" <<<"$out"; then
+    ok config-planted-live-reference
+else
+    bad config-planted-live-reference "rc=$rc: $(tail -n 3 <<<"$out")"
+fi
+probe repoint "$CFG" > /dev/null 2>&1
+out=$(probe check-config "$CFG" 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'isolation check passed' <<<"$out"; then ok config-repoint-heals-reference; else bad config-repoint-heals-reference "rc=$rc: $(tail -n 3 <<<"$out")"; fi
+
+# The live quick.md is the patched one, not the installer's: planted in the
+# throwaway copy, repointed as the dir's own files are, it must fail.
+if ! cmp -s "$LIVE/gsd-core/workflows/quick.md" "$CFG/gsd-core/workflows/quick.md"; then
+    cp "$LIVE/gsd-core/workflows/quick.md" "$CFG/gsd-core/workflows/quick.md"
+    probe repoint "$CFG" > /dev/null 2>&1
+    out=$(probe check-config "$CFG" 2>&1); rc=$?
+    if [ "$rc" -ne 0 ] && grep -q '^mismatch gsd-core/workflows/quick.md$' <<<"$out"; then
+        ok config-planted-patched-workflow
+    else
+        bad config-planted-patched-workflow "rc=$rc: $(tail -n 3 <<<"$out")"
+    fi
+else
+    bad config-planted-patched-workflow "live quick.md equals the installer copy; nothing to plant"
+fi
+probe make-config "$CFG" > /dev/null 2>&1
+
+# repoint on a directory built the old way: real copied files that name ~/.claude,
+# beside stand-ins for the files it must never touch.
+OLD=$WORK/old-config
+mkdir -p "$OLD/skills/gsd-quick" "$OLD/agents" "$OLD/projects/p" "$OLD/logs"
+cp "$LIVE/$SKILL_REL" "$OLD/$SKILL_REL"
+cp "$LIVE/agents/shell-developer.md" "$OLD/agents/shell-developer.md"
+printf 'built\n' > "$OLD/.routing-probe-config"
+for keep in .credentials.json settings.json settings.local.json projects/p/s.jsonl logs/l.log; do
+    printf 'sentinel %s %s/.claude/x %s/y\n' "$keep" "$TILDE" "$LIVE" > "$OLD/$keep"
+done
+chmod 600 "$OLD/.credentials.json"
+keep_before=$(cd "$OLD" && sha256sum .credentials.json settings.json settings.local.json projects/p/s.jsonl logs/l.log)
+out=$(probe repoint "$OLD" 2>&1); rc=$?
+OLD_REL=$(realpath -m --relative-to="$HOME" "$OLD")
+keep_after=$(cd "$OLD" && sha256sum .credentials.json settings.json settings.local.json projects/p/s.jsonl logs/l.log)
+if [ "$rc" -eq 0 ] && grep -qF "$TILDE/$OLD_REL/gsd-core/workflows/quick.md" "$OLD/$SKILL_REL" \
+        && ! grep -qF "$TILDE/.claude/" "$OLD/$SKILL_REL" "$OLD/agents/shell-developer.md"; then
+    ok repoint-rewrites-artifacts
+else
+    bad repoint-rewrites-artifacts "rc=$rc: $out"
+fi
+if [ "$keep_before" = "$keep_after" ] && [ "$(stat -c %a "$OLD/.credentials.json")" = 600 ]; then
+    ok repoint-leaves-credentials-and-state
+else
+    bad repoint-leaves-credentials-and-state "$(diff <(printf '%s\n' "$keep_before") <(printf '%s\n' "$keep_after"))"
+fi
+h1=$(probe tree-hash "$OLD" 2>&1)
+probe repoint "$OLD" > /dev/null 2>&1
+h2=$(probe tree-hash "$OLD" 2>&1)
+if [ -n "$h1" ] && [ "$h1" = "$h2" ] && ! grep -q 'unknown subcommand' <<<"$h1"; then ok repoint-idempotent; else bad repoint-idempotent "second run changed the tree"; fi
+
+mkdir -p "$WORK/notmine"
+out=$(probe repoint "$WORK/notmine" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -q 'make-config did not build it' <<<"$out"; then ok repoint-refuses-foreign; else bad repoint-refuses-foreign "rc=$rc: $out"; fi
+out=$(probe repoint "$LIVE" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -q 'inside the live config' <<<"$out"; then ok repoint-refuses-live; else bad repoint-refuses-live "rc=$rc: $out"; fi
+
+printf '\nreads-outside\n'
+
+# Recorded control session: it Read the live quick.md. DIR is the throwaway
+# config it ran under; the live root is the home install of the recording host.
+out=$(CLAUDE_CONFIG_DIR=/home/fade/.claude probe reads-outside /home/fade/.cache/dsmr-routing-probes/config "$CTRL_PARENT" 2>&1); rc=$?
+if [ "$rc" -eq 1 ] && [ "$out" = "$(printf 'Read\t/home/fade/.claude/gsd-core/workflows/quick.md')" ]; then
+    ok reads-outside-flags-live-read
+else
+    bad reads-outside-flags-live-read "rc=$rc: $out"
+fi
+# Control: the same session judged against a DIR that holds the path lists nothing.
+out=$(CLAUDE_CONFIG_DIR=/home/fade/.claude probe reads-outside /home/fade/.claude "$CTRL_PARENT" 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && [ -z "$out" ]; then ok reads-outside-inside-dir-clean; else bad reads-outside-inside-dir-clean "rc=$rc: $out"; fi
 
 printf '\ntree-hash\n'
 
