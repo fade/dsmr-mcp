@@ -8,13 +8,16 @@
 // as <tool_use_id>.json for replay.
 //
 // The spawn hook never denies. A spawn the rules cannot place, or one whose
-// hook fails, proceeds exactly as requested; so does a changed spawn the
-// engine refuses, run once more as requested (action `fallback`). The log
-// line says why, and the first such spawn of each kind in a session raises a
-// toast.
+// hook fails, proceeds exactly as requested. A spawn is passed on as another
+// agent type only when the engine last offered that type in this session and
+// no Agent permission rule names it: the engine checks a retyped spawn after
+// the agent.spawn chain has handed it over, and a refusal there cannot be
+// recovered inside the chain. A changed spawn a hook beneath refuses runs once
+// more as requested (action `fallback`). The log line says why, and the first
+// such spawn of each kind in a session raises a toast.
 
 import type { EngineInterface, Register } from 'claude-code'
-import { decide, ioDirs, type Action, type Decision, type RouteIo } from './route'
+import { decide, ioDirs, permissionRuleAgainst, type Action, type Decision, type RouteIo } from './route'
 
 const VERSION = '0.3.0'
 const LOG_DIR = 'logs/subagent-routing'
@@ -39,7 +42,15 @@ type Agent = { type: string; model: string | null }
 
 /** One engine call the decision depended on, with what it answered. */
 export type TapeEntry = {
-  op: 'env.get' | 'session.cwd' | 'session.root' | 'session.id' | 'fs.read' | 'fs.exists'
+  op:
+    | 'env.get'
+    | 'session.cwd'
+    | 'session.root'
+    | 'session.id'
+    | 'fs.read'
+    | 'fs.exists'
+    | 'agent.offered'
+    | 'settings.permissions'
   arg: string
   result: string | boolean | null
 }
@@ -72,6 +83,43 @@ const passedDown = new Map<string, Agent>()
 // Toasts already raised, keyed by session and kind, so a log that cannot be
 // read or written does not repeat them.
 const toasted = new Set<string>()
+
+// What the agent.offer chain beneath answered for each agent type, keyed by
+// session and type. The engine offers every type a call can dispatch just
+// before that call's agent.spawn chain runs.
+const offered = new Map<string, boolean>()
+
+function offerKey(session: string, type: string): string {
+  return `${session}\t${type}`
+}
+
+/**
+ * Why a spawn requested as `e.subagentType` must not be passed on as
+ * `target`, or undefined when it may: `target` was last offered in this
+ * session and no Agent permission rule names it. A fact that cannot be read
+ * refuses the rewrite. Never rejects.
+ */
+async function rewriteBlocker(
+  $: EngineInterface,
+  e: { subagentType: string; parentAgentId?: string },
+  target: string,
+  tape: TapeEntry[],
+): Promise<string | undefined> {
+  if (e.parentAgentId !== undefined) {
+    return `the spawn comes from agent ${e.parentAgentId}, whose dispatchable agent types are not known`
+  }
+  try {
+    const isOffered = offered.get(offerKey(await $.session.id(), target))
+    tape.push({ op: 'agent.offered', arg: target, result: isOffered ?? null })
+    if (isOffered === undefined) return `${target} has not been offered in this session`
+    if (!isOffered) return `${target} is not offered in this session`
+    const permissions = await $.settings.read({ key: 'permissions' })
+    tape.push({ op: 'settings.permissions', arg: '', result: JSON.stringify(permissions ?? null) })
+    return permissionRuleAgainst(permissions, target, e.subagentType) ?? undefined
+  } catch (err) {
+    return `the offered agent types or the permission rules could not be read (${messageOf(err)})`
+  }
+}
 
 /**
  * The log's text before the append, null when it could not be read, and the
@@ -270,6 +318,16 @@ export const register: Register = on => {
     return { text: statusText(path, text) }
   })
 
+  on('agent.offer', async ($, e, next) => {
+    const result = await next(e)
+    try {
+      offered.set(offerKey(await $.session.id(), e.agent), result.isOffered === true)
+    } catch {
+      // Not kept: the type keeps any earlier answer, and with none reads as never offered.
+    }
+    return result
+  })
+
   on('agent.spawn', async ($, e, next) => {
     const capture = await $.env.get('SUBAGENT_ROUTING_CAPTURE')
     const tape: TapeEntry[] = []
@@ -300,6 +358,22 @@ export const register: Register = on => {
         kind: 'subagent',
         shape: 'other',
         planPath: null,
+      }
+    }
+
+    if (
+      (decision.action === 'rewrote' || decision.action === 'cleared-model') &&
+      decision.subagentType !== e.subagentType
+    ) {
+      const blocker = await rewriteBlocker($, e, decision.subagentType, tape)
+      if (blocker !== undefined) {
+        decision = {
+          ...decision,
+          action: 'cannot-decide',
+          subagentType: e.subagentType,
+          model: e.model,
+          reason: `${decision.reason}; not passed on as ${decision.subagentType}: ${blocker}`,
+        }
       }
     }
 

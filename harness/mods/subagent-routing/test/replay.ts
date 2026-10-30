@@ -8,8 +8,8 @@
 // repository; a test file written beside a temporary copy of the mod passes
 // them in.
 
-import { expect, test } from 'claude-code/testing'
-import type { AgentSpawnInput, On } from 'claude-code'
+import { expect, test, type Engine } from 'claude-code/testing'
+import type { AgentSpawnInput, AgentSpawnResult, On } from 'claude-code'
 import type { TapeEntry } from '../hooks/register'
 import { decide, ioDirs, type RouteIo } from '../hooks/route'
 
@@ -98,6 +98,16 @@ function logLinesFor(text: string, toolUseId: string): Record<string, unknown>[]
     .filter(l => l.toolUseId === toolUseId)
 }
 
+/** What the engine answers about agent types and permission rules in one test. */
+type Offers = {
+  /** isOffered per agent type the chain beneath answers; a type left out is offered. */
+  isOffered?: Record<string, boolean>
+  /** The settings' `permissions` value; a function that throws makes the read fail. */
+  permissions?: () => unknown
+  /** Session id in place of the recorded one, so no earlier test's offers apply. */
+  session?: string
+}
+
 /**
  * Engine stand-ins for one recording: answers come from the tape, the spawn
  * log is kept in `log`, and every spawn passed beneath is pushed to `beneath`.
@@ -109,13 +119,19 @@ function standIns(
   log: LogFile,
   beneath: AgentSpawnInput[],
   answer: (e: AgentSpawnInput, n: number) => { model: string; agentId: string } | { deny: string },
+  offers: Offers = {},
 ): void {
   on('env.get', (_$, e) =>
     e.name === 'SUBAGENT_ROUTING_CAPTURE' ? { value: undefined } : { value: tape.text('env.get', e.name) },
   )
   on('session.cwd', () => ({ value: tape.text('session.cwd', '') ?? '' }))
   on('session.root', () => ({ value: rootOf(tape) }))
-  on('session.id', () => ({ value: tape.text('session.id', '') ?? '' }))
+  on('session.id', () => ({ value: offers.session ?? tape.text('session.id', '') ?? '' }))
+  on('agent.offer', (_$, e) => ({ isOffered: offers.isOffered?.[e.agent] ?? offeredOnTape(tape, e.agent) ?? true }))
+  on('settings.read', () => {
+    const permissions = offers.permissions === undefined ? permissionsOnTape(tape) : offers.permissions()
+    return { value: permissions === undefined ? {} : { permissions } }
+  })
   on('fs.read', (_$, e) => {
     if (LOG_PATH.test(e.path)) {
       if (log.text === '') throw new Error(`ENOENT: ${e.path}`)
@@ -136,6 +152,30 @@ function standIns(
     beneath.push(e)
     return answer(e, beneath.length)
   })
+}
+
+/** The recorded isOffered answer for `type`, when the recording holds one. */
+function offeredOnTape(tape: Tape, type: string): boolean | undefined {
+  if (!tape.has('agent.offered', type)) return undefined
+  const v = tape.answer('agent.offered', type)
+  return typeof v === 'boolean' ? v : undefined
+}
+
+/** The recorded settings `permissions` value, when the recording holds one. */
+function permissionsOnTape(tape: Tape): unknown {
+  const text = tape.has('settings.permissions', '') ? tape.text('settings.permissions', '') : undefined
+  return text === undefined ? undefined : (JSON.parse(text) as unknown)
+}
+
+/**
+ * Raises the spawn as a dispatch does: the engine offers each agent type the
+ * call can dispatch, then runs agent.spawn. `types` are the types offered.
+ */
+async function dispatch($: Engine, input: AgentSpawnInput, types: readonly string[]): Promise<AgentSpawnResult> {
+  for (const agent of new Set(types)) {
+    await $.agent.offer({ agent, description: '', source: 'userSettings', provider: { plugin: 'user', tier: 'user' } })
+  }
+  return $.agent.spawn(input)
 }
 
 function tapeIo(rec: Recording, tape: Tape): RouteIo {
@@ -174,7 +214,7 @@ export function replay(recordings: readonly Recording[]): void {
       const beneath: AgentSpawnInput[] = []
       standIns(on, tape, log, beneath, e => ({ model: e.model ?? 'definition', agentId: 'replay' }))
 
-      await $.agent.spawn(spawnInput(rec))
+      await dispatch($, spawnInput(rec), [rec.input.subagentType, rec.expected.subagentType])
 
       expect(tape.misses).toEqual([])
       expect(beneath.length).toBe(1)
@@ -189,8 +229,47 @@ export function replay(recordings: readonly Recording[]): void {
     })
 
     if (rec.expected.action !== 'rewrote' && rec.expected.action !== 'cleared-model') continue
+    const requested = { type: rec.input.subagentType, model: rec.input.model ?? null }
 
-    test(`${label}: a changed spawn the engine refuses runs once more as requested`, async ($, on) => {
+    if (rec.expected.subagentType !== rec.input.subagentType) {
+      const target = rec.expected.subagentType
+      const passesAsRequested = async (
+        $: Engine,
+        on: On,
+        offers: Offers,
+        types: readonly string[],
+        why: string,
+      ): Promise<void> => {
+        const tape = new Tape(rec.tape, label)
+        const log: LogFile = { text: '' }
+        const beneath: AgentSpawnInput[] = []
+        standIns(on, tape, log, beneath, e => ({ model: e.model ?? 'definition', agentId: 'replay' }), offers)
+        const result = await dispatch($, spawnInput(rec), types)
+        expect(result.deny).toBe(undefined)
+        expect(beneath.map(e => ({ type: e.subagentType, model: e.model ?? null }))).toEqual([requested])
+        const mine = logLinesFor(log.text, rec.input.tool_use_id)
+        expect(mine.length).toBe(1)
+        expect(mine[0]?.action).toBe('cannot-decide')
+        expect(mine[0]?.set).toEqual(requested)
+        expect(String(mine[0]?.reason)).toContain(why)
+      }
+
+      test(`${label}: a retype to a type this session was never offered passes as requested`, async ($, on) => {
+        await passesAsRequested($, on, { session: 'replay-never-offered' }, [rec.input.subagentType], 'has not been offered')
+      })
+
+      test(`${label}: a retype to a type a permissions.deny rule names passes as requested`, async ($, on) => {
+        await passesAsRequested(
+          $,
+          on,
+          { session: 'replay-denied', permissions: () => ({ deny: [`Agent(${target})`] }) },
+          [rec.input.subagentType, target],
+          `permissions.deny holds Agent(${target})`,
+        )
+      })
+    }
+
+    test(`${label}: a changed spawn a hook beneath refuses runs once more as requested`, async ($, on) => {
       const tape = new Tape(rec.tape, label)
       const log: LogFile = { text: '' }
       const beneath: AgentSpawnInput[] = []
@@ -203,9 +282,8 @@ export function replay(recordings: readonly Recording[]): void {
         return { value: undefined }
       })
 
-      const result = await $.agent.spawn(spawnInput(rec))
+      const result = await dispatch($, spawnInput(rec), [rec.input.subagentType, rec.expected.subagentType])
 
-      const requested = { type: rec.input.subagentType, model: rec.input.model ?? null }
       expect(result.deny).toBe(undefined)
       expect(beneath.map(e => ({ type: e.subagentType, model: e.model ?? null }))).toEqual([
         { type: rec.expected.subagentType, model: rec.expected.model },

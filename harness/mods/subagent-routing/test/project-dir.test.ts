@@ -34,6 +34,8 @@ function engine(on: On, files: Record<string, string>, cwd: string): { beneath: 
     if (e.path.endsWith('.jsonl')) log = e.text
     return { value: undefined }
   })
+  on('agent.offer', () => ({ isOffered: true }))
+  on('settings.read', () => ({ value: {} }))
   on('agent.spawn', (_$, e) => {
     beneath.push({ type: e.subagentType, model: e.model ?? null })
     return { model: e.model ?? 'definition', agentId: 'a' }
@@ -58,6 +60,7 @@ const lastAction = (log: string): unknown => JSON.parse(log.trim().split('\n').a
 
 test('a session cwd moved by a shell cd still reads the project root config', async ($, on) => {
   const eng = engine(on, { [`${ROOT}/${PLANNING_DIR}/config.json`]: SPECIALIZED, [PLAN]: '---\nwave: 1\n---\n' }, DRIFTED)
+  await $.agent.offer({ agent: 'lisp-developer', description: '', source: 'userSettings', provider: { plugin: 'user', tier: 'user' } })
   await $.agent.spawn(spawn('toolu_drift'))
   expect(eng.beneath).toEqual([{ type: 'lisp-developer', model: null }])
   expect(lastAction(eng.log())).toBe('rewrote')

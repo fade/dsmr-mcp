@@ -180,6 +180,42 @@ export function parseConfig(text: string | null): ProjectConfig {
   }
 }
 
+// A permission rule on one agent type: `Agent(<type>)`, or the older tool name `Task(<type>)`.
+const AGENT_RULE = /^(?:Agent|Task)\((.*)\)$/
+const PERMISSION_LISTS = ['deny', 'ask', 'allow'] as const
+
+/**
+ * The settings `permissions` rule that names agent type `target` and not
+ * `requested`, as `permissions.<list> holds <rule>`; null when there is none.
+ * A `permissions` value that is not an object, or a list that is not an
+ * array, is reported in place of a rule. `*` in a rule's agent type matches
+ * any run of characters.
+ */
+export function permissionRuleAgainst(permissions: unknown, target: string, requested: string): string | null {
+  if (permissions === undefined || permissions === null) return null
+  if (typeof permissions !== 'object' || Array.isArray(permissions)) return 'permissions is not an object'
+  for (const list of PERMISSION_LISTS) {
+    const rules = field(permissions, list)
+    if (rules === undefined) continue
+    if (!Array.isArray(rules)) return `permissions.${list} is not a list`
+    for (const rule of rules) {
+      if (typeof rule !== 'string') continue
+      const content = AGENT_RULE.exec(rule.trim())?.[1]?.trim()
+      if (content === undefined) continue
+      if (globMatches(content, target) && !globMatches(content, requested)) return `permissions.${list} holds ${rule}`
+    }
+  }
+  return null
+}
+
+function globMatches(pattern: string, name: string): boolean {
+  const source = pattern
+    .split('*')
+    .map(part => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&'))
+    .join('.*')
+  return new RegExp(`^${source}$`).test(name)
+}
+
 function field(value: unknown, key: string): unknown {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)[key]
