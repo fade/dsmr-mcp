@@ -194,14 +194,21 @@ printf '%s' "$torn_line" >> "$TORN_SUB"
 out=$(probe cap-check "$TORN_PARENT" 2>/dev/null); rc=$?
 if [ "$rc" -eq 3 ] && [ "$out" = $'8307533\t5000000\tover' ]; then ok cap-torn-line-still-trips; else bad cap-torn-line-still-trips "rc=$rc: $out"; fi
 
-# A transcript that cannot be read at all is over the cap, never under it.
-chmod 000 "$TORN_SUB"
-out=$(probe cap-check "$TORN_PARENT" 2>&1); rc=$?
-chmod 600 "$TORN_SUB"
-if [ "$rc" -eq 3 ] && ! grep -q under <<<"$out" && grep -q 'cannot read' <<<"$out"; then
+# A transcript that cannot be read at all is over the cap, never under it. The
+# tracer session reads under the cap, so only a total that fails closed trips it.
+UNR=$WORK/unreadable
+mkdir -p "$UNR"
+cp "$PARENT" "$UNR/"
+cp -a "${PARENT%.jsonl}" "$UNR/"
+UNR_SUBS=("$UNR/$SID"/subagents/agent-*.jsonl)
+UNR_SUB=${UNR_SUBS[0]}
+chmod 000 "$UNR_SUB"
+out=$(probe cap-check "$UNR/$SID.jsonl" 2>"$WORK/unreadable.err"); rc=$?
+chmod 600 "$UNR_SUB"
+if [ "$rc" -eq 3 ] && [ "$out" = $'unknown\t5000000\tover' ] && grep -q 'cannot read' "$WORK/unreadable.err"; then
     ok cap-unreadable-is-over
 else
-    bad cap-unreadable-is-over "rc=$rc: $out"
+    bad cap-unreadable-is-over "rc=$rc: $out $(cat "$WORK/unreadable.err")"
 fi
 
 printf '\nbus-silent\n'
