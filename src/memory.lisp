@@ -556,8 +556,8 @@ case: the values that say a page should no longer be relied on."
 
 (defstruct (memory-hit (:conc-name hit-))
   "One page that matched a search. TIER is 0 when every term matches the
-filename, name or description, 1 when at least one does, and 2 when only the
-body matches. BODY-HITS counts matches over body lines. EXCERPTS is a list of
+filename, name, description, status or status_reason, 1 when at least one
+does, and 2 when only the body matches. BODY-HITS counts matches over body lines. EXCERPTS is a list of
 plists (:LINE n :TEXT s :MATCH bool) numbered from the top of the file.
 RETIRED is true when the page's status says it should no longer be relied on."
   page tier body-hits excerpts retired)
@@ -602,10 +602,13 @@ memory, which a caller with no project of its own is not given."
         (list (cons (car (last (butlast (pathname-directory dir)))) dir)))))
 
 (defun %metadata-texts (page)
-  "The filename, name and description of PAGE, where present."
-  (remove nil (list (file-namestring (page-file page))
-                    (page-name page)
-                    (page-description page))))
+  "The filename, name, description, each status value and the status_reason
+of PAGE, where present. The update date is not included."
+  (remove nil (list* (file-namestring (page-file page))
+                     (page-name page)
+                     (page-description page)
+                     (page-status-reason page)
+                     (page-status page))))
 
 (defparameter *excerpt-line-limit* 240
   "The longest excerpt line returned; longer lines are cut to this length.")
@@ -626,8 +629,8 @@ in view."
 
 (defun %match-page (page scanners context lines-per-page)
   "The MEMORY-HIT for PAGE when every one of SCANNERS matches its filename,
-name, description or body, else NIL. Each body line is scanned once per
-scanner, and that one pass yields the match test, the body hit count and the
+name, description, status, status_reason or body, else NIL. Each body line
+is scanned once per scanner, and that one pass yields the match test, the body hit count and the
 excerpts, so an expensive pattern costs one scan of the page, not several.
 The tier is 0 when every scanner matches the metadata, 1 when some do and 2
 when none does. Excerpts are the first LINES-PER-PAGE matching body lines,
