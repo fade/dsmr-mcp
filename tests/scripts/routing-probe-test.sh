@@ -405,6 +405,66 @@ else
     bad config-isolated "rc=$rc: $(tail -n 3 <<<"$out")"
 fi
 
+# The installer's own scripts join the home directory with .claude at run
+# time; check-config lists them and still passes.
+if grep -q '^runtime home join gsd-core/bin/lib/' <<<"$out" && grep -q "^installer code names the home config root " <<<"$out"; then
+    ok config-lists-runtime-home-joins
+else
+    bad config-lists-runtime-home-joins "$(grep -c '' <<<"$out") lines"
+fi
+
+# Each spelling of the live root the rewrite does not produce, planted in a
+# copied file, fails check-config by name. The spellings are written out here,
+# not taken from the script.
+cp -p "$CFG/CLAUDE.md" "$WORK/claude-md.saved"
+# shellcheck disable=SC2016 # each spelling is literal text
+for spelling in 'cat "${HOME}/.claude/gsd-core/workflows/quick.md"' 'cat "$HOME"/.claude/x' \
+        "cat $TILDE/\".claude\"/y" "{\"p\": \"${LIVE//\//\\/}/x\"}" 'node -e "x" $HOME/.claude.json'; do
+    cp -p "$WORK/claude-md.saved" "$CFG/CLAUDE.md"
+    printf '\n%s\n' "$spelling" >> "$CFG/CLAUDE.md"
+    out=$(probe check-config "$CFG" 2>&1); rc=$?
+    if [ "$rc" -ne 0 ] && grep -qxF 'live-root reference CLAUDE.md' <<<"$out"; then
+        ok "config-spelling-flagged: $spelling"
+    else
+        bad "config-spelling-flagged: $spelling" "rc=$rc: $(tail -n 3 <<<"$out")"
+    fi
+done
+cp -p "$WORK/claude-md.saved" "$CFG/CLAUDE.md"
+
+# A copied file the check cannot read, or a binary one naming the live root,
+# fails check-config and repoint by name instead of being passed over.
+printf 'x %s/.claude/x\0' "$TILDE" > "$CFG/agents/blob.bin"
+out=$(probe check-config "$CFG" 2>&1); rc=$?
+rout=$(probe repoint "$CFG" 2>&1); rrc=$?
+rm -f "$CFG/agents/blob.bin"
+if [ "$rc" -ne 0 ] && grep -qxF 'binary file names the live root agents/blob.bin' <<<"$out" \
+        && [ "$rrc" -ne 0 ] && grep -qF 'agents/blob.bin' <<<"$rout"; then
+    ok config-binary-reported
+else
+    bad config-binary-reported "rc=$rc rrc=$rrc: $(tail -n 2 <<<"$out") / $(tail -n 2 <<<"$rout")"
+fi
+# Python bytecode embeds its source's path and is rebuilt on use: repoint drops it.
+mkdir -p "$CFG/skills/x/__pycache__"
+printf 'x %s/skills/x/s.py\0' "$LIVE" > "$CFG/skills/x/__pycache__/s.pyc"
+rout=$(probe repoint "$CFG" 2>&1); rrc=$?
+if [ "$rrc" -eq 0 ] && [ ! -e "$CFG/skills/x/__pycache__" ] && grep -qxF 'removed bytecode cache skills/x/__pycache__' <<<"$rout"; then
+    ok repoint-drops-bytecode-cache
+else
+    bad repoint-drops-bytecode-cache "rrc=$rrc: $rout"
+fi
+rm -rf "$CFG/skills/x"
+printf 'unread\n' > "$CFG/agents/sealed.md"
+chmod 000 "$CFG/agents/sealed.md"
+out=$(probe check-config "$CFG" 2>&1); rc=$?
+rout=$(probe repoint "$CFG" 2>&1); rrc=$?
+rm -f "$CFG/agents/sealed.md"
+if [ "$rc" -ne 0 ] && grep -qxF 'unreadable agents/sealed.md' <<<"$out" \
+        && [ "$rrc" -ne 0 ] && grep -qF 'agents/sealed.md' <<<"$rout"; then
+    ok config-unreadable-reported
+else
+    bad config-unreadable-reported "rc=$rc rrc=$rrc: $(tail -n 2 <<<"$out") / $(tail -n 2 <<<"$rout")"
+fi
+
 # Control: a copied file that names the live root again fails check-config by
 # name. CLAUDE.md is not the installer's, so the pristine proof does not see it.
 printf '\nRead %s/.claude/gsd-core/workflows/quick.md\n' "$TILDE" >> "$CFG/CLAUDE.md"

@@ -467,15 +467,31 @@ restore_installer_code() {
     done <<<"$list"
 }
 
+# drop_bytecode_caches DIR: remove each __pycache__ directory under the copied
+# artifacts in DIR, printing it. Python bytecode embeds the path of its source
+# and is rebuilt from the rewritten source on use.
+drop_bytecode_caches() {
+    local dir=$1 sub d
+    for sub in "${CONFIG_ARTIFACTS[@]}"; do
+        [ -d "$dir/$sub" ] && [ ! -L "$dir/$sub" ] || continue
+        while IFS= read -r -d '' d; do
+            rm -r -- "$d" || die "cannot remove $d"
+            echo "removed bytecode cache ${d#"$dir"/}"
+        done < <(find "$dir/$sub" -type d -name __pycache__ -prune -print0)
+    done
+}
+
 # repoint_tree DIR FROM: rewrite each copied artifact under DIR that names
 # config root FROM to name DIR (rewritable files only), and restore installer
 # files an earlier rewrite changed; print each file that is not markdown and
-# the count.
+# the count. Return 1, naming them, when a file cannot be read or is binary
+# and names FROM.
 repoint_tree() {
     local dir=$1 from=$2 f rel n=0
     if [ "$(realpath -m -- "$from")" != "$(realpath -m -- "$dir")" ]; then
         load_owned "$dir"
         restore_installer_code "$dir" "$from"
+        drop_bytecode_caches "$dir"
         swap_prepare "$from" "$dir"
         while IFS= read -r -d '' f; do
             rel=${f#"$dir"/}
@@ -487,27 +503,73 @@ repoint_tree() {
         done < <(artifact_files "$dir")
     fi
     echo "repointed $n files to $dir"
+    local rows kind bad=0
+    rows=$(scan_live "$dir" "$from") || die "cannot scan $dir"
+    while IFS=$'\t' read -r rel kind; do
+        case "$kind" in
+            unreadable|binary) echo "cannot rewrite $rel: $kind"; bad=1 ;;
+        esac
+    done <<<"$rows"
+    [ "$bad" -eq 0 ]
+}
+
+# scan_live DIR LIVE: one REL<TAB>KIND line per finding in the copied
+# artifacts under DIR (REL relative to DIR). KIND is unreadable (a file or
+# directory that cannot be read), binary (a file holding a NUL byte that names
+# LIVE), abs (names LIVE by absolute path), home (names LIVE from the home
+# directory) or join (joins the home directory with LIVE's last component at
+# run time).
+scan_live() {
+    local dir=$1 live=$2 sub base join_re
+    base=$(basename -- "$(realpath -ms -- "$live")")
+    join_re="(?:homedir\\(\\)|env\\.HOME|env\\[[\"']HOME[\"']\\])\\s*,\\s*[\"']$(re_quote "$base")[\"']"
+    for sub in "${CONFIG_ARTIFACTS[@]}"; do
+        [ -e "$dir/$sub" ] || continue
+        find "$dir/$sub" \( -type f -o -type d \( ! -readable -o ! -executable \) \) -print0 2>/dev/null
+    done | SCAN_DIR=$dir ABS_RE=$(live_abs_re "$live") HOME_RE=$(live_home_re "$live") JOIN_RE=$join_re perl -0 -ne '
+        BEGIN { $abs = qr/$ENV{ABS_RE}/; $home = qr/$ENV{HOME_RE}/; $join = qr/$ENV{JOIN_RE}/; $d = $ENV{SCAN_DIR}; }
+        chomp; my $f = $_; my $rel = substr($f, length($d) + 1);
+        if (-d $f) { print "$rel\tunreadable\n"; next }
+        my $h;
+        unless (open($h, "<", $f)) { print "$rel\tunreadable\n"; next }
+        my $c = do { local $/; <$h> };
+        close $h;
+        unless (defined $c) { print "$rel\tunreadable\n"; next }
+        my @k = grep { defined } ($c =~ $abs ? "abs" : undef, $c =~ $home ? "home" : undef, $c =~ $join ? "join" : undef);
+        next unless @k;
+        if ($c =~ /\0/) { print "$rel\tbinary\n"; next }
+        print "$rel\t$_\n" for @k;'
 }
 
 # live_references DIR LIVE: print each copied artifact under DIR that still
-# names config root LIVE; return 1 when there is one. An installer file that
-# is not markdown keeps its home-relative names (the installer leaves them,
-# and they resolve under the session's HOME); only its absolute ones count.
+# names config root LIVE in any spelling (live_text_re), cannot be read, or is
+# binary and names it; return 1 when there is one. Installer code that is not
+# markdown keeps its home-relative names, as the installer leaves them, and is
+# listed without failing, as are run-time joins of the home directory with
+# LIVE's name.
 live_references() {
-    local dir=$1 live=$2 f rel n=0
+    local dir=$1 live=$2 rel kind line rows n=0
+    local -A said=()
     [ "$(realpath -m -- "$live")" != "$(realpath -m -- "$dir")" ] || return 0
     load_owned "$dir"
-    swap_prepare "$live" "$dir"
-    while IFS= read -r -d '' f; do
-        rel=${f#"$dir"/}
-        if rewritable "$rel"; then
-            names_root "$f" || continue
-        else
-            grep -qF -e "$SWAP_FROM_ABS" "$f" || continue
-        fi
-        echo "live-root reference $rel"
-        n=$((n + 1))
-    done < <(artifact_files "$dir")
+    rows=$(scan_live "$dir" "$live") || die "cannot scan $dir"
+    while IFS=$'\t' read -r rel kind; do
+        [ -n "$rel" ] || continue
+        case "$kind" in
+            unreadable) line="unreadable $rel" ;;
+            binary) line="binary file names the live root $rel" ;;
+            abs) line="live-root reference $rel" ;;
+            home)
+                if rewritable "$rel"; then line="live-root reference $rel"
+                else line="installer code names the home config root $rel"; fi ;;
+            join) line="runtime home join $rel" ;;
+            *) continue ;;
+        esac
+        [ -z "${said[$line]:-}" ] || continue
+        said[$line]=1
+        printf '%s\n' "$line"
+        case "$line" in "installer code "*|"runtime home join "*) ;; *) n=$((n + 1)) ;; esac
+    done <<<"$rows"
     [ "$n" -eq 0 ]
 }
 
@@ -600,7 +662,10 @@ cmd_check_config() {
     dir=$(cd "$1" && pwd)
     live=$(realpath -m "$CONFIG_HOME")
     pristine_prove "$dir" "$live" "${PROVEN_PREFIXES[@]}" || rc=1
-    refs=$(live_references "$dir" "$live") || { printf '%s\n' "$refs"; echo "isolation check FAILED: copied files name $live"; rc=1; }
+    local lrc
+    refs=$(live_references "$dir" "$live"); lrc=$?
+    [ -z "$refs" ] || printf '%s\n' "$refs"
+    [ "$lrc" -eq 0 ] || { echo "isolation check FAILED: copied files name $live"; rc=1; }
     [ "$rc" -ne 0 ] || echo "isolation check passed"
     return "$rc"
 }
@@ -625,25 +690,37 @@ re_quote() {
     printf '%s' "$1" | sed 's/[][\\.^$|?*+(){}\/]/\\&/g'
 }
 
-# live_text_re LIVE: a regular expression (perl and jq) matching config root
-# LIVE named in text: its logical and physical absolute paths, each also
-# JSON-escaped, and, when LIVE lies under $HOME, ~/REL, $HOME/REL and
-# ${HOME}/REL with optional quotes around the slash. Broader than the forms
-# repoint rewrites.
-live_text_re() {
-    local logical physical home_l home_p a rel alts=() rels=()
-    logical=$(realpath -ms -- "$1"); physical=$(realpath -m -- "$1")
-    home_l=$(realpath -ms -- "$HOME"); home_p=$(realpath -m -- "$HOME")
-    for a in "$logical" "$physical"; do
+# live_abs_re LIVE: a regular expression (perl and jq) matching config root
+# LIVE by absolute path, logical and physical, each also JSON-escaped.
+live_abs_re() {
+    local a alts=()
+    for a in "$(realpath -ms -- "$1")" "$(realpath -m -- "$1")"; do
         alts+=("$(re_quote "$a")" "$(re_quote "${a//\//\\/}")")
-        case "$a" in "$home_l"/*) rels+=("${a#"$home_l"/}") ;; esac
-        case "$a" in "$home_p"/*) rels+=("${a#"$home_p"/}") ;; esac
-    done
-    for rel in "${rels[@]}"; do
-        alts+=("(?:~|\\\$HOME|\\\$\\{HOME\\})[\"']?/[\"']?$(re_quote "$rel")")
     done
     local IFS='|'
     printf '(?:%s)[\x22\x27]?(?![\\w-])' "${alts[*]}"
+}
+
+# live_home_re LIVE: a regular expression matching LIVE named from the home
+# directory: ~/REL, $HOME/REL and ${HOME}/REL, with optional quotes around the
+# slash. Matches nothing when LIVE does not lie under $HOME.
+live_home_re() {
+    local a home rel alts=()
+    for a in "$(realpath -ms -- "$1")" "$(realpath -m -- "$1")"; do
+        for home in "$(realpath -ms -- "$HOME")" "$(realpath -m -- "$HOME")"; do
+            case "$a" in "$home"/*) rel=${a#"$home"/} ;; *) continue ;; esac
+            alts+=("(?:~|\\\$HOME|\\\$\\{HOME\\})[\"']?/[\"']?$(re_quote "$rel")")
+        done
+    done
+    [ "${#alts[@]}" -gt 0 ] || { printf '(?!)'; return 0; }
+    local IFS='|'
+    printf '(?:%s)[\x22\x27]?(?![\\w-])' "${alts[*]}"
+}
+
+# live_text_re LIVE: config root LIVE named in text in any of those spellings.
+# Broader than the forms repoint rewrites.
+live_text_re() {
+    printf '(?:%s|%s)' "$(live_abs_re "$1")" "$(live_home_re "$1")"
 }
 
 # path_under PATH ROOT...: whether PATH is one of the ROOTs or lies under one.
@@ -821,7 +898,7 @@ cmd_make_config() {
     mv -f "$dir/.claude.json.tmp" "$dir/.claude.json" || die "cannot write .claude.json"
 
     pristine_restore "$dir"
-    repoint_tree "$dir" "$live"
+    repoint_tree "$dir" "$live" || return 1
     pristine_prove "$dir" "$live" "${PROVEN_PREFIXES[@]}" || return 1
     live_references "$dir" "$live" || { echo "isolation check FAILED: copied files name $live"; return 1; }
 
