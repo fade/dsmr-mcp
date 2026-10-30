@@ -7,6 +7,9 @@
 #       Build a scratch git repository that the GSD commands can run in, with
 #       the frozen probe fixtures. local-pristine adds a project-local gsd-core
 #       copy restored to the installer's files; global leaves the live install.
+#       The repository's .planning links to a directory under REPO.cache beside
+#       it (the cache run gives every session as XDG_CACHE_HOME); the identity
+#       script putting it anywhere else is refused.
 #   make-config DIR
 #       Build a throwaway Claude Code config directory with an unpatched
 #       gsd-core copied from the live one and proven against the installer's
@@ -21,14 +24,16 @@
 #   repoint DIR
 #       Redo that rewrite in a directory make-config built, in place, and put
 #       back the installer's bytes in any installer script an earlier rewrite
-#       changed. Only agents, skills, hooks, commands, scripts, gsd-core and
-#       CLAUDE.md under DIR are touched; credentials, settings, projects and
-#       logs never are.
+#       changed. Scripts that a hook under DIR requires, by the live root's name
+#       or DIR's own, and DIR lacks are copied from the live root. Only agents,
+#       skills, hooks, commands, scripts, gsd-core and CLAUDE.md under DIR are
+#       touched; credentials, settings, projects and logs never are.
 #   check-config DIR
 #       Re-check a config directory: every gsd-core, scripts, agents, skills
 #       and hooks manifest entry matches (markdown once the config-root rewrite
 #       is undone, anything else byte for byte), no copied file still names the
-#       live root, and the routing gate reports five units missing under DIR.
+#       live root, every script a hook requires beneath DIR is present, and
+#       the routing gate reports five units missing under DIR.
 #   reads-outside DIR TRANSCRIPT [--live LIVE]
 #       List what a session (and its subagents) touched outside DIR and the
 #       session's working directory: file tool paths, and every command,
@@ -54,6 +59,15 @@
 #       directory above it whose .claude is the live root is refused, since
 #       Claude Code loads instructions from there, as is a --plugin-dir under
 #       the live root.
+#       Every session, with or without --config-dir, gets XDG_CACHE_HOME=REPO.cache
+#       (beside REPO), so the session-start hook keeps the planning directory
+#       make-repo linked; the session also writes Claude Code's own cache files
+#       there. Run refuses, before any home exists, a REPO whose session
+#       identity script would place the planning directory outside that cache,
+#       or whose .planning exists and is not the link the hook keeps. Run exits
+#       5 with a "tripwire: " line when .planning no longer leads under the
+#       cache after the session, or when the session created the planning bucket
+#       for REPO in the caller's own cache. Nothing a tripwire finds is removed.
 #   run-arm ARM --gsd-core global|local-pristine --evidence DIR [--config-dir DIR]
 #       [--plugin-dir DIR|none] [--executor-model opus|inherit] [--capture DIR]
 #       [--orchestrator-model MODEL] [--only PATH[:SHAPE],...] [--env KEY=VAL]...
@@ -148,16 +162,47 @@ usage_error() { [ $# -gt 0 ] && echo "$PROGNAME: $*" >&2; usage >&2; exit 64; }
 
 # --- make-repo ---------------------------------------------------------------
 
+# probe_cache REPO: the cache directory of a probe repository, beside it as
+# REPO.cache, under the physical path of its parent. make-repo and run both
+# derive it, so the planning directory the identity script names is the same
+# one at build time and in the session.
+probe_cache() {
+    local parent
+    parent=$(cd -- "$(dirname -- "$1")" && pwd -P) || return 1
+    printf '%s/%s.cache\n' "$parent" "$(basename -- "$1")"
+}
+
+# session_planning_dir REPO IDENT HOME CACHE: the planning directory the
+# identity script IDENT names for REPO when the process has home directory HOME
+# and XDG_CACHE_HOME CACHE (empty: unset, so the script uses HOME/.cache).
+# Exit 3, printing nothing, for a meta project; another failure is an error.
+session_planning_dir() {
+    local -a cache_env=(-u XDG_CACHE_HOME)
+    [ -z "$4" ] || cache_env=("XDG_CACHE_HOME=$4")
+    HOME=$3 env "${cache_env[@]}" node -e '
+        const id = require(process.argv[1]).resolveProjectIdentity(process.argv[2]);
+        if (id.metaProject) process.exit(3);
+        process.stdout.write(id.planningDir);' "$2" "$1"
+}
+
 # link_planning DIR: where this site keeps planning state outside each
 # repository (an identity script under the config dir names the place), make
 # DIR's planning directory a link to it, as the session-start hook would;
-# otherwise make a plain directory. A non-empty target is refused.
+# otherwise make a plain directory. The script runs with XDG_CACHE_HOME set to
+# probe_cache DIR, which the session gets too, so its hook computes this same
+# place; a place outside that cache is refused, as is a non-empty target.
 link_planning() {
-    local dir=$1 ident=$CONFIG_HOME/scripts/project-identity.js target
-    if [ -f "$ident" ] && target=$(node -e '
-            const id = require(process.argv[1]).resolveProjectIdentity(process.argv[2]);
-            if (id.metaProject) process.exit(1);
-            process.stdout.write(id.planningDir);' "$ident" "$dir"); then
+    local dir=$1 ident=$CONFIG_HOME/scripts/project-identity.js cache target rc
+    cache=$(probe_cache "$dir") || die "cannot resolve the cache directory of $dir"
+    if [ -f "$ident" ]; then
+        target=$(session_planning_dir "$dir" "$ident" "$HOME" "$cache"); rc=$?
+        case "$rc" in 0|3) ;; *) die "cannot compute the planning directory of $dir with $ident" ;; esac
+    else
+        target=""
+    fi
+    if [ -n "$target" ]; then
+        path_under "$(realpath -m -- "$target")" "$(realpath -m -- "$cache")" \
+            || die "refusing $dir: $ident puts the planning directory at $target, outside $cache"
         [ -z "$(ls -A "$target" 2>/dev/null)" ] || die "planning target $target is not empty; move it aside first"
         mkdir -p "$target" || die "cannot create $target"
         ln -s "$target" "$dir/$PLANNING_DIR" || die "cannot link $dir/$PLANNING_DIR"
@@ -695,22 +740,77 @@ copy_installer_scripts() {
     done < <(jq -r '.files | keys[] | select(startswith("scripts/"))' "$src/gsd-file-manifest.json")
 }
 
-# copy_hook_scripts LIVE DIR: copy into DIR/scripts each script under
-# LIVE/scripts that a hook copied into DIR/hooks names by absolute path, so
-# the hook still finds it once repointed; print each one.
-copy_hook_scripts() {
-    local live=$1 dir=$2 rel names
+# root_name_re ROOT: a perl regular expression matching a name of config root
+# ROOT that swap_root writes: its absolute path (logical or physical), ~/REL or
+# $HOME/REL.
+root_name_re() {
+    local abs rel alts=()
+    for abs in "$(realpath -ms -- "$1")" "$(realpath -m -- "$1")"; do
+        alts+=("$(re_quote "$abs")")
+    done
+    rel=$(root_rel "$1")
+    local IFS='|'
+    # shellcheck disable=SC2016 # $HOME is literal regular expression text
+    printf '(?:(?:~|\\$HOME)/%s|(?<![\\w./-])(?:%s))' "$(re_quote "$rel")" "${alts[*]}"
+}
+
+# hook_script_names DIR ROOT...: the scripts/NAME each file under DIR/hooks
+# names beneath one of the config roots ROOT (root_name_re), sorted, once each.
+hook_script_names() {
+    local dir=$1 root re=""
+    shift
     [ -d "$dir/hooks" ] || return 0
+    for root in "$@"; do re+="${re:+|}$(root_name_re "$root")"; done
     # shellcheck disable=SC2016 # perl program
-    names=$(find "$dir/hooks" -type f -print0 | LIVE=$live xargs -0 -r perl -ne '
-        BEGIN { $l = $ENV{LIVE} }
-        print "$1\n" while m{\Q$l\E/(scripts/[\w.-]+)}g;' | sort -u) || die "cannot read $dir/hooks"
+    find "$dir/hooks" -type f -print0 | HOOK_RE=$re xargs -0 -r perl -ne '
+        BEGIN { $r = qr/(?:$ENV{HOOK_RE})\/(scripts\/[\w.-]+)/ }
+        while (/$r/g) { (my $n = $1) =~ s/\.+$//; print "$n\n" }' | sort -u
+}
+
+# copy_hook_scripts LIVE DIR [missing]: copy into DIR/scripts each script under
+# LIVE/scripts that a hook copied into DIR/hooks names beneath LIVE or beneath
+# DIR, so the hook still finds it once repointed; print each one. With
+# "missing", a script DIR already holds is left as it is.
+copy_hook_scripts() {
+    local live=$1 dir=$2 only_missing=${3:-} rel names
+    [ -d "$dir/hooks" ] || return 0
+    names=$(hook_script_names "$dir" "$live" "$dir") || die "cannot read $dir/hooks"
     while IFS= read -r rel; do
         [ -n "$rel" ] && [ -f "$live/$rel" ] || continue
+        if [ "$only_missing" = missing ] && { [ -e "$dir/$rel" ] || [ -L "$dir/$rel" ]; }; then continue; fi
         mkdir -p "$dir/${rel%/*}" || die "cannot create $dir/${rel%/*}"
         cp -a "$live/$rel" "$dir/$rel" || die "cannot copy $live/$rel"
         echo "copied $rel (a copied hook requires it)"
     done <<<"$names"
+}
+
+# hook_scripts_missing DIR: print "hook requires a missing script scripts/NAME"
+# for each script beneath DIR that a file under DIR/hooks names and DIR lacks;
+# return 1 when there is one.
+hook_scripts_missing() {
+    local dir=$1 rel names n=0
+    names=$(hook_script_names "$dir" "$dir") || die "cannot read $dir/hooks"
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        [ -e "$dir/$rel" ] && continue
+        echo "hook requires a missing script $rel"
+        n=$((n + 1))
+    done <<<"$names"
+    [ "$n" -eq 0 ]
+}
+
+# isolation_check DIR LIVE: the isolation half of check-config. Print each
+# finding (copied files or links naming config root LIVE, settings naming it,
+# a hook-required script DIR lacks) and a FAILED line for each kind; return 1
+# when there is any.
+isolation_check() {
+    local dir=$1 live=$2 refs lrc rc=0
+    refs=$(live_references "$dir" "$live"); lrc=$?
+    [ -z "$refs" ] || printf '%s\n' "$refs"
+    [ "$lrc" -eq 0 ] || { echo "isolation check FAILED: copied files name $live"; rc=1; }
+    settings_references "$dir" "$live" || { echo "isolation check FAILED: settings name $live"; rc=1; }
+    hook_scripts_missing "$dir" || { echo "isolation check FAILED: a hook requires a script $dir lacks"; rc=1; }
+    return "$rc"
 }
 
 # install_pristine DIR: copy gsd-core, and the installer's scripts it loads,
@@ -744,15 +844,11 @@ cmd_tree_hash() {
 cmd_check_config() {
     [ $# -eq 1 ] || usage_error "check-config needs one DIR"
     [ -d "$1" ] || die "no such directory: $1"
-    local dir live refs rc=0
+    local dir live rc=0
     dir=$(cd "$1" && pwd)
     live=$(realpath -m "$CONFIG_HOME")
     pristine_prove "$dir" "$live" "${PROVEN_PREFIXES[@]}" || rc=1
-    local lrc
-    refs=$(live_references "$dir" "$live"); lrc=$?
-    [ -z "$refs" ] || printf '%s\n' "$refs"
-    [ "$lrc" -eq 0 ] || { echo "isolation check FAILED: copied files name $live"; rc=1; }
-    settings_references "$dir" "$live" || { echo "isolation check FAILED: settings name $live"; rc=1; }
+    isolation_check "$dir" "$live" || rc=1
     [ "$rc" -ne 0 ] || echo "isolation check passed"
     return "$rc"
 }
@@ -769,6 +865,7 @@ cmd_repoint() {
     esac
     case "$live" in "$dir"/*) die "refusing $dir: it contains the live config directory $live" ;; esac
     [ -f "$dir/$CONFIG_MARKER" ] || die "refusing $dir: make-config did not build it (no $CONFIG_MARKER)"
+    copy_hook_scripts "$live" "$dir" missing
     repoint_tree "$dir" "$live"
 }
 
@@ -990,8 +1087,7 @@ cmd_make_config() {
     pristine_restore "$dir"
     repoint_tree "$dir" "$live" || return 1
     pristine_prove "$dir" "$live" "${PROVEN_PREFIXES[@]}" || return 1
-    live_references "$dir" "$live" || { echo "isolation check FAILED: copied files name $live"; return 1; }
-    settings_references "$dir" "$live" || { echo "isolation check FAILED: settings name $live"; return 1; }
+    isolation_check "$dir" "$live" || return 1
 
     after=$(tree_hash "$live/gsd-core") || exit 1
     echo "live gsd-core tree: $nbefore files, listing sha256 $(printf '%s\n' "$before" | sha256sum | cut -d' ' -f1) before"
@@ -1123,6 +1219,42 @@ probe_home() {
     esac
 }
 
+# planning_preflight REPO IDENT CHILD_HOME CACHE: refuse, before a session
+# starts, a repository whose planning directory the session would not keep
+# inside CACHE (the session's XDG_CACHE_HOME). IDENT is the session's identity
+# script and CHILD_HOME the session's home directory. With the script present,
+# the planning directory it names for REPO must lie under CACHE and REPO's
+# .planning, when it exists, must be the link the session-start hook keeps (it
+# would otherwise relink it to an empty bucket or move a directory aside).
+# Without it, a .planning link must lead under CACHE. Sets CALLER_BUCKET to the
+# bucket the hook would make in the caller's own cache, and CALLER_BUCKET_BEFORE
+# to 1 when that bucket exists now.
+planning_preflight() {
+    local repo=$1 ident=$2 child_home=$3 cache=$4 cache_p planned cur rc plan_dot=$1/$PLANNING_DIR
+    cache_p=$(realpath -m -- "$cache")
+    CALLER_BUCKET=""; CALLER_BUCKET_BEFORE=0
+    if [ -f "$ident" ]; then
+        planned=$(session_planning_dir "$repo" "$ident" "$child_home" "$cache"); rc=$?
+        case "$rc" in 0) ;; 3) planned="" ;; *) die "cannot compute the planning directory of $repo with $ident" ;; esac
+        [ -n "$planned" ] || return 0
+        path_under "$(realpath -m -- "$planned")" "$cache_p" \
+            || die "refusing $repo: with $ident the session would keep its planning directory at $planned, outside $cache"
+        if [ -e "$plan_dot" ] || [ -L "$plan_dot" ]; then
+            cur=$(readlink -- "$plan_dot") || cur=""
+            case "$cur" in /*|"") ;; *) cur=$repo/$cur ;; esac
+            [ -n "$cur" ] && [ "$(realpath -ms -- "$cur")" = "$(realpath -ms -- "$planned")" ] \
+                || die "refusing $repo: $plan_dot is not the link to $planned that the session's hook keeps; rebuild the repository with make-repo"
+        fi
+        planned=$(session_planning_dir "$repo" "$ident" "$HOME" "${XDG_CACHE_HOME:-}") \
+            || die "cannot compute the planning directory of $repo in the caller's cache"
+        CALLER_BUCKET=$(dirname -- "$planned")
+        if [ -e "$CALLER_BUCKET" ] || [ -L "$CALLER_BUCKET" ]; then CALLER_BUCKET_BEFORE=1; fi
+    elif [ -L "$plan_dot" ]; then
+        path_under "$(realpath -m -- "$plan_dot")" "$cache_p" \
+            || die "refusing $repo: $plan_dot leads outside $cache; rebuild the repository with make-repo"
+    fi
+}
+
 cmd_run() {
     local repo="" sid="" config="" plugin="" capture="" debug="" system="" prompt="" have_prompt=0 home=""
     local model=$PROBE_MODEL extra=()
@@ -1165,8 +1297,10 @@ cmd_run() {
     # A probe is its own session: nothing of the calling session, the
     # coordination bus or a mod list reaches it except what the flags give.
     collect_unsets
-    local set_args=("${extra[@]}") live
+    local set_args=("${extra[@]}") live cache child_home ident
+    cache=$(probe_cache "$repo") || die "cannot resolve the cache directory of $repo"
     [ -z "$capture" ] || set_args+=("SUBAGENT_ROUTING_CAPTURE=$capture")
+    set_args+=("XDG_CACHE_HOME=$cache")
     if [ -n "$config" ]; then
         live=$(realpath -m -- "$HOME/.claude")
         if [ -n "$plugin" ] && path_under "$plugin" "$live"; then
@@ -1174,10 +1308,19 @@ cmd_run() {
         fi
         [ -n "$home" ] || home=$(dirname -- "$repo")/home/$sid
         home=$(realpath -m -- "$home")
+        child_home=$home
+        ident=$config/scripts/project-identity.js
+    else
+        child_home=$HOME
+        ident=$HOME/.claude/scripts/project-identity.js
+    fi
+    planning_preflight "$repo" "$ident" "$child_home" "$cache"
+    local caller_bucket=$CALLER_BUCKET bucket_before=$CALLER_BUCKET_BEFORE
+    if [ -n "$config" ]; then
         probe_home "$home" "$repo" "$config" "$live"
         local probe_path_value name
         probe_path_value=$(probe_path "$PATH" "$live" "$config")
-        for name in XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME GIT_CONFIG_GLOBAL; do
+        for name in XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME GIT_CONFIG_GLOBAL; do
             [ -z "${!name+x}" ] || UNSET_ARGS+=(-u "$name")
         done
         set_args+=("CLAUDE_CONFIG_DIR=$config" "HOME=$home" "PATH=$probe_path_value")
@@ -1197,6 +1340,14 @@ cmd_run() {
     if [ -n "$config" ] && { [ -e "$home/.claude" ] || [ -L "$home/.claude" ]; }; then
         echo "tripwire: the session created $home/.claude" >&2
         find "$home/.claude" -maxdepth 3 >&2 2>/dev/null
+        rc=5
+    fi
+    if [ -n "$caller_bucket" ] && [ "$bucket_before" -eq 0 ] && { [ -e "$caller_bucket" ] || [ -L "$caller_bucket" ]; }; then
+        echo "tripwire: the session created the planning bucket $caller_bucket in the caller's cache" >&2
+        rc=5
+    fi
+    if [ -L "$repo/$PLANNING_DIR" ] && ! path_under "$(realpath -m -- "$repo/$PLANNING_DIR")" "$(realpath -m -- "$cache")"; then
+        echo "tripwire: the session moved $repo/$PLANNING_DIR to $(realpath -m -- "$repo/$PLANNING_DIR"), outside $cache" >&2
         rc=5
     fi
 

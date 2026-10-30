@@ -36,6 +36,11 @@
 # and copies the recorded tracer session into the config directory; they check
 # the model argument and the sessions.tsv column, not any output of claude.
 #
+# The planning-directory cases run real code from the live install, copied
+# unchanged under a stand-in home: the identity script, the git-exclusion script
+# and the session-start planning hook. Every run case uses the stand-in claude;
+# no Claude Code session starts anywhere.
+#
 # Usage: ROUTING_PROBE_RECORDED=DIR tests/scripts/routing-probe-test.sh
 #   DIR holds the recorded sessions under DIR/tracer, DIR/execute-phase and
 #   DIR/control-inherit.
@@ -875,7 +880,9 @@ git -C "$RREPO" init -q
 git -C "$RREPO" config user.name 'Probe Author'
 git -C "$RREPO" config user.email probe@example.invalid
 # The stand-in claude records what it was given and writes a transcript where
-# run looks for one. With PROBE_TRIP set it reaches for $HOME/.claude.
+# run looks for one. With PROBE_TRIP set it reaches for $HOME/.claude; with
+# PROBE_HOOK set it runs the config directory's session-start planning hook;
+# with PROBE_MKDIR set it creates that directory.
 cat > "$RSTUB/claude" <<STUB
 #!/bin/bash
 env > "$WORK/run-env.txt"
@@ -883,9 +890,12 @@ if [ -e "\$HOME/.claude" ]; then echo present; else echo absent; fi > "$WORK/run
 cat "\$HOME/.cache/dsmr-routing-probes/config/marker" > "$WORK/run-marker.txt" 2>&1
 git config --global user.name > "$WORK/run-git.txt" 2>&1
 [ -z "\${PROBE_TRIP:-}" ] || { mkdir -p "\$HOME/.claude"; : > "\$HOME/.claude/touched"; }
+[ -z "\${PROBE_HOOK:-}" ] || node "\$CLAUDE_CONFIG_DIR/hooks/gsd-planning-symlinks.js" > "$WORK/run-hook.txt" 2>&1
+[ -z "\${PROBE_MKDIR:-}" ] || mkdir -p "\$PROBE_MKDIR"
 while [ \$# -gt 0 ]; do case "\$1" in --session-id) sid=\$2; shift 2 ;; *) shift ;; esac; done
-mkdir -p "\$CLAUDE_CONFIG_DIR/projects/-r"
-printf '{}\n' > "\$CLAUDE_CONFIG_DIR/projects/-r/\$sid.jsonl"
+cfg=\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}
+mkdir -p "\$cfg/projects/-r"
+printf '{}\n' > "\$cfg/projects/-r/\$sid.jsonl"
 STUB
 chmod +x "$RSTUB/claude"
 RPATH=$RSTUB:$RH/.claude/gsd-core/bin:$RH/bin-link:$RH/.local/bin:/usr/bin:/bin
@@ -944,6 +954,138 @@ fi
 mkdir -p "$RH/.claude/mods/m"
 out=$(run_probe 44444444-2222-4333-8444-555555555555 "$RREPO" --plugin-dir "$RH/.claude/mods/m" 2>&1); rc=$?
 if [ "$rc" -ne 0 ] && grep -q 'refusing --plugin-dir' <<<"$out"; then ok run-refuses-live-plugin-dir; else bad run-refuses-live-plugin-dir "rc=$rc: $out"; fi
+
+printf '\nplanning directory\n'
+
+# Real code from the live install, read only and moved under the stand-in home
+# RH (whose live root is RH/.claude): the identity script, the git-exclusion
+# script, and the session-start planning hook with the live root's name
+# replaced by RH/.claude. The cases run the hook as SessionStart would. No
+# Claude Code session starts; the stand-in claude plays every run.
+for rel in scripts/project-identity.js scripts/git-exclusion.js hooks/gsd-planning-symlinks.js; do
+    [ -f "$LIVE/$rel" ] || bad planning-fixture "the live install lacks $rel"
+done
+mkdir -p "$RH/.claude/scripts" "$RH/.claude/projects"
+cp "$LIVE/scripts/project-identity.js" "$LIVE/scripts/git-exclusion.js" "$RH/.claude/scripts/"
+PL_HOOK=hooks/gsd-planning-symlinks.js
+PCFG=$RH/.cache/dsmr-routing-probes/hookcfg
+mkdir -p "$PCFG/hooks"
+printf 'built\n' > "$PCFG/.routing-probe-config"
+FROM_ROOT=$LIVE TO_ROOT=$RH/.claude perl -pe 's{\Q$ENV{FROM_ROOT}\E}{$ENV{TO_ROOT}}g' "$LIVE/$PL_HOOK" > "$PCFG/$PL_HOOK"
+
+# Each case runs with HOME at the stand-in, no XDG_CACHE_HOME and no
+# CLAUDE_CONFIG_DIR, so none can reach the caller's real cache.
+PL_ROOT=$WORK/plan-scratch
+mkdir -p "$PL_ROOT"
+PL_ROOT=$(cd "$PL_ROOT" && pwd -P)
+pl_env() {
+    env -u CLAUDE_CONFIG_DIR -u XDG_CACHE_HOME HOME="$RH" PATH="$RPATH" XDG_CONFIG_HOME="$RH/.config" \
+        GIT_AUTHOR_NAME='Probe Author' GIT_AUTHOR_EMAIL=probe@example.invalid \
+        GIT_COMMITTER_NAME='Probe Author' GIT_COMMITTER_EMAIL=probe@example.invalid "$@"
+}
+pl_probe() { pl_env bash "$PROBE" "$@"; }
+pl_run() {
+    local repo=$1 sid=$2
+    shift 2
+    pl_probe run "$repo" --session-id "$sid" --debug-file "$WORK/run-debug-$sid.log" "$@" -- hi
+}
+# pl_planning_dir REPO: the planning directory the live identity script
+# computes for REPO under the stand-in home with no XDG_CACHE_HOME.
+pl_planning_dir() {
+    pl_env node -e '
+        const id = require(process.argv[1]).resolveProjectIdentity(process.argv[2]);
+        process.stdout.write(id.planningDir);' "$RH/.claude/scripts/project-identity.js" "$1"
+}
+
+# A config directory whose hook requires scripts under itself, as an earlier
+# repoint left the real one, with none of them present.
+PCFG2=$RH/.cache/dsmr-routing-probes/hookcfg2
+mkdir -p "$PCFG2/hooks"
+printf 'built\n' > "$PCFG2/.routing-probe-config"
+FROM_ROOT=$RH/.claude/scripts/ TO_ROOT=$PCFG2/scripts/ perl -pe 's{\Q$ENV{FROM_ROOT}\E}{$ENV{TO_ROOT}}g' "$PCFG/$PL_HOOK" > "$PCFG2/$PL_HOOK"
+out=$(pl_probe check-config "$PCFG2" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -qxF 'hook requires a missing script scripts/project-identity.js' <<<"$out" \
+        && grep -qxF 'hook requires a missing script scripts/git-exclusion.js' <<<"$out"; then
+    ok check-config-flags-missing-hook-script
+else
+    bad check-config-flags-missing-hook-script "rc=$rc: $(tail -n 4 <<<"$out")"
+fi
+
+out=$(pl_probe repoint "$PCFG" 2>&1); rc=$?
+out2=$(pl_probe repoint "$PCFG" 2>&1)
+reqs=$(grep -oE "require\('[^']+'\)" "$PCFG/$PL_HOOK" | sed "s/^require('//; s/')\$//" | grep '^/')
+missing=""
+for r in $reqs; do [ -f "$r" ] || missing+=" $r"; done
+if [ "$rc" -eq 0 ] && [ -n "$reqs" ] && [ -z "$missing" ] && ! grep -qvF "$PCFG/scripts/" <<<"$reqs" \
+        && grep -qxF 'copied scripts/project-identity.js (a copied hook requires it)' <<<"$out" \
+        && grep -qxF 'copied scripts/git-exclusion.js (a copied hook requires it)' <<<"$out" \
+        && ! grep -q '^copied ' <<<"$out2"; then
+    ok repoint-copies-hook-scripts
+else
+    bad repoint-copies-hook-scripts "rc=$rc missing:$missing: $(tail -n 4 <<<"$out")"
+fi
+
+# A repository made under the stand-in home keeps its planning directory
+# beside it, and nothing appears in the stand-in home's cache.
+PREPO=$PL_ROOT/repo
+out=$(pl_probe make-repo "$PREPO" --gsd-core global --shapes shell 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && [ -L "$PREPO/.planning" ] \
+        && [[ "$(readlink "$PREPO/.planning")" == "$PREPO.cache/opencode/projects/"*"/planning" ]] \
+        && grep -qF "planning directory linked to $PREPO.cache/opencode/projects/" <<<"$out" \
+        && [ ! -e "$RH/.cache/opencode" ]; then
+    ok make-repo-planning-in-scratch
+else
+    bad make-repo-planning-in-scratch "rc=$rc link=$(readlink "$PREPO/.planning"): $(tail -n 3 <<<"$out")"
+fi
+
+# The session's hook computes the planning directory make-repo linked, so it
+# reports it already linked instead of relinking .planning to an empty bucket.
+PSID=aaaaaaaa-2222-4333-8444-555555555555
+rm -f "$WORK/run-env.txt" "$WORK/run-hook.txt"
+out=$(pl_run "$PREPO" "$PSID" --config-dir "$PCFG" --env PROBE_HOOK=1 2>&1); rc=$?
+action=$(jq -r '.hookSpecificOutput.planningSymlinks.action // "-"' "$WORK/run-hook.txt" 2>/dev/null)
+if [ "$rc" -eq 0 ] && [ "$action" = already_linked ] \
+        && [ "$(sed -n 's/^XDG_CACHE_HOME=//p' "$WORK/run-env.txt")" = "$PREPO.cache" ] \
+        && [[ "$(realpath -m "$PREPO/.planning")" == "$PREPO.cache/"* ]] \
+        && [ ! -e "$RH/.cache/opencode" ] && [ ! -e "$PL_ROOT/home/$PSID/.cache/opencode" ]; then
+    ok run-planning-bucket-in-scratch
+else
+    bad run-planning-bucket-in-scratch "rc=$rc action=$action cache=$(sed -n 's/^XDG_CACHE_HOME=//p' "$WORK/run-env.txt"): $(tail -n 3 <<<"$out")"
+fi
+
+rm -f "$WORK/run-env.txt"
+out=$(pl_run "$PREPO" bbbbbbbb-2222-4333-8444-555555555555 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && [ "$(sed -n 's/^XDG_CACHE_HOME=//p' "$WORK/run-env.txt")" = "$PREPO.cache" ] \
+        && [ ! -e "$RH/.cache/opencode" ]; then
+    ok run-live-planning-in-scratch
+else
+    bad run-live-planning-in-scratch "rc=$rc cache=$(sed -n 's/^XDG_CACHE_HOME=//p' "$WORK/run-env.txt"): $(tail -n 3 <<<"$out")"
+fi
+
+# A repository whose .planning links into the caller's cache, as make-repo
+# built it before, is refused before a home exists or claude starts.
+OREPO=$PL_ROOT/outside/repo
+mkdir -p "$OREPO"
+git -C "$OREPO" init -q
+ocache_plan=$(pl_planning_dir "$OREPO")
+mkdir -p "$ocache_plan"
+ln -s "$ocache_plan" "$OREPO/.planning"
+rm -f "$WORK/run-env.txt"
+out=$(pl_run "$OREPO" cccccccc-2222-4333-8444-555555555555 --config-dir "$PCFG" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -q 'make-repo' <<<"$out" && [ ! -e "$WORK/run-env.txt" ] && [ ! -e "$PL_ROOT/outside/home" ]; then
+    ok run-refuses-planning-outside-scratch
+else
+    bad run-refuses-planning-outside-scratch "rc=$rc env=$([ -e "$WORK/run-env.txt" ] && echo ran || echo absent): $(tail -n 3 <<<"$out")"
+fi
+
+# A session that creates the caller-cache bucket for its repository trips the wire.
+caller_bucket=$(dirname "$(pl_planning_dir "$PREPO")")
+out=$(pl_run "$PREPO" dddddddd-2222-4333-8444-555555555555 --config-dir "$PCFG" --env "PROBE_MKDIR=$caller_bucket" 2>&1); rc=$?
+if [ "$rc" -eq 5 ] && grep '^tripwire: ' <<<"$out" | grep -qF "$caller_bucket"; then
+    ok run-planning-tripwire-trips
+else
+    bad run-planning-tripwire-trips "rc=$rc: $(tail -n 3 <<<"$out")"
+fi
 
 printf '\nrun-arm orchestrator model\n'
 
