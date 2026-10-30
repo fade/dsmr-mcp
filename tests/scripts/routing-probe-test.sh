@@ -25,8 +25,9 @@
 # A third real session, the unpatched-arm control (session
 # 62d89842-08dc-46bd-9cf6-8ab0d8c6303a, run through `routing-probe.sh run-arm`
 # in a throwaway config directory), is copied unchanged under DIR/control-inherit.
-# Its orchestrator Read the live, patched /home/fade/.claude/gsd-core/workflows/quick.md
-# because the copied skill named ~/.claude literally; the reads-outside cases replay it.
+# Its orchestrator Read the live, patched gsd-core/workflows/quick.md under the
+# recording host's ~/.claude because the copied skill named ~/.claude literally;
+# the reads-outside cases replay it with its paths moved under a stand-in home.
 #
 # The make-config cases build a config directory from the live install on this
 # host (agents, skills, hooks, gsd-core and its installer manifest) and prove it
@@ -68,7 +69,8 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/routing-probe-test.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
 # The recorded dispatch names its plan under the directory the probe ran in.
-export ROUTING_PROBE_PATH_MAP="/home/fade/.cache/dsmr-routing-probes/tracer/repo=$REC/repo"
+REC_CWD=$(jq -rn 'first(inputs | select(.cwd != null) | .cwd)' "$PARENT")
+export ROUTING_PROBE_PATH_MAP="$REC_CWD=$REC/repo"
 
 # A literal tilde, for patterns that name a home-relative path.
 TILDE='~'
@@ -318,9 +320,16 @@ else
     bad config-tamper "rc=$rc: $(tail -n 3 <<<"$out")"
 fi
 
-# A target inside the live config directory is refused and nothing is created there.
-out=$(probe make-config "$LIVE/dsmr-make-config-must-not-exist" 2>&1); rc=$?
-if [ "$rc" -ne 0 ] && [ ! -e "$LIVE/dsmr-make-config-must-not-exist" ] && grep -q 'inside the live config' <<<"$out"; then
+# A target inside the live config directory is refused and nothing is created
+# there. The live tree here is a stand-in under a stand-in home.
+FAKE_HOME=$WORK/fake-home
+mkdir -p "$FAKE_HOME/.claude/agents"
+printf 'Read %s/.claude/x\n' "$TILDE" > "$FAKE_HOME/.claude/agents/a.md"
+printf 'built\n' > "$FAKE_HOME/.claude/.routing-probe-config"
+fake_before=$(probe tree-hash "$FAKE_HOME/.claude")
+out=$(HOME=$FAKE_HOME probe make-config "$FAKE_HOME/.claude/dsmr-make-config-must-not-exist" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && [ ! -e "$FAKE_HOME/.claude/dsmr-make-config-must-not-exist" ] && grep -q 'inside the live config' <<<"$out" \
+        && [ "$(probe tree-hash "$FAKE_HOME/.claude")" = "$fake_before" ]; then
     ok config-refuses-live
 else
     bad config-refuses-live "rc=$rc: $out"
@@ -671,8 +680,15 @@ rm -f "$OLD/agents/fresh.md" "$OLD/agents/fresh.md.repoint.tmp"
 mkdir -p "$WORK/notmine"
 out=$(probe repoint "$WORK/notmine" 2>&1); rc=$?
 if [ "$rc" -ne 0 ] && grep -q 'make-config did not build it' <<<"$out"; then ok repoint-refuses-foreign; else bad repoint-refuses-foreign "rc=$rc: $out"; fi
-out=$(probe repoint "$LIVE" 2>&1); rc=$?
-if [ "$rc" -ne 0 ] && grep -q 'inside the live config' <<<"$out"; then ok repoint-refuses-live; else bad repoint-refuses-live "rc=$rc: $out"; fi
+# The stand-in live tree carries the marker and a file naming ~/.claude, so
+# only the refusal keeps repoint from rewriting it.
+out=$(HOME=$FAKE_HOME probe repoint "$FAKE_HOME/.claude" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -q 'inside the live config' <<<"$out" \
+        && [ "$(probe tree-hash "$FAKE_HOME/.claude")" = "$fake_before" ]; then
+    ok repoint-refuses-live
+else
+    bad repoint-refuses-live "rc=$rc: $out"
+fi
 
 printf '\nreads-outside\n'
 
@@ -685,10 +701,13 @@ RO_CFG=$RO_HOME/.cache/dsmr-routing-probes/config
 mkdir -p "$RO_LIVE" "$RO_CFG"
 RO_T=$WORK/ro/${CTRL_PARENT##*/}
 mkdir -p "$WORK/ro"
-RO_CFG=$RO_CFG RO_LIVE=$RO_LIVE RO_HOME=$RO_HOME perl -pe '
-    s{/home/fade/\.cache/dsmr-routing-probes/config}{$ENV{RO_CFG}}g;
-    s{/home/fade/\.claude}{$ENV{RO_LIVE}}g;
-    s{/home/fade}{$ENV{RO_HOME}}g' "$CTRL_PARENT" > "$RO_T"
+# The recording host's home is the part of the session's cwd before /.cache/.
+CTRL_CWD=$(jq -rn 'first(inputs | select(.cwd != null) | .cwd)' "$CTRL_PARENT")
+REC_HOME=${CTRL_CWD%%/.cache/*}
+REC_HOME=$REC_HOME RO_CFG=$RO_CFG RO_LIVE=$RO_LIVE RO_HOME=$RO_HOME perl -pe '
+    s{\Q$ENV{REC_HOME}\E/\.cache/dsmr-routing-probes/config}{$ENV{RO_CFG}}g;
+    s{\Q$ENV{REC_HOME}\E/\.claude}{$ENV{RO_LIVE}}g;
+    s{\Q$ENV{REC_HOME}\E}{$ENV{RO_HOME}}g' "$CTRL_PARENT" > "$RO_T"
 
 ro_probe() { HOME=$RO_HOME probe reads-outside "$@"; }
 
