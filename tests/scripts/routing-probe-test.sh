@@ -302,15 +302,15 @@ else
     bad config-paths-rewritten "live $live_p, config $cfg_p, rewritten $cfg_q"
 fi
 
-if grep -q 'live gsd-core identical before and after' "$WORK/make-config.out" \
-        && grep -q 'live gate: five present' "$WORK/make-config.out"; then
+if grep -q 'live gsd-core identical before and after' "$WORK/make-config.out"; then
     ok config-live-unchanged
 else
     bad config-live-unchanged "$(tail -n 4 "$WORK/make-config.out")"
 fi
 
 out=$(probe check-config "$CFG" 2>&1); rc=$?
-if [ "$rc" -eq 0 ] && grep -q 'pristine check passed' <<<"$out" && [ "$(grep -c '^missing ' <<<"$out")" -eq 5 ]; then
+if [ "$rc" -eq 0 ] && grep -q 'pristine check passed' <<<"$out" \
+        && grep -qx 'dsmr-local markers under gsd-core/workflows: 0' <<<"$out"; then
     ok config-pristine
 else
     bad config-pristine "rc=$rc: $(tail -n 3 <<<"$out")"
@@ -378,14 +378,29 @@ fi
 # A directory that holds the repository is refused. The script is copied under
 # a stand-in repository so the directory under test is a scratch one.
 OUTER=$WORK/outer
-mkdir -p "$OUTER/repo/scripts" "$OUTER/repo/harness"
+mkdir -p "$OUTER/repo/scripts"
 cp "$PROBE" "$OUTER/repo/scripts/routing-probe.sh"
-cp -a "$REPO_ROOT/harness/scripts" "$OUTER/repo/harness/scripts"
 out=$(bash "$OUTER/repo/scripts/routing-probe.sh" make-config "$OUTER" 2>&1); rc=$?
 if [ "$rc" -ne 0 ] && [ ! -e "$OUTER/settings.json" ] && grep -q 'contains the repository' <<<"$out"; then
     ok config-refuses-repo-parent
 else
     bad config-refuses-repo-parent "rc=$rc: $(tail -n 3 <<<"$out")"
+fi
+
+# The pristine proof needs nothing from the repository but the script itself:
+# run from a stand-in repository holding only scripts/routing-probe.sh, a fresh
+# make-config passes and check-config passes on what it built.
+BARE=$WORK/bare
+mkdir -p "$BARE/repo/scripts"
+cp "$PROBE" "$BARE/repo/scripts/routing-probe.sh"
+mc_out=$(bash "$BARE/repo/scripts/routing-probe.sh" make-config "$BARE/config" 2>&1); mc_rc=$?
+out=$(bash "$BARE/repo/scripts/routing-probe.sh" check-config "$BARE/config" 2>&1); rc=$?
+if [ "$mc_rc" -eq 0 ] && [ "$rc" -eq 0 ] && [ "$(find "$BARE/repo" -type f | wc -l)" -eq 1 ] \
+        && grep -q 'pristine check passed' <<<"$out" \
+        && grep -qx 'dsmr-local markers under gsd-core/workflows: 0' <<<"$out"; then
+    ok pristine-without-gate
+else
+    bad pristine-without-gate "make-config rc=$mc_rc: $(tail -n 2 <<<"$mc_out"); check-config rc=$rc: $(tail -n 2 <<<"$out")"
 fi
 
 printf '\nconfig root rewrite\n'
@@ -541,19 +556,32 @@ probe repoint "$CFG" > /dev/null 2>&1
 out=$(probe check-config "$CFG" 2>&1); rc=$?
 if [ "$rc" -eq 0 ] && grep -q 'isolation check passed' <<<"$out"; then ok config-repoint-heals-reference; else bad config-repoint-heals-reference "rc=$rc: $(tail -n 3 <<<"$out")"; fi
 
-# The live quick.md is the patched one, not the installer's: planted in the
-# throwaway copy, repointed as the dir's own files are, it must fail.
-if ! cmp -s "$LIVE/gsd-core/workflows/quick.md" "$CFG/gsd-core/workflows/quick.md"; then
-    cp "$LIVE/gsd-core/workflows/quick.md" "$CFG/gsd-core/workflows/quick.md"
-    probe repoint "$CFG" > /dev/null 2>&1
-    out=$(probe check-config "$CFG" 2>&1); rc=$?
-    if [ "$rc" -ne 0 ] && grep -q '^mismatch gsd-core/workflows/quick.md$' <<<"$out"; then
-        ok config-planted-patched-workflow
-    else
-        bad config-planted-patched-workflow "rc=$rc: $(tail -n 3 <<<"$out")"
-    fi
+# A workflow carrying a local routing edit fails the proof twice, by manifest
+# and by marker. The planted line is the first line the retired quick
+# routing patch added to quick.md, unchanged.
+MARKER_LINE='# dsmr-local: quick executor routing'
+sed -i "1a\\$MARKER_LINE" "$CFG/gsd-core/workflows/quick.md"
+probe repoint "$CFG" > /dev/null 2>&1
+out=$(probe check-config "$CFG" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -qx 'mismatch gsd-core/workflows/quick.md' <<<"$out" \
+        && grep -qx 'dsmr-local marker gsd-core/workflows/quick.md' <<<"$out"; then
+    ok config-planted-patched-workflow
 else
-    bad config-planted-patched-workflow "live quick.md equals the installer copy; nothing to plant"
+    bad config-planted-patched-workflow "rc=$rc: $(tail -n 3 <<<"$out")"
+fi
+
+# The marker count alone fails the proof: a marked file the manifest does not
+# list leaves every manifest entry matching.
+probe make-config "$CFG" > /dev/null 2>&1
+printf '%s\n' "$MARKER_LINE" > "$CFG/gsd-core/workflows/local-routing.md"
+out=$(probe check-config "$CFG" 2>&1); rc=$?
+rm -f "$CFG/gsd-core/workflows/local-routing.md"
+if [ "$rc" -ne 0 ] && ! grep -q '^mismatch ' <<<"$out" \
+        && grep -qx 'dsmr-local marker gsd-core/workflows/local-routing.md' <<<"$out" \
+        && grep -q 'pristine check FAILED' <<<"$out"; then
+    ok config-planted-marker-outside-manifest
+else
+    bad config-planted-marker-outside-manifest "rc=$rc: $(tail -n 3 <<<"$out")"
 fi
 probe make-config "$CFG" > "$WORK/make-config3.out" 2>&1
 

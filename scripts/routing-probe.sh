@@ -35,7 +35,7 @@
 #       and hooks manifest entry matches (markdown once the config-root rewrite
 #       is undone, anything else byte for byte), no copied file still names the
 #       live root, every script a hook requires beneath DIR is present, and
-#       the routing gate reports five units missing under DIR.
+#       no file under DIR's gsd-core/workflows carries a dsmr-local marker.
 #   reads-outside DIR TRANSCRIPT [--live LIVE]
 #       List what a session (and its subagents) touched outside DIR and the
 #       session's working directory: file tool paths, and every command,
@@ -119,7 +119,6 @@ set -u
 
 PROGNAME=${0##*/}
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-GATE=$SCRIPT_DIR/../harness/scripts/gsd-routing-gate.sh
 CONFIG_HOME=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 # The planning directory gsd-core reads, named once.
 PLANNING_DIR=.planning
@@ -420,19 +419,24 @@ Makefile and one document.
 EOF
 }
 
-# pristine_restore ROOT: restore each patched gsd-core target under ROOT from
-# its backup, then delete every backup. Targets and suffixes are the gate's
-# units rows.
+# pristine_restore ROOT: for each FILE.pre-* backup under ROOT/gsd-core, copy
+# the backup over FILE when FILE does not match its installer manifest entry
+# and the backup does; then delete every backup. With no backup present,
+# nothing changes. Run before any config-root rewrite, while the copied bytes
+# are still the installer's.
 pristine_restore() {
-    local root=$1 row target suffix
-    [ -f "$GATE" ] || die "routing gate not found: $GATE"
-    while IFS= read -r row; do
-        target=$(printf '%s\n' "$row" | cut -d'|' -f2)
-        suffix=$(printf '%s\n' "$row" | cut -d'|' -f5)
-        [ -f "$root/$target$suffix" ] || die "no backup for $target ($suffix)"
-        cp "$root/$target$suffix" "$root/$target"
-        echo "restored $target from $suffix"
-    done < <(sed -n "s/^  '\([a-z-]*|gsd-core\/[^']*\)'\$/\1/p" "$GATE")
+    local root=$1 manifest=$1/gsd-file-manifest.json backup target rel want
+    [ -f "$manifest" ] || die "installer manifest not found: $manifest"
+    while IFS= read -r -d '' backup; do
+        target=${backup%.pre-*}
+        rel=${target#"$root"/}
+        want=$(jq -r --arg k "$rel" '.files[$k] // empty' "$manifest") || die "cannot read $manifest"
+        [ -n "$want" ] || continue
+        [ "$(sha256sum < "$target" 2>/dev/null | cut -d' ' -f1)" != "$want" ] || continue
+        [ "$(sha256sum < "$backup" | cut -d' ' -f1)" = "$want" ] || continue
+        cp "$backup" "$target" || die "cannot restore $rel"
+        echo "restored $rel from ${backup##*/}"
+    done < <(find "$root/gsd-core" -name '*.pre-*' -type f -print0)
     find "$root/gsd-core" -name '*.pre-*' -type f -delete
 }
 
@@ -710,13 +714,14 @@ PROVEN_PREFIXES=(gsd-core/ scripts/ agents/ skills/ hooks/)
 
 # pristine_prove ROOT [LIVE [PREFIX...]]: print the proof and return 1 if it
 # does not hold: every installer manifest entry under ROOT whose path starts
-# with a PREFIX (default gsd-core/ and scripts/) matches by SHA-256, and the
-# gate exits 1 printing five missing lines. Markdown that names ROOT matches
-# once ROOT is swapped back to LIVE, the config root the manifest was written
-# for; any other file must match byte for byte.
+# with a PREFIX (default gsd-core/ and scripts/) matches by SHA-256, and no
+# file under ROOT/gsd-core/workflows, listed in the manifest or not, carries a
+# dsmr-local marker. Markdown that names ROOT matches once ROOT is swapped back
+# to LIVE, the config root the manifest was written for; any other file must
+# match byte for byte.
 pristine_prove() {
     local root=$1 live=${2:-$1} manifest=$1/gsd-file-manifest.json
-    local entries=0 matched=0 bad=0 rel want got gate_out gate_rc nmissing
+    local entries=0 matched=0 bad=0 marked=0 rel want got path
     local -a prefixes=(gsd-core/ scripts/)
     [ $# -le 2 ] || prefixes=("${@:3}")
     swap_prepare "$root" "$live"
@@ -737,12 +742,13 @@ pristine_prove() {
                     | [.key, .value] | @tsv' --args "${prefixes[@]}" < "$manifest")
     echo "manifest $(jq -r .version "$manifest"): $matched of $entries entries under ${prefixes[*]} match"
 
-    gate_out=$(bash "$GATE" --root "$root")
-    gate_rc=$?
-    printf '%s\n' "$gate_out"
-    echo "gate exit $gate_rc"
-    nmissing=$(printf '%s\n' "$gate_out" | grep -c '^missing ')
-    [ "$bad" -eq 0 ] && [ "$entries" -gt 0 ] && [ "$gate_rc" -eq 1 ] && [ "$nmissing" -eq 5 ] || {
+    [ -d "$root/gsd-core/workflows" ] || { echo "no workflows: $root/gsd-core/workflows"; return 1; }
+    while IFS= read -r -d '' path; do
+        marked=$((marked + 1))
+        echo "dsmr-local marker ${path#"$root"/}"
+    done < <(grep -rlZF -- 'dsmr-local' "$root/gsd-core/workflows")
+    echo "dsmr-local markers under gsd-core/workflows: $marked"
+    [ "$bad" -eq 0 ] && [ "$entries" -gt 0 ] && [ "$marked" -eq 0 ] || {
         echo "pristine check FAILED"
         return 1
     }
@@ -835,8 +841,8 @@ isolation_check() {
 }
 
 # install_pristine DIR: copy gsd-core, and the installer's scripts it loads,
-# into DIR/.claude; restore each patched target from its backup; print the
-# proof and return 1 if it does not hold.
+# into DIR/.claude; restore any file a .pre-* backup holds the installer's
+# bytes for; print the proof and return 1 if it does not hold.
 install_pristine() {
     local dir=$1 src=$CONFIG_HOME/gsd-core
     [ -d "$src" ] || die "gsd-core not installed under $CONFIG_HOME"
@@ -1030,11 +1036,6 @@ cmd_reads_outside() {
     [ "$breach" -eq 0 ]
 }
 
-# live_gate_present: the count of present lines the gate prints for the live config.
-live_gate_present() {
-    bash "$GATE" --root "$CONFIG_HOME" | grep -c '^present '
-}
-
 cmd_make_config() {
     [ $# -eq 1 ] || usage_error "make-config needs one DIR"
     case "$1" in -h|--help) usage; exit 0 ;; -*) usage_error "unknown option $1" ;; esac
@@ -1116,8 +1117,6 @@ cmd_make_config() {
     echo "live gsd-core tree: $(printf '%s\n' "$after" | wc -l) files, listing sha256 $(printf '%s\n' "$after" | sha256sum | cut -d' ' -f1) after"
     [ "$before" = "$after" ] || { echo "live gsd-core CHANGED"; return 1; }
     echo "live gsd-core identical before and after"
-    [ "$(live_gate_present)" -eq 5 ] || { echo "live gate no longer prints five present"; return 1; }
-    echo "live gate: five present"
     if [ -e "$dir/.credentials.json" ]; then
         echo "credentials already present in $dir (kept)"
     else
