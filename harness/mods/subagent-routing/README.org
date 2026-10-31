@@ -205,17 +205,22 @@ directory that holds them.
 
 * Differences from the patched gsd-core workflows
 
-The patches under =harness/patches/gsd-core= route the same roles by editing
-gsd-core's workflows, and have to be applied again after every gsd-core update.
-The mod reproduces their mapping, with these differences:
+Before the mod, this repository carried patches that routed the same roles by
+editing gsd-core's workflows, and they had to be applied again after every
+gsd-core update. I replaced them with the mod and removed them; git history
+still holds them. The mod reproduces their mapping, with these differences:
 
 - A plan's =agent_hint= can select only =shell-developer=, =gsd-executor=, or
   the project executor, each with an installed definition, where the patches
-  accept any installed agent. Plan frontmatter is written by a model, so I
+  accepted any installed agent. Plan frontmatter is written by a model, so I
   narrowed what it can select.
 - A =gsd-executor= spawn whose prompt names no plan, other than an audit-fix
-  finding, runs as requested, as it does under the patches, but here it is logged =cannot-decide= and raises a
-  toast.
+  finding, runs as requested, as it did under the patches, but here it is
+  logged =cannot-decide= and raises a toast.
+- The patches gave the routed executor the =agent_skills= configured for its
+  own type. The mod routes a prompt GSD built for =gsd-executor=, so the
+  executor it starts receives the =agent_skills= entries for =gsd-executor=,
+  not those for =lisp-developer= or =shell-developer=.
 - The per-call model of a =gsd-executor= spawn is cleared only in a project
   that sets =planning.agents.specialized= to true. I limited it to those
   projects so that every other project keeps the model its =model_profile= and
