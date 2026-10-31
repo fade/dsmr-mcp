@@ -116,7 +116,8 @@ checks below catch that, and the one way the shared GSD install silently stops r
 the Lisp executor. Both are read-only. Run them now, before Step 2.
 
 **(a) The subagent-routing mod.** gsd-core is installed unmodified; executor routing (shell plans to
-`shell-developer`, Lisp and unhinted plans to the project executor, specialists on their own model)
+`shell-developer`, Lisp and unhinted plans to the project executor where `planning.agents.specialized` is true,
+specialists on their own model)
 lives in the `subagent-routing` mod, source `harness/mods/subagent-routing/` in dsmr-mcp.
 
 ```bash
@@ -135,7 +136,7 @@ The jq half matches one whole entry of the colon-separated list, so a neighbouri
 
 - **both pass**: nothing to report.
 - **the jq test fails**: put `routing mod not enabled: CLAUDE_CODE_PLUGIN_DIRS has no ~/.claude/mods/subagent-routing entry`
-  in your FIRST reply. Plans with no `agent_hint` then go to the generic executor.
+  in your FIRST reply. Every executor dispatch then runs on the generic executor, hinted or not.
 - **a file test fails**: put `routing mod not installed: ~/.claude/mods/subagent-routing/hooks/{hooks.json,register.ts} missing`
   in your FIRST reply, naming whichever file is absent.
 - A gsd-core upgrade no longer drops routing, and there is nothing to re-apply after one. The mod

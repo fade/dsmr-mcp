@@ -54,7 +54,8 @@ third-party skill would fork an artifact whose own installer will later overwrit
   manifest. It is installed unmodified, so an upgrade has nothing of ours to drop. I moved
   executor routing out of its workflows and into the `subagent-routing` Claude Code mod at
   `harness/mods/subagent-routing/`, which sends shell plans to `shell-developer`, Lisp and
-  unhinted plans to the project executor, and runs each specialist on the model its definition
+  unhinted plans to the project executor in a project that sets `planning.agents.specialized`,
+  and runs each specialist on the model its definition
   names.
 - **`graphify`** is ours, and that is exactly why it is not here. We carry a substantial
   Common Lisp patch set on a fork at `SourceCode/python/graphify` (`origin` is the fork,

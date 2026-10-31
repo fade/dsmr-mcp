@@ -3,7 +3,7 @@
 //
 // Log: <config>/logs/subagent-routing/<session>.jsonl, one JSON line per spawn
 // and one `loaded` line per session start; a log near its size limit is moved
-// aside to <session>.jsonl.<n>, oldest first. When SUBAGENT_ROUTING_CAPTURE names
+// aside to <session>.jsonl.<n>, where .1 is the oldest. When SUBAGENT_ROUTING_CAPTURE names
 // a directory, each spawn's input, io tape and decision are also written there
 // as <tool_use_id>.json for replay.
 //

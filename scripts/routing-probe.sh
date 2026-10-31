@@ -36,6 +36,8 @@
 #       is undone, anything else byte for byte), no copied file still names the
 #       live root, every script a hook requires beneath DIR is present, and
 #       no file under DIR's gsd-core/workflows carries a dsmr-local marker.
+#       It also fails on a link under DIR and on a settings file that names
+#       the live root.
 #   reads-outside DIR TRANSCRIPT [--live LIVE]
 #       List what a session (and its subagents) touched outside DIR and the
 #       session's working directory: file tool paths, and every command,
@@ -113,7 +115,8 @@
 # Environment: ROUTING_PROBE_PATH_MAP=FROM=TO makes report read a plan file
 # under TO where the dispatch named one under FROM (recorded transcripts).
 #
-# Exit status: 0 success, 1 failure, 64 usage.
+# Exit status: 0 success, 1 failure, 3 over the cache-read cap (cap-check,
+# run-arm), 5 a tripwire fired during run, 64 usage.
 
 set -u
 

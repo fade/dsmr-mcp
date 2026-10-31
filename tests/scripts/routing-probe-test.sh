@@ -4,7 +4,7 @@
 # scripts/routing-probe.sh, run by `make test-routing-probe`. No session is
 # started and the live bus is never read.
 #
-# Fixtures come from one real probe session, copied unchanged from the config
+# Fixtures come from real probe sessions. The first is copied unchanged from the config
 # directory of the run that produced it (the first routing probe, session
 # 2e3819fe-8005-4816-8db0-c1d9671529bd, run through `routing-probe.sh run`):
 #   projects/<dir>/<session>.jsonl and its subagents directory

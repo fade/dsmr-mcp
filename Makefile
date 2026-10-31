@@ -306,7 +306,7 @@ test-restart-session:
 ##   Needs ROUTING_PROBE_RECORDED, the directory holding the recorded sessions
 ##   (without it the target stops with a usage line). Runs no live session and
 ##   never reads the live bus. Every planted mismatch is an edit of the recording
-##   and must make check exit 1.
+##   and must make `routing-probe.sh check` exit 1 (a cap case, exit 3).
 test-routing-probe:
 	@bash tests/scripts/routing-probe-test.sh
 
