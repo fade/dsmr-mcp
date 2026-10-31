@@ -1,0 +1,240 @@
+#+TITLE: subagent-routing
+#+SUBTITLE: A Claude Code mod that sets a subagent's agent type and model by role
+
+=subagent-routing= sets the agent type and model of GSD executor and
+specialist subagents, according to the role the work needs, and writes one log
+line for every spawn. I wrote it so that GSD plans reach the right executor
+without patches to gsd-core's workflows: shell work goes to =shell-developer=,
+Lisp work goes to the project's own executor, and each specialist runs on the
+model its agent definition names.
+
+The mod never refuses a spawn. When its rules cannot place one, the spawn runs
+exactly as requested and the log line says why, so a fault in the mod rarely
+costs you an agent (see Known limits). It needs Claude Code 2.1.287 or later;
+the measurements below were taken on 2.1.312.
+
+* Routing rules
+
+Only an ordinary subagent spawn is routed. A fork, a resumed agent, a workflow
+agent, and a teammate pass unchanged. For a =gsd-executor= spawn, the mod reads
+the project's GSD configuration (=config.json= in the project's planning
+directory) and the one plan the prompt names, then applies the first row that
+fits.
+
+| Requested type                                            | Condition                                                                                                                | Runs as              | Model                                                                                      |
+|-----------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------+----------------------+--------------------------------------------------------------------------------------------|
+| =gsd-executor=                                            | the plan carries =agent_hint: shell-developer=                                                                           | =shell-developer=    | its definition's                                                                           |
+| =gsd-executor=                                            | the plan's =agent_hint= names the project executor                                                                       | the project executor | its definition's                                                                           |
+| =gsd-executor=                                            | the plan carries no hint, =planning.agents.specialized= is true, and =planning.agents.executor= names an installed agent | the project executor | its definition's                                                                           |
+| =gsd-executor=                                            | the plan carries =agent_hint: gsd-executor=, or no hint and the row above does not apply                                 | =gsd-executor=       | in a specialized project, the model of the session that spawned it; elsewhere as requested |
+| =shell-developer=, =lisp-developer=, the project executor | always                                                                                                                   | as requested         | its definition's; a per-call model is cleared                                              |
+| any other type                                            | always                                                                                                                   | as requested         | as requested                                                                               |
+
+A prompt that opens with the words =Fix finding= and names no plan, as an
+audit-fix prompt does, takes the project executor under the same conditions as an
+unhinted plan. When the configuration sets =workflow.agent_hint_routing= to
+false, a =gsd-executor= spawn stays =gsd-executor=. The project executor is the
+agent =planning.agents.executor= names (=lisp-developer= in this repository).
+An agent counts as installed when its definition is in the =agents= folder of
+your Claude Code configuration directory or in the project's =.claude/agents=.
+
+** Spawns left as requested
+
+A =gsd-executor= spawn runs exactly as requested, logged =cannot-decide=, when:
+
+- the project has no readable GSD configuration;
+- the prompt names more than one plan, or names none and is not an audit-fix
+  finding;
+- the plan cannot be read, or its path starts with =~/= and no home directory
+  is set;
+- the hint is not an agent name, is not a type the table routes to, or names
+  an agent with no installed definition.
+
+Claude Code checks a spawn again after the mod has passed it on as another agent
+type, and a refusal at that point ends the spawn with no agent started. For that
+reason I made the mod change a spawn's type only when Claude Code has offered the
+target type in the current session and no =Agent(...)= or =Task(...)= rule under
+=permissions= in your settings names the target without also naming the
+requested type. A spawn requested from inside another subagent is never
+retyped. In each of these cases the spawn runs as requested, logged
+=cannot-decide=, and the reason ends with =not passed on as <type>: <why>=.
+
+When another mod's spawn hook refuses the changed spawn, the spawn runs once
+more as requested and is logged =fallback=. When that is refused too, no agent
+starts and the line reads =refused=. If the mod itself fails, the spawn still
+proceeds and the line reads =error=.
+
+The mod raises a toast for the first =cannot-decide=, =fallback=, =refused=,
+or =error= line of each kind in a session, and for a log it cannot write.
+
+* The spawn log
+
+The mod writes each session's log to
+=<config>/logs/subagent-routing/<session>.jsonl=, where =<config>= is
+=$CLAUDE_CONFIG_DIR=, or =~/.claude= when that is unset. Every line is one JSON
+object. At session start the mod writes a =loaded= line carrying =ts=,
+=session=, =event=, =version=, =root= (the folder the mod loaded from), and
+=claudeCode= (the Claude Code version). Every spawn writes a line with these
+fields:
+
+- =ts= :: when the line was written, as an ISO 8601 UTC timestamp
+- =session= :: the session id
+- =toolUseId= :: the id of the Agent call that asked for the spawn
+- =parentAgentId= :: the subagent that asked for it, or null for the session itself
+- =shape= :: the GSD command the prompt came from, as far as its text shows:
+  =execute-phase=, =quick=, =quick-batch=, =audit-fix=, or =other=
+- =plan= :: the absolute path of the plan the prompt names, or null
+- =requested= :: the =type= and =model= the spawn asked for
+- =set= :: the =type= and =model= passed on; a null model lets the agent
+  definition's own model apply
+- =resolvedModel= :: the model of the agent that started, or null when none did
+- =agentId= :: the id of the agent that started, or null
+- =action= :: one of the seven actions below
+- =reason= :: one sentence saying why
+- =version= :: the mod's version
+- =error= :: the error's =name= and =message=, on an =error= line only
+
+| Action          | Meaning                                                                          |
+|-----------------+----------------------------------------------------------------------------------|
+| =rewrote=       | the agent type changed, or a =gsd-executor= spawn lost its per-call model        |
+| =cleared-model= | a specialist kept its type and lost its per-call model                           |
+| =unchanged=     | passed on as requested, with nothing to change                                   |
+| =cannot-decide= | passed on as requested, because the rules could not place it                     |
+| =fallback=      | the changed spawn was refused, and the spawn ran as requested                    |
+| =refused=       | the changed spawn and the spawn as requested were both refused; no agent started |
+| =error=         | the mod failed, and the spawn proceeded                                          |
+
+A log about to pass 1,048,576 characters is moved aside to the first free name
+from =<session>.jsonl.1= to =<session>.jsonl.99=, and the new line starts a
+fresh log.
+
+* The status command
+
+Run =/subagent-routing= in a session to get one line: the mod's version, when it
+loaded, the path of the session's log, and this session's spawns counted by
+action.
+
+#+begin_example
+subagent-routing 0.4.0 loaded <time>; log <path>; this session: <n> spawns, <n> rewrote, <n> cleared-model, <n> unchanged, <n> cannot-decide, <n> fallback, <n> refused, <n> error
+#+end_example
+
+A reply of =Unknown command: /subagent-routing= means the mod is not loaded in
+that session.
+
+* Install
+
+Run these from the repository root. =make install-harness= copies every file
+under =harness/= into =~/.claude=, not only this mod, so read what
+=make check-harness= lists first.
+
+#+begin_src sh
+make check-harness      # lists files NOT DEPLOYED, or that DIFFER from the installed copy
+make install-harness
+cp -p ~/.claude/settings.json ~/.claude/settings.json.pre-subagent-routing-$(date +%F)
+#+end_src
+
+Then add one entry to the =env= block of =~/.claude/settings.json=, creating
+the block if it is absent. I used the absolute path:
+
+#+begin_src json
+"env": {
+  "CLAUDE_CODE_PLUGIN_DIRS": "/home/<you>/.claude/mods/subagent-routing"
+}
+#+end_src
+
+Claude Code reads =CLAUDE_CODE_PLUGIN_DIRS= from the process environment or
+from the =env= block of =~/.claude/settings.json=, never from a project's
+settings, and loads each path as it would a =--plugin-dir=. Check the folder
+with =claude plugin validate ~/.claude/mods/subagent-routing=; warnings about
+files a published plugin needs, such as a licence or an icon, do not apply
+here.
+
+To confirm the install, start a new process and read its reply:
+
+#+begin_src sh
+claude -p /subagent-routing
+#+end_src
+
+* Remove
+
+Delete the =CLAUDE_CODE_PLUGIN_DIRS= entry from the =env= block, or restore the
+backup copy of =settings.json= (which also discards any other change made to
+the file since). You may also delete =~/.claude/mods/subagent-routing=. Restart
+each session's process afterwards; I have not measured removal.
+
+* Restarting running sessions
+
+These results come from 2026-10-30, on Claude Code 2.1.312. A session whose
+process started before you added the =env= entry does not load the mod when
+you restart it in place with =scripts/restart-session-in-place.sh=, which types
+=/clear= and then a follow-up command into its terminal. With =/subagent-routing=
+as the follow-up, the reply was =Unknown command=; with =/reload-plugins= as the
+follow-up, a later =/subagent-routing= got the same reply. A new process
+loads the mod, so an install reaches a running session only when that
+session's process restarts. Plan on the same for an upgrade: I have not
+measured whether a session that already loaded the mod picks up a newer copy
+installed over it, so restart its process to be sure.
+
+* Capture and replay
+
+Set =SUBAGENT_ROUTING_CAPTURE= to a directory and each spawn is also written
+there as =<tool_use_id>.json=: the spawn's input, the files, settings, and
+offers its routing depended on, and the decision. These recordings hold the
+real prompts of your sessions, so keep the directory outside any repository.
+
+#+begin_src sh
+bash scripts/routing-probe.sh replay RECORDINGS_DIR [--mod MOD_DIR]
+bash scripts/routing-probe.sh record-history --out DIR TRANSCRIPT...
+bash scripts/routing-probe.sh report TRANSCRIPT
+#+end_src
+
+=replay= runs the mod's tests over every recording in =RECORDINGS_DIR=. I made
+it work on a temporary copy of the mod (this repository's, unless =--mod=
+names another) so that recordings never land in the mod's folder.
+=record-history= builds recordings from past session transcripts, and =report=
+prints one row per Agent call in a session: what was asked for, what ran, and
+what the mod logged. The "what ran" column comes from each subagent's own
+transcript and =meta.json=, because the mod logs a spawn before Claude Code's
+last check on it.
+
+The probe commands =make-config=, =make-repo=, =run=, and =run-arm= prepare and
+run headless sessions in a throwaway configuration directory; =bash
+scripts/routing-probe.sh --help= lists every command. =make test-routing-probe= checks the transcript
+readers against recorded sessions and needs =ROUTING_PROBE_RECORDED= set to the
+directory that holds them.
+
+* Differences from the patched gsd-core workflows
+
+Before the mod, this repository carried patches that routed the same roles by
+editing gsd-core's workflows, and they had to be applied again after every
+gsd-core update. I replaced them with the mod and removed them; git history
+still holds them. The mod reproduces their mapping, with these differences:
+
+- A plan's =agent_hint= can select only =shell-developer=, =gsd-executor=, or
+  the project executor, each with an installed definition, where the patches
+  accepted any installed agent. Plan frontmatter is written by a model, so I
+  narrowed what it can select.
+- A =gsd-executor= spawn whose prompt names no plan, other than an audit-fix
+  finding, runs as requested, as it did under the patches, but here it is
+  logged =cannot-decide= and raises a toast.
+- The patches gave the routed executor the =agent_skills= configured for its
+  own type. The mod routes a prompt GSD built for =gsd-executor=, so the
+  executor it starts receives the =agent_skills= entries for =gsd-executor=,
+  not those for =lisp-developer= or =shell-developer=.
+- The per-call model of a =gsd-executor= spawn is cleared only in a project
+  that sets =planning.agents.specialized= to true. I limited it to those
+  projects so that every other project keeps the model its =model_profile= and
+  =model_overrides= ask for.
+
+* Known limits
+
+- The mod keeps each agent type's latest offer for the rest of the session. If
+  a type stops being offered partway through (a plugin's agents unloaded, or a
+  deny rule added for that session only), or another mod's offer hook above
+  this one answers that the type is not offered, a spawn can still be retyped
+  to it. Claude Code then refuses the spawn, no retry recovers it, and the log
+  may still read =rewrote=, with no toast.
+- An =ask= or =allow= rule for an agent type given on the command line
+  (=--allowedTools=) or granted for one session only is not in the settings the
+  mod reads. Deny rules from every source are covered, because Claude Code drops
+  a denied type before offering it.

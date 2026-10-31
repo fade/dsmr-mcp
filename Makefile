@@ -25,7 +25,7 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 
 .PHONY: bridge bus-watch bus-host install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
-        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session
+        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -300,6 +300,15 @@ test-hooks:
 ##   restarts when nothing is wrong.
 test-restart-session:
 	@bash tests/scripts/restart-session-in-place-test.sh
+
+## test-routing-probe: check the routing probe readers against recorded sessions.
+##
+##   Needs ROUTING_PROBE_RECORDED, the directory holding the recorded sessions
+##   (without it the target stops with a usage line). Runs no live session and
+##   never reads the live bus. Every planted mismatch is an edit of the recording
+##   and must make `routing-probe.sh check` exit 1 (a cap case, exit 3).
+test-routing-probe:
+	@bash tests/scripts/routing-probe-test.sh
 
 ## check-hooks: report where a deployed hook differs from this tree.
 ##

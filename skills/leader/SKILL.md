@@ -113,22 +113,35 @@ describing.
 
 **A repo can stop running through GSD for days with every record still reading as current.** The two
 checks below catch that, and the one way the shared GSD install silently stops routing Lisp work to
-the Lisp executor. Both are read-only unless you pass `--apply`. Run them now, before Step 2.
+the Lisp executor. Both are read-only. Run them now, before Step 2.
 
-**(a) The Lisp routing patch.**
+**(a) The subagent-routing mod.** gsd-core is installed unmodified; executor routing (shell plans to
+`shell-developer`, Lisp and unhinted plans to the project executor where `planning.agents.specialized` is true,
+specialists on their own model)
+lives in the `subagent-routing` mod, source `harness/mods/subagent-routing/` in dsmr-mcp.
 
 ```bash
-bash ~/.claude/scripts/gsd-routing-gate.sh
+jq -e --arg want "$HOME/.claude/mods/subagent-routing" \
+  '(.["env"]["CLAUDE_CODE_PLUGIN_DIRS"] // "") | split(":") | map(sub("^\\s+"; "") | sub("/?\\s*$"; ""))
+   | any(. == $want or . == "~/.claude/mods/subagent-routing")' ~/.claude/settings.json \
+  && test -f ~/.claude/mods/subagent-routing/hooks/hooks.json \
+  && test -f ~/.claude/mods/subagent-routing/hooks/register.ts
 ```
 
-- **exit 0** `Lisp routing patch present`: nothing to report.
-- **exit 1** `Lisp routing patch missing`: put that line in your FIRST reply. A gsd-core update is the
-  usual cause: it replaces the routing step and drops the patch, so plans with no `agent_hint` go to
-  the generic executor. Re-apply with `bash ~/.claude/scripts/gsd-routing-gate.sh --apply` **only when
-  no GSD executor is running on EITHER fleet**: the install is shared by both, and a step rewritten
-  under a live orchestrator is a step it may read half-written. If `--apply` refuses (a hunk no longer
-  fits), report its output; never hand-edit the step.
-- **exit 2** `gsd-core absent`: gsd-core is not installed on this host. Report it.
+The jq half matches one whole entry of the colon-separated list, so a neighbouring folder
+(`subagent-routing.disabled`, the repo's `harness/mods/` copy) does not pass for the installed one.
+
+(The bracket form of the jq path is deliberate: the secret-read guard refuses a command containing
+`.env.` followed by a name.)
+
+- **both pass**: nothing to report.
+- **the jq test fails**: put `routing mod not enabled: CLAUDE_CODE_PLUGIN_DIRS has no ~/.claude/mods/subagent-routing entry`
+  in your FIRST reply. Every executor dispatch then runs on the generic executor, hinted or not.
+- **a file test fails**: put `routing mod not installed: ~/.claude/mods/subagent-routing/hooks/{hooks.json,register.ts} missing`
+  in your FIRST reply, naming whichever file is absent.
+- A gsd-core upgrade no longer drops routing, and there is nothing to re-apply after one. The mod
+  loads only at process start: a session started before the setting was added runs without it
+  until restarted (`/clear` and `/reload-plugins` do not load it).
 
 **(b) Off-process drift.**
 
@@ -702,8 +715,8 @@ yourself. Surface store drift to the operator only when it is not clean.
 Report to the operator, in this order and nothing else:
 
 1. **Phase N**, the cursor, and the single next action. Beside Phase N, every `OFF-PROCESS` commit
-   from the drift check (sha and subject) and `Lisp routing patch missing` when the gate printed it
-   (Step 1, *Is this repo running through GSD?*).
+   from the drift check (sha and subject) and the `routing mod not enabled` or `routing mod not
+   installed` line when check (a) failed (Step 1, *Is this repo running through GSD?*).
 2. The roster table — one line per repo, OK / MISMATCH / unresolved.
 3. **Blocked list**, consolidated, with exact grants, and **every deaf sister**: run the reader
    check (`--check-live`, Step 4) for every sister at EVERY reply, not only at bring-up, and list
