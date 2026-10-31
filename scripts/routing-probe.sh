@@ -39,10 +39,14 @@
 #   reads-outside DIR TRANSCRIPT [--live LIVE]
 #       List what a session (and its subagents) touched outside DIR and the
 #       session's working directory: file tool paths, and every command,
-#       tool input, tool result, user message, loaded instruction file and
-#       hook run that names the live config root LIVE (default $HOME/.claude,
-#       whatever CLAUDE_CONFIG_DIR says) in any spelling. Exit 1 when anything
-#       lies under or names LIVE, or when a transcript does not parse.
+#       tool input, tool result, user message, and every string of every other
+#       record (system records, request blobs, attachments of any type) that
+#       names the live config root LIVE (default $HOME/.claude, whatever
+#       CLAUDE_CONFIG_DIR says) in any spelling. The built-in keybindings
+#       skill describes ~/.claude/keybindings.json in every session's request
+#       blobs and skill listing; that one phrase, "or modify
+#       ~/.claude/keybindings.json", is exempt. Exit 1 when anything lies
+#       under or names LIVE, or when a transcript does not parse.
 #   tree-hash DIR
 #       Print a sorted SHA-256 listing of every file under DIR.
 #   describe SHAPE
@@ -60,7 +64,8 @@
 #       first; the HOME and PATH given are printed on stderr. A REPO with a
 #       directory above it, by its logical or its physical path, whose .claude
 #       is the live root is refused, since Claude Code loads instructions from
-#       there, as is a --plugin-dir under the live root.
+#       there, as is a --plugin-dir under the live root, and a DIR that fails
+#       the check-config isolation check (its findings are printed).
 #       Every session, with or without --config-dir, gets XDG_CACHE_HOME=REPO.cache
 #       (beside REPO), so the session-start hook keeps the planning directory
 #       make-repo linked; the session also writes Claude Code's own cache files
@@ -937,11 +942,14 @@ path_under() {
 # subagents touched outside DIR and the session's cwd, one channel and value
 # per line. Paths come from Read, Grep, Glob, Edit, Write, MultiEdit and
 # NotebookEdit calls; text from every other tool call's input, tool results,
-# user messages and the paths, commands and output of attachments (loaded
-# instructions, hooks) is searched for LIVE in any spelling (live_text_re).
-# LIVE defaults to $HOME/.claude, whatever CLAUDE_CONFIG_DIR says. Exit 1
-# when anything names or lies under LIVE, or when a transcript cannot be
-# parsed.
+# user messages and every string of every other record (attachments of any
+# type, system records, request blobs, queue operations) is searched for LIVE
+# in any spelling (live_text_re), on a channel named for the record or
+# attachment type. The one phrase "or modify ~/.claude/keybindings.json" is
+# removed first: the built-in keybindings skill describes that file in every
+# session's skill listing and request blobs. LIVE defaults to $HOME/.claude,
+# whatever CLAUDE_CONFIG_DIR says. Exit 1 when anything names or lies under
+# LIVE, or when a transcript cannot be parsed.
 cmd_reads_outside() {
     local -
     set -o pipefail
@@ -972,7 +980,8 @@ cmd_reads_outside() {
     for f in "${files[@]}"; do
         # shellcheck disable=SC2016 # jq program
         out=$(jq -r --arg re "$re" '
-            def hit($ch): select(type == "string" and test($re))
+            def builtin: gsub("or modify ~/\\.claude/keybindings\\.json"; "");
+            def hit($ch): select(type == "string") | builtin | select(test($re))
                 | match($re) as $m
                 | [ "hit", $ch, (.[([$m.offset - 40, 0] | max):($m.offset + $m.length + 40)] | gsub("[\t\n\r]"; " ")) ];
             def pathrow($tool): select(type == "string" and . != "")
@@ -994,11 +1003,8 @@ cmd_reads_outside() {
                   end
             elif .type == "attachment" then
                 (.attachment.type // "-") as $at
-                | .attachment | .. | objects | to_entries[]
-                | select(.key == "path" or .key == "filePath" or .key == "file_path"
-                         or .key == "command" or .key == "stdout" or .key == "stderr")
-                | .value | hit("attachment:" + $at)
-            else empty end
+                | .attachment | .. | hit("attachment:" + $at)
+            else (.type // "-") as $t | .. | hit($t) end
             | @tsv' "$f" 2>&1) || die "cannot parse $f: $out"
         rows+=$out$'\n'
     done
@@ -1314,7 +1320,7 @@ cmd_run() {
     # A probe is its own session: nothing of the calling session, the
     # coordination bus or a mod list reaches it except what the flags give.
     collect_unsets
-    local set_args=("${extra[@]}") live cache child_home ident
+    local set_args=("${extra[@]}") live cache child_home ident iso
     cache=$(probe_cache "$repo") || die "cannot resolve the cache directory of $repo"
     [ -z "$capture" ] || set_args+=("SUBAGENT_ROUTING_CAPTURE=$capture")
     set_args+=("XDG_CACHE_HOME=$cache")
@@ -1323,6 +1329,7 @@ cmd_run() {
         if [ -n "$plugin" ] && path_under "$plugin" "$live"; then
             die "refusing --plugin-dir $plugin: it lies under the live config root $live; pass the repository's copy"
         fi
+        iso=$(isolation_check "$config" "$live") || { printf '%s\n' "$iso" >&2; die "refusing --config-dir $config: isolation check failed"; }
         [ -n "$home" ] || home=$(dirname -- "$repo")/home/$sid
         home=$(realpath -m -- "$home")
         child_home=$home

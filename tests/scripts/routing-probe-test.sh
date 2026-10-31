@@ -849,6 +849,62 @@ cp "$CLEAN_T" "$EMPTY_T"
 out=$(ro_probe "$RO_CFG" "$EMPTY_T" 2>&1); rc=$?
 if [ "$rc" -ne 0 ] && grep -q 'no subagent transcripts' <<<"$out"; then ok reads-outside-empty-subagents-fails; else bad reads-outside-empty-subagents-fails "rc=$rc: $out"; fi
 
+# Every record is searched, not only tool calls and a few attachment keys.
+# Each record below is copied from a real recording and moved under RO_HOME
+# with the same substitutions as RO_T: the tracer's stop-hook summary and its
+# prompt snapshot (a live session in the live config), and two request blobs
+# from the control session. The built-in keybindings skill describes
+# ~/.claude/keybindings.json in every session's request blobs and skill
+# listing; that one phrase is exempt, nothing else is.
+TRACER_HOME=$(jq -rn 'first(inputs | select(.cwd != null) | .cwd)' "$PARENT")
+TRACER_HOME=${TRACER_HOME%%/.cache/*}
+move_record() {
+    REC_HOME=$TRACER_HOME RO_CFG=$RO_CFG RO_LIVE=$RO_LIVE RO_HOME=$RO_HOME perl -pe '
+        s{\Q$ENV{REC_HOME}\E/\.cache/dsmr-routing-probes/config}{$ENV{RO_CFG}}g;
+        s{\Q$ENV{REC_HOME}\E/\.claude}{$ENV{RO_LIVE}}g;
+        s{\Q$ENV{REC_HOME}\E}{$ENV{RO_HOME}}g'
+}
+SYSTEM_REC=$(jq -c 'select(.type == "system" and .subtype == "stop_hook_summary")' "$PARENT" | head -n 1 | move_record)
+SNAPSHOT_REC=$(jq -c 'select(.attachment.type? == "prompt_snapshot")' "$PARENT" | head -n 1 | move_record)
+PHRASE='or modify ~/.claude/keybindings.json'
+# shellcheck disable=SC2016 # jq program
+BLOB_REC=$(jq -c --arg l "$RO_LIVE" 'select(.type == "api-request-blob" and (tostring | contains($l + "/CLAUDE.md")))' "$RO_T" | head -n 1)
+# shellcheck disable=SC2016 # jq program
+PHRASE_REC=$(jq -c --arg p "$PHRASE" --arg l "$RO_LIVE" 'select(.type == "api-request-blob" and (tostring | contains($p))
+        and ((tostring | gsub($p; "") | contains($l) or contains("~/.claude") or contains("$HOME/.claude")) | not))' "$RO_T" | head -n 1)
+
+# ro_planted NAME RECORD: a copy of the clean base with RECORD appended.
+ro_planted() {
+    mkdir -p "$WORK/plant-$1"
+    cp "$CLEAN_T" "$WORK/plant-$1/"
+    printf '%s\n' "$2" >> "$WORK/plant-$1/${CLEAN_T##*/}"
+    ro_probe "$RO_CFG" "$WORK/plant-$1/${CLEAN_T##*/}" 2>&1
+}
+
+for spec in "flags-system-record|system|$SYSTEM_REC" "flags-request-blob|api-request-blob|$BLOB_REC" \
+        "flags-attachment-content|attachment:prompt_snapshot|$SNAPSHOT_REC"; do
+    IFS='|' read -r name channel record <<<"$spec"
+    if [ -z "$record" ]; then bad "reads-outside-$name" "no recorded $channel record names the live root"; continue; fi
+    out=$(ro_planted "$name" "$record"); rc=$?
+    if [ "$rc" -eq 1 ] && grep -q "^$channel$(printf '\t')" <<<"$out"; then
+        ok "reads-outside-$name"
+    else
+        bad "reads-outside-$name" "rc=$rc: $(head -n 3 <<<"$out" | cut -c1-200)"
+    fi
+done
+
+# Control: the request blob whose only root name is the built-in phrase passes.
+if [ -z "$PHRASE_REC" ]; then
+    bad reads-outside-builtin-keybindings-control "no recorded request blob holds only the keybindings phrase"
+else
+    out=$(ro_planted keybindings-control "$PHRASE_REC"); rc=$?
+    if [ "$rc" -eq 0 ] && [ -z "$out" ] && grep -qF "$PHRASE" <<<"$PHRASE_REC"; then
+        ok reads-outside-builtin-keybindings-control
+    else
+        bad reads-outside-builtin-keybindings-control "rc=$rc: $(head -n 3 <<<"$out" | cut -c1-200)"
+    fi
+fi
+
 printf '\ntree-hash\n'
 
 mkdir -p "$WORK/tree/sub"
@@ -1127,6 +1183,22 @@ if [ "$rc" -ne 0 ] && grep -q "lies under $RH, whose .claude is the live config 
 else
     bad run-refuses-repo-linked-under-live-home "rc=$rc env=$([ -e "$WORK/run-env.txt" ] && echo ran || echo absent): $(tail -n 3 <<<"$out")"
 fi
+
+# A config directory that fails the isolation check is refused before a home
+# exists or claude starts: here its state file starts the live alive-lsp server.
+jq -n --arg r "$RH/.claude" '{mcpServers: {"alive-lsp": {command: "node",
+    args: [($r + "/tools/lsp-mcp/node_modules/lsp-mcp-server/dist/index.js"), "common-lisp", ($r + "/scripts/alive-lsp-stdio.js")]}}}' \
+    > "$RCFG/.claude.json"
+rm -f "$WORK/run-env.txt"
+UNISO_SID=66666666-2222-4333-8444-555555555555
+out=$(run_probe "$UNISO_SID" "$RREPO" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && grep -qF 'settings reference .claude.json .mcpServers.alive-lsp.args[0]' <<<"$out" \
+        && [ ! -e "$WORK/run-env.txt" ] && [ ! -e "$WORK/run-scratch/quick/home/$UNISO_SID" ]; then
+    ok run-refuses-unisolated-config
+else
+    bad run-refuses-unisolated-config "rc=$rc env=$([ -e "$WORK/run-env.txt" ] && echo ran || echo absent): $(tail -n 3 <<<"$out")"
+fi
+rm -f "$RCFG/.claude.json"
 
 printf '\nrun-arm orchestrator model\n'
 
