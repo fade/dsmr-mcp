@@ -120,18 +120,24 @@ the Lisp executor. Both are read-only. Run them now, before Step 2.
 lives in the `subagent-routing` mod, source `harness/mods/subagent-routing/` in dsmr-mcp.
 
 ```bash
-jq -e '.["env"]["CLAUDE_CODE_PLUGIN_DIRS"] // "" | test("mods/subagent-routing")' ~/.claude/settings.json \
+jq -e --arg want "$HOME/.claude/mods/subagent-routing" \
+  '(.["env"]["CLAUDE_CODE_PLUGIN_DIRS"] // "") | split(":") | map(sub("^\\s+"; "") | sub("/?\\s*$"; ""))
+   | any(. == $want or . == "~/.claude/mods/subagent-routing")' ~/.claude/settings.json \
+  && test -f ~/.claude/mods/subagent-routing/hooks/hooks.json \
   && test -f ~/.claude/mods/subagent-routing/hooks/register.ts
 ```
+
+The jq half matches one whole entry of the colon-separated list, so a neighbouring folder
+(`subagent-routing.disabled`, the repo's `harness/mods/` copy) does not pass for the installed one.
 
 (The bracket form of the jq path is deliberate: the secret-read guard refuses a command containing
 `.env.` followed by a name.)
 
 - **both pass**: nothing to report.
-- **the jq test fails**: put `routing mod not enabled: CLAUDE_CODE_PLUGIN_DIRS lacks mods/subagent-routing`
+- **the jq test fails**: put `routing mod not enabled: CLAUDE_CODE_PLUGIN_DIRS has no ~/.claude/mods/subagent-routing entry`
   in your FIRST reply. Plans with no `agent_hint` then go to the generic executor.
-- **the file test fails**: put `routing mod not installed: ~/.claude/mods/subagent-routing/hooks/register.ts missing`
-  in your FIRST reply.
+- **a file test fails**: put `routing mod not installed: ~/.claude/mods/subagent-routing/hooks/{hooks.json,register.ts} missing`
+  in your FIRST reply, naming whichever file is absent.
 - A gsd-core upgrade no longer drops routing, and there is nothing to re-apply after one. The mod
   loads only at process start: a session started before the setting was added runs without it
   until restarted (`/clear` and `/reload-plugins` do not load it).
