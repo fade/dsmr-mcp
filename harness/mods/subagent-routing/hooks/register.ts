@@ -7,17 +7,20 @@
 // a directory, each spawn's input, io tape and decision are also written there
 // as <tool_use_id>.json for replay.
 //
-// The spawn hook never denies. A spawn the rules cannot place, or one whose
-// hook fails, proceeds exactly as requested. A spawn is passed on as another
-// agent type only when the engine last offered that type in this session and
-// no Agent permission rule names it: the engine checks a retyped spawn after
-// the agent.spawn chain has handed it over, and a refusal there cannot be
-// recovered inside the chain. A changed spawn a hook beneath refuses runs once
-// more as requested (action `fallback`); when that is refused too, no agent
-// starts (action `refused`). The log line says why, and the first such spawn
-// of each kind in a session raises a toast.
+// The spawn hook denies only a spawn decide() refuses: a gsd-executor spawn
+// the rules cannot place, in a project whose config sets
+// planning.agents.specialized true. A refused spawn stays refused when the
+// hook fails afterwards. Any other spawn the rules cannot place, and one whose
+// hook fails before a refusal, proceeds exactly as requested. A spawn is passed
+// on as another agent type only when the engine last offered that type in
+// this session and no Agent permission rule names it: the engine checks a
+// retyped spawn after the agent.spawn chain has handed it over, and a refusal
+// there cannot be recovered inside the chain. A changed spawn a hook beneath
+// refuses runs once more as requested (action `fallback`); when that is
+// refused too, no agent starts (action `refused`). The log line says why, and
+// the first such spawn of each kind in a session raises a toast.
 
-import type { EngineInterface, Register } from 'claude-code'
+import type { AgentSpawnInput, AgentSpawnResult, EngineInterface, HookFailure, Register } from 'claude-code'
 import { decide, ioDirs, permissionRuleAgainst, type Action, type Decision, type RouteIo } from './route'
 
 const VERSION = '0.4.0'
@@ -39,9 +42,12 @@ const MODULE_LOADED_AT = new Date().toISOString()
 
 /**
  * - `fallback`: the changed spawn was refused, and it ran as requested.
- * - `refused`: the changed spawn and the spawn as requested were both refused; no agent started.
+ * - `refused` (from Action): no agent started; decide() refused the spawn, or
+ *   the changed spawn and the spawn as requested were both refused.
  */
-type LogAction = Action | 'fallback' | 'refused' | 'error'
+type LogAction = Action | 'fallback' | 'error'
+/** Opening of the Agent tool error for a spawn decide() refuses. */
+const REFUSAL = 'subagent-routing refused this gsd-executor spawn: '
 type Agent = { type: string; model: string | null }
 
 /** One engine call the decision depended on, with what it answered. */
@@ -83,6 +89,10 @@ let logChain: Promise<void> = Promise.resolve()
 
 // What each in-flight spawn was passed down as, for the failure handler.
 const passedDown = new Map<string, Agent>()
+
+// Each in-flight spawn decide() refused, for the failure handler: the deny,
+// the decision, and whether its log line was written.
+const refusals = new Map<string, { deny: string; decision: Decision; logged: boolean }>()
 
 // Toasts already raised, keyed by session and kind, so a log that cannot be
 // read or written does not repeat them.
@@ -242,9 +252,10 @@ function tapedIo($: EngineInterface, dirs: Pick<RouteIo, 'configDir' | 'projectD
 /**
  * Writes `line` to the session's log. Raises a toast, once per session each,
  * when the line could not be written, and when its action is loud and no
- * earlier line or toast of the session had that action.
+ * earlier line or toast of the session had that action. `refusedHere` marks a
+ * spawn decide() refused, which no hook beneath saw.
  */
-async function record($: EngineInterface, configDir: string, line: SpawnLogLine): Promise<void> {
+async function record($: EngineInterface, configDir: string, line: SpawnLogLine, refusedHere = false): Promise<void> {
   if (!SAFE_NAME.test(line.session)) return
   const path = logPath(configDir, line.session)
   const appended = await appendLine($, path, line)
@@ -265,7 +276,9 @@ async function record($: EngineInterface, configDir: string, line: SpawnLogLine)
   const what =
     line.action === 'fallback'
       ? 'ran a spawn as requested after its change was refused'
-      : line.action === 'refused'
+      : refusedHere
+        ? 'refused a gsd-executor spawn it could not place'
+        : line.action === 'refused'
         ? 'started no agent: a changed spawn and the spawn as requested were both refused'
         : asRequested
         ? 'left a spawn as requested'
@@ -285,6 +298,48 @@ export function statusText(path: string, text: string): string {
     `this session: ${spawns.length} spawns, ${rewrote} rewrote, ${cleared} cleared-model, ` +
     `${unchanged} unchanged, ${undecided} cannot-decide, ${fellBack} fallback, ${refusedBoth} refused, ${failed} error`
   )
+}
+
+/**
+ * Writes the refused line for a spawn whose hook failed after decide() refused
+ * it, with the failure attached. Never rejects.
+ */
+async function recordFailedRefusal(
+  $: EngineInterface,
+  e: AgentSpawnInput,
+  decision: Decision,
+  failure: HookFailure,
+): Promise<void> {
+  try {
+    const { config, home } = await configDirOf($, [])
+    const { configDir } = ioDirs(config, home, e.cwd ?? (await $.session.cwd()))
+    const name = failure.kind
+    const message = clip(failure.message ?? '')
+    const requested = { type: e.subagentType, model: e.model ?? null }
+    await record(
+      $,
+      configDir,
+      {
+        ts: new Date().toISOString(),
+        session: await $.session.id(),
+        toolUseId: e.tool_use_id,
+        parentAgentId: e.parentAgentId ?? null,
+        shape: decision.shape,
+        plan: decision.planPath,
+        requested,
+        set: requested,
+        resolvedModel: null,
+        agentId: null,
+        action: 'refused',
+        reason: `${decision.reason}; the routing hook then failed (${name}${message === '' ? '' : `: ${message}`})`,
+        version: VERSION,
+        error: { name, message },
+      },
+      true,
+    )
+  } catch {
+    // The refusal stands whether or not the line was written.
+  }
 }
 
 export const register: Register = on => {
@@ -383,15 +438,24 @@ export const register: Register = on => {
       }
     }
 
-    const changes = decision.action === 'rewrote' || decision.action === 'cleared-model'
-    const down = changes ? { ...e, subagentType: decision.subagentType, model: decision.model } : e
-    passedDown.set(e.tool_use_id, { type: down.subagentType, model: down.model ?? null })
-    let result = await next(down)
+    // The mod's own refusal is answered without next: a deny this hook
+    // returns after next has answered fails the hook.
+    const refusedHere = decision.action === 'refused'
+    let result: AgentSpawnResult
     let refused: string | undefined
-    if (changes && result.deny !== undefined) {
-      refused = result.deny
-      passedDown.set(e.tool_use_id, { type: e.subagentType, model: e.model ?? null })
-      result = await next(e)
+    if (refusedHere) {
+      result = { deny: `${REFUSAL}${decision.reason}` }
+      refusals.set(e.tool_use_id, { deny: result.deny, decision, logged: false })
+    } else {
+      const changes = decision.action === 'rewrote' || decision.action === 'cleared-model'
+      const down = changes ? { ...e, subagentType: decision.subagentType, model: decision.model } : e
+      passedDown.set(e.tool_use_id, { type: down.subagentType, model: down.model ?? null })
+      result = await next(down)
+      if (changes && result.deny !== undefined) {
+        refused = result.deny
+        passedDown.set(e.tool_use_id, { type: e.subagentType, model: e.model ?? null })
+        result = await next(e)
+      }
     }
     const set: Agent =
       refused === undefined
@@ -429,7 +493,9 @@ export const register: Register = on => {
       version: VERSION,
       ...(failure === undefined ? {} : { error: failure }),
     }
-    await record($, dirs.configDir, line)
+    await record($, dirs.configDir, line, refusedHere)
+    const refusal = refusals.get(e.tool_use_id)
+    if (refusal !== undefined) refusal.logged = true
     passedDown.delete(e.tool_use_id)
 
     if (capture !== undefined && capture !== '' && SAFE_NAME.test(e.tool_use_id)) {
@@ -451,8 +517,16 @@ export const register: Register = on => {
         .catch(() => undefined)
     }
 
+    refusals.delete(e.tool_use_id)
     return result
   }).catch(async ($, e, next) => {
+    // A spawn decide() refused stays refused: next was never called for it.
+    const refusal = refusals.get(e.tool_use_id)
+    if (refusal !== undefined && !next.called) {
+      refusals.delete(e.tool_use_id)
+      if (!refusal.logged) await recordFailedRefusal($, e, refusal.decision, next.error)
+      return { deny: refusal.deny }
+    }
     // next(e) replays the spawn the hook already passed on, or runs it as
     // requested when the hook failed before passing it on.
     const result = await next(e)
