@@ -23,7 +23,7 @@
 import type { AgentSpawnInput, AgentSpawnResult, EngineInterface, HookFailure, Register } from 'claude-code'
 import { decide, ioDirs, permissionRuleAgainst, type Action, type Decision, type RouteIo } from './route'
 
-const VERSION = '0.4.0'
+const VERSION = '0.5.0'
 const LOG_DIR = 'logs/subagent-routing'
 const SAFE_NAME = /^[A-Za-z0-9_-]+$/
 const ERROR_TEXT_LIMIT = 200
