@@ -72,6 +72,15 @@ const LISP_DEVELOPER = 'lisp-developer'
 const AGENT_NAME = /^[a-z0-9][a-z0-9-]*$/
 // A dispatch prompt's plan line: "- <path>-PLAN.md (Plan)", or "(Plan, authoritative)" and kin.
 const PLAN_LINE = /^[ \t]*- (\S+-PLAN\.md)[ \t]+\(Plan/gm
+// An absolute plan path anywhere, with one leading slash and no glob or
+// expansion character. Before it: the text's start, whitespace, a parenthesis,
+// an angle bracket, or an opening quote or backtick (one that itself follows
+// the start, whitespace, a parenthesis, or an angle bracket, so a closing quote
+// after a variable does not count). After -PLAN.md: the end, whitespace, a
+// quote, a backtick, a parenthesis, an angle bracket, or one of `.,:;!?` that
+// is followed by one of those.
+const ABSOLUTE_PLAN =
+  /(?<=^|[\s()<>]|(?:^|[\s()<>])[`'"])(\/(?!\/)[^\s`'"()<>*?[\]{}$]*-PLAN\.md)(?=$|[\s`'"()<>]|[.,:;!?](?:$|[\s`'"()<>]))/g
 // execute-phase writes plan paths under the repository root it names PROJECT_ROOT.
 const PROJECT_ROOT_REF = /^(\$\{PROJECT_ROOT\}|\$PROJECT_ROOT)\//
 const PROJECT_ROOT_SET = /^[ \t]*PROJECT_ROOT=['"]?(\/[^'"\s]*)['"]?[ \t]*$/m
@@ -110,6 +119,26 @@ export function planPaths(prompt: string): string[] {
 }
 
 /**
+ * Distinct absolute paths ending in -PLAN.md anywhere in `prompt`, normalized,
+ * in order of first appearance. None of these is one:
+ * - a relative, tilde, `${PROJECT_ROOT}`, or glob path;
+ * - a path that follows a variable or a closing quote;
+ * - a name that runs on past -PLAN.md.
+ */
+export function absolutePlanPaths(prompt: string): string[] {
+  const seen = new Set<string>()
+  for (const m of prompt.matchAll(ABSOLUTE_PLAN)) {
+    if (m[1] !== undefined) seen.add(normalizePath(m[1]))
+  }
+  return [...seen]
+}
+
+/** `path` with each `//` and `/./` collapsed to one slash. */
+export function normalizePath(path: string): string {
+  return path.replace(/\/(?:\.?\/)+/g, '/')
+}
+
+/**
  * Dispatch shape of `prompt`, given the first plan path it names (as written).
  */
 export function dispatchShape(prompt: string, plan: string | null): Shape {
@@ -122,9 +151,10 @@ export function dispatchShape(prompt: string, plan: string | null): Shape {
 }
 
 /**
- * Absolute form of `path`, or null when it starts with a tilde and no home is
- * known. A leading `${PROJECT_ROOT}/` takes the absolute value `prompt`
- * assigns to PROJECT_ROOT on a line of its own, else the project directory.
+ * Absolute, normalized form of `path`, or null when it starts with a tilde and
+ * no home is known. A leading `${PROJECT_ROOT}/` takes the absolute value
+ * `prompt` assigns to PROJECT_ROOT on a line of its own, else the project
+ * directory.
  */
 export function resolvePath(
   path: string,
@@ -135,9 +165,9 @@ export function resolvePath(
     const root = trimSlash(PROJECT_ROOT_SET.exec(prompt)?.[1] ?? io.projectDir)
     path = path.replace(PROJECT_ROOT_REF, `${root}/`)
   }
-  if (path.startsWith('/')) return path
-  if (path.startsWith('~/')) return io.homeDir === '' ? null : `${io.homeDir}${path.slice(1)}`
-  return `${io.projectDir}/${path.replace(/^(\.\/)+/, '')}`
+  if (path.startsWith('/')) return normalizePath(path)
+  if (path.startsWith('~/')) return io.homeDir === '' ? null : normalizePath(`${io.homeDir}${path.slice(1)}`)
+  return normalizePath(`${io.projectDir}/${path.replace(/^(\.\/)+/, '')}`)
 }
 
 /**
@@ -261,9 +291,12 @@ async function hasDefinition(name: string, io: RouteIo): Promise<boolean> {
  * 2. gsd-executor: with no readable project config it is `cannot-decide`;
  *    with `workflow.agent_hint_routing` false it stays
  *    gsd-executor. Otherwise the prompt must name exactly one
- *    readable plan: its `agent_hint`, when it is shell-developer, gsd-executor
- *    or the project executor and has an installed definition, becomes the
- *    agent type, model cleared; with no hint the project default applies. A
+ *    readable plan, on one or more plan lines (`- <path>-PLAN.md (Plan`)
+ *    naming the same path, or, with no plan line and no audit-fix opening,
+ *    as a single distinct absolute path ending in -PLAN.md anywhere. Its
+ *    `agent_hint`, when it is shell-developer, gsd-executor or the project
+ *    executor and has an installed definition, becomes the agent type, model
+ *    cleared; with no hint the project default applies. A
  *    prompt opening "Fix finding " with no plan takes the project default too.
  *    The project default is `planning.agents.executor` when
  *    `planning.agents.specialized` is true and that agent is installed, else
@@ -281,8 +314,8 @@ export function decide(input: SpawnFacts, io: RouteIo): Promise<Decision> {
 
 async function route(input: SpawnFacts, io: RouteIo): Promise<Decision> {
   const kind = spawnKind(input)
-  const named = planPaths(input.prompt)
-  const shape = dispatchShape(input.prompt, named[0] ?? null)
+  let named = planPaths(input.prompt)
+  let shape = dispatchShape(input.prompt, named[0] ?? null)
   const asRequested = (action: Action, reason: string, planPath: string | null = null): Decision => ({
     action,
     subagentType: input.subagentType,
@@ -337,7 +370,18 @@ async function route(input: SpawnFacts, io: RouteIo): Promise<Decision> {
       if (input.prompt.trimStart().startsWith(AUDIT_FIX_OPENING)) {
         return projectDefault('an audit-fix finding names no plan', null)
       }
-      return asRequested('cannot-decide', 'the prompt names no plan and is not an audit-fix finding')
+      const absolute = absolutePlanPaths(input.prompt)
+      if (absolute.length > 1) {
+        return asRequested(
+          'cannot-decide',
+          `the prompt names ${absolute.length} absolute plan paths and none on a plan line`,
+        )
+      }
+      if (absolute.length === 0) {
+        return asRequested('cannot-decide', 'the prompt names no plan and is not an audit-fix finding')
+      }
+      named = absolute
+      shape = dispatchShape(input.prompt, named[0] ?? null)
     }
 
     const planPath = resolvePath(named[0] ?? '', io, input.prompt)
