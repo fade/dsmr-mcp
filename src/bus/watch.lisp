@@ -801,20 +801,30 @@ Options:
                        every --wake saves beside the log when it returns; the
                        first arm ever starts at the end. STDOUT stays empty.
   --fleet-log          with --wake, listen on the host's fleet error log instead
-                       of an agent's watch log, and print the next fleet line
+                       of an agent's watch log, and print every fleet line at
+                       or above the floor (--min-level) that one read of the
+                       log finds,
                          <time> FLEET <ERROR|WARN|INFO> code=<code> bus=<name>
                              id=<id> msg=<text>
-                       exactly as written, then exit 0. A fleet line records a
-                       fault the host bus service could not heal, or one that
-                       stopped it. A leader keeps one such wake armed in the
-                       background beside its bus listener, re-arms it after
-                       each return, and on a wake reads the fleet log and
-                       --host-status. It follows the --wake contract: the idle
-                       line and exit 0 at --wake-seconds, a log that is rotated
-                       is followed onto its new file, and it resumes from where
+                       one per line and exactly as written, then exit 0. A
+                       fleet line whose level cannot be read wakes at every
+                       floor. A fleet line records a fault the host bus
+                       service could not heal, or one that stopped it. A
+                       leader keeps one such wake armed in the background
+                       beside its bus listener, re-arms it after each return,
+                       and on a wake reads the fleet log and --host-status. It
+                       follows the --wake contract: the idle line and exit 0
+                       at --wake-seconds, a log that is rotated is followed
+                       onto its new file, and it resumes from where
                        the last fleet-log wake for the same identity stopped
-                       reading, so a line written between two wakes is still
-                       reported (with no identity it starts at the end). One
+                       reading, so a line at or above the floor written
+                       between two wakes is still reported and a line below it
+                       never is (with no identity it starts at the end). That
+                       holds across any number of rollovers between two wakes,
+                       and across the log's creation, while the dated files
+                       stay beside it; when the saved position names no file
+                       left, the dated files written since the last wake are
+                       read whole, and a line can be reported twice. One
                        fleet-log listener per identity: a second prints
                        `already-armed` and exits 0 (but see --wait-for-arm),
                        and it never blocks the identity's bus listener. On a
@@ -2863,8 +2873,9 @@ detached watcher, its pid file.
 
 (defstruct (follower (:conc-name fol-))
   "One log being followed for --wake: where it lives, the stream held open on
-   it, how far it has been read, which file that stream is on, and the bytes of
-   a line not yet finished."
+   it, how far it has been read, which file that stream is on, the bytes of a
+   line not yet finished, and lines from elsewhere to report with its first
+   read."
   (path nil)
   (stream nil)
   (pos 0)
@@ -2872,7 +2883,8 @@ detached watcher, its pid file.
   (dev nil)
   (partial (make-array 0 :element-type '(unsigned-byte 8)
                          :adjustable t :fill-pointer 0))
-  (skip-p nil))
+  (skip-p nil)
+  (backlog nil))
 
 (defun %follow-open (fol from-end-p)
   "Open FOL's file and hold it. With FROM-END-P, reading starts at the current
@@ -2934,8 +2946,8 @@ detached watcher, its pid file.
 
    A log that did not exist yet is opened from the top once it appears, since
    everything in it is new. A log replaced under the same name, as a rotation
-   does, is read to its end first and then left for the new file, which is also
-   read from the top."
+   does, is read to its end once more after the replacement is seen, then left
+   for the new file, which is also read from the top."
   (let ((lines '()))
     (when (or (fol-stream fol) (%follow-open fol nil))
       (setf lines (%follow-drain fol))
@@ -2943,6 +2955,7 @@ detached watcher, its pid file.
                                                  (fol-path fol))))))
         (when (and now (or (/= (sb-posix:stat-ino now) (fol-ino fol))
                            (/= (sb-posix:stat-dev now) (fol-dev fol))))
+          (setf lines (append lines (%follow-drain fol)))
           (ignore-errors (close (fol-stream fol)))
           (setf (fol-stream fol) nil)
           (when (%follow-open fol nil)
@@ -2974,6 +2987,19 @@ detached watcher, its pid file.
             (pos (number-after "pos=")))
         (and ino pos (>= pos 0) (cons ino pos))))))
 
+(defun %write-offset (offset-path ino pos &optional (log-path offset-path))
+  "Write INO and POS to OFFSET-PATH as the line %READ-OFFSET reads, replacing
+   what was there. A failure is reported, naming LOG-PATH, and otherwise
+   ignored: the wake it follows has happened either way."
+  (handler-case
+      (with-open-file (out offset-path
+                           :direction :output :if-exists :supersede
+                           :if-does-not-exist :create)
+        (format out "ino=~D pos=~D~%" ino pos))
+    (error (e)
+      (%warn "could not save the read offset for ~A: ~A"
+             (uiop:native-namestring log-path) e))))
+
 (defun %save-offset (log-path &optional (offset-path (%offset-path log-path)))
   "Record in OFFSET-PATH (by default the offset file beside the log) how far a
    listener has now covered the log at LOG-PATH: its inode and its whole
@@ -2981,11 +3007,8 @@ detached watcher, its pid file.
    follows has happened either way."
   (handler-case
       (let ((stat (sb-posix:stat (uiop:native-namestring log-path))))
-        (with-open-file (out offset-path
-                             :direction :output :if-exists :supersede
-                             :if-does-not-exist :create)
-          (format out "ino=~D pos=~D~%"
-                  (sb-posix:stat-ino stat) (sb-posix:stat-size stat))))
+        (%write-offset offset-path (sb-posix:stat-ino stat)
+                       (sb-posix:stat-size stat) log-path))
     (error (e)
       (%warn "could not save the read offset for ~A: ~A"
              (uiop:native-namestring log-path) e))))
@@ -3021,19 +3044,29 @@ detached watcher, its pid file.
 (defun %wake-wait (targets poll-ms
                    &key (watcher-alive-p (lambda (pid-path)
                                            (and (%live-detached-pid pid-path) t)))
-                        deadline-ms start-offsets (event-p #'%event-line-p))
+                        deadline-ms start-offsets open-hook (event-p #'%event-line-p))
   "Wait for the next event line in any of TARGETS and return (values :event
-   line bus), or (values :no-watcher nil bus) naming the first bus whose
-   detached watcher is not running. Each target is a list (bus log-path
+   line bus lines ends), or (values :no-watcher nil bus) naming the first bus
+   whose detached watcher is not running. Each target is a list (bus log-path
    pid-path). DEADLINE-MS, when given, is a limit in milliseconds after which
-   this returns :timeout. EVENT-P decides which lines count as events (by
-   default the wake and error lines of a watch log).
+   this returns (values :timeout nil nil nil ends). EVENT-P decides which lines
+   count as events (by default the wake and error lines of a watch log).
+
+   LINE is the first event line of the read that found one, and LINES is every
+   event line of that read, oldest first. ENDS is an alist from the native
+   namestring of each log this wait opened to the (ino . pos) it read to on the
+   last file it held, in the shape START-OFFSETS accepts.
 
    Every log is read from its end as it stands when this starts, so a line
    already there is never reported again. START-OFFSETS, an alist from a log's
    native namestring to a saved (ino . pos), starts that log at POS instead,
    so a line written while no listener was armed is still reported; a saved
-   offset for a log since replaced, or past its end, is ignored. A watcher that is not running is
+   offset for a log since replaced, or past its end, is ignored. OPEN-HOOK,
+   when given, replaces START-OFFSETS: it is called once per log, just after
+   the log is opened from its end, with the log path and the open file's inode
+   and size (both NIL when the log could not be opened). It returns the
+   position to read that file from (NIL for its end) and a list of lines to
+   read ahead of the file's first new lines. A watcher that is not running is
    reported at once, and again if it stops while this waits: a wait on a log
    nothing will ever write to again never ends, and the agent running it would
    be as deaf as one running nothing."
@@ -3046,29 +3079,46 @@ detached watcher, its pid file.
     (let ((followers (loop for (bus log-path) in targets
                            collect (let ((fol (make-follower :path log-path)))
                                      (%follow-open fol t)
-                                     (let ((saved (cdr (assoc (uiop:native-namestring
-                                                               log-path)
-                                                              start-offsets
-                                                              :test #'string=))))
-                                       (when saved
-                                         (%follow-rewind fol (car saved) (cdr saved))))
+                                     (if open-hook
+                                         (multiple-value-bind (pos backlog)
+                                             (funcall open-hook log-path
+                                                      (and (fol-stream fol) (fol-ino fol))
+                                                      (and (fol-stream fol) (fol-pos fol)))
+                                           (setf (fol-backlog fol) backlog)
+                                           (when (and pos (fol-stream fol))
+                                             (%follow-rewind fol (fol-ino fol) pos)))
+                                         (let ((saved (cdr (assoc (uiop:native-namestring
+                                                                   log-path)
+                                                                  start-offsets
+                                                                  :test #'string=))))
+                                           (when saved
+                                             (%follow-rewind fol (car saved) (cdr saved)))))
                                      (cons bus fol))))
           (sleep-s (/ (max poll-ms 1) 1000.0))
           (limit (and deadline-ms (+ (now-ms) deadline-ms))))
-      (unwind-protect
-           (loop
-             (loop for (bus . fol) in followers
-                   do (let ((line (find-if event-p (%follow-lines fol))))
-                        (when line
-                          (return-from %wake-wait (values :event line bus)))))
-             (multiple-value-bind (dead bus) (dead-bus)
-               (when dead (return-from %wake-wait (values :no-watcher nil bus))))
-             (when (and limit (>= (now-ms) limit))
-               (return-from %wake-wait (values :timeout nil nil)))
-             (sleep sleep-s))
-        (dolist (entry followers)
-          (let ((stream (fol-stream (cdr entry))))
-            (when stream (ignore-errors (close stream)))))))))
+      (flet ((ends ()
+               (loop for (nil . fol) in followers
+                     when (fol-ino fol)
+                       collect (cons (uiop:native-namestring (fol-path fol))
+                                     (cons (fol-ino fol) (fol-pos fol))))))
+        (unwind-protect
+             (loop
+               (loop for (bus . fol) in followers
+                     do (let ((lines (remove-if-not
+                                      event-p
+                                      (append (shiftf (fol-backlog fol) nil)
+                                              (%follow-lines fol)))))
+                          (when lines
+                            (return-from %wake-wait
+                              (values :event (first lines) bus lines (ends))))))
+               (multiple-value-bind (dead bus) (dead-bus)
+                 (when dead (return-from %wake-wait (values :no-watcher nil bus))))
+               (when (and limit (>= (now-ms) limit))
+                 (return-from %wake-wait (values :timeout nil nil nil (ends))))
+               (sleep sleep-s))
+          (dolist (entry followers)
+            (let ((stream (fol-stream (cdr entry))))
+              (when stream (ignore-errors (close stream))))))))))
 
 (defun %wake-targets (bus self-id all-buses-p)
   "What --wake waits on, as (bus log-path pid-path) lists: the detached log for
@@ -3297,20 +3347,152 @@ detached watcher, its pid file.
                 (uiop:native-namestring (hostfiles:host-dir))
                 "fleet-error--" (%identity-stem self-id) ".offset")))
 
+(defun %rotated-fleet-logs (log)
+  "The rolled-over files beside LOG: LOG's file name, a dot, and a suffix, as
+   the host service's daily appender names them. NIL when the directory cannot
+   be listed."
+  (let ((prefix (concatenate 'string (file-namestring log) ".")))
+    (remove-if-not (lambda (path)
+                     (uiop:string-prefix-p prefix (file-namestring path)))
+                   (ignore-errors
+                    (uiop:directory-files (uiop:pathname-directory-pathname log))))))
+
+(defun %read-lines-from (path pos)
+  "The complete lines of the file at PATH from byte POS on, oldest first. A POS
+   inside a line moves back to that line's start, so the line comes back whole.
+   NIL for a POS at or past the end, and when PATH cannot be read."
+  (ignore-errors
+   (with-open-file (in path :element-type '(unsigned-byte 8))
+     (let ((size (file-length in)))
+       (when (< pos size)
+         (loop while (plusp pos)
+               do (file-position in (1- pos))
+                  (if (= (read-byte in) 10)
+                      (return)
+                      (decf pos)))
+         (let ((buffer (make-array (- size pos) :element-type '(unsigned-byte 8))))
+           (file-position in pos)
+           (read-sequence buffer in)
+           (loop with start = 0
+                 for end = (position 10 buffer :start start)
+                 while end
+                 collect (sb-ext:octets-to-string
+                          buffer :start start :end end
+                                 :external-format '(:utf-8 :replacement #\?))
+                 do (setf start (1+ end)))))))))
+
+(defun %fleet-start (log saved saved-at live-ino live-size)
+  "Where a fleet-log wait on LOG resumes, once it has opened the live file
+   with inode LIVE-INO and size LIVE-SIZE (both NIL when LOG is absent).
+   SAVED is the (ino . pos) the last fleet-log wake for the identity reached,
+   or NIL; SAVED-AT is when it was saved, in Unix seconds, or NIL. Returns two
+   values: the position to read the live file from, NIL for its end; and the
+   lines of rolled-over files to read first, oldest first.
+
+   - No SAVED: the live file from its end, nothing else.
+   - SAVED on the live file, within its size: the live file from SAVED's
+     position.
+   - SAVED on a rolled-over file beside LOG, within its size: that file from
+     SAVED's position, then every rolled-over file whose name sorts after it,
+     whole and in name order, then the live file from its start.
+   - Otherwise (no file carries SAVED's inode, or its position is past that
+     file's end, as when an inode was reused): every rolled-over file last
+     modified at or after SAVED-AT, whole and in name order, then the live file
+     from its start. A line already reported can be read again this way; one
+     not yet reported is not lost. With no SAVED-AT, only the live file."
+  (let ((dated (sort (loop for path in (%rotated-fleet-logs log)
+                           for stat = (ignore-errors
+                                       (sb-posix:stat (uiop:native-namestring path)))
+                           when (and stat (not (eql (sb-posix:stat-ino stat) live-ino)))
+                             collect (list path (sb-posix:stat-ino stat)
+                                           (sb-posix:stat-size stat)
+                                           (sb-posix:stat-mtime stat)))
+                     #'string< :key (lambda (entry) (file-namestring (first entry))))))
+    (flet ((whole (entries)
+             (loop for entry in entries
+                   append (%read-lines-from (first entry) 0))))
+      (cond ((null saved)
+             (values nil nil))
+            ((and (eql (car saved) live-ino) (<= (cdr saved) live-size))
+             (values (cdr saved) nil))
+            (t
+             (let ((at (position-if (lambda (entry)
+                                      (and (eql (car saved) (second entry))
+                                           (<= (cdr saved) (third entry))))
+                                    dated)))
+               (values 0
+                       (if at
+                           (append (%read-lines-from (first (nth at dated)) (cdr saved))
+                                   (whole (nthcdr (1+ at) dated)))
+                           (and saved-at
+                                (whole (remove-if (lambda (entry)
+                                                    (< (fourth entry) saved-at))
+                                                  dated)))))))))))
+
+(defun %fleet-resume-position (ends log)
+  "The (ino . pos) a fleet-log wake on LOG saves for the next one. ENDS is the
+   fifth value of %WAKE-WAIT.
+
+   When the wait opened LOG, the position it read to. Otherwise (0 . 0): no
+   file has inode 0, so the next wake reads the rolled-over files modified
+   since this save and the live log from its first line (see %FLEET-START).
+   Never LOG's current size, which would skip a line written after the last
+   read."
+  (or (cdr (assoc (uiop:native-namestring log) ends :test #'string=))
+      (cons 0 0)))
+
+(defun %fleet-wake-pass (log offset-path poll-ms listen-ms
+                         &key (floor +fleet-wake-default-floor+)
+                              (event-p (lambda (line)
+                                         (%fleet-line-qualifies-p line floor)))
+                              (report (constantly nil)))
+  "Wait once on the fleet log at LOG and return :EVENT or :TIMEOUT.
+
+   The wait resumes from the position saved in OFFSET-PATH, reading any
+   rolled-over files first (see %FLEET-START), or starts at the end when
+   OFFSET-PATH is NIL. It ends on lines satisfying EVENT-P, by default those at
+   or above FLOOR, or after LISTEN-MS (NIL for no limit). REPORT is called with
+   every such line of the read that ended it, oldest first, before the position
+   reached is written to OFFSET-PATH: a failure between the two repeats a line
+   rather than losing it."
+  (let* ((saved (and offset-path (%read-offset log offset-path)))
+         (saved-at (and saved
+                        (ignore-errors
+                         (sb-posix:stat-mtime
+                          (sb-posix:stat (uiop:native-namestring offset-path)))))))
+    (multiple-value-bind (outcome line bus lines ends)
+        (%wake-wait (list (list nil log nil)) poll-ms
+                    :watcher-alive-p (constantly t)
+                    :event-p event-p
+                    :deadline-ms listen-ms
+                    :open-hook (lambda (path ino size)
+                                 (%fleet-start path saved saved-at ino size)))
+      (declare (ignore line bus))
+      (when (eq outcome :event)
+        (funcall report lines))
+      (when offset-path
+        (let ((reached (%fleet-resume-position ends log)))
+          (%write-offset offset-path (car reached) (cdr reached) log)))
+      (if (eq outcome :event) :event :timeout))))
+
 (defun %wake-fleet-log (opts self-id)
-  "Block until the next fleet line at or above the floor (--min-level, default
-   WARN) reaches the host's fleet error log, print it and exit 0, or print the
-   idle line and exit 0 when --wake-seconds pass first. Lines below the floor
-   are read past.
+  "Block until a fleet line at or above the floor (--min-level, default WARN)
+   reaches the host's fleet error log, print every such line one read finds,
+   one per line and oldest first, and exit 0; or print the idle line and exit 0
+   when --wake-seconds pass first. Lines below the floor are read past.
    This is --wake --fleet-log: what a leader keeps armed in the background so
    a fault the host service could not heal reaches it without polling.
 
    It keeps the identity wake's contract. The log is followed across a
    rotation onto its new file. With an identity, the wake resumes from the
-   offset the last fleet-log wake for that identity saved, so a line written
-   while no wake was armed is still reported, and saves its own on return; the
-   first ever starts at the end. One fleet-log listener per identity, through
-   a lock of its own, so it never stands in the way of the identity's bus
+   position the last fleet-log wake for that identity reached, and saves the
+   position it reached after printing (see %FLEET-WAKE-PASS). A line below the
+   floor is never reported, and one at or above it written between two wakes
+   is, across any number of rollovers or the log's creation in between, while
+   the rolled-over files stay beside the log (see %FLEET-START for when a line
+   can be reported twice); the first ever starts at the end. One fleet-log
+   listener per identity, through a lock of its own, so it never stands in the
+   way of the identity's bus
    listener: a second prints `already-armed` and exits 0, or with
    --wait-for-arm waits its turn. With no identity it starts at the end, saves
    nothing and takes no lock.
@@ -3338,23 +3520,15 @@ detached watcher, its pid file.
                                        (opt-poll-ms opts) wake-seconds
                                        "fleet-armed")
                             (%wake-deadline-ms wake-seconds)))
-             (offset-path (and self-id (%fleet-offset-path self-id)))
-             (saved (and offset-path (%read-offset log offset-path))))
-        (multiple-value-bind (outcome line)
-            (%wake-wait (list (list nil log nil)) (opt-poll-ms opts)
-                        :watcher-alive-p (constantly t)
-                        :event-p (let ((floor (%fleet-floor opts)))
-                                   (lambda (line)
-                                     (%fleet-line-qualifies-p line floor)))
-                        :deadline-ms listen-ms
-                        :start-offsets (and saved
-                                            (list (cons (uiop:native-namestring log)
-                                                        saved))))
-          (when (and offset-path (probe-file log))
-            (%save-offset log offset-path))
-          (if (eq outcome :event)
-              (say-and-exit line 0)
-              (say-and-exit (%idle-line wake-seconds) 0)))))))
+             (offset-path (and self-id (%fleet-offset-path self-id))))
+        (if (eq (%fleet-wake-pass log offset-path (opt-poll-ms opts) listen-ms
+                                  :floor (%fleet-floor opts)
+                                  :report (lambda (lines)
+                                            (format *standard-output* "~{~A~%~}" lines)
+                                            (force-output *standard-output*)))
+                :event)
+            (uiop:quit 0)
+            (say-and-exit (%idle-line wake-seconds) 0))))))
 
 (defun %wake (opts bus self-id)
   "Block until the next event line reaches this agent's detached log, print it
