@@ -22,7 +22,12 @@
 
 (defpackage #:dsmr-mcp/tests/integration/bus/fleet-log-wake-test
   (:use #:cl #:zebra #:dsmr-mcp/tests/integration/bus/host-support)
-  (:local-nicknames (#:hostfiles #:dsmr-mcp/src/bus/hostfiles)))
+  (:local-nicknames (#:hostfiles #:dsmr-mcp/src/bus/hostfiles)
+                    (#:fleetlog #:dsmr-bus-host/src/bus/host/fleetlog))
+  (:import-from #:dsmr-mcp/tests/support/fleet-log-lines
+                #:*recorded-info-roster-gap*
+                #:*recorded-warn-memory-pressure*
+                #:*recorded-error-unrelieved*))
 
 (in-package #:dsmr-mcp/tests/integration/bus/fleet-log-wake-test)
 
@@ -236,6 +241,214 @@ nothing without --wake: both are usage errors."
         (declare (ignore err))
         (is = 64 code)
         (is string= "" out)))))
+
+(define-test fleet-wake-reads-past-an-info-line-by-default
+  "With no --min-level the floor is WARN: the recorded roster-gap INFO note
+leaves the wake running, and the WARN line after it ends the wait."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-service state)
+      (let ((wake (apply #'start-wake state "--wake" "--fleet-log"
+                         "--wake-seconds" "30" (id-args))))
+        (settle)
+        (append-line state *recorded-info-roster-gap*)
+        (false (await-exit wake 2) "an INFO line ended the default wait")
+        (append-line state *recorded-warn-memory-pressure*)
+        (multiple-value-bind (out code) (finish-fleet-wake state wake 10)
+          (is eql 0 code)
+          (is string= *recorded-warn-memory-pressure* out))))))
+
+(define-test fleet-wake-at-min-level-info-wakes-on-info
+  "--min-level INFO lowers the floor, so the INFO note ends the wait."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-service state)
+      (let ((wake (apply #'start-wake state "--wake" "--fleet-log"
+                         "--min-level" "INFO" "--wake-seconds" "30" (id-args))))
+        (settle)
+        (append-line state *recorded-info-roster-gap*)
+        (multiple-value-bind (out code) (finish-fleet-wake state wake 10)
+          (is eql 0 code)
+          (is string= *recorded-info-roster-gap* out))))))
+
+(define-test fleet-wake-refuses-an-unknown-min-level
+  "A level other than ERROR, WARN, or INFO is a usage error: exit 64, nothing on
+stdout, and the bad level named on stderr."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-service state)
+      (multiple-value-bind (out err code)
+          (apply #'run-in state bin "--wake" "--fleet-log" "--min-level" "DEBUG"
+                 "--wake-seconds" "2" (id-args))
+        (is = 64 code)
+        (is string= "" out)
+        (true (search "DEBUG" err) "stderr: ~A" err)))))
+
+(define-test fleet-wake-refuses-a-min-level-with-no-value
+  "A --min-level left with no value on a fleet-log wake is refused like an
+unknown level: exit 64 and nothing on stdout."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-service state)
+      (multiple-value-bind (out err code)
+          (apply #'run-in state bin "--wake" "--fleet-log" "--wake-seconds" "2"
+                 (append (id-args) (list "--min-level")))
+        (is = 64 code "stderr: ~A" err)
+        (is string= "" out)
+        (true (search "--min-level" err) "stderr: ~A" err)))))
+
+(define-test a-bus-wake-ignores-min-level
+  "--min-level on a bus wake is warned about and ignored: the bus wake still
+runs, and with no detached watcher reports nowatcher."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-service state)
+      (multiple-value-bind (out err code)
+          (apply #'run-in state bin "--wake" "--min-level" "ERROR"
+                 "--wake-seconds" "2" (id-args))
+        (is = 1 code "stderr: ~A" err)
+        (is string= (format nil "nowatcher bus=~A" *bus*) out)
+        (true (search "--min-level" err) "stderr: ~A" err)))))
+
+(define-test fleet-wake-prints-a-backlog-in-one-wake-and-never-a-skipped-line
+  "Lines written while no wake was armed are printed together by the next
+arm, the qualifying ones only, oldest first; the INFO line that arm read past
+is never printed by a later one, even at --min-level INFO."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-service state)
+      (let ((wake (apply #'start-wake state "--wake" "--fleet-log"
+                         "--wake-seconds" "30" (id-args))))
+        (settle)
+        (append-line state *recorded-warn-memory-pressure*)
+        (multiple-value-bind (out code) (finish-fleet-wake state wake 10)
+          (is eql 0 code)
+          (is string= *recorded-warn-memory-pressure* out)))
+      (append-line state *recorded-error-unrelieved*)
+      (append-line state *recorded-info-roster-gap*)
+      (append-line state *recorded-warn-memory-pressure*)
+      (multiple-value-bind (out err code)
+          (apply #'run-in state bin "--wake" "--fleet-log" "--wake-seconds" "5"
+                 (id-args))
+        (is = 0 code "stderr: ~A" err)
+        (is string= (format nil "~A~%~A" *recorded-error-unrelieved*
+                            *recorded-warn-memory-pressure*)
+            out))
+      (multiple-value-bind (out err code)
+          (apply #'run-in state bin "--wake" "--fleet-log" "--min-level" "INFO"
+                 "--wake-seconds" "2" (id-args))
+        (is = 0 code "stderr: ~A" err)
+        (is string= "idle wake-seconds=2" out)))))
+
+(defun rotate-with-a-fleet-report (state code &key (days-back 2))
+  "Roll the fleet log under STATE over the way the host service does: date the
+   current file DAYS-BACK days back, install the service's daily appender on
+   it, and report one ERROR under CODE. The appender renames the old file to
+   its dated name and writes the line to a new file. Returns the line written."
+  (with-state-home (state)
+    (let* ((log (hostfiles:fleet-log-path))
+           (then (- (sb-posix:time) (* days-back 86400))))
+      (sb-posix:utimes (uiop:native-namestring log) then then)
+      (fleetlog:install-fleet-log
+       :path log :service-log-path (merge-pathnames "service.log" log))
+      (unwind-protect
+           (fleetlog:fleet-report :error code :bus *bus*
+                                  :subject (format nil "~D" (random 1000000 (make-random-state t)))
+                                  :msg "after the rollover")
+        (fleetlog:remove-fleet-log))
+      (car (last (uiop:read-file-lines log))))))
+
+(defun dated-fleet-logs (state)
+  "The rolled-over fleet logs under STATE."
+  (with-state-home (state)
+    (let ((prefix (concatenate 'string (file-namestring (hostfiles:fleet-log-path)) ".")))
+      (remove-if-not (lambda (p) (uiop:string-prefix-p prefix (file-namestring p)))
+                     (uiop:directory-files (hostfiles:host-dir))))))
+
+(define-test fleet-wake-reports-lines-across-a-rollover-between-arms
+  "With no wake armed, a WARN line lands in the old file, the service's appender
+rolls the log over, and its ERROR line opens the new file. The next arm reports
+both, oldest first."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-service state)
+      (append-line state *recorded-info-roster-gap*)
+      (multiple-value-bind (out err code)
+          (apply #'run-in state bin "--wake" "--fleet-log" "--wake-seconds" "2"
+                 (id-args))
+        (is = 0 code "stderr: ~A" err)
+        (is string= "idle wake-seconds=2" out))
+      (append-line state *recorded-warn-memory-pressure*)
+      (let ((rolled (rotate-with-a-fleet-report state "rolled-between-arms")))
+        (is = 1 (length (dated-fleet-logs state)) "the log was not rolled over")
+        (multiple-value-bind (out err code)
+            (apply #'run-in state bin "--wake" "--fleet-log" "--wake-seconds" "5"
+                   (id-args))
+          (is = 0 code "stderr: ~A" err)
+          (is string= (format nil "~A~%~A" *recorded-warn-memory-pressure* rolled)
+              out))))))
+
+(define-test fleet-wake-reports-lines-across-two-rollovers-between-arms
+  "With no wake armed, a WARN line lands in the first file and the service's
+appender rolls the log over twice, each time opening the new file with an
+ERROR line. The next arm reports all three, oldest first."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-service state)
+      (append-line state *recorded-info-roster-gap*)
+      (multiple-value-bind (out err code)
+          (apply #'run-in state bin "--wake" "--fleet-log" "--wake-seconds" "2"
+                 (id-args))
+        (is = 0 code "stderr: ~A" err)
+        (is string= "idle wake-seconds=2" out))
+      (append-line state *recorded-warn-memory-pressure*)
+      (let* ((rolled-1 (rotate-with-a-fleet-report state "first-rollover" :days-back 2))
+             (rolled-2 (rotate-with-a-fleet-report state "second-rollover" :days-back 1)))
+        (is = 2 (length (dated-fleet-logs state)) "the log was not rolled over twice")
+        (multiple-value-bind (out err code)
+            (apply #'run-in state bin "--wake" "--fleet-log" "--wake-seconds" "5"
+                   (id-args))
+          (is = 0 code "stderr: ~A" err)
+          (is string= (format nil "~A~%~A~%~A" *recorded-warn-memory-pressure* rolled-1 rolled-2)
+              out))))))
+
+(define-test fleet-wake-reports-a-log-created-between-arms
+  "An arm that returns before the fleet log exists leaves the next arm to read
+the new log from its first line."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-service state)
+      (multiple-value-bind (out err code)
+          (apply #'run-in state bin "--wake" "--fleet-log" "--wake-seconds" "2"
+                 (id-args))
+        (is = 0 code "stderr: ~A" err)
+        (is string= "idle wake-seconds=2" out))
+      (append-line state *recorded-warn-memory-pressure*)
+      (multiple-value-bind (out err code)
+          (apply #'run-in state bin "--wake" "--fleet-log" "--wake-seconds" "5"
+                 (id-args))
+        (is = 0 code "stderr: ~A" err)
+        (is string= *recorded-warn-memory-pressure* out)))))
+
+(define-test fleet-wake-saves-the-position-it-read-to-on-idle
+  "An INFO line read past by an arm that then idles is not reported by a later
+arm at --min-level INFO."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-service state)
+      (append-line state *recorded-warn-memory-pressure*)
+      (let ((wake (apply #'start-wake state "--wake" "--fleet-log"
+                         "--wake-seconds" "4" (id-args))))
+        (settle)
+        (append-line state *recorded-info-roster-gap*)
+        (multiple-value-bind (out code) (finish-fleet-wake state wake 10)
+          (is eql 0 code)
+          (is string= "idle wake-seconds=4" out)))
+      (multiple-value-bind (out err code)
+          (apply #'run-in state bin "--wake" "--fleet-log" "--min-level" "INFO"
+                 "--wake-seconds" "2" (id-args))
+        (is = 0 code "stderr: ~A" err)
+        (is string= "idle wake-seconds=2" out)))))
 
 ;;; the service-failed alarm ------------------------------------------------------
 
