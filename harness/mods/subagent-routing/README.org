@@ -8,10 +8,14 @@ without patches to gsd-core's workflows: shell work goes to =shell-developer=,
 Lisp work goes to the project's own executor, and each specialist runs on the
 model its agent definition names.
 
-The mod never refuses a spawn. When its rules cannot place one, the spawn runs
-exactly as requested and the log line says why, so a fault in the mod rarely
-costs you an agent (see Known limits). It needs Claude Code 2.1.287 or later;
-the measurements below were taken on 2.1.312.
+In a project whose GSD configuration sets =planning.agents.specialized= to true,
+the mod refuses a =gsd-executor= spawn it cannot place. I made it refuse there
+because otherwise such a spawn runs unnoticed on the generic executor in a
+project configured for specialists. The refusal reaches the spawner as the Agent
+tool's error, naming the cause and what has to change. Everywhere else, a spawn
+the rules cannot place still runs exactly as requested and the log line says
+why, so a fault in the mod rarely costs you an agent (see Known limits). It needs Claude Code 2.1.287 or later; the
+measurements below were taken on 2.1.312.
 
 * Routing rules
 
@@ -21,14 +25,33 @@ the project's GSD configuration (=config.json= in the project's planning
 directory) and the one plan the prompt names, then applies the first row that
 fits.
 
-| Requested type                                            | Condition                                                                                                                | Runs as              | Model                                                                                      |
-|-----------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------+----------------------+--------------------------------------------------------------------------------------------|
-| =gsd-executor=                                            | the plan carries =agent_hint: shell-developer=                                                                           | =shell-developer=    | its definition's                                                                           |
-| =gsd-executor=                                            | the plan's =agent_hint= names the project executor                                                                       | the project executor | its definition's                                                                           |
-| =gsd-executor=                                            | the plan carries no hint, =planning.agents.specialized= is true, and =planning.agents.executor= names an installed agent | the project executor | its definition's                                                                           |
-| =gsd-executor=                                            | the plan carries =agent_hint: gsd-executor=, or no hint and the row above does not apply                                 | =gsd-executor=       | in a specialized project, the model of the session that spawned it; elsewhere as requested |
-| =shell-developer=, =lisp-developer=, the project executor | always                                                                                                                   | as requested         | its definition's; a per-call model is cleared                                              |
-| any other type                                            | always                                                                                                                   | as requested         | as requested                                                                               |
+| Requested type                                            | Condition                                                                                                                    | Runs as              | Model                                                                                      |
+|-----------------------------------------------------------+------------------------------------------------------------------------------------------------------------------------------+----------------------+--------------------------------------------------------------------------------------------|
+| =gsd-executor=                                            | the plan carries =agent_hint: shell-developer=                                                                               | =shell-developer=    | its definition's                                                                           |
+| =gsd-executor=                                            | the plan's =agent_hint= names the project executor                                                                           | the project executor | its definition's                                                                           |
+| =gsd-executor=                                            | the plan carries no hint, =planning.agents.specialized= is true, and =planning.agents.executor= names an installed agent     | the project executor | its definition's                                                                           |
+| =gsd-executor=                                            | the plan carries =agent_hint: gsd-executor=, or no hint and the project is not specialized or its executor is =gsd-executor= | =gsd-executor=       | in a specialized project, the model of the session that spawned it; elsewhere as requested |
+| =shell-developer=, =lisp-developer=, the project executor | always                                                                                                                       | as requested         | its definition's; a per-call model is cleared                                              |
+| any other type                                            | always                                                                                                                       | as requested         | as requested                                                                               |
+
+A prompt names its plan in one of two forms. The first is one or more lines
+of the form =- <path>-PLAN.md (Plan)=, all naming the same plan; a relative
+path there resolves against the project, and one starting with
+=${PROJECT_ROOT}/= against the root the prompt assigns, or the project when it
+assigns none. The second counts only when no such line exists and the prompt
+is not an audit-fix finding: a single absolute path ending in =-PLAN.md=, set
+off by whitespace, quotes, a backtick, parentheses, or angle brackets,
+anywhere in the prompt, such as =<plan>/abs/path/01-02-PLAN.md</plan>=. A
+full stop, comma, colon, semicolon, or question or exclamation mark may follow
+it. The same plan named twice counts once, even when spelled two ways, such as
+=/a/./b= and =/a/b=, or a =${PROJECT_ROOT}/= path and its absolute form.
+
+These do not count in the second form:
+
+- a glob, a relative path, or a path starting with =~/=;
+- a path right after a variable or a closing quote, such as
+  ="$PHASE_DIR"/01-01-PLAN.md=;
+- a name that runs on past =-PLAN.md=, such as =01-01-PLAN.md~=.
 
 A prompt that opens with the words =Fix finding= and names no plan, as an
 audit-fix prompt does, takes the project executor under the same conditions as an
@@ -38,17 +61,35 @@ agent =planning.agents.executor= names (=lisp-developer= in this repository).
 An agent counts as installed when its definition is in the =agents= folder of
 your Claude Code configuration directory or in the project's =.claude/agents=.
 
+** Spawns refused in a specialized project
+
+In a project whose GSD configuration sets =planning.agents.specialized= to
+true, the mod refuses a =gsd-executor= spawn, and no agent starts, when:
+
+- the prompt names no plan and is not an audit-fix finding;
+- the prompt names more than one plan, on plan lines or as absolute paths;
+- the plan path starts with =~/= and no home directory is set;
+- the plan cannot be read;
+- the plan's hint is not an agent name, is not a type the table routes to, or
+  names an agent with no installed definition;
+- the plan carries no hint, or the prompt is an audit-fix finding, and
+  =planning.agents.executor= is unset, is not an agent name, or names an agent
+  with no installed definition.
+
+You see the Agent tool's error, beginning =subagent-routing refused=, which
+names the cause and what has to change, and the log line reads =refused=.
+When the prompt is the cause (no plan, or more than one), the error gives both
+plan forms: re-spawn naming one plan in one of them. For any other cause, the
+plan file, its =agent_hint=, the project configuration, or the installed agent
+definitions must change first; for a hint the mod cannot use, the error lists
+the installed agents a hint may name. The same spawn is refused again until
+that change is made.
+
 ** Spawns left as requested
 
-A =gsd-executor= spawn runs exactly as requested, logged =cannot-decide=, when:
-
-- the project has no readable GSD configuration;
-- the prompt names more than one plan, or names none and is not an audit-fix
-  finding;
-- the plan cannot be read, or its path starts with =~/= and no home directory
-  is set;
-- the hint is not an agent name, is not a type the table routes to, or names
-  an agent with no installed definition.
+A =gsd-executor= spawn runs exactly as requested, logged =cannot-decide=, when
+the project has no readable GSD configuration, or when the project is not
+specialized and the prompt or the plan's hint is one of the causes above.
 
 Claude Code checks a spawn again after the mod has passed it on as another agent
 type, and a refusal at that point ends the spawn with no agent started. For that
@@ -59,10 +100,14 @@ requested type. A spawn requested from inside another subagent is never
 retyped. In each of these cases the spawn runs as requested, logged
 =cannot-decide=, and the reason ends with =not passed on as <type>: <why>=.
 
+These checks apply in every project, a specialized one included, and so do the
+fallback and a failure of the mod before it refuses, both described next.
+
 When another mod's spawn hook refuses the changed spawn, the spawn runs once
 more as requested and is logged =fallback=. When that is refused too, no agent
 starts and the line reads =refused=. If the mod itself fails, the spawn still
-proceeds and the line reads =error=.
+proceeds and the line reads =error=, unless the mod had already refused it: a
+refused spawn stays refused, and its =refused= line carries the =error=.
 
 The mod raises a toast for the first =cannot-decide=, =fallback=, =refused=,
 or =error= line of each kind in a session, and for a log it cannot write.
@@ -92,17 +137,18 @@ fields:
 - =action= :: one of the seven actions below
 - =reason= :: one sentence saying why
 - =version= :: the mod's version
-- =error= :: the error's =name= and =message=, on an =error= line only
+- =error= :: the error's =name= and =message=, on an =error= line, or on a
+  =refused= line when the mod failed after refusing
 
-| Action          | Meaning                                                                          |
-|-----------------+----------------------------------------------------------------------------------|
-| =rewrote=       | the agent type changed, or a =gsd-executor= spawn lost its per-call model        |
-| =cleared-model= | a specialist kept its type and lost its per-call model                           |
-| =unchanged=     | passed on as requested, with nothing to change                                   |
-| =cannot-decide= | passed on as requested, because the rules could not place it                     |
-| =fallback=      | the changed spawn was refused, and the spawn ran as requested                    |
-| =refused=       | the changed spawn and the spawn as requested were both refused; no agent started |
-| =error=         | the mod failed, and the spawn proceeded                                          |
+| Action          | Meaning                                                                                                                                                                 |
+|-----------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| =rewrote=       | the agent type changed, or a =gsd-executor= spawn lost its per-call model                                                                                               |
+| =cleared-model= | a specialist kept its type and lost its per-call model                                                                                                                  |
+| =unchanged=     | passed on as requested, with nothing to change                                                                                                                          |
+| =cannot-decide= | passed on as requested, because the rules could not place it                                                                                                            |
+| =fallback=      | the changed spawn was refused, and the spawn ran as requested                                                                                                           |
+| =refused=       | no agent started: the mod refused a =gsd-executor= spawn it could not place in a specialized project, or the changed spawn and the spawn as requested were both refused |
+| =error=         | the mod failed, and the spawn proceeded                                                                                                                                 |
 
 A log about to pass 1,048,576 characters is moved aside to the first free name
 from =<session>.jsonl.1= to =<session>.jsonl.99=, and the new line starts a
@@ -115,7 +161,7 @@ loaded, the path of the session's log, and this session's spawns counted by
 action.
 
 #+begin_example
-subagent-routing 0.4.0 loaded <time>; log <path>; this session: <n> spawns, <n> rewrote, <n> cleared-model, <n> unchanged, <n> cannot-decide, <n> fallback, <n> refused, <n> error
+subagent-routing 0.5.0 loaded <time>; log <path>; this session: <n> spawns, <n> rewrote, <n> cleared-model, <n> unchanged, <n> cannot-decide, <n> fallback, <n> refused, <n> error
 #+end_example
 
 A reply of =Unknown command: /subagent-routing= means the mod is not loaded in
@@ -215,8 +261,9 @@ still holds them. The mod reproduces their mapping, with these differences:
   accepted any installed agent. Plan frontmatter is written by a model, so I
   narrowed what it can select.
 - A =gsd-executor= spawn whose prompt names no plan, other than an audit-fix
-  finding, runs as requested, as it did under the patches, but here it is
-  logged =cannot-decide= and raises a toast.
+  finding, is refused in a specialized project. Elsewhere it runs as
+  requested, as it did under the patches, but here it is logged
+  =cannot-decide= and raises a toast.
 - The patches gave the routed executor the =agent_skills= configured for its
   own type. The mod routes a prompt GSD built for =gsd-executor=, so the
   executor it starts receives the =agent_skills= entries for =gsd-executor=,

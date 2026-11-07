@@ -33,8 +33,10 @@ export type RouteIo = {
  * - `cleared-model`: a specialist kept its type and lost its per-call model.
  * - `unchanged`: passed on as requested, nothing to change.
  * - `cannot-decide`: passed on as requested because the rules could not place it.
+ * - `refused`: no agent starts; a gsd-executor spawn the rules cannot place, in
+ *   a project whose config sets `planning.agents.specialized` true.
  */
-export type Action = 'rewrote' | 'cleared-model' | 'unchanged' | 'cannot-decide'
+export type Action = 'rewrote' | 'cleared-model' | 'unchanged' | 'cannot-decide' | 'refused'
 
 /** The workflow a dispatch prompt came from, as far as its text shows. */
 export type Shape = 'execute-phase' | 'quick' | 'quick-batch' | 'audit-fix' | 'other'
@@ -72,6 +74,15 @@ const LISP_DEVELOPER = 'lisp-developer'
 const AGENT_NAME = /^[a-z0-9][a-z0-9-]*$/
 // A dispatch prompt's plan line: "- <path>-PLAN.md (Plan)", or "(Plan, authoritative)" and kin.
 const PLAN_LINE = /^[ \t]*- (\S+-PLAN\.md)[ \t]+\(Plan/gm
+// An absolute plan path anywhere, with one leading slash and no glob or
+// expansion character. Before it: the text's start, whitespace, a parenthesis,
+// an angle bracket, or an opening quote or backtick (one that itself follows
+// the start, whitespace, a parenthesis, or an angle bracket, so a closing quote
+// after a variable does not count). After -PLAN.md: the end, whitespace, a
+// quote, a backtick, a parenthesis, an angle bracket, or one of `.,:;!?` that
+// is followed by one of those.
+const ABSOLUTE_PLAN =
+  /(?<=^|[\s()<>]|(?:^|[\s()<>])[`'"])(\/(?!\/)[^\s`'"()<>*?[\]{}$]*-PLAN\.md)(?=$|[\s`'"()<>]|[.,:;!?](?:$|[\s`'"()<>]))/g
 // execute-phase writes plan paths under the repository root it names PROJECT_ROOT.
 const PROJECT_ROOT_REF = /^(\$\{PROJECT_ROOT\}|\$PROJECT_ROOT)\//
 const PROJECT_ROOT_SET = /^[ \t]*PROJECT_ROOT=['"]?(\/[^'"\s]*)['"]?[ \t]*$/m
@@ -110,6 +121,26 @@ export function planPaths(prompt: string): string[] {
 }
 
 /**
+ * Distinct absolute paths ending in -PLAN.md anywhere in `prompt`, normalized,
+ * in order of first appearance. None of these is one:
+ * - a relative, tilde, `${PROJECT_ROOT}`, or glob path;
+ * - a path that follows a variable or a closing quote;
+ * - a name that runs on past -PLAN.md.
+ */
+export function absolutePlanPaths(prompt: string): string[] {
+  const seen = new Set<string>()
+  for (const m of prompt.matchAll(ABSOLUTE_PLAN)) {
+    if (m[1] !== undefined) seen.add(normalizePath(m[1]))
+  }
+  return [...seen]
+}
+
+/** `path` with each `//` and `/./` collapsed to one slash. */
+export function normalizePath(path: string): string {
+  return path.replace(/\/(?:\.?\/)+/g, '/')
+}
+
+/**
  * Dispatch shape of `prompt`, given the first plan path it names (as written).
  */
 export function dispatchShape(prompt: string, plan: string | null): Shape {
@@ -122,9 +153,10 @@ export function dispatchShape(prompt: string, plan: string | null): Shape {
 }
 
 /**
- * Absolute form of `path`, or null when it starts with a tilde and no home is
- * known. A leading `${PROJECT_ROOT}/` takes the absolute value `prompt`
- * assigns to PROJECT_ROOT on a line of its own, else the project directory.
+ * Absolute, normalized form of `path`, or null when it starts with a tilde and
+ * no home is known. A leading `${PROJECT_ROOT}/` takes the absolute value
+ * `prompt` assigns to PROJECT_ROOT on a line of its own, else the project
+ * directory.
  */
 export function resolvePath(
   path: string,
@@ -135,9 +167,9 @@ export function resolvePath(
     const root = trimSlash(PROJECT_ROOT_SET.exec(prompt)?.[1] ?? io.projectDir)
     path = path.replace(PROJECT_ROOT_REF, `${root}/`)
   }
-  if (path.startsWith('/')) return path
-  if (path.startsWith('~/')) return io.homeDir === '' ? null : `${io.homeDir}${path.slice(1)}`
-  return `${io.projectDir}/${path.replace(/^(\.\/)+/, '')}`
+  if (path.startsWith('/')) return normalizePath(path)
+  if (path.startsWith('~/')) return io.homeDir === '' ? null : normalizePath(`${io.homeDir}${path.slice(1)}`)
+  return normalizePath(`${io.projectDir}/${path.replace(/^(\.\/)+/, '')}`)
 }
 
 /**
@@ -261,15 +293,24 @@ async function hasDefinition(name: string, io: RouteIo): Promise<boolean> {
  * 2. gsd-executor: with no readable project config it is `cannot-decide`;
  *    with `workflow.agent_hint_routing` false it stays
  *    gsd-executor. Otherwise the prompt must name exactly one
- *    readable plan: its `agent_hint`, when it is shell-developer, gsd-executor
- *    or the project executor and has an installed definition, becomes the
- *    agent type, model cleared; with no hint the project default applies. A
- *    prompt opening "Fix finding " with no plan takes the project default too.
- *    The project default is `planning.agents.executor` when
- *    `planning.agents.specialized` is true and that agent is installed, else
- *    gsd-executor. A specialist's model is cleared; gsd-executor's per-call
- *    model is cleared only when `planning.agents.specialized` is true, and
- *    kept otherwise. Anything else is `cannot-decide` and passes exactly as
+ *    readable plan, on one or more plan lines (`- <path>-PLAN.md (Plan`)
+ *    naming the same resolved path, or, with no plan line and no audit-fix
+ *    opening, as a single distinct absolute path ending in -PLAN.md anywhere.
+ *    Its `agent_hint` becomes the agent type, model cleared, when it is one
+ *    of these and has an installed definition:
+ *    - shell-developer;
+ *    - gsd-executor;
+ *    - the project executor.
+ *    With no hint the project default applies. A prompt opening
+ *    "Fix finding " with no plan takes the project default too.
+ *    When `planning.agents.specialized` is true, the project default is
+ *    `planning.agents.executor`; when that is unset, is not an agent name, or
+ *    is not installed, the spawn cannot be placed. In any other project the
+ *    default is gsd-executor. A specialist's model is cleared; gsd-executor's
+ *    per-call model is cleared only when `planning.agents.specialized` is
+ *    true, and kept otherwise. A spawn that cannot be placed once the config
+ *    is read is `refused` when `planning.agents.specialized` is true, so no
+ *    agent starts, and `cannot-decide` otherwise, passing exactly as
  *    requested.
  * 3. shell-developer, lisp-developer or the project executor keeps its type
  *    and loses any per-call model.
@@ -281,8 +322,8 @@ export function decide(input: SpawnFacts, io: RouteIo): Promise<Decision> {
 
 async function route(input: SpawnFacts, io: RouteIo): Promise<Decision> {
   const kind = spawnKind(input)
-  const named = planPaths(input.prompt)
-  const shape = dispatchShape(input.prompt, named[0] ?? null)
+  let named = planPaths(input.prompt)
+  let shape = dispatchShape(input.prompt, named[0] ?? null)
   const asRequested = (action: Action, reason: string, planPath: string | null = null): Decision => ({
     action,
     subagentType: input.subagentType,
@@ -316,13 +357,40 @@ async function route(input: SpawnFacts, io: RouteIo): Promise<Decision> {
   const config = parseConfig(await io.read(`${io.projectDir}/${PLANNING_DIR}/config.json`))
   const type = input.subagentType
 
+  // A gsd-executor spawn the rules cannot place: refused in a specialized
+  // project, passed on as requested in any other. `help` says what must
+  // change; a function is called only for a refusal. Call once `config` is read.
+  const unplaced = async (
+    cause: string,
+    help: string | (() => Promise<string>),
+    planPath: string | null = null,
+  ): Promise<Decision> => {
+    if (!config.specialized) return asRequested('cannot-decide', cause, planPath)
+    const text = typeof help === 'string' ? help : await help()
+    return asRequested('refused', `${cause}; planning.agents.specialized is true, so it does not run as gsd-executor. ${text}`, planPath)
+  }
+  // Only a cause in the prompt itself is fixed by a new prompt.
+  const RENAME_PLAN =
+    'Name one plan as one line `- <absolute path>-PLAN.md (Plan)`, or as a single absolute path ending in ' +
+    '-PLAN.md, set off by whitespace, quotes, a backtick, parentheses, or angle brackets, anywhere in the ' +
+    'prompt (such as `<plan>/abs/path/01-02-PLAN.md</plan>`), then re-spawn.'
+  const install = (agent: string): string =>
+    `Install the ${agent} agent definition in ${io.configDir}/agents or ${io.projectDir}/.claude/agents; ` +
+    'until then the spawn is refused.'
+
   const projectDefault = async (reason: string, planPath: string | null): Promise<Decision> => {
     const executor = config.executor
     if (!config.specialized) return keepExecutor(`${reason}; planning.agents.specialized is not true`, planPath)
-    if (executor === null) return keepExecutor(`${reason}; no planning.agents.executor`, planPath)
     if (executor === EXECUTOR) return keepExecutor(`${reason}; the project executor is gsd-executor`, planPath)
+    if (executor === null) {
+      return unplaced(
+        `${reason}; planning.agents.executor is unset or not an agent name`,
+        `Set planning.agents.executor in ${PLANNING_DIR}/config.json to an installed agent; until then the spawn is refused.`,
+        planPath,
+      )
+    }
     if (!(await hasDefinition(executor, io))) {
-      return keepExecutor(`${reason}; project executor ${executor} has no installed definition`, planPath)
+      return unplaced(`${reason}; project executor ${executor} has no installed definition`, install(executor), planPath)
     }
     return setType(executor, 'rewrote', `${reason}; project executor ${executor} on its own model`, planPath)
   }
@@ -332,30 +400,64 @@ async function route(input: SpawnFacts, io: RouteIo): Promise<Decision> {
       return asRequested('cannot-decide', `no readable ${PLANNING_DIR}/config.json under ${clip(io.projectDir, 200)}`)
     }
     if (config.routingOff) return keepExecutor('workflow.agent_hint_routing is false', null)
-    if (named.length > 1) return asRequested('cannot-decide', `the prompt names ${named.length} plans`)
+    // One plan spelled two ways counts once: plan lines are compared resolved.
+    const lineCount = new Set(named.map(p => resolvePath(p, io, input.prompt) ?? p)).size
+    if (lineCount > 1) return unplaced(`the prompt names ${lineCount} plans`, RENAME_PLAN)
     if (named.length === 0) {
       if (input.prompt.trimStart().startsWith(AUDIT_FIX_OPENING)) {
         return projectDefault('an audit-fix finding names no plan', null)
       }
-      return asRequested('cannot-decide', 'the prompt names no plan and is not an audit-fix finding')
+      const absolute = absolutePlanPaths(input.prompt)
+      if (absolute.length > 1) {
+        return unplaced(`the prompt names ${absolute.length} absolute plan paths and none on a plan line`, RENAME_PLAN)
+      }
+      if (absolute.length === 0) return unplaced('the prompt names no plan and is not an audit-fix finding', RENAME_PLAN)
+      named = absolute
+      shape = dispatchShape(input.prompt, named[0] ?? null)
     }
 
     const planPath = resolvePath(named[0] ?? '', io, input.prompt)
-    if (planPath === null) return asRequested('cannot-decide', 'the plan path needs a home directory and none is known')
+    if (planPath === null) {
+      return unplaced(
+        'the plan path needs a home directory and none is known',
+        'Name the plan by its absolute path in place of the ~/ path; a ~/ path cannot be resolved here.',
+      )
+    }
     const text = await io.read(planPath)
-    if (text === null) return asRequested('cannot-decide', `the plan ${clip(planPath, 200)} is not readable`, planPath)
+    if (text === null) {
+      return unplaced(
+        `the plan ${clip(planPath, 200)} is not readable`,
+        'The plan file must exist and be readable at that path before the spawn can run.',
+        planPath,
+      )
+    }
 
     const hint = frontmatterValue(text, 'agent_hint')
     if (hint === null || hint === '') return projectDefault('the plan carries no agent_hint', planPath)
-    if (!AGENT_NAME.test(hint)) {
-      return asRequested('cannot-decide', `agent_hint ${JSON.stringify(clip(hint))} is not an agent name`, planPath)
-    }
     const routable = [SHELL_DEVELOPER, EXECUTOR, ...(config.executor === null ? [] : [config.executor])]
+    // Help names only installed specialists: a hint of gsd-executor would run the plan generic.
+    const fixHint = async (): Promise<string> => {
+      const installed: string[] = []
+      for (const agent of routable) {
+        if (agent !== EXECUTOR && !installed.includes(agent) && (await hasDefinition(agent, io))) installed.push(agent)
+      }
+      if (installed.length === 0) {
+        return `No routable specialist has an installed definition. ${install(config.executor ?? SHELL_DEVELOPER)}`
+      }
+      const remove = config.executor !== null && installed.includes(config.executor)
+      return (
+        `Set the plan's agent_hint to ${installed.join(' or ')}` +
+        `${remove ? ', or remove it to use the project executor' : ''}; until then the spawn is refused.`
+      )
+    }
+    if (!AGENT_NAME.test(hint)) {
+      return unplaced(`agent_hint ${JSON.stringify(clip(hint))} is not an agent name`, fixHint, planPath)
+    }
     if (!routable.includes(hint)) {
-      return asRequested('cannot-decide', `agent_hint ${hint} is outside the routable set (${routable.join(', ')})`, planPath)
+      return unplaced(`agent_hint ${hint} is outside the routable set`, fixHint, planPath)
     }
     if (!(await hasDefinition(hint, io))) {
-      return asRequested('cannot-decide', `agent_hint ${hint} names no installed definition`, planPath)
+      return unplaced(`agent_hint ${hint} names no installed definition`, install(hint), planPath)
     }
     if (hint === EXECUTOR) return keepExecutor('agent_hint gsd-executor', planPath)
     return setType(hint, 'rewrote', `agent_hint ${hint}; model cleared so the definition's own model applies`, planPath)

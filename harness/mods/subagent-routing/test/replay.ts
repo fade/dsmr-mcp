@@ -214,18 +214,29 @@ export function replay(recordings: readonly Recording[]): void {
       const beneath: AgentSpawnInput[] = []
       standIns(on, tape, log, beneath, e => ({ model: e.model ?? 'definition', agentId: 'replay' }))
 
-      await dispatch($, spawnInput(rec), [rec.input.subagentType, rec.expected.subagentType])
+      const result = await dispatch($, spawnInput(rec), [rec.input.subagentType, rec.expected.subagentType])
 
       expect(tape.misses).toEqual([])
+      const mine = logLinesFor(log.text, rec.input.tool_use_id)
+      expect(mine.length).toBe(1)
+      expect(mine[0]?.action).toBe(rec.expected.action)
+      expect(mine[0]?.error).toBe(undefined)
+      if (rec.expected.action === 'refused') {
+        // A refused spawn starts nothing and reaches the spawner as the Agent tool error.
+        expect(String(result.deny).startsWith('subagent-routing refused')).toBe(true)
+        expect(String(result.deny)).toContain('re-spawn')
+        expect(beneath.length).toBe(0)
+        expect(mine[0]?.set).toEqual({ type: rec.input.subagentType, model: rec.input.model ?? null })
+        expect(mine[0]?.resolvedModel).toBe(null)
+        expect(mine[0]?.agentId).toBe(null)
+        return
+      }
+      expect(result.deny).toBe(undefined)
       expect(beneath.length).toBe(1)
       const down = beneath[0]
       expect(down?.subagentType).toBe(rec.expected.subagentType)
       expect(down?.model ?? null).toBe(rec.expected.model)
-      const mine = logLinesFor(log.text, rec.input.tool_use_id)
-      expect(mine.length).toBe(1)
-      expect(mine[0]?.action).toBe(rec.expected.action)
       expect(mine[0]?.set).toEqual({ type: down?.subagentType, model: down?.model ?? null })
-      expect(mine[0]?.error).toBe(undefined)
     })
 
     if (rec.expected.action !== 'rewrote' && rec.expected.action !== 'cleared-model') continue
