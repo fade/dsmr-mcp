@@ -24,7 +24,7 @@ never-block-silently rule govern everything below.
 
 ## Step 0 — Arm your watch NOW, before anything else in this file
 
-⛔ **Go to Step 4, launch one detached watcher per joined bus and the background `--wake` with the
+⛔ **Go to Step 4, launch one detached watcher per bus (your own fleet's and `leaders`) and the background `--wake` with the
 lines given there, confirm each bus prints `live`, a `bus=` naming the bus you meant, and
 `readers=1` or more, and come back. Do not read Step 1 first.**
 
@@ -339,38 +339,25 @@ not a stand-down, not a FLEET-CLEAR. Those are addressed to that leader's worker
 governing you is the most natural mistake available, because the words are imperative and they
 arrive on a bus you can hear.
 
-⚠ **YOU MAY BE PRESENT ON ANOTHER LEADER'S BUS FOR A NARROW REASON, AND PRESENCE IS NOT
-MEMBERSHIP.** The usual reason is that you own shared tooling their fleet runs on, so their
-defects can reach you as they occur. That standing lets you answer tooling questions, take defect
-reports, and publish findings about the tooling. **It does not make you a sister in their
-constellation** and it does not make their operational traffic yours to hold.
+⛔ **ARM ONLY ON YOUR OWN FLEET'S BUS AND ON `leaders`** (operator, 2026-11-07). Never join, arm
+on, or drain a peer leader's fleet bus, even when you own tooling that fleet runs on. A peer
+leader reaches you on `leaders`, addressed by name, with tooling defects and dispatch requests.
+If you find yourself armed on a peer's fleet bus, reap it:
 
-⛔ **THE VENUE TRAP, which costs whole sessions:** a question you raise on someone else's fleet bus
-reads as a WORK ITEM to every repo on it, however carefully you address it, because direct
-addressing is off by default and every message reaches everyone. On 2026-08-01 a tooling question
-raised this way had six sisters sweeping their own trees unprompted, none of them dispatched.
-⇒ **Raise fleet-wide questions with THAT fleet's leader and let them dispatch it by name.** Ask
-for the answer; do not ask the fleet.
+```
+~/.local/bin/dsmr-bus-watch --reap --bus <peer-bus> --agent <your-name> --namespace <absolute-project-root>/
+```
+
+⛔ **THE VENUE TRAP, which costs whole sessions:** a question raised on a fleet bus reads as a
+WORK ITEM to every repo on it, however carefully you address it, because direct addressing is off
+by default and every message reaches everyone. On 2026-08-01 a tooling question raised this way
+had six sisters sweeping their own trees unprompted, none of them dispatched.
+⇒ **Raise fleet-wide questions with THAT fleet's leader, on `leaders`, and let them dispatch it
+by name.** Ask for the answer; do not ask the fleet.
 
 ⇒ **PEER LEADERS COORDINATE ON THE `leaders` BUS, not on either fleet bus.** That is where the
 split gets mutually recognised and recorded, so neither leader has to infer it from the other's
-behaviour. Join it, arm a watcher on it like any other bus, and state your fleet's membership and
-your standing on any other bus you sit on.
-
-⛔ **DRAIN ANOTHER FLEET'S BUS SILENTLY. NEVER NARRATE IT** (operator, 2026-08-02). Speak about
-off-fleet traffic in exactly two cases: it **addresses you**, or it **dispatches one of YOUR
-sisters**. Everything else is drained and dropped — no summary, no "not mine", no relay to the
-operator however good the finding is.
-
-⚠ **"Not mine" twelve times is still twelve interruptions.** Correctly declining to act and then
-reporting that you declined costs the operator the same attention as acting would have. You arm the
-watcher because you own shared tooling and their defects reach you there: that is a reason to
-LISTEN, never a reason to TALK.
-
-⚠ **Do NOT self-enroll on a roster you do not lead.** A roster records the OPERATOR'S intent; a
-participant who enrols itself converts it into self-assertion and destroys the only thing it is
-good for. That binds a leader harder than a worker. Arm and listen regardless — the roster gates
-nothing.
+behaviour. Join it, arm a watcher on it like any other bus, and state your fleet's membership.
 
 ## Step 3 — Every block in the fleet, batched
 
@@ -451,7 +438,7 @@ filters them. Never reconcile a drain against it.
 Arm the standing listener in two steps. This is the arm. Use it verbatim; do not
 compose one from memory.
 
-Once per session **per joined bus, each with its own `--bus`**, launch (or adopt)
+Once per session **per bus (your own fleet's and `leaders`, each with its own `--bus`)**, launch (or adopt)
 the detached watcher. It runs in its own session, survives the session, a park and
 a fleet restart, and re-arms itself at every idle recycle. If one is already up for
 you it answers `running` and is yours again:
@@ -475,7 +462,10 @@ your detached logs, and that exit is the wake:
 ```
 
 Launch it with `timeout: 7200000`; the 30-minute default kills it first.
-On wake, an `idle wake-seconds=<N>` line included: drain **every** joined bus with
+A routine wake (a re-arm, an idle tick, an INFO line, another fleet's traffic) gets no text to
+the operator: drain, re-arm, end the turn. Report only an error, real work, or a dispatch to or
+from a fleet.
+On wake, an `idle wake-seconds=<N>` line included: drain **every** bus you armed with
 `bus-receive`, then re-arm the same line, then one catch-up `bus-receive`. On
 `nowatcher bus=<b>` (exit 1): re-run `--detach`, then re-arm. ⛔ **The watch is
 permanent** (operator, 2026-10-01): a quiet bus is normal, and a runner kill at the
@@ -818,11 +808,10 @@ still sound, and still not a hose.
 - ⛔ Do not re-derive what a worker owns; dispatch it and check the claim.
 - ⛔ Do not let a spawned subagent take the stable bus identity.
 - ⛔ **Do not act on another leader's fleet orders.** A rotation, park, stand-down or
-  FLEET-CLEAR on a bus you merely listen to is addressed to that leader's workers, not to
-  you. Presence on their bus is not membership in their fleet.
-- ⛔ **Do not raise a fleet-wide question on another leader's bus.** Ask that leader; let
-  them dispatch it by name. Every message reaches every repo there, so a question reads as
-  a work item to all of them at once.
+  FLEET-CLEAR is addressed to that leader's workers, not to you, wherever you read it.
+- ⛔ **Do not join, arm on, or drain another leader's fleet bus.** Ask that leader on `leaders`;
+  let them dispatch it by name. Every message reaches every repo on a fleet bus, so a question
+  there reads as a work item to all of them at once.
 - ⛔ Do not broadcast anything a single named worker could act on.
 - ⛔ Do not relay one worker's inference to another as fact. Relay fidelity is a duty for the
   operator's *words*; it is the opposite for a worker's *inferences*.
