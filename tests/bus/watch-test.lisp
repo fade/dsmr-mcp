@@ -120,7 +120,19 @@
                 #:%gdbus-notify-args
                 #:opt-deaf-seconds
                 #:opt-park-p
-                #:opt-unpark-p)
+                #:opt-unpark-p
+                ;; internal: the severity floor of the fleet-log wake.
+                #:opt-min-level
+                #:%parse-min-level
+                #:%fleet-floor
+                #:%fleet-line-qualifies-p)
+  (:import-from #:dsmr-mcp/src/bus/hostfiles
+                #:fleet-line-level)
+  (:import-from #:dsmr-mcp/tests/support/fleet-log-lines
+                #:*recorded-info-roster-gap*
+                #:*recorded-info-recovered*
+                #:*recorded-warn-memory-pressure*
+                #:*recorded-error-unrelieved*)
   ;; The heartbeat helpers moved to a shared leaf so the watcher (writer) and the
   ;; MCP core (reader) share one implementation of the beat filename and format.
   ;; The pure liveness decision and its file-backed classifier both carry behavior
@@ -1433,6 +1445,92 @@
       (opt-wake-seconds
        (capturing-stderr (%parse-args '("--wake-seconds" "soon"))))
       "an unparseable value must keep the default"))
+
+;;; the fleet-log wake's severity floor ------------------------------------------
+
+;; The fleet lines below are recorded ones, from tests/support/fleet-log-lines.
+
+(defun floor-predicate (floor)
+  "The event test the fleet-log wake builds for FLOOR."
+  (lambda (line) (%fleet-line-qualifies-p line floor)))
+
+(define-test a-fleet-line-level-is-read-from-its-level-word
+  (is eq :info (fleet-line-level *recorded-info-roster-gap*))
+  (is eq :info (fleet-line-level *recorded-info-recovered*))
+  (is eq :warn (fleet-line-level *recorded-warn-memory-pressure*))
+  (is eq :error (fleet-line-level *recorded-error-unrelieved*))
+  (false (fleet-line-level "bus:1 from=old") "a line that is not a fleet line has no level"))
+
+(define-test min-level-parses-the-three-levels-in-any-case
+  (is eq :error (%parse-min-level "ERROR"))
+  (is eq :warn (%parse-min-level "warn"))
+  (is eq :info (%parse-min-level "Info")))
+
+(define-test an-unknown-min-level-parses-to-nil
+  (false (%parse-min-level "DEBUG"))
+  (false (%parse-min-level "WARNING"))
+  (false (%parse-min-level ""))
+  (false (%parse-min-level nil)))
+
+(define-test min-level-flag-parses-and-a-dangling-one-is-recorded-as-missing
+  (is string= "ERROR" (opt-min-level (%parse-args '("--wake" "--fleet-log" "--min-level" "ERROR"))))
+  (false (opt-min-level (%parse-args '("--wake" "--fleet-log"))))
+  (is eq :missing (opt-min-level (%parse-args '("--wake" "--fleet-log" "--min-level"))))
+  (false (%parse-min-level :missing) "a missing level is not a level"))
+
+(define-test the-fleet-floor-defaults-to-warn
+  (is eq :warn (%fleet-floor (%parse-args '("--wake" "--fleet-log"))))
+  (is eq :info (%fleet-floor (%parse-args '("--wake" "--fleet-log" "--min-level" "info")))))
+
+(define-test a-fleet-line-qualifies-at-or-above-the-floor
+  (false (%fleet-line-qualifies-p *recorded-info-roster-gap* :warn))
+  (false (%fleet-line-qualifies-p *recorded-info-recovered* :warn))
+  (true (%fleet-line-qualifies-p *recorded-warn-memory-pressure* :warn))
+  (true (%fleet-line-qualifies-p *recorded-error-unrelieved* :warn))
+  (true (%fleet-line-qualifies-p *recorded-info-roster-gap* :info))
+  (true (%fleet-line-qualifies-p *recorded-info-recovered* :info))
+  (true (%fleet-line-qualifies-p *recorded-warn-memory-pressure* :info))
+  (true (%fleet-line-qualifies-p *recorded-error-unrelieved* :info))
+  (false (%fleet-line-qualifies-p *recorded-warn-memory-pressure* :error))
+  (true (%fleet-line-qualifies-p *recorded-error-unrelieved* :error))
+  (false (%fleet-line-qualifies-p "bus:1 from=old" :info) "a line that is not a fleet line never qualifies"))
+
+(define-test fleet-wake-default-floor-skips-info
+  ;; The INFO line is a recorded roster-gap note.
+  (call-with-temp-logs
+   1 (lambda (log)
+       (append-later log *recorded-info-roster-gap* 0.1)
+       (append-later log *recorded-warn-memory-pressure* 0.4)
+       (multiple-value-bind (outcome line)
+           (%wake-wait (list (list nil log nil)) 20
+                       :watcher-alive-p (constantly t) :deadline-ms 5000
+                       :event-p (floor-predicate
+                                 (%fleet-floor (%parse-args '("--wake" "--fleet-log")))))
+         (is eq :event outcome)
+         (is equal *recorded-warn-memory-pressure* line)))))
+
+(define-test fleet-floor-error-skips-warn
+  (call-with-temp-logs
+   1 (lambda (log)
+       (append-later log *recorded-warn-memory-pressure* 0.1)
+       (append-later log *recorded-error-unrelieved* 0.4)
+       (multiple-value-bind (outcome line)
+           (%wake-wait (list (list nil log nil)) 20
+                       :watcher-alive-p (constantly t) :deadline-ms 5000
+                       :event-p (floor-predicate :error))
+         (is eq :event outcome)
+         (is equal *recorded-error-unrelieved* line)))))
+
+(define-test fleet-floor-info-wakes-on-info
+  (call-with-temp-logs
+   1 (lambda (log)
+       (append-later log *recorded-info-roster-gap* 0.1)
+       (multiple-value-bind (outcome line)
+           (%wake-wait (list (list nil log nil)) 20
+                       :watcher-alive-p (constantly t) :deadline-ms 5000
+                       :event-p (floor-predicate :info))
+         (is eq :event outcome)
+         (is equal *recorded-info-roster-gap* line)))))
 
 (define-test a-followed-log-survives-truncation-and-replacement
   ;; A half-written line at the arm is not an event, a truncated log is read

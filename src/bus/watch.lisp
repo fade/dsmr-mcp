@@ -70,6 +70,8 @@
   ;; public surface is unchanged.
   (:import-from #:dsmr-mcp/src/bus/heartbeat
                 #:default-watch-dir)
+  (:import-from #:dsmr-mcp/src/bus/hostfiles
+                #:fleet-line-level)
   (:export #:main
            #:watch-until-foreign
            #:watch-stream
@@ -819,6 +821,13 @@ Options:
                        host where neither the service nor the fleet log has
                        ever existed it prints `noservice` and exits 1.
                        Cannot be combined with --hook.
+  --min-level LEVEL    with --wake --fleet-log, the floor: the lowest level
+                       that wakes, ERROR, WARN, or INFO, matched in any case
+                       (default WARN, so an INFO line such as a `recovered`
+                       note never wakes). A line below the floor is read past,
+                       and no later wake reports it. A missing or unknown
+                       level is refused with exit 64 and nothing on STDOUT.
+                       With any other mode it is ignored with a warning.
   --deaf-seconds N     how long a wake line may sit unheard in a detached
                        watcher's log before the watcher raises the deafness
                        alarm (default 600; 0 turns the alarm off). A line
@@ -857,8 +866,9 @@ Options:
   -h, --help           print this help and exit
 
 An unknown flag, or a flag with an unparseable value, is reported on STDERR and
-then ignored — the watcher keeps running on defaults rather than leaving the
-agent deaf to the bus.
+then ignored, and the watcher keeps running on defaults rather than leaving the
+agent deaf to the bus. The exception is --min-level on a fleet-log wake: a
+missing or unknown level exits 64 (see --min-level).
 
 Exit-on-event prints one `bus:<SEQ>` line then exits 0; on idle recycle it
 prints `recycle:` then exits 0. Streaming prints one
@@ -916,6 +926,7 @@ detached watcher, its pid file.
   (host-restore-p nil)
   (host-failed-p nil)
   (fleet-log-p nil)
+  (min-level nil)
   (help-p nil))
 
 (defun %parse-nonneg (string flag)
@@ -943,7 +954,10 @@ detached watcher, its pid file.
    continues with what remains. This is a wake primitive, and it favors
    availability over strictness: an agent that mistypes a flag should get a
    watcher on default cadence, not silence. Refusing to start would leave the
-   agent deaf to the bus with an empty stdout and nothing to say why."
+   agent deaf to the bus with an empty stdout and nothing to say why.
+
+   A --min-level with no value after it is recorded as :MISSING, for MAIN to
+   refuse on a fleet-log wake."
   (let ((opts (make-options))
         (rest args))
     (labels ((next-value (flag)
@@ -1001,6 +1015,8 @@ detached watcher, its pid file.
                  ((string= arg "--stall-seconds")
                   (setf (opt-stall-seconds opts)
                         (next-nonneg "--stall-seconds" (opt-stall-seconds opts))))
+                 ((string= arg "--min-level")
+                  (setf (opt-min-level opts) (if rest (pop rest) :missing)))
                  ((string= arg "--wal")
                   (setf (opt-wal opts) (or (next-value "--wal") (opt-wal opts))))
                  ((string= arg "--agent")
@@ -3245,6 +3261,32 @@ detached watcher, its pid file.
   (force-output *error-output*)
   (uiop:quit 2))
 
+(defconstant +fleet-wake-default-floor+ :warn
+  "The lowest level that ends a fleet-log wake when --min-level is not given.")
+
+(defun %parse-min-level (string)
+  "STRING as a fleet level, :ERROR, :WARN, or :INFO, compared without regard to
+   case. NIL for any other word, and for anything that is not a string."
+  (cond ((not (stringp string)) nil)
+        ((string-equal string "ERROR") :error)
+        ((string-equal string "WARN") :warn)
+        ((string-equal string "INFO") :info)))
+
+(defun %fleet-floor (opts)
+  "The lowest level that ends the fleet-log wake for OPTS: its --min-level, or
+   +FLEET-WAKE-DEFAULT-FLOOR+ when none was given."
+  (or (%parse-min-level (opt-min-level opts)) +fleet-wake-default-floor+))
+
+(defun %fleet-line-qualifies-p (line floor)
+  "True when LINE is a fleet line whose level ranks at or above FLOOR, with INFO
+   below WARN below ERROR. A fleet line whose level cannot be read qualifies at
+   every floor."
+  (and (hostfiles:fleet-line-p line)
+       (let ((level (fleet-line-level line))
+             (ranks '(:info 0 :warn 1 :error 2)))
+         (or (null level)
+             (>= (getf ranks level) (getf ranks floor 0))))))
+
 (defun %fleet-offset-path (self-id)
   "Where SELF-ID's fleet-log listener keeps its read offset:
    fleet-error--<agent>--<hash>.offset in the host directory. The fleet log is
@@ -3256,8 +3298,10 @@ detached watcher, its pid file.
                 "fleet-error--" (%identity-stem self-id) ".offset")))
 
 (defun %wake-fleet-log (opts self-id)
-  "Block until the next fleet line reaches the host's fleet error log, print it
-   and exit 0, or print the idle line and exit 0 when --wake-seconds pass first.
+  "Block until the next fleet line at or above the floor (--min-level, default
+   WARN) reaches the host's fleet error log, print it and exit 0, or print the
+   idle line and exit 0 when --wake-seconds pass first. Lines below the floor
+   are read past.
    This is --wake --fleet-log: what a leader keeps armed in the background so
    a fault the host service could not heal reaches it without polling.
 
@@ -3299,7 +3343,9 @@ detached watcher, its pid file.
         (multiple-value-bind (outcome line)
             (%wake-wait (list (list nil log nil)) (opt-poll-ms opts)
                         :watcher-alive-p (constantly t)
-                        :event-p #'hostfiles:fleet-line-p
+                        :event-p (let ((floor (%fleet-floor opts)))
+                                   (lambda (line)
+                                     (%fleet-line-qualifies-p line floor)))
                         :deadline-ms listen-ms
                         :start-offsets (and saved
                                             (list (cons (uiop:native-namestring log)
@@ -3431,7 +3477,9 @@ detached watcher, its pid file.
    without watching. Signal lines go to *standard-output*; usage, diagnostics,
    and errors go to *error-output*. Exit 0 on a fired/recycled watch or a live
    heartbeat, 1 on a stale/absent heartbeat, 2 on a liveness probe with no
-   resolvable identity, 64 on an unrecoverable failure, 75 when the watch
+   resolvable identity, 64 on an unrecoverable failure or a refused usage
+   (--fleet-log without --wake or with --hook, or a missing or unknown
+   --min-level on a fleet-log wake), 75 when the watch
    wedged, and 143 on SIGTERM. A bad flag is not an unrecoverable failure, and
    neither is an unresolvable identity for a watch; an unusable bus name is,
    because the alternative is a watch armed on a bus nobody is talking on.
@@ -3469,6 +3517,20 @@ detached watcher, its pid file.
                    (or (not (opt-wake-p opts)) (opt-hook-p opts)))
           (%warn "--fleet-log goes with --wake, and not with --hook")
           (uiop:quit 64))
+        ;; A missing or unknown floor on a fleet-log wake is refused: a default
+        ;; would hide faults the caller asked to hear, or wake it on noise it
+        ;; asked to skip. On any other mode the flag is ignored: refusing a bus
+        ;; wake over a flag it does not use leaves the agent deaf.
+        (when (opt-min-level opts)
+          (cond ((not (opt-fleet-log-p opts))
+                 (%warn "--min-level goes with --wake --fleet-log; ignoring it"))
+                ((eq (opt-min-level opts) :missing)
+                 (%warn "--min-level requires a value: ERROR, WARN, or INFO")
+                 (uiop:quit 64))
+                ((null (%parse-min-level (opt-min-level opts)))
+                 (%warn "--min-level takes ERROR, WARN, or INFO, not ~S"
+                        (opt-min-level opts))
+                 (uiop:quit 64))))
         ;; About the host, not about one identity or one bus, so it answers
         ;; before either is resolved.
         (when (opt-host-status-p opts)

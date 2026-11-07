@@ -80,6 +80,7 @@
    ;; fleet log
    #:fleet-line
    #:fleet-line-p
+   #:fleet-line-level
    #:append-fleet-line
    ;; stranded cursors
    #:heal-stranded-baseline))
@@ -575,6 +576,19 @@
 (defun fleet-line-p (line)
   "True when LINE is a fleet-log line."
   (and (search " FLEET " line) t))
+
+(defun fleet-line-level (line)
+  "The level LINE carries, as :ERROR, :WARN, or :INFO. NIL when LINE is not a
+   fleet line, or when the word after FLEET is not one of the three words a
+   fleet line is written with."
+  (let ((at (search " FLEET " line)))
+    (when at
+      (let* ((start (+ at (length " FLEET ")))
+             (end (or (position #\Space line :start start) (length line)))
+             (word (subseq line start end)))
+        (cond ((string= word "ERROR") :error)
+              ((string= word "WARN") :warn)
+              ((string= word "INFO") :info))))))
 
 (defun append-fleet-line (line &optional (path (fleet-log-path)))
   "Append LINE and a newline to the fleet log at PATH in a single write on a

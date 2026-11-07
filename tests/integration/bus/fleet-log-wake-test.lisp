@@ -22,7 +22,11 @@
 
 (defpackage #:dsmr-mcp/tests/integration/bus/fleet-log-wake-test
   (:use #:cl #:zebra #:dsmr-mcp/tests/integration/bus/host-support)
-  (:local-nicknames (#:hostfiles #:dsmr-mcp/src/bus/hostfiles)))
+  (:local-nicknames (#:hostfiles #:dsmr-mcp/src/bus/hostfiles))
+  (:import-from #:dsmr-mcp/tests/support/fleet-log-lines
+                #:*recorded-info-roster-gap*
+                #:*recorded-warn-memory-pressure*
+                #:*recorded-error-unrelieved*))
 
 (in-package #:dsmr-mcp/tests/integration/bus/fleet-log-wake-test)
 
@@ -236,6 +240,74 @@ nothing without --wake: both are usage errors."
         (declare (ignore err))
         (is = 64 code)
         (is string= "" out)))))
+
+(define-test fleet-wake-reads-past-an-info-line-by-default
+  "With no --min-level the floor is WARN: the recorded roster-gap INFO note
+leaves the wake running, and the WARN line after it ends the wait."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-service state)
+      (let ((wake (apply #'start-wake state "--wake" "--fleet-log"
+                         "--wake-seconds" "30" (id-args))))
+        (settle)
+        (append-line state *recorded-info-roster-gap*)
+        (false (await-exit wake 2) "an INFO line ended the default wait")
+        (append-line state *recorded-warn-memory-pressure*)
+        (multiple-value-bind (out code) (finish-fleet-wake state wake 10)
+          (is eql 0 code)
+          (is string= *recorded-warn-memory-pressure* out))))))
+
+(define-test fleet-wake-at-min-level-info-wakes-on-info
+  "--min-level INFO lowers the floor, so the INFO note ends the wait."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-service state)
+      (let ((wake (apply #'start-wake state "--wake" "--fleet-log"
+                         "--min-level" "INFO" "--wake-seconds" "30" (id-args))))
+        (settle)
+        (append-line state *recorded-info-roster-gap*)
+        (multiple-value-bind (out code) (finish-fleet-wake state wake 10)
+          (is eql 0 code)
+          (is string= *recorded-info-roster-gap* out))))))
+
+(define-test fleet-wake-refuses-an-unknown-min-level
+  "A level other than ERROR, WARN, or INFO is a usage error: exit 64, nothing on
+stdout, and the bad level named on stderr."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-service state)
+      (multiple-value-bind (out err code)
+          (apply #'run-in state bin "--wake" "--fleet-log" "--min-level" "DEBUG"
+                 "--wake-seconds" "2" (id-args))
+        (is = 64 code)
+        (is string= "" out)
+        (true (search "DEBUG" err) "stderr: ~A" err)))))
+
+(define-test fleet-wake-refuses-a-min-level-with-no-value
+  "A --min-level left with no value on a fleet-log wake is refused like an
+unknown level: exit 64 and nothing on stdout."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-service state)
+      (multiple-value-bind (out err code)
+          (apply #'run-in state bin "--wake" "--fleet-log" "--wake-seconds" "2"
+                 (append (id-args) (list "--min-level")))
+        (is = 64 code "stderr: ~A" err)
+        (is string= "" out)
+        (true (search "--min-level" err) "stderr: ~A" err)))))
+
+(define-test a-bus-wake-ignores-min-level
+  "--min-level on a bus wake is warned about and ignored: the bus wake still
+runs, and with no detached watcher reports nowatcher."
+  (with-binary (bin)
+    (with-host-state (state)
+      (install-service state)
+      (multiple-value-bind (out err code)
+          (apply #'run-in state bin "--wake" "--min-level" "ERROR"
+                 "--wake-seconds" "2" (id-args))
+        (is = 1 code "stderr: ~A" err)
+        (is string= (format nil "nowatcher bus=~A" *bus*) out)
+        (true (search "--min-level" err) "stderr: ~A" err)))))
 
 ;;; the service-failed alarm ------------------------------------------------------
 
