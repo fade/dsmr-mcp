@@ -606,21 +606,25 @@ the Monitor tool:
 ~/.local/bin/dsmr-bus-watch --wake --fleet-log --agent <your-name> --namespace <absolute-project-root>/
 ```
 
-It exits on the next line written to the fleet error log, printed as
-`<time> FLEET <ERROR|WARN|INFO> code=<code> bus=<b> id=<id> msg=<text>`. Treat
-that exit as a wake: read the line, run `--host-status`, act on it
+It exits on the next WARN or ERROR line written to the fleet error log and
+prints every such line found in one read of the log, one per line, as
+`<time> FLEET <ERROR|WARN|INFO> code=<code> bus=<b> id=<id> msg=<text>`. A fleet
+line whose level cannot be read wakes it too. INFO
+lines, such as the `recovered` notes, never wake it; `--min-level INFO` makes
+them wake it. Treat that exit as a wake: read what it printed, run `--host-status`, act on it
 (`--host-restore` for a degraded bus) or carry it to the operator, then re-arm
 the same line. `idle wake-seconds=<N>` is a wake with nothing in it: re-arm.
 `noservice` (exit 1) means this host has never had the service; do not re-arm.
-It resumes where the last one stopped reading, so a line written between two
-arms is still reported, and it never blocks your bus listener. Arm exactly one:
+It resumes where the last one stopped reading, so a WARN or ERROR line written
+between two arms is still reported, even across a rollover of the log, and it
+never blocks your bus listener. Arm exactly one:
 a second for your identity answers `already-armed`.
 `FLEET ERROR code=service-failed` means the service failed and systemd is
 restarting it; the operator also gets a desktop notification for it. It stays in
 your footer until `--host-status` reads `alive` again.
 Memory relief writes three codes a leader acts on.
 `FLEET WARN code=memory-pressure` says the host entered pressure and relief
-began: note it in your footer until its `recovered` line arrives.
+began: note it in your footer until `--host-status` stops reading `state=pressure`.
 `FLEET ERROR code=memory-pressure-unrelieved`, or `code=breaker-tripped` whose
 message names memory-pressure, says relief has run out or is running hot:
 carry it to the operator at once, who decides what to park or stop.
@@ -728,7 +732,11 @@ Report to the operator, in this order and nothing else:
    (Step 4) at every reply, reduced to four things: every bus that reads `owner=client`, the
    service line's state and `beat-age`, the memory line while it reads `state=pressure`, and any
    fleet-log line you have not yet seen resolved. On
-   a host where it reads `not-installed`, leave it out.
+   a host where it reads `not-installed`, leave it out. A fleet-log item is resolved, and leaves
+   the footer, when `--host-status` no longer shows its condition, or when the fleet log holds its
+   `recovered` line, which the listener does not print at its default floor:
+   `grep 'code=<code> .*msg=recovered' ~/.local/state/dsmr-mcp/host/fleet-error.log*`. A code
+   that never writes a `recovered` line, such as `worker-resume-failed`, leaves it once reported.
 4. What you are doing next.
 
 Then dispatch. **By name, one worker, one task.** Never broadcast work. Before each dispatch, run
