@@ -1349,7 +1349,9 @@ Generate a complete Lisp project skeleton under the session root.
 Emits a package-inferred-system with a mode-dispatching executable, Zebra 
 test suite, build recipe, dev-boot script, dependency-preference agent docs, 
 a copied REPL-development guide, and a selectable license with per-file SPDX 
-headers. Returns a manifest of created files and next-step commands.
+headers. The new project includes the lint gate (linter config, lint script, 
+and a pre-commit gate) whenever the scaffold creates its repository. Returns a 
+manifest of created files and next-step commands.
 
 #+begin_src json
 {
