@@ -243,9 +243,15 @@ A break in function is always in scope for repair. Style is not, in a project I 
 to, but I still want every lint result I have seen tracked. So the gate appends each finding it
 shows to =lisp-gate/findings.tsv= under the repository's git directory: one row per finding per
 run, never deduplicated, shared by every worktree, and never tracked. Each row carries the time,
-the gate's mode, the class, mallet's category, the severity, the rule, the path, the line and
-column, and the message. A closing line after the findings gives the record's path and the count
-in each class.
+the gate's mode, the worktree and branch the commit was made in, the class, mallet's category,
+the severity, the rule, the path, the line and column, and the message. A closing line after the
+findings gives the record's path and the count in each class.
+
+Commits in several worktrees at once append under a lock, =flock(1)= where it is installed and a
+lock directory beside the record otherwise, so the header is written once and rows never
+interleave. The category is read from mallet's JSON whatever order its keys arrive in. A record
+that cannot be written or locked within about ten seconds costs you one notice line, never the
+commit.
 
 The class comes from the category mallet assigns each rule:
 

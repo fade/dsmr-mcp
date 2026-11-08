@@ -690,8 +690,8 @@ Line 7 ends in three spaces. The expectations below are mallet 0.9.1's recorded
 default-preset output for this exact text, in line and JSON format.")
 
 (defparameter +findings-header+
-  '("recorded_at" "mode" "class" "category" "severity" "rule" "path" "line"
-    "column" "message")
+  '("recorded_at" "mode" "worktree" "branch" "class" "category" "severity" "rule"
+    "path" "line" "column" "message")
   "The column names on the first line of the findings record.")
 
 (defparameter +planted-shown+
@@ -755,18 +755,30 @@ planted.lisp, and GATE to the gate rendered for PROFILE."
        (%stage ,root "planted.lisp" +planted-source+)
        ,@body)))
 
-(defun %check-record-rows (table mode expected)
+(defun %row-finding (row)
+  "Return ROW without its time, mode, worktree and branch columns."
+  (nthcdr 4 row))
+
+(defun %check-record-rows (table mode expected &key worktree)
   "Check that TABLE is the header followed by EXPECTED, each row recorded under
-MODE with a UTC time."
+MODE with a UTC time, a worktree and a branch. WORKTREE, when given, is the
+directory every row must name."
   (is equal +findings-header+ (first table) "the first line is the header")
-  (is equal expected (mapcar #'cddr (rest table))
+  (is equal expected (mapcar #'%row-finding (rest table))
       "one row per shown finding, classed from its category: ~S" table)
   (dolist (row (rest table))
     (is string= mode (second row) "the row names the gate's mode: ~S" row)
     (true (and (= 20 (length (first row)))
                (char= #\Z (char (first row) 19))
                (char= #\T (char (first row) 10)))
-          "the row carries a UTC ISO-8601 time: ~S" row)))
+          "the row carries a UTC ISO-8601 time: ~S" row)
+    (true (uiop:absolute-pathname-p (third row))
+          "the row names its worktree: ~S" row)
+    (true (plusp (length (fourth row))) "the row names its branch: ~S" row)
+    (when worktree
+      (is string= (namestring (truename worktree))
+          (namestring (uiop:ensure-directory-pathname (third row)))
+          "the row names the worktree the gate ran in: ~S" row))))
 
 (define-test the-blocking-gate-records-every-finding-it-shows
   "RECORD CONTROL, against mallet 0.9.1's recorded output for +PLANTED-SOURCE+.
@@ -782,7 +794,8 @@ gate writes shows in git status."
           ((gate-scanner-available-p)
            (is equal +planted-shown+ (%finding-lines output)
                "the finding lines are mallet's own: ~A" output)
-           (%check-record-rows (%record-table root) "blocking" +planted-rows+)
+           (%check-record-rows (%record-table root) "blocking" +planted-rows+
+                               :worktree root)
            (true (find-if (lambda (line)
                             (search "1 functional, 2 style, 0 unclassified" line))
                           (%gate-lines output))
@@ -841,18 +854,21 @@ leaves the header and the first run's rows as they were."
     (let ((first-run (%record-table root)))
       (%run-gate root gate)
       (let ((second-run (%record-table root)))
-        (when (gate-scanner-available-p)
-          (is = 4 (length first-run) "header and three rows: ~S" first-run)
-          (is = 7 (length second-run) "three rows appended: ~S" second-run)
-          (is equal first-run (subseq second-run 0 (length first-run))
-              "the earlier lines are unchanged")
-          (is equal +planted-rows+ (mapcar #'cddr (nthcdr 4 second-run))
-              "the appended rows are the second run's findings"))))))
+        (if (gate-scanner-available-p)
+            (progn
+              (is = 4 (length first-run) "header and three rows: ~S" first-run)
+              (is = 7 (length second-run) "three rows appended: ~S" second-run)
+              (is equal first-run (subseq second-run 0 (length first-run))
+                  "the earlier lines are unchanged")
+              (is equal +planted-rows+ (mapcar #'%row-finding (nthcdr 4 second-run))
+                  "the appended rows are the second run's findings"))
+            (skip ("no linter at ~A, so the gate records nothing to append to"
+                   (linter-path))))))))
 
 (define-test a-linked-worktree-appends-to-the-shared-record
   "LINKED-WORKTREE CONTROL. A run in a linked worktree appends to the record
-under the git directory every worktree shares, and creates nothing under the
-worktree's own git directory."
+under the git directory every worktree shares, names that worktree in each row,
+and creates nothing under the worktree's own git directory."
   (with-temp-git-repo (root :initial-file "README.md" :initial-content "notes
 ")
     (with-linked-worktree (worktree root)
@@ -863,13 +879,18 @@ worktree's own git directory."
         (%stage worktree "planted.lisp" +planted-source+)
         (multiple-value-bind (output code) (%run-gate worktree gate)
           (is = 1 code "the blocking gate refuses the commit: ~A" output)
-          (when (gate-scanner-available-p)
-            (is equal (namestring (%findings-directory root))
-                (namestring (%findings-directory worktree))
-                "both worktrees name one record directory")
-            (%check-record-rows (%record-table root) "blocking" +planted-rows+)
-            (false (probe-file (merge-pathnames "lisp-gate/" own))
-                   "nothing under the worktree's own git directory ~A" own)))))))
+          (if (gate-scanner-available-p)
+              (progn
+                (is equal (namestring (%findings-directory root))
+                    (namestring (%findings-directory worktree))
+                    "both worktrees name one record directory")
+                (%check-record-rows (%record-table root) "blocking" +planted-rows+
+                                    :worktree worktree)
+                (is string= "side" (fourth (second (%record-table root)))
+                    "the row names the worktree's branch")
+                (false (probe-file (merge-pathnames "lisp-gate/" own))
+                       "nothing under the worktree's own git directory ~A" own))
+              (skip ("no linter at ~A, so the gate records nothing" (linter-path)))))))))
 
 (define-test an-unreadable-category-is-recorded-as-unclassified
   "FAILED-JSON CONTROL. MALLET names a wrapper that runs the real linter for
@@ -877,7 +898,8 @@ every format but JSON and exits 2 for JSON, so no category can be read. Every
 row is unclassified under the category unknown, and the gate's output and exit
 status equal those of the same change under the real linter. The wrapper adds
 no finding text of its own."
-  (when (gate-scanner-available-p)
+  (if (not (gate-scanner-available-p))
+    (skip ("no linter at ~A for the wrapper to run" (linter-path)))
     (let ((bin (dsmr-mcp/tests/support/fs-fixture:%make-temp-directory)))
       (unwind-protect
            (let ((wrapper (merge-pathnames "mallet-no-json" bin)))
@@ -942,12 +964,87 @@ finding as functional."
 ")
       (multiple-value-bind (output code) (%run-gate root gate)
         (is = 0 code "the informational gate lets the commit through: ~A" output)
-        (when (gate-scanner-available-p)
-          (let ((row (find "error-without-custom-condition" (rest (%record-table root))
-                           :key #'sixth :test #'equal)))
-            (true row "the practice finding is recorded: ~A" output)
-            (when row
-              (is string= "practice" (fourth row) "its category: ~S" row)
-              (is string= "functional" (third row) "its class: ~S" row)
-              (is equal '("boom.lisp" "2" "2") (subseq row 6 9)
-                  "its place: ~S" row))))))))
+        (if (gate-scanner-available-p)
+            (let ((row (find "error-without-custom-condition"
+                             (mapcar #'%row-finding (rest (%record-table root)))
+                             :key #'fourth :test #'equal)))
+              (true row "the practice finding is recorded: ~A" output)
+              (when row
+                (is string= "practice" (second row) "its category: ~S" row)
+                (is string= "functional" (first row) "its class: ~S" row)
+                (is equal '("boom.lisp" "2" "2") (subseq row 4 7)
+                    "its place: ~S" row)))
+            (skip ("no linter at ~A, so the gate records nothing" (linter-path))))))))
+
+(defun %write-linter-wrapper (path script)
+  "Write SCRIPT, a bash body run with REAL naming the linter, to PATH as an
+executable wrapper and return PATH."
+  (with-open-file (out path :direction :output :if-exists :supersede
+                            :if-does-not-exist :create :element-type 'character)
+    (format out "#!/usr/bin/env bash~%REAL='~A'~%~A~%" (namestring (linter-path)) script))
+  (uiop:run-program (list "chmod" "+x" (namestring path)))
+  path)
+
+(define-test categories-are-read-whatever-the-json-key-order
+  "REORDERED-JSON CONTROL. MALLET names a wrapper that runs the real linter and,
+for JSON only, prints each violation's keys in reverse order: still valid JSON
+holding the same values. Every row keeps the class and category mallet 0.9.1's
+recorded output gives the rule, exactly as with the real linter."
+  (if (not (gate-scanner-available-p))
+      (skip ("no linter at ~A for the wrapper to run" (linter-path)))
+      (let ((bin (dsmr-mcp/tests/support/fs-fixture:%make-temp-directory)))
+        (unwind-protect
+             (let ((wrapper (%write-linter-wrapper
+                             (merge-pathnames "mallet-reordered" bin)
+                             "json=0
+for arg in \"$@\"; do [ \"$arg\" = json ] && json=1; done
+[ \"$json\" = 0 ] && exec \"$REAL\" \"$@\"
+\"$REAL\" \"$@\" | awk '
+  /^ *\"(rule|severity|line|column|message|category)\": / { buf[++n] = $0; next }
+  /^ *}/ && n > 0 {
+    for (i = n; i >= 1; i--) { l = buf[i]; sub(/,$/, \"\", l); print l (i > 1 ? \",\" : \"\") }
+    n = 0
+  }
+  { print }'
+exit \"${PIPESTATUS[0]}\"")))
+               (with-planted-gate (root gate :ours)
+                 (multiple-value-bind (output code)
+                     (%run-gate root gate :mallet (namestring wrapper))
+                   (is = 1 code "the exit status is unchanged: ~A" output)
+                   (%check-record-rows (%record-table root) "blocking"
+                                       +planted-rows+))))
+          (uiop:delete-directory-tree bin :validate t :if-does-not-exist :ignore)))))
+
+(define-test the-record-is-appended-under-a-lock
+  "LOCK CONTROL. Another process holds flock(1) on the record for three
+seconds and then writes a marker file. The gate waits for the lock: when it
+returns, the marker exists, and the record holds one header and the run's
+rows. Skipped where flock(1) is not installed."
+  (cond
+    ((not (gate-scanner-available-p))
+     (skip ("no linter at ~A, so the gate records nothing" (linter-path))))
+    ((not (zerop (nth-value 2 (uiop:run-program (list "sh" "-c" "command -v flock")
+                                                :ignore-error-status t))))
+     (skip "flock(1) is not installed here, so the gate takes its fallback lock"))
+    (t
+     (with-planted-gate (root gate :ours)
+       (let* ((dir (%findings-directory root))
+              (record (merge-pathnames "findings.tsv" dir))
+              (marker (merge-pathnames "released" dir)))
+         (ensure-directories-exist record)
+         (with-open-file (out record :direction :output :if-does-not-exist :create
+                                     :if-exists :append)
+           (declare (ignore out)))
+         (let ((holder (uiop:launch-program
+                        (list "flock" (namestring record) "sh" "-c"
+                              (format nil "sleep 3; : > '~A'" (namestring marker))))))
+           (unwind-protect
+                (progn
+                  (sleep 0.5)
+                  (multiple-value-bind (output code) (%run-gate root gate)
+                    (is = 1 code "the blocking gate refuses the commit: ~A" output)
+                    (true (probe-file marker)
+                          "the gate returned only after the holder released the lock")
+                    (%check-record-rows (%record-table root) "blocking"
+                                        +planted-rows+)))
+             (uiop:wait-process holder))))))))

@@ -23,13 +23,18 @@
 # Record: every finding shown is appended, one tab-separated row per finding
 # per run, to lisp-gate/findings.tsv under the git common directory, so every
 # worktree of the repository shares one record and none of it is tracked.
-# Columns: recorded_at, mode, class, category, severity, rule, path, line,
-# column, message. The category is the linter's own rule category, read from a
-# second run in JSON format; the class comes from FINDING_CLASSES below. A
-# category that cannot be read is recorded as unknown, class unclassified.
-# Severity does not decide the class: the linter reports trailing whitespace
-# and real defects at the same severity. The record never changes the exit
-# status; a record that cannot be written is one notice line.
+# Columns: recorded_at, mode, worktree, branch, class, category, severity,
+# rule, path, line, column, message. The worktree is the absolute root of the
+# worktree the commit is made in, and the branch is its checked-out branch, or
+# "detached". The category is the linter's own rule category, read from a
+# second run in JSON format, whatever order its keys come in; the class comes
+# from FINDING_CLASSES below. A category that cannot be read is recorded as
+# unknown, class unclassified. Severity does not decide the class: the linter
+# reports trailing whitespace and real defects at the same severity. Runs in
+# several worktrees append under a lock: flock(1) on the record where it is
+# installed, otherwise a lock directory beside it, so the header is written
+# once and rows never interleave. The record never changes the exit status; a
+# record that cannot be written or locked is one notice line.
 #
 # MALLET overrides the linter location; without it, DSMR_LINTER does, as it
 # does for the debt scan.
@@ -141,6 +146,7 @@ finding_rows() {
     printf '%s\n' "$2" | sed 's/^/J /'
     sed 's/^/F /'
   } | GATE_PATH="$1" GATE_TIME="$NOW" GATE_MODE="$GATE_MODE" \
+    GATE_WORKTREE="$ROOT" GATE_BRANCH="$BRANCH" \
     FINDING_CLASSES="$FINDING_CLASSES" awk '
     function clean(s) { gsub(/[\t\r\n]/, " ", s); return s }
     function value(s) {
@@ -156,22 +162,26 @@ finding_rows() {
         cls[substr(pairs[i], 1, eq - 1)] = substr(pairs[i], eq + 1)
       }
       path = clean(ENVIRON["GATE_PATH"])
+      worktree = clean(ENVIRON["GATE_WORKTREE"])
+      branch = clean(ENVIRON["GATE_BRANCH"])
     }
-    # JSON: one key per line, in the order rule, severity, line, column,
-    # message, category. Anything out of that order drops the violation.
+    # JSON: one key per line, in any order. Each object opens a fresh set of
+    # fields; a closing brace files the category of an object holding a rule,
+    # a line, a column and a category, and drops anything else.
     /^J / {
       s = substr($0, 3)
-      if (state == 0 && s ~ /^ *"rule": /) { rule = value(s); state = 1 }
-      else if (state == 1 && s ~ /^ *"severity": /) state = 2
-      else if (state == 2 && s ~ /^ *"line": /) { line = value(s) + 0; state = 3 }
-      else if (state == 3 && s ~ /^ *"column": /) { col = value(s) + 0; state = 4 }
-      else if (state == 4 && s ~ /^ *"message": /) state = 5
-      else if (state == 5 && s ~ /^ *"category": /) {
-        k = line SUBSEP col SUBSEP rule
-        if (!(k in category)) category[k] = value(s)
-        state = 0
+      if (s ~ /^ *[{]/) { rule = ""; line = ""; col = ""; cat = "" }
+      else if (s ~ /^ *"rule": /) rule = value(s)
+      else if (s ~ /^ *"line": /) line = value(s) + 0
+      else if (s ~ /^ *"column": /) col = value(s) + 0
+      else if (s ~ /^ *"category": /) cat = value(s)
+      else if (s ~ /^ *[}]/) {
+        if (rule != "" && line != "" && col != "" && cat != "") {
+          k = line SUBSEP col SUBSEP rule
+          if (!(k in category)) category[k] = cat
+        }
+        rule = ""; line = ""; col = ""; cat = ""
       }
-      else if (state >= 1 && state <= 4) state = 0
       next
     }
     /^F / {
@@ -195,19 +205,49 @@ finding_rows() {
         msg = substr(body, 1, pos - 1)
       }
       k = (h[1] + 0) SUBSEP (h[2] + 0) SUBSEP r
-      cat = (k in category) ? category[k] : "unknown"
-      c = (cat in cls) ? cls[cat] : "unclassified"
-      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\n",
-        ENVIRON["GATE_TIME"], ENVIRON["GATE_MODE"], c, clean(cat), sev,
-        clean(r), path, h[1], h[2], clean(msg)
+      fc = (k in category) ? category[k] : "unknown"
+      c = (fc in cls) ? cls[fc] : "unclassified"
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\n",
+        ENVIRON["GATE_TIME"], ENVIRON["GATE_MODE"], worktree, branch, c,
+        clean(fc), sev, clean(r), path, h[1], h[2], clean(msg)
     }'
+}
+
+# Append ROWS to the record file $1, writing the header first when the file is
+# empty, while holding the record's lock. Returns non-zero when the lock cannot
+# be taken within about ten seconds or the write fails.
+append_locked() {
+  local file="$1" lock="$1.lock" status tries=0
+  local header=$'recorded_at\tmode\tworktree\tbranch\tclass\tcategory\tseverity\trule\tpath\tline\tcolumn\tmessage\n'
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>>"$file" || return 1
+    if ! flock -w 10 9; then
+      exec 9>&-
+      return 1
+    fi
+    [ -s "$file" ] && header=''
+    printf '%s%s' "$header" "$ROWS" >&9
+    status=$?
+    exec 9>&-
+    return "$status"
+  fi
+  until mkdir -- "$lock" 2>/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -ge 10 ] && return 1
+    sleep 1
+  done
+  [ -s "$file" ] && header=''
+  printf '%s%s' "$header" "$ROWS" >>"$file"
+  status=$?
+  rmdir -- "$lock" 2>/dev/null
+  return "$status"
 }
 
 # Append ROWS to the record under the git common directory, then print one
 # line naming it with the count of each class, or one line saying the
 # findings were not recorded. Never exits.
 record_findings() {
-  local common dir file text f s u
+  local common dir file f s u
   common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
     common=''
   if [ -z "$common" ]; then
@@ -216,22 +256,19 @@ record_findings() {
   fi
   dir="$common/lisp-gate"
   file="$dir/findings.tsv"
-  text="$ROWS"
-  [ -s "$file" ] ||
-    text=$'recorded_at\tmode\tclass\tcategory\tseverity\trule\tpath\tline\tcolumn\tmessage\n'"$ROWS"
-  if mkdir -p -- "$dir" 2>/dev/null &&
-    printf '%s' "$text" 2>/dev/null >>"$file"; then
+  if mkdir -p -- "$dir" 2>/dev/null && append_locked "$file" 2>/dev/null; then
     read -r f s u < <(printf '%s' "$ROWS" | awk -F '\t' '
-      { n[$3]++ }
+      { n[$5]++ }
       END { print n["functional"] + 0, n["style"] + 0, n["unclassified"] + 0 }')
     printf 'lisp-gate: recorded %d finding(s) in %s (%d functional, %d style, %d unclassified).\n' \
       "$((f + s + u))" "$file" "$f" "$s" "$u"
   else
-    printf 'lisp-gate: findings not recorded: cannot write %s\n' "$file"
+    printf 'lisp-gate: findings not recorded: cannot write or lock %s\n' "$file"
   fi
 }
 
 NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+BRANCH="$(git symbolic-ref --short -q HEAD 2>/dev/null)" || BRANCH='detached'
 ROWS=''
 KEPT=()
 REFUSE=0
