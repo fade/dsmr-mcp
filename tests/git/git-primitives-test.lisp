@@ -191,3 +191,19 @@ the wrong reason."
          (false (equal first second))
       (uiop:delete-directory-tree first :validate t :if-does-not-exist :ignore)
       (uiop:delete-directory-tree second :validate t :if-does-not-exist :ignore))))
+
+;;; --- fixture independence from the host init template -----------------------
+
+(define-test fixture-repositories-carry-no-host-template
+  "A fixture repository holds no hook and no exclude file from the host's init
+template, so a test's outcome does not depend on whose machine runs it. The
+repository's own HEAD file is asserted present in the same test, so the absence
+checks are aimed at a real git directory rather than at nothing."
+  (with-temp-git-repo (root)
+    (let ((git-dir (merge-pathnames ".git/" root)))
+      (true (probe-file (merge-pathnames "HEAD" git-dir))
+            "the fixture created a real git directory")
+      (false (probe-file (merge-pathnames "hooks/pre-commit" git-dir))
+             "no pre-commit hook arrived from an init template")
+      (false (probe-file (merge-pathnames "info/exclude" git-dir))
+             "no exclude file arrived from an init template"))))

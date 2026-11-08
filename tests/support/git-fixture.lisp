@@ -23,7 +23,6 @@
   (:use #:cl)
   (:import-from #:dsmr-mcp/src/git
                 #:run-git
-                #:git-init
                 #:git-remote-add)
   (:import-from #:dsmr-mcp/tests/support/fs-fixture
                 #:write-fixture-file)
@@ -130,9 +129,13 @@ committed, so the repository has real history and a resolvable HEAD rather than
 the empty state a bare git init leaves behind.
 
 The caller owns the returned tree and must delete it. Prefer WITH-TEMP-GIT-REPO,
-which does that unconditionally."
+which does that unconditionally.
+
+The repository is created with an empty init template, so no hook or exclude
+file from the host's configured template reaches it. The code under test still
+creates its own repositories through GIT-INIT and the real template."
   (let ((root (%make-temp-repo-directory)))
-    (git-init root)
+    (run-git (list "init" "-q" "--template=") :directory root)
     (%configure-fixture-identity root)
     (when initial-file
       (fixture-commit-file root initial-file (or initial-content "")
