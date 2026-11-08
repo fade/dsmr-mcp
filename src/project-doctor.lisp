@@ -241,16 +241,20 @@ be able to see the two values rather than take the claim on trust."
 The project name comes from the directory the repository sits in, which is the
 only name a repository we did not create is guaranteed to have. Both an item's
 path and its content go through these, because the catalog names one file after
-the project it belongs to."
-  (let ((spdx "AGPL-3.0-or-later"))
-    (list (cons "name" (%repo-name root))
-          (cons "description" "")
-          (cons "author" "")
-          (cons "license" spdx)
-          (cons "spdx" spdx)
-          (cons "copyright" "")
-          (cons "year" (%current-year))
-          (cons "license-body" ""))))
+the project it belongs to.
+
+The licence, identifier, and copyright keys are bound to the empty string. An
+adopted project's licence is its own, so a template that names one renders
+nothing here."
+  (list (cons "name" (%repo-name root))
+        (cons "description" "")
+        (cons "author" "")
+        (cons "license" "")
+        (cons "spdx" "")
+        (cons "spdx-line" "")
+        (cons "copyright" "")
+        (cons "year" (%current-year))
+        (cons "license-body" "")))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Where an item lands, and what it should contain
