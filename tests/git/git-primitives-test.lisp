@@ -18,6 +18,7 @@
 
 (defpackage #:dsmr-mcp/tests/git/git-primitives-test
   (:use #:cl #:zebra)
+  (:import-from #:sb-posix)
   (:import-from #:dsmr-mcp/src/git
                 #:run-git
                 #:git-command-error
@@ -207,3 +208,35 @@ checks are aimed at a real git directory rather than at nothing."
              "no pre-commit hook arrived from an init template")
       (false (probe-file (merge-pathnames "info/exclude" git-dir))
              "no exclude file arrived from an init template"))))
+
+(defmacro %with-environment-variable ((name value) &body body)
+  "Run BODY with the process environment variable NAME set to VALUE, then
+restore whatever NAME held before, or unset it."
+  (let ((old (gensym "OLD-")))
+    `(let ((,old (sb-posix:getenv ,name)))
+       (unwind-protect
+            (progn (sb-posix:setenv ,name ,value 1) ,@body)
+         (if ,old
+             (sb-posix:setenv ,name ,old 1)
+             (sb-posix:unsetenv ,name))))))
+
+(define-test an-inherited-git-dir-does-not-redirect-a-command
+  "A GIT_DIR inherited from the parent process, as a git hook exports it, must
+not redirect a command aimed at another repository with -C. The config write
+lands in the repository named by DIRECTORY, and the repository GIT_DIR names
+is checked unchanged in the same test, so the assertion is aimed at both."
+  (with-temp-git-repo (decoy)
+    (with-temp-git-repo (target)
+      (%with-environment-variable
+          ("GIT_DIR" (namestring (merge-pathnames ".git/" decoy)))
+        (run-git (list "config" "--local" "probe.key" "target")
+                 :directory target))
+      (is string= "target"
+          (string-trim '(#\Newline)
+                       (run-git (list "config" "--local" "--get" "probe.key")
+                                :directory target :error-on-failure nil))
+          "the write landed in the repository named by DIRECTORY")
+      (is = 1 (nth-value 2 (run-git (list "config" "--local" "--get"
+                                          "probe.key")
+                                    :directory decoy :error-on-failure nil))
+          "the repository named by GIT_DIR was not written"))))

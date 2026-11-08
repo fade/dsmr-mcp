@@ -94,21 +94,36 @@ simply not met.")
   #+sbcl (sb-ext:posix-environ)
   #-sbcl nil)
 
+(defvar +repository-variables+
+  '("GIT_DIR" "GIT_WORK_TREE" "GIT_INDEX_FILE" "GIT_COMMON_DIR"
+    "GIT_OBJECT_DIRECTORY" "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+    "GIT_CONFIG_PARAMETERS" "GIT_CONFIG_COUNT" "GIT_PREFIX"
+    "GIT_NAMESPACE")
+  "Inherited variables that select a repository, index, or config for git.
+They outrank -C, and a git hook exports several of them, so an inherited one
+would aim the child at another repository than the one the caller names.")
+
 (defun %child-environment ()
   "Return the environment handed to a git child process.
 
 The inherited environment is preserved so git still finds its configuration,
-its PATH and the operator's locale. Two entries are forced on top of it, and
-any inherited entry of the same name is dropped so the forced value wins: a
-git that cannot find credentials must fail immediately rather than stop and
-wait for a password, because no terminal is attached to answer it and the
-whole caller would hang."
+its PATH and the operator's locale, with two exceptions:
+  - every variable in +REPOSITORY-VARIABLES+, and the numbered
+    GIT_CONFIG_KEY_n and GIT_CONFIG_VALUE_n entries, are dropped, so DIRECTORY
+    alone names the repository;
+  - GIT_TERMINAL_PROMPT=0 and GIT_ASKPASS=/bin/true are forced, replacing any
+    inherited value: no terminal is attached to answer a credential prompt, so
+    a git that cannot find credentials must fail rather than hang the caller."
   (let ((forced (list "GIT_TERMINAL_PROMPT=0" "GIT_ASKPASS=/bin/true")))
     (append forced
             (remove-if (lambda (entry)
-                         (member (%environment-key entry) forced
-                                 :key #'%environment-key
-                                 :test #'string=))
+                         (let ((key (%environment-key entry)))
+                           (or (member key forced :key #'%environment-key
+                                                  :test #'string=)
+                               (member key +repository-variables+
+                                       :test #'string=)
+                               (uiop:string-prefix-p "GIT_CONFIG_KEY_" key)
+                               (uiop:string-prefix-p "GIT_CONFIG_VALUE_" key))))
                        (%inherited-environment)))))
 
 ;;; ---------------------------------------------------------------------------
