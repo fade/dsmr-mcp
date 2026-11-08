@@ -298,6 +298,62 @@ failing form."
       (uiop:delete-directory-tree ambient :validate t
                                           :if-does-not-exist :ignore))))
 
+(define-test a-file-the-linter-cannot-name-is-never-passed-silently
+  "GLOB-NAME CONTROL. The linter reads a wildcard character in an argument as a
+pattern and prints such a name escaped, so its findings cannot be attributed to
+the file. The blocking gate refuses the commit instead of passing it with no
+findings; the informational gate lets it through and says the file was
+skipped."
+  (let ((name "a*b.lisp"))
+    (flet ((write-native (root content)
+             ;; A Lisp namestring reads * as a wildcard; write by native name.
+             (with-open-file (out (uiop:parse-native-namestring
+                                   (concatenate 'string (namestring root) name))
+                                  :direction :output :if-exists :supersede
+                                  :if-does-not-exist :create
+                                  :element-type 'character)
+               (write-string content out))
+             (run-git (list "add" "--" name) :directory root)))
+      (dolist (case '((:ours 1) (:foreign 0)))
+        (destructuring-bind (profile expected) case
+          (with-temp-git-repo (root :initial-file "lib.lisp"
+                                    :initial-content +two-form-source+)
+            (let ((gate (%install-gate root (render-pre-commit-hook
+                                             :profile profile))))
+              (write-native root +two-form-source+)
+              (run-git (list "commit" "-q" "-m" "glob name") :directory root)
+              (write-native root (%edit-second-form))
+              (multiple-value-bind (output code) (%run-gate root gate)
+                (is = expected code "~S: exit status: ~A" profile output)
+                (when (gate-scanner-available-p)
+                  (true (search "skipped" output)
+                        "~S: the output says the file was skipped: ~A"
+                        profile output))))))))))
+
+(define-test a-textconv-driver-does-not-move-the-touched-form
+  "TEXTCONV CONTROL. A diff driver whose textconv prepends four lines shifts the
+hunk line numbers of a plain git diff. The gate reads the staged blob's own
+line numbers, so an edit to the first form still reports line 2 and not the
+second form's line 6."
+  (with-foreign-gate (root gate)
+    (write-fixture-file root ".git/info/attributes" "*.lisp diff=shift
+")
+    (run-git (list "config" "--local" "diff.shift.textconv"
+                   "sh -c 'printf \"\\n\\n\\n\\n\"; cat \"$1\"' textconv")
+             :directory root)
+    (%stage root "lib.lisp" (%edit-first-form))
+    (true (search "@@ -5"
+                  (run-git (list "diff" "--cached" "-U0" "--" "lib.lisp")
+                           :directory root))
+          "precondition: the driver shifts the plain diff's hunk")
+    (multiple-value-bind (output code) (%run-gate root gate)
+      (is = 0 code "the informational gate lets the commit through: ~A" output)
+      (when (gate-scanner-available-p)
+        (true (%reports-p output "lib.lisp:2:")
+              "the touched form's finding is reported: ~A" output)
+        (false (%reports-p output "lib.lisp:6:")
+               "the untouched form's finding is not reported: ~A" output)))))
+
 (define-test the-blocking-gate-passes-when-only-untouched-forms-fail
   "Touching only the clean form lets the commit through although the other form
 in the same file carries a finding."

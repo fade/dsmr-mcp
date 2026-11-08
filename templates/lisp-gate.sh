@@ -12,8 +12,9 @@
 #
 # Modes, fixed when this file is rendered:
 #   informational  report the findings; exit 0 on every path.
-#   blocking       exit 1 when a reported finding is an error or a warning, or
-#                  when the linter cannot run; exit 0 otherwise.
+#   blocking       exit 1 when a reported finding is an error or a warning,
+#                  when the linter cannot run, or when a staged file cannot be
+#                  linted; exit 0 otherwise.
 #
 # Bound: a top-level form starts at a line whose first character is an open
 # parenthesis. Such a line inside a multi-line string or a block comment reads
@@ -84,7 +85,8 @@ regions() {
   local path="$1" copy="$2"
   {
     grep -n '^(' -- "$copy" | cut -d: -f1 | sed 's/^/S /'
-    git diff --cached -U0 --no-color --no-ext-diff -- "$path" |
+    git --literal-pathspecs diff --cached -U0 --no-color --no-ext-diff \
+      --no-textconv -- "$path" |
       sed -n 's/^@@ -[0-9,]* +\([0-9][0-9]*\)\(,\([0-9][0-9]*\)\)\{0,1\} @@.*/H \1 \3/p'
   } | awk '
     $1 == "S" { starts[++n] = $2 + 0; next }
@@ -109,10 +111,20 @@ regions() {
 
 KEPT=()
 REFUSE=0
+SKIPPED=0
 for path in "${FILES[@]}"; do
+  # The linter reads * ? [ in an argument as a pattern and prints a name
+  # holding them, or a backslash, escaped, so its findings could not be
+  # attributed to the file.
   case "$path" in
     *$'\n'*)
       printf 'lisp-gate: skipped a staged file whose name holds a newline\n'
+      SKIPPED=$((SKIPPED + 1))
+      continue
+      ;;
+    *'*'* | *'?'* | *'['* | *\\*)
+      printf 'lisp-gate: skipped %s: the linter reads its name as a pattern\n' "$path"
+      SKIPPED=$((SKIPPED + 1))
       continue
       ;;
   esac
@@ -130,7 +142,7 @@ for path in "${FILES[@]}"; do
   done < <(regions "$path" "$copy")
   [ "${#LO[@]}" -eq 0 ] && continue
 
-  output="$(cd -- "$TMP" && "$MALLET" "${LINT_ARGS[@]}" "./$path" 2>&1)"
+  output="$(cd -- "$TMP" || exit 125; "$MALLET" "${LINT_ARGS[@]}" "./$path" 2>&1)"
   status=$?
   case "$status" in
     0 | 1) ;;
@@ -140,7 +152,14 @@ for path in "${FILES[@]}"; do
   prefix="$path:"
   found=()
   while IFS= read -r line; do
-    [ "${line:0:${#prefix}}" = "$prefix" ] || continue
+    if [ "${line:0:${#prefix}}" != "$prefix" ]; then
+      # A finding line naming another file means the output was not read as
+      # expected; in blocking mode that is a gate that cannot do its work.
+      if blocking && [[ "$line" =~ ^[^:]+:[0-9]+:[0-9]+:\ (error|warning|info):\  ]]; then
+        cannot_run "the linter reported a finding for $path under another name"
+      fi
+      continue
+    fi
     rest="${line:${#prefix}}"
     [[ "$rest" =~ ^([0-9]+):[0-9]+:\ (error|warning|info):\  ]] || continue
     n="${BASH_REMATCH[1]}"
@@ -162,7 +181,11 @@ for path in "${FILES[@]}"; do
 done
 
 count="${#KEPT[@]}"
-if blocking && [ "$REFUSE" -eq 1 ]; then
+if blocking && [ "$SKIPPED" -gt 0 ]; then
+  printf 'lisp-gate: %d staged file(s) could not be linted; commit refused (%s). %s\n' \
+    "$SKIPPED" "$GATE_MODE" "$BYPASS"
+  status=1
+elif blocking && [ "$REFUSE" -eq 1 ]; then
   printf 'lisp-gate: %d finding(s) in the forms this commit touches; commit refused on an error or warning (%s). %s\n' \
     "$count" "$GATE_MODE" "$BYPASS"
   status=1
