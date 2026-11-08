@@ -199,7 +199,7 @@ resolve them."
 
 A hard fork is ours whatever its remotes say. An entry is added by the
 operator's decision in a reviewed commit and is never computed; there is no
-environment override. The operator declared these two on 2026-11-07.
+environment override.
 
 A DEFVAR rather than a DEFPARAMETER so that an override installed at runtime
 survives reloading the system, matching *OUR-GIT-ACCOUNTS*.")

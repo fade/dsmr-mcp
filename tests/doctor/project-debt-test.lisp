@@ -218,8 +218,8 @@ else signals rather than rendering either mode."
   "EMPTY-BASELINE CONTROL. Both cases asserted against each other in one test.
 
 A renderer emitting an empty table for an empty site list is indistinguishable
-on the page from a baseline nobody ever populated, and this phase asserts mostly
-on absence. So the empty case must carry the sentence and must NOT carry the
+on the page from a baseline nobody ever populated, and the adoption checks
+assert mostly on absence. So the empty case must carry the sentence and must NOT carry the
 table header, while the populated case must carry the header and the row. Split
 across two tests, deleting either leaves a green suite that cannot tell the two
 apart."

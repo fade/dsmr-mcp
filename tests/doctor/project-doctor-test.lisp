@@ -517,7 +517,7 @@ that gate is informational and never refuses, so the commit goes through."
 
 Absent before and present after, in one test. An existence assertion that was
 never observed failing cannot tell a document that was written from a report
-saying one was, and this phase's whole debt story rests on the difference.
+saying one was, and recording debt means nothing without the difference.
 
 The same test asserts the file is neither tracked nor visible in the
 maintainer's status. Present, excluded and invisible is the whole two-mode
