@@ -765,6 +765,19 @@ it satisfies exactly as well."
                   (string= "lisp-gate" (file-namestring (getf entry :path)))))
            entries))
 
+(defun %check-gate-not-installed (root report)
+  "Assert REPORT names the gate unresolved as :NOT-INSTALLED with the reason, and
+that no gate file is at ROOT's gate path."
+  (let ((entry (%gate-file-entry (report-unresolved report))))
+    (false (probe-file (gate-hook-path root)) "no gate file was written")
+    (is eq :not-installed (getf entry :action-taken)
+        "the gate is reported not installed: ~S" entry)
+    (true (and (getf entry :reason)
+               (search "configured hooks" (getf entry :reason)))
+          "with the reason: ~S" entry)
+    (false (%gate-file-entry (report-changed report))
+           "the gate is not reported as a change")))
+
 (defun %local-config-text (root)
   "Return the text of ROOT's local git config."
   (uiop:read-file-string
@@ -807,7 +820,8 @@ Returns the second run's report."
 
 (define-test a-foreign-repair-installs-the-informational-gate-and-wires-it
   "The gate lands executable and informational, git runs it, and the report names
-both the file and the wiring as changes."
+both the file and the wiring as changes. A git without configured hooks gets no
+gate, reported not installed."
   (with-fixture-template ()
     (with-temp-git-repo (root :origin-url +third-party-origin-url+
                               :initial-file "README.md" :initial-content "x")
@@ -815,22 +829,20 @@ both the file and the wiring as changes."
       (false (probe-file (gate-hook-path root)) "precondition: no gate yet")
       (let* ((report (normalise-repository root :policy :repair))
              (gate (gate-hook-path root)))
-        (true (probe-file gate) "the gate was written")
-        (true (%executable-p gate) "and is executable")
-        (true (%gate-mode-p gate "informational") "and informational")
-        (false (%gate-mode-p gate "blocking") "and not blocking")
-        (is eq :created
-            (getf (%gate-file-entry (report-changed report)) :action-taken)
-            "the gate file is reported as created")
         (if (configured-hooks-supported-p root)
             (progn
+              (true (probe-file gate) "the gate was written")
+              (true (%executable-p gate) "and is executable")
+              (true (%gate-mode-p gate "informational") "and informational")
+              (false (%gate-mode-p gate "blocking") "and not blocking")
+              (is eq :created
+                  (getf (%gate-file-entry (report-changed report)) :action-taken)
+                  "the gate file is reported as created")
               (true (gate-hook-wired-p root) "git runs the gate at pre-commit")
               (is eq :created
                   (getf (%wiring-entry (report-changed report)) :action-taken)
                   "the wiring is reported as created"))
-            (is eq :not-wired
-                (getf (%wiring-entry (report-unresolved report)) :action-taken)
-                "a git without configured hooks leaves the wiring unresolved")))
+            (%check-gate-not-installed root report)))
       (%check-never-leaked root)
       (%check-second-run-is-quiet root)
       (%check-never-leaked root))))
@@ -838,7 +850,8 @@ both the file and the wiring as changes."
 (define-test a-repair-in-a-linked-worktree-installs-the-shared-gate
   "LINKED-WORKTREE CONTROL. Run from a linked worktree, whose .git is a file, the
 repair completes: the exclude and the gate land in the git directory the
-worktrees share, the gate is wired, and nothing reaches either index."
+worktrees share, the gate is wired, and nothing reaches either index. A git
+without configured hooks gets no gate, reported not installed."
   (with-fixture-template ()
     (with-temp-git-repo (root :origin-url +third-party-origin-url+
                               :initial-file "README.md" :initial-content "x")
@@ -851,21 +864,24 @@ worktrees share, the gate is wired, and nothing reaches either index."
           (is equal (namestring (merge-pathnames "hooks/lisp-gate" shared))
               (namestring (gate-hook-path worktree))
               "the gate path is in the shared git directory")
-          (true (probe-file (gate-hook-path worktree)) "the gate was written")
-          (true (%executable-p (gate-hook-path worktree)) "and is executable")
           (is equal (namestring (merge-pathnames "info/exclude" shared))
               (namestring (getf (report-exclude report) :path))
               "the exclude written is the shared one")
-          (when (configured-hooks-supported-p worktree)
-            (true (gate-hook-wired-p worktree) "the gate is wired")
-            (true (gate-hook-wired-p root)
-                  "and reads as wired from the main worktree too"))
+          (if (configured-hooks-supported-p worktree)
+              (progn
+                (true (probe-file (gate-hook-path worktree)) "the gate was written")
+                (true (%executable-p (gate-hook-path worktree)) "and is executable")
+                (true (gate-hook-wired-p worktree) "the gate is wired")
+                (true (gate-hook-wired-p root)
+                      "and reads as wired from the main worktree too"))
+              (%check-gate-not-installed worktree report))
           (%check-never-leaked worktree)
           (%check-never-leaked root))))))
 
 (define-test an-existing-pre-commit-hook-is-left-alone-and-the-gate-goes-beside-it
   "A pre-commit already in the hooks directory is byte-identical after the repair,
-and the gate is installed and wired next to it rather than mistaken for it."
+and the gate is installed and wired next to it rather than mistaken for it. A git
+without configured hooks gets no gate, reported not installed."
   (with-fixture-template ()
     (with-temp-git-repo (root :origin-url +third-party-origin-url+
                               :initial-file "README.md" :initial-content "x")
@@ -875,28 +891,27 @@ and the gate is installed and wired next to it rather than mistaken for it."
              (report (normalise-repository root :policy :repair)))
         (is equalp before (%octets existing)
             "the existing hook is byte-identical after the repair")
-        (true (probe-file (gate-hook-path root)) "the gate was installed")
-        (is eq :created
-            (getf (%gate-file-entry (report-changed report)) :action-taken)
-            "and reported as created")
         (false (member :pre-commit (report-already-correct report))
                "the existing hook was not taken for the gate")
         (if (configured-hooks-supported-p root)
             (progn
+              (true (probe-file (gate-hook-path root)) "the gate was installed")
+              (is eq :created
+                  (getf (%gate-file-entry (report-changed report)) :action-taken)
+                  "and reported as created")
               (true (gate-hook-wired-p root) "the gate is wired")
               (is eq :created
                   (getf (%wiring-entry (report-changed report)) :action-taken)
                   "and the wiring is reported as created"))
-            (is eq :not-wired
-                (getf (%wiring-entry (report-unresolved report)) :action-taken)
-                "a git without configured hooks leaves the wiring unresolved"))
+            (%check-gate-not-installed root report))
         (%check-never-leaked root)
         (%check-second-run-is-quiet root)
         (is equalp before (%octets existing)
             "and still byte-identical after a second run")))))
 
 (define-test a-repository-of-ours-gets-the-blocking-gate
-  "Declared ours on the call, the repository receives the blocking rendering."
+  "Declared ours on the call, the repository receives the blocking rendering. A
+git without configured hooks gets no gate, reported not installed."
   (with-fixture-template ()
     (with-temp-git-repo (root :origin-url +ours-origin-url+
                               :initial-file "README.md" :initial-content "x")
@@ -905,19 +920,19 @@ and the gate is installed and wired next to it rather than mistaken for it."
                                                :declared-classification :ours))
             (gate (gate-hook-path root)))
         (is eq :ours (report-profile report))
-        (true (probe-file gate) "the gate was written")
-        (true (%gate-mode-p gate "blocking") "and rendered blocking")
-        (false (%gate-mode-p gate "informational") "and not informational")
         (if (configured-hooks-supported-p root)
-            (true (gate-hook-wired-p root) "and wired")
-            (is eq :not-wired
-                (getf (%wiring-entry (report-unresolved report)) :action-taken)
-                "a git without configured hooks leaves the wiring unresolved")))
+            (progn
+              (true (probe-file gate) "the gate was written")
+              (true (%gate-mode-p gate "blocking") "and rendered blocking")
+              (false (%gate-mode-p gate "informational") "and not informational")
+              (true (gate-hook-wired-p root) "and wired"))
+            (%check-gate-not-installed root report)))
       (%check-second-run-is-quiet root :declared-classification :ours))))
 
 (define-test a-present-gate-file-is-kept-and-only-the-wiring-is-added
   "A gate file already in place is left as it is and reported already correct;
-only the missing wiring is written and reported as a change."
+only the missing wiring is written and reported as a change. A git without
+configured hooks leaves the file as it is and reports the gate not installed."
   (with-fixture-template ()
     (with-temp-git-repo (root :origin-url +third-party-origin-url+
                               :initial-file "README.md" :initial-content "x")
@@ -931,19 +946,24 @@ only the missing wiring is written and reported as a change."
           (is equalp before (%octets gate) "the gate file is byte-identical")
           (false (%gate-file-entry (report-changed report))
                  "the gate file is not reported as a change")
-          (false (%gate-file-entry (report-unresolved report))
-                 "nor as unresolved")
-          (true (member :pre-commit (report-already-correct report))
-                "it is reported as already correct")
           (if (configured-hooks-supported-p root)
               (progn
+                (false (%gate-file-entry (report-unresolved report))
+                       "nor as unresolved")
+                (true (member :pre-commit (report-already-correct report))
+                      "it is reported as already correct")
                 (true (gate-hook-wired-p root) "the gate is now wired")
                 (is eq :created
                     (getf (%wiring-entry (report-changed report)) :action-taken)
                     "and the wiring is reported as created"))
-              (is eq :not-wired
-                  (getf (%wiring-entry (report-unresolved report)) :action-taken)
-                  "a git without configured hooks leaves the wiring unresolved"))))
+              (let ((entry (%gate-file-entry (report-unresolved report))))
+                (is eq :not-installed (getf entry :action-taken)
+                    "the gate is reported not installed: ~S" entry)
+                (true (and (getf entry :reason)
+                           (search "configured hooks" (getf entry :reason)))
+                      "with the reason: ~S" entry)
+                (false (member :pre-commit (report-already-correct report))
+                       "and not reported already correct")))))
       (%check-never-leaked root)
       (%check-second-run-is-quiet root))))
 
@@ -951,7 +971,8 @@ only the missing wiring is written and reported as a change."
   "PROFILE-CHANGE CONTROL. A repository adopted as foreign holds the
 informational gate. Once it is declared ours, the repair replaces that gate
 with the blocking rendering and rewires the command, rather than reporting the
-old gate already correct."
+old gate already correct. A git without configured hooks leaves the old gate as
+it is and reports the gate not installed."
   (with-fixture-template ()
     (with-temp-git-repo (root :origin-url +ours-origin-url+
                               :initial-file "README.md" :initial-content "x")
@@ -963,22 +984,31 @@ old gate already correct."
         (uiop:run-program (list "chmod" "+x" (namestring gate)))
         (when (configured-hooks-supported-p root)
           (wire-gate-hook root :profile :foreign))
-        (let ((report (normalise-repository root :policy :repair
-                                                 :declared-classification :ours)))
+        (let* ((before (%octets gate))
+               (report (normalise-repository root :policy :repair
+                                                  :declared-classification :ours)))
           (is eq :ours (report-profile report))
-          (true (%gate-mode-p gate "blocking") "the gate is now blocking")
-          (true (%executable-p gate) "and executable")
           (false (member :pre-commit (report-already-correct report))
                  "the old gate is not reported already correct")
-          (is eq :replaced
-              (getf (%gate-file-entry (report-changed report)) :action-taken)
-              "the gate file is reported replaced")
-          (when (configured-hooks-supported-p root)
-            (true (gate-hook-wired-p root :profile :ours)
-                  "the command is the blocking one")
-            (is eq :replaced
-                (getf (%wiring-entry (report-changed report)) :action-taken)
-                "the wiring is reported replaced")))
+          (if (configured-hooks-supported-p root)
+              (progn
+                (true (%gate-mode-p gate "blocking") "the gate is now blocking")
+                (true (%executable-p gate) "and executable")
+                (is eq :replaced
+                    (getf (%gate-file-entry (report-changed report)) :action-taken)
+                    "the gate file is reported replaced")
+                (true (gate-hook-wired-p root :profile :ours)
+                      "the command is the blocking one")
+                (is eq :replaced
+                    (getf (%wiring-entry (report-changed report)) :action-taken)
+                    "the wiring is reported replaced"))
+              (let ((entry (%gate-file-entry (report-unresolved report))))
+                (is equalp before (%octets gate) "the old gate is byte-identical")
+                (is eq :not-installed (getf entry :action-taken)
+                    "the gate is reported not installed: ~S" entry)
+                (true (and (getf entry :reason)
+                           (search "configured hooks" (getf entry :reason)))
+                      "with the reason: ~S" entry))))
         (%check-second-run-is-quiet root :declared-classification :ours)))))
 
 (define-test a-file-at-the-gate-path-that-is-not-the-gate-is-left-alone

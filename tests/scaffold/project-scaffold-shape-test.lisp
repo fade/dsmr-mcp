@@ -298,28 +298,34 @@ over every file the scaffold generated."
               "the linter config holds more than one form"))))))
 
 (define-test a-new-repository-gets-the-blocking-gate-wired
-  "A scaffold that creates the repository installs the blocking gate in its own hooks."
+  "A scaffold that creates the repository installs the blocking gate in its own hooks.
+A git without configured hooks gets no gate, reported not installed."
   (with-temp-project-root (session root)
     (let* ((outcome (scaffold-into root))
            (project (project-directory outcome))
            (gate-report (getf outcome :gate-hook))
            (gate (gate-hook-path project)))
-      (is eq :created (getf gate-report :action-taken)
-          "the result does not report the gate as created")
-      (is equal (namestring gate) (namestring (getf gate-report :path))
-          "the reported gate path is not the repository's gate path")
-      (true (probe-file gate) "no gate file at the repository's gate path")
-      (true (%executable-p gate) "the installed gate is not executable")
-      (is string= (render-pre-commit-hook :profile :ours)
-          (uiop:read-file-string gate)
-          "the installed gate is not the blocking rendering")
       (if (configured-hooks-supported-p project)
           (progn
+            (is eq :created (getf gate-report :action-taken)
+                "the result does not report the gate as created")
+            (is equal (namestring gate) (namestring (getf gate-report :path))
+                "the reported gate path is not the repository's gate path")
+            (true (probe-file gate) "no gate file at the repository's gate path")
+            (true (%executable-p gate) "the installed gate is not executable")
+            (is string= (render-pre-commit-hook :profile :ours)
+                (uiop:read-file-string gate)
+                "the installed gate is not the blocking rendering")
             (is eq :created (getf (getf gate-report :wiring) :action-taken)
                 "the wiring was not reported as created")
             (true (gate-hook-wired-p project) "the gate is not wired"))
-          (is eq :not-wired (getf (getf gate-report :wiring) :action-taken)
-              "a git without configured hooks reported the gate as wired")))))
+          (progn
+            (false (probe-file gate) "a gate file was written where git cannot run it")
+            (is eq :not-installed (getf gate-report :action-taken)
+                "the gate is not reported as not installed: ~S" gate-report)
+            (true (and (getf gate-report :reason)
+                       (search "configured hooks" (getf gate-report :reason)))
+                  "the report gives no reason: ~S" gate-report))))))
 
 (define-test a-git-without-configured-hooks-gets-no-gate-file
   "UNSUPPORTED-GIT CONTROL. Where git cannot run configured hooks, the scaffold

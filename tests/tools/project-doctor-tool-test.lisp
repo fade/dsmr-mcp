@@ -370,26 +370,32 @@ has something true to carry on that call as well as on the second."
         (true (vectorp (gethash "unresolved" first-run)))
         (true (hash-table-p (gethash "exclude" first-run))
               "the local exclude repair is reported")
-        (let ((wiring (find-if (lambda (entry)
-                                 (and (equal "pre-commit" (gethash "item" entry))
-                                      (stringp (gethash "path" entry))
-                                      (string= "config"
-                                               (file-namestring
+        (flet ((gate-entry (file)
+                 (find-if (lambda (entry)
+                            (and (equal "pre-commit" (gethash "item" entry))
+                                 (stringp (gethash "path" entry))
+                                 (string= file (file-namestring
                                                 (gethash "path" entry)))))
-                               (concatenate 'list
-                                            (gethash "changed" first-run)
-                                            (gethash "unresolved" first-run)))))
-          (true wiring "the gate's wiring is reported on the wire")
-          (true (search "/.git/" (gethash "path" wiring))
-                "with a path naming the repository's local config: ~S"
-                (gethash "path" wiring))
+                          (concatenate 'list
+                                       (gethash "changed" first-run)
+                                       (gethash "unresolved" first-run)))))
           (if (configured-hooks-supported-p root)
-              (progn
+              (let ((wiring (gate-entry "config")))
+                (true wiring "the gate's wiring is reported on the wire")
+                (true (search "/.git/" (gethash "path" wiring))
+                      "with a path naming the repository's local config: ~S"
+                      (gethash "path" wiring))
                 (true (find wiring (gethash "changed" first-run))
                       "in the changed array")
                 (is equal "created" (gethash "action_taken" wiring)))
-              (is equal "not-wired" (gethash "action_taken" wiring)
-                  "a git without configured hooks reports it unresolved"))))
+              (let ((gate (gate-entry "lisp-gate")))
+                (true (find gate (gethash "unresolved" first-run))
+                      "a git without configured hooks reports the gate unresolved")
+                (is equal "not-installed" (gethash "action_taken" gate))
+                (true (search "configured hooks" (gethash "reason" gate))
+                      "with the reason: ~S" (gethash "reason" gate))
+                (false (probe-file (gate-hook-path root))
+                       "and no gate file was written")))))
       (let ((second-run (%call root (%args "policy" "repair"))))
         (false (gethash "isError" second-run) "the second run completed")
         (is = 0 (length (gethash "changed" second-run))
