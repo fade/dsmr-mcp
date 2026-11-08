@@ -15,18 +15,23 @@
 ;;;; not reachable until the exclude step has returned.
 ;;;;
 ;;;; Nothing here touches git history. No add, no commit, no removal, no branch
-;;;; change. The only git state this module writes is the local exclude file,
-;;;; which lives under the repository's own git directory and is invisible to
-;;;; every upstream, and an upstream remote when the caller supplies one. The
-;;;; head sha is read before and after every run and the two are required to
-;;;; match, so a call that somehow reached a committing path fails loudly rather
-;;;; than leaving a commit of ours in somebody else's log.
+;;;; change. The git state this module writes is the local exclude file, an
+;;;; upstream remote when the caller supplies one, and the two hook.lisp-gate
+;;;; configured-hook entries in the local config that make git run the lint
+;;;; gate. All of it lives under the repository's own git directory and is
+;;;; invisible to every upstream. The head sha is read before and after every
+;;;; run and the two are required to match, so a call that somehow reached a
+;;;; committing path fails loudly rather than leaving a commit of ours in
+;;;; somebody else's log.
 ;;;;
 ;;;; Nothing here overwrites or deletes. A repair creates a file that is absent.
-;;;; A destination that already exists is a finding to report, never one to
-;;;; replace, and neither DELETE-FILE nor a directory-tree removal appears in
-;;;; this module at all. The destructive primitive lives elsewhere in this
-;;;; corner of the codebase and this is the module that must not reach for it.
+;;;; It never edits, replaces or deletes a file it finds, and never replaces a
+;;;; config value it finds. A destination that already exists is a finding to
+;;;; report; the one exception is a gate script already at its own path, which
+;;;; is kept and reported as already correct. Neither DELETE-FILE nor a
+;;;; directory-tree removal appears in this module at all. The destructive
+;;;; primitive lives elsewhere in this corner of the codebase and this is the
+;;;; module that must not reach for it.
 ;;;;
 ;;;; What changed is reported separately from what was already correct, using
 ;;;; the action-taken vocabulary the exclude repair already established rather
@@ -65,6 +70,7 @@
                 #:shape-item-match
                 #:shape-item-group
                 #:shape-item-generator
+                #:shape-item-assertion
                 #:shape-item-install-target
                 #:shape-group-items
                 #:*shape-catalog*)
@@ -77,6 +83,9 @@
                 #:render-lint-script
                 #:render-pre-commit-hook
                 #:render-debt-baseline)
+  (:import-from #:dsmr-mcp/src/project-hook
+                #:gate-hook-path
+                #:wire-gate-hook)
   (:import-from #:dsmr-mcp/src/project-gate-scan
                 #:collect-debt-sites
                 #:gate-scanner-unavailable-error
@@ -260,20 +269,27 @@ nothing here."
 ;;; Where an item lands, and what it should contain
 ;;; ---------------------------------------------------------------------------
 
+(defun %gate-hook-item-p (item)
+  "Return true when ITEM is the lint gate script git runs at pre-commit."
+  (eq :gate-hook-wired (shape-item-assertion item)))
+
 (defun %item-destination (item root bindings)
   "Return the absolute pathname ITEM installs to in the repository at ROOT.
 
 A :GIT-DIR item lands under the repository's own git directory. That directory
 is never part of any worktree and never reaches an upstream, so an item
-installed there is invisible to a third party whatever the profile."
-  (let ((base (ecase (shape-item-install-target item)
-                (:worktree (uiop:ensure-directory-pathname root))
-                (:git-dir (merge-pathnames
-                           ".git/" (uiop:ensure-directory-pathname root)))))
-        (relative (render-template
-                   (or (shape-item-path item) (shape-item-match item))
-                   bindings)))
-    (merge-pathnames relative base)))
+installed there is invisible to a third party whatever the profile. The gate
+script lands at GATE-HOOK-PATH, the path its configured-hook command names."
+  (if (%gate-hook-item-p item)
+      (gate-hook-path root)
+      (let ((base (ecase (shape-item-install-target item)
+                    (:worktree (uiop:ensure-directory-pathname root))
+                    (:git-dir (merge-pathnames
+                               ".git/" (uiop:ensure-directory-pathname root)))))
+            (relative (render-template
+                       (or (shape-item-path item) (shape-item-match item))
+                       bindings)))
+        (merge-pathnames relative base))))
 
 (defun %gate-item-p (item)
   "Return true when ITEM is one of the three files the quality gate is made of."
@@ -291,13 +307,15 @@ produce a document describing no repository at all."
   (or (%gate-item-p item)
       (and (shape-item-generator item) t)))
 
-(defun %item-content (item bindings severity project-name)
+(defun %item-content (item bindings severity project-name profile)
   "Return the text ITEM's file should carry.
 
 The three gate files come from the debt module's renderers, so the severity a
 newly adopted repository's gate is installed at reaches the file rather than
-being decided again here. Everything else comes from the item's own generator,
-which is the same one the scaffold writes a new project from."
+being decided again here. The gate script is rendered for PROFILE, :FOREIGN or
+:OURS: informational in a repository we do not own, blocking in one we do.
+Everything else comes from the item's own generator, which is the same one the
+scaffold writes a new project from."
   (if (%gate-item-p item)
       (ecase (shape-item-key item)
         (:mallet-config (render-gate-config :severity severity
@@ -305,7 +323,8 @@ which is the same one the scaffold writes a new project from."
         (:lint-script (render-lint-script :severity severity
                                           :project-name project-name))
         (:pre-commit (render-pre-commit-hook :severity severity
-                                             :project-name project-name)))
+                                             :project-name project-name
+                                             :profile profile)))
       (funcall (shape-item-generator item) bindings)))
 
 (defun %executable-item-p (item)
@@ -396,20 +415,32 @@ repository. Returns the empty list when the run was clean."
 ;;; Repairing one finding
 ;;; ---------------------------------------------------------------------------
 
+(defun %wiring-entry (deviation member wiring)
+  "Return the report entry for WIRING, the plist WIRE-GATE-HOOK returned for MEMBER."
+  (list* :deviation deviation :item (shape-item-key member) wiring))
+
 (defun %repair-deviation (deviation root catalog bindings jail dry-run severity
-                          exclude)
-  "Return two values: the changes made for DEVIATION, and what it left unresolved.
+                          exclude profile)
+  "Return three values for DEVIATION: the changes made, what it left unresolved,
+and the keys of members found already correct during the repair.
 
 A deviation naming a grouped item is repaired across the whole group, because a
 group is assessed as one unit and a finding about it names only its first member.
 Members already satisfied are left alone.
+
+The gate script is rendered for PROFILE and written only when absent; a gate
+file already in place is kept as it is and its key returned as already correct.
+With the file in place, the gate is wired through WIRE-GATE-HOOK, with DRY-RUN
+passed on. A :CREATED or :WOULD-CREATE wiring is a change and a :NOT-WIRED one is
+unresolved; either entry names the member's key and the local config file.
 
 A deviation naming no item at all is the local exclude, which is not a catalog
 item and was brought up to the pattern set of record before any file was written.
 Its entry here reports that repair rather than repeating it."
   (let ((item (deviation-item deviation))
         (changes '())
-        (problems '()))
+        (problems '())
+        (kept '()))
     (if (null item)
         (push (list :deviation deviation
                     :path (getf exclude :path)
@@ -419,7 +450,8 @@ Its entry here reports that repair rather than repeating it."
                             (shape-group-items (shape-item-group item) catalog)
                             (list item)))
           (unless (item-satisfied-p member root)
-            (let ((destination (%item-destination member root bindings)))
+            (let ((destination (%item-destination member root bindings))
+                  (in-place nil))
               (cond
                 ((not (%writable-item-p member))
                  (push (list :deviation deviation
@@ -428,6 +460,11 @@ Its entry here reports that repair rather than repeating it."
                              :reason
                              "this item's content is measured from the repository rather than rendered, so it is recorded as debt rather than repaired")
                        problems))
+                ((and (%gate-hook-item-p member)
+                      (uiop:file-exists-p destination)
+                      (not (uiop:directory-exists-p destination)))
+                 (setf in-place t)
+                 (push (shape-item-key member) kept))
                 ((probe-file destination)
                  (push (list :deviation deviation
                              :item (shape-item-key member)
@@ -436,6 +473,7 @@ Its entry here reports that repair rather than repeating it."
                              "something is already there, and a repair never replaces what it finds")
                        problems))
                 (dry-run
+                 (setf in-place t)
                  (push (list :deviation deviation
                              :item (shape-item-key member)
                              :path destination
@@ -444,16 +482,24 @@ Its entry here reports that repair rather than repeating it."
                 (t
                  (%write-repair destination
                                 (%item-content member bindings severity
-                                               (%repo-name root))
+                                               (%repo-name root) profile)
                                 jail)
                  (when (%executable-item-p member)
                    (%make-executable destination))
+                 (setf in-place t)
                  (push (list :deviation deviation
                              :item (shape-item-key member)
                              :path destination
                              :action-taken :created)
-                       changes)))))))
-    (values (nreverse changes) (nreverse problems))))
+                       changes)))
+              (when (and in-place (%gate-hook-item-p member))
+                (let ((wiring (wire-gate-hook root :dry-run dry-run)))
+                  (case (getf wiring :action-taken)
+                    ((:created :would-create)
+                     (push (%wiring-entry deviation member wiring) changes))
+                    (:not-wired
+                     (push (%wiring-entry deviation member wiring) problems)))))))))
+    (values (nreverse changes) (nreverse problems) (nreverse kept))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Freezing the debt
@@ -532,6 +578,11 @@ a foreign repository indistinguishable from one of ours.
 
 DRY-RUN writes nothing at all and still names what would change.
 
+A repair of the quality gate installs the gate script rendered for the
+repository's profile and wires it as a configured pre-commit hook beside any
+hook already there. The wiring is reported like a file: a change when written,
+unresolved when an existing hook.lisp-gate entry differs.
+
 Returns a DOCTOR-REPORT."
   (let* ((root (uiop:ensure-directory-pathname root))
          (jail (or session-root root))
@@ -550,6 +601,7 @@ Returns a DOCTOR-REPORT."
          (recorded-debt '())
          (accepted '())
          (unresolved '())
+         (kept '())
          (baseline nil)
          (remote-added nil))
 
@@ -586,11 +638,12 @@ Returns a DOCTOR-REPORT."
                         (lambda () (signal-deviation deviation))
                         :policy policy)
                   (:repaired
-                   (multiple-value-bind (entries problems)
+                   (multiple-value-bind (entries problems keys)
                        (%repair-deviation deviation root catalog bindings jail
-                                          dry-run severity exclude)
+                                          dry-run severity exclude profile)
                      (dolist (entry entries) (push entry changed))
-                     (dolist (problem problems) (push problem unresolved))))
+                     (dolist (problem problems) (push problem unresolved))
+                     (dolist (key keys) (pushnew key kept))))
                   (:recorded-as-debt
                    (unless baseline
                      (multiple-value-bind (report reason)
@@ -628,7 +681,11 @@ Returns a DOCTOR-REPORT."
          :classification classification
          :profile profile
          :changed (nreverse changed)
-         :already-correct (assessment-satisfied assessment)
+         :already-correct (append (assessment-satisfied assessment)
+                                  (remove-if (lambda (key)
+                                               (member key (assessment-satisfied
+                                                            assessment)))
+                                             (nreverse kept)))
          :recorded-debt (nreverse recorded-debt)
          :accepted (nreverse accepted)
          :unresolved (nreverse unresolved)

@@ -156,6 +156,13 @@ item's generator is one place rather than a rendering call repeated per file."
 
        ;; Tier: gate. The quality gate, assessed through its group as one unit.
        ;;
+       ;; The hook is a script of ours under the git directory, hooks/lisp-gate,
+       ;; wired through the repository's local configured-hook entries. Git runs
+       ;; it beside whatever pre-commit hook the repository already has, and it
+       ;; replaces none. Every repository created on this host already holds a
+       ;; pre-commit hook from the init template, so the item asserts that the
+       ;; gate is wired, never that a file named pre-commit exists.
+       ;;
        ;; ⚠ These three carry EMIT-ON-SCAFFOLD-P NIL, and that flag is the
        ;; unsettled part of the shape question. NIL leaves what the scaffold
        ;; writes exactly as it was. If a new project should be born with the gate
@@ -188,12 +195,12 @@ item's generator is one place rather than a rendering call repeated per file."
 
        (make-shape-item
         :key :pre-commit
-        :path "hooks/pre-commit"
+        :path "hooks/lisp-gate"
         :tier :gate
         :group :quality-gate
         :apparatus-p t
-        :assertion :file-exists
-        :match "hooks/pre-commit"
+        :assertion :gate-hook-wired
+        :match "hooks/lisp-gate"
         :generator (%renderer *pre-commit-hook-template*)
         :emit-on-scaffold-p nil
         :install-target :git-dir)

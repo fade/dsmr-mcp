@@ -136,7 +136,8 @@ cannot change what is measured."
    item
    (dsmr-mcp/src/project-doctor::%bindings root)
    (adopted-repo-gate-severity)
-   (dsmr-mcp/src/project-doctor::%repo-name root)))
+   (dsmr-mcp/src/project-doctor::%repo-name root)
+   :foreign))
 
 (define-test no-foreign-apparatus-renders-licence-text
   "Every apparatus item a foreign repository receives renders with no licence text.

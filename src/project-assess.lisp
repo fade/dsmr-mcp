@@ -5,11 +5,12 @@
 ;;;; without touching it.
 ;;;;
 ;;;; Nothing here writes. There is no atomic-write call, no directory creation,
-;;;; no deletion, and the only git the assessment reaches is the read-only
-;;;; listing of what a repository tracks. That is a property of the module
-;;;; rather than a promise about how it is used: an assessment that cannot write
-;;;; cannot damage a third party's tree however it is called, and the repair
-;;;; engine that does write is a separate module with its own tests.
+;;;; no deletion, and every git command the assessment runs is a read: the
+;;;; listing of what a repository tracks, and the hook list and local config
+;;;; reads that say whether the lint gate is wired. That is a property of the
+;;;; module rather than a promise about how it is used: an assessment that
+;;;; cannot write cannot damage a third party's tree however it is called, and
+;;;; the repair engine that does write is a separate module with its own tests.
 ;;;;
 ;;;; What makes the report worth reading is that a repository is only measured
 ;;;; against what it is answerable for. A flat requirement that every repository
@@ -63,6 +64,9 @@
                 #:parse-exclude-patterns
                 #:repo-exclude-path
                 #:missing-exclude-patterns)
+  (:import-from #:dsmr-mcp/src/project-hook
+                #:gate-hook-path
+                #:gate-hook-wired-p)
   (:import-from #:dsmr-mcp/src/git
                 #:git-tracked-files)
   (:export #:assess-repository
@@ -103,6 +107,11 @@ system definition is asserted without dictating what the project is called; it
 does not descend, so a system definition buried in a subdirectory is not the
 top-level one being asked about.
 
+:GATE-HOOK-WIRED wants the gate script at GATE-HOOK-PATH and git listing it as an
+enabled pre-commit hook with the expected command. A file named pre-commit is
+not evidence of the gate: every repository created on this host already has one
+from the init template, and it is not ours.
+
 An unrecognised assertion signals rather than answering NIL. NIL would report the
 item as absent from every repository, which reads as a finding about the
 repository rather than as the typo it is."
@@ -114,7 +123,11 @@ repository rather than as the typo it is."
       (:directory-exists
        (and (uiop:directory-exists-p (merge-pathnames match base)) t))
       (:any-file-matching
-       (and (directory (merge-pathnames match base)) t)))))
+       (and (directory (merge-pathnames match base)) t))
+      (:gate-hook-wired
+       (and (uiop:file-exists-p (gate-hook-path root))
+            (gate-hook-wired-p root)
+            t)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The result

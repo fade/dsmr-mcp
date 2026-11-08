@@ -74,12 +74,15 @@ requirement that every project carry every file we like to have would report the
 majority of the third-party repositories on this machine as broken, and a report
 that is mostly false entries hides the true ones.")
 
-(defvar +assertions+ '(:file-exists :directory-exists :any-file-matching)
+(defvar +assertions+ '(:file-exists :directory-exists :any-file-matching
+                       :gate-hook-wired)
   "Every kind of check that can decide whether an item is satisfied.
 
 :FILE-EXISTS and :DIRECTORY-EXISTS take a relative path. :ANY-FILE-MATCHING takes
 a filename glob and is satisfied by any one file matching it, which is how a
-system definition is asserted without dictating what the project is called.")
+system definition is asserted without dictating what the project is called.
+:GATE-HOOK-WIRED is satisfied only when the lint gate script exists and git runs
+it at pre-commit through the repository's configured-hook entries.")
 
 (defvar +install-targets+ '(:worktree :git-dir)
   "Where an item lives once installed.
@@ -162,6 +165,9 @@ This is the only way to build an item. TIER, ASSERTION and INSTALL-TARGET are
 checked against +TIERS+, +ASSERTIONS+ and +INSTALL-TARGETS+, so a typo in the
 catalog is a load-time failure naming the field rather than an item that quietly
 never matches anything.
+
+An assertion of :GATE-HOOK-WIRED holds only when the gate script exists and git
+will run it at pre-commit; a file at the path alone does not satisfy it.
 
 KEY names the item in reports and must be a keyword. MATCH is the argument the
 assertion needs and is required for every kind: without it the item asserts
