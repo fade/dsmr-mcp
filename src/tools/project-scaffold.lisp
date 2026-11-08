@@ -3,7 +3,7 @@
 ;;;;
 ;;;; MCP tool: emit a full DSMR-discipline Lisp project tree under the
 ;;;; session write-jail. Mode-independent (dispatcher-side). No-root guard
-;;;; at entry — scaffold writes require a session root.
+;;;; at entry: scaffold writes require a session root.
 
 (defpackage #:dsmr-mcp/src/tools/project-scaffold
   (:use #:cl)
@@ -23,7 +23,8 @@
   (:import-from #:dsmr-mcp/src/project-scaffold-core
                 #:invalid-argument-error
                 #:invalid-argument-field
-                #:invalid-argument-reason))
+                #:invalid-argument-reason)
+  (:export #:project-scaffold-tool))
 
 (in-package #:dsmr-mcp/src/tools/project-scaffold)
 
@@ -37,7 +38,9 @@
 Emits a package-inferred-system with a mode-dispatching executable, Zebra \
 test suite, build recipe, dev-boot script, dependency-preference agent docs, \
 a copied REPL-development guide, and a selectable license with per-file SPDX \
-headers. Returns a manifest of created files and next-step commands.")
+headers. The new project includes the lint gate (linter config, lint script, \
+and a pre-commit gate) whenever the scaffold creates its repository. Returns a \
+manifest of created files and next-step commands.")
    (dsmr-mcp/src/tools/base::input-schema
     :allocation :class
     :initform '(:object
@@ -70,14 +73,57 @@ where <name>/ is created (default: scaffolds). No leading / or .. segments.")
                   :description "Copyright year for LICENSE (default: current year).")
                  (overwrite
                   :type :boolean
-                  :description "When true, replace an existing scaffold directory. Default: false."))
+                  :description "When true, replace an existing scaffold directory. Default: false.")
+                 (init-git
+                  :type :boolean
+                  :description "When false, skip repository initialization. \
+Default: true. A repository is created only when the new project would not sit \
+inside an existing one."))
                 :required ("name"))))
   (:metaclass mcp-tool-class)
   (:documentation "MCP tool: generate a DSMR-discipline Lisp project skeleton.
 Writes an atomic tree under the session root via temp-dir + rename-file.
-No-root guard at entry — call fs-set-project-root first."))
+No-root guard at entry: call fs-set-project-root first.
+Initializes a git repository in the new project unless it would nest inside an
+existing one, and reports which of those happened."))
 
 (c2mop:ensure-finalized (find-class 'project-scaffold-tool))
+
+(defun %wire-name (keyword)
+  "Return KEYWORD as the lower-case string the wire carries."
+  (string-downcase (symbol-name keyword)))
+
+(defun %gate-hook-object (gate)
+  "Return the gate_hook result object for GATE, the :GATE-HOOK plist of write-scaffold.
+Carries action_taken always, path when the gate was installed, reason when it
+was not, and the wiring's action_taken, plus its reason when it has one."
+  (let ((object (make-ht "action_taken" (%wire-name (getf gate :action-taken))))
+        (wiring (getf gate :wiring)))
+    (when (getf gate :path)
+      (setf (gethash "path" object) (namestring (getf gate :path))))
+    (when (getf gate :reason)
+      (setf (gethash "reason" object) (getf gate :reason)))
+    (when wiring
+      (let ((wiring-object (make-ht "action_taken"
+                                    (%wire-name (getf wiring :action-taken)))))
+        (when (getf wiring :reason)
+          (setf (gethash "reason" wiring-object) (getf wiring :reason)))
+        (setf (gethash "wiring" object) wiring-object)))
+    object))
+
+(defun %gate-hook-line (gate)
+  "Return the content line saying whether the lint gate was installed, and why not."
+  (let ((wiring (getf gate :wiring)))
+    (cond
+      ((not (eq :created (getf gate :action-taken)))
+       (format nil "No lint gate was installed: ~A." (getf gate :reason)))
+      ((member (getf wiring :action-taken) '(:created :already-present))
+       (format nil "Installed the lint gate at ~A; it refuses a commit that ~
+touches a failing form."
+               (namestring (getf gate :path))))
+      (t
+       (format nil "Installed the lint gate at ~A, but it is not wired: ~A."
+               (namestring (getf gate :path)) (getf wiring :reason))))))
 
 (defmethod tool-handle ((tool project-scaffold-tool) id args)
   (let* ((session (tool-session tool))
@@ -99,7 +145,13 @@ Call fs-set-project-root first.")))))
            (description (gethash "description" args))
            (destination (gethash "destination" args))
            (year        (gethash "year" args))
-           (overwrite   (gethash "overwrite" args)))
+           (overwrite   (gethash "overwrite" args))
+           ;; Absent means the default, and the default is true. Reading the
+           ;; value alone cannot tell an omitted argument from an explicit
+           ;; false, and those two must not answer the same way.
+           (init-git    (if (nth-value 1 (gethash "init_git" args))
+                            (and (gethash "init_git" args) t)
+                            t)))
       (unless (and name (stringp name))
         (return-from tool-handle
           (result id (make-ht "isError" t
@@ -118,10 +170,12 @@ Call fs-set-project-root first.")))))
                                ;; the scaffold core; pass the raw arg through
                                :year year
                                :destination (or destination "scaffolds")
-                               :overwrite overwrite))
+                               :overwrite overwrite
+                               :init-git init-git))
                  (target-dir  (getf res :target-dir))
                  (relative    (getf res :relative-path))
                  (files       (getf res :files))
+                 (git-init-p  (getf res :git-initialised))
                  (abs-asd     (namestring
                                (merge-pathnames (format nil "~A.asd" name) target-dir)))
                  (registration (getf res :registration))
@@ -156,12 +210,18 @@ ASDF source-registry tree. Elsewhere: (asdf:load-asd ~S)"
                                         (namestring relative))
                              "absolute_path" (namestring target-dir)
                              "files" (coerce files 'vector)
+                             "git_initialised" git-init-p
+                             "gate_hook" (%gate-hook-object (getf res :gate-hook))
                              "next_steps" next-steps
                              "content"
                              (text-content
-                              (format nil "Scaffolded ~A at ~A (~D files)~%Path: ~A~%~{~A~%~}"
+                              (format nil "Scaffolded ~A at ~A (~D files)~%Path: ~A~%~A~%~A~%~{~A~%~}"
                                       name relative (length files)
                                       (namestring target-dir)
+                                      (if git-init-p
+                                          "Initialized a git repository here."
+                                          "No git repository was created here.")
+                                      (%gate-hook-line (getf res :gate-hook))
                                       (coerce next-steps 'list))))))
         (invalid-argument-error (e)
           (result id

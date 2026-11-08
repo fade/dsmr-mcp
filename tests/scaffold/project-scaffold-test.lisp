@@ -24,6 +24,12 @@
                 #:invalid-argument-reason)
   (:import-from #:dsmr-mcp/src/project-scaffold
                 #:write-scaffold)
+  (:import-from #:dsmr-mcp/src/tools/project-scaffold
+                #:project-scaffold-tool)
+  (:import-from #:dsmr-mcp/src/tools/base
+                #:tool-handle)
+  (:import-from #:dsmr-mcp/src/state
+                #:make-session)
   (:import-from #:dsmr-mcp/tests/support/fs-fixture
                 #:with-temp-project-root)
   (:import-from #:alexandria
@@ -166,7 +172,10 @@
     (true (find ".gitignore" keys :test #'string=) ".gitignore missing")
     (true (find "prompts/repl-driven-development.md" keys :test #'string=)
           "prompts/repl-driven-development.md missing (D-12: self-contained prompt)")
-    (true (find "LICENSE" keys :test #'string=) "LICENSE missing")))
+    (true (find "LICENSE" keys :test #'string=) "LICENSE missing")
+    (true (find ".mallet.lisp" keys :test #'string=) ".mallet.lisp missing")
+    (true (find "scripts/lint-lisp.sh" keys :test #'string=)
+          "scripts/lint-lisp.sh missing")))
 
 (define-test scaffold-copies-prompt-into-tree
   "The scaffold bakes the dsmr-discipline prompt into the project itself (D-12),
@@ -281,7 +290,7 @@ executable, and ordinary files do not."
                                    :year "2026"
                                    :destination "scaffolds"))
            (target-dir (getf result :target-dir)))
-      (dolist (script '("build.sh" "scripts/dev-boot.sh"))
+      (dolist (script '("build.sh" "scripts/dev-boot.sh" "scripts/lint-lisp.sh"))
         (let ((path (merge-pathnames script target-dir)))
           (true (probe-file path) (format nil "~A was not emitted" script))
           (true (%executable-file-p path)
@@ -342,3 +351,46 @@ a caller can load it without being told to register it by hand first."
                         (uiop:subdirectories scaffolds-dir)))))
       (true (null tmp-dirs)
             (format nil "Debris found after failed scaffold: ~S" tmp-dirs)))))
+
+;;; --- the verb reports the lint gate -------------------------------------------
+
+(defun %call-scaffold (root &rest kvs)
+  "Dispatch the project-scaffold verb rooted at ROOT with KVS as its arguments.
+Returns the result payload hash-table."
+  (let ((args (make-hash-table :test 'equal)))
+    (loop for (k v) on kvs by #'cddr do (setf (gethash k args) v))
+    (gethash "result"
+             (tool-handle (make-instance 'project-scaffold-tool
+                                         :session (make-session :id "scaffold-verb-test"
+                                                                :project-root root))
+                          "req-scaffold" args))))
+
+(defun %content-text (payload)
+  "Return the text of the first content object in PAYLOAD."
+  (gethash "text" (aref (gethash "content" payload) 0)))
+
+(define-test the-verb-reports-the-gate-it-installed
+  "Outside any repository the verb reports the gate created, with its path."
+  (with-temp-project-root (session root)
+    (let* ((payload (%call-scaffold root "name" "verb-gate-proj" "license" "MIT"))
+           (gate (gethash "gate_hook" payload)))
+      (true (hash-table-p gate) "the result has no gate_hook object")
+      (is string= "created" (gethash "action_taken" gate))
+      (true (stringp (gethash "path" gate)) "the installed gate has no path")
+      (true (hash-table-p (gethash "wiring" gate)) "the gate reports no wiring")
+      (true (search "Installed the lint gate" (%content-text payload))
+            "the content does not say the lint gate was installed")
+      (asdf:clear-system "verb-gate-proj"))))
+
+(define-test the-verb-says-why-no-gate-was-installed
+  "With init_git false the verb reports the gate not installed, and why."
+  (with-temp-project-root (session root)
+    (let* ((payload (%call-scaffold root "name" "verb-nogate-proj" "init_git" nil))
+           (gate (gethash "gate_hook" payload)))
+      (true (hash-table-p gate) "the result has no gate_hook object")
+      (is string= "not-installed" (gethash "action_taken" gate))
+      (true (stringp (gethash "reason" gate)) "the result does not say why")
+      (false (gethash "path" gate) "a gate that was not installed reports a path")
+      (true (search "No lint gate was installed" (%content-text payload))
+            "the content does not say why no lint gate was installed")
+      (asdf:clear-system "verb-nogate-proj"))))

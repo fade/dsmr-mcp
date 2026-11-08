@@ -1,15 +1,15 @@
 ;;;; src/project-scaffold.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Effectful I/O layer for project-scaffold (VERB-22).
+;;;; Effectful I/O layer for project-scaffold.
 ;;;; Thin wrapper on top of the pure logic in project-scaffold-core.
 ;;;; Writes the scaffold tree atomically: all files go into a random-suffixed
 ;;;; temp directory, then a single rename-file commits the whole tree.
 ;;;; unwind-protect removes the temp dir on any failure so a partial write
-;;;; never leaves debris under the session root (D-16).
+;;;; never leaves debris under the session root.
 ;;;;
 ;;;; Route writes through ensure-write-path + write-file-string-atomically
-;;;; (the Phase-6 jail primitives), NOT the fs-write-file tool — the tool
+;;;; (the write-jail primitives), NOT the fs-write-file tool: the tool
 ;;;; refuses existing .lisp/.asd files and fires LSP didChange, both
 ;;;; inappropriate for fresh-tree generation.
 
@@ -27,6 +27,15 @@
                 #:write-file-string-atomically)
   (:import-from #:dsmr-mcp/src/envrc-init
                 #:envrc-content-with-derived-port)
+  (:import-from #:dsmr-mcp/src/git
+                #:git-toplevel
+                #:git-init)
+  (:import-from #:dsmr-mcp/src/project-debt
+                #:render-pre-commit-hook)
+  (:import-from #:dsmr-mcp/src/project-hook
+                #:gate-hook-path
+                #:configured-hooks-supported-p
+                #:wire-gate-hook)
   (:export #:write-scaffold))
 
 (in-package #:dsmr-mcp/src/project-scaffold)
@@ -80,7 +89,7 @@ bare process umask those instructions fail on their first step."
 
 (defun %write-plan-to-temp (temp-dir plan session-root)
   "Write all PLAN entries into TEMP-DIR, routing each file through the
-Phase-6 write-jail (ensure-write-path) then write-file-string-atomically.
+write-jail (ensure-write-path) then write-file-string-atomically.
 TEMP-DIR must already be inside SESSION-ROOT; this is asserted per-file."
   (ensure-directories-exist temp-dir)
   (let* ((temp-ns (namestring temp-dir))
@@ -129,14 +138,86 @@ hand, which reaches no image but this one."
         (progn (ignore-errors (asdf:load-asd abs-asd))
                :load-asd))))
 
+(defun %initialise-repository (target-dir)
+  "Make TARGET-DIR a git repository when it is not already inside one.
+
+Returns T when a repository was created here, NIL when none was.
+
+A scaffolded project needs somewhere to keep the local ignore patterns that
+must never appear in a tracked file, and that somewhere is the exclude file
+under the repository's own git directory. Running git init is the whole of the
+scaffold's part in it: git seeds that file from the configured init template at
+the moment the repository is created.
+
+⛔ Nothing here writes an ignore pattern, and nothing here should. The template
+is the one list of record. On a host with no such template configured the file
+arrives empty, and bringing it up to date is a repair belonging to the doctor
+rather than a second copy of the list kept here.
+
+Nothing is created when the directory already sits inside a repository. That
+covers both the case where it is a repository root already and the case where
+it lives inside somebody else's checkout, and in the second case a nested
+repository would quietly shadow the enclosing one for every command run below
+this point."
+  (unless (git-toplevel target-dir)
+    (git-init target-dir)
+    t))
+
+(defun %install-gate-hook (target-dir)
+  "Install the blocking lint gate in the repository at TARGET-DIR and wire it.
+
+Writes the :OURS rendering of the gate to GATE-HOOK-PATH through the write jail,
+rooted at TARGET-DIR, sets its execute bit, and registers it with
+WIRE-GATE-HOOK. Call only when the scaffold created the repository at
+TARGET-DIR. Where git cannot run configured hooks, nothing is written.
+
+Returns (:PATH P :ACTION-TAKEN :CREATED :WIRING W), where W is the plist
+WIRE-GATE-HOOK returns, or (:ACTION-TAKEN :NOT-INSTALLED :REASON R) when a step
+fails. A failure is reported, never signalled: the project tree is already
+written and complete, and a hook problem must not cost the caller that write."
+  (flet ((not-installed (reason)
+           (list :action-taken :not-installed :reason reason)))
+    (handler-case
+        (let* ((path (gate-hook-path target-dir))
+               (jailed (ensure-write-path (namestring path) target-dir)))
+          (cond
+            ((not (configured-hooks-supported-p target-dir))
+             (not-installed
+              "this git cannot run configured hooks, so the gate is not installed"))
+            ((null jailed)
+             (not-installed
+              (format nil "the gate path ~A resolves outside the new project"
+                      (namestring path))))
+            (t
+             (write-file-string-atomically
+              jailed (render-pre-commit-hook :profile :ours))
+             (uiop:run-program (list "chmod" "+x" (namestring jailed)))
+             (list :path path
+                   :action-taken :created
+                   :wiring (wire-gate-hook target-dir :profile :ours)))))
+      (error (condition)
+        (not-installed
+         (format nil "the lint gate could not be installed: ~A" condition))))))
+
 (defun write-scaffold (&key name description author license copyright year
-                              destination overwrite session-root)
+                              destination overwrite session-root
+                              (init-git t))
   "Generate the scaffold project atomically under SESSION-ROOT.
 Returns a plist with:
-  :target-dir    (absolute directory pathname)
-  :relative-path (namestring relative to session-root)
-  :files         (list of relative path strings, in manifest order)
-  :registration  :SOURCE-REGISTRY or :LOAD-ASD, see %register-with-asdf
+  :target-dir       (absolute directory pathname)
+  :relative-path    (namestring relative to session-root)
+  :files            (list of relative path strings, in manifest order)
+  :registration     :SOURCE-REGISTRY or :LOAD-ASD, see %register-with-asdf
+  :git-initialised  (T when a repository was created here, NIL when not)
+  :gate-hook        the lint gate, see %install-gate-hook; when no repository
+                    was created here, (:ACTION-TAKEN :NOT-INSTALLED :REASON R)
+
+INIT-GIT defaults to T. A scaffolded project is a git repository from the
+moment it is written, unless it would nest inside one that already exists.
+Whether that happened is reported rather than assumed, so no repository is
+touched without the caller being told. The blocking lint gate is installed
+only in a repository created here: an enclosing repository's hooks and config
+are never written.
 
 On any failure, signals INVALID-ARGUMENT-ERROR or propagates the
 underlying error after cleaning up the temp directory (no debris)."
@@ -191,14 +272,31 @@ underlying error after cleaning up the temp directory (no debris)."
                  (uiop:delete-directory-tree target-dir :validate t))
                (rename-file temp-dir target-dir)
                (setf committed t)
-               (let* ((abs-asd (namestring
+               ;; The repository is created only once the rename has committed
+               ;; the tree, so a git failure propagates against a complete and
+               ;; correct project rather than costing the caller the write.
+               (let* ((git-initialised (when init-git
+                                         (%initialise-repository target-dir)))
+                      (abs-asd (namestring
                                 (merge-pathnames (format nil "~A.asd" name) target-dir)))
                       (registration (when (probe-file abs-asd)
-                                      (%register-with-asdf name abs-asd))))
+                                      (%register-with-asdf name abs-asd)))
+                      (gate-hook
+                        (if git-initialised
+                            (%install-gate-hook target-dir)
+                            (list :action-taken :not-installed
+                                  :reason
+                                  (if init-git
+                                      (format nil "no repository was created here: ~
+the project is inside an existing one, whose hooks are never written")
+                                      (format nil "no repository was created: ~
+the project has no hooks directory of its own"))))))
                  (list :target-dir target-dir
                        :relative-path (enough-namestring target-dir session-root)
                        :files (mapcar #'car manifest)
-                       :registration registration)))
+                       :registration registration
+                       :git-initialised (and git-initialised t)
+                       :gate-hook gate-hook)))
           (unless committed
             (when (uiop:directory-exists-p temp-dir)
               (ignore-errors

@@ -1,10 +1,11 @@
 ;;;; src/project-scaffold-templates.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Template string constants for project-scaffold (VERB-22).
+;;;; Template string constants for project-scaffold.
 ;;;; Kept in a dedicated module so bulk literal content stays out of the
 ;;;; logic layer. All templates use {{key}} placeholders resolved by
-;;;; render-template in project-scaffold-core.
+;;;; render-template, which lives in its own leaf module because both the
+;;;; scaffold and the shape catalogue reach it.
 ;;;;
 ;;;; Placeholders used across templates:
 ;;;;   {{name}}         — project name (kebab-case, e.g. foo-lib)
@@ -29,6 +30,10 @@
            #:*claude-md-template*
            #:*readme-template*
            #:*gitignore-template*
+           #:*mallet-config-template*
+           #:*severity-pins-template*
+           #:*lint-lisp-template*
+           #:*pre-commit-hook-template*
            #:*prompt-template*
            #:*envrc-template*
            #:*license-template*
@@ -129,10 +134,10 @@ package-inferred-system + Zebra convention of dsmr-mcp itself.")
 
 (defun start-dev ()
   \"Dev mode: load Slynk and start a listener so an editor or dsmr-mcp can attach.\"
-  (let ((port (or (ignore-errors
-                   (parse-integer (uiop:getenv \"SLYNK_PORT\")))
-                  4005))
-        (host (or (uiop:getenv \"SLYNK_HOST\") \"127.0.0.1\")))
+  (let* ((raw-port (uiop:getenv \"SLYNK_PORT\"))
+         (port (or (and raw-port (parse-integer raw-port :junk-allowed t))
+                   4005))
+         (host (or (uiop:getenv \"SLYNK_HOST\") \"127.0.0.1\")))
     (asdf:load-system :slynk)
     (uiop:symbol-call :slynk :create-server :port port :interface host :dont-close t)
     (format t \"{{name}}: Slynk listening on ~A:~A~%\" host port)
@@ -527,6 +532,114 @@ bin/
 .dsmr-slynk.port
 "
   "Template for the generated project's .gitignore.")
+
+;;; ---------------------------------------------------------------------------
+;;; Quality-gate templates: linter config, lint runner, pre-commit hook
+;;;
+;;; These three are one unit. Across the application repositories measured, the
+;;; linter config and the lint script co-occur exactly, and the hook is what
+;;; makes either of them take effect, so a partial install is a shape that does
+;;; not occur in practice and should not be reported as three separate misses.
+;;; ---------------------------------------------------------------------------
+
+(defparameter *mallet-config-template*
+  "(:mallet-config
+ (:extends :default)
+
+ ;; This is a package-inferred system: each file's defpackage imports the
+ ;; symbols it consumes, and some of those imports exist to be re-exported or
+ ;; used across a package boundary by a sibling package. The linter reads one
+ ;; file at a time and cannot see the cross-package use, so it reports those
+ ;; imports as unused. Keeping them explicit is what documents each file's real
+ ;; dependency surface.
+ (:disable :unused-imported-symbols){{severity-pins}})
+"
+  "Template for a project's .mallet.lisp linter configuration.
+Carries a {{severity-pins}} placeholder: an adopted repository binds it to
+*SEVERITY-PINS-TEMPLATE* rendered at its gate severity, and a new project binds
+it to the empty string and starts at the linter's own severities. The only
+blanket disable is one this project can defend from its own structure; every
+other suppression belongs to the repository that needs it, with its own reason
+written beside it.")
+
+(defparameter *severity-pins-template*
+  "
+
+ ;; The gate is new and the code is not. What it reports on a first run is a
+ ;; record of what is already here rather than a claim that any of it is wrong.
+ ;; Holding these categories below the failing threshold keeps every site
+ ;; visible without blocking a commit, which is the only way the record
+ ;; survives: a rule that blocks before the codebase can satisfy it just gets
+ ;; switched off, and switched off it reports nothing at all. Raising them is a
+ ;; deliberate decision to take once the reports have been worked through.
+ (:set-severity :style {{gate-severity}})
+ (:set-severity :cleanliness {{gate-severity}})"
+  "The severity pins an adoption adds to *MALLET-CONFIG-TEMPLATE*.
+Carries a {{gate-severity}} placeholder. Starts with the blank line that
+separates it from the preceding clause and ends without a newline, so the
+config's closing parenthesis follows the last pin.")
+
+(defparameter *lint-lisp-template*
+  "#!/usr/bin/env bash
+# scripts/lint-lisp.sh: run the mallet linter over this project's Lisp sources.
+#
+# Usage: ./scripts/lint-lisp.sh [file ...]
+#   With no arguments, lints every .lisp file under src/ and tests/.
+#
+# The linter is invoked by absolute path deliberately. A binary named 'mallet'
+# on PATH belongs to an unrelated Java toolkit that happens to share the name,
+# and reaching it instead would either fail in a confusing way or appear to
+# succeed having linted nothing. Set MALLET to override the location.
+{{spdx-line}}
+set -euo pipefail
+
+MALLET=\"${MALLET:-$HOME/.local/share/mallet/mallet}\"
+PROJECT_ROOT=\"$(cd \"$(dirname \"$0\")/..\" && pwd)\"
+
+if [ ! -x \"$MALLET\" ]; then
+  echo \"lint-lisp: no linter at $MALLET\" >&2
+  echo \"lint-lisp: install it there, or set MALLET to its location.\" >&2
+  exit 127
+fi
+
+cd \"$PROJECT_ROOT\"
+
+if [ \"$#\" -gt 0 ]; then
+  exec \"$MALLET\" \"$@\"
+fi
+
+SOURCES=()
+while IFS= read -r file; do
+  SOURCES+=(\"$file\")
+done < <(find src tests -type f -name '*.lisp' 2>/dev/null | sort)
+
+if [ \"${#SOURCES[@]}\" -eq 0 ]; then
+  echo \"lint-lisp: no .lisp files under src/ or tests/; nothing to lint.\" >&2
+  exit 0
+fi
+
+exec \"$MALLET\" \"${SOURCES[@]}\"
+"
+  "Template for a project's scripts/lint-lisp.sh.
+Runs the linter over src/ and tests/, or over the files named on the command
+line. Exits non-zero when the linter reports a violation at or above its
+failing threshold, which is what lets the pre-commit hook be a gate rather
+than a notification.
+
+The {{spdx-line}} placeholder occupies a line of its own. A caller that chose
+the project's licence binds it to that licence's identifier comment; every
+other caller binds it to the empty string, so the script names no licence. An
+adopted repository keeps the licence it came with.")
+
+(defparameter *pre-commit-hook-template*
+  (uiop:read-file-string
+   (asdf:system-relative-pathname "dsmr-mcp" "templates/lisp-gate.sh"))
+  "Template for a project's lint gate, read from templates/lisp-gate.sh at load time.
+Reports the linter findings inside the top-level forms a staged change touches.
+Placeholders:
+  {{gate-mode}}  informational or blocking.
+  {{spdx-line}}  a licence comment, or the empty string for no licence line.
+Kept as a shell file so bash -n checks it as written.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; REPL-driven-development prompt template (D-12)
