@@ -31,6 +31,7 @@
   (:import-from #:dsmr-mcp/src/git
                 #:git-repository-p
                 #:git-toplevel
+                #:git-common-dir
                 #:not-a-repository-error)
   (:export #:*exclude-template-path*
            #:exclude-template-path
@@ -122,8 +123,11 @@ repository look compliant."
     (parse-exclude-patterns (uiop:read-file-string path))))
 
 (defun repo-exclude-path (root)
-  "Return ROOT/.git/info/exclude, the local exclude file of the repository at ROOT."
-  (merge-pathnames ".git/info/exclude" (uiop:ensure-directory-pathname root)))
+  "Return the local exclude file of the repository at ROOT.
+It lives in the git directory every worktree shares, so a linked worktree, a
+submodule, or a separate git directory resolves to the file git reads.
+Signals GIT-COMMAND-ERROR when ROOT is not in a repository."
+  (merge-pathnames "info/exclude" (git-common-dir root)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Idempotency predicate and pure transform

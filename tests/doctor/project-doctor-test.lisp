@@ -83,6 +83,7 @@
                 #:git-status-porcelain)
   (:import-from #:dsmr-mcp/tests/support/git-fixture
                 #:with-temp-git-repo
+                #:with-linked-worktree
                 #:fixture-commit-file
                 #:seed-exclude-patterns
                 #:+ours-origin-url+
@@ -832,6 +833,34 @@ both the file and the wiring as changes."
       (%check-never-leaked root)
       (%check-second-run-is-quiet root)
       (%check-never-leaked root))))
+
+(define-test a-repair-in-a-linked-worktree-installs-the-shared-gate
+  "LINKED-WORKTREE CONTROL. Run from a linked worktree, whose .git is a file, the
+repair completes: the exclude and the gate land in the git directory the
+worktrees share, the gate is wired, and nothing reaches either index."
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (with-linked-worktree (worktree root)
+        (true (uiop:file-exists-p (merge-pathnames ".git" worktree))
+              "precondition: the linked worktree's .git is a file")
+        (let* ((report (normalise-repository worktree :policy :repair))
+               (shared (merge-pathnames ".git/" root)))
+          (is equal (namestring (merge-pathnames "hooks/lisp-gate" shared))
+              (namestring (gate-hook-path worktree))
+              "the gate path is in the shared git directory")
+          (true (probe-file (gate-hook-path worktree)) "the gate was written")
+          (true (%executable-p (gate-hook-path worktree)) "and is executable")
+          (is equal (namestring (merge-pathnames "info/exclude" shared))
+              (namestring (getf (report-exclude report) :path))
+              "the exclude written is the shared one")
+          (when (configured-hooks-supported-p worktree)
+            (true (gate-hook-wired-p worktree) "the gate is wired")
+            (true (gate-hook-wired-p root)
+                  "and reads as wired from the main worktree too"))
+          (%check-never-leaked worktree)
+          (%check-never-leaked root))))))
 
 (define-test an-existing-pre-commit-hook-is-left-alone-and-the-gate-goes-beside-it
   "A pre-commit already in the hooks directory is byte-identical after the repair,

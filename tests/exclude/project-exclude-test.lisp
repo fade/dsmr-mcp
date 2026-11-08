@@ -319,6 +319,9 @@ repair and the caller is told so rather than handed a fabricated one."
       (unwind-protect
            (progn
              (fail (repair-repo-exclude plain) 'not-a-repository-error)
-             (is eq nil (probe-file (repo-exclude-path plain))))
+             (fail (repo-exclude-path plain)
+                 'dsmr-mcp/src/git:git-command-error)
+             (false (probe-file (merge-pathnames ".git/info/exclude" plain))
+                    "no exclude file was fabricated"))
         (uiop:delete-directory-tree plain :validate t
                                           :if-does-not-exist :ignore)))))
