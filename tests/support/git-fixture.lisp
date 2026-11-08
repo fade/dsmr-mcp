@@ -42,8 +42,9 @@
 ;;; Sample remote URLs
 ;;; ---------------------------------------------------------------------------
 
-;;; These exist to be parsed and classified. No network access is ever made
-;;; against them, and none of these repositories is contacted by any test.
+;;; Remotes for fixtures in which the remotes must decide nothing. No network
+;;; access is ever made against them, and none of these repositories is
+;;; contacted by any test.
 
 (defvar +ours-origin-url+ "git@github.com:fade/example.git"
   "An origin URL under our own account.")

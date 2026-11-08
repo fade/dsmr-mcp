@@ -46,6 +46,7 @@
            #:defaulting-declaration
            #:declaration-line
            #:declared-value
+           #:declared-values
            #:declared-p
            #:ensure-declaration
            #:ensure-declaration-line
@@ -146,6 +147,18 @@ answer must say so."
 (defun declared-p (text name)
   "True when TEXT declares NAME anywhere."
   (nth-value 1 (declared-value text name)))
+
+(defun declared-values (text name)
+  "Return every expression NAME is declared to in TEXT, in file order.
+
+The whole text is searched, as for DECLARED-VALUE. Returns the empty list when
+TEXT declares NAME nowhere. A caller for which two declarations must agree reads
+all of them here, since DECLARED-VALUE answers with the first alone."
+  (let ((values '()))
+    (dolist (line (%split-text text) (nreverse values))
+      (let ((value (%declaration-value line name)))
+        (when value
+          (push value values))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Reading the managed-region markers

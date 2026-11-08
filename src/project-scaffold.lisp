@@ -36,6 +36,8 @@
                 #:gate-hook-path
                 #:configured-hooks-supported-p
                 #:wire-gate-hook)
+  (:import-from #:dsmr-mcp/src/repo-classify
+                #:record-disposition)
   (:export #:write-scaffold))
 
 (in-package #:dsmr-mcp/src/project-scaffold)
@@ -199,6 +201,20 @@ written and complete, and a hook problem must not cost the caller that write."
         (not-installed
          (format nil "the lint gate could not be installed: ~A" condition))))))
 
+(defun %record-origin-disposition (target-dir)
+  "Record the disposition ours in the .envrc of the repository at TARGET-DIR.
+
+Call only when the scaffold created that repository: creating the code is where
+it originates, so ours is a fact here rather than an inference. Returns the plist
+RECORD-DISPOSITION returns, or (:ACTION-TAKEN :NOT-RECORDED :REASON R) when it
+signals. A failure is reported, never signalled, for the reason given at
+%INSTALL-GATE-HOOK."
+  (handler-case (record-disposition target-dir :ours :jail target-dir)
+    (error (condition)
+      (list :action-taken :not-recorded
+            :reason (format nil "the disposition could not be recorded: ~A"
+                            condition)))))
+
 (defun write-scaffold (&key name description author license copyright year
                               destination overwrite session-root
                               (init-git t))
@@ -211,6 +227,9 @@ Returns a plist with:
   :git-initialised  (T when a repository was created here, NIL when not)
   :gate-hook        the lint gate, see %install-gate-hook; when no repository
                     was created here, (:ACTION-TAKEN :NOT-INSTALLED :REASON R)
+  :disposition      the ours record, see %record-origin-disposition; when no
+                    repository was created here, (:ACTION-TAKEN :NOT-RECORDED
+                    :REASON R)
 
 INIT-GIT defaults to T. A scaffolded project is a git repository from the
 moment it is written, unless it would nest inside one that already exists.
@@ -290,13 +309,21 @@ underlying error after cleaning up the temp directory (no debris)."
                                       (format nil "no repository was created here: ~
 the project is inside an existing one, whose hooks are never written")
                                       (format nil "no repository was created: ~
-the project has no hooks directory of its own"))))))
+the project has no hooks directory of its own")))))
+                      (disposition
+                        (if git-initialised
+                            (%record-origin-disposition target-dir)
+                            (list :action-taken :not-recorded
+                                  :reason
+                                  (format nil "no repository was created here, ~
+so no disposition was recorded; project-doctor asks for one on its first run")))))
                  (list :target-dir target-dir
                        :relative-path (enough-namestring target-dir session-root)
                        :files (mapcar #'car manifest)
                        :registration registration
                        :git-initialised (and git-initialised t)
-                       :gate-hook gate-hook)))
+                       :gate-hook gate-hook
+                       :disposition disposition)))
           (unless committed
             (when (uiop:directory-exists-p temp-dir)
               (ignore-errors

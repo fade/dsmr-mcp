@@ -46,6 +46,8 @@
                 #:configured-hooks-supported-p)
   (:import-from #:dsmr-mcp/src/git
                 #:git-remote-url
+                #:git-head-sha
+                #:run-git
                 #:git-status-porcelain)
   (:import-from #:dsmr-mcp/tests/support/git-fixture
                 #:with-temp-git-repo
@@ -172,6 +174,29 @@ create, and a run that wrote none of them wrote none of ours."
   (let ((path (repo-exclude-path root)))
     (if (probe-file path) (uiop:read-file-string path) "")))
 
+(defun %envrc-text (root)
+  "Return the text of ROOT's .envrc, or NIL when there is none."
+  (let ((path (merge-pathnames ".envrc" (uiop:ensure-directory-pathname root))))
+    (when (probe-file path) (uiop:read-file-string path))))
+
+(defun %repository-state (root)
+  "Return everything a disposition question must leave unchanged in ROOT: the
+head, the local exclude, the gate script, the local config, the .envrc and the
+status of the worktree."
+  (let ((dir (uiop:ensure-directory-pathname root)))
+    (flet ((text (path) (when (probe-file path) (uiop:read-file-string path))))
+      (list :head (git-head-sha root)
+            :exclude (%exclude-text root)
+            :gate (text (gate-hook-path root))
+            :config (values (run-git (list "config" "--local" "--list")
+                                     :directory root))
+            :envrc (text (merge-pathnames ".envrc" dir))
+            :status (git-status-porcelain root)))))
+
+(defun %error-type (payload)
+  "Return the error_type of PAYLOAD, or NIL for a completed run."
+  (and (gethash "isError" payload) (gethash "error_type" payload)))
+
 (defun %schema-enum (property-name)
   "Return the enum the verb's schema declares for PROPERTY-NAME.
 
@@ -204,113 +229,134 @@ sitting in."
 ;;; CONTROL 1 - the ask control
 ;;; ---------------------------------------------------------------------------
 
-(define-test the-ambiguous-repository-is-asked-about-and-left-alone
-  "CONTROL: the ask control. A repository whose origin is ours and which records
-no upstream produces the question, and the repository is untouched afterwards.
+(define-test a-repository-with-no-disposition-is-asked-about-and-left-alone
+  "CONTROL: the ask control. A repository with no recorded disposition produces
+the question, naming the three answers and what each means, with the origin
+found reported as a fact. HEAD, the local exclude, the gate script, the local
+config and the .envrc are byte-identical afterwards, and no .envrc exists.
 
-Both halves are required. A verb that asked and wrote anyway would satisfy the
-first assertion on its own, and a verb that wrote nothing because it did nothing
-would satisfy the second. The status instrument is seen reporting a change
-before it is required to report none, so an empty answer cannot come from the
-instrument being aimed at nothing."
+The status instrument is seen reporting a change before it is required to
+report none, so an empty answer cannot come from the instrument being aimed at
+nothing."
   (with-fixture-template
     (with-temp-git-repo (root :origin-url +ours-origin-url+
                               :initial-file "seed" :initial-content "seed")
       (%prepare root)
-      ;; The instrument, proven able to see a change before it is trusted to
-      ;; report the absence of one.
       (write-fixture-file root "stray.txt" "not committed")
       (true (plusp (length (git-status-porcelain root)))
             "git status lists an untracked file")
       (uiop:delete-file-if-exists
        (merge-pathnames "stray.txt" (uiop:ensure-directory-pathname root)))
-      (let ((exclude-before (%exclude-text root))
+      (let ((before (%repository-state root))
             (payload (%call root nil)))
         (true (gethash "isError" payload) "the ask is carried as an error result")
-        (is equal "repo-classification-required" (gethash "error_type" payload))
-        (true (gethash "requires_classification" payload)
+        (is equal "project-disposition-required" (gethash "error_type" payload))
+        (true (gethash "requires_disposition" payload)
               "the caller is told an answer is required")
+        (is equalp #("ours" "contributing" "forked")
+            (gethash "accepted_dispositions" payload)
+            "the three answers are advertised in order")
+        (let ((meanings (gethash "disposition_meanings" payload)))
+          (true (hash-table-p meanings) "each answer carries its meaning")
+          (when (hash-table-p meanings)
+            (dolist (answer '("ours" "contributing" "forked"))
+              (true (stringp (gethash answer meanings))
+                    "~A has a meaning" answer))))
         (is equal +ours-origin-url+ (gethash "origin_url" payload)
-            "the origin that caused the question is reported back")
-        (true (vectorp (gethash "accepted_classifications" payload))
-              "the answers it accepts are advertised")
-        (true (stringp (gethash "text"
-                                (aref (gethash "content" payload) 0)))
+            "the origin is reported as a fact")
+        (true (stringp (gethash "text" (aref (gethash "content" payload) 0)))
               "the question carries text a person can read")
-        ;; Nothing was written.
-        (true (%worktree-clean-p root)
-            "the worktree is untouched by a question")
-        (false (%apparatus-present-p root)
-               "no apparatus of ours was written")
-        (is equal exclude-before (%exclude-text root)
-            "the local exclude is untouched by a question")))))
+        (is equal before (%repository-state root)
+            "HEAD, exclude, gate, config and .envrc are unchanged")
+        (false (%envrc-text root) "no .envrc was written")
+        (false (%apparatus-present-p root) "no apparatus of ours was written")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CONTROL 2 - the two-call control
 ;;; ---------------------------------------------------------------------------
 
-(define-test the-answer-comes-out-of-the-question-and-resolves-it
-  "CONTROL: the two-call control. The answer supplied on the second call is read
-out of the first call's own accepted_classifications array, never written here.
-
-This is the whole mechanism and it has to be exercised end to end. A verb that
-advertises answers it will not accept and a verb that accepts an answer it never
-advertised both pass one half of it. Taking the answer from the first result
-means that if the verb stops advertising the answers, this test goes red rather
-than quietly testing a constant."
+(define-test the-answer-is-recorded-once-and-never-asked-for-again
+  "CONTROL: the three-call control. The answer is read out of the first call's
+own accepted_dispositions array. A second call carrying it under a repair policy
+records the literal declaration in .envrc, lists .envrc in the local exclude,
+installs the informational gate and leaves .envrc out of git status. A third
+call with no answer reads it back and asks nothing."
   (with-fixture-template
     (with-temp-git-repo (root :origin-url +ours-origin-url+
                               :initial-file "seed" :initial-content "seed")
       (%prepare root)
       (let* ((ask (%call root nil))
-             (answers (gethash "accepted_classifications" ask)))
-        (is equal "repo-classification-required" (gethash "error_type" ask))
-        (true (and (vectorp answers) (plusp (length answers)))
-              "the ask advertises at least one answer")
-        (if (and (vectorp answers) (plusp (length answers)))
-            (let* ((answer (aref answers (1- (length answers))))
-                   (resolved (%call root (%args "classification" answer))))
-              (true (stringp answer) "the advertised answer is a string")
-              (false (gethash "isError" resolved)
-                     "the advertised answer resolves the question")
-              (is equal answer (gethash "classification" resolved)
-                  "the run reports the classification it was given")
-              (true (vectorp (gethash "changed" resolved))
-                    "the resolved run reports what it changed")
-              (true (vectorp (gethash "already_correct" resolved))
-                    "the resolved run reports what was already correct"))
-            (true nil
-                  "no answers were advertised, so the second call cannot be made"))))))
+             (answers (gethash "accepted_dispositions" ask))
+             (answer (and (vectorp answers)
+                          (find "contributing" answers :test #'equal))))
+        (is equal "project-disposition-required" (gethash "error_type" ask))
+        (true answer "the ask advertises contributing")
+        (when answer
+          (let ((recorded (%call root (%args "disposition" answer
+                                             "policy" "repair"))))
+            (false (gethash "isError" recorded) "the answer resolves the question")
+            (is equal "contributing" (gethash "disposition" recorded))
+            (is equal "argument" (gethash "disposition_source" recorded))
+            (let ((entry (gethash "disposition_recorded" recorded)))
+              (true (hash-table-p entry) "the record is reported")
+              (when (hash-table-p entry)
+                (true (member (gethash "action_taken" entry)
+                              '("created" "added") :test #'equal)
+                      "the declaration was written: ~S"
+                      (gethash "action_taken" entry))))
+            (true (search (format nil "~%export DSMR_PROJECT_DISPOSITION=contributing~%")
+                          (or (%envrc-text root) ""))
+                  "the .envrc holds the literal declaration")
+            (true (search (format nil "~%.envrc~%")
+                          (format nil "~%~A" (%exclude-text root)))
+                  "the local exclude lists .envrc")
+            (when (configured-hooks-supported-p root)
+              (true (search "GATE_MODE='informational'"
+                            (uiop:read-file-string (gate-hook-path root)))
+                    "the installed gate is informational"))
+            (true (%worktree-clean-p root)
+                  "git status does not list .envrc"))
+          (let ((again (%call root nil)))
+            (false (gethash "isError" again) "the third call asks nothing")
+            (is equal "contributing" (gethash "disposition" again))
+            (true (search ".envrc" (or (gethash "disposition_source" again) ""))
+                  "and names the file it read")))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CONTROL 3 - the no-inference control
 ;;; ---------------------------------------------------------------------------
 
 (define-test an-unanswered-question-never-becomes-a-successful-run
-  "CONTROL: the no-inference control. For an ambiguous repository, omitting the
-classification yields the question and never a completed run, with a policy and
-without one.
+  "CONTROL: the no-inference control. With nothing recorded, omitting the
+disposition yields the question and never a completed run, with a policy and
+without one, whatever the remotes say: an origin under the operator's account,
+one under a third party, one with an upstream recorded, and none at all.
 
-Both policies are exercised in one test because the danger is a verb that asks
-on the read-only path and guesses on the writing one, which is exactly the
-direction in which guessing wrong puts our tooling into somebody else's tree."
-  (with-fixture-template
-    (with-temp-git-repo (root :origin-url +ours-origin-url+
-                              :initial-file "seed" :initial-content "seed")
-      (%prepare root)
-      (dolist (args (list nil
-                          (%args "policy" "repair")
-                          (%args "policy" "repair" "dry_run" t)))
-        (let ((payload (%call root args)))
-          (true (gethash "isError" payload)
-                "an unanswered question is never a completed run")
-          (is equal "repo-classification-required" (gethash "error_type" payload))
-          (false (gethash "classification" payload)
-                 "no classification is reported for a question")))
-      (true (%worktree-clean-p root)
-          "none of those calls wrote anything")
-      (false (%apparatus-present-p root)
-             "none of those calls wrote apparatus of ours"))))
+The writing policies are exercised beside the read-only call because the danger
+is a verb that asks on one path and infers on the other."
+  (dolist (remotes (list (list :origin +ours-origin-url+)
+                         (list :origin +third-party-origin-url+)
+                         (list :origin +ours-origin-url+
+                               :upstream +third-party-upstream-url+)
+                         (list)))
+    (with-fixture-template
+      (with-temp-git-repo (root :origin-url (getf remotes :origin)
+                                :upstream-url (getf remotes :upstream)
+                                :initial-file "seed" :initial-content "seed")
+        (%prepare root)
+        (let ((before (%repository-state root)))
+          (dolist (args (list nil
+                              (%args "policy" "repair")
+                              (%args "policy" "repair" "dry_run" t)
+                              (%args "policy" "repair"
+                                     "upstream_url" +third-party-upstream-url+)))
+            (let ((payload (%call root args)))
+              (is equal "project-disposition-required" (%error-type payload)
+                  "remotes ~S settle nothing" remotes)
+              (false (gethash "disposition" payload)
+                     "no disposition is reported for a question")))
+          (is equal before (%repository-state root)
+              "none of those calls wrote anything"))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CONTROL 4 - the sandbox control
@@ -326,7 +372,8 @@ every call was refused cannot pass for one in which the right call was refused."
     (with-temp-git-repo (root :origin-url +third-party-origin-url+
                               :initial-file "seed" :initial-content "seed")
       (%prepare root)
-      (let ((escaping (%call root (%args "path" "../.." "policy" "repair"))))
+      (let ((escaping (%call root (%args "path" "../.." "policy" "repair"
+                                         "disposition" "contributing"))))
         (true (gethash "isError" escaping) "an escaping path is an error")
         (is equal "sandbox-violation" (gethash "error_type" escaping)))
       (true (%worktree-clean-p root)
@@ -334,7 +381,7 @@ every call was refused cannot pass for one in which the right call was refused."
       (false (%apparatus-present-p root)
              "the refused call wrote no apparatus")
       ;; The same instrument accepting a path inside the root.
-      (let ((inside (%call root (%args "path" "."))))
+      (let ((inside (%call root (%args "path" "." "disposition" "contributing"))))
         (false (gethash "isError" inside)
                "a path inside the session root is accepted")))))
 
@@ -357,9 +404,10 @@ has something true to carry on that call as well as on the second."
                               :initial-file "seed" :initial-content "seed")
       (%prepare root)
       (write-fixture-file root "AGENTS.md" "# already in place")
-      (let ((first-run (%call root (%args "policy" "repair"))))
+      (let ((first-run (%call root (%args "policy" "repair"
+                                          "disposition" "contributing"))))
         (false (gethash "isError" first-run) "the repair completed")
-        (is equal "foreign-with-upstream" (gethash "classification" first-run))
+        (is equal "contributing" (gethash "disposition" first-run))
         (is equal "foreign" (gethash "profile" first-run))
         (true (plusp (length (gethash "changed" first-run)))
               "the repair reports at least one change")
@@ -414,12 +462,19 @@ exclude is the one thing a run writes that git status cannot see."
                               :initial-file "seed" :initial-content "seed")
       (%prepare root)
       (let ((exclude-before (%exclude-text root))
-            (dry (%call root (%args "policy" "repair" "dry_run" t))))
+            (dry (%call root (%args "policy" "repair" "dry_run" t
+                                    "disposition" "forked"))))
         (false (gethash "isError" dry) "a dry run completes")
         (true (gethash "dry_run" dry) "and says it was one")
         (true (plusp (length (gethash "changed" dry)))
               "a dry run still names what would change")
-        (dolist (key '("classification" "profile" "changed" "already_correct"
+        (let ((entry (gethash "disposition_recorded" dry)))
+          (true (hash-table-p entry) "the record it would make is reported")
+          (when (hash-table-p entry)
+            (is equal "would-record" (gethash "action_taken" entry))))
+        (false (%envrc-text root) "a dry run writes no .envrc")
+        (dolist (key '("disposition" "disposition_source" "disposition_recorded"
+                       "warnings" "profile" "changed" "already_correct"
                        "recorded_debt" "accepted" "unresolved" "exclude"
                        "content"))
           (true (nth-value 1 (gethash key dry))
@@ -431,39 +486,45 @@ exclude is the one thing a run writes that git status cannot see."
         (false (%apparatus-present-p root)
                "a dry run writes no apparatus")))))
 
-(define-test an-upstream-answers-the-question-and-is-recorded
-  "Supplying the upstream answers the classification question, and under a
-policy it writes the remote down, which is the one piece of missing evidence
-that made the repository indistinguishable from one of ours.
+(define-test a-supplied-upstream-is-recorded-and-decides-nothing
+  "A supplied upstream is written down as the upstream remote, and answers no
+question: with a disposition it is proposed without a policy and added with
+one; without a disposition the call is still the question.
 
-Without a policy the answer still resolves the question and the remote is
-reported as one that WOULD be added, with nothing written. That is the no-policy
-contract holding over the remote as it holds over everything else: an unattended
-call reports and does not act."
+Without a policy the remote is reported as one that WOULD be added, with
+nothing written, which is the no-policy contract holding over the remote as it
+holds over everything else."
   (with-fixture-template
     (with-temp-git-repo (root :origin-url +ours-origin-url+
                               :initial-file "seed" :initial-content "seed")
       (%prepare root)
       (false (git-remote-url root "upstream")
              "the fixture records no upstream to begin with")
-      ;; No policy: the question is answered, the remote is only proposed.
+      (is equal "project-disposition-required"
+          (%error-type (%call root (%args "upstream_url"
+                                          +third-party-upstream-url+
+                                          "policy" "repair")))
+          "an upstream alone answers nothing")
+      (false (git-remote-url root "upstream")
+             "and the question wrote no remote")
       (let* ((assessed (%call root (%args "upstream_url"
-                                          +third-party-upstream-url+)))
+                                          +third-party-upstream-url+
+                                          "disposition" "forked")))
              (proposed (gethash "remote_added" assessed)))
-        (false (gethash "isError" assessed) "the upstream resolves the question")
-        (is equal "foreign-with-upstream" (gethash "classification" assessed))
+        (false (gethash "isError" assessed) "the assessment completed")
+        (is equal "forked" (gethash "disposition" assessed))
         (true (hash-table-p proposed) "the remote it would add is reported")
         (when (hash-table-p proposed)
           (is equal "would-add" (gethash "action_taken" proposed)))
         (false (git-remote-url root "upstream")
                "and a call with no policy wrote nothing"))
-      ;; With a policy: the remote is really added.
       (let* ((payload (%call root (%args "upstream_url"
                                          +third-party-upstream-url+
+                                         "disposition" "forked"
                                          "policy" "repair")))
              (remote (gethash "remote_added" payload)))
         (false (gethash "isError" payload) "the repair completed")
-        (is equal "foreign-with-upstream" (gethash "classification" payload))
+        (is equal "forked" (gethash "disposition" payload))
         (true (hash-table-p remote) "the remote it added is reported")
         (when (hash-table-p remote)
           (is equal "upstream" (gethash "remote" remote))
@@ -502,6 +563,7 @@ this test is aimed at could not occur."
                               :initial-file "seed" :initial-content "seed")
       (%prepare root)
       (let ((payload (%call root (%args "upstream_url" "--upload-pack=x"
+                                        "disposition" "forked"
                                         "policy" "repair"))))
         (true (gethash "isError" payload))
         (is equal "git-command-failed" (gethash "error_type" payload))
@@ -511,23 +573,25 @@ this test is aimed at could not occur."
                "and no remote was added")))))
 
 (define-test a-value-outside-the-enum-is-refused-rather-than-becoming-a-keyword
-  "A classification or policy the verb does not offer is refused as an invalid
+  "A disposition or policy the verb does not offer is refused as an invalid
 argument. Nothing the caller sends is converted into a keyword, so a value the
 enum never offered cannot reach the engine by construction."
   (with-fixture-template
     (with-temp-git-repo (root :origin-url +ours-origin-url+
                               :initial-file "seed" :initial-content "seed")
       (%prepare root)
-      (dolist (args (list (%args "classification" "theirs")
-                          (%args "classification" "OURS ")
-                          (%args "policy" "delete-everything")
-                          (%args "policy" "repair " "classification" "ours")))
-        (let ((payload (%call root args)))
-          (true (gethash "isError" payload)
-                "a value outside the enum is an error")
-          (is equal "invalid-argument" (gethash "error_type" payload))))
-      (true (%worktree-clean-p root)
-          "a refused argument wrote nothing"))))
+      (let ((before (%repository-state root)))
+        (dolist (args (list (%args "disposition" "theirs")
+                            (%args "disposition" "OURS ")
+                            (%args "disposition" "foreign")
+                            (%args "policy" "delete-everything")
+                            (%args "policy" "repair " "disposition" "ours")))
+          (let ((payload (%call root args)))
+            (true (gethash "isError" payload)
+                  "a value outside the enum is an error")
+            (is equal "invalid-argument" (gethash "error_type" payload))))
+        (is equal before (%repository-state root)
+            "a refused argument wrote nothing")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The advertised answers and the accepted answers are one set
@@ -544,14 +608,93 @@ argument validation before it ever reached the verb."
     (with-temp-git-repo (root :origin-url +ours-origin-url+
                               :initial-file "seed" :initial-content "seed")
       (%prepare root)
-      (let ((advertised (gethash "accepted_classifications" (%call root nil)))
-            (declared (%schema-enum "classification")))
+      (let ((advertised (gethash "accepted_dispositions" (%call root nil)))
+            (declared (%schema-enum "disposition")))
         (true (and (vectorp advertised) (plusp (length advertised)))
               "the ask advertises answers")
         (true (and (listp declared) (plusp (length declared)))
-              "the schema declares an enum for classification")
+              "the schema declares an enum for disposition")
         (is = (length declared) (length advertised)
             "the two lists name the same number of answers")
-        (loop for answer across advertised
-              do (true (member answer declared :test #'string=)
-                       (format nil "~A is one the schema accepts" answer)))))))
+        (when (vectorp advertised)
+          (loop for answer across advertised
+                do (true (member answer declared :test #'string=)
+                         (format nil "~A is one the schema accepts" answer))))
+        (false (%schema-enum "classification")
+               "the schema no longer offers a classification")))))
+
+(define-test every-disposition-refusal-writes-nothing
+  "Each refusal comes back typed and leaves the repository as it was: a supplied
+answer differing from the recorded one, a recorded value that cannot be read,
+two recorded values that disagree, and a tracked .envrc on a run that would
+record. Paired with the same fixture's repair succeeding once the cause is
+gone, so the refusals are not every call failing."
+  (flet ((refused (expected setup args)
+           (with-fixture-template
+             (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                                       :initial-file "seed" :initial-content "seed")
+               (%prepare root)
+               (funcall setup root)
+               (let ((before (%repository-state root))
+                     (payload (%call root args)))
+                 (is equal expected (%error-type payload)
+                     "~A is refused as ~A" args expected)
+                 (true (search "written nothing"
+                               (or (gethash "text"
+                                            (aref (gethash "content" payload) 0))
+                                   ""))
+                       "the refusal says it wrote nothing")
+                 (is equal before (%repository-state root)
+                     "and nothing was written"))))))
+    (refused "project-disposition-conflict"
+             (lambda (root)
+               (write-fixture-file root ".envrc"
+                                   (format nil "export DSMR_PROJECT_DISPOSITION=contributing~%")))
+             (%args "disposition" "ours" "policy" "repair"))
+    (refused "project-disposition-unreadable"
+             (lambda (root)
+               (write-fixture-file root ".envrc"
+                                   (format nil "export DSMR_PROJECT_DISPOSITION=\"${X:-ours}\"~%")))
+             (%args "policy" "repair"))
+    (refused "project-disposition-unreadable"
+             (lambda (root)
+               (write-fixture-file root ".envrc"
+                                   (format nil "export DSMR_PROJECT_DISPOSITION=maybe~%")))
+             (%args "policy" "repair"))
+    (refused "project-disposition-conflict"
+             (lambda (root)
+               (write-fixture-file root ".envrc"
+                                   (format nil "export DSMR_PROJECT_DISPOSITION=ours~%~
+export DSMR_PROJECT_DISPOSITION=forked~%")))
+             (%args "policy" "repair"))
+    (refused "project-disposition-not-recordable"
+             (lambda (root)
+               (fixture-commit-file root ".envrc" (format nil "export FOO=bar~%")))
+             (%args "disposition" "contributing" "policy" "repair")))
+  ;; The control: the same fixture with nothing in the way completes.
+  (with-fixture-template
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "seed" :initial-content "seed")
+      (%prepare root)
+      (false (gethash "isError"
+                      (%call root (%args "disposition" "contributing"
+                                         "policy" "repair")))
+             "with nothing in the way the repair completes"))))
+
+(define-test remote-facts-arrive-as-warnings-and-change-nothing
+  "Declared ours with an upstream remote recorded completes, as ours, with a
+warning on the wire. Declared forked with the same remotes carries none."
+  (with-fixture-template
+    (with-temp-git-repo (root :origin-url +ours-origin-url+
+                              :upstream-url +third-party-upstream-url+
+                              :initial-file "seed" :initial-content "seed")
+      (%prepare root)
+      (let ((ours (%call root (%args "disposition" "ours"))))
+        (false (gethash "isError" ours))
+        (is equal "ours" (gethash "disposition" ours) "the warning decides nothing")
+        (true (plusp (length (gethash "warnings" ours)))
+              "ours with an upstream remote warns"))
+      (let ((forked (%call root (%args "disposition" "forked"))))
+        (is equal "forked" (gethash "disposition" forked))
+        (is = 0 (length (gethash "warnings" forked))
+            "forked with an upstream is normal")))))

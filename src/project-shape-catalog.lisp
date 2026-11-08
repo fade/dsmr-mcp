@@ -289,6 +289,7 @@ item's generator is one place rather than a rendering call repeated per file."
         :path ".envrc"
         :tier :convenience
         :apparatus-p t
+        :local-only-p t
         :assertion :file-exists
         :match ".envrc"
         :generator (%renderer *envrc-template*)

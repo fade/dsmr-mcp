@@ -191,20 +191,23 @@ a system definition. Walks every renderable item the :OURS profile is held to."
                      (shape-item-key item) line))))))))
 
 (define-test a-foreign-repair-writes-no-licence-text
-  "A full repair of a foreign repository writes files, none naming a licence."
-  (with-fixture-template ()
-    (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                              :initial-file "README.md" :initial-content "x")
-      (%flat-foreign-fixture root)
-      (let* ((report (normalise-repository root :policy :repair))
-             (created (%created-paths report)))
-        (true created "the run created files, so the scan below reads something")
-        (true (find "lint-lisp.sh" created
-                    :key #'file-namestring :test #'string=)
-              "the lint script is among the files written")
-        (dolist (path created)
-          (is equal '() (%licence-markers-in (uiop:read-file-string path))
-              "~A carries no licence text" path))))))
+  "A full repair of a repository declared contributing or forked writes files,
+none naming a licence."
+  (dolist (disposition '(:contributing :forked))
+    (with-fixture-template ()
+      (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                                :initial-file "README.md" :initial-content "x")
+        (%flat-foreign-fixture root)
+        (let* ((report (normalise-repository root :policy :repair
+                                                  :disposition disposition))
+               (created (%created-paths report)))
+          (true created "the run created files, so the scan below reads something")
+          (true (find "lint-lisp.sh" created
+                      :key #'file-namestring :test #'string=)
+                "the lint script is among the files written")
+          (dolist (path created)
+            (is equal '() (%licence-markers-in (uiop:read-file-string path))
+                "~(~A~): ~A carries no licence text" disposition path)))))))
 
 (defun %octets (path)
   "Return the contents of PATH as a vector of octets."
@@ -276,40 +279,46 @@ owner chose for it.~%"))
   root)
 
 (define-test a-foreign-adoption-leaves-the-licence-byte-identical
-  "Repair and then record-as-debt over a foreign repository with its own licence
-leave every tracked file byte-identical and create no licence-named file.
+  "Repair and then record-as-debt over a repository with its own licence,
+declared contributing or forked, leave every tracked file byte-identical and
+create no licence-named file.
 
 The debt run branches on the linter being installed: present, the baseline is
 written and must carry no licence text; absent, the run must say the debt was
 not enumerated."
-  (with-fixture-template ()
-    (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                              :initial-file "README.md" :initial-content "x")
-      (%licensed-foreign-fixture root)
-      (let ((before (%tracked-octets root))
-            (names-before (%licence-named-files root)))
-        (true (assoc "LICENSE" before :test #'string=)
-              "precondition: the fixture tracks its licence")
-        (is equal '("COPYING" "LICENSE") names-before
-            "precondition: the name scan finds the fixture's licence files")
-        (let ((repair (normalise-repository root :policy :repair)))
-          (true (report-changed repair)
-                "the repair wrote something, so the comparison is about a run"))
-        (let ((debt (normalise-repository root :policy :record-as-debt)))
-          (if (gate-scanner-available-p (linter-path))
-              (let ((baseline (merge-pathnames ".gate-baseline.md" root)))
-                (is eq :created (getf (report-debt-baseline debt) :action-taken)
-                    "with the linter installed the baseline is written")
-                (is equal '() (%licence-markers-in
-                               (uiop:read-file-string baseline))
-                    "and the baseline carries no licence text"))
-              (is eq :not-enumerated
-                  (getf (report-debt-baseline debt) :action-taken)
-                  "with no linter installed the debt is not enumerated")))
-        (is equal '() (%changed-tracked-files before root)
-            "every tracked file is byte-identical after both runs")
-        (is equal '() (%new-licence-files names-before root)
-            "no licence-named file was created")))))
+  (dolist (disposition '(:contributing :forked))
+    (with-fixture-template ()
+      (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                                :initial-file "README.md" :initial-content "x")
+        (%licensed-foreign-fixture root)
+        (let ((before (%tracked-octets root))
+              (names-before (%licence-named-files root)))
+          (true (assoc "LICENSE" before :test #'string=)
+                "precondition: the fixture tracks its licence")
+          (is equal '("COPYING" "LICENSE") names-before
+              "precondition: the name scan finds the fixture's licence files")
+          (let ((repair (normalise-repository root :policy :repair
+                                                   :disposition disposition)))
+            (true (report-changed repair)
+                  "the repair wrote something, so the comparison is about a run"))
+          (let ((debt (normalise-repository root :policy :record-as-debt)))
+            (if (gate-scanner-available-p (linter-path))
+                (let ((baseline (merge-pathnames ".gate-baseline.md" root)))
+                  (when (eq disposition :contributing)
+                    (is eq :created (getf (report-debt-baseline debt) :action-taken)
+                        "with the linter installed the baseline is written"))
+                  (when (probe-file baseline)
+                    (is equal '() (%licence-markers-in
+                                   (uiop:read-file-string baseline))
+                        "the baseline carries no licence text")))
+                (is eq :not-enumerated
+                    (getf (report-debt-baseline debt) :action-taken)
+                    "with no linter installed the debt is not enumerated")))
+          (is equal '() (%changed-tracked-files before root)
+              "~(~A~): every tracked file is byte-identical after both runs"
+              disposition)
+          (is equal '() (%new-licence-files names-before root)
+              "~(~A~): no licence-named file was created" disposition))))))
 
 (define-test control-a-writer-touching-the-licence-is-caught
   "CONTROL for the byte-identity check. A repair writer that also appends to
@@ -327,7 +336,7 @@ LICENSE makes the same comparison report LICENSE as changed."
                    (with-open-file (out licence :direction :output
                                                 :if-exists :append)
                      (write-line "appended" out))))))
-        (normalise-repository root :policy :repair)
+        (normalise-repository root :policy :repair :disposition :contributing)
         (is equal '("LICENSE") (%changed-tracked-files before root)
             "the comparison reports the licence change, and only that")))))
 
@@ -339,43 +348,35 @@ reported as a new licence-named file."
                               :initial-file "README.md" :initial-content "x")
       (%licensed-foreign-fixture root)
       (let ((names-before (%licence-named-files root)))
-        (normalise-repository root :policy :repair)
+        (normalise-repository root :policy :repair :disposition :contributing)
         (write-fixture-file root "LICENSE-extra" "planted")
         (is equal '("LICENSE-extra") (%new-licence-files names-before root)
             "the scan finds the planted file, and only that")))))
 
-(defun %adopt-unlicensed (root declared)
+(defun %adopt-unlicensed (root disposition)
   "Commit an unlicensed source file to ROOT, then run repair and record-as-debt
-over it, passing DECLARED as the classification. Return the repair report."
+over it, declaring DISPOSITION on the first run. Return the repair report."
   (%clear-ambient-ignores root)
   (fixture-commit-file root "example.lisp" ";; no licence anywhere")
-  (prog1 (normalise-repository root :policy :repair
-                                    :declared-classification declared)
-    (normalise-repository root :policy :record-as-debt
-                               :declared-classification declared)))
+  (prog1 (normalise-repository root :policy :repair :disposition disposition)
+    (normalise-repository root :policy :record-as-debt)))
 
-(define-test a-repository-of-ours-is-given-no-licence-file
-  "A repository of ours, declared on the call or a declared hard fork, ends a
-repair and a record-as-debt run with no licence-named file.
+(define-test no-disposition-is-given-a-licence-file
+  "A repository declared ours, forked or contributing ends a repair and a
+record-as-debt run with no licence-named file. A forked or contributing project
+keeps the licence it came with, and an ours project is given none by the doctor.
 
 The licence item sits in the convenience tier, which no profile the doctor
 assesses holds; the control below widens that and watches a LICENSE appear."
-  (with-fixture-template ()
-    (with-temp-git-repo (root :origin-url +ours-origin-url+
-                              :initial-file "README.md" :initial-content "x")
-      (let ((report (%adopt-unlicensed root :ours)))
-        (true (report-changed report)
-              "the repair of a declared-ours repository wrote something"))
-      (is equal '() (%licence-named-files root)
-          "declared ours on the call: no licence-named file")))
-  (with-fixture-template ()
-    (with-temp-git-repo (root :origin-url "git@github.com:fade/zebra.git"
-                              :initial-file "README.md" :initial-content "x")
-      (let ((report (%adopt-unlicensed root nil)))
-        (true (report-changed report)
-              "the repair of a declared hard fork wrote something"))
-      (is equal '() (%licence-named-files root)
-          "a declared hard fork: no licence-named file"))))
+  (dolist (disposition '(:ours :forked :contributing))
+    (with-fixture-template ()
+      (with-temp-git-repo (root :origin-url +ours-origin-url+
+                                :initial-file "README.md" :initial-content "x")
+        (let ((report (%adopt-unlicensed root disposition)))
+          (true (report-changed report)
+                "the repair of a ~(~A~) repository wrote something" disposition))
+        (is equal '() (%licence-named-files root)
+            "~(~A~): no licence-named file" disposition)))))
 
 (define-test control-a-widened-ours-profile-writes-a-licence
   "CONTROL. With the convenience tier assessed for :OURS the same repair writes a

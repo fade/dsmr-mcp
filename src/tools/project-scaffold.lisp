@@ -125,6 +125,28 @@ touches a failing form."
        (format nil "Installed the lint gate at ~A, but it is not wired: ~A."
                (namestring (getf gate :path)) (getf wiring :reason))))))
 
+(defun %disposition-object (recorded)
+  "Return the disposition result object for RECORDED, the :DISPOSITION plist of
+write-scaffold. Carries action_taken always, and disposition and path when one
+was recorded, reason when none was."
+  (let ((object (make-ht "action_taken" (%wire-name (getf recorded :action-taken)))))
+    (when (getf recorded :disposition)
+      (setf (gethash "disposition" object)
+            (%wire-name (getf recorded :disposition))))
+    (when (getf recorded :path)
+      (setf (gethash "path" object) (namestring (getf recorded :path))))
+    (when (getf recorded :reason)
+      (setf (gethash "reason" object) (getf recorded :reason)))
+    object))
+
+(defun %disposition-line (recorded)
+  "Return the content line saying whether the disposition was recorded, and why not."
+  (if (getf recorded :disposition)
+      (format nil "Recorded the disposition ~A in ~A."
+              (%wire-name (getf recorded :disposition))
+              (namestring (getf recorded :path)))
+      (format nil "No disposition was recorded: ~A." (getf recorded :reason))))
+
 (defmethod tool-handle ((tool project-scaffold-tool) id args)
   (let* ((session (tool-session tool))
          (root    (session-project-root session)))
@@ -212,16 +234,19 @@ ASDF source-registry tree. Elsewhere: (asdf:load-asd ~S)"
                              "files" (coerce files 'vector)
                              "git_initialised" git-init-p
                              "gate_hook" (%gate-hook-object (getf res :gate-hook))
+                             "disposition" (%disposition-object
+                                            (getf res :disposition))
                              "next_steps" next-steps
                              "content"
                              (text-content
-                              (format nil "Scaffolded ~A at ~A (~D files)~%Path: ~A~%~A~%~A~%~{~A~%~}"
+                              (format nil "Scaffolded ~A at ~A (~D files)~%Path: ~A~%~A~%~A~%~A~%~{~A~%~}"
                                       name relative (length files)
                                       (namestring target-dir)
                                       (if git-init-p
                                           "Initialized a git repository here."
                                           "No git repository was created here.")
                                       (%gate-hook-line (getf res :gate-hook))
+                                      (%disposition-line (getf res :disposition))
                                       (coerce next-steps 'list))))))
         (invalid-argument-error (e)
           (result id

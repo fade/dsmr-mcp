@@ -1,19 +1,17 @@
 ;;;; tests/repo/repo-classify-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Zebra tests for repository classification, over real git repositories.
+;;;; Zebra tests for the declared project disposition, over real git repositories.
 ;;;;
-;;;; Every fixture here is an actual repository with actual remotes, not a temp
-;;;; directory standing in for one. Classification reads remotes, and a bare
-;;;; directory has none, so a check aimed at one would report the same answer
-;;;; whether the code worked or not.
+;;;; The disposition is a fact the operator states once, recorded in the
+;;;; repository's own untracked .envrc. These tests hold the reader to the file
+;;;; and nothing else: remotes, the process environment and the absence of a
+;;;; declaration each get a fixture in which a reader that consulted them would
+;;;; answer differently from one that did not.
 ;;;;
-;;;; The dangerous mistake this file is built around is a single direction:
-;;;; concluding that somebody else's repository is ours. That conclusion ends
-;;;; with our tooling committed into a third party's history, and it is silent.
-;;;; So the tests that matter most assert the negative explicitly, rather than
-;;;; trusting a positive assertion that a function returning one constant would
-;;;; also satisfy.
+;;;; Every refusal is checked for the bytes it did not write, beside a fixture in
+;;;; which the same write does happen, so an instrument aimed at nothing cannot
+;;;; pass for one reporting an absence.
 
 ;; Package evolution guard - delete prior definition on warm reload.
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -24,312 +22,383 @@
 (defpackage #:dsmr-mcp/tests/repo/repo-classify-test
   (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/repo-classify
-                #:*our-git-accounts*
-                #:our-git-accounts
-                #:parse-remote-owner
-                #:our-remote-p
-                #:*declared-hard-forks*
-                #:declared-hard-forks
-                #:parse-remote-repository
-                #:declared-hard-fork-p
-                #:classify-repository
-                #:repo-profile
-                #:+classifications+
-                #:repo-classification-ambiguous-error
-                #:repo-classification-ambiguous-directory
-                #:repo-classification-ambiguous-origin-url)
+                #:+dispositions+
+                #:+disposition-variable+
+                #:resolve-disposition
+                #:record-disposition
+                #:disposition-profile
+                #:disposition-warnings
+                #:project-disposition-required
+                #:disposition-required-directory
+                #:disposition-required-origin-url
+                #:project-disposition-conflict
+                #:disposition-conflict-declarations
+                #:project-disposition-unreadable
+                #:disposition-unreadable-path
+                #:disposition-unreadable-value
+                #:project-disposition-not-recordable
+                #:disposition-not-recordable-path)
+  (:import-from #:dsmr-mcp/src/envrc-vars
+                #:declared-values)
+  (:import-from #:dsmr-mcp/src/project-exclude
+                #:repo-exclude-path
+                #:parse-exclude-patterns)
   (:import-from #:dsmr-mcp/src/git
                 #:not-a-repository-error)
   (:import-from #:dsmr-mcp/tests/support/git-fixture
                 #:with-temp-git-repo
+                #:with-linked-worktree
+                #:fixture-commit-file
+                #:seed-exclude-patterns
                 #:+ours-origin-url+
                 #:+third-party-origin-url+
                 #:+third-party-upstream-url+)
   (:import-from #:dsmr-mcp/tests/support/fs-fixture
+                #:write-fixture-file
                 #:%make-temp-directory))
 
 (in-package #:dsmr-mcp/tests/repo/repo-classify-test)
 
 ;;; --- helpers ----------------------------------------------------------------
 
-(defun ambiguity-signalled-by (directory &rest arguments)
-  "Return the ambiguity condition CLASSIFY-REPOSITORY signals for DIRECTORY.
+(defun %envrc (root)
+  "Return the pathname of ROOT's .envrc."
+  (merge-pathnames ".envrc" (uiop:ensure-directory-pathname root)))
 
-Returns NIL when the call returned instead of signalling, so a caller can tell
-the two apart and report which happened. ZEBRA's FAIL proves that something
-was signalled; this exists to read the slots off it afterwards."
-  (handler-case (progn (apply #'classify-repository directory arguments) nil)
-    (repo-classification-ambiguous-error (condition) condition)))
+(defun %envrc-text (root)
+  "Return the text of ROOT's .envrc, or NIL when there is none."
+  (let ((path (%envrc root)))
+    (when (probe-file path) (uiop:read-file-string path))))
 
-;;; --- reading an account out of a URL ----------------------------------------
+(defun %exclude-text (root)
+  "Return the text of ROOT's local exclude, or the empty string."
+  (let ((path (repo-exclude-path root)))
+    (if (probe-file path) (uiop:read-file-string path) "")))
 
-(define-test parse-remote-owner-reads-every-url-shape-on-this-host
-  "The three shapes remotes actually take here, each read back to its account."
-  (is string= "sionescu"
-      (parse-remote-owner "https://github.com/sionescu/iolib.git"))
-  (is string= "fade"
-      (parse-remote-owner "git@github.com:fade/dsmr-mcp.git"))
-  (is string= "fade"
-      (parse-remote-owner "ssh://git@codeberg.org/fade/parachute")))
+(defun %excluded-p (root pattern)
+  "Return true when ROOT's local exclude lists PATTERN."
+  (and (member pattern (parse-exclude-patterns (%exclude-text root))
+               :test #'string=)
+       t))
 
-(define-test unparseable-url-fails-toward-foreign
-  "CONTROL for the parse step: proves an unrecognized URL yields no account and
-is not treated as ours. Were an unparseable URL to read as ours, every remote
-shape this parser does not know would silently become an invitation to track our
-apparatus in somebody else's tree, and no other check in this file would catch it."
-  (is eq nil (parse-remote-owner "not-a-url"))
-  (is eq nil (parse-remote-owner ""))
-  (is eq nil (parse-remote-owner :not-even-a-string))
-  (false (our-remote-p "not-a-url")
-         "an unparseable URL is not ours")
-  (false (our-remote-p "https://github.com/sionescu/iolib.git")
-         "and a parseable third-party URL is not ours either")
-  (true (our-remote-p +ours-origin-url+)
-        "while one of our own accounts is, so the negatives above are not blanket"))
+(defun %declare (root value)
+  "Write a .envrc under ROOT holding one disposition declaration of VALUE."
+  (write-fixture-file root ".envrc"
+                      (format nil "export DSMR_PROJECT_DISPOSITION=~A~%" value)))
 
-(define-test our-git-accounts-defaults-without-an-override
-  "The account list is readable and non-empty, which every classification below
-depends on. An empty list would make every repository foreign and would make the
-foreign assertions pass for the wrong reason."
-  (true (member "fade" (our-git-accounts) :test #'string=))
-  (true (member "fade" *our-git-accounts* :test #'string=)))
+(defun %signalled (type function &rest arguments)
+  "Return the condition of TYPE signalled by applying FUNCTION to ARGUMENTS, or
+NIL when the call returned. Lets a test read the slots of the refusal."
+  (handler-case (progn (apply function arguments) nil)
+    (condition (c) (when (typep c type) c))))
 
-;;; --- the four classification inputs -----------------------------------------
+(defmacro with-process-variable ((name value) &body body)
+  "Run BODY with the process environment variable NAME set to VALUE, restoring
+the previous value afterwards."
+  (let ((saved (gensym "SAVED-")))
+    `(let ((,saved (uiop:getenv ,name)))
+       (unwind-protect
+            (progn (setf (uiop:getenv ,name) ,value) ,@body)
+         (setf (uiop:getenv ,name) (or ,saved ""))))))
 
-(define-test ours-is-reached-only-by-a-declaration
-  "A repository reaches :OURS by one of two declarations and never by inference:
-an explicit classification on the call, or a hard fork named in the tracked
-list. The same fixture without the call's declaration signals, which the
-ambiguity test below asserts separately."
+;;; --- the vocabulary ---------------------------------------------------------
+
+(define-test the-three-dispositions-and-the-variable-that-records-them
+  "The operator's three dispositions, in the order they are offered, and the
+shell variable a .envrc records one in."
+  (is equal '(:ours :contributing :forked) +dispositions+)
+  (is string= "DSMR_PROJECT_DISPOSITION" +disposition-variable+))
+
+(define-test declared-values-returns-every-declaration-in-file-order
+  "Every declaration of a name, in file order, so two that disagree can be seen.
+A comment that mentions the name declares nothing."
+  (is equal '("ours" "\"forked\"")
+      (declared-values (format nil "# DSMR_PROJECT_DISPOSITION=contributing~%~
+export DSMR_PROJECT_DISPOSITION=ours~%~
+X=1~%~
+DSMR_PROJECT_DISPOSITION=\"forked\"~%")
+                       "DSMR_PROJECT_DISPOSITION"))
+  (is equal '() (declared-values "export X=1" "DSMR_PROJECT_DISPOSITION")))
+
+;;; --- nothing recorded: the question -----------------------------------------
+
+(define-test with-nothing-recorded-the-question-is-asked
+  "With no declaration and no supplied answer the reader signals the question,
+carrying the directory and the origin found. The repository is not written."
   (with-temp-git-repo (root :origin-url +ours-origin-url+
-                            :initial-file "README.md"
-                            :initial-content "x")
-    (multiple-value-bind (classification upstream)
-        (classify-repository root :declared-classification :ours)
-      (is eq :ours classification)
-      (is eq nil upstream "our own project records no upstream")
-      (is eq :ours (repo-profile classification))))
-  (with-temp-git-repo (root :origin-url "git@github.com:fade/zebra.git"
-                            :initial-file "README.md"
-                            :initial-content "x")
-    (is eq :ours (ignore-errors (classify-repository root))
-        "a declared hard fork is ours with nothing passed on the call")))
+                            :initial-file "seed" :initial-content "seed")
+    (let ((exclude-before (%exclude-text root))
+          (condition (%signalled 'project-disposition-required
+                                 #'resolve-disposition root)))
+      (true condition "the question is signalled")
+      (when condition
+        (is equal +ours-origin-url+ (disposition-required-origin-url condition))
+        (true (disposition-required-directory condition)))
+      (false (probe-file (%envrc root)) "no .envrc was written")
+      (is equal exclude-before (%exclude-text root)
+          "the local exclude is untouched"))))
 
-(define-test parse-remote-repository-reads-owner-and-name
-  "Every recognized URL shape reads back to owner/name, with .git and a
-trailing slash removed; anything else reads as NIL."
-  (is string= "fade/zebra"
-      (parse-remote-repository "git@github.com:fade/zebra.git"))
-  (is string= "fade/zebra"
-      (parse-remote-repository "https://github.com/fade/zebra"))
-  (is string= "fade/zebra"
-      (parse-remote-repository "https://github.com/fade/zebra.git"))
-  (is string= "fade/zebra"
-      (parse-remote-repository "https://github.com/fade/zebra/"))
-  (is string= "fade/parachute"
-      (parse-remote-repository "ssh://git@codeberg.org/fade/parachute"))
-  (is eq nil (parse-remote-repository "not-a-url"))
-  (is eq nil (parse-remote-repository ""))
-  (is eq nil (parse-remote-repository :not-even-a-string)))
-
-(define-test the-declared-hard-forks-are-zebra-and-boomer
-  "The tracked declaration names the two hard forks the operator declared."
-  (true (member "fade/zebra" (declared-hard-forks) :test #'string-equal))
-  (true (member "fade/boomer" (declared-hard-forks) :test #'string-equal)))
-
-(define-test a-declared-hard-fork-classifies-as-ours
-  "Every URL shape of a declared hard fork's origin, with no upstream, is :OURS
-without a question asked."
-  (dolist (url '("git@github.com:fade/zebra.git"
-                 "https://github.com/fade/zebra"
-                 "https://github.com/fade/zebra.git"
-                 "git@github.com:Fade/Zebra.git"
-                 "git@github.com:fade/boomer.git"))
-    (with-temp-git-repo (root :origin-url url
-                              :initial-file "README.md"
-                              :initial-content "x")
-      (true (declared-hard-fork-p url) "~A is a declared hard fork" url)
-      (multiple-value-bind (classification upstream)
-          (handler-case (classify-repository root)
-            (repo-classification-ambiguous-error () (values :signalled nil)))
-        (is eq :ours classification "~A classifies as ours" url)
-        (is eq nil upstream "~A records no upstream to report" url)))))
-
-(define-test a-declared-hard-fork-with-an-upstream-is-still-ours
-  "An upstream remote does not turn a declared hard fork back into a fork of
-somebody else's software."
-  (with-temp-git-repo (root :origin-url "git@github.com:fade/zebra.git"
-                            :upstream-url "https://github.com/Shinmera/parachute.git"
-                            :initial-file "README.md"
-                            :initial-content "x")
-    (is eq :ours (classify-repository root))))
-
-(define-test a-near-miss-never-matches-a-declaration
-  "CONTROL for the match. A name that merely begins with a declared one, a
-declared name under another owner, and an unparseable origin all fall through
-to the existing classification."
-  (with-temp-git-repo (root :origin-url "git@github.com:fade/zebra-tools.git"
-                            :initial-file "README.md"
-                            :initial-content "x")
-    (false (declared-hard-fork-p "git@github.com:fade/zebra-tools.git")
-           "a prefix of a declared name is not declared")
-    (true (ambiguity-signalled-by root)
-          "and the question is still asked"))
-  (with-temp-git-repo (root :origin-url "git@github.com:someone-else/zebra.git"
-                            :initial-file "README.md"
-                            :initial-content "x")
-    (false (declared-hard-fork-p "git@github.com:someone-else/zebra.git")
-           "a declared name under another owner is not declared")
-    (is eq :foreign-with-upstream (classify-repository root)))
-  (false (declared-hard-fork-p "not-a-url") "an unparseable URL never matches")
-  (false (declared-hard-fork-p nil) "no URL never matches"))
-
-(define-test an-explicit-classification-outranks-a-hard-fork
-  "An answer given on the call wins over the tracked declaration."
-  (with-temp-git-repo (root :origin-url "git@github.com:fade/zebra.git"
-                            :initial-file "README.md"
-                            :initial-content "x")
-    (is eq :foreign-orphan
-        (classify-repository root :declared-classification :foreign-orphan))))
-
-(define-test control-an-empty-declaration-asks-again
-  "CONTROL. With no hard forks declared the zebra fixture signals the ambiguity
-again, so the :OURS answers above come from the declaration and nothing else."
-  (with-temp-git-repo (root :origin-url "git@github.com:fade/zebra.git"
-                            :initial-file "README.md"
-                            :initial-content "x")
-    (is eq :ours (ignore-errors (classify-repository root))
-        "precondition: declared, it is ours")
-    (let ((*declared-hard-forks* '()))
-      (false (declared-hard-fork-p "git@github.com:fade/zebra.git")
-             "with an empty list nothing is declared")
-      (true (ambiguity-signalled-by root)
-            "and the question is asked"))))
-
-(define-test our-origin-with-an-upstream-is-a-foreign-fork
-  "Our origin plus a third-party upstream is the fork-then-clone shape, and it is
-somebody else's software however our own the origin looks."
-  (with-temp-git-repo (root :origin-url +ours-origin-url+
-                            :upstream-url +third-party-upstream-url+
-                            :initial-file "README.md"
-                            :initial-content "x")
-    (multiple-value-bind (classification upstream)
-        (classify-repository root)
-      (is eq :foreign-with-upstream classification)
-      (is string= +third-party-upstream-url+ upstream)
-      (is eq :foreign (repo-profile classification)))))
-
-(define-test third-party-origin-without-an-upstream-is-foreign
-  "CONTROL for classification, and the one that guards the leak. This fixture is
-a raw clone of somebody else's repository with NO upstream remote at all, which
-is the commonest shape in the workspace and the shape an upstream-presence test
-reads as ours. The negative assertion is made explicitly rather than inferred
-from the positive one, because a function that returned a single constant would
-satisfy the positive assertion alone."
-  (with-temp-git-repo (root :origin-url +third-party-origin-url+
-                            :initial-file "README.md"
-                            :initial-content "x")
-    (multiple-value-bind (classification upstream)
-        (classify-repository root)
-      (isnt eql :ours classification
-            "a third party's repository is never ours")
-      (isnt eq :ours (repo-profile classification)
-            "and its profile is never the tracked-apparatus one")
-      (is eq :foreign-with-upstream classification)
-      (is string= +third-party-origin-url+ upstream
-          "the origin is the upstream to record, there being no other")
-      (is eq :foreign (repo-profile classification)))))
-
-(define-test declared-orphan-is-a-terminal-state
-  "An absent upstream is a place to stop, not drift to repair. A declared orphan
-comes back as one and carries no upstream, and its profile is foreign, so it is
-adopted exactly like any other repository we do not own."
-  (with-temp-git-repo (root :origin-url +ours-origin-url+
-                            :initial-file "README.md"
-                            :initial-content "x")
-    (multiple-value-bind (classification upstream)
-        (classify-repository root :declared-classification :foreign-orphan)
-      (is eq :foreign-orphan classification)
-      (is eq nil upstream)
-      (is eq :foreign (repo-profile classification))
-      (true (member classification +classifications+)
-            "orphan is one of the terminal classifications, not an error code"))))
-
-;;; --- the ambiguous case, which is the common one ----------------------------
-
-(define-test our-origin-without-an-upstream-signals
-  "CONTROL for the ambiguity path. Our origin with nothing recording an upstream
-cannot be told from one of our own projects by anything on disk, and it is the
-largest of the our-origin buckets. FAIL proves the call produces no value at
-all: a version that returned :OURS here is precisely the silent leak, and it
-would satisfy any assertion phrased as a comparison."
-  (with-temp-git-repo (root :origin-url +ours-origin-url+
-                            :initial-file "README.md"
-                            :initial-content "x")
-    (fail (classify-repository root) 'repo-classification-ambiguous-error)
-    (let ((condition (ambiguity-signalled-by root)))
-      (true condition "the call signalled rather than returning")
-      (is string= +ours-origin-url+
-          (repo-classification-ambiguous-origin-url condition)
-          "the condition carries the origin, so the operator can be asked")
-      (true (repo-classification-ambiguous-directory condition)
-            "and the directory the question is about"))))
-
-(define-test a-supplied-upstream-resolves-the-ambiguity
-  "The ambiguous fixture stops being ambiguous once an upstream is supplied,
-without the repository's remotes being repaired first."
-  (with-temp-git-repo (root :origin-url +ours-origin-url+
-                            :initial-file "README.md"
-                            :initial-content "x")
-    (multiple-value-bind (classification upstream)
-        (classify-repository root :upstream-url +third-party-upstream-url+)
-      (is eq :foreign-with-upstream classification)
-      (is string= +third-party-upstream-url+ upstream))))
-
-(define-test a-repository-with-no-origin-signals
-  "No origin is as undecidable as an ambiguous one, and it signals the same way
-rather than defaulting. The condition carries a NIL origin, which is how a
-caller tells this shape from the our-origin one."
-  (with-temp-git-repo (root :initial-file "README.md" :initial-content "x")
-    (fail (classify-repository root) 'repo-classification-ambiguous-error)
-    (let ((condition (ambiguity-signalled-by root)))
-      (true condition "the call signalled rather than returning")
-      (is eq nil (repo-classification-ambiguous-origin-url condition)))))
-
-;;; --- inputs that are not classifiable at all --------------------------------
+(define-test remotes-decide-nothing
+  "An origin under the operator's account, an origin under a third party and no
+origin at all each produce the question when nothing is recorded. An upstream
+remote decides nothing either."
+  (dolist (remotes (list (list :origin +ours-origin-url+)
+                         (list :origin +third-party-origin-url+)
+                         (list :origin +ours-origin-url+
+                               :upstream +third-party-upstream-url+)
+                         (list)))
+    (with-temp-git-repo (root :origin-url (getf remotes :origin)
+                              :upstream-url (getf remotes :upstream)
+                              :initial-file "seed" :initial-content "seed")
+      (true (%signalled 'project-disposition-required #'resolve-disposition root)
+            "remotes ~S settle nothing" remotes))))
 
 (define-test a-plain-directory-is-not-a-repository
-  "A directory outside any repository is a broken precondition, reported as such
-rather than folded into the ambiguity path where it would be mistaken for a
-question worth asking the operator."
-  (let ((plain (%make-temp-directory)))
+  "A directory outside any repository is refused as such."
+  (let ((dir (%make-temp-directory)))
     (unwind-protect
-         (fail (classify-repository plain) 'not-a-repository-error)
-      (uiop:delete-directory-tree plain :validate t :if-does-not-exist :ignore))))
+         (fail (resolve-disposition dir) 'not-a-repository-error)
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
 
-(define-test an-invalid-declaration-signals-rather-than-being-ignored
-  "CONTROL for the declaration path: proves a value outside the three terminal
-classifications is rejected. Were it ignored, a mistyped declaration would fall
-through to inference and the operator's answer would be silently replaced by a
-guess, which is the failure this module exists to prevent."
+;;; --- reading a declaration --------------------------------------------------
+
+(define-test a-declaration-in-the-file-is-the-answer
+  "Each of the three values, bare and inside one pair of matching quotes, reads
+back as its keyword, and the source is the file it was read from."
+  (dolist (case '(("ours" :ours) ("contributing" :contributing)
+                  ("forked" :forked) ("\"forked\"" :forked)
+                  ("'contributing'" :contributing)))
+    (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+      (%declare root (first case))
+      (multiple-value-bind (disposition source) (resolve-disposition root)
+        (is eq (second case) disposition "~A reads back" (first case))
+        (is equal (namestring (truename (%envrc root)))
+            (namestring (truename source))
+            "the source is the .envrc")))))
+
+(define-test the-process-environment-is-never-read
+  "With the variable set to ours in this process and the file declaring
+contributing, the answer is contributing. With the variable set and no file at
+all, the question is still asked."
+  (with-process-variable ("DSMR_PROJECT_DISPOSITION" "ours")
+    (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+      (%declare root "contributing")
+      (is eq :contributing (resolve-disposition root)))
+    (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+      (true (%signalled 'project-disposition-required #'resolve-disposition root)
+            "an inherited variable is not a declaration"))))
+
+(define-test an-unreadable-value-is-refused
+  "A shell expansion, an unknown word and mismatched quotes are refused, naming
+the file and the value, rather than read as a guess."
+  (dolist (value '("${X:-ours}" "maybe" "\"ours'" "OURS" ""))
+    (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+      (%declare root value)
+      (let ((condition (%signalled 'project-disposition-unreadable
+                                   #'resolve-disposition root)))
+        (true condition "~S is refused" value)
+        (when condition
+          (is equal value (disposition-unreadable-value condition))
+          (true (disposition-unreadable-path condition)))))))
+
+(define-test declarations-that-disagree-are-refused
+  "Two declarations in one file that disagree are refused, never resolved by
+taking the first or the last. Two that agree are one answer."
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (write-fixture-file root ".envrc"
+                        (format nil "export DSMR_PROJECT_DISPOSITION=ours~%~
+export DSMR_PROJECT_DISPOSITION=forked~%"))
+    (let ((condition (%signalled 'project-disposition-conflict
+                                 #'resolve-disposition root)))
+      (true condition "the disagreement is refused")
+      (when condition
+        (is = 2 (length (disposition-conflict-declarations condition))))))
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (write-fixture-file root ".envrc"
+                        (format nil "export DSMR_PROJECT_DISPOSITION=forked~%~
+export DSMR_PROJECT_DISPOSITION=\"forked\"~%"))
+    (is eq :forked (resolve-disposition root))))
+
+(define-test a-supplied-answer-is-used-only-when-nothing-is-recorded
+  "With nothing recorded a supplied answer is the disposition and its source is
+the argument. With a declaration recorded, the same answer agrees and the file
+is the source; a different one is refused."
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (multiple-value-bind (disposition source)
+        (resolve-disposition root :supplied :forked)
+      (is eq :forked disposition)
+      (is eq :argument source)))
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (%declare root "contributing")
+    (multiple-value-bind (disposition source)
+        (resolve-disposition root :supplied :contributing)
+      (is eq :contributing disposition)
+      (true (pathnamep source) "the recorded file is the source"))
+    (true (%signalled 'project-disposition-conflict
+                      #'resolve-disposition root :supplied :ours)
+          "a supplied answer that differs from the record is refused")))
+
+;;; --- linked worktrees -------------------------------------------------------
+
+(define-test a-linked-worktree-reads-the-main-worktrees-declaration
+  "A linked worktree with no declaration of its own resolves from the main
+worktree's .envrc, and neither file is written by the read."
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (%declare root "forked")
+    (let ((main-before (%envrc-text root)))
+      (with-linked-worktree (worktree root)
+        (multiple-value-bind (disposition source) (resolve-disposition worktree)
+          (is eq :forked disposition)
+          (is equal (namestring (truename (%envrc root)))
+              (namestring (truename source))
+              "the source is the main worktree's .envrc"))
+        (false (probe-file (%envrc worktree))
+               "nothing was written into the linked worktree")
+        (is equal main-before (%envrc-text root)
+            "the main worktree's .envrc is unchanged")))))
+
+(define-test worktrees-that-disagree-are-refused-naming-both-files
+  "A linked worktree declaring a value different from the main worktree's is
+refused, and the refusal names both files."
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (%declare root "forked")
+    (with-linked-worktree (worktree root)
+      (%declare worktree "contributing")
+      (let ((condition (%signalled 'project-disposition-conflict
+                                   #'resolve-disposition worktree)))
+        (true condition "the disagreement is refused")
+        (when condition
+          (let ((sources (mapcar (lambda (entry)
+                                   (namestring (truename (car entry))))
+                                 (disposition-conflict-declarations condition))))
+            (true (member (namestring (truename (%envrc root))) sources
+                          :test #'string=)
+                  "the main worktree's file is named")
+            (true (member (namestring (truename (%envrc worktree))) sources
+                          :test #'string=)
+                  "the linked worktree's file is named")))))))
+
+;;; --- recording --------------------------------------------------------------
+
+(define-test recording-creates-the-file-and-excludes-it-first
+  "Recording into a repository with no .envrc creates one holding the literal
+declaration, lists .envrc in the local exclude, and leaves git status clean. A
+second record of the same value changes nothing."
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (seed-exclude-patterns root '())
+    (false (%excluded-p root ".envrc") "precondition: .envrc is not excluded")
+    (let ((result (record-disposition root :contributing)))
+      (is eq :created (getf result :action-taken))
+      (is eq :contributing (getf result :disposition)))
+    (true (search "export DSMR_PROJECT_DISPOSITION=contributing"
+                  (or (%envrc-text root) ""))
+          "the literal declaration is in the file")
+    (is eq :contributing (resolve-disposition root) "and reads back")
+    (true (%excluded-p root ".envrc") ".envrc is in the local exclude")
+    (is equal '() (dsmr-mcp/src/git:git-status-porcelain root)
+        "git status does not list .envrc")
+    (let ((text (%envrc-text root)))
+      (is eq :already-present
+          (getf (record-disposition root :contributing) :action-taken))
+      (is equal text (%envrc-text root) "a repeat record writes nothing"))))
+
+(define-test recording-edits-an-existing-file-in-place
+  "An existing .envrc with operator lines outside and inside a managed region
+gains exactly one line, inside the region, and every other byte is kept."
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (let ((before (format nil "# operator's own~%export FOO=bar~%~%~
+# >>> dsmr-mcp (added automatically; edit or remove freely) >>>~%~
+export DSMR_LOG_LEVEL=info~%~
+# <<< dsmr-mcp <<<~%~
+export AFTER=1~%")))
+      (write-fixture-file root ".envrc" before)
+      (is eq :added (getf (record-disposition root :forked) :action-taken))
+      (is equal (format nil "# operator's own~%export FOO=bar~%~%~
+# >>> dsmr-mcp (added automatically; edit or remove freely) >>>~%~
+export DSMR_LOG_LEVEL=info~%~
+export DSMR_PROJECT_DISPOSITION=forked~%~
+# <<< dsmr-mcp <<<~%~
+export AFTER=1~%")
+          (%envrc-text root)))))
+
+(define-test a-dry-run-record-writes-nothing
+  "A dry run reports that it would record and writes neither the .envrc nor the
+local exclude."
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (seed-exclude-patterns root '())
+    (let ((exclude-before (%exclude-text root)))
+      (is eq :would-record
+          (getf (record-disposition root :ours :dry-run t) :action-taken))
+      (false (probe-file (%envrc root)) "no .envrc was written")
+      (is equal exclude-before (%exclude-text root) "the exclude is unchanged"))))
+
+(define-test a-tracked-envrc-is-never-recorded-into
+  "A repository that tracks its .envrc is refused: a declaration written there
+would be committed. The file and the exclude are left as they were."
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (seed-exclude-patterns root '())
+    (fixture-commit-file root ".envrc" (format nil "export FOO=bar~%"))
+    (let ((text-before (%envrc-text root))
+          (exclude-before (%exclude-text root))
+          (condition (%signalled 'project-disposition-not-recordable
+                                 #'record-disposition root :ours)))
+      (true condition "the record is refused")
+      (when condition
+        (true (disposition-not-recordable-path condition)))
+      (is equal text-before (%envrc-text root) "the .envrc is unchanged")
+      (is equal exclude-before (%exclude-text root) "the exclude is unchanged"))))
+
+(define-test a-recorded-value-is-never-rewritten
+  "Recording a value different from the one already declared is refused and the
+file is unchanged: a change of disposition is a hand edit."
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (%declare root "contributing")
+    (let ((before (%envrc-text root)))
+      (true (%signalled 'project-disposition-conflict
+                        #'record-disposition root :ours))
+      (is equal before (%envrc-text root)))))
+
+;;; --- profile and warnings ---------------------------------------------------
+
+(define-test ours-and-forked-take-the-blocking-profile
+  "ours and forked map to the :OURS profile, contributing to :FOREIGN, and
+anything else is a type error rather than a default."
+  (is eq :ours (disposition-profile :ours))
+  (is eq :ours (disposition-profile :forked))
+  (is eq :foreign (disposition-profile :contributing))
+  (fail (disposition-profile :foreign) 'type-error)
+  (fail (disposition-profile nil) 'type-error))
+
+(define-test remote-facts-only-warn
+  "ours with an upstream remote warns; contributing with no upstream remote and
+no supplied upstream warns; forked warns about neither. The warnings change no
+answer."
   (with-temp-git-repo (root :origin-url +ours-origin-url+
-                            :initial-file "README.md"
-                            :initial-content "x")
-    (fail (classify-repository root :declared-classification :probably-ours)
-          'type-error)
-    (fail (classify-repository root :declared-classification "ours")
-          'type-error)
-    (is eq :ours (classify-repository root :declared-classification :ours)
-        "while a valid declaration still goes through, so the rejections above
-are not blanket")))
+                            :upstream-url +third-party-upstream-url+
+                            :initial-file "seed" :initial-content "seed")
+    (true (disposition-warnings root :ours) "ours plus an upstream warns")
+    (is equal '() (disposition-warnings root :forked) "forked with one does not")
+    (is equal '() (disposition-warnings root :contributing)
+        "contributing with one does not"))
+  (with-temp-git-repo (root :origin-url +ours-origin-url+
+                            :initial-file "seed" :initial-content "seed")
+    (true (disposition-warnings root :contributing)
+          "contributing with no upstream warns")
+    (is equal '() (disposition-warnings root :contributing
+                                        :upstream-url +third-party-upstream-url+)
+        "a supplied upstream answers it")
+    (is equal '() (disposition-warnings root :forked) "forked without one does not")
+    (is equal '() (disposition-warnings root :ours) "ours without one does not")))
 
-;;; --- profile ----------------------------------------------------------------
-
-(define-test repo-profile-collapses-both-foreign-outcomes
-  "Both foreign outcomes call for the same treatment, apparatus present and none
-of it tracked, so they share one profile. An unrecognized value signals rather
-than defaulting to either."
-  (is eq :ours (repo-profile :ours))
-  (is eq :foreign (repo-profile :foreign-with-upstream))
-  (is eq :foreign (repo-profile :foreign-orphan))
-  (fail (repo-profile :something-else) 'type-error))
+(define-test a-declaration-recorded-only-in-a-linked-worktree-warns
+  "A declaration held only by a linked worktree warns that a new worktree would
+be asked again. The same declaration in the main worktree does not warn."
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (with-linked-worktree (worktree root)
+      (%declare worktree "forked")
+      (true (some (lambda (w) (search "worktree" w))
+                  (disposition-warnings worktree :forked))
+            "the linked-worktree-only declaration warns"))
+    (%declare root "forked")
+    (is equal '() (disposition-warnings root :forked)
+        "the main worktree's declaration does not")))

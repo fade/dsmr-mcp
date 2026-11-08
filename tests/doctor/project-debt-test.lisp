@@ -203,11 +203,12 @@ else signals rather than rendering either mode."
 (define-test the-baseline-reads-as-a-record-rather-than-an-endorsement
   "The document says what it is, at what severity, and what promotion costs."
   (let ((text (render-debt-baseline :repo-name "some-library"
-                                    :classification :foreign-orphan
+                                    :disposition :contributing
                                     :severity :info
                                     :sites (list +one-site+))))
     (true (contains-p text "some-library")   "the document names the repository")
-    (true (contains-p text "foreign-orphan") "it names what kind of repository it is")
+    (true (contains-p text "Repository disposition: contributing")
+          "it names the repository's declared disposition")
     (true (contains-p text "not an")         "it says it is not an endorsement")
     (true (contains-p text "endorsement")    "in those words")
     (true (contains-p text ":info")          "it states the severity installed at")
@@ -224,11 +225,11 @@ table header, while the populated case must carry the header and the row. Split
 across two tests, deleting either leaves a green suite that cannot tell the two
 apart."
   (let ((empty      (render-debt-baseline :repo-name "quiet-repo"
-                                          :classification :ours
+                                          :disposition :ours
                                           :severity :info
                                           :sites '()))
         (populated  (render-debt-baseline :repo-name "loud-repo"
-                                          :classification :ours
+                                          :disposition :ours
                                           :severity :info
                                           :sites (list +one-site+))))
     (true  (contains-p empty +no-sites-marker+)
@@ -256,7 +257,7 @@ apart."
 Printing a word that sounds like a measurement where nothing was measured is how
 a record starts being believed for more than it says."
   (let ((text (render-debt-baseline
-               :repo-name "r" :classification :ours :severity :info
+               :repo-name "r" :disposition :ours :severity :info
                :sites (list (list :file "src/a.lisp" :line 1
                                   :category :frozen-with-diagnosis)))))
     (true (contains-p text ":not-determined")
@@ -280,7 +281,7 @@ believe they had changed it."
   (fail (render-gate-config :severity :critical) 'invalid-severity-error)
   (fail (render-lint-script :severity :critical) 'invalid-severity-error)
   (fail (render-pre-commit-hook :severity :critical) 'invalid-severity-error)
-  (fail (render-debt-baseline :repo-name "r" :classification :ours
+  (fail (render-debt-baseline :repo-name "r" :disposition :ours
                               :severity :critical :sites '())
         'invalid-severity-error)
   (handler-case (progn (validate-severity :critical) nil)
@@ -302,7 +303,7 @@ terms nothing else in the system understands."
   (fail (validate-debt-category :probably-fine) 'invalid-debt-category-error)
   (fail (validate-debt-category nil) 'invalid-debt-category-error)
   (fail (render-debt-baseline
-         :repo-name "r" :classification :ours :severity :info
+         :repo-name "r" :disposition :ours :severity :info
          :sites (list (list :file "src/a.lisp" :line 1 :category :probably-fine)))
         'invalid-debt-category-error
         "a bad category in a site stops the baseline being rendered"))

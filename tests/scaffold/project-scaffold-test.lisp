@@ -394,3 +394,56 @@ Returns the result payload hash-table."
       (true (search "No lint gate was installed" (%content-text payload))
             "the content does not say why no lint gate was installed")
       (asdf:clear-system "verb-nogate-proj"))))
+
+(define-test the-verb-records-ours-when-it-creates-the-repository
+  "A scaffold that creates its own repository records the disposition ours in
+the new project's .envrc and lists .envrc in that repository's local exclude,
+reporting both."
+  (with-temp-project-root (session root)
+    (let* ((payload (%call-scaffold root "name" "verb-ours-proj" "license" "MIT"))
+           (recorded (gethash "disposition" payload))
+           (project (merge-pathnames "scaffolds/verb-ours-proj/" root))
+           (envrc (merge-pathnames ".envrc" project))
+           (exclude (merge-pathnames ".git/info/exclude" project)))
+      (true (hash-table-p recorded) "the result has no disposition object")
+      (when (hash-table-p recorded)
+        (is string= "ours" (gethash "disposition" recorded))
+        (true (member (gethash "action_taken" recorded) '("created" "added")
+                      :test #'equal)
+              "the declaration was written: ~S" (gethash "action_taken" recorded)))
+      (true (search (format nil "~%export DSMR_PROJECT_DISPOSITION=ours~%")
+                    (read-file-into-string envrc))
+            "the .envrc declares ours")
+      (true (member ".envrc"
+                    (mapcar (lambda (line) (string-trim " " line))
+                            (uiop:split-string (read-file-into-string exclude)
+                                               :separator '(#\Newline)))
+                    :test #'string=)
+            "the local exclude lists .envrc")
+      (true (search "disposition" (%content-text payload))
+            "the content reports the disposition")
+      (asdf:clear-system "verb-ours-proj"))))
+
+(define-test a-scaffold-nested-in-a-repository-records-no-disposition
+  "A scaffold inside an existing repository, and one with init_git false, record
+no disposition, and the result says the doctor will ask."
+  (with-temp-project-root (session root)
+    (uiop:run-program (list "git" "-C" (namestring root) "init" "-q"))
+    (let* ((payload (%call-scaffold root "name" "verb-nested-proj"))
+           (recorded (gethash "disposition" payload))
+           (envrc (merge-pathnames "scaffolds/verb-nested-proj/.envrc" root)))
+      (true (hash-table-p recorded) "the result has no disposition object")
+      (when (hash-table-p recorded)
+        (is string= "not-recorded" (gethash "action_taken" recorded))
+        (true (search "project-doctor" (or (gethash "reason" recorded) ""))
+              "the reason says the doctor will ask"))
+      (false (search "DSMR_PROJECT_DISPOSITION" (read-file-into-string envrc))
+             "the nested project's .envrc declares nothing")
+      (asdf:clear-system "verb-nested-proj")))
+  (with-temp-project-root (session root)
+    (let* ((payload (%call-scaffold root "name" "verb-nogit-proj" "init_git" nil))
+           (recorded (gethash "disposition" payload)))
+      (when (hash-table-p recorded)
+        (is string= "not-recorded" (gethash "action_taken" recorded)))
+      (true (hash-table-p recorded) "the result has no disposition object")
+      (asdf:clear-system "verb-nogit-proj"))))

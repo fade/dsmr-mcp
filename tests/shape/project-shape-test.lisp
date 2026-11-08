@@ -29,6 +29,7 @@
                 #:shape-item
                 #:make-shape-item
                 #:shape-item-key
+                #:shape-item-local-only-p
                 #:shape-item-path
                 #:shape-item-tier
                 #:shape-item-group
@@ -124,13 +125,20 @@ item somebody adds next."
           "~S is excluded under the foreign profile." (shape-item-key item)))))
 
 (define-test every-apparatus-item-is-tracked-in-our-own-repository
-  "The same files are ordinary tracked content in a repository we own.
+  "The same files are ordinary tracked content in a repository we own, except a
+local-only file, which holds per-checkout facts and is excluded under every
+profile.
 
 Without this the excluded-in-foreign assertion is satisfied by a function that
 excludes everything everywhere, which would be a different bug."
   (dolist (item (apparatus-items))
-    (is eql :tracked (item-disposition item :ours)
-        "~S is tracked under our own profile." (shape-item-key item))))
+    (is eql (if (shape-item-local-only-p item) :excluded :tracked)
+        (item-disposition item :ours)
+        "~S under our own profile." (shape-item-key item)))
+  (let ((envrc (catalog-item :envrc)))
+    (true (shape-item-local-only-p envrc) "The .envrc item is local-only.")
+    (is eql :excluded (item-disposition envrc :ours))
+    (is eql :excluded (item-disposition envrc :foreign))))
 
 (define-test ordinary-project-content-is-tracked-under-either-profile
   "A file that is the project's own content is tracked whoever owns the repo."
@@ -207,8 +215,8 @@ worktree at all."
     (true (member ".mallet.lisp" paths :test #'string=))
     (false (member "hooks/lisp-gate" paths :test #'string=)
            "An item under the git directory is not a worktree pattern.")
-    (is equal '() (apparatus-paths-for-profile :ours)
-        "Nothing is excluded in a repository we own.")))
+    (is equal '(".envrc") (apparatus-paths-for-profile :ours)
+        "Only the local-only .envrc is excluded in a repository we own.")))
 
 ;;; --- what each kind of repository is held to --------------------------------
 
