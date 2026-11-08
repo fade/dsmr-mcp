@@ -1,7 +1,7 @@
 ;;;; tests/doctor/project-assess-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for read-only repository assessment, over real git
+;;;; Zebra tests for read-only repository assessment, over real git
 ;;;; repositories.
 ;;;;
 ;;;; The claim this file exists to defend is a negative one, and it is the
@@ -35,7 +35,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/doctor/project-assess-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/project-assess
                 #:assess-repository
                 #:item-satisfied-p

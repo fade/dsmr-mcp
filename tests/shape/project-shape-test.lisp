@@ -1,7 +1,7 @@
 ;;;; tests/shape/project-shape-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the shape representation and the declared catalog.
+;;;; Zebra tests for the shape representation and the declared catalog.
 ;;;;
 ;;;; The property that matters most here is a negative one: our operational
 ;;;; apparatus is never tracked in a repository we do not own. A negative
@@ -24,7 +24,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/shape/project-shape-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/project-shape
                 #:shape-item
                 #:make-shape-item

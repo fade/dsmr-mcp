@@ -1,7 +1,7 @@
 ;;;; tests/exclude/project-exclude-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for exclude drift detection and repair, over real git
+;;;; Zebra tests for exclude drift detection and repair, over real git
 ;;;; repositories.
 ;;;;
 ;;;; Two things this file is deliberately built to avoid.
@@ -26,7 +26,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/exclude/project-exclude-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/project-exclude
                 #:*exclude-template-path*
                 #:exclude-template-path

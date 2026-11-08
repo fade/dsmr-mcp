@@ -1,7 +1,7 @@
 ;;;; tests/repo/repo-classify-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for repository classification, over real git repositories.
+;;;; Zebra tests for repository classification, over real git repositories.
 ;;;;
 ;;;; Every fixture here is an actual repository with actual remotes, not a temp
 ;;;; directory standing in for one. Classification reads remotes, and a bare
@@ -22,7 +22,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/repo/repo-classify-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/repo-classify
                 #:*our-git-accounts*
                 #:our-git-accounts
@@ -52,7 +52,7 @@
   "Return the ambiguity condition CLASSIFY-REPOSITORY signals for DIRECTORY.
 
 Returns NIL when the call returned instead of signalling, so a caller can tell
-the two apart and report which happened. PARACHUTE's FAIL proves that something
+the two apart and report which happened. ZEBRA's FAIL proves that something
 was signalled; this exists to read the slots off it afterwards."
   (handler-case (progn (apply #'classify-repository directory arguments) nil)
     (repo-classification-ambiguous-error (condition) condition)))

@@ -1,7 +1,7 @@
 ;;;; tests/tools/project-doctor-tool-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the project-doctor verb, driven through TOOL-HANDLE.
+;;;; Zebra tests for the project-doctor verb, driven through TOOL-HANDLE.
 ;;;;
 ;;;; Everything here is measured on the wire shape rather than on the function
 ;;;; underneath it. The engine has its own suite; what this file defends is the
@@ -30,7 +30,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/tools/project-doctor-tool-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/tools/project-doctor
                 #:project-doctor-tool)
   (:import-from #:dsmr-mcp/src/tools/base

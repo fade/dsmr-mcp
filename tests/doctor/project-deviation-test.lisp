@@ -1,7 +1,7 @@
 ;;;; tests/doctor/project-deviation-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the deviation vocabulary: the three recoveries, the one
+;;;; Zebra tests for the deviation vocabulary: the three recoveries, the one
 ;;;; that is withheld, and the absence of any recovery when nobody asked for one.
 ;;;;
 ;;;; Two of the three things under test here are negative, and a negative claim
@@ -32,7 +32,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/doctor/project-deviation-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/project-shape
                 #:make-shape-item)
   (:import-from #:dsmr-mcp/src/project-deviation

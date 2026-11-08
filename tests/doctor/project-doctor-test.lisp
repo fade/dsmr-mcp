@@ -1,7 +1,7 @@
 ;;;; tests/doctor/project-doctor-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for repository normalisation, over real git repositories.
+;;;; Zebra tests for repository normalisation, over real git repositories.
 ;;;;
 ;;;; The property this file exists to defend is the one whose failure reaches a
 ;;;; third party: our tooling must never become tracked content in a repository
@@ -33,7 +33,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/doctor/project-doctor-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/project-doctor
                 #:normalise-repository
                 #:report-changed

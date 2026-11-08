@@ -1,7 +1,7 @@
 ;;;; tests/doctor/project-gate-scan-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for discovering the sites a quality gate would report,
+;;;; Zebra tests for discovering the sites a quality gate would report,
 ;;;; against a real source tree and a real linter.
 ;;;;
 ;;;; The claim under test is one that passes trivially when the instrument is
@@ -31,7 +31,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/doctor/project-gate-scan-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/project-gate-scan
                 #:*linter-path*
                 #:linter-path

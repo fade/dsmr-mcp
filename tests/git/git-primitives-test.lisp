@@ -1,7 +1,7 @@
 ;;;; tests/git/git-primitives-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the typed git subprocess primitives.
+;;;; Zebra tests for the typed git subprocess primitives.
 ;;;;
 ;;;; Most of what is asserted about adopting a repository is an ABSENCE: no
 ;;;; apparatus file tracked, no change on a second run, no remote configured.
@@ -17,7 +17,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/git/git-primitives-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/git
                 #:run-git
                 #:git-command-error

@@ -1,7 +1,7 @@
 ;;;; tests/doctor/project-debt-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Parachute tests for the severity ladder, the gate renderers and the frozen
+;;;; Zebra tests for the severity ladder, the gate renderers and the frozen
 ;;;; baseline. Nothing here touches a filesystem, a repository or a subprocess:
 ;;;; the module renders text and decides nothing else.
 ;;;;
@@ -31,7 +31,7 @@
       (sb-ext:without-package-locks (delete-package pkg)))))
 
 (defpackage #:dsmr-mcp/tests/doctor/project-debt-test
-  (:use #:cl #:parachute)
+  (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/project-debt
                 #:*severity-ladder*
                 #:*adopted-repo-gate-severity*
