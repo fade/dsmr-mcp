@@ -20,13 +20,16 @@
 # parenthesis. Such a line inside a multi-line string or a block comment reads
 # as a form start and narrows the region around it.
 #
-# MALLET overrides the linter location. Bypass a single commit with:
+# MALLET overrides the linter location; without it, DSMR_LINTER does, as it
+# does for the debt scan.
+#
+# Bypass a single commit with:
 #   git commit --no-verify
 #{{spdx-line}}
 set -u
 
 GATE_MODE='{{gate-mode}}'
-MALLET="${MALLET:-$HOME/.local/share/mallet/mallet}"
+MALLET="${MALLET:-${DSMR_LINTER:-$HOME/.local/share/mallet/mallet}}"
 BYPASS='Bypass a single commit with: git commit --no-verify'
 
 blocking() {

@@ -196,6 +196,27 @@ one line saying so and lets the commit through."
         (true (search "linter not found" output)
               "the line says the linter was not found: ~A" output)))))
 
+(define-test the-gate-honours-the-debt-scans-linter-override
+  "With MALLET unset, DSMR_LINTER names the linter the gate runs, the same one
+the debt scan uses. Pointed at a missing path, the gate says so by that path."
+  (with-foreign-gate (root gate)
+    (%stage root "lib.lisp" (%edit-second-form))
+    (let ((missing (namestring (merge-pathnames "dsmr-linter-here"
+                                                (uiop:ensure-directory-pathname
+                                                 root)))))
+      (multiple-value-bind (output error-output code)
+          (uiop:run-program (list "/usr/bin/env" "-u" "MALLET"
+                                  (format nil "DSMR_LINTER=~A" missing)
+                                  (namestring gate))
+                            :directory (namestring root)
+                            :output :string
+                            :error-output :output
+                            :ignore-error-status t)
+        (declare (ignore error-output))
+        (is = 0 code "the informational gate exits 0: ~A" output)
+        (true (search missing output)
+              "the gate looked for the linter at DSMR_LINTER: ~A" output)))))
+
 (define-test a-hostile-file-name-is-linted-and-never-evaluated
   "INJECTION CONTROL. A staged file whose name holds a space, a semicolon and a
 dollar-parenthesis sequence is reported under that name, and the canary the
