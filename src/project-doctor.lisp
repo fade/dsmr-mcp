@@ -100,7 +100,8 @@
                 #:git-head-sha
                 #:git-tracked-files
                 #:git-remote-url
-                #:git-remote-add)
+                #:git-remote-add
+                #:git-common-dir)
   (:export #:normalise-repository
            #:doctor-report
            #:doctor-report-p
@@ -276,20 +277,29 @@ nothing here."
 (defun %item-destination (item root bindings)
   "Return the absolute pathname ITEM installs to in the repository at ROOT.
 
-A :GIT-DIR item lands under the repository's own git directory. That directory
-is never part of any worktree and never reaches an upstream, so an item
-installed there is invisible to a third party whatever the profile. The gate
-script lands at GATE-HOOK-PATH, the path its configured-hook command names."
+A :GIT-DIR item lands under the git directory every worktree of the repository
+shares. That directory is never part of any worktree and never reaches an
+upstream, so an item installed there is invisible to a third party whatever the
+profile. The gate script lands at GATE-HOOK-PATH, the path its configured-hook
+command names."
   (if (%gate-hook-item-p item)
       (gate-hook-path root)
       (let ((base (ecase (shape-item-install-target item)
                     (:worktree (uiop:ensure-directory-pathname root))
-                    (:git-dir (merge-pathnames
-                               ".git/" (uiop:ensure-directory-pathname root)))))
+                    (:git-dir (git-common-dir root))))
             (relative (render-template
                        (or (shape-item-path item) (shape-item-match item))
                        bindings)))
         (merge-pathnames relative base))))
+
+(defun %item-jail (item root jail)
+  "Return the directory a write of ITEM in the repository at ROOT must stay inside.
+A :GIT-DIR item is bounded by the shared git directory, which in a linked
+worktree lies outside the worktree and so outside JAIL; every other item is
+bounded by JAIL."
+  (ecase (shape-item-install-target item)
+    (:worktree jail)
+    (:git-dir (git-common-dir root))))
 
 (defun %gate-item-p (item)
   "Return true when ITEM is one of the three files the quality gate is made of."
@@ -483,7 +493,7 @@ Its entry here reports that repair rather than repeating it."
                  (%write-repair destination
                                 (%item-content member bindings severity
                                                (%repo-name root) profile)
-                                jail)
+                                (%item-jail member root jail))
                  (when (%executable-item-p member)
                    (%make-executable destination))
                  (setf in-place t)
@@ -493,9 +503,10 @@ Its entry here reports that repair rather than repeating it."
                              :action-taken :created)
                        changes)))
               (when (and in-place (%gate-hook-item-p member))
-                (let ((wiring (wire-gate-hook root :dry-run dry-run)))
+                (let ((wiring (wire-gate-hook root :dry-run dry-run
+                                                  :profile profile)))
                   (case (getf wiring :action-taken)
-                    ((:created :would-create)
+                    ((:created :would-create :replaced :would-replace)
                      (push (%wiring-entry deviation member wiring) changes))
                     (:not-wired
                      (push (%wiring-entry deviation member wiring) problems)))))))))

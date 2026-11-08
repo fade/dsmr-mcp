@@ -27,6 +27,7 @@
   (:import-from #:dsmr-mcp/tests/support/fs-fixture
                 #:write-fixture-file)
   (:export #:with-temp-git-repo
+           #:with-linked-worktree
            #:make-temp-git-repo
            #:seed-exclude-patterns
            #:fixture-commit-file
@@ -164,5 +165,26 @@ find a stale directory."
        (unwind-protect
             (progn ,@body)
          (uiop:delete-directory-tree ,dir-var
+                                     :validate t
+                                     :if-does-not-exist :ignore)))))
+
+(defmacro with-linked-worktree ((worktree-var root &key (branch "side"))
+                                &body body)
+  "Bind WORKTREE-VAR to a linked worktree of the repository at ROOT, run BODY,
+then delete the worktree.
+
+The worktree is created with git worktree add on a new BRANCH, in a fresh temp
+directory outside ROOT, so its .git is a file and its own git directory differs
+from the one it shares with ROOT. ROOT must already have a commit."
+  (let ((parent (gensym "PARENT-")))
+    `(let* ((,parent (%make-temp-repo-directory))
+            (,worktree-var (merge-pathnames "wt/" ,parent)))
+       (unwind-protect
+            (progn
+              (run-git (list "worktree" "add" "-q" "-b" ,branch
+                             (namestring ,worktree-var))
+                       :directory ,root)
+              ,@body)
+         (uiop:delete-directory-tree ,parent
                                      :validate t
                                      :if-does-not-exist :ignore)))))

@@ -68,7 +68,8 @@
                 #:gate-hook-path
                 #:gate-hook-wired-p)
   (:import-from #:dsmr-mcp/src/git
-                #:git-tracked-files)
+                #:git-tracked-files
+                #:git-common-dir)
   (:export #:assess-repository
            #:item-satisfied-p
            #:assessment
@@ -88,14 +89,13 @@
 (defun %assertion-base (item root)
   "Return the directory ITEM's match is resolved against, under ROOT.
 
-An item installed under the repository's own git directory is looked for there
-and never in the working tree. Resolving it against the worktree would report a
-hook as absent in every repository that has one, and would report a same-named
-file in the tree as the hook."
-  (let ((top (uiop:ensure-directory-pathname root)))
-    (ecase (shape-item-install-target item)
-      (:worktree top)
-      (:git-dir (merge-pathnames ".git/" top)))))
+An item installed under the repository's git directory is looked for in the
+directory every worktree shares and never in the working tree. Resolving it
+against the worktree would report a hook as absent in every repository that
+has one, and would report a same-named file in the tree as the hook."
+  (ecase (shape-item-install-target item)
+    (:worktree (uiop:ensure-directory-pathname root))
+    (:git-dir (git-common-dir root))))
 
 (defun item-satisfied-p (item root)
   "Return T when ITEM's assertion holds in the repository at ROOT, else NIL.

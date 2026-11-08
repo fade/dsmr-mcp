@@ -795,7 +795,9 @@ Returns the second run's report."
     (is equal '() (report-changed again) "the second run changed nothing")
     (when (gate-hook-wired-p root)
       (is eq :already-present
-          (getf (wire-gate-hook root :dry-run t) :action-taken)
+          (getf (wire-gate-hook root :dry-run t
+                                     :profile (report-profile again))
+                :action-taken)
           "and the wiring reads as already present")
       (true (member :pre-commit (report-already-correct again))
             "and the gate is reported already correct"))

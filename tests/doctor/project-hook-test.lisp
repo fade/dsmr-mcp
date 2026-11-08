@@ -34,6 +34,7 @@
                 #:run-git)
   (:import-from #:dsmr-mcp/tests/support/git-fixture
                 #:with-temp-git-repo
+                #:with-linked-worktree
                 #:fixture-commit-file)
   (:import-from #:dsmr-mcp/tests/support/fs-fixture
                 #:write-fixture-file))
@@ -486,3 +487,61 @@ HEAD does not move."
                      (is string= head (run-git (list "rev-parse" "HEAD")
                                                :directory root)
                          "~S: HEAD did not move" profile)))))))))))
+
+(defun %install-gate-at (path text)
+  "Write TEXT to PATH, make it executable, and return PATH."
+  (ensure-directories-exist path)
+  (with-open-file (out path :direction :output :if-exists :supersede
+                            :if-does-not-exist :create
+                            :element-type 'character)
+    (write-string text out))
+  (uiop:run-program (list "chmod" "+x" (namestring path)))
+  path)
+
+(define-test one-wiring-serves-every-worktree
+  "LINKED-WORKTREE CONTROL. git config --local writes the config every worktree
+shares, so the gate installed and wired from one worktree must run from all of
+them. Installed from the linked worktree, a commit in the main worktree
+succeeds, and the reverse; each commit stages a non-Lisp file, so only a
+missing or unrunnable gate can refuse it."
+  (dolist (installer '(:linked :main))
+    (with-temp-git-repo (root :initial-file "lib.lisp"
+                              :initial-content +two-form-source+)
+      (with-linked-worktree (worktree root)
+        (if (not (configured-hooks-supported-p root))
+            (is eq :not-wired (getf (wire-gate-hook root) :action-taken))
+            (let ((from (if (eq installer :linked) worktree root)))
+              (%install-gate-at (gate-hook-path from)
+                                (render-pre-commit-hook :profile :foreign))
+              (wire-gate-hook from)
+              (true (probe-file (gate-hook-path worktree))
+                    "from ~(~A~): the linked worktree resolves the gate" installer)
+              (true (probe-file (gate-hook-path root))
+                    "from ~(~A~): the main worktree resolves the gate" installer)
+              (dolist (where (list root worktree))
+                (%stage where "notes.txt" (namestring where))
+                (multiple-value-bind (output code) (%commit where)
+                  (is = 0 code "wired from the ~(~A~) worktree, a commit in ~A succeeds: ~A"
+                      installer where output)))))))))
+
+(define-test a-missing-gate-script-follows-the-profile
+  "With the wiring in place and the script removed, the informational wiring
+lets the commit through and the blocking wiring refuses it. Each prints one
+line naming where it looked."
+  (dolist (case '((:foreign 0) (:ours 1)))
+    (destructuring-bind (profile expected) case
+      (with-temp-git-repo (root :initial-file "lib.lisp"
+                                :initial-content +two-form-source+)
+        (if (not (configured-hooks-supported-p root))
+            (is eq :not-wired (getf (wire-gate-hook root :profile profile)
+                                    :action-taken))
+            (progn
+              (wire-gate-hook root :profile profile)
+              (false (probe-file (gate-hook-path root))
+                     "precondition: no gate script is installed")
+              (%stage root "notes.txt" "notes")
+              (multiple-value-bind (output code) (%commit root)
+                (is = expected code "~S: exit status: ~A" profile output)
+                (true (search "lisp-gate: no gate at" output)
+                      "~S: the output says the gate is missing: ~A"
+                      profile output))))))))

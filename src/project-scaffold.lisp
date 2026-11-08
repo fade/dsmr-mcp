@@ -189,7 +189,7 @@ written and complete, and a hook problem must not cost the caller that write."
                 (uiop:run-program (list "chmod" "+x" (namestring jailed)))
                 (list :path path
                       :action-taken :created
-                      :wiring (wire-gate-hook target-dir)))))
+                      :wiring (wire-gate-hook target-dir :profile :ours)))))
       (error (condition)
         (not-installed
          (format nil "the lint gate could not be installed: ~A" condition))))))

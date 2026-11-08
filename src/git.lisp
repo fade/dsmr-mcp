@@ -27,6 +27,7 @@
            #:run-git
            #:git-repository-p
            #:git-toplevel
+           #:git-common-dir
            #:git-init
            #:git-remote-url
            #:git-remote-add
@@ -137,6 +138,17 @@ its PATH and the operator's locale, with two exceptions:
 (defun %nonempty (string)
   "Return STRING when it holds something, NIL when it is empty."
   (if (string= string "") nil string))
+
+(defun git-common-dir (directory)
+  "Return the absolute git directory shared by every worktree of the repository
+containing DIRECTORY, as a directory pathname.
+
+This is where git keeps the local config, the hooks, and info/exclude. In a
+linked worktree it is the main checkout's git directory, not the worktree's
+own. Signals GIT-COMMAND-ERROR when DIRECTORY is not in a repository."
+  (uiop:ensure-directory-pathname
+   (%trim (run-git (list "rev-parse" "--path-format=absolute" "--git-common-dir")
+                   :directory directory))))
 
 (defun %split-on-nul (string)
   "Split STRING on NUL characters, discarding empty pieces.
