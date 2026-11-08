@@ -39,7 +39,9 @@ Emits a package-inferred-system with a mode-dispatching executable, Zebra \
 test suite, build recipe, dev-boot script, dependency-preference agent docs, \
 a copied REPL-development guide, and a selectable license with per-file SPDX \
 headers. The new project includes the lint gate (linter config, lint script, \
-and a pre-commit gate) whenever the scaffold creates its repository. Returns a \
+and a pre-commit gate) whenever the scaffold creates its repository, and then \
+records the disposition ours in the project's untracked .envrc. Inside an \
+existing repository nothing is recorded, and project-doctor asks. Returns a \
 manifest of created files and next-step commands.")
    (dsmr-mcp/src/tools/base::input-schema
     :allocation :class

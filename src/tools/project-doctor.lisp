@@ -121,13 +121,15 @@ fresh, non-EQL object on reload and breaks a warm image.")
 destroying what is there. Assesses by default and writes nothing; repairs, \
 records as debt, or accepts a deviation as deliberate only when a policy says \
 so, and reports every change separately from what was already correct. The \
-repository's disposition (ours, contributing or forked) is read from its \
+repository's disposition (ours, contributing, or forked) is read from its \
 untracked .envrc. With none recorded the call returns the question, the three \
-answers and what each means, and writes nothing; a second call carries the \
+answers, and what each means, and writes nothing; a second call carries the \
 answer in disposition, and a writing run records it. For contributing the lint \
 gate reports the findings in the forms a commit changes and never refuses the \
 commit; for ours and forked it refuses a commit whose changed forms carry a \
-warning or an error.")
+warning or an error. Either way the gate appends every finding it shows to \
+lisp-gate/findings.tsv under the git directory, classed functional or style \
+from the linter's rule category.")
    (dsmr-mcp/src/tools/base::input-schema
     :allocation :class
     :initform '(:object
