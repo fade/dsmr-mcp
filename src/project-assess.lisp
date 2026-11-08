@@ -67,11 +67,15 @@
   (:import-from #:dsmr-mcp/src/project-hook
                 #:gate-hook-path
                 #:gate-hook-wired-p)
+  (:import-from #:dsmr-mcp/src/project-debt
+                #:render-pre-commit-hook)
+  (:import-from #:sb-posix)
   (:import-from #:dsmr-mcp/src/git
                 #:git-tracked-files
                 #:git-common-dir)
   (:export #:assess-repository
            #:item-satisfied-p
+           #:gate-file-state
            #:assessment
            #:assessment-p
            #:assessment-root
@@ -97,7 +101,51 @@ has one, and would report a same-named file in the tree as the hook."
     (:worktree (uiop:ensure-directory-pathname root))
     (:git-dir (git-common-dir root))))
 
-(defun item-satisfied-p (item root)
+(defun %gate-signature ()
+  "Return the opening two lines every rendering of the lint gate starts with."
+  (let ((lines (uiop:split-string (render-pre-commit-hook :profile :foreign)
+                                  :separator '(#\Newline))))
+    (format nil "~A~%~A~%" (first lines) (second lines))))
+
+(defun %executable-file-p (path)
+  "Return true when PATH names a regular file with an execute bit set."
+  (handler-case
+      (let ((mode (sb-posix:stat-mode
+                   (sb-posix:stat (uiop:native-namestring path)))))
+        (and (sb-posix:s-isreg mode)
+             (logtest mode (logior sb-posix:s-ixusr sb-posix:s-ixgrp
+                                   sb-posix:s-ixoth))
+             t))
+    (sb-posix:syscall-error () nil)))
+
+(defun gate-file-state (root profile)
+  "Return the state of the file at GATE-HOOK-PATH of the repository at ROOT.
+
+  :ABSENT   nothing is there.
+  :CURRENT  an executable file holding the gate rendered for PROFILE.
+  :STALE    a lint gate rendered for another profile, an earlier rendering of
+            the gate, or the current one without its execute bit. The doctor
+            replaces it.
+  :OTHER    a directory, or a file that is not a lint gate. Nothing replaces it.
+A lint gate is recognised by its two opening lines and a GATE_MODE line."
+  (let ((path (gate-hook-path root)))
+    (cond
+      ((uiop:directory-exists-p path) :other)
+      ((not (probe-file path)) :absent)
+      (t
+       (let ((text (handler-case (uiop:read-file-string path)
+                     (error () nil))))
+         (cond
+           ((null text) :other)
+           ((and (string= text (render-pre-commit-hook :profile profile))
+                 (%executable-file-p path))
+            :current)
+           ((and (uiop:string-prefix-p (%gate-signature) text)
+                 (search (format nil "~%GATE_MODE='") text))
+            :stale)
+           (t :other)))))))
+
+(defun item-satisfied-p (item root &optional profile)
   "Return T when ITEM's assertion holds in the repository at ROOT, else NIL.
 
 :FILE-EXISTS wants a file at the named relative path, and a directory of that
@@ -108,7 +156,10 @@ does not descend, so a system definition buried in a subdirectory is not the
 top-level one being asked about.
 
 :GATE-HOOK-WIRED wants the gate script at GATE-HOOK-PATH and git listing it as an
-enabled pre-commit hook with the expected command. A file named pre-commit is
+enabled pre-commit hook with the expected command. Given PROFILE, the script
+must be the executable rendering for PROFILE (see GATE-FILE-STATE) and the
+command the one for PROFILE; with PROFILE NIL, any file there and either
+profile's command satisfy it. A file named pre-commit is
 not evidence of the gate: every repository created on this host already has one
 from the init template, and it is not ours.
 
@@ -125,8 +176,10 @@ repository rather than as the typo it is."
       (:any-file-matching
        (and (directory (merge-pathnames match base)) t))
       (:gate-hook-wired
-       (and (uiop:file-exists-p (gate-hook-path root))
-            (gate-hook-wired-p root)
+       (and (if profile
+                (eq :current (gate-file-state root profile))
+                (uiop:file-exists-p (gate-hook-path root)))
+            (gate-hook-wired-p root :profile profile)
             t)))))
 
 ;;; ---------------------------------------------------------------------------
@@ -157,6 +210,16 @@ of an assessment that never looked at anything."
 (defun %item-label (item)
   "Return the path ITEM names, falling back to the pattern it is matched by."
   (or (shape-item-path item) (shape-item-match item)))
+
+(defun %unsatisfied-label (item root profile)
+  "Return how an unsatisfied ITEM is named in a finding about ROOT under PROFILE.
+A gate that is present but not the rendering for PROFILE is named as such,
+since calling it absent would misdescribe the repository."
+  (if (and (eq :gate-hook-wired (shape-item-assertion item))
+           (eq :stale (gate-file-state root profile)))
+      (format nil "~A (a lint gate rendered for another profile or out of date)"
+              (%item-label item))
+      (%item-label item)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Which items this repository is held to
@@ -192,7 +255,7 @@ one absent gate as several unrelated faults."
   (let ((unsatisfied '())
         (satisfied '()))
     (dolist (item members)
-      (if (item-satisfied-p item root)
+      (if (item-satisfied-p item root profile)
           (push item satisfied)
           (push item unsatisfied)))
     (setf unsatisfied (nreverse unsatisfied)
@@ -205,7 +268,10 @@ one absent gate as several unrelated faults."
                        :profile profile
                        :detail (format nil "the ~(~A~) is not installed; absent: ~{~A~^, ~}"
                                        group
-                                       (mapcar #'%item-label unsatisfied))))
+                                       (mapcar (lambda (item)
+                                                 (%unsatisfied-label item root
+                                                                     profile))
+                                               unsatisfied))))
      (mapcar #'shape-item-key satisfied))))
 
 (defun %exclude-drift (root profile)
@@ -304,7 +370,7 @@ thing wrong with it."
           (push key satisfied))))
     (dolist (item items)
       (unless (shape-item-group item)
-        (if (item-satisfied-p item root)
+        (if (item-satisfied-p item root profile)
             (push (shape-item-key item) satisfied)
             (push (make-condition 'missing-shape-item
                                   :item item

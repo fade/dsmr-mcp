@@ -56,6 +56,8 @@
                 #:catalog-item)
   (:import-from #:dsmr-mcp/src/project-exclude
                 #:*exclude-template-path*)
+  (:import-from #:dsmr-mcp/src/project-debt
+                #:render-pre-commit-hook)
   (:import-from #:dsmr-mcp/src/project-hook
                 #:gate-hook-path
                 #:gate-hook-wired-p
@@ -139,25 +141,31 @@ to us for any part of it."
   (write-fixture-file root "tests/main-test.lisp" ";; tests")
   root)
 
-(defun %write-gate-file (root)
-  "Write a stand-in gate script at ROOT's GATE-HOOK-PATH and return its path."
+(defun %write-gate-file (root &optional profile)
+  "Write a gate script at ROOT's GATE-HOOK-PATH and return its path.
+With PROFILE, the script is the executable rendering for PROFILE; without it,
+a one-line stand-in."
   (let ((path (gate-hook-path root)))
     (ensure-directories-exist path)
     (with-open-file (out path :direction :output :if-exists :supersede
                               :if-does-not-exist :create :element-type 'character)
-      (write-line "#!/usr/bin/env bash" out))
+      (if profile
+          (write-string (render-pre-commit-hook :profile profile) out)
+          (write-line "#!/usr/bin/env bash" out)))
+    (when profile
+      (uiop:run-program (list "chmod" "+x" (namestring path))))
     path))
 
-(defun %seed-quality-gate (root)
+(defun %seed-quality-gate (root &optional (profile :foreign))
   "Install every part of the quality gate under ROOT, plus its frozen baseline.
 
-The gate script is written at GATE-HOOK-PATH and wired through the configured-hook
-entries, since a gate git does not run is not installed. Signals an error when
-this git cannot wire it."
+The gate script is the rendering for PROFILE, written at GATE-HOOK-PATH and
+wired through the configured-hook entries for PROFILE, since a gate git does
+not run is not installed. Signals an error when this git cannot wire it."
   (write-fixture-file root ".mallet.lisp" ";; linter configuration")
   (write-fixture-file root "scripts/lint-lisp.sh" "#!/usr/bin/env bash")
-  (%write-gate-file root)
-  (let ((wiring (wire-gate-hook root)))
+  (%write-gate-file root profile)
+  (let ((wiring (wire-gate-hook root :profile profile)))
     (unless (member (getf wiring :action-taken) '(:created :already-present))
       (error "the fixture gate could not be wired at ~A: ~S" root wiring)))
   (write-fixture-file root ".gate-baseline.md" "# baseline")
@@ -323,7 +331,7 @@ repository of that kind has."
     (with-temp-git-repo (root :origin-url +ours-origin-url+
                               :initial-file "README.md" :initial-content "x")
       (%seed-library root)
-      (%seed-quality-gate root)
+      (%seed-quality-gate root :ours)
       (%seed-clean-exclude root)
       (uiop:delete-directory-tree (merge-pathnames "src/" root)
                                   :validate t :if-does-not-exist :ignore)
@@ -332,6 +340,30 @@ repository of that kind has."
              (missing (%of-type assessment 'missing-shape-item)))
         (is = 1 (length missing))
         (is equal '(:src-dir) (%keys missing))))))
+
+(define-test a-gate-rendered-for-another-profile-is-a-finding
+  "PROFILE-CHANGE CONTROL. The informational gate, wired, in a repository of ours
+is one finding naming the gate as rendered for another profile. The same
+repository with the blocking gate assesses with no gate finding."
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +ours-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%seed-library root)
+      (%seed-quality-gate root :foreign)
+      (%seed-clean-exclude root)
+      (when (configured-hooks-supported-p root)
+        (let* ((assessment (assess-repository root
+                                              :declared-classification :ours))
+               (missing (%of-type assessment 'missing-shape-item)))
+          (is = 1 (length missing) "one finding: ~S" missing)
+          (true (and missing (%mentions-p (first missing) "another profile"))
+                "it names the gate as rendered for another profile"))
+        (%write-gate-file root :ours)
+        (wire-gate-hook root :profile :ours)
+        (is equal '()
+            (%of-type (assess-repository root :declared-classification :ours)
+                      'missing-shape-item)
+            "the blocking gate satisfies a repository of ours")))))
 
 (define-test a-foreign-repository-is-held-to-none-of-its-own-structure
   "A third-party library is not sick for lacking a build script, and it is not
@@ -478,7 +510,7 @@ report by two entries that say nothing the first does not."
     (with-temp-git-repo (root :origin-url +ours-origin-url+
                               :initial-file "README.md" :initial-content "x")
       (%seed-library root)
-      (%seed-quality-gate root)
+      (%seed-quality-gate root :ours)
       (%seed-clean-exclude root)
       ;; Remove two of the gate's three parts, leaving the configuration.
       (uiop:delete-file-if-exists (merge-pathnames "scripts/lint-lisp.sh" root))

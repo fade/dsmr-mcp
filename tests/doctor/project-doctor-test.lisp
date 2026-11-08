@@ -946,6 +946,76 @@ only the missing wiring is written and reported as a change."
       (%check-never-leaked root)
       (%check-second-run-is-quiet root))))
 
+(define-test a-gate-rendered-for-another-profile-is-replaced
+  "PROFILE-CHANGE CONTROL. A repository adopted as foreign holds the
+informational gate. Once it is declared ours, the repair replaces that gate
+with the blocking rendering and rewires the command, rather than reporting the
+old gate already correct."
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +ours-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (let ((gate (gate-hook-path root)))
+        (ensure-directories-exist gate)
+        (write-fixture-file root ".git/hooks/lisp-gate"
+                            (render-pre-commit-hook :profile :foreign))
+        (uiop:run-program (list "chmod" "+x" (namestring gate)))
+        (when (configured-hooks-supported-p root)
+          (wire-gate-hook root :profile :foreign))
+        (let ((report (normalise-repository root :policy :repair
+                                                 :declared-classification :ours)))
+          (is eq :ours (report-profile report))
+          (true (%gate-mode-p gate "blocking") "the gate is now blocking")
+          (true (%executable-p gate) "and executable")
+          (false (member :pre-commit (report-already-correct report))
+                 "the old gate is not reported already correct")
+          (is eq :replaced
+              (getf (%gate-file-entry (report-changed report)) :action-taken)
+              "the gate file is reported replaced")
+          (when (configured-hooks-supported-p root)
+            (true (gate-hook-wired-p root :profile :ours)
+                  "the command is the blocking one")
+            (is eq :replaced
+                (getf (%wiring-entry (report-changed report)) :action-taken)
+                "the wiring is reported replaced")))
+        (%check-second-run-is-quiet root :declared-classification :ours)))))
+
+(define-test a-file-at-the-gate-path-that-is-not-the-gate-is-left-alone
+  "FOREIGN-FILE CONTROL. An executable script of somebody else's at the gate path
+is byte-identical after the repair, reported unresolved, never wired, and never
+reported already correct. The current rendering without its execute bit is
+replaced and made executable."
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (let ((gate (gate-hook-path root)))
+        (ensure-directories-exist gate)
+        (write-fixture-file root ".git/hooks/lisp-gate"
+                            (format nil "#!/bin/sh~%echo mine~%"))
+        (uiop:run-program (list "chmod" "+x" (namestring gate)))
+        (let* ((before (%octets gate))
+               (report (normalise-repository root :policy :repair)))
+          (is equalp before (%octets gate) "the file is byte-identical")
+          (true (%gate-file-entry (report-unresolved report))
+                "the gate file is reported unresolved")
+          (false (member :pre-commit (report-already-correct report))
+                 "it is not reported already correct")
+          (false (%wiring-entry (report-changed report))
+                 "no wiring is written for it")
+          (false (gate-hook-wired-p root) "and it is not wired"))))
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (let ((gate (write-fixture-file root ".git/hooks/lisp-gate"
+                                      (render-pre-commit-hook :profile :foreign))))
+        (false (%executable-p gate) "precondition: the gate is not executable")
+        (let ((report (normalise-repository root :policy :repair)))
+          (true (%executable-p gate) "the gate is executable after the repair")
+          (is eq :replaced
+              (getf (%gate-file-entry (report-changed report)) :action-taken)
+              "and reported replaced"))))))
+
 (define-test a-conflicting-gate-entry-is-reported-and-never-replaced
   "A hook.lisp-gate.command set to something else leaves the config as found and
 the wiring unresolved with a reason."

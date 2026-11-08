@@ -47,6 +47,7 @@
   (:import-from #:dsmr-mcp/src/project-assess
                 #:assess-repository
                 #:item-satisfied-p
+                #:gate-file-state
                 #:assessment-classification
                 #:assessment-profile
                 #:assessment-deviations
@@ -438,11 +439,19 @@ A deviation naming a grouped item is repaired across the whole group, because a
 group is assessed as one unit and a finding about it names only its first member.
 Members already satisfied are left alone.
 
-The gate script is rendered for PROFILE and written only when absent; a gate
-file already in place is kept as it is and its key returned as already correct.
-With the file in place, the gate is wired through WIRE-GATE-HOOK, with DRY-RUN
-passed on. A :CREATED or :WOULD-CREATE wiring is a change and a :NOT-WIRED one is
-unresolved; either entry names the member's key and the local config file.
+The gate script is handled by GATE-FILE-STATE for PROFILE:
+  :ABSENT   rendered for PROFILE and written, reported :CREATED.
+  :CURRENT  kept as it is.
+  :STALE    a lint gate rendered for another profile or out of date; rewritten
+            for PROFILE and reported :REPLACED. This is the only file a repair
+            replaces, and only because it is the doctor's own.
+  :OTHER    unresolved: something is already there.
+DRY-RUN reports :WOULD-CREATE or :WOULD-REPLACE and writes nothing. With the file
+in place, the gate is wired through WIRE-GATE-HOOK for PROFILE, with DRY-RUN
+passed on. A wiring that writes or would write is a change and a :NOT-WIRED one
+is unresolved; either entry names the member's key and the local config file. A
+kept gate's key is returned as already correct only when its wiring is not
+unresolved.
 
 A deviation naming no item at all is the local exclude, which is not a catalog
 item and was brought up to the pattern set of record before any file was written.
@@ -459,57 +468,66 @@ Its entry here reports that repair rather than repeating it."
         (dolist (member (if (shape-item-group item)
                             (shape-group-items (shape-item-group item) catalog)
                             (list item)))
-          (unless (item-satisfied-p member root)
-            (let ((destination (%item-destination member root bindings))
-                  (in-place nil))
-              (cond
-                ((not (%writable-item-p member))
-                 (push (list :deviation deviation
-                             :item (shape-item-key member)
-                             :path destination
-                             :reason
-                             "this item's content is measured from the repository rather than rendered, so it is recorded as debt rather than repaired")
-                       problems))
-                ((and (%gate-hook-item-p member)
-                      (uiop:file-exists-p destination)
-                      (not (uiop:directory-exists-p destination)))
-                 (setf in-place t)
-                 (push (shape-item-key member) kept))
-                ((probe-file destination)
-                 (push (list :deviation deviation
-                             :item (shape-item-key member)
-                             :path destination
-                             :reason
-                             "something is already there, and a repair never replaces what it finds")
-                       problems))
-                (dry-run
-                 (setf in-place t)
-                 (push (list :deviation deviation
-                             :item (shape-item-key member)
-                             :path destination
-                             :action-taken :would-create)
-                       changes))
-                (t
-                 (%write-repair destination
-                                (%item-content member bindings severity
-                                               (%repo-name root) profile)
-                                (%item-jail member root jail))
-                 (when (%executable-item-p member)
-                   (%make-executable destination))
-                 (setf in-place t)
-                 (push (list :deviation deviation
-                             :item (shape-item-key member)
-                             :path destination
-                             :action-taken :created)
-                       changes)))
-              (when (and in-place (%gate-hook-item-p member))
+          (unless (item-satisfied-p member root profile)
+            (let* ((destination (%item-destination member root bindings))
+                   (gate-p (%gate-hook-item-p member))
+                   (state (when gate-p (gate-file-state root profile)))
+                   (in-place nil)
+                   (keep nil))
+              (flet ((write-member (action)
+                       (%write-repair destination
+                                      (%item-content member bindings severity
+                                                     (%repo-name root) profile)
+                                      (%item-jail member root jail))
+                       (when (%executable-item-p member)
+                         (%make-executable destination))
+                       (setf in-place t)
+                       (push (list :deviation deviation
+                                   :item (shape-item-key member)
+                                   :path destination
+                                   :action-taken action)
+                             changes))
+                     (would (action)
+                       (setf in-place t)
+                       (push (list :deviation deviation
+                                   :item (shape-item-key member)
+                                   :path destination
+                                   :action-taken action)
+                             changes)))
+                (cond
+                  ((not (%writable-item-p member))
+                   (push (list :deviation deviation
+                               :item (shape-item-key member)
+                               :path destination
+                               :reason
+                               "this item's content is measured from the repository rather than rendered, so it is recorded as debt rather than repaired")
+                         problems))
+                  ((eq state :current)
+                   (setf in-place t keep t))
+                  ((eq state :stale)
+                   (if dry-run
+                       (would :would-replace)
+                       (write-member :replaced)))
+                  ((probe-file destination)
+                   (push (list :deviation deviation
+                               :item (shape-item-key member)
+                               :path destination
+                               :reason
+                               "something is already there, and a repair never replaces what it finds")
+                         problems))
+                  (dry-run (would :would-create))
+                  (t (write-member :created))))
+              (when (and in-place gate-p)
                 (let ((wiring (wire-gate-hook root :dry-run dry-run
-                                                  :profile profile)))
+                                                   :profile profile)))
                   (case (getf wiring :action-taken)
                     ((:created :would-create :replaced :would-replace)
                      (push (%wiring-entry deviation member wiring) changes))
                     (:not-wired
-                     (push (%wiring-entry deviation member wiring) problems)))))))))
+                     (setf keep nil)
+                     (push (%wiring-entry deviation member wiring) problems)))))
+              (when keep
+                (push (shape-item-key member) kept))))))
     (values (nreverse changes) (nreverse problems) (nreverse kept))))
 
 ;;; ---------------------------------------------------------------------------
