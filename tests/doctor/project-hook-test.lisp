@@ -205,3 +205,93 @@ name would create if evaluated does not exist afterwards."
         (false (probe-file (merge-pathnames "canary"
                                             (uiop:temporary-directory)))
                "no canary in the temporary directory")))))
+
+;;; ---------------------------------------------------------------------------
+;;; The blocking gate
+;;; ---------------------------------------------------------------------------
+
+(defparameter +clean-and-failing-source+
+  "(defun clean-form (x)
+  (+ x 1))
+
+(defun failing-form (y)
+  (ignore-errors (error \"bang\"))
+  y)
+"
+  "A clean first form and a second form with one finding, on line 5.")
+
+(defmacro with-ours-gate ((root gate &key (source '+two-form-source+))
+                          &body body)
+  "Bind ROOT to a fixture tracking lib.lisp holding SOURCE, and GATE to its
+blocking gate."
+  `(with-temp-git-repo (,root :initial-file "lib.lisp"
+                              :initial-content ,source)
+     (let ((,gate (%install-gate ,root (render-pre-commit-hook
+                                         :profile :ours))))
+       ,@body)))
+
+(define-test the-blocking-gate-refuses-a-touched-failing-form
+  "ALWAYS-PASS CONTROL. A touched form carrying a warning refuses the commit."
+  (with-ours-gate (root gate)
+    (%stage root "lib.lisp" (%edit-second-form))
+    (multiple-value-bind (output code) (%run-gate root gate)
+      (is = 1 code "the blocking gate refuses the commit: ~A" output)
+      (if (gate-scanner-available-p)
+          (true (%reports-p output "lib.lisp:6:")
+                "the finding that refuses it is printed: ~A" output)
+          (true (search "linter not found" output)
+                "with no linter, the gate says so: ~A" output)))))
+
+(define-test the-blocking-gate-passes-when-only-untouched-forms-fail
+  "Touching only the clean form lets the commit through although the other form
+in the same file carries a finding."
+  (with-ours-gate (root gate :source +clean-and-failing-source+)
+    (%stage root "lib.lisp"
+            (%edit-line +clean-and-failing-source+ 1
+                        "(defun clean-form-renamed (x)"))
+    (multiple-value-bind (output code) (%run-gate root gate)
+      (if (gate-scanner-available-p)
+          (progn
+            (is = 0 code "the commit proceeds: ~A" output)
+            (is = 0 (length (%finding-lines output))
+                "no finding line is printed: ~A" output))
+          (progn
+            (is = 1 code "with no linter, the blocking gate refuses: ~A" output)
+            (true (search "linter not found" output)
+                  "with no linter, the gate says so: ~A" output))))))
+
+(define-test a-finding-lowered-to-info-is-printed-and-passes
+  "With the planted rule lowered to info by the repository's .mallet.lisp, the
+blocking gate prints the finding and lets the commit through."
+  (with-ours-gate (root gate)
+    (fixture-commit-file root ".mallet.lisp"
+                         "(:mallet-config
+ (:extends :default)
+ (:enable :no-ignore-errors :severity :info))
+")
+    (%stage root "lib.lisp" (%edit-second-form))
+    (multiple-value-bind (output code) (%run-gate root gate)
+      (if (gate-scanner-available-p)
+          (progn
+            (is = 0 code "an info finding does not refuse: ~A" output)
+            (true (%reports-p output "lib.lisp:6:")
+                  "the info finding is still printed: ~A" output)
+            (true (search ": info: " output)
+                  "it is printed at info severity: ~A" output))
+          (true (search "linter not found" output)
+                "with no linter, the gate says so: ~A" output)))))
+
+(define-test the-blocking-gate-refuses-without-a-linter
+  "With MALLET naming a missing path, the blocking gate exits 1 and names the
+single-commit bypass."
+  (with-ours-gate (root gate)
+    (%stage root "lib.lisp" (%edit-second-form))
+    (let ((missing (namestring (merge-pathnames "no-linter-here"
+                                                (uiop:ensure-directory-pathname
+                                                 root)))))
+      (multiple-value-bind (output code) (%run-gate root gate :mallet missing)
+        (is = 1 code "the blocking gate refuses: ~A" output)
+        (true (search "linter not found" output)
+              "the output says the linter was not found: ~A" output)
+        (true (search "git commit --no-verify" output)
+              "the output names the single-commit bypass: ~A" output)))))

@@ -9,8 +9,10 @@
 # paths, so its line numbers agree with the diff even when the working tree
 # holds unstaged edits.
 #
-# Mode, fixed when this file is rendered:
+# Modes, fixed when this file is rendered:
 #   informational  report the findings; exit 0 on every path.
+#   blocking       exit 1 when a reported finding is an error or a warning, or
+#                  when the linter cannot run; exit 0 otherwise.
 #
 # Bound: a top-level form starts at a line whose first character is an open
 # parenthesis. Such a line inside a multi-line string or a block comment reads
@@ -23,9 +25,19 @@ set -u
 
 GATE_MODE='{{gate-mode}}'
 MALLET="${MALLET:-$HOME/.local/share/mallet/mallet}"
+BYPASS='Bypass a single commit with: git commit --no-verify'
 
-# Print one line for a gate that cannot do its work, then exit 0.
+blocking() {
+  [ "$GATE_MODE" = 'blocking' ]
+}
+
+# Print one line for a gate that cannot do its work, then exit: 1 when
+# blocking, 0 otherwise.
 cannot_run() {
+  if blocking; then
+    printf 'lisp-gate: %s; commit refused. %s\n' "$1" "$BYPASS"
+    exit 1
+  fi
   printf 'lisp-gate: %s; the commit proceeds without a lint check.\n' "$1"
   exit 0
 }
@@ -85,6 +97,7 @@ regions() {
 }
 
 KEPT=()
+REFUSE=0
 for path in "${FILES[@]}"; do
   case "$path" in
     *$'\n'*)
@@ -120,9 +133,11 @@ for path in "${FILES[@]}"; do
     rest="${line:${#prefix}}"
     [[ "$rest" =~ ^([0-9]+):[0-9]+:\ (error|warning|info):\  ]] || continue
     n="${BASH_REMATCH[1]}"
+    severity="${BASH_REMATCH[2]}"
     for i in "${!LO[@]}"; do
       if [ "$n" -ge "${LO[$i]}" ] && [ "$n" -le "${HI[$i]}" ]; then
         found+=("$rest")
+        [ "$severity" = 'info' ] || REFUSE=1
         break
       fi
     done
@@ -136,8 +151,16 @@ for path in "${FILES[@]}"; do
 done
 
 count="${#KEPT[@]}"
-printf 'lisp-gate: %d finding(s) in the forms this commit touches; the commit proceeds (%s).\n' "$count" "$GATE_MODE"
+if blocking && [ "$REFUSE" -eq 1 ]; then
+  printf 'lisp-gate: %d finding(s) in the forms this commit touches; commit refused on an error or warning (%s). %s\n' \
+    "$count" "$GATE_MODE" "$BYPASS"
+  status=1
+else
+  printf 'lisp-gate: %d finding(s) in the forms this commit touches; the commit proceeds (%s).\n' \
+    "$count" "$GATE_MODE"
+  status=0
+fi
 if [ "$count" -gt 0 ]; then
   printf '%s\n' "${KEPT[@]}"
 fi
-exit 0
+exit "$status"
