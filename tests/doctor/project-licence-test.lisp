@@ -23,24 +23,31 @@
   (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/project-doctor
                 #:normalise-repository
-                #:report-changed)
+                #:report-changed
+                #:report-debt-baseline
+                #:*repair-writer*)
   (:import-from #:dsmr-mcp/src/project-shape
                 #:shape-item-key
                 #:shape-item-generator
                 #:item-disposition
                 #:*shape-catalog*)
   (:import-from #:dsmr-mcp/src/project-shape-catalog
-                #:catalog-item)
+                #:*assessed-tiers*)
   (:import-from #:dsmr-mcp/src/project-debt
                 #:adopted-repo-gate-severity)
+  (:import-from #:dsmr-mcp/src/project-gate-scan
+                #:linter-path
+                #:gate-scanner-available-p)
   (:import-from #:dsmr-mcp/src/project-exclude
                 #:*exclude-template-path*)
   (:import-from #:dsmr-mcp/src/git
-                #:run-git)
+                #:run-git
+                #:git-tracked-files)
   (:import-from #:dsmr-mcp/tests/support/git-fixture
                 #:with-temp-git-repo
                 #:fixture-commit-file
                 #:seed-exclude-patterns
+                #:+ours-origin-url+
                 #:+third-party-origin-url+)
   (:import-from #:dsmr-mcp/tests/support/fs-fixture
                 #:write-fixture-file
@@ -164,3 +171,186 @@ covered without anyone adding a case for it."
         (dolist (path created)
           (is equal '() (%licence-markers-in (uiop:read-file-string path))
               "~A carries no licence text" path))))))
+
+(defun %octets (path)
+  "Return the contents of PATH as a vector of octets."
+  (with-open-file (in path :element-type '(unsigned-byte 8))
+    (let ((octets (make-array (file-length in) :element-type '(unsigned-byte 8))))
+      (read-sequence octets in)
+      octets)))
+
+(defun %tracked-octets (root)
+  "Return an alist of (RELATIVE-PATH . OCTETS) for every file ROOT tracks."
+  (mapcar (lambda (path)
+            (cons path (%octets (merge-pathnames
+                                 path (uiop:ensure-directory-pathname root)))))
+          (git-tracked-files root)))
+
+(defun %changed-tracked-files (before root)
+  "Return the paths in BEFORE, a %TRACKED-OCTETS result, whose octets in ROOT differ.
+A path no longer present counts as changed."
+  (loop for (path . octets) in before
+        for file = (merge-pathnames path (uiop:ensure-directory-pathname root))
+        unless (and (probe-file file) (equalp octets (%octets file)))
+          collect path))
+
+(defun %licence-named-p (path)
+  "Return true when PATH's file name contains licence, license, copying or
+notice, ignoring case."
+  (let ((name (file-namestring path)))
+    (and (some (lambda (word) (search word name :test #'char-equal))
+               '("licence" "license" "copying" "notice"))
+         t)))
+
+(defun %licence-named-files (root)
+  "Return, sorted, every licence-named file under ROOT outside its git directory,
+as it reads from ROOT."
+  (let* ((base (uiop:ensure-directory-pathname root))
+         (prefix (length (namestring base)))
+         (found '()))
+    (flet ((outside-git-p (directory)
+             (not (equal ".git" (car (last (pathname-directory directory)))))))
+      (uiop:collect-sub*directories
+       base #'outside-git-p #'outside-git-p
+       (lambda (directory)
+         (dolist (file (uiop:directory-files directory))
+           (when (%licence-named-p file)
+             (push (subseq (namestring file) prefix) found))))))
+    (sort found #'string<)))
+
+(defun %new-licence-files (before root)
+  "Return the licence-named files in ROOT that are not in the list BEFORE."
+  (set-difference (%licence-named-files root) before :test #'string=))
+
+(defun %licensed-foreign-fixture (root)
+  "Give ROOT the committed shape of a third-party library carrying its own licence.
+
+The licence-shaped content is synthetic and names an example owner; it is not
+a copy of any real licence text."
+  (%clear-ambient-ignores root)
+  (fixture-commit-file root "LICENSE"
+                       (format nil "Example Licence~%~%Copyright (c) 2026 Example Owner~%~%~
+Redistribution and use of this example are permitted on the terms the example~%~
+owner chose for it.~%"))
+  (fixture-commit-file root "COPYING"
+                       (format nil "See LICENSE for the terms of this example.~%"))
+  (fixture-commit-file root "example.asd"
+                       (format nil "(asdf:defsystem \"example\"~%  :license \"BSD-2-Clause\"~%  :components ((:file \"src/example\")))~%"))
+  (fixture-commit-file root "src/example.lisp"
+                       (format nil ";;;; Copyright (c) 2026 Example Owner~%~
+;;;; SPDX-License-Identifier: BSD-2-Clause~%~%(defpackage #:example (:use #:cl))~%"))
+  root)
+
+(define-test a-foreign-adoption-leaves-the-licence-byte-identical
+  "Repair and then record-as-debt over a foreign repository with its own licence
+leave every tracked file byte-identical and create no licence-named file.
+
+The debt run branches on the linter being installed: present, the baseline is
+written and must carry no licence text; absent, the run must say the debt was
+not enumerated."
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%licensed-foreign-fixture root)
+      (let ((before (%tracked-octets root))
+            (names-before (%licence-named-files root)))
+        (true (assoc "LICENSE" before :test #'string=)
+              "precondition: the fixture tracks its licence")
+        (is equal '("COPYING" "LICENSE") names-before
+            "precondition: the name scan sees the fixture's licence files")
+        (let ((repair (normalise-repository root :policy :repair)))
+          (true (report-changed repair)
+                "the repair wrote something, so the comparison is about a run"))
+        (let ((debt (normalise-repository root :policy :record-as-debt)))
+          (if (gate-scanner-available-p (linter-path))
+              (let ((baseline (merge-pathnames ".gate-baseline.md" root)))
+                (is eq :created (getf (report-debt-baseline debt) :action-taken)
+                    "with the linter installed the baseline is written")
+                (is equal '() (%licence-markers-in
+                               (uiop:read-file-string baseline))
+                    "and the baseline carries no licence text"))
+              (is eq :not-enumerated
+                  (getf (report-debt-baseline debt) :action-taken)
+                  "with no linter installed the debt is not enumerated")))
+        (is equal '() (%changed-tracked-files before root)
+            "every tracked file is byte-identical after both runs")
+        (is equal '() (%new-licence-files names-before root)
+            "no licence-named file was created")))))
+
+(define-test control-a-writer-touching-the-licence-is-caught
+  "CONTROL for the byte-identity check. A repair writer that also appends to
+LICENSE makes the same comparison report LICENSE as changed."
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%licensed-foreign-fixture root)
+      (let* ((before (%tracked-octets root))
+             (licence (merge-pathnames "LICENSE" root))
+             (original *repair-writer*)
+             (*repair-writer*
+               (lambda (path content)
+                 (prog1 (funcall original path content)
+                   (with-open-file (out licence :direction :output
+                                                :if-exists :append)
+                     (write-line "appended" out))))))
+        (normalise-repository root :policy :repair)
+        (is equal '("LICENSE") (%changed-tracked-files before root)
+            "the comparison sees the licence change, and only that")))))
+
+(define-test control-a-planted-licence-file-is-caught
+  "CONTROL for the name scan. A file named LICENSE-extra planted after a run is
+reported as a new licence-named file."
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%licensed-foreign-fixture root)
+      (let ((names-before (%licence-named-files root)))
+        (normalise-repository root :policy :repair)
+        (write-fixture-file root "LICENSE-extra" "planted")
+        (is equal '("LICENSE-extra") (%new-licence-files names-before root)
+            "the scan sees the planted file, and only that")))))
+
+(defun %adopt-unlicensed (root declared)
+  "Commit an unlicensed source file to ROOT, then run repair and record-as-debt
+over it, passing DECLARED as the classification. Return the repair report."
+  (%clear-ambient-ignores root)
+  (fixture-commit-file root "example.lisp" ";; no licence anywhere")
+  (prog1 (normalise-repository root :policy :repair
+                                    :declared-classification declared)
+    (normalise-repository root :policy :record-as-debt
+                               :declared-classification declared)))
+
+(define-test a-repository-of-ours-is-given-no-licence-file
+  "A repository of ours, declared on the call or a declared hard fork, ends a
+repair and a record-as-debt run with no licence-named file.
+
+The licence item sits in the convenience tier, which no profile the doctor
+assesses holds; the control below widens that and watches a LICENSE appear."
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +ours-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (let ((report (%adopt-unlicensed root :ours)))
+        (true (report-changed report)
+              "the repair of a declared-ours repository wrote something"))
+      (is equal '() (%licence-named-files root)
+          "declared ours on the call: no licence-named file")))
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url "git@github.com:fade/zebra.git"
+                              :initial-file "README.md" :initial-content "x")
+      (let ((report (%adopt-unlicensed root nil)))
+        (true (report-changed report)
+              "the repair of a declared hard fork wrote something"))
+      (is equal '() (%licence-named-files root)
+          "a declared hard fork: no licence-named file"))))
+
+(define-test control-a-widened-ours-profile-writes-a-licence
+  "CONTROL. With the convenience tier assessed for :OURS the same repair writes a
+LICENSE, so the absence asserted above is one the scan can see."
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +ours-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (let ((*assessed-tiers* '((:ours . (:invariant :gate :convenience))
+                                (:foreign . ()))))
+        (%adopt-unlicensed root :ours))
+      (true (member "LICENSE" (%licence-named-files root) :test #'string=)
+            "a LICENSE appears once the convenience tier is assessed"))))
