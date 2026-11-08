@@ -28,6 +28,7 @@
                 #:write-fixture-file)
   (:export #:with-temp-git-repo
            #:with-linked-worktree
+           #:with-git-lacking-configured-hooks
            #:make-temp-git-repo
            #:seed-exclude-patterns
            #:fixture-commit-file
@@ -188,3 +189,41 @@ from the one it shares with ROOT. ROOT must already have a commit."
          (uiop:delete-directory-tree ,parent
                                      :validate t
                                      :if-does-not-exist :ignore)))))
+
+(defmacro with-git-lacking-configured-hooks (() &body body)
+  "Run BODY with a git on PATH that cannot run configured hooks.
+
+A wrapper script named git is put first on PATH. It answers git hook list with a
+usage message and exit 129, as a git without configured hooks does, and passes
+every other command to the real git. PATH is restored and the wrapper deleted
+afterwards, whether BODY returned or threw."
+  (let ((dir (gensym "DIR-"))
+        (saved (gensym "SAVED-"))
+        (real (gensym "REAL-"))
+        (script (gensym "SCRIPT-")))
+    `(let* ((,dir (%make-temp-repo-directory))
+            (,saved (uiop:getenv "PATH"))
+            (,real (string-trim '(#\Space #\Newline)
+                                (uiop:run-program '("sh" "-c" "command -v git")
+                                                  :output :string)))
+            (,script (merge-pathnames "git" ,dir)))
+       (unwind-protect
+            (progn
+              (with-open-file (out ,script :direction :output
+                                           :if-exists :supersede
+                                           :if-does-not-exist :create)
+                (format out "#!/bin/sh~%~
+                             if [ \"$1\" = -C ]; then a=\"$3\"; b=\"$4\"; else a=\"$1\"; b=\"$2\"; fi~%~
+                             if [ \"$a\" = hook ] && [ \"$b\" = list ]; then~%~
+                             echo \"usage: git hook run [--ignore-missing] <hook-name> [-- <hook-args>]\" >&2~%~
+                             exit 129~%~
+                             fi~%~
+                             exec ~A \"$@\"~%"
+                        ,real))
+              (uiop:run-program (list "chmod" "+x" (namestring ,script)))
+              (setf (uiop:getenv "PATH")
+                    (format nil "~A:~A" (namestring ,dir) ,saved))
+              ,@body)
+         (setf (uiop:getenv "PATH") ,saved)
+         (uiop:delete-directory-tree ,dir :validate t
+                                          :if-does-not-exist :ignore)))))

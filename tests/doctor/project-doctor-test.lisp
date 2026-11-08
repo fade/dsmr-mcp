@@ -84,6 +84,7 @@
   (:import-from #:dsmr-mcp/tests/support/git-fixture
                 #:with-temp-git-repo
                 #:with-linked-worktree
+                #:with-git-lacking-configured-hooks
                 #:fixture-commit-file
                 #:seed-exclude-patterns
                 #:+ours-origin-url+
@@ -1041,6 +1042,37 @@ the wiring unresolved with a reason."
       (let ((again (%check-second-run-is-quiet root)))
         (true (%wiring-entry (report-unresolved again))
               "the second run still reports the conflict")))))
+
+(define-test a-git-without-configured-hooks-gets-no-gate-file
+  "UNSUPPORTED-GIT CONTROL. Where git cannot run configured hooks, the repair
+writes no gate script and no hook entry, and reports the gate unresolved with
+the reason. A dry run reports the same and writes nothing."
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (with-git-lacking-configured-hooks ()
+        (false (configured-hooks-supported-p root)
+               "precondition: the wrapper git cannot run configured hooks")
+        (dolist (dry-run '(t nil))
+          (let* ((before (%local-config-text root))
+                 (report (normalise-repository root :policy :repair
+                                                    :dry-run dry-run))
+                 (entry (%gate-file-entry (report-unresolved report))))
+            (false (probe-file (gate-hook-path root))
+                   "no gate file was written (dry-run ~A)" dry-run)
+            (is string= before (%local-config-text root)
+                "the local config is unchanged (dry-run ~A)" dry-run)
+            (true entry "the gate is reported unresolved: ~S"
+                  (report-unresolved report))
+            (true (and (getf entry :reason)
+                       (search "configured hooks" (getf entry :reason)))
+                  "with the reason: ~S" entry)
+            (false (%gate-file-entry (report-changed report))
+                   "the gate is not reported as a change")
+            (false (%wiring-entry (report-changed report))
+                   "nor is its wiring"))))
+      (%check-never-leaked root))))
 
 (define-test a-dry-run-writes-nothing-and-still-names-what-would-change
   "The file set and the exclude are identical afterwards, and the report is not."

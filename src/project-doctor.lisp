@@ -86,6 +86,7 @@
                 #:render-debt-baseline)
   (:import-from #:dsmr-mcp/src/project-hook
                 #:gate-hook-path
+                #:configured-hooks-supported-p
                 #:wire-gate-hook)
   (:import-from #:dsmr-mcp/src/project-gate-scan
                 #:collect-debt-sites
@@ -456,7 +457,9 @@ A deviation naming a grouped item is repaired across the whole group, because a
 group is assessed as one unit and a finding about it names only its first member.
 Members already satisfied are left alone.
 
-The gate script is handled by GATE-FILE-STATE for PROFILE:
+Where git cannot run configured hooks, the gate script is neither written nor
+wired, and is reported unresolved as :NOT-INSTALLED with the reason. Otherwise
+it is handled by GATE-FILE-STATE for PROFILE:
   :ABSENT   rendered for PROFILE and written, reported :CREATED.
   :CURRENT  kept as it is.
   :STALE    a lint gate rendered for another profile or out of date; rewritten
@@ -518,6 +521,14 @@ Its entry here reports that repair rather than repeating it."
                                :path destination
                                :reason
                                "this item's content is measured from the repository rather than rendered, so it is recorded as debt rather than repaired")
+                         problems))
+                  ((and gate-p (not (configured-hooks-supported-p root)))
+                   (push (list :deviation deviation
+                               :item (shape-item-key member)
+                               :path destination
+                               :action-taken :not-installed
+                               :reason
+                               "this git cannot run configured hooks, so the gate is not installed")
                          problems))
                   ((eq state :current)
                    (setf in-place t keep t))
@@ -627,7 +638,8 @@ DRY-RUN writes nothing at all and still names what would change.
 A repair of the quality gate installs the gate script rendered for the
 repository's profile and wires it as a configured pre-commit hook beside any
 hook already there. The wiring is reported like a file: a change when written,
-unresolved when an existing hook.lisp-gate entry differs.
+unresolved when an existing hook.lisp-gate entry differs. Where git cannot run
+configured hooks, neither is written and the gate is reported unresolved.
 
 Returns a DOCTOR-REPORT."
   (let* ((root (uiop:ensure-directory-pathname root))

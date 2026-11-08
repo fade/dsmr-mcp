@@ -34,6 +34,7 @@
                 #:render-pre-commit-hook)
   (:import-from #:dsmr-mcp/src/project-hook
                 #:gate-hook-path
+                #:configured-hooks-supported-p
                 #:wire-gate-hook)
   (:export #:write-scaffold))
 
@@ -168,7 +169,7 @@ this point."
 Writes the :OURS rendering of the gate to GATE-HOOK-PATH through the write jail,
 rooted at TARGET-DIR, sets its execute bit, and registers it with
 WIRE-GATE-HOOK. Call only when the scaffold created the repository at
-TARGET-DIR.
+TARGET-DIR. Where git cannot run configured hooks, nothing is written.
 
 Returns (:PATH P :ACTION-TAKEN :CREATED :WIRING W), where W is the plist
 WIRE-GATE-HOOK returns, or (:ACTION-TAKEN :NOT-INSTALLED :REASON R) when a step
@@ -179,17 +180,21 @@ written and complete, and a hook problem must not cost the caller that write."
     (handler-case
         (let* ((path (gate-hook-path target-dir))
                (jailed (ensure-write-path (namestring path) target-dir)))
-          (if (null jailed)
-              (not-installed
-               (format nil "the gate path ~A resolves outside the new project"
-                       (namestring path)))
-              (progn
-                (write-file-string-atomically
-                 jailed (render-pre-commit-hook :profile :ours))
-                (uiop:run-program (list "chmod" "+x" (namestring jailed)))
-                (list :path path
-                      :action-taken :created
-                      :wiring (wire-gate-hook target-dir :profile :ours)))))
+          (cond
+            ((not (configured-hooks-supported-p target-dir))
+             (not-installed
+              "this git cannot run configured hooks, so the gate is not installed"))
+            ((null jailed)
+             (not-installed
+              (format nil "the gate path ~A resolves outside the new project"
+                      (namestring path))))
+            (t
+             (write-file-string-atomically
+              jailed (render-pre-commit-hook :profile :ours))
+             (uiop:run-program (list "chmod" "+x" (namestring jailed)))
+             (list :path path
+                   :action-taken :created
+                   :wiring (wire-gate-hook target-dir :profile :ours)))))
       (error (condition)
         (not-installed
          (format nil "the lint gate could not be installed: ~A" condition))))))

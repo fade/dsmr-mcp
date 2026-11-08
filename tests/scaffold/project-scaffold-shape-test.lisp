@@ -56,6 +56,7 @@
                 #:with-temp-project-root)
   (:import-from #:dsmr-mcp/tests/support/git-fixture
                 #:with-temp-git-repo
+                #:with-git-lacking-configured-hooks
                 #:fixture-commit-file))
 
 (in-package #:dsmr-mcp/tests/scaffold/project-scaffold-shape-test)
@@ -319,6 +320,25 @@ over every file the scaffold generated."
             (true (gate-hook-wired-p project) "the gate is not wired"))
           (is eq :not-wired (getf (getf gate-report :wiring) :action-taken)
               "a git without configured hooks reported the gate as wired")))))
+
+(define-test a-git-without-configured-hooks-gets-no-gate-file
+  "UNSUPPORTED-GIT CONTROL. Where git cannot run configured hooks, the scaffold
+writes no gate script and reports the gate not installed, with the reason."
+  (with-temp-project-root (session root)
+    (with-git-lacking-configured-hooks ()
+      (let* ((outcome (scaffold-into root))
+             (project (project-directory outcome))
+             (gate-report (getf outcome :gate-hook)))
+        (true (getf outcome :git-initialised)
+              "precondition: the scaffold created the repository")
+        (false (probe-file (gate-hook-path project))
+               "a gate file was written where git cannot run it")
+        (is eq :not-installed (getf gate-report :action-taken)
+            "the gate is not reported as not installed: ~S" gate-report)
+        (true (and (getf gate-report :reason)
+                   (search "configured hooks" (getf gate-report :reason)))
+              "the report gives no reason: ~S" gate-report)
+        (false (gate-hook-wired-p project) "the gate reads as wired")))))
 
 (define-test the-generated-entry-point-reads-its-port-without-ignore-errors
   "The generated src/main.lisp carries no ignore-errors, which its own gate refuses.
