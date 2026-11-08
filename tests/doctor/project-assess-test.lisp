@@ -56,6 +56,11 @@
                 #:catalog-item)
   (:import-from #:dsmr-mcp/src/project-exclude
                 #:*exclude-template-path*)
+  (:import-from #:dsmr-mcp/src/project-hook
+                #:gate-hook-path
+                #:gate-hook-wired-p
+                #:configured-hooks-supported-p
+                #:wire-gate-hook)
   (:import-from #:dsmr-mcp/src/git
                 #:run-git
                 #:git-tracked-files
@@ -134,11 +139,27 @@ to us for any part of it."
   (write-fixture-file root "tests/main-test.lisp" ";; tests")
   root)
 
+(defun %write-gate-file (root)
+  "Write a stand-in gate script at ROOT's GATE-HOOK-PATH and return its path."
+  (let ((path (gate-hook-path root)))
+    (ensure-directories-exist path)
+    (with-open-file (out path :direction :output :if-exists :supersede
+                              :if-does-not-exist :create :element-type 'character)
+      (write-line "#!/usr/bin/env bash" out))
+    path))
+
 (defun %seed-quality-gate (root)
-  "Install every part of the quality gate under ROOT, plus its frozen baseline."
+  "Install every part of the quality gate under ROOT, plus its frozen baseline.
+
+The gate script is written at GATE-HOOK-PATH and wired through the configured-hook
+entries, since a gate git does not run is not installed. Signals an error when
+this git cannot wire it."
   (write-fixture-file root ".mallet.lisp" ";; linter configuration")
   (write-fixture-file root "scripts/lint-lisp.sh" "#!/usr/bin/env bash")
-  (write-fixture-file root ".git/hooks/pre-commit" "#!/usr/bin/env bash")
+  (%write-gate-file root)
+  (let ((wiring (wire-gate-hook root)))
+    (unless (member (getf wiring :action-taken) '(:created :already-present))
+      (error "the fixture gate could not be wired at ~A: ~S" root wiring)))
   (write-fixture-file root ".gate-baseline.md" "# baseline")
   root)
 
@@ -208,24 +229,59 @@ either file. Both sources are emptied for this repository alone."
     (false (item-satisfied-p (catalog-item :mallet-config) root))))
 
 (define-test a-git-directory-item-is-looked-for-under-the-git-directory
-  "CONTROL: the hook is resolved under .git/, and a same-named file in the
-working tree does not satisfy it.
+  "CONTROL: the gate is resolved under the git directory and satisfied only once
+git runs it. A same-named file in the working tree, a pre-commit hook in the
+hooks directory, and an unwired gate script each leave it unsatisfied.
 
-Resolving a git-directory item against the worktree would report the hook as
+Resolving a git-directory item against the worktree would report the gate as
 absent in every repository that has one, and would report an unrelated file that
-happens to share the name as the hook."
+happens to share the name as the gate."
   (with-temp-git-repo (root :origin-url +third-party-origin-url+
                             :initial-file "README.md" :initial-content "x")
     (let ((item (catalog-item :pre-commit)))
-      ;; The host's configured template directory may seed a hook into every new
-      ;; repository, so the baseline is established here rather than assumed.
-      (uiop:delete-file-if-exists (merge-pathnames ".git/hooks/pre-commit" root))
-      (false (item-satisfied-p item root))
+      (false (item-satisfied-p item root) "no gate at all")
       ;; A decoy at the same relative path in the working tree.
-      (write-fixture-file root "hooks/pre-commit" "#!/usr/bin/env bash")
-      (false (item-satisfied-p item root))
+      (write-fixture-file root "hooks/lisp-gate" "#!/usr/bin/env bash")
+      (false (item-satisfied-p item root) "a worktree decoy is not the gate")
       (write-fixture-file root ".git/hooks/pre-commit" "#!/usr/bin/env bash")
-      (true (item-satisfied-p item root)))))
+      (false (item-satisfied-p item root) "a pre-commit hook is not the gate")
+      (%write-gate-file root)
+      (false (item-satisfied-p item root) "an unwired gate is not installed")
+      (if (configured-hooks-supported-p root)
+          (progn
+            (wire-gate-hook root)
+            (true (gate-hook-wired-p root))
+            (true (item-satisfied-p item root) "the wired gate is installed"))
+          (progn
+            (is eq :not-wired (getf (wire-gate-hook root) :action-taken))
+            (false (item-satisfied-p item root)
+                   "a git without configured hooks never runs the gate"))))))
+
+(define-test a-template-pre-commit-hook-is-not-taken-for-the-gate
+  "CONTROL: a repository holding the linter configuration, the lint script and an
+executable pre-commit hook, as every clone on this host does, is reported as
+missing the gate.
+
+The hook stands in for the one the host's init template seeds. Taken for the
+gate, it would make the doctor report the gate installed and never install it."
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (write-fixture-file root ".mallet.lisp" ";; linter configuration")
+      (write-fixture-file root "scripts/lint-lisp.sh" "#!/usr/bin/env bash")
+      (let ((hook (write-fixture-file root ".git/hooks/pre-commit"
+                                      (format nil "#!/bin/sh~%exit 0~%"))))
+        (uiop:run-program (list "chmod" "+x" (namestring hook))))
+      (let* ((assessment (assess-repository root))
+             (gate (find-if (lambda (deviation)
+                              (and (typep deviation 'missing-shape-item)
+                                   (%mentions-p deviation "hooks/lisp-gate")))
+                            (assessment-deviations assessment))))
+        (true gate "the quality gate is reported as a deviation naming the gate")
+        (false (member :pre-commit (assessment-satisfied assessment))
+               "and the gate is not among the satisfied items")
+        (true (member :mallet-config (assessment-satisfied assessment))
+              "while the parts that are present are")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; A clean answer, and the evidence that a look happened
@@ -426,13 +482,13 @@ report by two entries that say nothing the first does not."
       (%seed-clean-exclude root)
       ;; Remove two of the gate's three parts, leaving the configuration.
       (uiop:delete-file-if-exists (merge-pathnames "scripts/lint-lisp.sh" root))
-      (uiop:delete-file-if-exists (merge-pathnames ".git/hooks/pre-commit" root))
+      (uiop:delete-file-if-exists (gate-hook-path root))
       (let* ((assessment (assess-repository root :declared-classification :ours))
              (deviations (assessment-deviations assessment)))
         (is = 1 (length deviations))
         (is equal '(:mallet-config) (%keys deviations))
         (true (%mentions-p (first deviations) "scripts/lint-lisp.sh"))
-        (true (%mentions-p (first deviations) "hooks/pre-commit"))
+        (true (%mentions-p (first deviations) "hooks/lisp-gate"))
         (true (member :gate-baseline (assessment-satisfied assessment)))))))
 
 ;;; ---------------------------------------------------------------------------

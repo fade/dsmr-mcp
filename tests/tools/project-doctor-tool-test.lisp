@@ -41,6 +41,9 @@
   (:import-from #:dsmr-mcp/src/project-exclude
                 #:*exclude-template-path*
                 #:repo-exclude-path)
+  (:import-from #:dsmr-mcp/src/project-hook
+                #:gate-hook-path
+                #:configured-hooks-supported-p)
   (:import-from #:dsmr-mcp/src/git
                 #:git-remote-url
                 #:git-status-porcelain)
@@ -136,12 +139,11 @@ that already points the check elsewhere cannot change what this suite measures."
 
 The local exclude is emptied rather than left as the host's git template seeded
 it, so the drift the doctor is asked to repair is the same drift on every
-machine. The seeded pre-commit hook goes for the same reason: a fixture that
-starts with part of the gate already installed measures a different repair from
-the one written down."
+machine. Any gate script at GATE-HOOK-PATH goes for the same reason: a fixture
+that starts with part of the gate already installed measures a different repair
+from the one written down."
   (seed-exclude-patterns root '())
-  (uiop:delete-file-if-exists
-   (merge-pathnames ".git/hooks/pre-commit" (uiop:ensure-directory-pathname root)))
+  (uiop:delete-file-if-exists (gate-hook-path root))
   (fixture-commit-file root "example.asd" "(asdf:defsystem \"example\")")
   (fixture-commit-file root "src/main.lisp" ";; source")
   (fixture-commit-file root "tests/main-test.lisp" ";; tests")
@@ -367,7 +369,27 @@ has something true to carry on that call as well as on the second."
         (true (vectorp (gethash "accepted" first-run)))
         (true (vectorp (gethash "unresolved" first-run)))
         (true (hash-table-p (gethash "exclude" first-run))
-              "the local exclude repair is reported"))
+              "the local exclude repair is reported")
+        (let ((wiring (find-if (lambda (entry)
+                                 (and (equal "pre-commit" (gethash "item" entry))
+                                      (stringp (gethash "path" entry))
+                                      (string= "config"
+                                               (file-namestring
+                                                (gethash "path" entry)))))
+                               (concatenate 'list
+                                            (gethash "changed" first-run)
+                                            (gethash "unresolved" first-run)))))
+          (true wiring "the gate's wiring is reported on the wire")
+          (true (search "/.git/" (gethash "path" wiring))
+                "with a path naming the repository's local config: ~S"
+                (gethash "path" wiring))
+          (if (configured-hooks-supported-p root)
+              (progn
+                (true (find wiring (gethash "changed" first-run))
+                      "in the changed array")
+                (is equal "created" (gethash "action_taken" wiring)))
+              (is equal "not-wired" (gethash "action_taken" wiring)
+                  "a git without configured hooks reports it unresolved"))))
       (let ((second-run (%call root (%args "policy" "repair"))))
         (false (gethash "isError" second-run) "the second run completed")
         (is = 0 (length (gethash "changed" second-run))

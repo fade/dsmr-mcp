@@ -33,6 +33,7 @@
                 #:shape-item-tier
                 #:shape-item-group
                 #:shape-item-apparatus-p
+                #:shape-item-assertion
                 #:shape-item-emit-on-scaffold-p
                 #:item-disposition
                 #:shape-items-for-profile
@@ -199,7 +200,7 @@ worktree at all."
     (true (member ".gate-baseline.md" paths :test #'string=)
           "An item with no generator is still excluded.")
     (true (member ".mallet.lisp" paths :test #'string=))
-    (false (member "hooks/pre-commit" paths :test #'string=)
+    (false (member "hooks/lisp-gate" paths :test #'string=)
            "An item under the git directory is not a worktree pattern.")
     (is equal '() (apparatus-paths-for-profile :ours)
         "Nothing is excluded in a repository we own.")))
@@ -319,7 +320,16 @@ than as the typo it is."
         'invalid-shape-item-error)
   (let ((item (make-shape-item :key :fine :tier :gate
                                :assertion :file-exists :match "x")))
-    (is eql :fine (shape-item-key item))))
+    (is eql :fine (shape-item-key item)))
+  (let ((item (make-shape-item :key :gate :tier :gate
+                               :assertion :gate-hook-wired
+                               :match "hooks/lisp-gate"
+                               :install-target :git-dir)))
+    (is eql :gate-hook-wired (shape-item-assertion item)
+        "the gate's wiring assertion is accepted"))
+  (fail (make-shape-item :key :bad :tier :gate
+                         :assertion :gate-hook-installed :match "x")
+        'invalid-shape-item-error))
 
 (define-test control-what-a-profile-is-held-to-is-decided-here-and-nowhere-else
   "CONTROL for the claim that what each kind of repository is held to lives in
