@@ -10,10 +10,11 @@ not own are in /The rules adoption follows/.
 Adopting a project means putting *our own apparatus* in place inside a repository,
 so that our tooling can work there. It does *not* mean changing the project.
 
-Getting that distinction wrong is the only way this can do real harm. The repositories in question are usually dependencies of something we are building.
-They have their own history, their own conventions, an upstream we do not control, and a
-maintainer who never agreed to our habits. Anything of ours that becomes visible in their
-work product, their tracked tree, their git log, anything a maintainer reads, is a defect.
+Getting that distinction wrong is the only way this can do real harm. The repositories in
+question are usually dependencies of something we are building. They have their own history,
+their own conventions, an upstream we do not control, and a maintainer who never agreed to our
+habits. Anything of ours that becomes visible in their work product, their tracked tree, their
+git log, anything a maintainer reads, is a defect.
 
 So the feature has two halves that must not be confused:
 

@@ -24,14 +24,15 @@
 ;;;; committing path fails loudly rather than leaving a commit of ours in
 ;;;; somebody else's log.
 ;;;;
-;;;; Nothing here overwrites or deletes. A repair creates a file that is absent.
-;;;; It never edits, replaces or deletes a file it finds, and never replaces a
-;;;; config value it finds. A destination that already exists is a finding to
-;;;; report; the one exception is a gate script already at its own path, which
-;;;; is kept and reported as already correct. Neither DELETE-FILE nor a
-;;;; directory-tree removal appears in this module at all. The destructive
-;;;; primitive lives elsewhere in this corner of the codebase and this is the
-;;;; module that must not reach for it.
+;;;; Nothing here deletes, and nothing here overwrites a file the doctor does not
+;;;; own or replaces a config value it did not write. A repair creates a file
+;;;; that is absent; a destination that already holds something else is a
+;;;; finding to report. The doctor's own files and entries are the exception:
+;;;; a gate script of its own rendering that is stale is rewritten, and a
+;;;; hook.lisp-gate.command entry of its own is rewired for the current
+;;;; profile. Neither DELETE-FILE nor a directory-tree removal appears in this
+;;;; module at all. The destructive primitive lives elsewhere in this corner of
+;;;; the codebase and this is the module that must not reach for it.
 ;;;;
 ;;;; What changed is reported separately from what was already correct, using
 ;;;; the action-taken vocabulary the exclude repair already established rather

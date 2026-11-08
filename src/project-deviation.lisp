@@ -14,11 +14,9 @@
 ;;;; The three decisions are named restarts rather than report categories:
 ;;;; REPAIR for a difference demonstrated to be a defect, RECORD-AS-DEBT for one
 ;;;; examined and frozen together with its diagnosis, ACCEPT-AS-DELIBERATE for
-;;;; one that is correct as written. That vocabulary is not coined here. It is
-;;;; the triage taxonomy already in use across the fleet, stated as recoveries
-;;;; instead of as labels, so the recovery is an explicit named decision at a
-;;;; site that understands the consequence rather than a default buried in a
-;;;; handler.
+;;;; one that is correct as written. Stated as recoveries instead of as labels,
+;;;; each is an explicit named decision at a site that understands the
+;;;; consequence rather than a default buried in a handler.
 ;;;;
 ;;;; One difference is deliberately not repairable. Our operational apparatus
 ;;;; being tracked in a repository we do not own is a violation whose obvious
