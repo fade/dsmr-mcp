@@ -59,6 +59,8 @@
            #:check-disposition-recordable
            #:record-disposition
            #:disposition-profile
+           #:disposition-gate-profile
+           #:disposition-writes-licence-p
            #:disposition-warnings
            #:project-disposition-error
            #:project-disposition-required
@@ -418,10 +420,30 @@ Signals:
 
 (defun disposition-profile (disposition)
   "Return the shape profile for DISPOSITION: :OURS for ours and forked, :FOREIGN
-for contributing. Signals TYPE-ERROR for anything else."
+for contributing. Signals TYPE-ERROR for anything else.
+
+The shape profile decides which tiers a repository is held to and whether our
+apparatus in it is tracked or excluded. The gate's mode is decided separately,
+by DISPOSITION-GATE-PROFILE."
   (ecase disposition
     ((:ours :forked) :ours)
     (:contributing :foreign)))
+
+(defun disposition-gate-profile (disposition)
+  "Return the profile the lint gate is rendered for under DISPOSITION: :OURS,
+which blocks, for ours and forked; :FOREIGN, which only reports, for
+contributing. Signals TYPE-ERROR for anything else."
+  (ecase disposition
+    ((:ours :forked) :ours)
+    (:contributing :foreign)))
+
+(defun disposition-writes-licence-p (disposition)
+  "Return true when licence text may be written into a repository declared
+DISPOSITION: only ours. A contributing project's licence is its maintainer's,
+and a fork keeps the licence it came with. Signals TYPE-ERROR for anything else."
+  (ecase disposition
+    (:ours t)
+    ((:contributing :forked) nil)))
 
 (defun %declares-p (path)
   "Return true when the file at PATH holds a disposition declaration of any value."

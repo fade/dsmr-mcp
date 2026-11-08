@@ -154,7 +154,32 @@ has, while the manifest still looked complete."
              (shape-item-key item)))
     (funcall generator bindings)))
 
-(defun plan-scaffold (&key name description author license copyright year destination)
+(defun %without-licence-text (text)
+  "Return TEXT without its licence text: every line naming an SPDX identifier,
+every :license line, and a Markdown section headed License up to the next
+heading of the same or a higher level. Every other line is kept."
+  (let ((kept '())
+        (skipping nil))
+    (dolist (line (uiop:split-string text :separator '(#\Newline)))
+      (let ((trimmed (string-trim '(#\Space #\Tab #\Return) line)))
+        (cond
+          ((string= trimmed "## License") (setf skipping t))
+          ((and skipping (or (uiop:string-prefix-p "# " trimmed)
+                             (uiop:string-prefix-p "## " trimmed)))
+           (setf skipping nil)
+           (push line kept))
+          (skipping nil)
+          ((search "SPDX-License-Identifier" trimmed) nil)
+          ((uiop:string-prefix-p ":license " trimmed) nil)
+          (t (push line kept)))))
+    (let ((result (string-right-trim '(#\Newline)
+                                     (format nil "~{~A~^~%~}" (nreverse kept)))))
+      (if (uiop:string-suffix-p text (string #\Newline))
+          (concatenate 'string result (string #\Newline))
+          result))))
+
+(defun plan-scaffold (&key name description author license copyright year destination
+                           without-licence)
   "Return an alist of (RELATIVE-PATH . CONTENT) for the scaffold manifest.
 Applies all template substitutions but performs no I/O. Callers are
 responsible for input validation before calling this function;
@@ -169,6 +194,10 @@ directory is never part of a manifest.
 
 Both an item's path and its content go through template substitution, so the
 catalogue can name a file whose name depends on the project.
+
+WITHOUT-LICENCE true plans no licence text at all: no LICENSE file, and no
+SPDX identifier, :license line or License section in any other file. LICENSE
+and COPYRIGHT are then ignored.
 
 DESTINATION is accepted for caller symmetry with write-scaffold but is not used
 here: the prompt is copied into the project's own prompts/ dir, so no path back
@@ -200,7 +229,13 @@ to a parent prompts/ directory is computed."
                  (remove "license-body" bindings :key #'car :test #'string=))))
       (loop for item in *shape-catalog*
             when (and (shape-item-emit-on-scaffold-p item)
-                      (eq :worktree (shape-item-install-target item)))
-              collect (cons (render-template (shape-item-path item)
-                                             bindings-with-rendered-license)
-                            (%item-content item bindings-with-rendered-license))))))
+                      (eq :worktree (shape-item-install-target item))
+                      (not (and without-licence
+                                (eq :license (shape-item-key item)))))
+              collect (let ((content (%item-content
+                                      item bindings-with-rendered-license)))
+                        (cons (render-template (shape-item-path item)
+                                               bindings-with-rendered-license)
+                              (if without-licence
+                                  (%without-licence-text content)
+                                  content)))))))

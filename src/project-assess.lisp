@@ -58,7 +58,8 @@
                 #:foreign-apparatus-tracked)
   (:import-from #:dsmr-mcp/src/repo-classify
                 #:resolve-disposition
-                #:disposition-profile)
+                #:disposition-profile
+                #:disposition-gate-profile)
   (:import-from #:dsmr-mcp/src/project-exclude
                 #:template-exclude-patterns
                 #:parse-exclude-patterns
@@ -250,17 +251,20 @@ restating any of it here would mean a revised answer had to be applied twice."
 ;;; The passes
 ;;; ---------------------------------------------------------------------------
 
-(defun %assess-group (group members root profile)
+(defun %assess-group (group members root profile &optional (gate-profile profile))
   "Return two values: one deviation or NIL, and the keys of the satisfied members.
 
 A group stands or falls together, so any unsatisfied member yields exactly one
 finding naming the group and the members that are absent. Reporting them
 separately would describe a partial install that does not occur, and would count
-one absent gate as several unrelated faults."
+one absent gate as several unrelated faults.
+
+PROFILE is the shape profile the finding names; GATE-PROFILE is the profile the
+gate script must be rendered for to count as present."
   (let ((unsatisfied '())
         (satisfied '()))
     (dolist (item members)
-      (if (item-satisfied-p item root profile)
+      (if (item-satisfied-p item root gate-profile)
           (push item satisfied)
           (push item unsatisfied)))
     (setf unsatisfied (nreverse unsatisfied)
@@ -275,7 +279,7 @@ one absent gate as several unrelated faults."
                                        group
                                        (mapcar (lambda (item)
                                                  (%unsatisfied-label item root
-                                                                     profile))
+                                                                     gate-profile))
                                                unsatisfied))))
      (mapcar #'shape-item-key satisfied))))
 
@@ -360,19 +364,21 @@ thing wrong with it."
   (multiple-value-bind (declared source)
       (resolve-disposition root :supplied disposition)
     (let* ((profile (disposition-profile declared))
+           (gate-profile (disposition-gate-profile declared))
            (items (%assessed-items catalog profile))
            (deviations '())
            (satisfied '()))
       (dolist (group (%groups-in-order items))
         (multiple-value-bind (deviation keys)
-            (%assess-group group (shape-group-items group items) root profile)
+            (%assess-group group (shape-group-items group items) root profile
+                           gate-profile)
           (when deviation
             (push deviation deviations))
           (dolist (key keys)
             (push key satisfied))))
       (dolist (item items)
         (unless (shape-item-group item)
-          (if (item-satisfied-p item root profile)
+          (if (item-satisfied-p item root gate-profile)
               (push (shape-item-key item) satisfied)
               (push (make-condition 'missing-shape-item
                                     :item item

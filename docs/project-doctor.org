@@ -209,6 +209,15 @@ doctor does, with the three answers and what each means, and writes nothing. Cal
 A repository the scaffold creates takes only ours, and with =init_git= false outside every
 repository there is nowhere to record a disposition, so none is recorded.
 
+The answer then governs what the scaffold writes there. In a repository declared contributing or
+forked, the project carries no licence text at all, whatever =license= says: no =LICENSE=, and no
+SPDX line, =:license= entry or License section in any file. The result says so. The apparatus
+paths the disposition keeps out of the index (for contributing, =CLAUDE.md=, =AGENTS.md=,
+=.mallet.lisp=, =scripts/lint-lisp.sh= and =.envrc=) go into that repository's
+=.git/info/exclude=, anchored under the new project, before any of its files is written. If the
+scaffold fails after it recorded the disposition or changed the exclude, the error names those
+writes, so you know the repository changed.
+
 ** The lint gate reports in a project we contribute to and refuses in our own
 
 The gate lints the top-level forms a commit touches, and nothing else. Findings in forms and files

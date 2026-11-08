@@ -71,6 +71,7 @@
   (:import-from #:dsmr-mcp/src/repo-classify
                 #:record-disposition
                 #:check-disposition-recordable
+                #:disposition-gate-profile
                 #:disposition-warnings)
   (:import-from #:dsmr-mcp/src/project-shape
                 #:shape-item-key
@@ -725,7 +726,8 @@ Returns a DOCTOR-REPORT."
                   (:repaired
                    (multiple-value-bind (entries problems keys)
                        (%repair-deviation deviation root catalog bindings jail
-                                          dry-run severity exclude profile)
+                                          dry-run severity exclude
+                                          (disposition-gate-profile declared))
                      (dolist (entry entries) (push entry changed))
                      (dolist (problem problems) (push problem unresolved))
                      (dolist (key keys) (pushnew key kept))))

@@ -19,7 +19,8 @@
   (:import-from #:dsmr-mcp/src/state
                 #:session-project-root)
   (:import-from #:dsmr-mcp/src/project-scaffold
-                #:write-scaffold)
+                #:write-scaffold
+                #:scaffold-failed-after-writing)
   (:import-from #:dsmr-mcp/src/project-scaffold-core
                 #:invalid-argument-error
                 #:invalid-argument-field
@@ -55,6 +56,9 @@ existing repository with no disposition recorded, the call returns the \
 question, the three answers (ours, contributing, or forked), and what each \
 means, and writes nothing; a second call carries the answer in disposition, \
 which is recorded in that repository's .envrc before the project is written. \
+In a repository declared contributing or forked the project carries no licence \
+text at all, and in a contributing one our agent and lint files are added to \
+that repository's local exclude before they are written. \
 Returns a manifest of created files and next-step commands.")
    (dsmr-mcp/src/tools/base::input-schema
     :allocation :class
@@ -177,6 +181,12 @@ was recorded, reason when none was."
              (%wire-name (getf recorded :disposition))
              (namestring (getf recorded :path))))))
 
+(defun %licence-line (licence)
+  "Return the content line saying whether licence text was written, and why not."
+  (if (eq :omitted (getf licence :action-taken))
+      (format nil "No licence text was written: ~A." (getf licence :reason))
+      (format nil "Licence: ~A." (getf licence :license))))
+
 (defmethod tool-handle ((tool project-scaffold-tool) id args)
   (let* ((session (tool-session tool))
          (root    (session-project-root session)))
@@ -276,10 +286,14 @@ ASDF source-registry tree. Elsewhere: (asdf:load-asd ~S)"
                              "gate_hook" (%gate-hook-object (getf res :gate-hook))
                              "disposition" (%disposition-object
                                             (getf res :disposition))
+                             "licence" (make-ht "action_taken"
+                                                (%wire-name
+                                                 (getf (getf res :licence)
+                                                       :action-taken)))
                              "next_steps" next-steps
                              "content"
                              (text-content
-                              (format nil "Scaffolded ~A at ~A (~D files)~%Path: ~A~%~A~%~A~%~A~%~{~A~%~}"
+                              (format nil "Scaffolded ~A at ~A (~D files)~%Path: ~A~%~A~%~A~%~A~%~A~%~{~A~%~}"
                                       name relative (length files)
                                       (namestring target-dir)
                                       (if git-init-p
@@ -287,6 +301,7 @@ ASDF source-registry tree. Elsewhere: (asdf:load-asd ~S)"
                                           "No git repository was created here.")
                                       (%gate-hook-line (getf res :gate-hook))
                                       (%disposition-line (getf res :disposition))
+                                      (%licence-line (getf res :licence))
                                       (coerce next-steps 'list))))))
         (invalid-argument-error (e)
           (result id
@@ -297,6 +312,14 @@ ASDF source-registry tree. Elsewhere: (asdf:load-asd ~S)"
                                           (if (string= field "destination")
                                               "sandbox-violation"
                                               "invalid-argument"))
+                           "content" (text-content (princ-to-string e)))))
+        ;; A failure after the enclosing repository was written names those
+        ;; writes, so the caller learns that repository changed.
+        (scaffold-failed-after-writing (e)
+          (result id
+                  (make-ht "isError" t
+                           "created" nil
+                           "error_type" "scaffold-failed-after-writing"
                            "content" (text-content (princ-to-string e)))))
         ;; The question. Nothing has been written: the disposition is settled
         ;; before the project is.
