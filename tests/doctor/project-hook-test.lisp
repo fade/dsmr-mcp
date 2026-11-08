@@ -92,12 +92,18 @@ The findings sit at lines 2 and 6; each form's first line is finding-free.")
     (uiop:run-program (list "chmod" "+x" (namestring path)))
     path))
 
-(defun %run-gate (root gate &key (mallet (namestring (linter-path))))
+(defun %run-gate (root gate &key (mallet (namestring (linter-path))) tmpdir)
   "Run GATE with ROOT as the working directory and MALLET naming the linter.
+TMPDIR, when given, is the gate's TMPDIR.
 Returns the combined output and the exit code."
   (multiple-value-bind (output error-output code)
-      (uiop:run-program (list "/usr/bin/env" (format nil "MALLET=~A" mallet)
-                              (namestring gate))
+      (uiop:run-program (append (list "/usr/bin/env"
+                                      (format nil "MALLET=~A" mallet))
+                                (when tmpdir
+                                  (list (format nil "TMPDIR=~A"
+                                                (string-right-trim
+                                                 "/" (namestring tmpdir)))))
+                                (list (namestring gate)))
                         :directory (namestring root)
                         :output :string
                         :error-output :output
@@ -268,6 +274,29 @@ commit on the touched form's finding."
                 "the renamed file's finding is printed: ~A" output)
           (true (search "linter not found" output)
                 "with no linter, the gate says so: ~A" output)))))
+
+(define-test an-ambient-linter-config-does-not-disable-the-gate
+  "AMBIENT-CONFIG CONTROL. The linter looks for a config upward from the file it
+lints. A config that ignores every file, planted in the gate's TMPDIR, must not
+reach the repository's lint: the blocking gate still refuses the touched
+failing form."
+  (let ((ambient (dsmr-mcp/tests/support/fs-fixture:%make-temp-directory)))
+    (unwind-protect
+         (progn
+           (write-fixture-file ambient ".mallet.lisp"
+                               "(:mallet-config
+ (:ignore \"**/*.lisp\"))
+")
+           (with-ours-gate (root gate)
+             (%stage root "lib.lisp" (%edit-second-form))
+             (multiple-value-bind (output code)
+                 (%run-gate root gate :tmpdir ambient)
+               (is = 1 code "the blocking gate refuses the commit: ~A" output)
+               (when (gate-scanner-available-p)
+                 (true (%reports-p output "lib.lisp:6:")
+                       "the finding is printed: ~A" output)))))
+      (uiop:delete-directory-tree ambient :validate t
+                                          :if-does-not-exist :ignore))))
 
 (define-test the-blocking-gate-passes-when-only-untouched-forms-fail
   "Touching only the clean form lets the commit through although the other form

@@ -7,7 +7,8 @@
 # files the commit leaves alone are not reported. The linter runs over the
 # staged content, copied into a temporary directory under the same relative
 # paths, so its line numbers agree with the diff even when the working tree
-# holds unstaged edits.
+# holds unstaged edits. The linter config is the staged .mallet.lisp, or the
+# default preset when none is staged.
 #
 # Modes, fixed when this file is rendered:
 #   informational  report the findings; exit 0 on every path.
@@ -63,10 +64,18 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/lisp-gate.XXXXXX")" ||
   cannot_run 'cannot create a temporary directory'
 trap 'rm -rf -- "$TMP"' EXIT
 
-LINT_ARGS=(--format line --no-color)
-if [ -f "$ROOT/.mallet.lisp" ]; then
-  LINT_ARGS+=(--config "$ROOT/.mallet.lisp")
+# The linter always gets a config at the root of the copy: the staged
+# .mallet.lisp, or the default preset. Without one it would search upward from
+# the copy and could take a config from any directory above TMPDIR.
+CONFIG="$TMP/.mallet.lisp"
+if git cat-file -e ':.mallet.lisp' 2>/dev/null; then
+  git cat-file blob ':.mallet.lisp' >"$CONFIG" ||
+    cannot_run 'cannot read the staged linter config'
+else
+  printf '(:mallet-config\n (:extends :default))\n' >"$CONFIG" ||
+    cannot_run 'cannot write the linter config'
 fi
+LINT_ARGS=(--format line --no-color --config "$CONFIG")
 
 # Print "START END" for each region of the staged file $1 that the staged diff
 # touches, widened to whole top-level forms. Line numbers only cross into awk;
