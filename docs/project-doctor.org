@@ -5,22 +5,21 @@ This describes =project-doctor=, the verb that adopts an existing repository int
 and the lint gate that it and the scaffold install. The rules it follows in a repository we do
 not own are in /The rules adoption follows/.
 
-* What the feature is
+* Scope
 
-Adopting a project means putting *our own control surfaces* in place inside a repository,
+Adopting a project means putting *our own apparatus* in place inside a repository,
 so that our tooling can work there. It does *not* mean changing the project.
 
-That distinction is the whole feature, and getting it wrong is the only way this can do real
-harm. The repositories in question are usually dependencies of something we are building.
+Getting that distinction wrong is the only way this can do real harm. The repositories in question are usually dependencies of something we are building.
 They have their own history, their own conventions, an upstream we do not control, and a
 maintainer who never agreed to our habits. Anything of ours that becomes visible in their
 work product, their tracked tree, their git log, anything a maintainer reads, is a defect.
 
 So the feature has two halves that must not be confused:
 
-- *Our control surfaces*, which we install and which are invisible to the project:
+- *Our apparatus*, which we install and which are invisible to the project:
   =.mallet.lisp= (the mallet linter's config), =scripts/lint-lisp.sh=, the lint gate, the
-  entries in =.git/info/exclude=, and =.gate-baseline.md= holding the frozen record of
+  entries in =.git/info/exclude=, and =.gate-baseline.md= holding the baseline of
   pre-existing lint findings. In a repository we do not own, every one of these is present on
   disk and excluded from version control. The gate lives inside =.git/= and so is invisible by
   construction.
@@ -46,7 +45,7 @@ and that we must leave intact.
 
 ** The observation that prompted it
 
-Of the ten application repositories under =DeepSkyV2=, seven carry the linter config, the lint
+Of ten application repositories of ours, seven carry the linter config, the lint
 script, and the pre-commit hook, and three do not. The config and the script co-occur exactly:
 no repository has one without the other. The gate was arriving with the scaffold, or not at all.
 
@@ -92,7 +91,7 @@ content. That answers "write me a new project" and cannot answer "is this projec
 shape", because rendered content cannot express that a build script is optional or that a test
 must assert on a result object rather than on a printed line.
 
-Both now read a single catalog. Each entry carries what it is, where it installs, whether the
+Both now read a single catalogue. Each entry carries what it is, where it installs, whether the
 scaffold emits it, and which group it belongs to. Two lists that agree today drift tomorrow,
 and the drift is invisible until somebody compares them by hand.
 
@@ -101,8 +100,7 @@ and the drift is invisible until somebody compares them by hand.
 A difference between a repository and the shape is signalled as a typed condition, not returned
 as a list of filenames. A string cannot be dispatched on, and neither can a path.
 
-Three recoveries are named, reusing the three outcomes this codebase already uses when triaging
-a condition handler rather than coining a parallel set: repair it, record it as debt with the
+Three recoveries are named: repair it, record it as debt with the
 diagnosis, or accept it as deliberately different. The distinction between something missing and
 something deliberately different is the difference between a useful report and one that gets
 ignored.
@@ -130,7 +128,7 @@ record: a busier, older, ungated repository comes out *less* urgent than a quiet
 number built from those signals would have contradicted the only judgement available, and would
 have been believed precisely because it was a number.
 
-So there is a starting severity, in one place, and a frozen record of what was already there.
+So there is a starting severity, in one place, and a baseline of what was already there.
 
 ** Ordering is the safety property
 
@@ -152,7 +150,7 @@ Beyond installing the git-invisible components of our own apparatus, the doctor 
 the structure of an adopted project in any way. A flat library with its sources at the top level
 and a =test/= directory is not missing anything we would supply.
 
-The rule is encoded on whether a catalog entry is apparatus, not on which tier it sits in,
+The rule is encoded on whether a catalogue entry is apparatus, not on which tier it sits in,
 because apparatus spans two tiers: a tier-based rule would silently drop =AGENTS.md=, =CLAUDE.md=,
 and =.envrc=, and would let a future non-apparatus entry added to the gate tier start leaking.
 
@@ -161,8 +159,7 @@ I settled this after an earlier version wrote =src/main.lisp= and =tests/main-te
 header into a BSD-2-clause project. The suite could not see it: every fixture committed those two
 files before the run, so the never-leak check had only ever watched excluded apparatus being
 written. The fixtures now include a flat library with no =src/= and no =tests/=, and the assertion
-that a repair writes nothing but apparatus was shown failing against the old behaviour before it
-was believed against the new one.
+that a repair writes nothing but apparatus fails against the old behaviour.
 
 ** Adoption leaves the licence alone
 
@@ -196,19 +193,18 @@ the commit leaves alone are not reported.
   offer upstream. What I want there is to know about defects near our own edits, and you see
   those in the commit's output while the commit proceeds.
 - *In our own repositories and declared hard forks* the same gate refuses a commit when a form it
-  touches carries a warning or an error. A finding that was already there in a form you did not
-  touch never blocks you.
+  touches carries a warning or an error, or when the linter is missing or cannot lint a staged
+  file. A finding that was already there in a form you did not touch never blocks you.
 
 A new project of ours is created with the gate in place: the scaffold writes the linter config,
 the lint script, and the gate, and wires the gate when it creates the repository.
 
-Every clone on this host arrives with a pre-commit hook of its own, from the git init template,
-and that hook belongs to whoever installed it. So I wired the gate through git's configured hooks,
-which run it beside the existing hook, rather than replacing the hook file. Where git is too old
-for configured hooks, the doctor reports the gate as not wired and leaves the hooks directory
-alone. Removing the wiring takes one =git config --unset= per entry.
+When the git init template seeds a pre-commit hook, every clone arrives with one, and that hook
+belongs to whoever installed it. So I wired the gate through git's configured hooks,
+which run it beside the existing hook, rather than replacing the hook file. Where git cannot run
+configured hooks, the doctor and the scaffold install no gate and report it unresolved. Removing the wiring takes one =git config --unset= per entry.
 
-* How it is put together
+* Modules
 
 Twelve modules, a shell template for the gate, and a request surface, each with one
 responsibility, layered so that each depends only on those above it and on modules that predate
@@ -217,37 +213,36 @@ this work.
 | module                           | responsibility                                                        |
 |----------------------------------+-----------------------------------------------------------------------|
 | =src/git.lisp=                   | typed subprocess access to git; failures signal rather than returning nil |
-| =src/template-render.lisp=       | template substitution, split out to keep the catalog and the scaffold from depending on each other |
+| =src/template-render.lisp=       | template substitution, split out to keep the catalogue and the scaffold from depending on each other |
 | =src/repo-classify.lisp=         | ours / foreign / orphan / ambiguous, from the remotes and the hard-fork declaration |
 | =src/project-shape.lisp=         | what a shape entry is, and what may be said about it                   |
 | =src/project-shape-catalog.lisp= | the entries themselves, and which are assessed for which kind of repository |
 | =src/project-exclude.lisp=       | reading the exclude template, merging, and repairing with a backup      |
 | =src/project-deviation.lisp=     | the condition types and the three named recoveries                   |
-| =src/project-assess.lisp=        | read-only: what differs, writing nothing                               |
 | =src/project-gate-scan.lisp=     | running mallet over existing sources to discover pre-existing findings |
-| =src/project-debt.lisp=          | the severity, and rendering the frozen record                          |
+| =src/project-debt.lisp=          | the severity, and rendering the baseline                               |
 | =src/project-hook.lisp=          | wiring the gate into git's configured hooks                            |
+| =src/project-assess.lisp=        | read-only: what differs, writing nothing                               |
 | =src/project-doctor.lisp=        | the engine that applies a policy and reports what it did               |
 | =templates/lisp-gate.sh=         | the gate itself, rendered informational or blocking                    |
 | =src/tools/project-doctor.lisp=  | the request surface                                                  |
 
-The scaffold was changed to read the catalog rather than hold its own copy, to make a new project
+The scaffold was changed to read the catalogue rather than hold its own copy, to make a new project
 a git repository from the start, and to install the gate. The second change matters more than it
 looks: the global git init template already seeds the correct exclude entries into every newly
 created repository, so once the scaffold runs =git init=, the existing provisioning does the
 writing. No exclude list is reimplemented in Lisp.
 
-** Two structural choices worth naming
+** Structural choices
 
 The distinction between a repository we own and one we do not is carried in the *type* of a
-shape entry rather than checked at each site that writes. Making a wrong state unrepresentable is
-better than detecting it reliably.
+shape entry rather than checked at each site that writes.
 
-The frozen record of pre-existing findings distinguishes *absent* from *empty*. If mallet cannot
-be run, the result is "not enumerated" and nothing is written. A record asserting zero findings
-and a record nobody populated look identical once written, and the written one would be believed.
+The baseline of pre-existing findings distinguishes *absent* from *empty*. If mallet cannot
+be run, the result is "not enumerated" and nothing is written. A baseline asserting zero findings
+and one nobody populated look identical once written, and the written one would be believed.
 
-* How it was verified
+* Verification
 
 Every check was proven able to fail before its success was accepted. Deliberate breaks were
 seeded against each property and watched to go red, then reverted, with the restoring run checked
@@ -301,15 +296,15 @@ changes. The two are separate commands because =make test= does not walk =tests/
 * Outstanding verification
 
 The checks that need a running server on a rebuilt image have not been done, because that needs
-the merge, the rebuild, and a reconnect.
+a rebuilt image and a reconnect.
 
 Separately, whether a client rejects a prompt carrying a required field is still untested.
 Nothing in this design depends on the answer, because the classification question crosses the
 wire as an ordinary result answered by an ordinary follow-up call, but it is unverified.
 
-* Was this the right size?
+* Size
 
-Twelve modules and several thousand lines is a lot for "put our control surfaces into a
+Twelve modules and several thousand lines is a lot for "put our apparatus into a
 dependency", and most of the volume is in three places.
 
 Roughly half is tests and fixtures, and that is where the value showed up: every defect the suite
