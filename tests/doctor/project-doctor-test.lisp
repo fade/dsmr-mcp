@@ -880,8 +880,9 @@ without configured hooks gets no gate, reported not installed."
       (with-linked-worktree (worktree root)
         (true (uiop:file-exists-p (merge-pathnames ".git" worktree))
               "precondition: the linked worktree's .git is a file")
-        (let* ((report (normalise-repository worktree :policy :repair
-                                                    :disposition :contributing))
+        ;; The disposition is the repository's, recorded in the main worktree.
+        (record-disposition root :contributing)
+        (let* ((report (normalise-repository worktree :policy :repair))
                (shared (merge-pathnames ".git/" root)))
           (is equal (namestring (merge-pathnames "hooks/lisp-gate" shared))
               (namestring (gate-hook-path worktree))
@@ -1345,6 +1346,64 @@ like any other change. It decides nothing: the disposition is the declared one."
         (is eq :added (getf (report-remote-added report) :action-taken)))
       (is equal +third-party-upstream-url+ (git-remote-url root "upstream")
           "and git can read it back"))))
+
+(defun %git-file-text (root relative)
+  "Return the text of RELATIVE under ROOT's git directory, or NIL when absent."
+  (let ((path (merge-pathnames relative (merge-pathnames ".git/" root))))
+    (when (probe-file path) (uiop:read-file-string path))))
+
+(define-test a-jail-refusal-comes-before-any-write
+  "JAIL CONTROL. The .envrc is a symlink to a file outside the session root, a
+common direnv arrangement, so a supplied answer cannot be recorded. The refusal
+arrives before the upstream remote, the exclude, the gate, the hooks config or
+any worktree file is written. The same run with a plain .envrc does write, so
+the comparison sees writes when there are some."
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (let* ((outside (%make-temp-directory))
+             (shared (merge-pathnames "lisp.envrc" outside)))
+        (unwind-protect
+             (progn
+               (write-fixture-file outside "lisp.envrc"
+                                   (format nil "export FOO=1~%"))
+               (uiop:run-program (list "ln" "-s" (namestring shared)
+                                       (namestring (merge-pathnames ".envrc" root))))
+               (let ((tree (%snapshot root))
+                     (exclude (%git-file-text root "info/exclude"))
+                     (config (%git-file-text root "config"))
+                     (hooks (mapcar #'namestring
+                                    (uiop:directory-files
+                                     (merge-pathnames ".git/hooks/" root)))))
+                 (fail (normalise-repository root :policy :repair
+                                                  :disposition :contributing
+                                                  :upstream-url +third-party-upstream-url+)
+                       'dsmr-mcp/src/repo-classify:project-disposition-not-recordable)
+                 (false (git-remote-url root "upstream") "no upstream remote was added")
+                 (is equal exclude (%git-file-text root "info/exclude")
+                     "the exclude is unchanged")
+                 (is equal config (%git-file-text root "config")
+                     "the git config is unchanged")
+                 (is equal hooks (mapcar #'namestring
+                                         (uiop:directory-files
+                                          (merge-pathnames ".git/hooks/" root)))
+                     "nothing was added under hooks/")
+                 (is equal tree (%snapshot root) "the worktree is unchanged")
+                 (is equal (format nil "export FOO=1~%")
+                     (uiop:read-file-string shared)
+                     "the shared file is unchanged"))
+               (delete-file (merge-pathnames ".envrc" root))
+               (let ((config (%git-file-text root "config")))
+                 (normalise-repository root :policy :repair
+                                            :disposition :contributing
+                                            :upstream-url +third-party-upstream-url+)
+                 (true (git-remote-url root "upstream")
+                       "control: with a plain .envrc the same run writes")
+                 (false (equal config (%git-file-text root "config"))
+                        "control: the git config changed")))
+          (uiop:delete-directory-tree outside :validate t
+                                              :if-does-not-exist :ignore))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The post-condition, asked directly

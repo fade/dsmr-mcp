@@ -402,3 +402,116 @@ be asked again. The same declaration in the main worktree does not warn."
     (%declare root "forked")
     (is equal '() (disposition-warnings root :forked)
         "the main worktree's declaration does not")))
+
+(define-test a-dry-run-from-a-linked-worktree-claims-no-record
+  "With nothing declared anywhere, the warnings for a supplied answer in a linked
+worktree say nothing about where it is recorded: nothing is."
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (with-linked-worktree (worktree root)
+      (is equal '() (disposition-warnings worktree :forked)
+          "no warning claims a record that a dry run did not make"))))
+
+(define-test recording-from-a-linked-worktree-writes-the-main-worktrees-envrc
+  "A record made from a linked worktree lands in the main worktree's .envrc,
+which every worktree of the repository reads, and nothing is written in the
+linked worktree. With the main worktree outside the write jail, the record is
+refused and names the main worktree's file."
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (with-linked-worktree (worktree root)
+      (let ((condition (%signalled 'project-disposition-not-recordable
+                                   #'record-disposition worktree :forked
+                                   :jail worktree)))
+        (true condition "a main worktree outside the jail is refused")
+        (when condition
+          (true (search (namestring (merge-pathnames ".envrc" (truename root)))
+                        (princ-to-string condition))
+                "the refusal names the main worktree's file: ~A" condition))
+        (false (probe-file (%envrc root)) "nothing was written in main"))
+      (let ((result (record-disposition worktree :forked :jail root)))
+        (is eq :created (getf result :action-taken)))
+      (true (search "DSMR_PROJECT_DISPOSITION=forked" (or (%envrc-text root) ""))
+            "the main worktree's .envrc holds the declaration")
+      (false (probe-file (%envrc worktree))
+             "nothing was written in the linked worktree")
+      (is eq :forked (resolve-disposition worktree) "the worktree reads it")
+      (is eq :forked (resolve-disposition root) "and so does main"))))
+
+(define-test main-disagreeing-with-a-linked-worktree-is-refused
+  "Resolved from the main worktree, a linked worktree's declaration that differs
+is refused naming both files, and a supplied answer that differs from a linked
+worktree's declaration is refused as well."
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (with-linked-worktree (worktree root)
+      (%declare worktree "ours")
+      (let ((condition (%signalled 'project-disposition-conflict
+                                   #'resolve-disposition root
+                                   :supplied :contributing)))
+        (true condition "the supplied answer is refused")
+        (when condition
+          (true (find-if (lambda (entry)
+                           (and (pathnamep (car entry))
+                                (string= (namestring (truename (car entry)))
+                                         (namestring (truename (%envrc worktree))))))
+                         (disposition-conflict-declarations condition))
+                "the linked worktree's file is named")))
+      (%declare root "contributing")
+      (let ((condition (%signalled 'project-disposition-conflict
+                                   #'resolve-disposition root)))
+        (true condition "the two declarations are refused from main")
+        (when condition
+          (let ((sources (mapcar (lambda (entry)
+                                   (namestring (truename (car entry))))
+                                 (disposition-conflict-declarations condition))))
+            (true (member (namestring (truename (%envrc root))) sources
+                          :test #'string=)
+                  "the main worktree's file is named")
+            (true (member (namestring (truename (%envrc worktree))) sources
+                          :test #'string=)
+                  "the linked worktree's file is named")))))))
+
+(defun %file-mode (path)
+  "Return the permission bits of PATH as an octal string."
+  (string-right-trim '(#\Newline)
+                     (uiop:run-program (list "stat" "-c" "%a" (namestring path))
+                                       :output :string)))
+
+(define-test recording-keeps-the-envrc-mode
+  "A 0600 .envrc, as one holding a token would be, is still 0600 after a record
+adds the declaration."
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (write-fixture-file root ".envrc" (format nil "export TOKEN=secret~%"))
+    (uiop:run-program (list "chmod" "600" (namestring (%envrc root))))
+    (is string= "600" (%file-mode (%envrc root)) "precondition: mode 600")
+    (is eq :added (getf (record-disposition root :ours) :action-taken))
+    (is string= "600" (%file-mode (%envrc root)) "the mode is kept")))
+
+(define-test a-non-utf-8-envrc-reads-and-records-byte-for-byte
+  "An .envrc with a Latin-1 comment is read without a decoding error, a record
+adds the declaration, and every other byte comes back unchanged."
+  (with-temp-git-repo (root :initial-file "seed" :initial-content "seed")
+    (let ((bytes (map '(vector (unsigned-byte 8)) #'char-code
+                      (format nil "# caf~C~%export FOO=1~%" (code-char 233)))))
+      (with-open-file (out (%envrc root) :direction :output
+                                         :element-type '(unsigned-byte 8)
+                                         :if-exists :supersede
+                                         :if-does-not-exist :create)
+        (write-sequence bytes out))
+      (true (%signalled 'project-disposition-required #'resolve-disposition root)
+            "the file reads, and declares nothing")
+      (is eq :added (getf (record-disposition root :ours) :action-taken))
+      (let ((after (with-open-file (in (%envrc root)
+                                       :element-type '(unsigned-byte 8))
+                     (let ((v (make-array (file-length in)
+                                          :element-type '(unsigned-byte 8))))
+                       (read-sequence v in)
+                       v))))
+        (is equalp bytes (subseq after 0 (length bytes))
+            "the original bytes are kept")
+        (is eq :ours (resolve-disposition root) "and the record reads back")))))
+
+(define-test an-export-followed-by-a-tab-is-a-declaration
+  "export followed by a tab declares the variable, as the shell reads it."
+  (is equal '("ours")
+      (declared-values (format nil "export~CDSMR_PROJECT_DISPOSITION=ours~%"
+                               #\Tab)
+                       +disposition-variable+)))

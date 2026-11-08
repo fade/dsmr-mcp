@@ -18,13 +18,16 @@
 ;;;; read from the file as text and never from the process environment: the
 ;;;; server's environment belongs to the directory it was launched in, the
 ;;;; repository asked about may be another one, and the lint gate runs under git
-;;;; without direnv. The file is never sourced. A linked worktree with no
-;;;; declaration of its own reads the main worktree's. Declarations that disagree
-;;;; are refused, never resolved.
+;;;; without direnv. The file is never sourced.
 ;;;;
-;;;; Recording writes only the target worktree's own .envrc, only after .envrc is
-;;;; in the local exclude, and never rewrites a value already declared: a change
-;;;; of disposition is a hand edit.
+;;;; The disposition belongs to the repository, because the lint gate and the
+;;;; findings record are shared by all its worktrees. It is recorded in the main
+;;;; worktree's .envrc. Every worktree's .envrc that declares it must agree, and
+;;;; declarations that disagree are refused, never resolved.
+;;;;
+;;;; Recording writes only that one .envrc, only inside the write jail, only
+;;;; after .envrc is in the local exclude, and never rewrites a value already
+;;;; declared: a change of disposition is a hand edit.
 
 (defpackage #:dsmr-mcp/src/repo-classify
   (:use #:cl)
@@ -34,6 +37,7 @@
                 #:git-common-dir
                 #:git-remote-url
                 #:git-tracked-files
+                #:run-git
                 #:not-a-repository-error)
   (:import-from #:dsmr-mcp/src/envrc-vars
                 #:declared-values
@@ -217,14 +221,19 @@ is named .git. A bare or separated git directory has no main worktree."
         (unless (%same-directory-p main (%worktree-root directory))
           main)))))
 
+(defun %read-envrc (path)
+  "Return the text of the file at PATH, read as Latin-1.
+Latin-1 maps every byte to one character, so a file in any encoding reads
+without a decoding error and is written back byte for byte."
+  (uiop:read-file-string path :external-format :latin-1))
+
 (defun %file-declaration (path)
   "Return the disposition the file at PATH declares, or NIL when it declares none.
 
 Signals PROJECT-DISPOSITION-UNREADABLE for a value that is not one of the names,
 and PROJECT-DISPOSITION-CONFLICT when the file declares two that disagree."
   (when (probe-file path)
-    (let ((raws (declared-values (uiop:read-file-string path)
-                                 +disposition-variable+)))
+    (let ((raws (declared-values (%read-envrc path) +disposition-variable+)))
       (when raws
         (let ((parsed (mapcar (lambda (raw)
                                 (or (%parse-value raw)
@@ -236,14 +245,60 @@ and PROJECT-DISPOSITION-CONFLICT when the file declares two that disagree."
                    :declarations (mapcar (lambda (raw) (cons path raw)) raws)))
           (first parsed))))))
 
+(defun %worktree-roots (directory)
+  "Return the root of every worktree of the repository at DIRECTORY that has a
+working tree, in the order git lists them."
+  (let ((roots '())
+        (current nil)
+        (bare nil))
+    (flet ((flush ()
+             (when (and current (not bare))
+               (push current roots))))
+      (dolist (line (uiop:split-string
+                     (values (run-git (list "worktree" "list" "--porcelain")
+                                      :directory directory))
+                     :separator '(#\Newline)))
+        (cond
+          ((uiop:string-prefix-p "worktree " line)
+           (flush)
+           (setf current (uiop:ensure-directory-pathname (subseq line 9))
+                 bare nil))
+          ((string= line "bare") (setf bare t))))
+      (flush))
+    (nreverse roots)))
+
+(defun %record-root (directory)
+  "Return the root of the worktree whose .envrc records the disposition for the
+repository at DIRECTORY: the main worktree's, or DIRECTORY's own when there is
+no main worktree or DIRECTORY lies in it."
+  (or (%main-worktree-root directory) (%worktree-root directory)))
+
+(defun %declarations (directory)
+  "Return (PATH . DISPOSITION) for every worktree .envrc of the repository at
+DIRECTORY that declares one: the recording worktree's first, then DIRECTORY's
+own, then the rest. Signals what %FILE-DECLARATION signals."
+  (let ((roots (remove-duplicates (list* (%record-root directory)
+                                         (%worktree-root directory)
+                                         (%worktree-roots directory))
+                                  :test #'%same-directory-p
+                                  :from-end t))
+        (found '()))
+    (dolist (root roots (nreverse found))
+      (let* ((path (%envrc-path root))
+             (declared (%file-declaration path)))
+        (when declared
+          (push (cons path declared) found))))))
+
 (defun resolve-disposition (directory &key supplied)
   "Return the disposition of the repository at DIRECTORY, and where it came from.
 
 Two values: a member of +DISPOSITIONS+, and the .envrc pathname it was read from
 or :ARGUMENT when SUPPLIED was used because nothing is recorded.
 
-The worktree's own .envrc is read first; a linked worktree with no declaration
-of its own reads the main worktree's. The process environment is never read.
+The disposition belongs to the repository, since the lint gate and the findings
+record are shared by all its worktrees. Every worktree's .envrc that declares it
+must agree. The value is read from the main worktree's .envrc, else from the
+first worktree's that declares it. The process environment is never read.
 
 Signals:
   NOT-A-REPOSITORY-ERROR          DIRECTORY lies outside any repository.
@@ -256,28 +311,24 @@ Signals:
     (error 'not-a-repository-error :path directory))
   (when supplied
     (check-type supplied disposition))
-  (let* ((own-path (%envrc-path (%worktree-root directory)))
-         (own (%file-declaration own-path))
-         (main-root (%main-worktree-root directory))
-         (main-path (and main-root (%envrc-path main-root)))
-         (main (and main-path (%file-declaration main-path))))
-    (when (and own main (not (eq own main)))
-      (error 'project-disposition-conflict
-             :declarations (list (cons main-path (disposition-name main))
-                                 (cons own-path (disposition-name own)))))
-    (let ((stored (or own main))
-          (source (if own own-path main-path)))
-      (cond
-        ((and stored supplied (not (eq stored supplied)))
-         (error 'project-disposition-conflict
-                :declarations (list (cons source (disposition-name stored))
-                                    (cons :argument (disposition-name supplied)))))
-        (stored (values stored source))
-        (supplied (values supplied :argument))
-        (t (error 'project-disposition-required
-                  :directory directory
-                  :origin-url (git-remote-url directory "origin")
-                  :upstream-url (git-remote-url directory "upstream")))))))
+  (let* ((declarations (%declarations directory))
+         (first (first declarations)))
+    (dolist (entry (rest declarations))
+      (unless (eq (cdr entry) (cdr first))
+        (error 'project-disposition-conflict
+               :declarations (list (cons (car first) (disposition-name (cdr first)))
+                                   (cons (car entry) (disposition-name (cdr entry)))))))
+    (cond
+      ((and first supplied (not (eq (cdr first) supplied)))
+       (error 'project-disposition-conflict
+              :declarations (list (cons (car first) (disposition-name (cdr first)))
+                                  (cons :argument (disposition-name supplied)))))
+      (first (values (cdr first) (car first)))
+      (supplied (values supplied :argument))
+      (t (error 'project-disposition-required
+                :directory directory
+                :origin-url (git-remote-url directory "origin")
+                :upstream-url (git-remote-url directory "upstream"))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Recording
@@ -287,14 +338,28 @@ Signals:
   "Return true when the repository at ROOT tracks its .envrc."
   (and (member ".envrc" (git-tracked-files root) :test #'string=) t))
 
-(defun check-disposition-recordable (directory)
-  "Signal PROJECT-DISPOSITION-NOT-RECORDABLE when the worktree containing
-DIRECTORY tracks its .envrc, else return NIL. Writes nothing."
-  (let ((root (%worktree-root directory)))
+(defun check-disposition-recordable (directory &key jail)
+  "Return the resolved pathname a disposition for the repository at DIRECTORY
+would be written to. Writes nothing.
+
+The record goes in the main worktree's .envrc, or DIRECTORY's own worktree's
+when there is no main worktree. JAIL, defaulting to that worktree's root,
+bounds the write; a symlinked .envrc is followed before the check.
+
+Signals PROJECT-DISPOSITION-NOT-RECORDABLE when that .envrc is tracked, or
+resolves outside JAIL."
+  (let* ((root (%record-root directory))
+         (path (%envrc-path root)))
     (when (%envrc-tracked-p root)
       (error 'project-disposition-not-recordable
-             :path (%envrc-path root)
-             :reason "the repository tracks its .envrc, so a declaration written there would be committed"))))
+             :path path
+             :reason "the repository tracks its .envrc, so a declaration written there would be committed"))
+    (or (ensure-write-path (namestring path) (or jail root))
+        (error 'project-disposition-not-recordable
+               :path path
+               :reason (if (%same-directory-p root (%worktree-root directory))
+                           "the .envrc lies outside the write jail"
+                           "it is the main worktree's .envrc, which records the disposition for every worktree of the repository, and it lies outside the write jail; record the disposition from the main worktree")))))
 
 (defun %declaration-text (text disposition)
   "Return TEXT with the declaration of DISPOSITION added, every other line kept.
@@ -306,14 +371,19 @@ The line joins the last dsmr-mcp managed region, or a new one is appended."
         (values (ensure-declaration-line text +disposition-variable+ line)))))
 
 (defun record-disposition (directory disposition &key jail dry-run)
-  "Record DISPOSITION in the .envrc of the worktree containing DIRECTORY.
+  "Record DISPOSITION for the repository containing DIRECTORY.
 
-Returns a plist (:PATH P :DISPOSITION D :ACTION-TAKEN A), where A is :CREATED
-(no .envrc existed), :ADDED (the line joined an existing file), :ALREADY-PRESENT
-(the same value is declared), or :WOULD-RECORD (DRY-RUN; nothing written).
+The record goes in the main worktree's .envrc, which every worktree of the
+repository reads, or in DIRECTORY's own worktree's when there is no main
+worktree. Returns a plist (:PATH P :DISPOSITION D :ACTION-TAKEN A), where A is
+:CREATED (no .envrc existed), :ADDED (the line joined an existing file),
+:ALREADY-PRESENT (the same value is declared; P is the file declaring it), or
+:WOULD-RECORD (DRY-RUN; nothing written).
 
-Before writing, .envrc is added to the local exclude. Every other line of an
-existing file is kept. JAIL, defaulting to the worktree root, bounds the write.
+Before writing, .envrc is added to the local exclude. Every other byte of an
+existing file is kept, and so are its permission bits and, where the process
+may set them, its owner. JAIL, defaulting to the recording worktree's root,
+bounds the write.
 
 Signals:
   PROJECT-DISPOSITION-CONFLICT        a different value is already declared.
@@ -321,33 +391,26 @@ Signals:
   PROJECT-DISPOSITION-NOT-RECORDABLE  the .envrc is tracked, or lies outside JAIL.
   TYPE-ERROR                          DISPOSITION is not a disposition."
   (check-type disposition disposition)
-  (let* ((root (%worktree-root directory))
-         (path (%envrc-path root))
-         (stored (%file-declaration path)))
-    (cond
-      ((eq stored disposition)
-       (list :path path :disposition disposition :action-taken :already-present))
-      (stored
-       (error 'project-disposition-conflict
-              :declarations (list (cons path (disposition-name stored))
-                                  (cons :argument (disposition-name disposition)))))
-      (t
-       (check-disposition-recordable root)
-       (let ((target (ensure-write-path (namestring path) (or jail root))))
-         (unless target
-           (error 'project-disposition-not-recordable
-                  :path path
-                  :reason "the .envrc lies outside the write jail"))
-         (if dry-run
-             (list :path path :disposition disposition :action-taken :would-record)
-             (let* ((existed (and (probe-file path) t))
-                    (text (if existed (uiop:read-file-string path) "")))
-               (repair-repo-exclude root :template-patterns (list ".envrc"))
-               (write-file-string-atomically target
-                                             (%declaration-text text disposition))
-               (list :path path
-                     :disposition disposition
-                     :action-taken (if existed :added :created)))))))))
+  (multiple-value-bind (resolved source)
+      (resolve-disposition directory :supplied disposition)
+    (declare (ignore resolved))
+    (if (pathnamep source)
+        (list :path source :disposition disposition :action-taken :already-present)
+        (let* ((root (%record-root directory))
+               (path (%envrc-path root))
+               (target (check-disposition-recordable directory :jail jail)))
+          (if dry-run
+              (list :path path :disposition disposition :action-taken :would-record)
+              (let* ((existed (and (probe-file path) t))
+                     (text (if existed (%read-envrc path) "")))
+                (repair-repo-exclude root :template-patterns (list ".envrc"))
+                (write-file-string-atomically target
+                                              (%declaration-text text disposition)
+                                              :keep-mode t
+                                              :external-format :latin-1)
+                (list :path path
+                      :disposition disposition
+                      :action-taken (if existed :added :created))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; What the disposition implies
@@ -363,7 +426,7 @@ for contributing. Signals TYPE-ERROR for anything else."
 (defun %declares-p (path)
   "Return true when the file at PATH holds a disposition declaration of any value."
   (and (probe-file path)
-       (declared-values (uiop:read-file-string path) +disposition-variable+)
+       (declared-values (%read-envrc path) +disposition-variable+)
        t))
 
 (defun disposition-warnings (directory disposition &key upstream-url)
@@ -387,9 +450,12 @@ code that originates here has no upstream, so forked may be the disposition mean
     (when (and (%declares-p (%envrc-path root)) (%envrc-tracked-p root))
       (push "the .envrc holding the declaration is tracked, so the declaration is committed content"
             warnings))
-    (when (and main-root (not (%declares-p (%envrc-path main-root))))
-      (push (format nil "the disposition is recorded only in this linked worktree; ~
-a new worktree of this repository would be asked again until ~A declares it"
+    (when (and main-root
+               (%declares-p (%envrc-path root))
+               (not (%declares-p (%envrc-path main-root))))
+      (push (format nil "the disposition is declared only in this linked worktree's ~A; ~
+the main worktree's ~A records it for every worktree of the repository, so move the line there"
+                    (namestring (%envrc-path root))
                     (namestring (%envrc-path main-root)))
             warnings))
     (nreverse warnings)))

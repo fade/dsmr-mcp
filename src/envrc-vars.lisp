@@ -115,14 +115,21 @@ without it is still a declaration, so the prefix is optional when reading.")
 declaration of NAME. An empty right-hand side (`export NAME=`) is a declaration
 and yields the empty string, which is why the answer is NIL-or-string rather
 than a truth value. A comment line declares nothing, so a file that merely
-mentions a variable in prose is not treated as having set it."
+mentions a variable in prose is not treated as having set it.
+
+Only the single-assignment form is read: NAME=VALUE, optionally after export
+and any blanks. A line assigning several variables, or using declare -x,
+declares nothing here."
   (let ((trimmed (%trim line)))
     (when (and (plusp (length trimmed))
                (char/= (char trimmed 0) #\#))
-      (let ((rest trimmed)
-            (prefix-length (length +export-prefix+)))
+      (let* ((rest trimmed)
+             (keyword (string-right-trim " " +export-prefix+))
+             (prefix-length (1+ (length keyword))))
+        ;; export followed by any blank, as the shell reads it.
         (when (and (>= (length rest) prefix-length)
-                   (string= +export-prefix+ rest :end2 prefix-length))
+                   (string= keyword rest :end2 (1- prefix-length))
+                   (member (char rest (1- prefix-length)) '(#\Space #\Tab)))
           (setf rest (string-left-trim '(#\Space #\Tab)
                                        (subseq rest prefix-length))))
         (let ((n (length name)))

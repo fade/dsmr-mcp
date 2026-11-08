@@ -645,8 +645,9 @@ unattended run must not decide on its own what to do to a repository.
 DISPOSITION answers the disposition question when the repository records none.
 The disposition refusals propagate before anything is written: the question,
 a conflict with the recorded value, an unreadable value, and, when the answer
-would be recorded, a tracked .envrc. A supplied answer is recorded in the
-worktree's .envrc after the exclude step and the repairs; a run with no policy
+would be recorded, a tracked .envrc or one outside the write jail. A supplied
+answer is recorded in the main worktree's .envrc after the exclude step and the
+repairs; a run with no policy
 or a dry run reports :WOULD-RECORD instead. A recorded value is never rewritten.
 
 UPSTREAM-URL, when supplied for a repository that records no upstream, adds that
@@ -684,9 +685,10 @@ Returns a DOCTOR-REPORT."
          (recorded nil))
 
     ;; A disposition that will have to be recorded is checked for being
-    ;; recordable before any write, so the refusal leaves nothing behind.
+    ;; recordable, tracked file and write jail both, before any write, so the
+    ;; refusal leaves nothing behind.
     (when (eq source :argument)
-      (check-disposition-recordable root))
+      (check-disposition-recordable root :jail jail))
 
     ;; The offer to record where a repository came from, before anything else is
     ;; decided about it.

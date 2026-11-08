@@ -95,10 +95,20 @@ server's own environment, which belongs to whatever directory the server was sta
 value must be one of the three names, optionally quoted. Anything else, a shell expansion
 included, is refused as unreadable, and so are two declarations that disagree.
 
-A linked worktree with no =.envrc= of its own reads the main worktree's. When both declare and
-the values differ, you are refused with both files named. The doctor writes only the target's own
-=.envrc=, so a declaration recorded in a linked worktree carries a warning that the next worktree
-will be asked again.
+Only the single-assignment form is read: =NAME=value=, optionally after =export= and blanks. A
+line that assigns several variables, or uses =declare -x=, declares nothing, and you are asked.
+
+The disposition is one per repository, because the gate and the findings record are shared by
+all its worktrees. The main worktree's =.envrc= holds it, and every worktree reads it from there.
+A recording made from a linked worktree is written into the main worktree's =.envrc=, and only
+when that file lies inside the session root; otherwise you are refused with the file named, and
+you record it from the main worktree. A linked worktree's own declaration still counts: when any
+two worktrees' declarations differ, you are refused with both files named. A refusal of this kind
+arrives before the doctor writes anything, so a refused run has changed nothing.
+
+Recording keeps the =.envrc='s permission bits and, where the server may set it, its owner, so a
+=0600= file holding a token stays =0600=. A file in any encoding is read and written back byte for
+byte.
 
 The doctor never rewrites a declaration, and an answer that differs from the recorded one is
 refused. To change the disposition, edit the line and run a repair: the gate is rendered again
