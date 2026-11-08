@@ -31,6 +31,7 @@
            #:*readme-template*
            #:*gitignore-template*
            #:*mallet-config-template*
+           #:*severity-pins-template*
            #:*lint-lisp-template*
            #:*pre-commit-hook-template*
            #:*prompt-template*
@@ -551,7 +552,18 @@ bin/
  ;; file at a time and cannot see the cross-package use, so it reports those
  ;; imports as unused. Keeping them explicit is what documents each file's real
  ;; dependency surface.
- (:disable :unused-imported-symbols)
+ (:disable :unused-imported-symbols){{severity-pins}})
+"
+  "Template for a project's .mallet.lisp linter configuration.
+Carries a {{severity-pins}} placeholder: an adopted repository binds it to
+*SEVERITY-PINS-TEMPLATE* rendered at its gate severity, and a new project binds
+it to the empty string and starts at the linter's own severities. The only
+blanket disable is one this project can defend from its own structure; every
+other suppression belongs to the repository that needs it, with its own reason
+written beside it.")
+
+(defparameter *severity-pins-template*
+  "
 
  ;; The gate is new and the code is not. What it reports on a first run is a
  ;; record of what is already here rather than a claim that any of it is wrong.
@@ -561,14 +573,11 @@ bin/
  ;; switched off, and switched off it reports nothing at all. Raising them is a
  ;; deliberate decision to take once the reports have been worked through.
  (:set-severity :style {{gate-severity}})
- (:set-severity :cleanliness {{gate-severity}}))
-"
-  "Template for a project's .mallet.lisp linter configuration.
-Carries a {{gate-severity}} placeholder for the severity a newly installed
-gate starts at, which is supplied per project rather than fixed here. The only
-blanket disable is one this project can defend from its own structure; every
-other suppression belongs to the repository that needs it, with its own reason
-written beside it.")
+ (:set-severity :cleanliness {{gate-severity}})"
+  "The severity pins an adoption adds to *MALLET-CONFIG-TEMPLATE*.
+Carries a {{gate-severity}} placeholder. Starts with the blank line that
+separates it from the preceding clause and ends without a newline, so the
+config's closing parenthesis follows the last pin.")
 
 (defparameter *lint-lisp-template*
   "#!/usr/bin/env bash

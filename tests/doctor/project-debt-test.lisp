@@ -46,7 +46,11 @@
                 #:render-gate-config
                 #:render-lint-script
                 #:render-pre-commit-hook
-                #:render-debt-baseline))
+                #:render-debt-baseline)
+  (:import-from #:dsmr-mcp/src/project-scaffold-core
+                #:render-template)
+  (:import-from #:dsmr-mcp/src/project-scaffold-templates
+                #:*mallet-config-template*))
 
 (in-package #:dsmr-mcp/tests/doctor/project-debt-test)
 
@@ -131,6 +135,28 @@ each to carry its own severity and not the other's, is what that renderer fails.
            "rendering at :warning does not produce :info")
     (false (string= at-info at-warning)
            "the two renderings differ")))
+
+(define-test severity-pins-are-rendered-only-when-bound
+  "render-gate-config carries the pins and the comment explaining them; the
+template rendered with severity-pins bound empty reads as one form with no pin
+and no raw placeholder."
+  (let ((pinned (render-gate-config :severity :info))
+        (bare   (render-template *mallet-config-template*
+                                 (list (cons "severity-pins" "")))))
+    (true (contains-p pinned "(:set-severity :style :info)")
+          "the style pin is rendered at the given severity")
+    (true (contains-p pinned "(:set-severity :cleanliness :info)")
+          "the cleanliness pin is rendered at the given severity")
+    (true (contains-p pinned "The gate is new and the code is not.")
+          "the comment explaining the pins is rendered with them")
+    (false (search ":set-severity" bare) "an empty binding renders no pin")
+    (false (search "{{" bare) "an empty binding leaves no raw placeholder")
+    (let ((*read-eval* nil))
+      (with-input-from-string (in bare)
+        (let ((form (read in nil :eof))
+              (next (read in nil :eof)))
+          (true (consp form) "the bare config reads as a form")
+          (is eq :eof next "the bare config holds exactly one form"))))))
 
 (define-test the-other-two-gate-files-render
   "The lint script and the hook render, name no licence, and carry no

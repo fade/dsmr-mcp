@@ -41,6 +41,7 @@
                 #:render-template)
   (:import-from #:dsmr-mcp/src/project-scaffold-templates
                 #:*mallet-config-template*
+                #:*severity-pins-template*
                 #:*lint-lisp-template*
                 #:*pre-commit-hook-template*)
   (:export #:*severity-ladder*
@@ -231,11 +232,14 @@ licence, so no gate file rendered here names one."
                                 project-name)
   "Return the text of a linter configuration installed at SEVERITY.
 
-SEVERITY is validated before anything is rendered, so an unrecognised one never
-reaches a file. The text names no licence."
+The text carries the severity pins an adoption needs, at SEVERITY. SEVERITY is
+validated before anything is rendered, so an unrecognised one never reaches a
+file. The text names no licence."
   (validate-severity severity)
-  (render-template *mallet-config-template*
-                   (%gate-bindings severity project-name)))
+  (let* ((bindings (%gate-bindings severity project-name))
+         (pins (render-template *severity-pins-template* bindings)))
+    (render-template *mallet-config-template*
+                     (list* (cons "severity-pins" pins) bindings))))
 
 (defun render-lint-script (&key (severity (adopted-repo-gate-severity))
                                 project-name)
