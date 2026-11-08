@@ -226,19 +226,18 @@ The class comes from the category mallet assigns each rule:
 
 | mallet category                                        | class        |
 |--------------------------------------------------------+--------------|
-| correctness, suspicious                                | functional   |
-| practice, cleanliness, style, format, metrics          | style        |
+| correctness, suspicious, practice                      | functional   |
+| cleanliness, style, format, metrics                    | style        |
 | anything else, or a category that could not be read    | unclassified |
 
 Severity cannot make this split. Over =cl-ppcre= mallet reports trailing whitespace and unused
 variables as warnings, and a lambda list mixing =&optional= with =&key= as an error. Over our
 own sources with every rule enabled, its suspicious and practice findings are warnings too. A
-split by severity would put
-trailing whitespace beside real defects. Practice sits under style for now, because mallet
-describes it as code that works; the table is one line at the top of the gate, so it moves
-easily.
+split by severity would put trailing whitespace beside real defects. Practice counts as
+functional even though mallet describes such code as working. The table is one line at the top of
+the gate.
 
-Recording never changes what the gate decides. A finding is recorded the same way whether it
+Recording never changes whether a commit proceeds. A finding is recorded the same way whether it
 refuses the commit or not, and when the record cannot be written you get one line saying so and
 the same exit status you would have had.
 

@@ -48,7 +48,7 @@ BYPASS='Bypass a single commit with: git commit --no-verify'
 # is objectively wrong, suspicious is most likely a bug, practice works but
 # uses a discouraged pattern, cleanliness is dead code, and style, format, and
 # metrics concern presentation. A category not listed is unclassified.
-FINDING_CLASSES='correctness=functional suspicious=functional practice=style cleanliness=style style=style format=style metrics=style'
+FINDING_CLASSES='correctness=functional suspicious=functional practice=functional cleanliness=style style=style format=style metrics=style'
 
 blocking() {
   [ "$GATE_MODE" = 'blocking' ]

@@ -923,3 +923,31 @@ exits as it would have with a record."
               "the verdict line and the notice, nothing else: ~A" output)
           (is = 0 (with-open-file (in blocker) (file-length in))
               "the plain file is left as it was"))))))
+
+(define-test a-practice-finding-is-recorded-as-functional
+  "mallet 0.9.1 puts error-without-custom-condition in the practice category,
+both in its recorded JSON over this repository's sources and in the recording
+for this exact text and config: one warning at 2:2. The gate records that
+finding as functional."
+  (with-temp-git-repo (root :initial-file "README.md" :initial-content "notes
+")
+    (fixture-commit-file root ".mallet.lisp"
+                         "(:mallet-config
+ (:extends :default)
+ (:enable :error-without-custom-condition))
+")
+    (let ((gate (%install-gate root (render-pre-commit-hook :profile :foreign))))
+      (%stage root "boom.lisp" "(defun boom ()
+  (error \"boom\"))
+")
+      (multiple-value-bind (output code) (%run-gate root gate)
+        (is = 0 code "the informational gate lets the commit through: ~A" output)
+        (when (gate-scanner-available-p)
+          (let ((row (find "error-without-custom-condition" (rest (%record-table root))
+                           :key #'sixth :test #'equal)))
+            (true row "the practice finding is recorded: ~A" output)
+            (when row
+              (is string= "practice" (fourth row) "its category: ~S" row)
+              (is string= "functional" (third row) "its class: ~S" row)
+              (is equal '("boom.lisp" "2" "2") (subseq row 6 9)
+                  "its place: ~S" row))))))))
