@@ -218,42 +218,45 @@ it was supposed to mean."
   "Return SEVERITY as the text a linter configuration reads, e.g. \":info\"."
   (string-downcase (format nil "~S" severity)))
 
-(defun %gate-bindings (severity project-name spdx)
-  "Return the substitution alist the three gate templates are rendered from."
+(defun %gate-bindings (severity project-name)
+  "Return the substitution alist the three gate templates are rendered from.
+
+Binds spdx-line to the empty string: an adopted repository keeps its own
+licence, so no gate file rendered here names one."
   (list (cons "gate-severity" (%severity-literal severity))
         (cons "name" (or project-name ""))
-        (cons "spdx" (or spdx "AGPL-3.0-or-later"))))
+        (cons "spdx-line" "")))
 
 (defun render-gate-config (&key (severity (adopted-repo-gate-severity))
-                                project-name
-                                spdx)
+                                project-name)
   "Return the text of a linter configuration installed at SEVERITY.
 
 SEVERITY is validated before anything is rendered, so an unrecognised one never
-reaches a file."
+reaches a file. The text names no licence."
   (validate-severity severity)
   (render-template *mallet-config-template*
-                   (%gate-bindings severity project-name spdx)))
+                   (%gate-bindings severity project-name)))
 
 (defun render-lint-script (&key (severity (adopted-repo-gate-severity))
-                                project-name
-                                spdx)
+                                project-name)
   "Return the text of the lint runner script for a project.
 
 Takes SEVERITY for symmetry with the other two renderers and validates it, so a
 caller rendering the whole gate at one severity cannot get two of the three
-files and a signal on the third."
+files and a signal on the third. The script carries no licence line: an adopted
+repository keeps its own licence."
   (validate-severity severity)
   (render-template *lint-lisp-template*
-                   (%gate-bindings severity project-name spdx)))
+                   (%gate-bindings severity project-name)))
 
 (defun render-pre-commit-hook (&key (severity (adopted-repo-gate-severity))
-                                    project-name
-                                    spdx)
-  "Return the text of the pre-commit hook for a project."
+                                    project-name)
+  "Return the text of the pre-commit hook for a project.
+
+The hook carries no licence line: an adopted repository keeps its own licence."
   (validate-severity severity)
   (render-template *pre-commit-hook-template*
-                   (%gate-bindings severity project-name spdx)))
+                   (%gate-bindings severity project-name)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Rendering the frozen baseline

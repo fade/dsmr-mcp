@@ -581,9 +581,7 @@ written beside it.")
 # on PATH belongs to an unrelated Java toolkit that happens to share the name,
 # and reaching it instead would either fail in a confusing way or appear to
 # succeed having linted nothing. Set MALLET to override the location.
-#
-# SPDX-License-Identifier: {{spdx}}
-
+{{spdx-line}}
 set -euo pipefail
 
 MALLET=\"${MALLET:-$HOME/.local/share/mallet/mallet}\"
@@ -617,7 +615,12 @@ exec \"$MALLET\" \"${SOURCES[@]}\"
 Runs the linter over src/ and tests/, or over the files named on the command
 line. Exits non-zero when the linter reports a violation at or above its
 failing threshold, which is what lets the pre-commit hook be a gate rather
-than a notification.")
+than a notification.
+
+The {{spdx-line}} placeholder occupies a line of its own. A caller that chose
+the project's licence binds it to that licence's identifier comment; every
+other caller binds it to the empty string, so the script names no licence. An
+adopted repository keeps the licence it came with.")
 
 (defparameter *pre-commit-hook-template*
   "#!/usr/bin/env bash
@@ -631,9 +634,7 @@ than a notification.")
 # arguments taken from the commit.
 #
 # Bypass a single commit with: git commit --no-verify
-#
-# SPDX-License-Identifier: {{spdx}}
-
+{{spdx-line}}
 set -euo pipefail
 
 REPO_ROOT=\"$(git rev-parse --show-toplevel)\"
@@ -656,7 +657,12 @@ fi
 Invokes only the repository's own lint script, with no data interpolated from
 the commit being made. Announces loudly and lets the commit through when the
 lint script is absent: an incompletely installed gate should be visible, not a
-wall that blocks every commit in the repository until someone reinstalls it.")
+wall that blocks every commit in the repository until someone reinstalls it.
+
+The {{spdx-line}} placeholder occupies a line of its own. A caller that chose
+the project's licence binds it to that licence's identifier comment; every
+other caller binds it to the empty string, so the hook names no licence. An
+adopted repository keeps the licence it came with.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; REPL-driven-development prompt template (D-12)

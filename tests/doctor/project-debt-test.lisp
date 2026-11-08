@@ -133,17 +133,23 @@ each to carry its own severity and not the other's, is what that renderer fails.
            "the two renderings differ")))
 
 (define-test the-other-two-gate-files-render
-  "The lint script and the hook render, and carry no unsubstituted placeholder."
-  (let ((script (render-lint-script :severity :info :spdx "AGPL-3.0-or-later"))
-        (hook   (render-pre-commit-hook :severity :info :spdx "AGPL-3.0-or-later")))
-    (true (plusp (length script)) "the lint script renders to something")
-    (true (plusp (length hook))   "the hook renders to something")
-    (false (contains-p script "{{spdx}}") "the script carries no raw placeholder")
-    (false (contains-p hook "{{spdx}}")   "the hook carries no raw placeholder")
-    (true (contains-p script "mallet")
-          "the script names the linter it runs")
-    (true (contains-p hook "lint-lisp.sh")
-          "the hook runs the repository's own lint script and nothing else")))
+  "The lint script and the hook render, name no licence, and carry no
+unsubstituted placeholder, at every severity."
+  (dolist (severity '(:info :warning :error))
+    (let ((script (render-lint-script :severity severity))
+          (hook   (render-pre-commit-hook :severity severity)))
+      (true (plusp (length script)) "the lint script renders to something")
+      (true (plusp (length hook))   "the hook renders to something")
+      (false (search "{{" script) "the script carries no raw placeholder")
+      (false (search "{{" hook)   "the hook carries no raw placeholder")
+      (false (search "SPDX-License-Identifier" script)
+             "the script carries no licence identifier line")
+      (false (search "SPDX-License-Identifier" hook)
+             "the hook carries no licence identifier line")
+      (true (contains-p script "mallet")
+            "the script names the linter it runs")
+      (true (contains-p hook "lint-lisp.sh")
+            "the hook runs the repository's own lint script and nothing else"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The frozen baseline
