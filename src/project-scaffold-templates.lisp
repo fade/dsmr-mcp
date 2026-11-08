@@ -5,7 +5,7 @@
 ;;;; Kept in a dedicated module so bulk literal content stays out of the
 ;;;; logic layer. All templates use {{key}} placeholders resolved by
 ;;;; render-template, which lives in its own leaf module because both the
-;;;; scaffold and the shape catalog reach it.
+;;;; scaffold and the shape catalogue reach it.
 ;;;;
 ;;;; Placeholders used across templates:
 ;;;;   {{name}}         — project name (kebab-case, e.g. foo-lib)
@@ -536,7 +536,7 @@ bin/
 ;;; ---------------------------------------------------------------------------
 ;;; Quality-gate templates: linter config, lint runner, pre-commit hook
 ;;;
-;;; These three are one unit. Across the repositories measured on this host the
+;;; These three are one unit. Across the application repositories measured, the
 ;;; linter config and the lint script co-occur exactly, and the hook is what
 ;;; makes either of them take effect, so a partial install is a shape that does
 ;;; not occur in practice and should not be reported as three separate misses.

@@ -46,7 +46,7 @@
    (exit-code :initarg :exit-code :reader git-command-error-exit-code)
    (stderr    :initarg :stderr    :initform "" :reader git-command-error-stderr))
   (:documentation
-   "Signaled when a git invocation fails.
+   "Signalled when a git invocation fails.
 
 Carries the whole argument vector, the process exit code and whatever git
 wrote to standard error, so a caller reporting the failure does not have to
@@ -69,7 +69,7 @@ before a process was ever started.")
 (define-condition not-a-repository-error (error)
   ((path :initarg :path :reader not-a-repository-path))
   (:documentation
-   "Signaled when a directory that was required to be a git repository is not one.
+   "Signalled when a directory that was required to be a git repository is not one.
 
 Distinct from GIT-COMMAND-ERROR: nothing failed, the caller's precondition was
 simply not met.")

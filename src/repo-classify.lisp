@@ -85,7 +85,7 @@ DEFCONSTANT in this codebase holds a number, for the same reason.")
    (origin-url :initarg :origin-url :initform nil
                :reader repo-classification-ambiguous-origin-url))
   (:documentation
-   "Signaled when nothing on disk decides whether a repository is ours.
+   "Signalled when nothing on disk settles whether a repository is ours.
 
 Two shapes reach here: an origin under one of our own accounts with no upstream
 recorded anywhere, and no origin at all. Both are questions for the operator,
@@ -145,7 +145,7 @@ read on every call so a change takes effect without reloading anything."
 ;;; Reading an account out of a remote URL
 ;;; ---------------------------------------------------------------------------
 
-;;; Three URL shapes occur across the repositories on this host. Both scanners
+;;; Three URL shapes occur across the repositories in $LISP_WORKSPACE. Both scanners
 ;;; require a non-empty repository segment after the account, so a bare host
 ;;; cannot be read as an account name.
 
@@ -171,7 +171,7 @@ read on every call so a change takes effect without reloading anything."
   "Return the hosting account named in URL as a string, or NIL when there is none.
 
 Pure string work: nothing here or below it opens a connection, so a crafted
-remote URL cannot cause a lookup. A URL in none of the recognised shapes returns
+remote URL cannot cause a lookup. A URL in none of the recognized shapes returns
 NIL, which every caller reads as \"not ours\"."
   (when (stringp url)
     (let ((owner (or (%first-group *scheme-url-scanner* url)
@@ -183,7 +183,7 @@ NIL, which every caller reads as \"not ours\"."
   "Return T when URL names a repository under one of OUR-GIT-ACCOUNTS.
 
 A URL that cannot be parsed is not ours. That asymmetry is deliberate: reading
-an unrecognised URL as ours is what puts our tooling into somebody else's
+an unrecognized URL as ours is what puts our tooling into somebody else's
 tracked tree, while reading one of ours as foreign only leaves the apparatus
 untracked in a repository we own.
 
@@ -236,7 +236,7 @@ repository name without a trailing .git or slash.")
 (defun parse-remote-repository (url)
   "Return \"owner/name\" for the repository URL names, or NIL.
 
-Recognises the URL shapes PARSE-REMOTE-OWNER does, with a trailing .git and a
+Recognizes the URL shapes PARSE-REMOTE-OWNER does, with a trailing .git and a
 trailing slash removed. Pure string work: no lookup is made."
   (when (stringp url)
     (or (%owner-and-name *scheme-repository-scanner* url)
@@ -322,8 +322,8 @@ else's software as our own, and only the operator knows which."
 
 The two foreign outcomes collapse into one profile because they call for
 identical treatment: the apparatus is present on disk and none of it is tracked.
-They differ only in whether there is an upstream to record. An unrecognised
-value signals rather than defaulting, because this profile is what decides
+They differ only in whether there is an upstream to record. An unrecognized
+value signals rather than defaulting, because this profile sets
 whether a write becomes tracked content in a repository we do not own."
   (ecase classification
     (:ours :ours)

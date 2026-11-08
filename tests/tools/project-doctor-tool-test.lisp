@@ -221,7 +221,7 @@ instrument being aimed at nothing."
       ;; report the absence of one.
       (write-fixture-file root "stray.txt" "not committed")
       (true (plusp (length (git-status-porcelain root)))
-            "git status sees an untracked file")
+            "git status lists an untracked file")
       (uiop:delete-file-if-exists
        (merge-pathnames "stray.txt" (uiop:ensure-directory-pathname root)))
       (let ((exclude-before (%exclude-text root))

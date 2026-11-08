@@ -7,8 +7,8 @@
 ;;;; the logic is testable without a session root, a filesystem, or a running
 ;;;; image.
 ;;;;
-;;;; The manifest is derived from the shape catalog rather than listed here.
-;;;; The catalog is the same definition an existing repository is assessed
+;;;; The manifest is derived from the shape catalogue rather than listed here.
+;;;; The catalogue is the same definition an existing repository is assessed
 ;;;; against, and two lists that agree today drift tomorrow: once they have,
 ;;;; a repository can be certified as the right shape while being one the
 ;;;; scaffold would not produce, and nothing reports it.
@@ -25,8 +25,8 @@
                 #:shape-item-generator
                 #:shape-item-emit-on-scaffold-p
                 #:shape-item-install-target)
-  ;; *SHAPE-CATALOG* is declared by project-shape and filled by the catalog data
-  ;; file. Reading it from the catalog package is what makes this module depend
+  ;; *SHAPE-CATALOG* is declared by project-shape and filled by the catalogue data
+  ;; file. Reading it from the catalogue package is what makes this module depend
   ;; on the file that populates it, so the manifest is never derived from an
   ;; empty list.
   (:import-from #:dsmr-mcp/src/project-shape-catalog
@@ -145,12 +145,12 @@ year default for generated LICENSE/.asd content)."
   "Return the content ITEM's generator produces from BINDINGS.
 
 An item the scaffold is asked to emit but that carries no generator is a
-catalog defect, not a caller mistake, and it is reported as one. Skipping it
-instead would write a project silently short of a file the catalog says it
+catalogue defect, not a caller mistake, and it is reported as one. Skipping it
+instead would write a project silently short of a file the catalogue says it
 has, while the manifest still looked complete."
   (let ((generator (shape-item-generator item)))
     (unless generator
-      (error "Shape catalog item ~S is marked for emission but has no generator."
+      (error "Shape catalogue item ~S is marked for emission but has no generator."
              (shape-item-key item)))
     (funcall generator bindings)))
 
@@ -160,7 +160,7 @@ Applies all template substitutions but performs no I/O. Callers are
 responsible for input validation before calling this function;
 plan-scaffold assumes its arguments are already normalized strings.
 
-Which files are emitted is not listed here. It is read from the shape catalog,
+Which files are emitted is not listed here. It is read from the shape catalogue,
 which is the same definition an existing repository is assessed against, so
 the set the scaffold writes and the set a repository is expected to have
 cannot drift apart. An item is emitted when it is marked for emission and
@@ -168,7 +168,7 @@ lives in the working tree; an item belonging under the repository's git
 directory is never part of a manifest.
 
 Both an item's path and its content go through template substitution, so the
-catalog can name a file whose name depends on the project.
+catalogue can name a file whose name depends on the project.
 
 DESTINATION is accepted for caller symmetry with write-scaffold but is not used
 here: the prompt is copied into the project's own prompts/ dir, so no path back

@@ -23,9 +23,9 @@
 ;;;; committed into a third party's history.
 ;;;;
 ;;;; This module is mechanism only. Which files exist, what tier each is in and
-;;;; which of them are apparatus are declared in the catalog data file, which
+;;;; which of them are apparatus are declared in the catalogue data file, which
 ;;;; fills in *SHAPE-CATALOG*. Nothing here reads that file, and every function
-;;;; below accepts a catalog argument so a caller can supply its own.
+;;;; below accepts a catalogue argument so a caller can supply its own.
 
 (defpackage #:dsmr-mcp/src/project-shape
   (:use #:cl)
@@ -71,12 +71,12 @@ separate files. :CONVENIENCE is advisory and its absence is never a fault.
 
 The tier is what keeps assessment from declaring working repositories sick. A
 requirement that every project carry every file we like to have would report the
-majority of the third-party repositories on this machine as broken, and a report
+majority of the third-party repositories in $LISP_WORKSPACE as broken, and a report
 that is mostly false entries hides the true ones.")
 
 (defvar +assertions+ '(:file-exists :directory-exists :any-file-matching
                        :gate-hook-wired)
-  "Every kind of check that can decide whether an item is satisfied.
+  "Every kind of check that can test whether an item is satisfied.
 
 :FILE-EXISTS and :DIRECTORY-EXISTS take a relative path. :ANY-FILE-MATCHING takes
 a filename glob and is satisfied by any one file matching it, which is how a
@@ -101,10 +101,10 @@ they are invisible to a third party regardless of profile.")
    (value  :initarg :value  :reader invalid-shape-item-value)
    (reason :initarg :reason :reader invalid-shape-item-reason))
   (:documentation
-   "Signaled when MAKE-SHAPE-ITEM is given an argument it cannot accept.
+   "Signalled when MAKE-SHAPE-ITEM is given an argument it cannot accept.
 
 Carries the offending field, the value supplied and why it was rejected, so a
-malformed catalog entry names itself rather than surfacing later as a missing
+malformed catalogue entry names itself rather than surfacing later as a missing
 file nobody declared.")
   (:report
    (lambda (condition stream)
@@ -163,7 +163,7 @@ answer only the first."
 
 This is the only way to build an item. TIER, ASSERTION and INSTALL-TARGET are
 checked against +TIERS+, +ASSERTIONS+ and +INSTALL-TARGETS+, so a typo in the
-catalog is a load-time failure naming the field rather than an item that quietly
+catalogue is a load-time failure naming the field rather than an item that quietly
 never matches anything.
 
 An assertion of :GATE-HOOK-WIRED holds only when the gate script exists and git
@@ -223,7 +223,7 @@ because the structure has no slot able to hold that claim: it cannot be
 constructed, written down, or read back. The rule has exactly one place it could
 be broken, and this is it.
 
-An unrecognised profile signals rather than defaulting. A default would have to
+An unrecognized profile signals rather than defaulting. A default would have to
 answer :TRACKED, and that is the answer that puts our files into somebody else's
 commit."
   (ecase profile
@@ -231,13 +231,13 @@ commit."
     (:ours :tracked)))
 
 ;;; ---------------------------------------------------------------------------
-;;; Reading a catalog
+;;; Reading a catalogue
 ;;; ---------------------------------------------------------------------------
 
 (defvar *shape-catalog* '()
   "The list of SHAPE-ITEMs that defines the shape of a project of ours.
 
-Declared here and filled in by the catalog data file, so that this module holds
+Declared here and filled in by the catalogue data file, so that this module holds
 no list of its own and a caller can bind or pass a different one. Empty until
 that file is loaded.")
 

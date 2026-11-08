@@ -134,7 +134,7 @@ that already points the check elsewhere cannot change what this suite measures."
 
 A system definition, a source directory and a test directory: the layout our own
 projects always have, and none of our conventions on top of it. Roughly ninety
-repositories on this machine look like this, and not one of them is answerable
+repositories in $LISP_WORKSPACE look like this, and not one of them is answerable
 to us for any part of it."
   (write-fixture-file root "example.asd" "(asdf:defsystem \"example\")")
   (write-fixture-file root "src/main.lisp" ";; source")
@@ -172,7 +172,7 @@ not run is not installed. Signals an error when this git cannot wire it."
   root)
 
 (defun %seed-apparatus (root)
-  "Install every file the catalog names as our own apparatus under ROOT.
+  "Install every file the catalogue names as our own apparatus under ROOT.
 
 A repository we do not own is assessed against these and against nothing else,
 so this is the whole of what it takes for such a repository to report clean."
@@ -185,8 +185,8 @@ so this is the whole of what it takes for such a repository to report clean."
 (defun %clear-ambient-ignores (root)
   "Make every path in ROOT stageable regardless of how the host ignores things.
 
-A repository created on this machine inherits a seeded local exclude and a global
-ignore file, and both cover our apparatus paths by design. A fixture that has to
+A repository created where a git init template and a global ignore file are
+configured inherits both, and both cover our apparatus paths by design. A fixture that has to
 place such a path in the index would otherwise succeed or fail depending on whose
 machine the suite ran on, and the property under test has nothing to do with
 either file. Both sources are emptied for this repository alone."
@@ -267,7 +267,7 @@ happens to share the name as the gate."
 
 (define-test a-template-pre-commit-hook-is-not-taken-for-the-gate
   "CONTROL: a repository holding the linter configuration, the lint script and an
-executable pre-commit hook, as every clone on this host does, is reported as
+executable pre-commit hook, as a seeded clone has, is reported as
 missing the gate.
 
 The hook stands in for the one the host's init template seeds. Taken for the

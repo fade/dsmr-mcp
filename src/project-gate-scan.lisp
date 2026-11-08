@@ -18,7 +18,7 @@
 ;;;;    So the first thing here is a check, and its failure is a signal.
 ;;;;
 ;;;; 2. A non-zero exit is the ordinary case, not a failure. The linter exits
-;;;;    non-zero precisely when it found something, which is what we came for.
+;;;;    non-zero precisely when it found something, which is the point of the scan.
 ;;;;    Only output that will not parse is a failure, and that one signals with
 ;;;;    the exit code and a bounded piece of what was written.
 ;;;;
@@ -26,7 +26,7 @@
 ;;;; PATH belongs to an unrelated toolkit, and reaching it would either fail
 ;;;; confusingly or appear to succeed having examined nothing.
 ;;;;
-;;;; Every site this returns is categorised as examined-and-frozen, and its
+;;;; Every site this returns is categorized as examined-and-frozen, and its
 ;;;; callee knowability is left explicitly undetermined. Neither is a hedge: a
 ;;;; linter running one rule over one file cannot tell that a site is correct as
 ;;;; written or demonstrably defective, and callee knowability is a property of
@@ -57,7 +57,7 @@
 (define-condition gate-scanner-unavailable-error (error)
   ((path :initarg :path :reader gate-scanner-unavailable-path))
   (:documentation
-   "Signaled when the linter is not present where the scanner expects it.
+   "Signalled when the linter is not present where the scanner looks for it.
 
 This is the condition that keeps \"nobody could look\" from being recorded as
 \"there was nothing to find\". A caller that wants to proceed anyway handles it
@@ -75,7 +75,7 @@ and records the debt as not enumerated; nothing here decides that for it.")
    (exit-code :initarg :exit-code :reader gate-scan-failed-exit-code)
    (output    :initarg :output    :reader gate-scan-failed-output))
   (:documentation
-   "Signaled when the scanner ran but produced output that will not parse.
+   "Signalled when the scanner ran but produced output that will not parse.
 
 Distinct from a non-zero exit, which is what the linter does whenever it finds
 anything and is the case this module exists to handle. Carries the argument

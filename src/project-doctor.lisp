@@ -143,7 +143,7 @@
    (before :initarg :before :reader head-moved-before)
    (after  :initarg :after  :reader head-moved-after))
   (:documentation
-   "Signaled when a repository's head sha differs after a run from before it.
+   "Signalled when a repository's head sha differs after a run from before it.
 
 The doctor makes no commits, so a moved head means something ran that should
 not have. Reported rather than tolerated, because a commit of ours in a third
@@ -167,7 +167,7 @@ can be noticed cheaply is here.")
   ((path :initarg :path :reader write-outside-root-path)
    (root :initarg :root :reader write-outside-root-root))
   (:documentation
-   "Signaled when a repair's destination resolves outside the write jail.
+   "Signalled when a repair's destination resolves outside the write jail.
 
 The containment check runs on the resolved pathname, so a symlinked parent
 cannot carry a repair out of the tree it was asked to operate on. Signalled
@@ -210,7 +210,7 @@ the system being reloaded under it.")
                           (:conc-name report-)
                           (:copier nil)
                           (:predicate doctor-report-p))
-  "What one normalisation run did to a repository, and what it found already right.
+  "What one normalization run did to a repository, and what it found already right.
 
 CHANGED, ALREADY-CORRECT, RECORDED-DEBT, ACCEPTED and UNRESOLVED are separate
 lists on purpose. A single list of findings cannot say which of them the run
@@ -253,7 +253,7 @@ be able to see the two values rather than take the claim on trust."
 
 The project name comes from the directory the repository sits in, which is the
 only name a repository we did not create is guaranteed to have. Both an item's
-path and its content go through these, because the catalog names one file after
+path and its content go through these, because the catalogue names one file after
 the project it belongs to.
 
 The licence, identifier, and copyright keys are bound to the empty string. An
@@ -377,7 +377,7 @@ not consulted, exactly as the existing installer does for the script it copies."
   "Write CONTENT to DESTINATION, which must resolve inside JAIL. Return the path.
 
 Every destination goes through the symlink-safe containment check before any
-byte is written, so a catalog path that has been made to point elsewhere cannot
+byte is written, so a catalogue path that has been made to point elsewhere cannot
 carry a repair out of the repository it was aimed at."
   (let ((resolved (ensure-write-path (namestring destination) jail)))
     (unless resolved
@@ -393,7 +393,7 @@ carry a repair out of the repository it was aimed at."
   "Return the pattern set of record joined with PROFILE's apparatus paths.
 
 Two sets answering two questions. The template says what git already seeds into
-every repository; the catalog says what our apparatus consists of. A repository
+every repository; the catalogue says what our apparatus consists of. A repository
 we do not own needs both, because an apparatus file the template has never heard
 of is exactly the one that would appear in a maintainer's git status."
   (let* ((template (template-exclude-patterns))
@@ -423,7 +423,7 @@ ALREADY-TRACKED names the apparatus paths the repository tracked before the run
 started, and those are excluded from the check. They are a finding about the
 repository, reported by the assessment and never repairable, and the caller has
 already been told about them. What is checked here is the difference: a path that
-was not in the index when we arrived and is in it now.
+was not in the index before the run and is in it now.
 
 That difference can only come from our own writes, which is why reaching it means
 the exclude-before-write ordering failed rather than meaning anything about the
@@ -474,7 +474,7 @@ is unresolved; either entry names the member's key and the local config file. A
 kept gate's key is returned as already correct only when its wiring is not
 unresolved.
 
-A deviation naming no item at all is the local exclude, which is not a catalog
+A deviation naming no item at all is the local exclude, which is not a catalogue
 item and was brought up to the pattern set of record before any file was written.
 Its entry here reports that repair rather than repeating it."
   (let ((item (deviation-item deviation))
@@ -578,7 +578,7 @@ written, and the written one is believed."
   (let ((item (catalog-item :gate-baseline catalog)))
     (if (null item)
         (values (list :path nil :site-count nil :action-taken :not-enumerated)
-                "the catalog declares no frozen baseline, so there is nowhere to record debt")
+                "the catalogue declares no frozen baseline, so there is nowhere to record debt")
         (let ((destination (%item-destination item root bindings)))
           (if (probe-file destination)
               (values (list :path destination

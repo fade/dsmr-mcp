@@ -170,7 +170,7 @@ for it, which is how the readers that accept one specific status are built."
 
 (define-test head-sha-is-present-with-history-and-absent-without
   "CONTROL for the empty-repository case: proves git-head-sha returns NIL on a
-repository with no commits rather than signalling. A freshly initialised
+repository with no commits rather than signalling. A freshly initialized
 repository is a normal state during adoption, not a fault."
   (with-temp-git-repo (root :initial-file "a.txt" :initial-content "a")
     (let ((sha (git-head-sha root)))

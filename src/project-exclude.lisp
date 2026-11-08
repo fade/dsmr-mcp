@@ -74,7 +74,7 @@ time, so a caller can point the check at a fixture without rebuilding."
 (define-condition exclude-template-missing-error (error)
   ((path :initarg :path :reader exclude-template-missing-path))
   (:documentation
-   "Signaled when the template holding the pattern set of record is absent.
+   "Signalled when the template holding the pattern set of record is absent.
 
 There is deliberately no fallback to a list written into this file. A host with
 no template would then report every repository it examined as carrying every
@@ -147,7 +147,7 @@ nothing is missing, which is what makes the transform below idempotent."
 
 EXISTING-TEXT is never mutated and may be NIL for a repository with no exclude
 file yet. Every pre-existing line survives verbatim, comments included and local
-entries the template knows nothing about included: the result is the existing
+entries the template does not list included: the result is the existing
 text followed, only when something is actually missing, by a blank line, a
 one-line comment saying what the block is for, and the missing patterns one per
 line. Nothing is reordered, nothing is deduplicated and nothing is removed.

@@ -1,7 +1,7 @@
 ;;;; tests/doctor/project-doctor-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Zebra tests for repository normalisation, over real git repositories.
+;;;; Zebra tests for repository normalization, over real git repositories.
 ;;;;
 ;;;; The property this file exists to defend is the one whose failure reaches a
 ;;;; third party: our tooling must never become tracked content in a repository
@@ -108,9 +108,9 @@ Written to a file each test creates. A suite reading the developer's own
 template would measure something different on every machine and nothing at all
 on a build host that has none.
 
-Deliberately does NOT list any of the apparatus paths the catalog names. The
+Deliberately does NOT list any of the apparatus paths the catalogue names. The
 patterns that keep our own files out of a maintainer's index have to come from
-the catalog, and a template already carrying them would hide a run that never
+the catalogue, and a template already carrying them would hide a run that never
 consulted it.")
 
 (defun %write-fixture-template (directory patterns)
@@ -169,8 +169,8 @@ different test from the one written here."
 (defun %clear-ambient-ignores (root)
   "Make every path in ROOT stageable regardless of how the host ignores things.
 
-A repository created on this machine inherits a seeded local exclude and a
-global ignore file, and both cover our apparatus paths by design. A fixture that
+A repository created where a git init template and a global ignore file are
+configured inherits both, and both cover our apparatus paths by design. A fixture that
 has to place such a path in the index, or that must see one appear in git
 status, would otherwise answer differently depending on whose machine the suite
 ran on. Both sources are emptied for this repository alone."
@@ -183,7 +183,7 @@ ran on. Both sources are emptied for this repository alone."
 (defun %remove-seeded-hook (root)
   "Delete any pre-commit hook the host's git template seeded into ROOT.
 
-The template configured on this machine installs one into every new repository,
+A git init template can install one into every new repository,
 so a fixture that does not clear it starts with part of the gate already in
 place and measures a different repair from the one written down."
   (uiop:delete-file-if-exists
@@ -353,7 +353,7 @@ adopted repository; in the index is the leak."
 ;;; ---------------------------------------------------------------------------
 
 (define-test control-the-exclude-is-updated-before-any-file-is-written
-  "CONTROL. The ordering, which nothing else in this file would notice.
+  "CONTROL. The ordering, which nothing else in this file would detect.
 
 Exclude-then-write and write-then-exclude leave identical end states on a run
 that succeeds, so the difference can only be seen when the write does not
@@ -419,7 +419,7 @@ none."
   "CONTROL.
 
 The whole tree is compared before and after, and then the comparison itself is
-put to work: one file is edited by hand and the same comparison must notice. An
+put to work: one file is edited by hand and the same comparison must detect it. An
 equality assertion that has never been observed failing is not an instrument,
 and a snapshot function that returned a constant would satisfy the first half
 perfectly.
@@ -1099,7 +1099,7 @@ the reason. A dry run reports the same and writes nothing."
                "nothing was created")))))
 
 (define-test with-no-policy-nothing-is-written-and-every-finding-comes-back
-  "An unattended run decides nothing.
+  "An unattended run resolves nothing.
 
 Without a policy there is no outcome, because nobody chose one. The findings
 come back with the decisions each of them admits, for the caller to pick from."

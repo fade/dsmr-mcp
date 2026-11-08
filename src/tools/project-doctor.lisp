@@ -4,8 +4,8 @@
 ;;;; MCP verb: bring an existing repository up to the declared project shape.
 ;;;;
 ;;;; Whether a tree whose origin sits under one of our own accounts is our
-;;;; software or somebody else's is not readable from anything on disk, and on
-;;;; this host that case outnumbers the decidable one three to one. So this verb
+;;;; software or somebody else's is not readable from anything on disk, and across
+;;;; $LISP_WORKSPACE that case outnumbers the decidable one three to one. So this verb
 ;;;; asks. An ambiguous repository produces a result naming the question, the
 ;;;; origin that was found and the answers the verb accepts, with nothing
 ;;;; written and nothing decided. The caller answers by calling again with one
@@ -113,7 +113,7 @@ re-evaluates to a fresh, non-EQL object on reload and breaks a warm image.")
     :initform "project-doctor")
    (dsmr-mcp/src/tools/base::description
     :allocation :class
-    :initform "Normalise an existing repository into the project shape without \
+    :initform "Normalize an existing repository into the project shape without \
 destroying what is there. Assesses by default and writes nothing; repairs, \
 records as debt, or accepts a deviation as deliberate only when a policy says \
 so, and reports every change separately from what was already correct. In a \
@@ -174,7 +174,7 @@ returned as a question with the answers it accepts, never resolved by a guess.")
   "Return VALUE's symbol name in lower case, or NIL when VALUE is NIL.
 
 Every keyword the report carries reaches the wire through here, so a caller
-never sees a printed Lisp form where it expected a name."
+never receives a printed Lisp form in place of a name."
   (and value (string-downcase (symbol-name value))))
 
 (defun %path-string (value)
@@ -188,9 +188,9 @@ never sees a printed Lisp form where it expected a name."
 (defun %entry-item (entry)
   "Return the shape item key ENTRY is about, or NIL when it names none.
 
-An entry carries the key directly when the repair loop knew it; an entry that
+An entry carries the key directly when the repair loop had it; an entry that
 carries only the deviation has it one level down. The local exclude is not a
-catalog item at all and legitimately has none."
+catalogue item at all and legitimately has none."
   (or (getf entry :item)
       (let* ((deviation (getf entry :deviation))
              (item (and deviation (deviation-item deviation))))
@@ -262,7 +262,7 @@ without reading the repository."
                                    'null))))
 
 (defun %summary-text (report policy)
-  "Return the human-readable summary of REPORT under POLICY."
+  "Return the prose summary of REPORT under POLICY."
   (format nil "project-doctor over ~A: classified ~A, assessed as ~A.~%~
 ~D changed, ~D already correct, ~D recorded as debt, ~D accepted, ~D unresolved.~
 ~@[~%~A~]~@[~%~A~]"
@@ -310,7 +310,7 @@ carries the outcomes it admits. Call again with policy set to act on them.")))
 (defun %classification-keyword (value)
   "Return the classification keyword VALUE names.
 
-Three values are recognised and nothing else. NIL means the caller did not
+Three values are recognized and nothing else. NIL means the caller did not
 answer, which is a different thing from answering wrongly, so it returns NIL and
 :INVALID is reserved for a value that was supplied and is not one of the answers
 this verb offers.

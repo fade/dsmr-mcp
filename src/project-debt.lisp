@@ -13,7 +13,7 @@
 ;;;;
 ;;;; Nothing here derives that severity from a measurement of the repository.
 ;;;; Development tempo and the number of people committing were both measured
-;;;; across the whole population of repositories on this host, and no ordering
+;;;; across our application repositories, and no ordering
 ;;;; of either reproduces the one calibration on record: the repository judged
 ;;;; least urgent is busier and older than one already gated, with the same
 ;;;; number of contributors. A number built from those signals would contradict
@@ -114,9 +114,9 @@ adopted repository should start costs exactly this line.")
 (define-condition invalid-severity-error (error)
   ((value :initarg :value :reader invalid-severity-value))
   (:documentation
-   "Signaled when something that is not a gate severity is offered as one.
+   "Signalled when something that is not a gate severity is offered as one.
 
-Rendering a configuration around an unrecognised severity would produce a linter
+Rendering a configuration around an unrecognized severity would produce a linter
 configuration the linter cannot read, discovered at the developer's next commit
 rather than here.")
   (:report
@@ -131,7 +131,7 @@ rather than here.")
 (define-condition invalid-debt-category-error (error)
   ((value :initarg :value :reader invalid-debt-category-value))
   (:documentation
-   "Signaled when a frozen site carries a category outside the settled three.
+   "Signalled when a frozen site carries a category outside the settled three.
 
 The categories are the decisions the deviation module names. A fourth one
 appearing in a baseline means a site was classified by something that does not
@@ -154,7 +154,7 @@ else in the system understands.")
   "Return SEVERITY when it names a gate severity, else signal.
 
 Signals INVALID-SEVERITY-ERROR rather than returning a default. A caller that
-handed us something unrecognised has a bug, and quietly substituting :INFO for
+handed us something unrecognized has a bug, and quietly substituting :INFO for
 it would install a gate nobody asked for at a severity nobody chose."
   (unless (member severity *severity-ladder*)
     (error 'invalid-severity-error :value severity))
@@ -163,7 +163,7 @@ it would install a gate nobody asked for at a severity nobody chose."
 (defun severity-at-least-p (severity floor)
   "Return true when SEVERITY sits at or above FLOOR on the ladder.
 
-Both arguments are validated, so an unrecognised severity is a signal rather
+Both arguments are validated, so an unrecognized severity is a signal rather
 than a comparison against a position that does not exist."
   (validate-severity severity)
   (validate-severity floor)
@@ -190,7 +190,7 @@ Reads DSMR_GATE_SEVERITY at call time, so a developer can override the starting
 severity for one run without editing anything. An override that names no ladder
 severity signals INVALID-SEVERITY-ERROR: a misspelled override that silently
 fell back to the default would install a gate at a severity the developer
-believes he changed."
+believes they changed."
   (let ((override (uiop:getenv "DSMR_GATE_SEVERITY")))
     (if (and override (plusp (length (string-trim " " override))))
         (or (%severity-from-string override)
@@ -204,7 +204,7 @@ believes he changed."
 (defun validate-debt-category (category)
   "Return CATEGORY when it is one of the three, else signal.
 
-Signals INVALID-DEBT-CATEGORY-ERROR. Rendering an unrecognised category into
+Signals INVALID-DEBT-CATEGORY-ERROR. Rendering an unrecognized category into
 the baseline would put a word in a record that outlives everyone who knew what
 it was supposed to mean."
   (unless (member category +debt-categories+)
@@ -233,7 +233,7 @@ licence, so no gate file rendered here names one."
   "Return the text of a linter configuration installed at SEVERITY.
 
 The text carries the severity pins an adoption needs, at SEVERITY. SEVERITY is
-validated before anything is rendered, so an unrecognised one never reaches a
+validated before anything is rendered, so an unrecognized one never reaches a
 file. The text names no licence."
   (validate-severity severity)
   (let* ((bindings (%gate-bindings severity project-name))

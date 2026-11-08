@@ -6,8 +6,8 @@
 ;;;; The gate is registered as two local config entries, hook.lisp-gate.event
 ;;;; and hook.lisp-gate.command, so git runs it beside whatever pre-commit hook
 ;;;; the repository already has. No file under the hooks directory is edited,
-;;;; renamed or replaced: on this host every git init and git clone seeds a
-;;;; pre-commit hook from the init template, and that hook belongs to whoever
+;;;; renamed or replaced: a git init template can seed a pre-commit hook into
+;;;; every git init and git clone, and that hook belongs to whoever
 ;;;; installed it. Removing the wiring is one git config --unset per entry.
 
 (defpackage #:dsmr-mcp/src/project-hook

@@ -73,10 +73,10 @@ was signalled; this exists to read the slots off it afterwards."
       (parse-remote-owner "ssh://git@codeberg.org/fade/parachute")))
 
 (define-test unparseable-url-fails-toward-foreign
-  "CONTROL for the parse step: proves an unrecognised URL yields no account and
+  "CONTROL for the parse step: proves an unrecognized URL yields no account and
 is not treated as ours. Were an unparseable URL to read as ours, every remote
 shape this parser does not know would silently become an invitation to track our
-apparatus in somebody else's tree, and no other check in this file would notice."
+apparatus in somebody else's tree, and no other check in this file would catch it."
   (is eq nil (parse-remote-owner "not-a-url"))
   (is eq nil (parse-remote-owner ""))
   (is eq nil (parse-remote-owner :not-even-a-string))
@@ -116,7 +116,7 @@ ambiguity test below asserts separately."
         "a declared hard fork is ours with nothing passed on the call")))
 
 (define-test parse-remote-repository-reads-owner-and-name
-  "Every recognised URL shape reads back to owner/name, with .git and a
+  "Every recognized URL shape reads back to owner/name, with .git and a
 trailing slash removed; anything else reads as NIL."
   (is string= "fade/zebra"
       (parse-remote-repository "git@github.com:fade/zebra.git"))
@@ -327,7 +327,7 @@ are not blanket")))
 
 (define-test repo-profile-collapses-both-foreign-outcomes
   "Both foreign outcomes call for the same treatment, apparatus present and none
-of it tracked, so they share one profile. An unrecognised value signals rather
+of it tracked, so they share one profile. An unrecognized value signals rather
 than defaulting to either."
   (is eq :ours (repo-profile :ours))
   (is eq :foreign (repo-profile :foreign-with-upstream))

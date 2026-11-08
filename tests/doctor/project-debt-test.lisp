@@ -3,7 +3,7 @@
 ;;;;
 ;;;; Zebra tests for the severity ladder, the gate renderers and the frozen
 ;;;; baseline. Nothing here touches a filesystem, a repository or a subprocess:
-;;;; the module renders text and decides nothing else.
+;;;; the module renders text and does nothing else.
 ;;;;
 ;;;; Three of the properties defended here are the kind that pass against an
 ;;;; implementation doing nothing at all, so each is watched from a second side.
@@ -270,9 +270,9 @@ a record starts being believed for more than it says."
   "VALIDATION CONTROL, first half. Nothing is produced from a severity we do not
 know.
 
-A renderer substituting a default for an unrecognised severity would write a
+A renderer substituting a default for an unrecognized severity would write a
 gate at a severity nobody chose, and the developer who misspelled it would
-believe he had changed it."
+believe they had changed it."
   (fail (validate-severity :critical) 'invalid-severity-error)
   (fail (validate-severity nil) 'invalid-severity-error)
   (fail (validate-severity "info") 'invalid-severity-error

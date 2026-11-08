@@ -23,7 +23,7 @@
 ;;;;
 ;;;; Nothing here touches a filesystem or a repository. The deviations are built
 ;;;; directly and the shape items are synthetic, which is possible only because
-;;;; the recoveries decide without acting.
+;;;; the recoveries return a keyword and act on nothing.
 
 ;; Package evolution guard - delete prior definition on warm reload.
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -124,8 +124,8 @@ on its own."
     (is = 3 (length (remove-duplicates outcomes)))))
 
 (define-test the-macro-and-the-function-agree
-  "WITH-DEVIATION-POLICY is the wrapper and must decide the same way the function
-does. A macro that dropped its policy argument would leave the deviation
+  "WITH-DEVIATION-POLICY is the wrapper and must return what the function
+returns. A macro that dropped its policy argument would leave the deviation
 unhandled, which is a different bug from deciding wrongly."
   (is eql :recorded-as-debt
       (with-deviation-policy (:policy :record-as-debt)

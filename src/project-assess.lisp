@@ -15,7 +15,7 @@
 ;;;; What makes the report worth reading is that a repository is only measured
 ;;;; against what it is answerable for. A flat requirement that every repository
 ;;;; carry every file we like to have would report roughly ninety working
-;;;; third-party repositories on this machine as sick, and a list that is mostly
+;;;; third-party repositories in $LISP_WORKSPACE as sick, and a list that is mostly
 ;;;; false entries hides the true ones. A repository we do not own is answerable
 ;;;; for none of our conventions at all, only for our own apparatus being where
 ;;;; we need it and out of its index. Which items a profile is held to is read
@@ -127,7 +127,7 @@ has one, and would report a same-named file in the tree as the hook."
             the gate, or the current one without its execute bit. The doctor
             replaces it.
   :OTHER    a directory, or a file that is not a lint gate. Nothing replaces it.
-A lint gate is recognised by its two opening lines and a GATE_MODE line."
+A lint gate is recognized by its two opening lines and a GATE_MODE line."
   (let ((path (gate-hook-path root)))
     (cond
       ((uiop:directory-exists-p path) :other)
@@ -148,22 +148,22 @@ A lint gate is recognised by its two opening lines and a GATE_MODE line."
 (defun item-satisfied-p (item root &optional profile)
   "Return T when ITEM's assertion holds in the repository at ROOT, else NIL.
 
-:FILE-EXISTS wants a file at the named relative path, and a directory of that
-name does not satisfy it. :DIRECTORY-EXISTS wants a directory. :ANY-FILE-MATCHING
+:FILE-EXISTS requires a file at the named relative path, and a directory of that
+name does not satisfy it. :DIRECTORY-EXISTS requires a directory. :ANY-FILE-MATCHING
 is satisfied by any one file at the top level matching the glob, which is how a
 system definition is asserted without dictating what the project is called; it
 does not descend, so a system definition buried in a subdirectory is not the
 top-level one being asked about.
 
-:GATE-HOOK-WIRED wants the gate script at GATE-HOOK-PATH and git listing it as an
+:GATE-HOOK-WIRED requires the gate script at GATE-HOOK-PATH and git listing it as an
 enabled pre-commit hook with the expected command. Given PROFILE, the script
 must be the executable rendering for PROFILE (see GATE-FILE-STATE) and the
 command the one for PROFILE; with PROFILE NIL, any file there and either
 profile's command satisfy it. A file named pre-commit is
-not evidence of the gate: every repository created on this host already has one
-from the init template, and it is not ours.
+not evidence of the gate: a git init template can seed one into every new
+repository, and it is not ours.
 
-An unrecognised assertion signals rather than answering NIL. NIL would report the
+An unrecognized assertion signals rather than answering NIL. NIL would report the
 item as absent from every repository, which reads as a finding about the
 repository rather than as the typo it is."
   (let ((base (%assertion-base item root))
@@ -226,9 +226,9 @@ since calling it absent would misdescribe the repository."
 ;;; ---------------------------------------------------------------------------
 
 (defun %assessed-items (catalog profile)
-  "Return the members of CATALOG that PROFILE is held to, in catalog order.
+  "Return the members of CATALOG that PROFILE is held to, in catalogue order.
 
-What that comes to is the catalog's to answer and not this module's. The
+What that comes to is the catalogue's to answer and not this module's. The
 question a repository is measured against is part of the shape declaration, and
 restating any of it here would mean a revised answer had to be applied twice."
   (remove-if-not (lambda (item) (item-assessed-p item profile)) catalog))
@@ -282,7 +282,7 @@ added to the template becomes a finding in every repository at once. A repositor
 with no exclude file at all is measured as carrying no patterns, which is what it
 carries.
 
-The deviation names no catalog item, because the local exclude is not one: it is
+The deviation names no catalogue item, because the local exclude is not one: it is
 provisioned by git itself and never written by the scaffold. Declaring an item
 for it here would put part of the shape outside the one file that holds the
 shape. The path and the patterns it lacks are in the detail."

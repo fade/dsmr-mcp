@@ -103,9 +103,9 @@ signaller already knew."))
                      (deviation-detail condition))))
   (:documentation
    "Signalled when an item's assertion is unsatisfied in a repository whose
-profile expects that item to be present.
+profile requires that item to be present.
 
-Absent under a profile that does not expect the item is not a deviation at all
+Absent under a profile that does not require the item is not a deviation at all
 and must not be signalled: a repository legitimately without a convenience file
 is not sick, and reporting it as such buries the findings that are real."))
 
@@ -328,7 +328,7 @@ report would be indistinguishable from the truthful one."
   (when (and policy (not (member policy +policies+)))
     (error 'policy-not-applicable-error
            :policy policy
-           :reason "not one of the policies this doctor knows"))
+           :reason "not one of the policies the doctor accepts"))
   (if (null policy)
       (funcall thunk)
       (handler-bind

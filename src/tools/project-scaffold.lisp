@@ -76,7 +76,7 @@ where <name>/ is created (default: scaffolds). No leading / or .. segments.")
                   :description "When true, replace an existing scaffold directory. Default: false.")
                  (init-git
                   :type :boolean
-                  :description "When false, skip repository initialisation. \
+                  :description "When false, skip repository initialization. \
 Default: true. A repository is created only when the new project would not sit \
 inside an existing one."))
                 :required ("name"))))
@@ -84,7 +84,7 @@ inside an existing one."))
   (:documentation "MCP tool: generate a DSMR-discipline Lisp project skeleton.
 Writes an atomic tree under the session root via temp-dir + rename-file.
 No-root guard at entry: call fs-set-project-root first.
-Initialises a git repository in the new project unless it would nest inside an
+Initializes a git repository in the new project unless it would nest inside an
 existing one, and reports which of those happened."))
 
 (c2mop:ensure-finalized (find-class 'project-scaffold-tool))
@@ -219,7 +219,7 @@ ASDF source-registry tree. Elsewhere: (asdf:load-asd ~S)"
                                       name relative (length files)
                                       (namestring target-dir)
                                       (if git-init-p
-                                          "Initialised a git repository here."
+                                          "Initialized a git repository here."
                                           "No git repository was created here.")
                                       (%gate-hook-line (getf res :gate-hook))
                                       (coerce next-steps 'list))))))

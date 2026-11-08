@@ -4,7 +4,7 @@
 ;;;; The one placeholder substitution used to turn a template into file content.
 ;;;;
 ;;;; It lives on its own rather than beside the scaffold because two modules need
-;;;; it and neither may depend on the other. The shape catalog renders a template
+;;;; it and neither may depend on the other. The shape catalogue renders a template
 ;;;; to produce an item's content, and the scaffold renders the same templates to
 ;;;; produce a manifest derived from that catalog. With the substitution sitting
 ;;;; in the scaffold, those two imports close a loop and the system will not

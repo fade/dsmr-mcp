@@ -122,7 +122,7 @@ cannot change what is measured."
 ;;; ---------------------------------------------------------------------------
 
 (defun %foreign-renderable-items ()
-  "Return the catalog items excluded under :FOREIGN whose content can be rendered."
+  "Return the catalogue items excluded under :FOREIGN whose content can be rendered."
   (remove-if-not
    (lambda (item)
      (and (eq :excluded (item-disposition item :foreign))
@@ -143,7 +143,7 @@ cannot change what is measured."
 (define-test no-foreign-apparatus-renders-licence-text
   "Every apparatus item a foreign repository receives renders with no licence text.
 
-Walks the whole catalog rather than naming items, so a template added later is
+Walks the whole catalogue rather than naming items, so a template added later is
 covered without anyone adding a case for it."
   (with-temp-git-repo (root :origin-url +third-party-origin-url+
                             :initial-file "README.md" :initial-content "x")
@@ -291,7 +291,7 @@ not enumerated."
         (true (assoc "LICENSE" before :test #'string=)
               "precondition: the fixture tracks its licence")
         (is equal '("COPYING" "LICENSE") names-before
-            "precondition: the name scan sees the fixture's licence files")
+            "precondition: the name scan finds the fixture's licence files")
         (let ((repair (normalise-repository root :policy :repair)))
           (true (report-changed repair)
                 "the repair wrote something, so the comparison is about a run"))
@@ -329,7 +329,7 @@ LICENSE makes the same comparison report LICENSE as changed."
                      (write-line "appended" out))))))
         (normalise-repository root :policy :repair)
         (is equal '("LICENSE") (%changed-tracked-files before root)
-            "the comparison sees the licence change, and only that")))))
+            "the comparison reports the licence change, and only that")))))
 
 (define-test control-a-planted-licence-file-is-caught
   "CONTROL for the name scan. A file named LICENSE-extra planted after a run is
@@ -342,7 +342,7 @@ reported as a new licence-named file."
         (normalise-repository root :policy :repair)
         (write-fixture-file root "LICENSE-extra" "planted")
         (is equal '("LICENSE-extra") (%new-licence-files names-before root)
-            "the scan sees the planted file, and only that")))))
+            "the scan finds the planted file, and only that")))))
 
 (defun %adopt-unlicensed (root declared)
   "Commit an unlicensed source file to ROOT, then run repair and record-as-debt

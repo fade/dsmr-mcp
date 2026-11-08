@@ -7,7 +7,7 @@
 ;;;;
 ;;;; ⚠ MOST OF THE ANSWERS IN THIS FILE ARE PROVISIONAL. The tier each item is
 ;;;; assigned and the flags saying which items the scaffold writes are a reading
-;;;; of what the repositories on this machine actually contain. They are not a
+;;;; of what our existing repositories actually contain. They are not a
 ;;;; settled ruling, and the reading may be overruled.
 ;;;;
 ;;;; The one settled answer is what reaches a repository we do not own, and it is
@@ -48,7 +48,7 @@
                 #:item-disposition
                 #:*shape-catalog*)
   ;; The substitution comes from its own leaf module rather than from the
-  ;; scaffold. The scaffold derives its manifest from this catalog, so a
+  ;; scaffold. The scaffold derives its manifest from this catalogue, so a
   ;; dependency in that direction would close a loop and the system would not
   ;; build.
   (:import-from #:dsmr-mcp/src/template-render
@@ -88,7 +88,7 @@
 (define-condition unknown-profile-error (error)
   ((profile :initarg :profile :reader unknown-profile-error-profile))
   (:documentation
-   "Signaled when a repository profile has no entry in *ASSESSED-TIERS*.
+   "Signalled when a repository profile has no entry in *ASSESSED-TIERS*.
 
 Signalled rather than answered with an empty tier list, because an empty list
 assesses every repository as clean and a clean report on a misspelled profile
@@ -99,7 +99,7 @@ looks exactly like a clean report on a healthy repository.")
              (unknown-profile-error-profile condition)))))
 
 (setf (documentation 'unknown-profile-error-profile 'function)
-      "Return the unrecognised profile from an UNKNOWN-PROFILE-ERROR.")
+      "Return the unrecognized profile from an UNKNOWN-PROFILE-ERROR.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; A generator is a template plus the bindings the caller supplies
@@ -113,7 +113,7 @@ item's generator is one place rather than a rendering call repeated per file."
   (lambda (bindings) (render-template template bindings)))
 
 ;;; ---------------------------------------------------------------------------
-;;; The catalog
+;;; The catalogue
 ;;; ---------------------------------------------------------------------------
 
 ;;; The items the scaffold writes appear here in the order it writes them, so
@@ -159,15 +159,15 @@ item's generator is one place rather than a rendering call repeated per file."
        ;; The hook is a script of ours under the git directory, hooks/lisp-gate,
        ;; wired through the repository's local configured-hook entries. Git runs
        ;; it beside whatever pre-commit hook the repository already has, and it
-       ;; replaces none. Every repository created on this host already holds a
-       ;; pre-commit hook from the init template, so the item asserts that the
+       ;; replaces none. A git init template can seed a pre-commit hook into
+       ;; every new repository, so the item asserts that the
        ;; gate is wired, never that a file named pre-commit exists.
        ;;
        ;; A new project of ours is created with the gate in place, so all three
        ;; are marked for emission. The two worktree files reach the project
        ;; through the manifest. The hook lives under a git directory that does
        ;; not exist until the repository is created, so the scaffold installs
-       ;; it after initialisation rather than through the manifest.
+       ;; it after initialization rather than through the manifest.
 
        (make-shape-item
         :key :mallet-config
@@ -324,8 +324,8 @@ item's generator is one place rather than a rendering call repeated per file."
 ;;; ruling is written down: beyond installing the git-invisible parts of our own
 ;;; apparatus, we alter nothing about the structure of somebody else's project.
 ;;; Not its layout, not what its files are called, not which directories it keeps
-;;; them in. The tiers each item sits in remain a reading of the repositories on
-;;; this machine and may still be revised; which of them reach a foreign
+;;; them in. The tiers each item sits in remain a reading of our existing
+;;; repositories and may still be revised; which of them reach a foreign
 ;;; repository no longer is.
 ;;;
 ;;; It lives here rather than beside the assessment so that a different ruling
@@ -398,7 +398,7 @@ profile as a repository in perfect shape."
 (defun apparatus-paths-for-profile (profile &optional (catalog *shape-catalog*))
   "Return the worktree paths in CATALOG that PROFILE must not track.
 
-Derived from the same catalog everything else reads, so the set of paths to
+Derived from the same catalogue everything else reads, so the set of paths to
 exclude cannot fall behind the set of files that get written.
 
 Items installed under the repository's git directory are left out: they are
