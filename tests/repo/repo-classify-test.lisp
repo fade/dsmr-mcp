@@ -28,6 +28,10 @@
                 #:our-git-accounts
                 #:parse-remote-owner
                 #:our-remote-p
+                #:*declared-hard-forks*
+                #:declared-hard-forks
+                #:parse-remote-repository
+                #:declared-hard-fork-p
                 #:classify-repository
                 #:repo-profile
                 #:+classifications+
@@ -92,9 +96,10 @@ foreign assertions pass for the wrong reason."
 
 ;;; --- the four classification inputs -----------------------------------------
 
-(define-test declared-ours-is-the-only-route-to-ours
-  "A repository indistinguishable from one of ours reaches :OURS only because it
-was declared. The same fixture without the declaration signals, which the
+(define-test ours-is-reached-only-by-a-declaration
+  "A repository reaches :OURS by one of two declarations and never by inference:
+an explicit classification on the call, or a hard fork named in the tracked
+list. The same fixture without the call's declaration signals, which the
 ambiguity test below asserts separately."
   (with-temp-git-repo (root :origin-url +ours-origin-url+
                             :initial-file "README.md"
@@ -103,7 +108,103 @@ ambiguity test below asserts separately."
         (classify-repository root :declared-classification :ours)
       (is eq :ours classification)
       (is eq nil upstream "our own project records no upstream")
-      (is eq :ours (repo-profile classification)))))
+      (is eq :ours (repo-profile classification))))
+  (with-temp-git-repo (root :origin-url "git@github.com:fade/zebra.git"
+                            :initial-file "README.md"
+                            :initial-content "x")
+    (is eq :ours (ignore-errors (classify-repository root))
+        "a declared hard fork is ours with nothing passed on the call")))
+
+(define-test parse-remote-repository-reads-owner-and-name
+  "Every recognised URL shape reads back to owner/name, with .git and a
+trailing slash removed; anything else reads as NIL."
+  (is string= "fade/zebra"
+      (parse-remote-repository "git@github.com:fade/zebra.git"))
+  (is string= "fade/zebra"
+      (parse-remote-repository "https://github.com/fade/zebra"))
+  (is string= "fade/zebra"
+      (parse-remote-repository "https://github.com/fade/zebra.git"))
+  (is string= "fade/zebra"
+      (parse-remote-repository "https://github.com/fade/zebra/"))
+  (is string= "fade/parachute"
+      (parse-remote-repository "ssh://git@codeberg.org/fade/parachute"))
+  (is eq nil (parse-remote-repository "not-a-url"))
+  (is eq nil (parse-remote-repository ""))
+  (is eq nil (parse-remote-repository :not-even-a-string)))
+
+(define-test the-declared-hard-forks-are-zebra-and-boomer
+  "The tracked declaration names the two hard forks the operator declared."
+  (true (member "fade/zebra" (declared-hard-forks) :test #'string-equal))
+  (true (member "fade/boomer" (declared-hard-forks) :test #'string-equal)))
+
+(define-test a-declared-hard-fork-classifies-as-ours
+  "Every URL shape of a declared hard fork's origin, with no upstream, is :OURS
+without a question asked."
+  (dolist (url '("git@github.com:fade/zebra.git"
+                 "https://github.com/fade/zebra"
+                 "https://github.com/fade/zebra.git"
+                 "git@github.com:Fade/Zebra.git"
+                 "git@github.com:fade/boomer.git"))
+    (with-temp-git-repo (root :origin-url url
+                              :initial-file "README.md"
+                              :initial-content "x")
+      (true (declared-hard-fork-p url) "~A is a declared hard fork" url)
+      (multiple-value-bind (classification upstream)
+          (handler-case (classify-repository root)
+            (repo-classification-ambiguous-error () (values :signalled nil)))
+        (is eq :ours classification "~A classifies as ours" url)
+        (is eq nil upstream "~A records no upstream to report" url)))))
+
+(define-test a-declared-hard-fork-with-an-upstream-is-still-ours
+  "An upstream remote does not turn a declared hard fork back into a fork of
+somebody else's software."
+  (with-temp-git-repo (root :origin-url "git@github.com:fade/zebra.git"
+                            :upstream-url "https://github.com/Shinmera/parachute.git"
+                            :initial-file "README.md"
+                            :initial-content "x")
+    (is eq :ours (classify-repository root))))
+
+(define-test a-near-miss-never-matches-a-declaration
+  "CONTROL for the match. A name that merely begins with a declared one, a
+declared name under another owner, and an unparseable origin all fall through
+to the existing classification."
+  (with-temp-git-repo (root :origin-url "git@github.com:fade/zebra-tools.git"
+                            :initial-file "README.md"
+                            :initial-content "x")
+    (false (declared-hard-fork-p "git@github.com:fade/zebra-tools.git")
+           "a prefix of a declared name is not declared")
+    (true (ambiguity-signalled-by root)
+          "and the question is still asked"))
+  (with-temp-git-repo (root :origin-url "git@github.com:someone-else/zebra.git"
+                            :initial-file "README.md"
+                            :initial-content "x")
+    (false (declared-hard-fork-p "git@github.com:someone-else/zebra.git")
+           "a declared name under another owner is not declared")
+    (is eq :foreign-with-upstream (classify-repository root)))
+  (false (declared-hard-fork-p "not-a-url") "an unparseable URL never matches")
+  (false (declared-hard-fork-p nil) "no URL never matches"))
+
+(define-test an-explicit-classification-outranks-a-hard-fork
+  "An answer given on the call wins over the tracked declaration."
+  (with-temp-git-repo (root :origin-url "git@github.com:fade/zebra.git"
+                            :initial-file "README.md"
+                            :initial-content "x")
+    (is eq :foreign-orphan
+        (classify-repository root :declared-classification :foreign-orphan))))
+
+(define-test control-an-empty-declaration-asks-again
+  "CONTROL. With no hard forks declared the zebra fixture signals the ambiguity
+again, so the :OURS answers above come from the declaration and nothing else."
+  (with-temp-git-repo (root :origin-url "git@github.com:fade/zebra.git"
+                            :initial-file "README.md"
+                            :initial-content "x")
+    (is eq :ours (ignore-errors (classify-repository root))
+        "precondition: declared, it is ours")
+    (let ((*declared-hard-forks* '()))
+      (false (declared-hard-fork-p "git@github.com:fade/zebra.git")
+             "with an empty list nothing is declared")
+      (true (ambiguity-signalled-by root)
+            "and the question is asked"))))
 
 (define-test our-origin-with-an-upstream-is-a-foreign-fork
   "Our origin plus a third-party upstream is the fork-then-clone shape, and it is

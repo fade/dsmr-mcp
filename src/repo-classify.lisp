@@ -46,6 +46,10 @@
            #:our-git-accounts
            #:parse-remote-owner
            #:our-remote-p
+           #:*declared-hard-forks*
+           #:declared-hard-forks
+           #:parse-remote-repository
+           #:declared-hard-fork-p
            #:classify-repository
            #:repo-classification
            #:repo-profile
@@ -190,6 +194,66 @@ resolve them."
                (member owner (our-git-accounts) :test #'string-equal))
       t)))
 
+(defvar *declared-hard-forks* (list "fade/zebra" "fade/boomer")
+  "The repositories declared hard forks, as owner/name strings.
+
+A hard fork is ours whatever its remotes say. An entry is added by the
+operator's decision in a reviewed commit and is never computed; there is no
+environment override. The operator declared these two on 2026-11-07.
+
+A DEFVAR rather than a DEFPARAMETER so that an override installed at runtime
+survives reloading the system, matching *OUR-GIT-ACCOUNTS*.")
+
+(defun declared-hard-forks ()
+  "Return the list of owner/name strings currently declared hard forks."
+  *declared-hard-forks*)
+
+(defvar *scheme-repository-scanner*
+  (create-scanner
+   "^[a-zA-Z][a-zA-Z0-9+.-]*://(?:[^/@]+@)?[^/]+/([^/]+)/([^/]+?)(?:\\.git)?/?$")
+  "Matches https://host/owner/repo and ssh://git@host/owner/repo, capturing
+owner and repository name without a trailing .git or slash.")
+
+(defvar *scp-repository-scanner*
+  (create-scanner "^[^/@]+@[^/:]+:([^/]+)/([^/]+?)(?:\\.git)?/?$")
+  "Matches the scp shorthand git@host:owner/repo.git, capturing owner and
+repository name without a trailing .git or slash.")
+
+(defun %owner-and-name (scanner string)
+  "Return \"owner/name\" from the two groups SCANNER captures in STRING, or NIL."
+  (multiple-value-bind (start end group-starts group-ends)
+      (scan scanner string)
+    (declare (ignore end))
+    (when (and start
+               (= 2 (length group-starts))
+               (aref group-starts 0)
+               (aref group-starts 1)
+               (< (aref group-starts 1) (aref group-ends 1)))
+      (format nil "~A/~A"
+              (subseq string (aref group-starts 0) (aref group-ends 0))
+              (subseq string (aref group-starts 1) (aref group-ends 1))))))
+
+(defun parse-remote-repository (url)
+  "Return \"owner/name\" for the repository URL names, or NIL.
+
+Recognises the URL shapes PARSE-REMOTE-OWNER does, with a trailing .git and a
+trailing slash removed. Pure string work: no lookup is made."
+  (when (stringp url)
+    (or (%owner-and-name *scheme-repository-scanner* url)
+        (%owner-and-name *scp-repository-scanner* url))))
+
+(defun declared-hard-fork-p (url)
+  "Return T when URL names a repository in DECLARED-HARD-FORKS, else NIL.
+
+Requires OUR-REMOTE-P as well. Owner and name are compared as one whole string
+without regard to case, so a name that merely begins with a declared one never
+matches, and an unparseable URL never matches."
+  (let ((repository (parse-remote-repository url)))
+    (when (and repository
+               (our-remote-p url)
+               (member repository (declared-hard-forks) :test #'string-equal))
+      t)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; The classification itself
 ;;; ---------------------------------------------------------------------------
@@ -205,6 +269,10 @@ DECLARED-CLASSIFICATION carries an answer already given by the operator and
 outranks everything inferred here. A value outside +CLASSIFICATIONS+ signals a
 TYPE-ERROR rather than falling through to inference, so a mistyped declaration
 cannot quietly become a guess.
+
+Precedence: an explicit DECLARED-CLASSIFICATION, then a declared hard fork (an
+origin matching DECLARED-HARD-FORK-P is :OURS with no upstream), then inference
+from the remotes.
 
 UPSTREAM-URL supplies an upstream that the repository does not yet record, which
 is how a repository is resolved without first repairing its remotes.
@@ -230,6 +298,10 @@ else's software as our own, and only the operator knows which."
       (error 'repo-classification-ambiguous-error
              :directory directory
              :origin-url nil))
+    ;; A declared hard fork is ours by the operator's word, whatever other
+    ;; remotes it records, so it is settled before any inference below.
+    (when (declared-hard-fork-p origin)
+      (return-from classify-repository (values :ours nil)))
     (unless (our-remote-p origin)
       ;; A third-party origin settles the question by itself, with no reference
       ;; to any upstream remote. These are the raw clones that record no
