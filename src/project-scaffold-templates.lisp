@@ -623,46 +623,14 @@ other caller binds it to the empty string, so the script names no licence. An
 adopted repository keeps the licence it came with.")
 
 (defparameter *pre-commit-hook-template*
-  "#!/usr/bin/env bash
-# pre-commit: refuse a commit the Lisp linter rejects.
-#
-# This hook lives under the repository's git directory, which is never part of
-# the working tree and never reaches an upstream. That is what makes it safe to
-# install in a repository we do not own: it changes nothing a maintainer sees.
-#
-# It runs the repository's own scripts/lint-lisp.sh and nothing else, with no
-# arguments taken from the commit.
-#
-# Bypass a single commit with: git commit --no-verify
-{{spdx-line}}
-set -euo pipefail
-
-REPO_ROOT=\"$(git rev-parse --show-toplevel)\"
-LINT=\"$REPO_ROOT/scripts/lint-lisp.sh\"
-
-if [ ! -x \"$LINT\" ]; then
-  echo \"pre-commit: $LINT is missing or not executable.\" >&2
-  echo \"pre-commit: the Lisp gate is NOT running for this commit.\" >&2
-  exit 0
-fi
-
-if ! \"$LINT\"; then
-  echo >&2
-  echo \"pre-commit: the Lisp linter rejected this tree.\" >&2
-  echo \"pre-commit: fix the reports above, or commit with --no-verify.\" >&2
-  exit 1
-fi
-"
-  "Template for a project's pre-commit hook.
-Invokes only the repository's own lint script, with no data interpolated from
-the commit being made. Announces loudly and lets the commit through when the
-lint script is absent: an incompletely installed gate should be visible, not a
-wall that blocks every commit in the repository until someone reinstalls it.
-
-The {{spdx-line}} placeholder occupies a line of its own. A caller that chose
-the project's licence binds it to that licence's identifier comment; every
-other caller binds it to the empty string, so the hook names no licence. An
-adopted repository keeps the licence it came with.")
+  (uiop:read-file-string
+   (asdf:system-relative-pathname "dsmr-mcp" "templates/lisp-gate.sh"))
+  "Template for a project's lint gate, read from templates/lisp-gate.sh at load time.
+Reports the linter findings inside the top-level forms a staged change touches.
+Placeholders:
+  {{gate-mode}}  informational or blocking.
+  {{spdx-line}}  a licence comment, or the empty string for no licence line.
+Kept as a shell file so bash -n checks it as written.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; REPL-driven-development prompt template (D-12)

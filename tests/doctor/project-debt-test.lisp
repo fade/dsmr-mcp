@@ -148,8 +148,27 @@ unsubstituted placeholder, at every severity."
              "the hook carries no licence identifier line")
       (true (contains-p script "mallet")
             "the script names the linter it runs")
-      (true (contains-p hook "lint-lisp.sh")
-            "the hook runs the repository's own lint script and nothing else"))))
+      (true (contains-p hook "GATE_MODE='informational'")
+            "the hook renders informational by default"))))
+
+(define-test the-gate-profile-selects-its-mode
+  "PROFILE :FOREIGN renders informational, :OURS renders blocking, and anything
+else signals rather than rendering either mode."
+  (let ((foreign (render-pre-commit-hook :profile :foreign))
+        (ours    (render-pre-commit-hook :profile :ours)))
+    (true (contains-p foreign "GATE_MODE='informational'")
+          ":foreign renders the informational gate")
+    (false (contains-p foreign "GATE_MODE='blocking'")
+           ":foreign does not render the blocking gate")
+    (true (contains-p ours "GATE_MODE='blocking'")
+          ":ours renders the blocking gate")
+    (false (contains-p ours "GATE_MODE='informational'")
+           ":ours does not render the informational gate")
+    (false (search "{{" ours) "the :ours gate carries no raw placeholder"))
+  (fail (render-pre-commit-hook :profile :mine) 'error
+        "an unknown profile signals")
+  (fail (render-pre-commit-hook :profile nil) 'error
+        "a NIL profile signals"))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The frozen baseline

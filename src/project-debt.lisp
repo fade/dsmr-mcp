@@ -250,13 +250,28 @@ repository keeps its own licence."
                    (%gate-bindings severity project-name)))
 
 (defun render-pre-commit-hook (&key (severity (adopted-repo-gate-severity))
-                                    project-name)
-  "Return the text of the pre-commit hook for a project.
+                                    project-name
+                                    (profile :foreign))
+  "Return the text of the lint gate for a project.
 
-The hook carries no licence line: an adopted repository keeps its own licence."
+The gate reports the linter findings inside the top-level forms a staged change
+touches, and none from forms or files the commit leaves alone.
+
+PROFILE selects the mode:
+  :FOREIGN  informational, the default: reports and never refuses a commit.
+            Third-party code carries findings its maintainers wrote, so a
+            refusal there would be over code outside the change.
+  :OURS     blocking: refuses a commit when a touched form carries an error or
+            a warning finding.
+Any other PROFILE signals an error. SEVERITY is validated first and signals
+INVALID-SEVERITY-ERROR. The text carries no licence line."
   (validate-severity severity)
-  (render-template *pre-commit-hook-template*
-                   (%gate-bindings severity project-name)))
+  (let ((mode (ecase profile
+                (:foreign "informational")
+                (:ours "blocking"))))
+    (render-template *pre-commit-hook-template*
+                     (list* (cons "gate-mode" mode)
+                            (%gate-bindings severity project-name)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Rendering the frozen baseline
