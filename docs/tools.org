@@ -1295,7 +1295,11 @@ or disabled with the reason).
 Normalise an existing repository into the project shape without 
 destroying what is there. Assesses by default and writes nothing; repairs, 
 records as debt, or accepts a deviation as deliberate only when a policy says 
-so, and reports every change separately from what was already correct. A 
+so, and reports every change separately from what was already correct. In a 
+repository we do not own, the lint gate it installs reports the findings in the 
+forms a commit changes and never refuses the commit; in our own repositories 
+and declared hard forks it refuses a commit whose changed forms carry a warning 
+or an error. A 
 repository that cannot be told apart from one of ours is not guessed at: the 
 call returns the question, the origin it found and the answers it accepts, and 
 a second call carries the answer.
