@@ -134,10 +134,10 @@ package-inferred-system + Zebra convention of dsmr-mcp itself.")
 
 (defun start-dev ()
   \"Dev mode: load Slynk and start a listener so an editor or dsmr-mcp can attach.\"
-  (let ((port (or (ignore-errors
-                   (parse-integer (uiop:getenv \"SLYNK_PORT\")))
-                  4005))
-        (host (or (uiop:getenv \"SLYNK_HOST\") \"127.0.0.1\")))
+  (let* ((raw-port (uiop:getenv \"SLYNK_PORT\"))
+         (port (or (and raw-port (parse-integer raw-port :junk-allowed t))
+                   4005))
+         (host (or (uiop:getenv \"SLYNK_HOST\") \"127.0.0.1\")))
     (asdf:load-system :slynk)
     (uiop:symbol-call :slynk :create-server :port port :interface host :dont-close t)
     (format t \"{{name}}: Slynk listening on ~A:~A~%\" host port)

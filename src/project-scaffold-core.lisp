@@ -186,6 +186,13 @@ to a parent prompts/ directory is computed."
                      ("spdx"          . ,spdx)
                      ("copyright"     . ,(or copyright author "Unknown"))
                      ("year"          . ,(or year (%current-year)))
+                     ;; A project we create states the licence its creator
+                     ;; chose on every script, and starts at the linter's own
+                     ;; severities: it has no existing sites to hold below the
+                     ;; failing threshold.
+                     ("spdx-line"     . ,(format nil "# SPDX-License-Identifier: ~A"
+                                                 spdx))
+                     ("severity-pins" . "")
                      ("license-body"  . ,license-body))))
     ;; Render the license body with copyright/year substitutions
     (let ((bindings-with-rendered-license

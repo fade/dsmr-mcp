@@ -163,11 +163,11 @@ item's generator is one place rather than a rendering call repeated per file."
        ;; pre-commit hook from the init template, so the item asserts that the
        ;; gate is wired, never that a file named pre-commit exists.
        ;;
-       ;; ⚠ These three carry EMIT-ON-SCAFFOLD-P NIL, and that flag is the
-       ;; unsettled part of the shape question. NIL leaves what the scaffold
-       ;; writes exactly as it was. If a new project should be born with the gate
-       ;; already installed, flipping these three flags to T is the entire
-       ;; change, and nothing outside this file moves.
+       ;; A new project of ours is created with the gate in place, so all three
+       ;; are marked for emission. The two worktree files reach the project
+       ;; through the manifest. The hook lives under a git directory that does
+       ;; not exist until the repository is created, so the scaffold installs
+       ;; it after initialisation rather than through the manifest.
 
        (make-shape-item
         :key :mallet-config
@@ -178,7 +178,7 @@ item's generator is one place rather than a rendering call repeated per file."
         :assertion :file-exists
         :match ".mallet.lisp"
         :generator (%renderer *mallet-config-template*)
-        :emit-on-scaffold-p nil
+        :emit-on-scaffold-p t
         :install-target :worktree)
 
        (make-shape-item
@@ -190,7 +190,7 @@ item's generator is one place rather than a rendering call repeated per file."
         :assertion :file-exists
         :match "scripts/lint-lisp.sh"
         :generator (%renderer *lint-lisp-template*)
-        :emit-on-scaffold-p nil
+        :emit-on-scaffold-p t
         :install-target :worktree)
 
        (make-shape-item
@@ -202,7 +202,7 @@ item's generator is one place rather than a rendering call repeated per file."
         :assertion :gate-hook-wired
         :match "hooks/lisp-gate"
         :generator (%renderer *pre-commit-hook-template*)
-        :emit-on-scaffold-p nil
+        :emit-on-scaffold-p t
         :install-target :git-dir)
 
        ;; The frozen record of what the gate would have fired on in this

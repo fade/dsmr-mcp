@@ -35,6 +35,7 @@
                 #:shape-item-apparatus-p
                 #:shape-item-assertion
                 #:shape-item-emit-on-scaffold-p
+                #:shape-item-install-target
                 #:item-disposition
                 #:shape-items-for-profile
                 #:shape-group-items
@@ -67,12 +68,17 @@
 (defun emitted-paths (&optional (catalog *shape-catalog*))
   "Return the relative paths CATALOG says the scaffold writes, in order.
 
-Reads the catalog argument on every call, so binding *SHAPE-CATALOG* changes the
-answer. A version that closed over a fixed list would satisfy the parity
-assertion below no matter what the catalog said."
+An item is written when it is marked for emission and lives in the worktree; an
+item under the git directory never reaches the manifest. Reads the catalog
+argument on every call, so binding *SHAPE-CATALOG* changes the answer. A version
+that closed over a fixed list would satisfy the parity assertion below no matter
+what the catalog said."
   (mapcar (lambda (item)
             (render-template (shape-item-path item) (sample-bindings)))
-          (remove-if-not #'shape-item-emit-on-scaffold-p catalog)))
+          (remove-if-not (lambda (item)
+                           (and (shape-item-emit-on-scaffold-p item)
+                                (eq :worktree (shape-item-install-target item))))
+                         catalog)))
 
 (defun scaffold-paths ()
   "Return the relative paths the scaffold actually writes today, in order."
@@ -183,14 +189,13 @@ we do not own, which is our convention presented as their defect."
     (true (member (shape-item-tier item) +tiers+)
           "~S carries a declared tier." (shape-item-key item))))
 
-(define-test the-gate-is-not-written-by-the-scaffold-yet
-  "Whether a new project is born with the gate installed is still open.
-
-These flags are the entire cost of answering it the other way, which is only
-true while they all agree."
+(define-test the-scaffold-writes-the-whole-gate
+  "A new project of ours is created with the gate, so every gate item is emitted.
+The three flags agree: a project with the linter config and no hook, or the
+reverse, has a gate that does nothing."
   (dolist (item (shape-group-items :quality-gate))
-    (false (shape-item-emit-on-scaffold-p item)
-           "~S is not emitted by the scaffold." (shape-item-key item))))
+    (true (shape-item-emit-on-scaffold-p item)
+          "~S is emitted by the scaffold." (shape-item-key item))))
 
 (define-test the-exclude-set-is-derived-from-the-catalog
   "What must stay out of a foreign index comes from the same list as everything
@@ -290,7 +295,7 @@ Two unrelated constant lists satisfy an equality check just as well as two
 related ones. Removing an emitting item from the catalog must shorten the derived
 list; if it does not, the assertion above was never reading the catalog."
   (let ((expected (scaffold-paths)))
-    (is = 12 (length expected))
+    (is = 14 (length expected))
     (is equal expected (emitted-paths))
     (let ((*shape-catalog* (remove (catalog-item :readme) *shape-catalog*)))
       (is = (1- (length expected)) (length (emitted-paths))
