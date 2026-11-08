@@ -318,6 +318,21 @@ produce a document describing no repository at all."
   (or (%gate-item-p item)
       (and (shape-item-generator item) t)))
 
+(defun %without-empty-licence-lines (text)
+  "Return TEXT without the lines a template leaves naming no licence.
+Drops a line ending in SPDX-License-Identifier: with nothing after it, and a
+:license \"\" line, so a file the doctor writes carries no licence tag at all
+rather than a malformed one."
+  (let ((lines (uiop:split-string text :separator '(#\Newline))))
+    (format nil "~{~A~^~%~}"
+            (remove-if (lambda (line)
+                         (let ((trimmed (string-trim '(#\Space #\Tab #\Return)
+                                                     line)))
+                           (or (uiop:string-suffix-p trimmed
+                                                     "SPDX-License-Identifier:")
+                               (string= trimmed ":license \"\""))))
+                       lines))))
+
 (defun %item-content (item bindings severity project-name profile)
   "Return the text ITEM's file should carry.
 
@@ -326,7 +341,8 @@ newly adopted repository's gate is installed at reaches the file rather than
 being decided again here. The gate script is rendered for PROFILE, :FOREIGN or
 :OURS: informational in a repository we do not own, blocking in one we do.
 Everything else comes from the item's own generator, which is the same one the
-scaffold writes a new project from."
+scaffold writes a new project from, with the licence lines the empty licence
+bindings leave behind removed."
   (if (%gate-item-p item)
       (ecase (shape-item-key item)
         (:mallet-config (render-gate-config :severity severity
@@ -336,7 +352,8 @@ scaffold writes a new project from."
         (:pre-commit (render-pre-commit-hook :severity severity
                                              :project-name project-name
                                              :profile profile)))
-      (funcall (shape-item-generator item) bindings)))
+      (%without-empty-licence-lines
+       (funcall (shape-item-generator item) bindings))))
 
 (defun %executable-item-p (item)
   "Return true when ITEM is a script that has to be executable to do anything."

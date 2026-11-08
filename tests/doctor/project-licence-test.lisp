@@ -29,6 +29,7 @@
   (:import-from #:dsmr-mcp/src/project-shape
                 #:shape-item-key
                 #:shape-item-generator
+                #:shape-item-tier
                 #:item-disposition
                 #:*shape-catalog*)
   (:import-from #:dsmr-mcp/src/project-shape-catalog
@@ -156,6 +157,38 @@ covered without anyone adding a case for it."
                 "~S renders to something" (shape-item-key item))
           (is equal '() (%licence-markers-in content)
               "~S carries no licence text" (shape-item-key item)))))))
+
+(define-test no-item-of-ours-renders-an-empty-licence-tag
+  "The doctor binds no licence, so a file it writes into a repository of ours
+must carry no licence tag at all rather than one naming nothing: no
+SPDX-License-Identifier line without an identifier, and no empty :license in
+a system definition. Walks every renderable item the :OURS profile is held to."
+  (with-temp-git-repo (root :origin-url +ours-origin-url+
+                            :initial-file "README.md" :initial-content "x")
+    (let ((items (remove-if-not
+                  (lambda (item)
+                    (and (member (shape-item-tier item) '(:invariant :gate))
+                         (or (shape-item-generator item)
+                             (member (shape-item-key item)
+                                     '(:mallet-config :lint-script :pre-commit)))))
+                  *shape-catalog*)))
+      (true (member :asd-system items :key #'shape-item-key)
+            "the walk reaches the system definition")
+      (dolist (item items)
+        (let ((content (dsmr-mcp/src/project-doctor::%item-content
+                        item
+                        (dsmr-mcp/src/project-doctor::%bindings root)
+                        (adopted-repo-gate-severity)
+                        (dsmr-mcp/src/project-doctor::%repo-name root)
+                        :ours)))
+          (dolist (line (uiop:split-string content :separator '(#\Newline)))
+            (let ((trimmed (string-trim '(#\Space #\Tab #\Return) line)))
+              (false (uiop:string-suffix-p trimmed "SPDX-License-Identifier:")
+                     "~S carries an empty licence tag: ~S"
+                     (shape-item-key item) line)
+              (false (string= trimmed ":license \"\"")
+                     "~S carries an empty :license: ~S"
+                     (shape-item-key item) line))))))))
 
 (define-test a-foreign-repair-writes-no-licence-text
   "A full repair of a foreign repository writes files, none naming a licence."
