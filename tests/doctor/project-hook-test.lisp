@@ -23,6 +23,13 @@
   (:import-from #:dsmr-mcp/src/project-gate-scan
                 #:linter-path
                 #:gate-scanner-available-p)
+  (:import-from #:dsmr-mcp/src/project-hook
+                #:+gate-hook-name+
+                #:gate-hook-command
+                #:gate-hook-path
+                #:configured-hooks-supported-p
+                #:gate-hook-wired-p
+                #:wire-gate-hook)
   (:import-from #:dsmr-mcp/src/git
                 #:run-git)
   (:import-from #:dsmr-mcp/tests/support/git-fixture
@@ -295,3 +302,187 @@ single-commit bypass."
               "the output says the linter was not found: ~A" output)
         (true (search "git commit --no-verify" output)
               "the output names the single-commit bypass: ~A" output)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Wiring through git's configured hooks
+;;; ---------------------------------------------------------------------------
+
+(defun %local-config (root)
+  "Return the repository-local config at ROOT as git config --list prints it."
+  (values (run-git (list "config" "--local" "--list") :directory root)))
+
+(defun %hook-list-lines (root)
+  "Return the lines git hook list prints for pre-commit at ROOT."
+  (%lines (run-git (list "hook" "list" "pre-commit")
+                   :directory root :error-on-failure nil)))
+
+(defun %file-octets (path)
+  "Return the contents of PATH as an octet vector."
+  (with-open-file (in path :element-type '(unsigned-byte 8))
+    (let ((octets (make-array (file-length in)
+                              :element-type '(unsigned-byte 8))))
+      (read-sequence octets in)
+      octets)))
+
+(defun %commit (root &key (mallet (namestring (linter-path))))
+  "Run git commit at ROOT with MALLET naming the linter.
+Returns the combined output and the exit code."
+  (multiple-value-bind (output error-output code)
+      (uiop:run-program (list "/usr/bin/env" (format nil "MALLET=~A" mallet)
+                              "git" "-C" (namestring root)
+                              "commit" "-q" "-m" "edit")
+                        :output :string
+                        :error-output :output
+                        :ignore-error-status t)
+    (declare (ignore error-output))
+    (values output code)))
+
+(define-test wiring-a-repository-with-no-hooks
+  "The first call creates the two entries and git lists the gate; the second
+answers :already-present and changes no config entry."
+  (with-temp-git-repo (root :initial-file "lib.lisp"
+                            :initial-content +two-form-source+)
+    (if (not (configured-hooks-supported-p root))
+        (is eq :not-wired (getf (wire-gate-hook root) :action-taken)
+            "a git without configured hooks is reported as not wired")
+        (let ((created (wire-gate-hook root)))
+          (is eq :created (getf created :action-taken) "~S" created)
+          (true (uiop:string-suffix-p (namestring (getf created :path))
+                                      "config")
+                "the report names the local config file: ~S" created)
+          (true (member +gate-hook-name+ (%hook-list-lines root)
+                        :test #'string=)
+                "git hook list names the gate: ~S" (%hook-list-lines root))
+          (true (gate-hook-wired-p root) "the gate reads as wired")
+          (let* ((before (%local-config root))
+                 (again (wire-gate-hook root)))
+            (is eq :already-present (getf again :action-taken) "~S" again)
+            (is string= before (%local-config root)
+                "the second call changes no config entry"))))))
+
+(define-test wiring-leaves-an-existing-hookdir-hook-untouched
+  "An executable pre-commit already in the hooks directory is byte-identical
+after wiring, and git lists both it and the gate."
+  (with-temp-git-repo (root :initial-file "lib.lisp"
+                            :initial-content +two-form-source+)
+    (let ((existing (merge-pathnames ".git/hooks/pre-commit"
+                                     (uiop:ensure-directory-pathname root))))
+      (ensure-directories-exist existing)
+      (with-open-file (out existing :direction :output :if-exists :supersede
+                                    :if-does-not-exist :create
+                                    :element-type 'character)
+        (write-string (format nil "#!/bin/sh~%# somebody else's hook~%exit 0~%")
+                      out))
+      (uiop:run-program (list "chmod" "+x" (namestring existing)))
+      (let ((before (%file-octets existing))
+            (report (wire-gate-hook root)))
+        (is equalp before (%file-octets existing)
+            "the existing hook is byte-identical after wiring")
+        (if (not (configured-hooks-supported-p root))
+            (is eq :not-wired (getf report :action-taken) "~S" report)
+            (let ((listed (%hook-list-lines root)))
+              (is eq :created (getf report :action-taken) "~S" report)
+              (true (member +gate-hook-name+ listed :test #'string=)
+                    "git lists the gate: ~S" listed)
+              (true (member "hook from hookdir" listed :test #'string=)
+                    "git still lists the hookdir hook: ~S" listed)))))))
+
+(define-test a-differing-existing-entry-is-reported-never-replaced
+  "A command entry set to another value, or the gate disabled, is reported as
+:not-wired with a reason, and the config is left as it was found."
+  (dolist (setting (list (list "hook.lisp-gate.command" "echo somebody-else")
+                         (list "hook.lisp-gate.enabled" "false")))
+    (with-temp-git-repo (root :initial-file "lib.lisp"
+                              :initial-content +two-form-source+)
+      (run-git (list* "config" "--local" setting) :directory root)
+      (let* ((before (%local-config root))
+             (report (wire-gate-hook root)))
+        (is eq :not-wired (getf report :action-taken)
+            "~A set elsewhere: ~S" (first setting) report)
+        (true (stringp (getf report :reason))
+              "the report says why: ~S" report)
+        (is string= before (%local-config root)
+            "the config is unchanged after ~A" (first setting))
+        (false (gate-hook-wired-p root)
+               "the gate does not read as wired with ~A" (first setting))))))
+
+(define-test a-dry-run-writes-nothing
+  "DRY-RUN answers :would-create and leaves the config unchanged."
+  (with-temp-git-repo (root :initial-file "lib.lisp"
+                            :initial-content +two-form-source+)
+    (let* ((before (%local-config root))
+           (report (wire-gate-hook root :dry-run t)))
+      (if (configured-hooks-supported-p root)
+          (is eq :would-create (getf report :action-taken) "~S" report)
+          (is eq :not-wired (getf report :action-taken) "~S" report))
+      (is string= before (%local-config root) "the config is unchanged")
+      (false (gate-hook-wired-p root) "the gate does not read as wired"))))
+
+(define-test wired-means-listed-enabled-with-the-expected-command
+  "DISABLED-PREFIX CONTROL. gate-hook-wired-p is true after wiring, false once
+the gate is disabled (git then lists it with a disabled prefix), and false when
+the command entry differs."
+  (with-temp-git-repo (root :initial-file "lib.lisp"
+                            :initial-content +two-form-source+)
+    (if (not (configured-hooks-supported-p root))
+        (false (gate-hook-wired-p root)
+               "a git without configured hooks never reads as wired")
+        (progn
+          (wire-gate-hook root)
+          (true (gate-hook-wired-p root) "wired after wire-gate-hook")
+          (run-git (list "config" "--local" "hook.lisp-gate.enabled" "false")
+                   :directory root)
+          (true (find-if (lambda (line) (uiop:string-prefix-p "disabled" line))
+                         (%hook-list-lines root))
+                "precondition: git lists the gate as disabled: ~S"
+                (%hook-list-lines root))
+          (false (gate-hook-wired-p root) "a disabled gate is not wired")
+          (run-git (list "config" "--local" "--unset" "hook.lisp-gate.enabled")
+                   :directory root)
+          (true (gate-hook-wired-p root) "re-enabled, it is wired again")
+          (run-git (list "config" "--local" "hook.lisp-gate.command"
+                         "echo somebody-else")
+                   :directory root)
+          (false (gate-hook-wired-p root)
+                 "a differing command entry is not wired")))))
+
+(define-test the-wired-gate-runs-at-commit
+  "End to end through git commit. The informational gate lets a commit touching
+a failing form through and names the finding; the blocking gate refuses it and
+HEAD does not move."
+  (dolist (case '((:foreign 0) (:ours 1)))
+    (destructuring-bind (profile expected) case
+      (with-temp-git-repo (root :initial-file "lib.lisp"
+                                :initial-content +two-form-source+)
+        (%install-gate root (render-pre-commit-hook :profile profile))
+        (let ((report (wire-gate-hook root))
+              (head (run-git (list "rev-parse" "HEAD") :directory root)))
+          (if (not (configured-hooks-supported-p root))
+              (is eq :not-wired (getf report :action-taken) "~S" report)
+              (progn
+                (true (probe-file (gate-hook-path root))
+                      "the gate is installed where the command points")
+                (%stage root "lib.lisp" (%edit-second-form))
+                (multiple-value-bind (output code) (%commit root)
+                  (cond
+                    ((not (gate-scanner-available-p))
+                     (true (search "linter not found" output)
+                           "~S: with no linter, the gate says so: ~A"
+                           profile output))
+                    ((zerop expected)
+                     (is = 0 code "~S: the commit succeeds: ~A" profile output)
+                     (true (search "lib.lisp:6:" output)
+                           "~S: the output names the finding: ~A"
+                           profile output)
+                     (false (string= head (run-git (list "rev-parse" "HEAD")
+                                                   :directory root))
+                            "~S: HEAD moved" profile))
+                    (t
+                     (false (zerop code)
+                            "~S: the commit is refused: ~A" profile output)
+                     (true (search "lib.lisp:6:" output)
+                           "~S: the output names the finding: ~A"
+                           profile output)
+                     (is string= head (run-git (list "rev-parse" "HEAD")
+                                               :directory root)
+                         "~S: HEAD did not move" profile)))))))))))
