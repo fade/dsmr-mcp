@@ -46,12 +46,14 @@ ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" ||
   cannot_run 'no git working tree found'
 cd -- "$ROOT" || cannot_run "cannot enter $ROOT"
 
+# --no-renames: a renamed or copied file is listed as added under its new name
+# and linted whole, instead of being dropped as status R or C.
 FILES=()
 while IFS= read -r -d '' path; do
   case "$path" in
     *.lisp | *.asd) FILES+=("$path") ;;
   esac
-done < <(git diff --cached --name-only -z --diff-filter=AM)
+done < <(git diff --cached --name-only -z --no-renames --diff-filter=AM)
 
 [ "${#FILES[@]}" -eq 0 ] && exit 0
 

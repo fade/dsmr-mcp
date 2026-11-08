@@ -250,6 +250,25 @@ blocking gate."
           (true (search "linter not found" output)
                 "with no linter, the gate says so: ~A" output)))))
 
+(define-test the-blocking-gate-lints-a-renamed-file
+  "RENAME CONTROL. git diff detects renames by default, so a file moved with git
+mv and edited is staged as a rename. The gate still lints it and refuses the
+commit on the touched form's finding."
+  (with-ours-gate (root gate)
+    (run-git (list "mv" "lib.lisp" "moved.lisp") :directory root)
+    (%stage root "moved.lisp" (%edit-second-form))
+    (true (search "moved.lisp"
+                  (run-git (list "diff" "--cached" "--name-status" "-M")
+                           :directory root))
+          "precondition: the change is staged")
+    (multiple-value-bind (output code) (%run-gate root gate)
+      (is = 1 code "the blocking gate refuses the commit: ~A" output)
+      (if (gate-scanner-available-p)
+          (true (%reports-p output "moved.lisp:6:")
+                "the renamed file's finding is printed: ~A" output)
+          (true (search "linter not found" output)
+                "with no linter, the gate says so: ~A" output)))))
+
 (define-test the-blocking-gate-passes-when-only-untouched-forms-fail
   "Touching only the clean form lets the commit through although the other form
 in the same file carries a finding."
