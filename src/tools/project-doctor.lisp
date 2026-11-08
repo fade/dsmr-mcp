@@ -86,7 +86,11 @@
                 #:git-command-error
                 #:git-command-error-exit-code)
   (:import-from #:dsmr-mcp/src/project-scaffold-core
-                #:invalid-argument-error))
+                #:invalid-argument-error)
+  (:export #:+accepted-dispositions+
+           #:disposition-argument
+           #:disposition-question-result
+           #:disposition-refusal-result))
 
 (in-package #:dsmr-mcp/src/tools/project-doctor)
 
@@ -336,7 +340,7 @@ carries the outcomes it admits. Call again with policy set to act on them.")))
 ;;; Reading the arguments
 ;;; ---------------------------------------------------------------------------
 
-(defun %disposition-keyword (value)
+(defun disposition-argument (value)
   "Return the disposition keyword VALUE names.
 
 NIL means the caller did not answer and returns NIL. :INVALID is a supplied
@@ -354,7 +358,7 @@ caller string becomes a keyword the enum never offered."
 
 NIL means assess only, which is the default call. :INVALID means a value was
 supplied that is not one of the three outcomes. Explicit for the same reason
-%DISPOSITION-KEYWORD is."
+DISPOSITION-ARGUMENT is."
   (cond ((null value)                             nil)
         ((not (stringp value))                    :invalid)
         ((string= value "repair")                 :repair)
@@ -380,21 +384,55 @@ parent symlink cannot carry a run out of the tree it was asked about."
                       "error_type" "invalid-argument"
                       "content" (text-content message))))
 
-(defun %refusal (id error-type condition)
-  "Return the JSON-RPC result for a disposition refusal of ERROR-TYPE, carrying
-CONDITION's report and the statement that nothing was written."
+(defun disposition-refusal-result (id error-type condition verb)
+  "Return the JSON-RPC result for a disposition refusal of ERROR-TYPE by the tool
+named VERB, carrying CONDITION's report and the statement that nothing was
+written."
   (result id (make-ht "isError" t
                       "error_type" error-type
                       "content"
                       (text-content
-                       (format nil "project-doctor refused and has written nothing.~%~A"
-                               (princ-to-string condition))))))
+                       (format nil "~A refused and has written nothing.~%~A"
+                               verb (princ-to-string condition))))))
 
 (defun %meanings-hash ()
   "Return a hash of each accepted disposition's name to what declaring it means."
   (let ((hash (make-hash-table :test 'equal)))
     (dolist (entry +disposition-meanings+ hash)
       (setf (gethash (disposition-name (car entry)) hash) (cdr entry)))))
+
+(defun disposition-question-result (id condition verb)
+  "Return the JSON-RPC result asking for a disposition, for CONDITION, a
+PROJECT-DISPOSITION-REQUIRED signalled under the tool named VERB.
+
+The result carries the three answers, what each means, and the remotes found as
+facts, and says that nothing was written and that VERB takes the answer."
+  (result id
+          (make-ht "isError" t
+                   "error_type" "project-disposition-required"
+                   "requires_disposition" t
+                   "directory"
+                   (or (%path-string (disposition-required-directory condition))
+                       'null)
+                   "origin_url"
+                   (or (disposition-required-origin-url condition) 'null)
+                   "upstream_url"
+                   (or (disposition-required-upstream-url condition) 'null)
+                   "accepted_dispositions" +accepted-dispositions+
+                   "disposition_meanings" (%meanings-hash)
+                   "content"
+                   (text-content
+                    (format nil "~A is asking, not failing, and it has written \
+nothing.~%~A~%~{~A~%~}Call ~A again with disposition set to one of those. The \
+remotes are reported as facts and decide nothing."
+                            verb
+                            (princ-to-string condition)
+                            (mapcar (lambda (entry)
+                                      (format nil "  ~A: ~A"
+                                              (disposition-name (car entry))
+                                              (cdr entry)))
+                                    +disposition-meanings+)
+                            verb)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The call
@@ -424,7 +462,7 @@ Call fs-set-project-root first.")))))
       (when (and upstream-arg (not (stringp upstream-arg)))
         (return-from tool-handle
           (%invalid-argument id "project-doctor: upstream_url must be a string.")))
-      (let ((disposition (%disposition-keyword disposition-arg))
+      (let ((disposition (disposition-argument disposition-arg))
             (policy      (%policy-keyword policy-arg)))
         (when (eq disposition :invalid)
           (return-from tool-handle
@@ -462,42 +500,17 @@ outside the session root and was not read."
             ;; The question. Not a failure: the answer is one field on the next
             ;; call. Nothing has been written at this point.
             (project-disposition-required (condition)
-              (result id
-                      (make-ht "isError" t
-                               "error_type" "project-disposition-required"
-                               "requires_disposition" t
-                               "directory"
-                               (or (%path-string
-                                    (disposition-required-directory condition))
-                                   'null)
-                               "origin_url"
-                               (or (disposition-required-origin-url condition)
-                                   'null)
-                               "upstream_url"
-                               (or (disposition-required-upstream-url condition)
-                                   'null)
-                               "accepted_dispositions" +accepted-dispositions+
-                               "disposition_meanings" (%meanings-hash)
-                               "content"
-                               (text-content
-                                (format nil "project-doctor is asking, not \
-failing, and it has written nothing.~%~A~%~{~A~%~}Call project-doctor again with \
-disposition set to one of those. The remotes are reported as facts and decide \
-nothing."
-                                        (princ-to-string condition)
-                                        (mapcar (lambda (entry)
-                                                  (format nil "  ~A: ~A"
-                                                          (disposition-name
-                                                           (car entry))
-                                                          (cdr entry)))
-                                                +disposition-meanings+))))))
+              (disposition-question-result id condition "project-doctor"))
 
             (project-disposition-conflict (condition)
-              (%refusal id "project-disposition-conflict" condition))
+              (disposition-refusal-result
+               id "project-disposition-conflict" condition "project-doctor"))
             (project-disposition-unreadable (condition)
-              (%refusal id "project-disposition-unreadable" condition))
+              (disposition-refusal-result
+               id "project-disposition-unreadable" condition "project-doctor"))
             (project-disposition-not-recordable (condition)
-              (%refusal id "project-disposition-not-recordable" condition))
+              (disposition-refusal-result
+               id "project-disposition-not-recordable" condition "project-doctor"))
 
             (not-a-repository-error (condition)
               (result id (make-ht "isError" t

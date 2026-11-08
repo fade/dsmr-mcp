@@ -1354,8 +1354,11 @@ a copied REPL-development guide, and a selectable license with per-file SPDX
 headers. The new project includes the lint gate (linter config, lint script, 
 and a pre-commit gate) whenever the scaffold creates its repository, and then 
 records the disposition ours in the project's untracked .envrc. Inside an 
-existing repository nothing is recorded, and project-doctor asks. Returns a 
-manifest of created files and next-step commands.
+existing repository with no disposition recorded, the call returns the 
+question, the three answers (ours, contributing, or forked), and what each 
+means, and writes nothing; a second call carries the answer in disposition, 
+which is recorded in that repository's .envrc before the project is written. 
+Returns a manifest of created files and next-step commands.
 
 #+begin_src json
 {
@@ -1374,6 +1377,15 @@ manifest of created files and next-step commands.
     },
     "destination": {
       "description": "Relative parent directory under the session root \nwhere <name>/ is created (default: scaffolds). No leading / or .. segments.",
+      "type": "string"
+    },
+    "disposition": {
+      "description": "What the existing repository the project goes \ninto is, when its .envrc records nothing: ours, code originating with the \noperator; contributing, a third-party project the operator only contributes to; \nforked, forked to shorten the acceptance chain or because upstream is \nunmaintained. Recorded in that repository's .envrc before the project is \nwritten. A repository the scaffold creates takes only ours.",
+      "enum": [
+        "ours",
+        "contributing",
+        "forked"
+      ],
       "type": "string"
     },
     "init_git": {

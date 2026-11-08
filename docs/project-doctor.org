@@ -190,8 +190,14 @@ script and the gate installed in such a repository carry no licence line at all.
 doctor over a third party's tree and every licence byte in it stays where it was.
 
 A project the scaffold creates is ours: when the scaffold initialises the repository itself, it
-records the disposition ours, and its lint script names the licence you chose for it. A project
-scaffolded inside an existing repository records nothing, and the doctor asks.
+records the disposition ours, and its lint script names the licence you chose for it.
+
+When I adopt a project that already has a repository checked out, the scaffold asks first. With
+no disposition recorded in that repository, =project-scaffold= returns the same question the
+doctor does, with the three answers and what each means, and writes nothing. Call it again with
+=disposition= and the answer goes into that repository's =.envrc= before the project is written.
+A repository the scaffold creates takes only ours, and with =init_git= false outside every
+repository there is nowhere to record a disposition, so none is recorded.
 
 ** The lint gate reports in a project we contribute to and refuses in our own
 

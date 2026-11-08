@@ -38,6 +38,8 @@
                 #:plan-scaffold)
   (:import-from #:dsmr-mcp/src/project-scaffold
                 #:write-scaffold)
+  (:import-from #:dsmr-mcp/src/repo-classify
+                #:project-disposition-required)
   (:import-from #:dsmr-mcp/src/project-debt
                 #:render-pre-commit-hook)
   (:import-from #:dsmr-mcp/src/project-gate-scan
@@ -186,7 +188,7 @@ report saying so is the thing that would otherwise be taken on trust, so the
 git directory's absence is also asserted directly: a report wired to answer NIL
 would satisfy the first assertion and not the second."
   (with-temp-git-repo (root :initial-file "README" :initial-content "enclosing")
-    (let* ((outcome (scaffold-into root))
+    (let* ((outcome (scaffold-into root :disposition :contributing))
            (project (project-directory outcome)))
       (false (getf outcome :git-initialised)
              "write-scaffold reported initializing a nested repository")
@@ -206,7 +208,7 @@ is asserted to have moved."
   (with-temp-git-repo (root :initial-file "README" :initial-content "enclosing")
     (let ((before (git-head-sha root)))
       (true before "the fixture repository has no commit to compare against")
-      (scaffold-into root)
+      (scaffold-into root :disposition :contributing)
       (is equal before (git-head-sha root)
           "scaffolding moved the enclosing repository's head")
       (is equal (list "?? scaffolds/") (git-status-porcelain root)
@@ -216,6 +218,69 @@ is asserted to have moved."
                            :message "prove the head reading moves")
       (false (equal before (git-head-sha root))
              "the head reading did not move across a real commit, so the assertion above proves nothing"))))
+
+(defun %file-text (path)
+  "Return the text of PATH, or NIL when it does not exist."
+  (when (probe-file path) (uiop:read-file-string path)))
+
+(define-test scaffolding-into-an-existing-repository-asks-first
+  "With no disposition recorded and none supplied, a scaffold into an existing
+repository signals PROJECT-DISPOSITION-REQUIRED and writes nothing: no project
+directory, no .envrc, and the local exclude as it was. The same holds with
+init-git NIL."
+  (dolist (init-git '(t nil))
+    (with-temp-git-repo (root :initial-file "README" :initial-content "enclosing")
+      (let* ((exclude (merge-pathnames ".git/info/exclude" root))
+             (before (%file-text exclude))
+             (outcome (handler-case (scaffold-into root :init-git init-git)
+                        (project-disposition-required () :asked))))
+        (is eq :asked outcome "init-git ~A: the scaffold asks: ~S" init-git outcome)
+        (false (probe-file (merge-pathnames
+                            (format nil "scaffolds/~A/" *sample-name*) root))
+               "init-git ~A: no project directory was written" init-git)
+        (false (probe-file (merge-pathnames ".envrc" root))
+               "init-git ~A: no .envrc was written" init-git)
+        (is equal before (%file-text exclude)
+            "init-git ~A: the local exclude is unchanged" init-git)))))
+
+(define-test an-answer-is-recorded-in-the-existing-repository-then-scaffolded
+  "Answered, the scaffold records the disposition in the enclosing repository's
+.envrc, lists .envrc in its local exclude, writes the project, and reports the
+record. A second scaffold into the same repository asks nothing and reports
+the declaration already present."
+  (with-temp-git-repo (root :initial-file "README" :initial-content "enclosing")
+    (let* ((outcome (scaffold-into root :disposition :forked :init-git nil))
+           (recorded (getf outcome :disposition))
+           (envrc (%file-text (merge-pathnames ".envrc" root))))
+      (is eq :forked (getf recorded :disposition) "~S" recorded)
+      (is eq :created (getf recorded :action-taken) "~S" recorded)
+      (true (and envrc (search "export DSMR_PROJECT_DISPOSITION=forked" envrc))
+            "the enclosing .envrc declares forked: ~S" envrc)
+      (true (search (format nil "~%.envrc~%")
+                    (format nil "~%~A" (%file-text (merge-pathnames ".git/info/exclude"
+                                                                     root))))
+            "the local exclude lists .envrc")
+      (true (probe-file (merge-pathnames "README.md" (project-directory outcome)))
+            "the project was written")
+      (is equal (list "?? scaffolds/") (git-status-porcelain root)
+          "only the new project shows in git status"))
+    (let* ((*sample-name* "shape-parity-second")
+           (again (getf (scaffold-into root :init-git nil) :disposition)))
+      (is eq :forked (getf again :disposition) "~S" again)
+      (is eq :already-present (getf again :action-taken) "~S" again))))
+
+(define-test a-repository-the-scaffold-creates-takes-no-other-disposition
+  "A repository the scaffold creates is ours. Supplying another disposition is
+refused before anything is written; supplying ours is accepted and recorded."
+  (with-temp-project-root (session root)
+    (true (handler-case (progn (scaffold-into root :disposition :contributing) nil)
+            (dsmr-mcp/src/project-scaffold-core:invalid-argument-error () t))
+          "contributing is refused for a repository the scaffold creates")
+    (false (probe-file (merge-pathnames (format nil "scaffolds/~A/" *sample-name*)
+                                        root))
+           "nothing was written")
+    (let ((recorded (getf (scaffold-into root :disposition :ours) :disposition)))
+      (is eq :ours (getf recorded :disposition) "~S" recorded))))
 
 ;;; --- the scaffold creates the project with its lint gate --------------------
 
@@ -397,7 +462,7 @@ asserted to change, so the equality is evidence rather than a constant."
   (with-temp-git-repo (root :initial-file "README" :initial-content "enclosing")
     (let ((hooks-before (%hooks-listing root))
           (config-before (%local-config root)))
-      (let ((gate (getf (scaffold-into root) :gate-hook)))
+      (let ((gate (getf (scaffold-into root :disposition :contributing) :gate-hook)))
         (is eq :not-installed (getf gate :action-taken)
             "a gate was installed for a project inside an existing repository")
         (true (stringp (getf gate :reason))

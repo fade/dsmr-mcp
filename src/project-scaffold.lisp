@@ -37,6 +37,7 @@
                 #:configured-hooks-supported-p
                 #:wire-gate-hook)
   (:import-from #:dsmr-mcp/src/repo-classify
+                #:resolve-disposition
                 #:record-disposition)
   (:export #:write-scaffold))
 
@@ -215,9 +216,57 @@ signals. A failure is reported, never signalled, for the reason given at
             :reason (format nil "the disposition could not be recorded: ~A"
                             condition)))))
 
+(defun %enclosing-repository (target-dir)
+  "Return the root of the existing repository the project at TARGET-DIR will sit
+in, or NIL when there is none.
+
+The search starts at the parent of TARGET-DIR, never TARGET-DIR itself, which an
+overwrite replaces, and climbs to the nearest directory that exists."
+  (let ((dir (uiop:pathname-parent-directory-pathname target-dir)))
+    (loop until (or (uiop:directory-exists-p dir)
+                    (equal dir (uiop:pathname-parent-directory-pathname dir)))
+          do (setf dir (uiop:pathname-parent-directory-pathname dir)))
+    (let ((top (git-toplevel dir)))
+      (and top (uiop:ensure-directory-pathname top)))))
+
+(defun %declare-disposition (target-dir disposition init-git session-root)
+  "Settle the disposition before anything is scaffolded at TARGET-DIR.
+
+Inside an existing repository: resolve its disposition, with DISPOSITION as the
+answer when nothing is recorded, and record a supplied answer in that
+repository's .envrc. Returns the plist RECORD-DISPOSITION returns, or
+(:PATH P :DISPOSITION D :ACTION-TAKEN :ALREADY-PRESENT) for a recorded value.
+
+Outside every repository returns NIL: a repository the scaffold creates is
+recorded ours after it exists, and with INIT-GIT NIL there is none to record in.
+
+Signals, each before anything is written:
+  PROJECT-DISPOSITION-REQUIRED    nothing recorded and DISPOSITION is NIL.
+  PROJECT-DISPOSITION-ERROR       any other refusal RESOLVE-DISPOSITION or
+                                  RECORD-DISPOSITION signals.
+  INVALID-ARGUMENT-ERROR          DISPOSITION is supplied outside every
+                                  repository and is not ours, or INIT-GIT is NIL."
+  (let ((enclosing (%enclosing-repository target-dir)))
+    (cond
+      (enclosing
+       (multiple-value-bind (resolved source)
+           (resolve-disposition enclosing :supplied disposition)
+         (if (eq source :argument)
+             (record-disposition enclosing resolved :jail session-root)
+             (list :path source :disposition resolved
+                   :action-taken :already-present))))
+      ((null disposition) nil)
+      ((and init-git (eq disposition :ours)) nil)
+      (t
+       (error 'invalid-argument-error
+              :field "disposition" :value disposition
+              :reason (if init-git
+                          "the scaffold creates this repository, so its disposition is ours"
+                          "the project is outside every repository and init_git is false, so there is no repository to record a disposition in"))))))
+
 (defun write-scaffold (&key name description author license copyright year
                               destination overwrite session-root
-                              (init-git t))
+                              (init-git t) disposition)
   "Generate the scaffold project atomically under SESSION-ROOT.
 Returns a plist with:
   :target-dir       (absolute directory pathname)
@@ -227,9 +276,16 @@ Returns a plist with:
   :git-initialised  (T when a repository was created here, NIL when not)
   :gate-hook        the lint gate, see %install-gate-hook; when no repository
                     was created here, (:ACTION-TAKEN :NOT-INSTALLED :REASON R)
-  :disposition      the ours record, see %record-origin-disposition; when no
-                    repository was created here, (:ACTION-TAKEN :NOT-RECORDED
-                    :REASON R)
+  :disposition      inside an existing repository, its disposition, see
+                    %declare-disposition; in a repository created here, the
+                    ours record, see %record-origin-disposition; in none,
+                    (:ACTION-TAKEN :NOT-RECORDED :REASON R)
+
+DISPOSITION answers the disposition question for an existing repository the
+project will sit in. With nothing recorded there and no answer, the call signals
+PROJECT-DISPOSITION-REQUIRED and writes nothing; an answer is recorded in that
+repository's .envrc before the project is written. A repository the scaffold
+creates takes only ours.
 
 INIT-GIT defaults to T. A scaffolded project is a git repository from the
 moment it is written, unless it would nest inside one that already exists.
@@ -259,7 +315,9 @@ underlying error after cleaning up the temp directory (no debris)."
                :field "name" :value name
                :reason (format nil "target directory already exists: ~A"
                                (namestring target-dir))))
-      (let* ((manifest (plan-scaffold :name name
+      (let* ((declared (%declare-disposition target-dir disposition init-git
+                                             session-root))
+             (manifest (plan-scaffold :name name
                                       :description (or description "")
                                       :author (or author "")
                                       :license (or license "AGPL-3.0-or-later")
@@ -311,12 +369,15 @@ the project is inside an existing one, whose hooks are never written")
                                       (format nil "no repository was created: ~
 the project has no hooks directory of its own")))))
                       (disposition
-                        (if git-initialised
-                            (%record-origin-disposition target-dir)
-                            (list :action-taken :not-recorded
-                                  :reason
-                                  (format nil "no repository was created here, ~
-so no disposition was recorded; project-doctor asks for one on its first run")))))
+                        (cond
+                          (declared declared)
+                          (git-initialised
+                           (%record-origin-disposition target-dir))
+                          (t
+                           (list :action-taken :not-recorded
+                                 :reason
+                                 (format nil "the project is in no repository, ~
+so there is nowhere to record a disposition"))))))
                  (list :target-dir target-dir
                        :relative-path (enough-namestring target-dir session-root)
                        :files (mapcar #'car manifest)

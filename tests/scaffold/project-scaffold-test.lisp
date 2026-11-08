@@ -424,26 +424,44 @@ reporting both."
             "the content reports the disposition")
       (asdf:clear-system "verb-ours-proj"))))
 
-(define-test a-scaffold-nested-in-a-repository-records-no-disposition
-  "A scaffold inside an existing repository, and one with init_git false, record
-no disposition, and the result says the doctor will ask."
+(define-test a-scaffold-in-an-existing-repository-asks-then-records
+  "Inside an existing repository with nothing recorded, the verb returns the
+disposition question with the three answers and their meanings and writes
+nothing. Called again with an answer, it records the answer in the repository's
+.envrc and then writes the project. With init_git false and no repository at
+all, nothing is recorded and the result says why."
   (with-temp-project-root (session root)
     (uiop:run-program (list "git" "-C" (namestring root) "init" "-q"))
     (let* ((payload (%call-scaffold root "name" "verb-nested-proj"))
-           (recorded (gethash "disposition" payload))
-           (envrc (merge-pathnames "scaffolds/verb-nested-proj/.envrc" root)))
+           (project (merge-pathnames "scaffolds/verb-nested-proj/" root)))
+      (is string= "project-disposition-required" (gethash "error_type" payload)
+          "the verb asks: ~S" (%content-text payload))
+      (true (gethash "requires_disposition" payload) "requires_disposition is set")
+      (is equalp #("ours" "contributing" "forked")
+          (gethash "accepted_dispositions" payload) "the three answers, in order")
+      (true (hash-table-p (gethash "disposition_meanings" payload))
+            "each answer's meaning is given")
+      (true (search "project-scaffold" (%content-text payload))
+            "the question names the verb to call again")
+      (false (probe-file project) "nothing was scaffolded")
+      (false (probe-file (merge-pathnames ".envrc" root)) "no .envrc was written"))
+    (let* ((payload (%call-scaffold root "name" "verb-nested-proj"
+                                    "disposition" "contributing"))
+           (recorded (gethash "disposition" payload)))
+      (true (gethash "created" payload) "the project is written once answered: ~A"
+            (%content-text payload))
       (true (hash-table-p recorded) "the result has no disposition object")
       (when (hash-table-p recorded)
-        (is string= "not-recorded" (gethash "action_taken" recorded))
-        (true (search "project-doctor" (or (gethash "reason" recorded) ""))
-              "the reason says the doctor will ask"))
-      (false (search "DSMR_PROJECT_DISPOSITION" (read-file-into-string envrc))
-             "the nested project's .envrc declares nothing")
+        (is string= "contributing" (gethash "disposition" recorded)))
+      (true (search (format nil "~%export DSMR_PROJECT_DISPOSITION=contributing~%")
+                    (read-file-into-string (merge-pathnames ".envrc" root)))
+            "the repository's .envrc declares contributing")
       (asdf:clear-system "verb-nested-proj")))
   (with-temp-project-root (session root)
     (let* ((payload (%call-scaffold root "name" "verb-nogit-proj" "init_git" nil))
            (recorded (gethash "disposition" payload)))
-      (when (hash-table-p recorded)
-        (is string= "not-recorded" (gethash "action_taken" recorded)))
       (true (hash-table-p recorded) "the result has no disposition object")
+      (when (hash-table-p recorded)
+        (is string= "not-recorded" (gethash "action_taken" recorded))
+        (true (stringp (gethash "reason" recorded)) "the result says why"))
       (asdf:clear-system "verb-nogit-proj"))))
