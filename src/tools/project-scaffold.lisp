@@ -58,7 +58,8 @@ means, and writes nothing; a second call carries the answer in disposition, \
 which is recorded in that repository's .envrc before the project is written. \
 In a repository declared contributing or forked the project carries no licence \
 text at all, and in a contributing one our agent and lint files are added to \
-that repository's local exclude before they are written. \
+that repository's local exclude before they are written. A forked repository is \
+otherwise treated as ours, with those files tracked. \
 Returns a manifest of created files and next-step commands.")
    (dsmr-mcp/src/tools/base::input-schema
     :allocation :class

@@ -131,7 +131,10 @@ answers, and what each means, and writes nothing; a second call carries the \
 answer in disposition, and a writing run records it. For contributing the lint \
 gate reports the findings in the forms a commit changes and never refuses the \
 commit; for ours and forked it refuses a commit whose changed forms carry a \
-warning or an error. Either way the gate appends every finding it shows to \
+warning or an error. A forked repository is held to everything a repository of \
+ours is, with our agent and lint files tracked, except that it keeps the \
+licence it came with and no licence text is written. Under every disposition \
+the gate appends every finding it shows to \
 lisp-gate/findings.tsv under the git directory, classed functional or style \
 from the linter's rule category.")
    (dsmr-mcp/src/tools/base::input-schema

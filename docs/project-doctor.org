@@ -64,6 +64,11 @@ project. So I declare it once, when a project is first tooled, as one of three d
   its upstream is unmaintained. =zebra= and =boomer= are forked; our =parachute=, kept so that
   patches can go back upstream, is contributing.
 
+A fork is one I take ownership of, so it matches a project of ours in every respect but one: it
+keeps the licence it came with, and no licence text is ever written into it. Our agent files and
+lint gate are tracked there as they are in my own projects, and the gate refuses a commit the same
+way.
+
 Remotes cannot decide it. Adoption forks the upstream under my own account and clones the fork,
 so =origin= points at my account for third-party code exactly as it does for my own. Even before
 that, the remotes left most of the question open: across 251 repositories in =$LISP_WORKSPACE=,
