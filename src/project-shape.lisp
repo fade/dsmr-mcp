@@ -176,8 +176,9 @@ KEY names the item in reports and must be a keyword. MATCH is the argument the
 assertion needs and is required for every kind: without it the item asserts
 nothing and would report satisfied in any repository at all.
 
-LOCAL-ONLY-P marks a file that holds facts about one checkout, such as the
-recorded project disposition. Such a file is never tracked, under any profile.
+LOCAL-ONLY-P marks a file that must never be committed, such as the .envrc
+holding the recorded project disposition. Such a file is never tracked, under
+any profile.
 
 PATH may be NIL for an item that is matched rather than named, such as a system
 definition found by glob. GENERATOR may be NIL for an item that can be asserted
@@ -223,9 +224,9 @@ but not written, such as one whose content is computed per repository."
 Our operational apparatus is ordinary tracked content in a repository we own, and
 must be present but untracked in one we do not. Under :FOREIGN every apparatus
 item is therefore :EXCLUDED, and no argument to this function can change that.
-A local-only item holds per-checkout facts and is :EXCLUDED under every profile.
+A local-only item must never be committed and is :EXCLUDED under every profile.
 
-The disposition is computed here and never stored on the item, which is the whole
+The tracking is computed here and never stored on the item, which is the whole
 of the design. No accessor can report a foreign repository's apparatus as tracked,
 because the structure has no slot able to hold that claim: it cannot be
 constructed, written down, or read back. The rule has exactly one place it could

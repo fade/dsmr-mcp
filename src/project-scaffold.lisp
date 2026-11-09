@@ -442,7 +442,7 @@ creates takes only ours.
 
 Inside an existing repository the disposition governs what is written. Unless
 it is ours, the project carries no licence text at all, whatever LICENSE says:
-no LICENSE file, and no SPDX identifier, :license line or License section. The
+no LICENSE file, and no SPDX identifier, :license line, or License section. The
 apparatus paths the disposition keeps out of the index are added to that
 repository's local exclude, anchored under the project, before any project file
 is written.

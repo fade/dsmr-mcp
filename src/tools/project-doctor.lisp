@@ -3,10 +3,10 @@
 ;;;;
 ;;;; MCP verb: bring an existing repository up to the declared project shape.
 ;;;;
-;;;; What a repository is to the operator (ours, contributing or forked) is
+;;;; What a repository is to the operator (ours, contributing, or forked) is
 ;;;; declared once and recorded in the repository's untracked .envrc. With
 ;;;; nothing recorded this verb asks: the result names the question, the three
-;;;; answers and what each means, and the origin and upstream found as facts,
+;;;; answers, what each means, and the origin and upstream found as facts,
 ;;;; with nothing written. The caller answers with the disposition argument; a
 ;;;; writing run records it and every later run reads it from the file.
 ;;;;
@@ -135,7 +135,7 @@ warning or an error. A forked repository is held to everything a repository of \
 ours is, with our agent and lint files tracked, except that it keeps the \
 licence it came with and no licence text is written. Under every disposition \
 the gate appends every finding it shows to \
-lisp-gate/findings.tsv under the git directory, classed functional or style \
+lisp-gate/findings.tsv under the git common directory, classed functional or style \
 from the linter's rule category.")
    (dsmr-mcp/src/tools/base::input-schema
     :allocation :class

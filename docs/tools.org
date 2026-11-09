@@ -1306,7 +1306,7 @@ warning or an error. A forked repository is held to everything a repository of
 ours is, with our agent and lint files tracked, except that it keeps the 
 licence it came with and no licence text is written. Under every disposition 
 the gate appends every finding it shows to 
-lisp-gate/findings.tsv under the git directory, classed functional or style 
+lisp-gate/findings.tsv under the git common directory, classed functional or style 
 from the linter's rule category.
 
 #+begin_src json

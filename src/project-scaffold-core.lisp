@@ -197,7 +197,7 @@ Both an item's path and its content go through template substitution, so the
 catalogue can name a file whose name depends on the project.
 
 WITHOUT-LICENCE true plans no licence text at all: no LICENSE file, and no
-SPDX identifier, :license line or License section in any other file. LICENSE
+SPDX identifier, :license line, or License section in any other file. LICENSE
 and COPYRIGHT are then ignored.
 
 DESTINATION is accepted for caller symmetry with write-scaffold but is not used

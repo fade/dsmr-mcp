@@ -65,15 +65,15 @@ project. So I declare it once, when a project is first tooled, as one of three d
   patches can go back upstream, is contributing.
 
 A fork is one I take ownership of, so it matches a project of ours in every respect but one: it
-keeps the licence it came with, and no licence text is ever written into it. Our agent files and
-lint gate are tracked there as they are in my own projects, and the gate refuses a commit the same
+keeps the licence it came with, and no licence text is ever written into it. Our agent and lint
+files are tracked there as they are in my own projects, and the gate refuses a commit the same
 way.
 
 Remotes cannot decide it. Adoption forks the upstream under my own account and clones the fork,
 so =origin= points at my account for third-party code exactly as it does for my own. Even before
-that, the remotes left most of the question open: across 251 repositories in =$LISP_WORKSPACE=,
-68 had an origin of ours and no upstream and could have been either, against 22 that carried an
-upstream. Licence files and author marks are no more reliable. Remotes now produce warnings and
+that, the remotes left the question open for most of our own origins: across 251 repositories in
+=$LISP_WORKSPACE=, 68 of the 90 with an origin of ours had no upstream and could have been either.
+Licence files and author marks are no more reliable. Remotes now produce warnings and
 nothing else: you are told when a project declared ours has an =upstream= remote, or when one
 declared contributing has none, and the disposition stands either way.
 
@@ -217,7 +217,7 @@ repository there is nowhere to record a disposition, so none is recorded.
 
 The answer then governs what the scaffold writes there. In a repository declared contributing or
 forked, the project carries no licence text at all, whatever =license= says: no =LICENSE=, and no
-SPDX line, =:license= entry or License section in any file. The result says so. The apparatus
+SPDX line, =:license= entry, or License section in any file. The result says so. The apparatus
 paths the disposition keeps out of the index (for contributing, =CLAUDE.md=, =AGENTS.md=,
 =prompts/repl-driven-development.md=, =.mallet.lisp=, =scripts/lint-lisp.sh=, and =.envrc=; for
 forked, only =.envrc=, as in a project of ours) go into that repository's
@@ -241,14 +241,14 @@ the commit leaves alone are not reported.
 
 The mode is fixed when the doctor or the scaffold renders the gate. The gate reads neither
 =.envrc= nor the environment to find it, so it behaves the same whether or not direnv is loaded.
-A gate rendered for one disposition reads as stale once the declaration changes, and a repair
-renders it again.
+A gate rendered for one mode reads as stale once the declaration changes to or from contributing,
+and a repair renders it again.
 
 ** Every finding the gate shows is recorded
 
 A break in function is always in scope for repair. Style is not, in a project I only contribute
 to, but I still want every lint result I have seen tracked. So the gate appends each finding it
-shows to =lisp-gate/findings.tsv= under the repository's git directory: one row per finding per
+shows to =lisp-gate/findings.tsv= under the git common directory: one row per finding per
 run, never deduplicated, shared by every worktree, and never tracked. Each row carries the time,
 the gate's mode, the worktree and branch the commit was made in, the class, mallet's category,
 the severity, the rule, the path, the line and column, and the message. A closing line after the
@@ -398,9 +398,9 @@ Roughly half is tests and fixtures, and that is where the value showed up: every
 found was found by a check that had been proven able to fail. The one defect the suite missed was
 the layout write described above, which no check was positioned to see.
 
-The disposition module is small, because it reads and records a declaration instead of
-inferring one. I tried inference first, and the ambiguous case turned out to be the common one.
-That was not knowable in advance.
+The disposition module reads and records a declaration instead of inferring one. I tried
+inference first, and the ambiguous case turned out to be the common one. That was not knowable in
+advance.
 
 The part that could reasonably be smaller is the separation between assessment, deviation types,
 debt recording, and the engine. Those are four modules that could have been two. They were kept

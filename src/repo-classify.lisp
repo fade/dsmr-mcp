@@ -98,7 +98,7 @@ non-EQL list on reload and breaks a warm image.")
 (defvar +disposition-meanings+
   '((:ours . "code originating with the operator; the lint gate refuses a commit whose changed forms carry a warning or an error")
     (:contributing . "a third-party project the operator only contributes to; the lint gate reports and never refuses, and the licence is never touched")
-    (:forked . "forked to shorten the acceptance chain or because upstream is unmaintained; the fork is taken over and treated as ours, with our tooling tracked and the lint gate ours gets, except that it keeps the licence it came with and none is written"))
+    (:forked . "forked to shorten the acceptance chain or because upstream is unmaintained; the operator has taken it over, so it is treated as ours, with our tooling tracked and the blocking lint gate, except that it keeps the licence it came with and no licence text is written"))
   "An alist of each disposition and what declaring it means.")
 
 (defun disposition-name (disposition)
@@ -422,7 +422,7 @@ Signals:
   "Return the shape profile for DISPOSITION: :OURS for ours and forked, :FOREIGN
 for contributing. Signals TYPE-ERROR for anything else.
 
-The shape profile decides which tiers a repository is held to and whether our
+The shape profile selects which tiers a repository is held to and whether our
 apparatus in it is tracked or excluded. A fork is taken over as ours, so its
 apparatus is tracked; the licence is the one difference, answered by
 DISPOSITION-WRITES-LICENCE-P. The gate's mode is decided separately, by
