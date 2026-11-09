@@ -180,6 +180,7 @@ so this is the whole of what it takes for such a repository to report clean."
   (%seed-quality-gate root)
   (write-fixture-file root "AGENTS.md" "# notes for an agent")
   (write-fixture-file root "CLAUDE.md" "# notes for an agent")
+  (write-fixture-file root "prompts/repl-driven-development.md" "# a guide for an agent")
   (write-fixture-file root ".envrc" "# the environment this project wants")
   root)
 

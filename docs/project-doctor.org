@@ -187,7 +187,8 @@ and a =test/= directory is not missing anything we would supply.
 
 The rule is encoded on whether a catalogue entry is apparatus, not on which tier it sits in,
 because apparatus spans two tiers: a tier-based rule would silently drop =AGENTS.md=, =CLAUDE.md=,
-and =.envrc=, and would let a future non-apparatus entry added to the gate tier start leaking.
+the REPL-development guide, and =.envrc=, and would let a future non-apparatus entry added to the
+gate tier start leaking.
 
 I settled this after an earlier version wrote =src/main.lisp= and =tests/main-test.lisp= into
 =cl-ppcre=, leaving two untracked entries of ours in a third party's status, carrying an AGPL
@@ -218,7 +219,8 @@ The answer then governs what the scaffold writes there. In a repository declared
 forked, the project carries no licence text at all, whatever =license= says: no =LICENSE=, and no
 SPDX line, =:license= entry or License section in any file. The result says so. The apparatus
 paths the disposition keeps out of the index (for contributing, =CLAUDE.md=, =AGENTS.md=,
-=.mallet.lisp=, =scripts/lint-lisp.sh= and =.envrc=) go into that repository's
+=prompts/repl-driven-development.md=, =.mallet.lisp=, =scripts/lint-lisp.sh=, and =.envrc=; for
+forked, only =.envrc=, as in a project of ours) go into that repository's
 =.git/info/exclude=, anchored under the new project, before any of its files is written. If the
 scaffold fails after it recorded the disposition or changed the exclude, the error names those
 writes, so you know the repository changed.

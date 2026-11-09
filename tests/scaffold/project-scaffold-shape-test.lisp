@@ -301,7 +301,8 @@ a LICENSE file, an SPDX identifier, a :license line, or a License heading."
   "Inside a repository declared contributing, the scaffold writes no licence
 text at all, and every apparatus file it writes is excluded rather than left
 for the next commit: git status lists the project's own sources and none of
-CLAUDE.md, AGENTS.md, .mallet.lisp, scripts/lint-lisp.sh or .envrc. The result
+CLAUDE.md, AGENTS.md, prompts/repl-driven-development.md, .mallet.lisp,
+scripts/lint-lisp.sh or .envrc. The result
 says no licence was written. A project the scaffold creates is the control: it
 carries the licence it was given."
   (with-temp-git-repo (root :initial-file "README" :initial-content "enclosing")
@@ -313,8 +314,8 @@ carries the licence it was given."
       (is equal '() (%licence-text-in project) "no file carries licence text")
       (true (search "src/main.lisp" status)
             "control: the project's own source shows in git status: ~A" status)
-      (dolist (path '("CLAUDE.md" "AGENTS.md" ".mallet.lisp"
-                      "scripts/lint-lisp.sh" ".envrc"))
+      (dolist (path '("CLAUDE.md" "AGENTS.md" "prompts/repl-driven-development.md"
+                      ".mallet.lisp" "scripts/lint-lisp.sh" ".envrc"))
         (true (probe-file (merge-pathnames path project)) "~A was written" path)
         (false (search (format nil "/~A~%" path) status)
                "~A is not listed by git status: ~A" path status))

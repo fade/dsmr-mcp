@@ -38,6 +38,7 @@
            #:validate-text-field
            #:render-template
            #:plan-scaffold
+           #:without-licence-text
            #:invalid-argument-error
            #:invalid-argument-field
            #:invalid-argument-value
@@ -154,7 +155,7 @@ has, while the manifest still looked complete."
              (shape-item-key item)))
     (funcall generator bindings)))
 
-(defun %without-licence-text (text)
+(defun without-licence-text (text)
   "Return TEXT without its licence text: every line naming an SPDX identifier,
 every :license line, and a Markdown section headed License up to the next
 heading of the same or a higher level. Every other line is kept."
@@ -237,5 +238,5 @@ to a parent prompts/ directory is computed."
                         (cons (render-template (shape-item-path item)
                                                bindings-with-rendered-license)
                               (if without-licence
-                                  (%without-licence-text content)
+                                  (without-licence-text content)
                                   content)))))))

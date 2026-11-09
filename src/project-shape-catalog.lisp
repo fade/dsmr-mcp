@@ -299,6 +299,7 @@ item's generator is one place rather than a rendering call repeated per file."
         :key :prompt
         :path "prompts/repl-driven-development.md"
         :tier :convenience
+        :apparatus-p t
         :assertion :file-exists
         :match "prompts/repl-driven-development.md"
         :generator (%renderer *prompt-template*)

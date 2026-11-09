@@ -54,6 +54,8 @@
                 #:assessment-profile
                 #:assessment-deviations
                 #:assessment-satisfied)
+  (:import-from #:dsmr-mcp/src/project-scaffold-core
+                #:without-licence-text)
   (:import-from #:dsmr-mcp/src/project-deviation
                 #:deviation-item
                 #:signal-deviation
@@ -362,7 +364,8 @@ being decided again here. The gate script is rendered for PROFILE, :FOREIGN or
 :OURS: informational in a repository we do not own, blocking in one we do.
 Everything else comes from the item's own generator, which is the same one the
 scaffold writes a new project from, with the licence lines the empty licence
-bindings leave behind removed."
+bindings leave behind removed. Under :FOREIGN every line of licence text is
+removed, by the rule the scaffold applies in a repository declared contributing."
   (if (%gate-item-p item)
       (ecase (shape-item-key item)
         (:mallet-config (render-gate-config :severity severity
@@ -372,8 +375,10 @@ bindings leave behind removed."
         (:pre-commit (render-pre-commit-hook :severity severity
                                              :project-name project-name
                                              :profile profile)))
-      (%without-empty-licence-lines
-       (funcall (shape-item-generator item) bindings))))
+      (let ((content (funcall (shape-item-generator item) bindings)))
+        (if (eq profile :foreign)
+            (without-licence-text content)
+            (%without-empty-licence-lines content)))))
 
 (defun %executable-item-p (item)
   "Return true when ITEM is a script that has to be executable to do anything."

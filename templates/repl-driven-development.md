@@ -117,8 +117,7 @@ These are not suggestions; they are how {{name}} stays maintainable.
   `defpackage` declares its own dependencies; there is no central component list.
   Always cold-verify (clear the fasl cache, fresh SBCL) — a warm REPL hides
   missing `:import-from` declarations.
-- **Licensing.** Every source file opens with an SPDX header
-  (`;;;; SPDX-License-Identifier: {{spdx}}`) tracking the project license.
+- **Licensing.** Every source file opens with an SPDX header (`;;;; SPDX-License-Identifier: {{spdx}}`) naming the project licence.
 - **Naming.** Name symbols for the behavior they implement. Never embed planning
   or ticket indices (`phase-`, `plan-`, `task-`, `wave-`, `req-`, milestone
   numbers) in any symbol, including tests.

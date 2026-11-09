@@ -213,6 +213,8 @@ worktree at all."
     (true (member ".gate-baseline.md" paths :test #'string=)
           "An item with no generator is still excluded.")
     (true (member ".mallet.lisp" paths :test #'string=))
+    (true (member "prompts/repl-driven-development.md" paths :test #'string=)
+          "The REPL-development guide is agent tooling and is excluded.")
     (false (member "hooks/lisp-gate" paths :test #'string=)
            "An item under the git directory is not a worktree pattern.")
     (is equal '(".envrc") (apparatus-paths-for-profile :ours)
