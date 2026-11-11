@@ -36,9 +36,42 @@
                 #:gate-hook-path
                 #:configured-hooks-supported-p
                 #:wire-gate-hook)
-  (:export #:write-scaffold))
+  (:import-from #:dsmr-mcp/src/repo-classify
+                #:resolve-disposition
+                #:record-disposition
+                #:disposition-profile
+                #:disposition-writes-licence-p)
+  (:import-from #:dsmr-mcp/src/project-exclude
+                #:repair-repo-exclude)
+  (:import-from #:dsmr-mcp/src/project-shape-catalog
+                #:apparatus-paths-for-profile)
+  (:export #:write-scaffold
+           #:scaffold-failed-after-writing
+           #:scaffold-failure-writes
+           #:scaffold-failure-cause))
 
 (in-package #:dsmr-mcp/src/project-scaffold)
+
+(define-condition scaffold-failed-after-writing (error)
+  ((writes :initarg :writes :reader scaffold-failure-writes)
+   (cause  :initarg :cause  :reader scaffold-failure-cause))
+  (:documentation
+   "Signalled when the scaffold fails after it wrote to the enclosing
+repository. WRITES lists those writes: the disposition record plist and the
+exclude plist. CAUSE is the underlying condition.")
+  (:report
+   (lambda (condition stream)
+     (format stream "The scaffold failed: ~A~%Before it failed, it ~{~A~^, and ~}."
+             (scaffold-failure-cause condition)
+             (mapcar (lambda (write)
+                       (if (getf write :disposition)
+                           (format nil "recorded the disposition ~(~A~) in ~A"
+                                   (getf write :disposition)
+                                   (namestring (getf write :path)))
+                           (format nil "added ~{~A~^ ~} to ~A"
+                                   (getf write :added-patterns)
+                                   (namestring (getf write :path)))))
+                     (scaffold-failure-writes condition))))))
 
 (defun %uuid-suffix ()
   "Return a short pseudo-random hex suffix for temp directory naming."
@@ -199,9 +232,189 @@ written and complete, and a hook problem must not cost the caller that write."
         (not-installed
          (format nil "the lint gate could not be installed: ~A" condition))))))
 
+(defun %record-origin-disposition (target-dir)
+  "Record the disposition ours in the .envrc of the repository at TARGET-DIR.
+
+Call only when the scaffold created that repository: creating the code is where
+it originates, so ours is a fact here rather than an inference. Returns the plist
+RECORD-DISPOSITION returns, or (:ACTION-TAKEN :NOT-RECORDED :REASON R) when it
+signals. A failure is reported, never signalled, for the reason given at
+%INSTALL-GATE-HOOK."
+  (handler-case (record-disposition target-dir :ours :jail target-dir)
+    (error (condition)
+      (list :action-taken :not-recorded
+            :reason (format nil "the disposition could not be recorded: ~A"
+                            condition)))))
+
+(defun %enclosing-repository (target-dir)
+  "Return the root of the existing repository the project at TARGET-DIR will sit
+in, or NIL when there is none.
+
+The search starts at the parent of TARGET-DIR, never TARGET-DIR itself, which an
+overwrite replaces, and climbs to the nearest directory that exists."
+  (let ((dir (uiop:pathname-parent-directory-pathname target-dir)))
+    (loop until (or (uiop:directory-exists-p dir)
+                    (equal dir (uiop:pathname-parent-directory-pathname dir)))
+          do (setf dir (uiop:pathname-parent-directory-pathname dir)))
+    (let ((top (git-toplevel dir)))
+      (and top (uiop:ensure-directory-pathname top)))))
+
+(defun %declare-disposition (target-dir disposition init-git session-root)
+  "Settle the disposition before anything is scaffolded at TARGET-DIR.
+
+Inside an existing repository: resolve its disposition, with DISPOSITION as the
+answer when nothing is recorded, and record a supplied answer in that
+repository's .envrc. Returns the plist RECORD-DISPOSITION returns, or
+(:PATH P :DISPOSITION D :ACTION-TAKEN :ALREADY-PRESENT) for a recorded value.
+
+Outside every repository returns NIL: a repository the scaffold creates is
+recorded ours after it exists, and with INIT-GIT NIL there is none to record in.
+
+Signals, each before anything is written:
+  PROJECT-DISPOSITION-REQUIRED    nothing recorded and DISPOSITION is NIL.
+  PROJECT-DISPOSITION-ERROR       any other refusal RESOLVE-DISPOSITION or
+                                  RECORD-DISPOSITION signals.
+  INVALID-ARGUMENT-ERROR          DISPOSITION is supplied outside every
+                                  repository and is not ours, or INIT-GIT is NIL."
+  (let ((enclosing (%enclosing-repository target-dir)))
+    (cond
+      (enclosing
+       (multiple-value-bind (resolved source)
+           (resolve-disposition enclosing :supplied disposition)
+         (if (eq source :argument)
+             (record-disposition enclosing resolved :jail session-root)
+             (list :path source :disposition resolved
+                   :action-taken :already-present))))
+      ((null disposition) nil)
+      ((and init-git (eq disposition :ours)) nil)
+      (t
+       (error 'invalid-argument-error
+              :field "disposition" :value disposition
+              :reason (if init-git
+                          "the scaffold creates this repository, so its disposition is ours"
+                          "the project is outside every repository and init_git is false, so there is no repository to record a disposition in"))))))
+
+(defun %path-in-repository (target-dir enclosing)
+  "Return TARGET-DIR relative to the repository root ENCLOSING, as a string
+ending in a slash. TARGET-DIR need not exist; its nearest existing ancestor is
+resolved, so a symlink on the way does not change the answer."
+  (let ((dir (uiop:ensure-directory-pathname target-dir))
+        (tail '()))
+    (loop until (uiop:directory-exists-p dir)
+          do (push (car (last (pathname-directory dir))) tail)
+             (setf dir (uiop:pathname-parent-directory-pathname dir)))
+    (format nil "~A~{~A/~}"
+            (enough-namestring (truename dir) (truename enclosing))
+            tail)))
+
+(defun %apparatus-exclude-patterns (enclosing target-dir profile)
+  "Return the local-exclude patterns that keep the apparatus PROFILE excludes
+out of the index of the repository at ENCLOSING, each anchored under the
+project at TARGET-DIR."
+  (let ((prefix (%path-in-repository target-dir enclosing)))
+    (mapcar (lambda (path) (format nil "/~A~A" prefix path))
+            (apparatus-paths-for-profile profile))))
+
+(defun %write-project (&key target-dir temp-dir session-root name description
+                             author license copyright year destination overwrite
+                             init-git declared licence note-write)
+  "Write the project for WRITE-SCAFFOLD once its disposition is settled, and
+return WRITE-SCAFFOLD's result plist.
+
+DECLARED is the enclosing repository's disposition record, or NIL when there is
+none. LICENCE is the :LICENCE plist; :OMITTED plans no licence text. NOTE-WRITE
+is called with the exclude plist when the enclosing repository's exclude is
+changed, before any project file is written."
+  (let* ((enclosing (and declared (%enclosing-repository target-dir)))
+         (exclude (when enclosing
+                    (repair-repo-exclude
+                     enclosing
+                     :template-patterns (%apparatus-exclude-patterns
+                                         enclosing target-dir
+                                         (disposition-profile
+                                          (getf declared :disposition)))))))
+    (when (member (getf exclude :action-taken) '(:created :updated))
+      (funcall note-write exclude))
+    (let* ((manifest (plan-scaffold :name name
+                                    :description (or description "")
+                                    :author (or author "")
+                                    :license license
+                                    :copyright (or copyright author "Unknown")
+                                    ;; year default is owned by plan-scaffold
+                                    ;; (live current year); pass through as-is
+                                    :year year
+                                    :destination destination
+                                    :without-licence (eq :omitted
+                                                         (getf licence :action-taken))))
+           ;; Substitute the per-project derived Slynk port into the
+           ;; generated .envrc and scripts/dev-boot.sh, so the new project
+           ;; starts with its own port from day one rather than the shared
+           ;; literal 4005.
+           (manifest (mapcar
+                      (lambda (entry)
+                        (if (member (car entry) '(".envrc" "scripts/dev-boot.sh")
+                                    :test #'string=)
+                            (cons (car entry)
+                                  (envrc-content-with-derived-port
+                                   (cdr entry) target-dir))
+                            entry))
+                      manifest))
+           (committed nil))
+      (unwind-protect
+           (progn
+             (%write-plan-to-temp temp-dir manifest session-root)
+             ;; Delete existing target AFTER temp is ready, preserving
+             ;; atomicity: if the write failed, the original survives.
+             (when (and overwrite (uiop:directory-exists-p target-dir))
+               (uiop:delete-directory-tree target-dir :validate t))
+             (rename-file temp-dir target-dir)
+             (setf committed t)
+             ;; The repository is created only once the rename has committed
+             ;; the tree, so a git failure propagates against a complete and
+             ;; correct project rather than costing the caller the write.
+             (let* ((git-initialised (when init-git
+                                       (%initialise-repository target-dir)))
+                    (abs-asd (namestring
+                              (merge-pathnames (format nil "~A.asd" name) target-dir)))
+                    (registration (when (probe-file abs-asd)
+                                    (%register-with-asdf name abs-asd)))
+                    (gate-hook
+                      (if git-initialised
+                          (%install-gate-hook target-dir)
+                          (list :action-taken :not-installed
+                                :reason
+                                (if init-git
+                                    (format nil "no repository was created here: ~
+the project is inside an existing one, whose hooks are never written")
+                                    (format nil "no repository was created: ~
+the project has no hooks directory of its own")))))
+                    (disposition
+                      (cond
+                        (declared declared)
+                        (git-initialised
+                         (%record-origin-disposition target-dir))
+                        (t
+                         (list :action-taken :not-recorded
+                               :reason
+                               (format nil "the project is in no repository, ~
+so there is nowhere to record a disposition"))))))
+               (list :target-dir target-dir
+                     :relative-path (enough-namestring target-dir session-root)
+                     :files (mapcar #'car manifest)
+                     :registration registration
+                     :git-initialised (and git-initialised t)
+                     :gate-hook gate-hook
+                     :disposition disposition
+                     :licence licence
+                     :exclude exclude)))
+        (unless committed
+          (when (uiop:directory-exists-p temp-dir)
+            (ignore-errors
+             (uiop:delete-directory-tree temp-dir :validate t))))))))
+
 (defun write-scaffold (&key name description author license copyright year
                               destination overwrite session-root
-                              (init-git t))
+                              (init-git t) disposition)
   "Generate the scaffold project atomically under SESSION-ROOT.
 Returns a plist with:
   :target-dir       (absolute directory pathname)
@@ -211,6 +424,28 @@ Returns a plist with:
   :git-initialised  (T when a repository was created here, NIL when not)
   :gate-hook        the lint gate, see %install-gate-hook; when no repository
                     was created here, (:ACTION-TAKEN :NOT-INSTALLED :REASON R)
+  :disposition      inside an existing repository, its disposition, see
+                    %declare-disposition; in a repository created here, the
+                    ours record, see %record-origin-disposition; in none,
+                    (:ACTION-TAKEN :NOT-RECORDED :REASON R)
+  :licence          (:ACTION-TAKEN :WRITTEN :LICENSE L), or
+                    (:ACTION-TAKEN :OMITTED :REASON R) when none was written
+  :exclude          inside an existing repository, the plist
+                    REPAIR-REPO-EXCLUDE returned for the apparatus paths;
+                    otherwise NIL
+
+DISPOSITION answers the disposition question for an existing repository the
+project will sit in. With nothing recorded there and no answer, the call signals
+PROJECT-DISPOSITION-REQUIRED and writes nothing; an answer is recorded in that
+repository's .envrc before the project is written. A repository the scaffold
+creates takes only ours.
+
+Inside an existing repository the disposition governs what is written. Unless
+it is ours, the project carries no licence text at all, whatever LICENSE says:
+no LICENSE file, and no SPDX identifier, :license line, or License section. The
+apparatus paths the disposition keeps out of the index are added to that
+repository's local exclude, anchored under the project, before any project file
+is written.
 
 INIT-GIT defaults to T. A scaffolded project is a git repository from the
 moment it is written, unless it would nest inside one that already exists.
@@ -220,7 +455,10 @@ only in a repository created here: an enclosing repository's hooks and config
 are never written.
 
 On any failure, signals INVALID-ARGUMENT-ERROR or propagates the
-underlying error after cleaning up the temp directory (no debris)."
+underlying error after cleaning up the temp directory (no debris). A failure
+after the enclosing repository's .envrc or exclude was written signals
+SCAFFOLD-FAILED-AFTER-WRITING, which names those writes and carries the
+underlying condition."
   (unless session-root
     (error 'invalid-argument-error
            :field "session-root" :value nil :reason "session root is required"))
@@ -240,64 +478,30 @@ underlying error after cleaning up the temp directory (no debris)."
                :field "name" :value name
                :reason (format nil "target directory already exists: ~A"
                                (namestring target-dir))))
-      (let* ((manifest (plan-scaffold :name name
-                                      :description (or description "")
-                                      :author (or author "")
-                                      :license (or license "AGPL-3.0-or-later")
-                                      :copyright (or copyright author "Unknown")
-                                      ;; year default is owned by plan-scaffold
-                                      ;; (live current year); pass through as-is
-                                      :year year
-                                      :destination effective-destination))
-             ;; Substitute the per-project derived Slynk port into the
-             ;; generated .envrc and scripts/dev-boot.sh, so the new project
-             ;; starts with its own port from day one rather than the shared
-             ;; literal 4005.
-             (manifest (mapcar
-                        (lambda (entry)
-                          (if (member (car entry) '(".envrc" "scripts/dev-boot.sh")
-                                      :test #'string=)
-                              (cons (car entry)
-                                    (envrc-content-with-derived-port
-                                     (cdr entry) target-dir))
-                              entry))
-                        manifest))
-             (committed nil))
-        (unwind-protect
-             (progn
-               (%write-plan-to-temp temp-dir manifest session-root)
-               ;; Delete existing target AFTER temp is ready, preserving
-               ;; atomicity: if the write failed, the original survives.
-               (when (and overwrite (uiop:directory-exists-p target-dir))
-                 (uiop:delete-directory-tree target-dir :validate t))
-               (rename-file temp-dir target-dir)
-               (setf committed t)
-               ;; The repository is created only once the rename has committed
-               ;; the tree, so a git failure propagates against a complete and
-               ;; correct project rather than costing the caller the write.
-               (let* ((git-initialised (when init-git
-                                         (%initialise-repository target-dir)))
-                      (abs-asd (namestring
-                                (merge-pathnames (format nil "~A.asd" name) target-dir)))
-                      (registration (when (probe-file abs-asd)
-                                      (%register-with-asdf name abs-asd)))
-                      (gate-hook
-                        (if git-initialised
-                            (%install-gate-hook target-dir)
-                            (list :action-taken :not-installed
-                                  :reason
-                                  (if init-git
-                                      (format nil "no repository was created here: ~
-the project is inside an existing one, whose hooks are never written")
-                                      (format nil "no repository was created: ~
-the project has no hooks directory of its own"))))))
-                 (list :target-dir target-dir
-                       :relative-path (enough-namestring target-dir session-root)
-                       :files (mapcar #'car manifest)
-                       :registration registration
-                       :git-initialised (and git-initialised t)
-                       :gate-hook gate-hook)))
-          (unless committed
-            (when (uiop:directory-exists-p temp-dir)
-              (ignore-errors
-               (uiop:delete-directory-tree temp-dir :validate t)))))))))
+      (let* ((declared (%declare-disposition target-dir disposition init-git
+                                             session-root))
+             (declared-as (getf declared :disposition))
+             (writes-licence (or (null declared)
+                                 (disposition-writes-licence-p declared-as)))
+             (writes (when (member (getf declared :action-taken) '(:created :added))
+                       (list declared))))
+        (handler-case
+            (%write-project
+             :target-dir target-dir :temp-dir temp-dir :session-root session-root
+             :name name :description description :author author
+             :license (or license "AGPL-3.0-or-later")
+             :copyright copyright :year year
+             :destination effective-destination :overwrite overwrite
+             :init-git init-git :declared declared
+             :licence (if writes-licence
+                          (list :action-taken :written
+                                :license (or license "AGPL-3.0-or-later"))
+                          (list :action-taken :omitted
+                                :reason (format nil "the enclosing repository is declared ~A, ~
+so no licence text is written into it"
+                                                (string-downcase declared-as))))
+             :note-write (lambda (write) (setf writes (append writes (list write)))))
+          (error (condition)
+            (if writes
+                (error 'scaffold-failed-after-writing :writes writes :cause condition)
+                (error condition))))))))

@@ -3,14 +3,12 @@
 ;;;;
 ;;;; MCP verb: bring an existing repository up to the declared project shape.
 ;;;;
-;;;; Whether a tree whose origin sits under one of our own accounts is our
-;;;; software or somebody else's is not readable from anything on disk, and across
-;;;; $LISP_WORKSPACE that case outnumbers the decidable one three to one. So this verb
-;;;; asks. An ambiguous repository produces a result naming the question, the
-;;;; origin that was found and the answers the verb accepts, with nothing
-;;;; written and nothing decided. The caller answers by calling again with one
-;;;; of those answers, or by supplying the upstream, which answers the same
-;;;; question and records the missing remote at the same time.
+;;;; What a repository is to the operator (ours, contributing, or forked) is
+;;;; declared once and recorded in the repository's untracked .envrc. With
+;;;; nothing recorded this verb asks: the result names the question, the three
+;;;; answers, what each means, and the origin and upstream found as facts,
+;;;; with nothing written. The caller answers with the disposition argument; a
+;;;; writing run records it and every later run reads it from the file.
 ;;;;
 ;;;; The ask is an ordinary result and an ordinary follow-up call. It asks for
 ;;;; no capability of the client beyond reading a field out of a response it
@@ -45,7 +43,10 @@
   (:import-from #:dsmr-mcp/src/project-doctor
                 #:normalise-repository
                 #:report-root
-                #:report-classification
+                #:report-disposition
+                #:report-disposition-source
+                #:report-disposition-recorded
+                #:report-warnings
                 #:report-profile
                 #:report-changed
                 #:report-already-correct
@@ -60,9 +61,16 @@
                 #:write-outside-root-error
                 #:write-outside-root-path)
   (:import-from #:dsmr-mcp/src/repo-classify
-                #:repo-classification-ambiguous-error
-                #:repo-classification-ambiguous-directory
-                #:repo-classification-ambiguous-origin-url)
+                #:+dispositions+
+                #:+disposition-meanings+
+                #:disposition-name
+                #:project-disposition-required
+                #:disposition-required-directory
+                #:disposition-required-origin-url
+                #:disposition-required-upstream-url
+                #:project-disposition-conflict
+                #:project-disposition-unreadable
+                #:project-disposition-not-recordable)
   (:import-from #:dsmr-mcp/src/project-deviation
                 #:deviation-item
                 #:deviation-report-line
@@ -78,30 +86,30 @@
                 #:git-command-error
                 #:git-command-error-exit-code)
   (:import-from #:dsmr-mcp/src/project-scaffold-core
-                #:invalid-argument-error))
+                #:invalid-argument-error)
+  (:export #:+accepted-dispositions+
+           #:disposition-argument
+           #:disposition-question-result
+           #:disposition-refusal-result))
 
 (in-package #:dsmr-mcp/src/tools/project-doctor)
 
 ;;; ---------------------------------------------------------------------------
-;;; The answers the classification question accepts
+;;; The answers the disposition question accepts
 ;;; ---------------------------------------------------------------------------
 
-(defvar +accepted-classifications+
-  (vector "ours" "foreign-with-upstream" "foreign-orphan")
-  "The answers the classification question offers, in the order it offers them.
+(defvar +accepted-dispositions+
+  (vector "ours" "contributing" "forked")
+  "The answers the disposition question offers, in the order it offers them.
 
-A simple-vector so it encodes as a JSON array rather than as null when it is
-empty of nothing at all.
+A simple-vector so it encodes as a JSON array.
 
-⚠ This vector and the classification property's enum in the schema below must
-name the same three answers. They are written out twice because the schema is a
-class-allocated literal and cannot read a variable, and the tool test asserts
-that the answers the verb advertises are exactly the ones the schema accepts, so
-a drift between them fails rather than producing a question whose answer is
-refused.
+⚠ This vector and the disposition property's enum in the schema below must
+name the same three answers. The schema is a class-allocated literal and cannot
+read a variable; the tool test asserts the two agree.
 
-Named as a constant and defined with DEFVAR: DEFCONSTANT on a vector
-re-evaluates to a fresh, non-EQL object on reload and breaks a warm image.")
+DEFVAR rather than DEFCONSTANT: DEFCONSTANT on a vector re-evaluates to a
+fresh, non-EQL object on reload and breaks a warm image.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; The verb
@@ -116,14 +124,19 @@ re-evaluates to a fresh, non-EQL object on reload and breaks a warm image.")
     :initform "Normalize an existing repository into the project shape without \
 destroying what is there. Assesses by default and writes nothing; repairs, \
 records as debt, or accepts a deviation as deliberate only when a policy says \
-so, and reports every change separately from what was already correct. In a \
-repository we do not own, the lint gate it installs reports the findings in the \
-forms a commit changes and never refuses the commit; in our own repositories \
-and declared hard forks it refuses a commit whose changed forms carry a warning \
-or an error. A \
-repository that cannot be told apart from one of ours is not guessed at: the \
-call returns the question, the origin it found and the answers it accepts, and \
-a second call carries the answer.")
+so, and reports every change separately from what was already correct. The \
+repository's disposition (ours, contributing, or forked) is read from its \
+untracked .envrc. With none recorded the call returns the question, the three \
+answers, and what each means, and writes nothing; a second call carries the \
+answer in disposition, and a writing run records it. For contributing the lint \
+gate reports the findings in the forms a commit changes and never refuses the \
+commit; for ours and forked it refuses a commit whose changed forms carry a \
+warning or an error. A forked repository is held to everything a repository of \
+ours is, with our agent and lint files tracked, except that it keeps the \
+licence it came with and no licence text is written. Under every disposition \
+the gate appends every finding it shows to \
+lisp-gate/findings.tsv under the git common directory, classed functional or style \
+from the linter's rule category.")
    (dsmr-mcp/src/tools/base::input-schema
     :allocation :class
     :initform '(:object
@@ -133,18 +146,19 @@ a second call carries the answer.")
                   :description "Repository directory, relative to the session \
 root. Defaults to the session root itself. Must resolve inside the session \
 root.")
-                 (classification
+                 (disposition
                   :type :string
-                  :enum ("ours" "foreign-with-upstream" "foreign-orphan")
-                  :description "The answer to the classification question, when \
-the repository cannot be told apart from one of ours. Supplied by the operator \
-and never inferred: guessing that somebody else's software is ours is how our \
-tooling ends up tracked in their tree.")
+                  :enum ("ours" "contributing" "forked")
+                  :description "What the repository is, when its .envrc records \
+nothing: ours, code originating with the operator; contributing, a third-party \
+project the operator only contributes to; forked, forked to shorten the \
+acceptance chain or because upstream is unmaintained. A writing run records it \
+in .envrc. Refused when it differs from the recorded value.")
                  (upstream_url
                   :type :string
                   :description "The upstream this repository was forked from. \
-Answers the classification question and records the missing remote at the same \
-time. Ignored when an upstream is already recorded.")
+Recorded as the upstream remote when none is recorded; it decides nothing about \
+the disposition.")
                  (policy
                   :type :string
                   :enum ("repair" "record-as-debt" "accept-as-deliberate")
@@ -161,8 +175,8 @@ report has the same shape either way."))
 Mode-independent (dispatcher-side). No-root guard at entry: call
 fs-set-project-root first, and every path is resolved through the write jail.
 
-Assessment is the default and it writes nothing. An ambiguous classification is
-returned as a question with the answers it accepts, never resolved by a guess."))
+Assessment is the default and it writes nothing. A repository with no recorded
+disposition is returned as a question with the answers it accepts."))
 
 (c2mop:ensure-finalized (find-class 'project-doctor-tool))
 
@@ -261,19 +275,34 @@ without reading the repository."
                 "action_taken" (or (%name-string (getf remote :action-taken))
                                    'null))))
 
+(defun %source-string (source)
+  "Return the wire form of a disposition SOURCE: \"argument\" or the file's path."
+  (if (eq source :argument) "argument" (%path-string source)))
+
+(defun %recorded-hash (recorded)
+  "Return the wire hash for the disposition record plist RECORDED, or NIL."
+  (and recorded
+       (make-ht "path"         (or (%path-string (getf recorded :path)) 'null)
+                "disposition"  (or (%name-string (getf recorded :disposition))
+                                   'null)
+                "action_taken" (or (%name-string (getf recorded :action-taken))
+                                   'null))))
+
 (defun %summary-text (report policy)
   "Return the prose summary of REPORT under POLICY."
-  (format nil "project-doctor over ~A: classified ~A, assessed as ~A.~%~
+  (format nil "project-doctor over ~A: disposition ~A (~A), assessed as ~A.~%~
 ~D changed, ~D already correct, ~D recorded as debt, ~D accepted, ~D unresolved.~
-~@[~%~A~]~@[~%~A~]"
+~{~%Warning: ~A~}~@[~%~A~]~@[~%~A~]"
           (%path-string (report-root report))
-          (%name-string (report-classification report))
+          (%name-string (report-disposition report))
+          (%source-string (report-disposition-source report))
           (%name-string (report-profile report))
           (length (report-changed report))
           (length (report-already-correct report))
           (length (report-recorded-debt report))
           (length (report-accepted report))
           (length (report-unresolved report))
+          (report-warnings report)
           (when (report-dry-run report)
             "This was a dry run. Nothing was written.")
           (unless policy
@@ -283,7 +312,14 @@ carries the outcomes it admits. Call again with policy set to act on them.")))
 (defun %success-result (id report policy)
   "Return the JSON-RPC result for a completed run described by REPORT."
   (result id
-          (make-ht "classification"  (%name-string (report-classification report))
+          (make-ht "disposition"     (%name-string (report-disposition report))
+                   "disposition_source" (%source-string
+                                         (report-disposition-source report))
+                   "disposition_recorded" (or (%recorded-hash
+                                               (report-disposition-recorded report))
+                                              'null)
+                   "warnings"        (coerce (report-warnings report)
+                                             'simple-vector)
                    "profile"         (%name-string (report-profile report))
                    "path"            (%path-string (report-root report))
                    "changed"         (%entries (report-changed report))
@@ -307,30 +343,25 @@ carries the outcomes it admits. Call again with policy set to act on them.")))
 ;;; Reading the arguments
 ;;; ---------------------------------------------------------------------------
 
-(defun %classification-keyword (value)
-  "Return the classification keyword VALUE names.
+(defun disposition-argument (value)
+  "Return the disposition keyword VALUE names.
 
-Three values are recognized and nothing else. NIL means the caller did not
-answer, which is a different thing from answering wrongly, so it returns NIL and
-:INVALID is reserved for a value that was supplied and is not one of the answers
-this verb offers.
-
-The comparison is explicit rather than a conversion from the caller's string,
-because a conversion would let a caller reach a value the enum never offered and
-the failure would land inside the doctor rather than here."
-  (cond ((null value)                             nil)
-        ((not (stringp value))                    :invalid)
-        ((string= value "ours")                   :ours)
-        ((string= value "foreign-with-upstream")  :foreign-with-upstream)
-        ((string= value "foreign-orphan")         :foreign-orphan)
-        (t                                        :invalid)))
+NIL means the caller did not answer and returns NIL. :INVALID is a supplied
+value that is not one of the answers offered. The comparison is explicit, so no
+caller string becomes a keyword the enum never offered."
+  (cond ((null value)                    nil)
+        ((not (stringp value))           :invalid)
+        ((string= value "ours")          :ours)
+        ((string= value "contributing")  :contributing)
+        ((string= value "forked")        :forked)
+        (t                               :invalid)))
 
 (defun %policy-keyword (value)
   "Return the policy keyword VALUE names.
 
 NIL means assess only, which is the default call. :INVALID means a value was
 supplied that is not one of the three outcomes. Explicit for the same reason
-%CLASSIFICATION-KEYWORD is."
+DISPOSITION-ARGUMENT is."
   (cond ((null value)                             nil)
         ((not (stringp value))                    :invalid)
         ((string= value "repair")                 :repair)
@@ -356,6 +387,56 @@ parent symlink cannot carry a run out of the tree it was asked about."
                       "error_type" "invalid-argument"
                       "content" (text-content message))))
 
+(defun disposition-refusal-result (id error-type condition verb)
+  "Return the JSON-RPC result for a disposition refusal of ERROR-TYPE by the tool
+named VERB, carrying CONDITION's report and the statement that nothing was
+written."
+  (result id (make-ht "isError" t
+                      "error_type" error-type
+                      "content"
+                      (text-content
+                       (format nil "~A refused and has written nothing.~%~A"
+                               verb (princ-to-string condition))))))
+
+(defun %meanings-hash ()
+  "Return a hash of each accepted disposition's name to what declaring it means."
+  (let ((hash (make-hash-table :test 'equal)))
+    (dolist (entry +disposition-meanings+ hash)
+      (setf (gethash (disposition-name (car entry)) hash) (cdr entry)))))
+
+(defun disposition-question-result (id condition verb)
+  "Return the JSON-RPC result asking for a disposition, for CONDITION, a
+PROJECT-DISPOSITION-REQUIRED signalled under the tool named VERB.
+
+The result carries the three answers, what each means, and the remotes found as
+facts, and says that nothing was written and that VERB takes the answer."
+  (result id
+          (make-ht "isError" t
+                   "error_type" "project-disposition-required"
+                   "requires_disposition" t
+                   "directory"
+                   (or (%path-string (disposition-required-directory condition))
+                       'null)
+                   "origin_url"
+                   (or (disposition-required-origin-url condition) 'null)
+                   "upstream_url"
+                   (or (disposition-required-upstream-url condition) 'null)
+                   "accepted_dispositions" +accepted-dispositions+
+                   "disposition_meanings" (%meanings-hash)
+                   "content"
+                   (text-content
+                    (format nil "~A is asking, not failing, and it has written \
+nothing.~%~A~%~{~A~%~}Call ~A again with disposition set to one of those. The \
+remotes are reported as facts and decide nothing."
+                            verb
+                            (princ-to-string condition)
+                            (mapcar (lambda (entry)
+                                      (format nil "  ~A: ~A"
+                                              (disposition-name (car entry))
+                                              (cdr entry)))
+                                    +disposition-meanings+)
+                            verb)))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; The call
 ;;; ---------------------------------------------------------------------------
@@ -374,7 +455,7 @@ parent symlink cannot carry a run out of the tree it was asked about."
                             (text-content "project-doctor: no project root set. \
 Call fs-set-project-root first.")))))
     (let ((path-arg           (gethash "path" args))
-          (classification-arg (gethash "classification" args))
+          (disposition-arg    (gethash "disposition" args))
           (upstream-arg       (gethash "upstream_url" args))
           (policy-arg         (gethash "policy" args))
           (dry-run            (and (gethash "dry_run" args) t)))
@@ -384,14 +465,14 @@ Call fs-set-project-root first.")))))
       (when (and upstream-arg (not (stringp upstream-arg)))
         (return-from tool-handle
           (%invalid-argument id "project-doctor: upstream_url must be a string.")))
-      (let ((classification (%classification-keyword classification-arg))
-            (policy         (%policy-keyword policy-arg)))
-        (when (eq classification :invalid)
+      (let ((disposition (disposition-argument disposition-arg))
+            (policy      (%policy-keyword policy-arg)))
+        (when (eq disposition :invalid)
           (return-from tool-handle
             (%invalid-argument
              id
-             (format nil "project-doctor: classification must be one of ~{~A~^, ~}."
-                     (coerce +accepted-classifications+ 'list)))))
+             (format nil "project-doctor: disposition must be one of ~{~A~^, ~}."
+                     (coerce +accepted-dispositions+ 'list)))))
         (when (eq policy :invalid)
           (return-from tool-handle
             (%invalid-argument
@@ -413,40 +494,26 @@ outside the session root and was not read."
                                (normalise-repository
                                 target
                                 :policy policy
-                                :declared-classification classification
+                                :disposition disposition
                                 :upstream-url upstream-arg
                                 :dry-run dry-run
                                 :session-root root)
                                policy)
 
-            ;; The question. Not a failure: this is the most common outcome for
-            ;; a repository whose origin is ours, and the answer is one field on
-            ;; the next call. Nothing has been written at this point.
-            (repo-classification-ambiguous-error (condition)
-              (result id
-                      (make-ht "isError" t
-                               "error_type" "repo-classification-required"
-                               "requires_classification" t
-                               "directory"
-                               (or (%path-string
-                                    (repo-classification-ambiguous-directory
-                                     condition))
-                                   'null)
-                               "origin_url"
-                               (or (repo-classification-ambiguous-origin-url
-                                    condition)
-                                   'null)
-                               "accepted_classifications"
-                               +accepted-classifications+
-                               "content"
-                               (text-content
-                                (format nil "project-doctor is asking, not \
-failing, and it has written nothing.~%~A~%Call project-doctor again with \
-classification set to one of ~{~A~^, ~}. Supplying upstream_url instead answers \
-the same question and records the missing remote at the same time."
-                                        (princ-to-string condition)
-                                        (coerce +accepted-classifications+
-                                                'list))))))
+            ;; The question. Not a failure: the answer is one field on the next
+            ;; call. Nothing has been written at this point.
+            (project-disposition-required (condition)
+              (disposition-question-result id condition "project-doctor"))
+
+            (project-disposition-conflict (condition)
+              (disposition-refusal-result
+               id "project-disposition-conflict" condition "project-doctor"))
+            (project-disposition-unreadable (condition)
+              (disposition-refusal-result
+               id "project-disposition-unreadable" condition "project-doctor"))
+            (project-disposition-not-recordable (condition)
+              (disposition-refusal-result
+               id "project-disposition-not-recordable" condition "project-doctor"))
 
             (not-a-repository-error (condition)
               (result id (make-ht "isError" t

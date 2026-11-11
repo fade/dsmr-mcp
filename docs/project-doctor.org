@@ -29,7 +29,7 @@ So the feature has two halves that must not be confused:
 
 ** The surface
 
-One verb, =project-doctor=. It takes a repository path, an optional classification answer, an
+One verb, =project-doctor=. It takes a repository path, an optional disposition answer, an
 optional upstream URL, and an optional policy. *With no policy it assesses and writes nothing*,
 and =dry_run= reports the same shape without writing. Repairing a difference, recording it as
 debt, or accepting it as deliberate each require the caller to say so.
@@ -52,38 +52,72 @@ no repository has one without the other. The gate was arriving with the scaffold
 
 * The design
 
-** Classification comes first, because guessing is unsafe in one direction
+** The disposition comes first, and I declare it
 
-Nothing else can be decided until we know whether a repository is ours. Guessing "ours" is the
+Nothing else can be decided until we know what a repository is to us. Guessing "ours" is the
 dangerous answer: it is what would let our tooling become tracked content in somebody else's
-project.
+project. So I declare it once, when a project is first tooled, as one of three dispositions:
 
-There are three terminal answers and one non-answer:
+- *ours*: code that originates with me.
+- *contributing*: a third-party project I only contribute to.
+- *forked*: somebody else's project that I forked, to shorten the acceptance chain or because
+  its upstream is unmaintained. =zebra= and =boomer= are forked; our =parachute=, kept so that
+  patches can go back upstream, is contributing.
 
-- *ours*
-- *foreign, with a live upstream*
-- *foreign orphan*, which is a legitimate outcome and not a defect. Plenty of unmaintained
-  Common Lisp projects are still solid software, and an absent upstream is not drift to repair.
-- *ambiguous*, which signals and asks rather than defaulting.
+A fork is one I take ownership of, so it matches a project of ours in every respect but one: it
+keeps the licence it came with, and no licence text is ever written into it. Our agent and lint
+files are tracked there as they are in my own projects, and the gate refuses a commit the same
+way.
 
-The obvious discriminator is wrong, and measurably so. Checking for an =upstream= remote
-misclassifies raw third-party clones as ours, because a clone taken straight from the canonical
-source has its origin pointing at the third party and no upstream remote at all. Ownership of
-=origin= is the necessary test.
+Remotes cannot decide it. Adoption forks the upstream under my own account and clones the fork,
+so =origin= points at my account for third-party code exactly as it does for my own. Even before
+that, the remotes left the question open for most of our own origins: across 251 repositories in
+=$LISP_WORKSPACE=, 68 of the 90 with an origin of ours had no upstream and could have been either.
+Licence files and author marks are no more reliable. Remotes now produce warnings and
+nothing else: you are told when a project declared ours has an =upstream= remote, or when one
+declared contributing has none, and the disposition stands either way.
 
-Even that is not sufficient, and the residue is not an edge case. Measured across 251
-repositories in =$LISP_WORKSPACE=:
+*** Where the declaration lives
 
-| bucket                                             | count |
-|----------------------------------------------------+-------|
-| origin is third-party, unambiguously foreign       |   161 |
-| origin ours with an upstream, unambiguously a fork  |    22 |
-| *origin ours, no upstream, genuinely ambiguous*    |  *68* |
+The declaration is one line in the project's =.envrc=:
 
-Among repositories that look like ours, the ambiguous case outnumbers the certain one three to
-one. So asking is the normal path, not a fallback, and the design treats it that way: the verb
-returns the question along with the answers it will accept, and a second call carries the
-decision.
+#+begin_src sh
+export DSMR_PROJECT_DISPOSITION=contributing
+#+end_src
+
+I keep it there so that it is answered once, when the project is tooled, and never becomes a
+recurring question. =.envrc= goes into =.git/info/exclude= before the line is written, so the
+file never reaches the tracked tree, and the doctor records nothing into an =.envrc= that is
+already tracked. Every other line of the file stays as it was.
+
+When a repository has no declaration, =project-doctor= returns the question, with the three
+answers and what each means, and writes nothing. You answer by calling it again with
+=disposition=. An assessment or a dry run uses your answer for that run only; a run with a policy
+records it, and every later run reads it from the file and asks nothing.
+
+The doctor reads =.envrc= as text and never sources it, and it never takes the value from the
+server's own environment, which belongs to whatever directory the server was started in. The
+value must be one of the three names, optionally quoted. Anything else, a shell expansion
+included, is refused as unreadable, and so are two declarations that disagree.
+
+Only the single-assignment form is read: =NAME=value=, optionally after =export= and blanks. A
+line that assigns several variables, or uses =declare -x=, declares nothing, and you are asked.
+
+The disposition is one per repository, because the gate and the findings record are shared by
+all its worktrees. The main worktree's =.envrc= holds it, and every worktree reads it from there.
+A recording made from a linked worktree is written into the main worktree's =.envrc=, and only
+when that file lies inside the session root; otherwise you are refused with the file named, and
+you record it from the main worktree. A linked worktree's own declaration still counts: when any
+two worktrees' declarations differ, you are refused with both files named. A refusal of this kind
+arrives before the doctor writes anything, so a refused run has changed nothing.
+
+Recording keeps the =.envrc='s permission bits and, where the server may set it, its owner, so a
+=0600= file holding a token stays =0600=. A file in any encoding is read and written back byte for
+byte.
+
+The doctor never rewrites a declaration, and an answer that differs from the recorded one is
+refused. To change the disposition, edit the line and run a repair: the gate is rendered again
+for the new value.
 
 ** One definition of shape, read by both the scaffold and the verb
 
@@ -145,15 +179,16 @@ way. Only the ordering check can see the interval.
 
 * The rules adoption follows
 
-** A repository we do not own is assessed only against our apparatus
+** A project we contribute to is assessed only against our apparatus
 
 Beyond installing the git-invisible components of our own apparatus, the doctor does not alter
-the structure of an adopted project in any way. A flat library with its sources at the top level
+the structure of a project declared contributing in any way. A flat library with its sources at the top level
 and a =test/= directory is not missing anything we would supply.
 
 The rule is encoded on whether a catalogue entry is apparatus, not on which tier it sits in,
 because apparatus spans two tiers: a tier-based rule would silently drop =AGENTS.md=, =CLAUDE.md=,
-and =.envrc=, and would let a future non-apparatus entry added to the gate tier start leaking.
+the REPL-development guide, and =.envrc=, and would let a future non-apparatus entry added to the
+gate tier start leaking.
 
 I settled this after an earlier version wrote =src/main.lisp= and =tests/main-test.lisp= into
 =cl-ppcre=, leaving two untracked entries of ours in a third party's status, carrying an AGPL
@@ -165,37 +200,84 @@ that a repair writes nothing but apparatus fails against the old behaviour.
 ** Adoption leaves the licence alone
 
 Adopting a project is agreeing to contribute to it on its own terms, so I made adoption write no
-licence file, no licence header, and no licence text into a repository we do not own, and change
-none that is there. The lint script and the gate installed in such a repository carry no licence
-line at all. You can run the doctor over a third party's tree and every licence byte in it stays
-where it was.
+licence file, no licence header, and no licence text into a project declared contributing or
+forked, and change none that is there. A forked project keeps the licence it came with. The lint
+script and the gate installed in such a repository carry no licence line at all. You can run the
+doctor over a third party's tree and every licence byte in it stays where it was.
 
-A project the scaffold creates is ours, and its lint script names the licence you chose for it.
+A project the scaffold creates is ours: when the scaffold initialises the repository itself, it
+records the disposition ours, and its lint script names the licence you chose for it.
 
-** A hard fork is declared, never inferred
+When I adopt a project that already has a repository checked out, the scaffold asks first. With
+no disposition recorded in that repository, =project-scaffold= returns the same question the
+doctor does, with the three answers and what each means, and writes nothing. Call it again with
+=disposition= and the answer goes into that repository's =.envrc= before the project is written.
+A repository the scaffold creates takes only ours, and with =init_git= false outside every
+repository there is nowhere to record a disposition, so none is recorded.
 
-Some repositories began as somebody else's work and are now ours to develop on our own terms.
-Those are hard forks, and they are declared by name in one list in the classifier, changed only
-by a reviewed commit. =zebra= and =boomer= are declared today. A declared hard fork classifies as
-ours whatever its remotes say. A fork we keep in order to contribute upstream, such as our
-=parachute=, is not a hard fork and stays foreign.
+The answer then governs what the scaffold writes there. In a repository declared contributing or
+forked, the project carries no licence text at all, whatever =license= says: no =LICENSE=, and no
+SPDX line, =:license= entry, or License section in any file. The result says so. The apparatus
+paths the disposition keeps out of the index (for contributing, =CLAUDE.md=, =AGENTS.md=,
+=prompts/repl-driven-development.md=, =.mallet.lisp=, =scripts/lint-lisp.sh=, and =.envrc=; for
+forked, only =.envrc=, as in a project of ours) go into that repository's
+=.git/info/exclude=, anchored under the new project, before any of its files is written. If the
+scaffold fails after it recorded the disposition or changed the exclude, the error names those
+writes, so you know the repository changed.
 
-I made this a declaration because no remote layout distinguishes the two: a hard fork and a
-contributing fork can carry identical remotes, and only the intent differs.
-
-** The lint gate reports in a repository we adopt and refuses in our own
+** The lint gate reports in a project we contribute to and refuses in our own
 
 The gate lints the top-level forms a commit touches, and nothing else. Findings in forms and files
 the commit leaves alone are not reported.
 
-- *In a repository we adopt* the gate reports the findings inside the touched forms and never
-  refuses the commit. Third-party code carries findings we did not write (=cl-ppcre= arrives with
-  93 findings across its 23 sources), and a gate that refused over those would refuse the first patch we
-  offer upstream. What I want there is to know about defects near our own edits, and you see
-  those in the commit's output while the commit proceeds.
-- *In our own repositories and declared hard forks* the same gate refuses a commit when a form it
-  touches carries a warning or an error, or when the linter is missing or cannot lint a staged
-  file. A finding that was already there in a form you did not touch never blocks you.
+- *In a project declared contributing* the gate reports the findings inside the touched forms
+  and never refuses the commit. Third-party code carries findings we did not write (=cl-ppcre=
+  arrives with 93 findings across its 23 sources), and a gate that refused over those would
+  refuse the first patch we offer upstream. What I want there is to know about defects near our
+  own edits, and you see those in the commit's output while the commit proceeds.
+- *In a project declared ours or forked* the same gate refuses a commit when a form it touches
+  carries a warning or an error, or when the linter is missing or cannot lint a staged file. A
+  finding that was already there in a form you did not touch never blocks you.
+
+The mode is fixed when the doctor or the scaffold renders the gate. The gate reads neither
+=.envrc= nor the environment to find it, so it behaves the same whether or not direnv is loaded.
+A gate rendered for one mode reads as stale once the declaration changes to or from contributing,
+and a repair renders it again.
+
+** Every finding the gate shows is recorded
+
+A break in function is always in scope for repair. Style is not, in a project I only contribute
+to, but I still want every lint result I have seen tracked. So the gate appends each finding it
+shows to =lisp-gate/findings.tsv= under the git common directory: one row per finding per
+run, never deduplicated, shared by every worktree, and never tracked. Each row carries the time,
+the gate's mode, the worktree and branch the commit was made in, the class, mallet's category,
+the severity, the rule, the path, the line and column, and the message. A closing line after the
+findings gives the record's path and the count in each class.
+
+Commits in several worktrees at once append under a lock, =flock(1)= where it is installed and a
+lock directory beside the record otherwise, so the header is written once and rows never
+interleave. The category is read from mallet's JSON whatever order its keys arrive in. A record
+that cannot be written or locked within about ten seconds costs you one notice line, never the
+commit.
+
+The class comes from the category mallet assigns each rule:
+
+| mallet category                                        | class        |
+|--------------------------------------------------------+--------------|
+| correctness, suspicious, practice                      | functional   |
+| cleanliness, style, format, metrics                    | style        |
+| anything else, or a category that could not be read    | unclassified |
+
+Severity cannot make this split. Over =cl-ppcre= mallet reports trailing whitespace and unused
+variables as warnings, and a lambda list mixing =&optional= with =&key= as an error. Over our
+own sources with every rule enabled, its suspicious and practice findings are warnings too. A
+split by severity would put trailing whitespace beside real defects. Practice counts as
+functional even though mallet describes such code as working. The table is one line at the top of
+the gate.
+
+Recording never changes whether a commit proceeds. A finding is recorded the same way whether it
+refuses the commit or not, and when the record cannot be written you get one line saying so and
+the same exit status you would have had.
 
 A new project of ours is created with the gate in place: the scaffold writes the linter config,
 the lint script, and the gate, and wires the gate when it creates the repository.
@@ -215,7 +297,7 @@ this work.
 |----------------------------------+-----------------------------------------------------------------------|
 | =src/git.lisp=                   | typed subprocess access to git; failures signal rather than returning nil |
 | =src/template-render.lisp=       | template substitution, split out to keep the catalogue and the scaffold from depending on each other |
-| =src/repo-classify.lisp=         | ours / foreign / orphan / ambiguous, from the remotes and the hard-fork declaration |
+| =src/repo-classify.lisp=         | the declared disposition: reading it from =.envrc=, recording it, and warning where the remotes disagree |
 | =src/project-shape.lisp=         | what a shape entry is, and what may be said about it                   |
 | =src/project-shape-catalog.lisp= | the entries themselves, and which are assessed for which kind of repository |
 | =src/project-exclude.lisp=       | reading the exclude template, merging, and repairing with a backup      |
@@ -225,7 +307,7 @@ this work.
 | =src/project-hook.lisp=          | wiring the gate into git's configured hooks                            |
 | =src/project-assess.lisp=        | read-only: what differs, writing nothing                               |
 | =src/project-doctor.lisp=        | the engine that applies a policy and reports what it did               |
-| =templates/lisp-gate.sh=         | the gate itself, rendered informational or blocking                    |
+| =templates/lisp-gate.sh=         | the gate itself, rendered informational or blocking, and its findings record |
 | =src/tools/project-doctor.lisp=  | the request surface                                                  |
 
 The scaffold was changed to read the catalogue rather than hold its own copy, to make a new project
@@ -286,10 +368,14 @@ already holds a finding, the gate reported that one finding, out of the ten in t
 commit proceeded; a planted =ignore-errors= in the same form appeared beside it, and the commit
 still proceeded.
 
-The classifier answers ours for =zebra= and =boomer= and foreign for =parachute=, and reading them
-changed none of the three. A project created through the scaffold carries the linter config, the
-lint script, and a wired, blocking gate; its generated files pass that gate, and a planted
-=ignore-errors= is refused.
+A project created through the scaffold records the disposition ours and carries the linter
+config, the lint script, and a wired, blocking gate; its generated files pass that gate, and a
+planted =ignore-errors= is refused.
+
+The findings record was checked against mallet's own output, recorded for a file planted with one
+finding each in the correctness, format, and style categories: the rows match it field for field,
+in both modes, across two runs and from a linked worktree. With the JSON run made to fail, every
+row is unclassified and the gate's output and exit status are unchanged.
 
 Both cold suites, =make test= and =make test-integration=, pass on every test this feature adds or
 changes. The two are separate commands because =make test= does not walk =tests/integration/=.
@@ -300,7 +386,7 @@ The checks that need a running server on a rebuilt image have not been done, bec
 a rebuilt image and a reconnect.
 
 Separately, whether a client rejects a prompt carrying a required field is still untested.
-Nothing in this design depends on the answer, because the classification question crosses the
+Nothing in this design depends on the answer, because the disposition question crosses the
 wire as an ordinary result answered by an ordinary follow-up call, but it is unverified.
 
 * Size
@@ -312,8 +398,9 @@ Roughly half is tests and fixtures, and that is where the value showed up: every
 found was found by a check that had been proven able to fail. The one defect the suite missed was
 the layout write described above, which no check was positioned to see.
 
-The classification module is larger than expected because the obvious discriminator is wrong and
-the ambiguous case turned out to be the common one. That was not knowable in advance.
+The disposition module reads and records a declaration instead of inferring one. I tried
+inference first, and the ambiguous case turned out to be the common one. That was not knowable in
+advance.
 
 The part that could reasonably be smaller is the separation between assessment, deviation types,
 debt recording, and the engine. Those are four modules that could have been two. They were kept

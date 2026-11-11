@@ -38,6 +38,8 @@
                 #:plan-scaffold)
   (:import-from #:dsmr-mcp/src/project-scaffold
                 #:write-scaffold)
+  (:import-from #:dsmr-mcp/src/repo-classify
+                #:project-disposition-required)
   (:import-from #:dsmr-mcp/src/project-debt
                 #:render-pre-commit-hook)
   (:import-from #:dsmr-mcp/src/project-gate-scan
@@ -186,7 +188,7 @@ report saying so is the thing that would otherwise be taken on trust, so the
 git directory's absence is also asserted directly: a report wired to answer NIL
 would satisfy the first assertion and not the second."
   (with-temp-git-repo (root :initial-file "README" :initial-content "enclosing")
-    (let* ((outcome (scaffold-into root))
+    (let* ((outcome (scaffold-into root :disposition :contributing))
            (project (project-directory outcome)))
       (false (getf outcome :git-initialised)
              "write-scaffold reported initializing a nested repository")
@@ -206,7 +208,7 @@ is asserted to have moved."
   (with-temp-git-repo (root :initial-file "README" :initial-content "enclosing")
     (let ((before (git-head-sha root)))
       (true before "the fixture repository has no commit to compare against")
-      (scaffold-into root)
+      (scaffold-into root :disposition :contributing)
       (is equal before (git-head-sha root)
           "scaffolding moved the enclosing repository's head")
       (is equal (list "?? scaffolds/") (git-status-porcelain root)
@@ -216,6 +218,152 @@ is asserted to have moved."
                            :message "prove the head reading moves")
       (false (equal before (git-head-sha root))
              "the head reading did not move across a real commit, so the assertion above proves nothing"))))
+
+(defun %file-text (path)
+  "Return the text of PATH, or NIL when it does not exist."
+  (when (probe-file path) (uiop:read-file-string path)))
+
+(define-test scaffolding-into-an-existing-repository-asks-first
+  "With no disposition recorded and none supplied, a scaffold into an existing
+repository signals PROJECT-DISPOSITION-REQUIRED and writes nothing: no project
+directory, no .envrc, and the local exclude as it was. The same holds with
+init-git NIL."
+  (dolist (init-git '(t nil))
+    (with-temp-git-repo (root :initial-file "README" :initial-content "enclosing")
+      (let* ((exclude (merge-pathnames ".git/info/exclude" root))
+             (before (%file-text exclude))
+             (outcome (handler-case (scaffold-into root :init-git init-git)
+                        (project-disposition-required () :asked))))
+        (is eq :asked outcome "init-git ~A: the scaffold asks: ~S" init-git outcome)
+        (false (probe-file (merge-pathnames
+                            (format nil "scaffolds/~A/" *sample-name*) root))
+               "init-git ~A: no project directory was written" init-git)
+        (false (probe-file (merge-pathnames ".envrc" root))
+               "init-git ~A: no .envrc was written" init-git)
+        (is equal before (%file-text exclude)
+            "init-git ~A: the local exclude is unchanged" init-git)))))
+
+(define-test an-answer-is-recorded-in-the-existing-repository-then-scaffolded
+  "Answered, the scaffold records the disposition in the enclosing repository's
+.envrc, lists .envrc in its local exclude, writes the project, and reports the
+record. A second scaffold into the same repository asks nothing and reports
+the declaration already present."
+  (with-temp-git-repo (root :initial-file "README" :initial-content "enclosing")
+    (let* ((outcome (scaffold-into root :disposition :forked :init-git nil))
+           (recorded (getf outcome :disposition))
+           (envrc (%file-text (merge-pathnames ".envrc" root))))
+      (is eq :forked (getf recorded :disposition) "~S" recorded)
+      (is eq :created (getf recorded :action-taken) "~S" recorded)
+      (true (and envrc (search "export DSMR_PROJECT_DISPOSITION=forked" envrc))
+            "the enclosing .envrc declares forked: ~S" envrc)
+      (true (search (format nil "~%.envrc~%")
+                    (format nil "~%~A" (%file-text (merge-pathnames ".git/info/exclude"
+                                                                     root))))
+            "the local exclude lists .envrc")
+      (true (probe-file (merge-pathnames "README.md" (project-directory outcome)))
+            "the project was written")
+      (is equal (list "?? scaffolds/") (git-status-porcelain root)
+          "only the new project shows in git status"))
+    (let* ((*sample-name* "shape-parity-second")
+           (again (getf (scaffold-into root :init-git nil) :disposition)))
+      (is eq :forked (getf again :disposition) "~S" again)
+      (is eq :already-present (getf again :action-taken) "~S" again))))
+
+(define-test a-repository-the-scaffold-creates-takes-no-other-disposition
+  "A repository the scaffold creates is ours. Supplying another disposition is
+refused before anything is written; supplying ours is accepted and recorded."
+  (with-temp-project-root (session root)
+    (true (handler-case (progn (scaffold-into root :disposition :contributing) nil)
+            (dsmr-mcp/src/project-scaffold-core:invalid-argument-error () t))
+          "contributing is refused for a repository the scaffold creates")
+    (false (probe-file (merge-pathnames (format nil "scaffolds/~A/" *sample-name*)
+                                        root))
+           "nothing was written")
+    (let ((recorded (getf (scaffold-into root :disposition :ours) :disposition)))
+      (is eq :ours (getf recorded :disposition) "~S" recorded))))
+
+(defun %licence-text-in (project)
+  "Return the relative paths of the files under PROJECT that carry licence text:
+a LICENSE file, an SPDX identifier, a :license line, or a License heading."
+  (let ((found '()))
+    (dolist (file (directory (merge-pathnames "**/*.*" project))
+                  (sort found #'string<))
+      (when (uiop:file-pathname-p file)
+        (let ((text (uiop:read-file-string file))
+              (relative (enough-namestring file project)))
+          (when (or (string= "LICENSE" (file-namestring file))
+                    (search "SPDX-License-Identifier" text)
+                    (search ":license" text)
+                    (search "## License" text))
+            (push relative found)))))))
+
+(define-test a-contributing-repository-gets-no-licence-and-no-tracked-apparatus
+  "Inside a repository declared contributing, the scaffold writes no licence
+text at all, and every apparatus file it writes is excluded rather than left
+for the next commit: git status lists the project's own sources and none of
+CLAUDE.md, AGENTS.md, prompts/repl-driven-development.md, .mallet.lisp,
+scripts/lint-lisp.sh or .envrc. The result
+says no licence was written. A project the scaffold creates is the control: it
+carries the licence it was given."
+  (with-temp-git-repo (root :initial-file "README" :initial-content "enclosing")
+    (let* ((outcome (scaffold-into root :disposition :contributing))
+           (project (project-directory outcome))
+           (status (values (run-git (list "status" "--porcelain"
+                                          "--untracked-files=all")
+                                    :directory root))))
+      (is equal '() (%licence-text-in project) "no file carries licence text")
+      (true (search "src/main.lisp" status)
+            "control: the project's own source shows in git status: ~A" status)
+      (dolist (path '("CLAUDE.md" "AGENTS.md" "prompts/repl-driven-development.md"
+                      ".mallet.lisp" "scripts/lint-lisp.sh" ".envrc"))
+        (true (probe-file (merge-pathnames path project)) "~A was written" path)
+        (false (search (format nil "/~A~%" path) status)
+               "~A is not listed by git status: ~A" path status))
+      (is eq :omitted (getf (getf outcome :licence) :action-taken)
+          "the result says no licence was written: ~S" (getf outcome :licence))))
+  (with-temp-project-root (session root)
+    (let ((project (project-directory (scaffold-into root))))
+      (true (member "LICENSE" (%licence-text-in project) :test #'string=)
+            "control: a project the scaffold creates has its LICENSE")
+      (true (member "src/main.lisp" (%licence-text-in project) :test #'string=)
+            "control: and SPDX headers"))))
+
+(define-test a-forked-repository-gets-no-licence
+  "Inside a repository declared forked, the scaffold writes no licence text: a
+fork keeps the licence it came with."
+  (with-temp-git-repo (root :initial-file "README" :initial-content "enclosing")
+    (let* ((outcome (scaffold-into root :disposition :forked))
+           (project (project-directory outcome)))
+      (is equal '() (%licence-text-in project) "no file carries licence text")
+      (true (probe-file (merge-pathnames "src/main.lisp" project))
+            "control: the project was written"))))
+
+(define-test a-failure-after-the-record-reports-the-record
+  "When the project cannot be written after the disposition was recorded in the
+enclosing repository, the failure names the .envrc it wrote, so the caller
+learns the repository changed. The project directory is not left behind."
+  (with-temp-git-repo (root :initial-file "README" :initial-content "enclosing")
+    (let ((destination (merge-pathnames "scaffolds/" root)))
+      (ensure-directories-exist destination)
+      (uiop:run-program (list "chmod" "555" (namestring destination)))
+      (unwind-protect
+           (let ((condition (handler-case (progn (scaffold-into root :disposition :forked)
+                                                 nil)
+                              (error (c) c))))
+             (true condition "the scaffold fails")
+             (is string= "SCAFFOLD-FAILED-AFTER-WRITING"
+                 (and condition (symbol-name (type-of condition)))
+                 "the failure is the one that reports earlier writes: ~A" condition)
+             (true (search (namestring (merge-pathnames ".envrc" (truename root)))
+                           (princ-to-string condition))
+                   "the failure names the .envrc it wrote: ~A" condition)
+             (true (search "DSMR_PROJECT_DISPOSITION=forked"
+                           (or (%file-text (merge-pathnames ".envrc" root)) ""))
+                   "control: the record was written")
+             (false (probe-file (merge-pathnames
+                                 (format nil "~A/" *sample-name*) destination))
+                    "no project directory was left"))
+        (uiop:run-program (list "chmod" "755" (namestring destination)))))))
 
 ;;; --- the scaffold creates the project with its lint gate --------------------
 
@@ -397,7 +545,7 @@ asserted to change, so the equality is evidence rather than a constant."
   (with-temp-git-repo (root :initial-file "README" :initial-content "enclosing")
     (let ((hooks-before (%hooks-listing root))
           (config-before (%local-config root)))
-      (let ((gate (getf (scaffold-into root) :gate-hook)))
+      (let ((gate (getf (scaffold-into root :disposition :contributing) :gate-hook)))
         (is eq :not-installed (getf gate :action-taken)
             "a gate was installed for a project inside an existing repository")
         (true (stringp (getf gate :reason))

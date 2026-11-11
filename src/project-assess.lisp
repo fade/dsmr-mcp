@@ -34,7 +34,7 @@
 ;;;; enough to decide with.
 ;;;;
 ;;;; A clean answer is distinguishable from no answer. The returned structure
-;;;; carries the classification, the profile and the keys of every item found
+;;;; carries the disposition, the profile and the keys of every item found
 ;;;; already correct, so an empty deviation list arrives with the evidence of
 ;;;; the work that produced it.
 
@@ -57,8 +57,9 @@
                 #:drifted-shape-item
                 #:foreign-apparatus-tracked)
   (:import-from #:dsmr-mcp/src/repo-classify
-                #:classify-repository
-                #:repo-profile)
+                #:resolve-disposition
+                #:disposition-profile
+                #:disposition-gate-profile)
   (:import-from #:dsmr-mcp/src/project-exclude
                 #:template-exclude-patterns
                 #:parse-exclude-patterns
@@ -79,7 +80,8 @@
            #:assessment
            #:assessment-p
            #:assessment-root
-           #:assessment-classification
+           #:assessment-disposition
+           #:assessment-disposition-source
            #:assessment-profile
            #:assessment-deviations
            #:assessment-satisfied))
@@ -191,6 +193,9 @@ repository rather than as the typo it is."
                        (:predicate assessment-p))
   "What one read-only look at a repository found.
 
+DISPOSITION is the declared disposition and DISPOSITION-SOURCE the .envrc it was
+read from, or :ARGUMENT when the caller supplied it and nothing is recorded.
+
 DEVIATIONS is a list of condition objects, possibly empty, none of them
 signalled. SATISFIED is the list of item keys found already correct.
 
@@ -198,7 +203,8 @@ SATISFIED is not decoration. Without it an empty deviation list says only that
 nothing was reported, which is equally true of a repository in perfect shape and
 of an assessment that never looked at anything."
   (root           nil :read-only t)
-  (classification nil :type keyword :read-only t)
+  (disposition    nil :type keyword :read-only t)
+  (disposition-source nil :read-only t)
   (profile        nil :type keyword :read-only t)
   (deviations     '() :type list    :read-only t)
   (satisfied      '() :type list    :read-only t))
@@ -245,17 +251,20 @@ restating any of it here would mean a revised answer had to be applied twice."
 ;;; The passes
 ;;; ---------------------------------------------------------------------------
 
-(defun %assess-group (group members root profile)
+(defun %assess-group (group members root profile &optional (gate-profile profile))
   "Return two values: one deviation or NIL, and the keys of the satisfied members.
 
 A group stands or falls together, so any unsatisfied member yields exactly one
 finding naming the group and the members that are absent. Reporting them
 separately would describe a partial install that does not occur, and would count
-one absent gate as several unrelated faults."
+one absent gate as several unrelated faults.
+
+PROFILE is the shape profile the finding names; GATE-PROFILE is the profile the
+gate script must be rendered for to count as present."
   (let ((unsatisfied '())
         (satisfied '()))
     (dolist (item members)
-      (if (item-satisfied-p item root profile)
+      (if (item-satisfied-p item root gate-profile)
           (push item satisfied)
           (push item unsatisfied)))
     (setf unsatisfied (nreverse unsatisfied)
@@ -270,7 +279,7 @@ one absent gate as several unrelated faults."
                                        group
                                        (mapcar (lambda (item)
                                                  (%unsatisfied-label item root
-                                                                     profile))
+                                                                     gate-profile))
                                                unsatisfied))))
      (mapcar #'shape-item-key satisfied))))
 
@@ -331,14 +340,13 @@ report every correctly adopted repository and miss nothing else."
 ;;; The assessment
 ;;; ---------------------------------------------------------------------------
 
-(defun assess-repository (root &key declared-classification upstream-url
-                                    (catalog *shape-catalog*))
+(defun assess-repository (root &key disposition (catalog *shape-catalog*))
   "Return an ASSESSMENT of the repository at ROOT. Writes nothing.
 
-The repository is classified first, and an ambiguous classification propagates
-unhandled. Whether a tree whose origin is ours but which records no upstream is
-our own project is not inferable from anything on disk, and answering it here
-would be a guess made where nobody can see it. The caller decides whether to ask.
+The disposition is resolved first, through RESOLVE-DISPOSITION with DISPOSITION
+as the supplied answer, and every refusal it signals propagates unhandled: the
+question when nothing is recorded or supplied, a conflict, an unreadable value.
+The profile is DISPOSITION-PROFILE of the result.
 
 Which items the profile is held to is read from the catalog. A repository we own
 is measured against its own structure and the quality gate, so one legitimately
@@ -353,39 +361,40 @@ read for apparatus that has leaked into it.
 Every finding is a condition object built and returned, never signalled, so one
 call reports everything the repository has rather than stopping at the first
 thing wrong with it."
-  (let* ((classification (classify-repository
-                          root
-                          :declared-classification declared-classification
-                          :upstream-url upstream-url))
-         (profile (repo-profile classification))
-         (items (%assessed-items catalog profile))
-         (deviations '())
-         (satisfied '()))
-    (dolist (group (%groups-in-order items))
-      (multiple-value-bind (deviation keys)
-          (%assess-group group (shape-group-items group items) root profile)
-        (when deviation
-          (push deviation deviations))
-        (dolist (key keys)
-          (push key satisfied))))
-    (dolist (item items)
-      (unless (shape-item-group item)
-        (if (item-satisfied-p item root profile)
-            (push (shape-item-key item) satisfied)
-            (push (make-condition 'missing-shape-item
-                                  :item item
-                                  :repo root
-                                  :profile profile
-                                  :detail (format nil "nothing at ~A"
-                                                  (%item-label item)))
-                  deviations))))
-    (let ((drift (%exclude-drift root profile)))
-      (when drift
-        (push drift deviations)))
-    (dolist (leak (%tracked-apparatus root profile catalog))
-      (push leak deviations))
-    (%make-assessment :root root
-                      :classification classification
-                      :profile profile
-                      :deviations (nreverse deviations)
-                      :satisfied (nreverse satisfied))))
+  (multiple-value-bind (declared source)
+      (resolve-disposition root :supplied disposition)
+    (let* ((profile (disposition-profile declared))
+           (gate-profile (disposition-gate-profile declared))
+           (items (%assessed-items catalog profile))
+           (deviations '())
+           (satisfied '()))
+      (dolist (group (%groups-in-order items))
+        (multiple-value-bind (deviation keys)
+            (%assess-group group (shape-group-items group items) root profile
+                           gate-profile)
+          (when deviation
+            (push deviation deviations))
+          (dolist (key keys)
+            (push key satisfied))))
+      (dolist (item items)
+        (unless (shape-item-group item)
+          (if (item-satisfied-p item root gate-profile)
+              (push (shape-item-key item) satisfied)
+              (push (make-condition 'missing-shape-item
+                                    :item item
+                                    :repo root
+                                    :profile profile
+                                    :detail (format nil "nothing at ~A"
+                                                    (%item-label item)))
+                    deviations))))
+      (let ((drift (%exclude-drift root profile)))
+        (when drift
+          (push drift deviations)))
+      (dolist (leak (%tracked-apparatus root profile catalog))
+        (push leak deviations))
+      (%make-assessment :root root
+                        :disposition declared
+                        :disposition-source source
+                        :profile profile
+                        :deviations (nreverse deviations)
+                        :satisfied (nreverse satisfied)))))

@@ -46,6 +46,7 @@
            #:defaulting-declaration
            #:declaration-line
            #:declared-value
+           #:declared-values
            #:declared-p
            #:ensure-declaration
            #:ensure-declaration-line
@@ -114,14 +115,21 @@ without it is still a declaration, so the prefix is optional when reading.")
 declaration of NAME. An empty right-hand side (`export NAME=`) is a declaration
 and yields the empty string, which is why the answer is NIL-or-string rather
 than a truth value. A comment line declares nothing, so a file that merely
-mentions a variable in prose is not treated as having set it."
+mentions a variable in prose is not treated as having set it.
+
+Only the single-assignment form is read: NAME=VALUE, optionally after export
+and any blanks. A line assigning several variables, or using declare -x,
+declares nothing here."
   (let ((trimmed (%trim line)))
     (when (and (plusp (length trimmed))
                (char/= (char trimmed 0) #\#))
-      (let ((rest trimmed)
-            (prefix-length (length +export-prefix+)))
+      (let* ((rest trimmed)
+             (keyword (string-right-trim " " +export-prefix+))
+             (prefix-length (1+ (length keyword))))
+        ;; export followed by any blank, as the shell reads it.
         (when (and (>= (length rest) prefix-length)
-                   (string= +export-prefix+ rest :end2 prefix-length))
+                   (string= keyword rest :end2 (1- prefix-length))
+                   (member (char rest (1- prefix-length)) '(#\Space #\Tab)))
           (setf rest (string-left-trim '(#\Space #\Tab)
                                        (subseq rest prefix-length))))
         (let ((n (length name)))
@@ -146,6 +154,18 @@ answer must say so."
 (defun declared-p (text name)
   "True when TEXT declares NAME anywhere."
   (nth-value 1 (declared-value text name)))
+
+(defun declared-values (text name)
+  "Return every expression NAME is declared to in TEXT, in file order.
+
+The whole text is searched, as for DECLARED-VALUE. Returns the empty list when
+TEXT declares NAME nowhere. A caller for which two declarations must agree reads
+all of them here, since DECLARED-VALUE answers with the first alone."
+  (let ((values '()))
+    (dolist (line (%split-text text) (nreverse values))
+      (let ((value (%declaration-value line name)))
+        (when value
+          (push value values))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Reading the managed-region markers

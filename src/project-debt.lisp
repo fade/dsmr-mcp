@@ -316,11 +316,11 @@ more than it says."
           (or (getf site :message) "")
           (%site-note site)))
 
-(defun render-debt-baseline (&key repo-name classification severity sites)
+(defun render-debt-baseline (&key repo-name disposition severity sites)
   "Return the text of the frozen quality-gate baseline for a repository.
 
-REPO-NAME names the repository, CLASSIFICATION says what kind of repository it
-was found to be, SEVERITY is the severity the gate was installed at, and SITES
+REPO-NAME names the repository, DISPOSITION is its declared disposition,
+SEVERITY is the severity the gate was installed at, and SITES
 is a list of site plists carrying :FILE :LINE :COLUMN :RULE :SEVERITY :MESSAGE
 :CALLEE-KNOWABLE :CATEGORY and :NOTE.
 
@@ -332,7 +332,7 @@ be read as a clean repository."
   (let ((rows (mapcar #'%baseline-row sites)))
     (with-output-to-string (out)
       (format out "# Quality gate baseline: ~A~%~%" (or repo-name "this repository"))
-      (format out "Repository kind: ~(~S~)~%" (or classification :unclassified))
+      (format out "Repository disposition: ~(~A~)~%" (or disposition :undeclared))
       (format out "Gate installed at severity: ~(~S~)~%" severity)
       (format out "Sites recorded: ~D~%~%" (length sites))
       (format out "These sites were present when the gate was installed. Freezing~%")

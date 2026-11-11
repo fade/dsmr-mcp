@@ -41,7 +41,10 @@
                 #:report-recorded-debt
                 #:report-accepted
                 #:report-unresolved
-                #:report-classification
+                #:report-disposition
+                #:report-disposition-source
+                #:report-disposition-recorded
+                #:report-warnings
                 #:report-profile
                 #:report-exclude
                 #:report-debt-baseline
@@ -50,6 +53,10 @@
                 #:report-head-sha-after
                 #:verify-no-tracked-apparatus
                 #:*repair-writer*)
+  (:import-from #:dsmr-mcp/src/project-assess
+                #:gate-file-state)
+  (:import-from #:dsmr-mcp/src/repo-classify
+                #:record-disposition)
   (:import-from #:dsmr-mcp/src/project-deviation
                 #:deviation-item
                 #:foreign-apparatus-tracked)
@@ -339,7 +346,8 @@ adopted repository; in the index is the leak."
     (with-temp-git-repo (root :origin-url +third-party-origin-url+
                               :initial-file "README.md" :initial-content "x")
       (%foreign-fixture root)
-      (let ((report (normalise-repository root :policy :repair)))
+      (let ((report (normalise-repository root :policy :repair
+                                                  :disposition :contributing)))
         (true (report-changed report)
               "the run wrote something, so the emptiness below is about a run"))
       (is equal '() (git-status-porcelain root)
@@ -372,7 +380,8 @@ here, and this is the only test in the file that would go red."
               (lambda (path content)
                 (declare (ignore path content))
                 (error "the write step was replaced and refuses to run"))))
-        (fail (normalise-repository root :policy :repair) 'simple-error
+        (fail (normalise-repository root :policy :repair
+                                                 :disposition :contributing) 'simple-error
               "the run dies at the first write"))
       (true (%has-pattern-p root ".mallet.lisp")
             "the exclude already carried the apparatus pattern when the write ran")
@@ -398,7 +407,8 @@ none."
     (with-temp-git-repo (root :origin-url +third-party-origin-url+
                               :initial-file "README.md" :initial-content "x")
       (%foreign-fixture root)
-      (let ((first (normalise-repository root :policy :repair)))
+      (let ((first (normalise-repository root :policy :repair
+                                              :disposition :contributing)))
         (true (report-changed first)
               "the first run changed something")
         (is eq :updated (getf (report-exclude first) :action-taken)
@@ -436,7 +446,7 @@ overwrites everything it finds."
       (let ((before (%snapshot root)))
         (true (assoc ".mallet.lisp" before :test #'string=)
               "precondition: the tree holds a file a repair could collide with")
-        (normalise-repository root :policy :repair)
+        (normalise-repository root :policy :repair :disposition :contributing)
         (let ((after (%snapshot root)))
           (dolist (entry before)
             (is equal (cdr entry) (cdr (assoc (car entry) after :test #'string=))
@@ -456,7 +466,7 @@ group is still installed around it."
                               :initial-file "README.md" :initial-content "x")
       (%foreign-fixture root)
       (write-fixture-file root ".mallet.lisp" ";; the maintainer's own file")
-      (normalise-repository root :policy :repair)
+      (normalise-repository root :policy :repair :disposition :contributing)
       (is equal ";; the maintainer's own file"
           (uiop:read-file-string (merge-pathnames ".mallet.lisp" root))
           "the existing file is untouched")
@@ -475,7 +485,8 @@ questions come apart: the assertion is unsatisfied and the path is occupied."
       (%foreign-fixture root)
       (ensure-directories-exist
        (uiop:ensure-directory-pathname (merge-pathnames ".mallet.lisp" root)))
-      (let ((report (normalise-repository root :policy :repair)))
+      (let ((report (normalise-repository root :policy :repair
+                                                  :disposition :contributing)))
         (true (member :mallet-config (%unresolved-keys report))
               "the occupied destination is reported unresolved")
         (false (member :mallet-config (%changed-items report))
@@ -499,7 +510,8 @@ that gate is informational and never refuses, so the commit goes through."
                               :initial-file "README.md" :initial-content "x")
       (%foreign-fixture root)
       (let ((before (git-head-sha root))
-            (report (normalise-repository root :policy :repair)))
+            (report (normalise-repository root :policy :repair
+                                          :disposition :contributing)))
         (is equal before (git-head-sha root)
             "the run left the head where it found it")
         (is equal (report-head-sha-before report) (report-head-sha-after report)
@@ -535,13 +547,15 @@ skip form to end the test."
         (false (probe-file baseline)
                "precondition: no baseline exists before the run")
         (if (not (gate-scanner-available-p (linter-path)))
-            (let ((report (normalise-repository root :policy :record-as-debt)))
+            (let ((report (normalise-repository root :policy :record-as-debt
+                                                     :disposition :contributing)))
               (is eq :not-enumerated
                   (getf (report-debt-baseline report) :action-taken)
                   "with no linter installed the debt is not enumerated")
               (false (probe-file baseline)
                      "and nothing is written"))
-            (let ((report (normalise-repository root :policy :record-as-debt)))
+            (let ((report (normalise-repository root :policy :record-as-debt
+                                                     :disposition :contributing)))
               (is eq :created (getf (report-debt-baseline report) :action-taken)
                   "the run says it created the baseline")
               (true (probe-file baseline)
@@ -566,11 +580,13 @@ existence assertion in this file while naming no repository at all."
       (fixture-commit-file root "src/violating.lisp" +violating-source+)
       (if (not (gate-scanner-available-p (linter-path)))
           (with-no-linter (root)
-            (let ((report (normalise-repository root :policy :record-as-debt)))
+            (let ((report (normalise-repository root :policy :record-as-debt
+                                                     :disposition :contributing)))
               (is eq :not-enumerated
                   (getf (report-debt-baseline report) :action-taken)
                   "with no linter installed there is nothing to name")))
-          (let* ((report (normalise-repository root :policy :record-as-debt))
+          (let* ((report (normalise-repository root :policy :record-as-debt
+                                                    :disposition :contributing))
                  (text (uiop:read-file-string
                         (merge-pathnames ".gate-baseline.md" root))))
             (true (plusp (getf (report-debt-baseline report) :site-count))
@@ -592,12 +608,14 @@ there was none."
       (%foreign-fixture root)
       (fixture-commit-file root "src/violating.lisp" +violating-source+)
       (if (not (gate-scanner-available-p (linter-path)))
-          (let ((report (normalise-repository root :policy :record-as-debt)))
+          (let ((report (normalise-repository root :policy :record-as-debt
+                                                   :disposition :contributing)))
             (is eq :not-enumerated
                 (getf (report-debt-baseline report) :action-taken)
                 "with no linter installed there is no baseline to leave alone"))
           (let ((baseline (merge-pathnames ".gate-baseline.md" root)))
-            (normalise-repository root :policy :record-as-debt)
+            (normalise-repository root :policy :record-as-debt
+                                       :disposition :contributing)
             (let ((written (file-write-date baseline))
                   (text (uiop:read-file-string baseline)))
               (let ((second (normalise-repository root :policy :record-as-debt)))
@@ -628,7 +646,8 @@ unreachable, and the run must write nothing and name the reason."
       (with-no-linter (root)
         (false (gate-scanner-available-p (linter-path))
                "precondition: the bound path holds no linter")
-        (let ((report (normalise-repository root :policy :record-as-debt)))
+        (let ((report (normalise-repository root :policy :record-as-debt
+                                                 :disposition :contributing)))
           (is eq :not-enumerated
               (getf (report-debt-baseline report) :action-taken)
               "the run says the debt was not enumerated")
@@ -668,7 +687,7 @@ just as well."
       (let ((before (%paths-in root)))
         (false (member "src/main.lisp" before :test #'string=)
                "precondition: the fixture carries none of our layout")
-        (normalise-repository root :policy :repair)
+        (normalise-repository root :policy :repair :disposition :contributing)
         (let ((written (set-difference (%paths-in root) before :test #'string=)))
           (true written
                 "the run created something, so the check below has something to read")
@@ -691,7 +710,7 @@ just as well."
         (let ((*assessed-tiers* '((:ours . (:invariant :gate))
                                   (:foreign . (:invariant))))
               (*apparatus-assessed-profiles* '()))
-          (normalise-repository root :policy :repair))
+          (normalise-repository root :policy :repair :disposition :contributing))
         (let ((written (set-difference (%paths-in root) before :test #'string=)))
           (true (member "src/main.lisp" written :test #'string=)
                 "held to somebody else's layout the run does write it, so the
@@ -713,9 +732,10 @@ it satisfies exactly as well."
                               :initial-file "README.md" :initial-content "x")
       (%foreign-fixture root)
       (write-fixture-file root "AGENTS.md" "# already in place")
-      (let ((report (normalise-repository root :policy :repair)))
+      (let ((report (normalise-repository root :policy :repair
+                                               :disposition :contributing)))
         (is eq :foreign (report-profile report))
-        (true (report-classification report))
+        (is eq :contributing (report-disposition report))
         (true (member :mallet-config (%changed-items report))
               "the linter configuration was written and reported")
         (true (member :lint-script (%changed-items report))
@@ -827,7 +847,8 @@ gate, reported not installed."
                               :initial-file "README.md" :initial-content "x")
       (%foreign-fixture root)
       (false (probe-file (gate-hook-path root)) "precondition: no gate yet")
-      (let* ((report (normalise-repository root :policy :repair))
+      (let* ((report (normalise-repository root :policy :repair
+                                                :disposition :contributing))
              (gate (gate-hook-path root)))
         (if (configured-hooks-supported-p root)
             (progn
@@ -859,6 +880,8 @@ without configured hooks gets no gate, reported not installed."
       (with-linked-worktree (worktree root)
         (true (uiop:file-exists-p (merge-pathnames ".git" worktree))
               "precondition: the linked worktree's .git is a file")
+        ;; The disposition is the repository's, recorded in the main worktree.
+        (record-disposition root :contributing)
         (let* ((report (normalise-repository worktree :policy :repair))
                (shared (merge-pathnames ".git/" root)))
           (is equal (namestring (merge-pathnames "hooks/lisp-gate" shared))
@@ -888,7 +911,8 @@ without configured hooks gets no gate, reported not installed."
       (%foreign-fixture root)
       (let* ((existing (%write-hookdir-pre-commit root))
              (before (%octets existing))
-             (report (normalise-repository root :policy :repair)))
+             (report (normalise-repository root :policy :repair
+                                           :disposition :contributing)))
         (is equalp before (%octets existing)
             "the existing hook is byte-identical after the repair")
         (false (member :pre-commit (report-already-correct report))
@@ -917,7 +941,7 @@ git without configured hooks gets no gate, reported not installed."
                               :initial-file "README.md" :initial-content "x")
       (%foreign-fixture root)
       (let ((report (normalise-repository root :policy :repair
-                                               :declared-classification :ours))
+                                               :disposition :ours))
             (gate (gate-hook-path root)))
         (is eq :ours (report-profile report))
         (if (configured-hooks-supported-p root)
@@ -927,7 +951,7 @@ git without configured hooks gets no gate, reported not installed."
               (false (%gate-mode-p gate "informational") "and not informational")
               (true (gate-hook-wired-p root) "and wired"))
             (%check-gate-not-installed root report)))
-      (%check-second-run-is-quiet root :declared-classification :ours))))
+      (%check-second-run-is-quiet root))))
 
 (define-test a-present-gate-file-is-kept-and-only-the-wiring-is-added
   "A gate file already in place is left as it is and reported already correct;
@@ -942,7 +966,8 @@ configured hooks leaves the file as it is and reports the gate not installed."
         (uiop:run-program (list "chmod" "+x" (namestring gate)))
         (false (gate-hook-wired-p root) "precondition: the gate is not wired")
         (let* ((before (%octets gate))
-               (report (normalise-repository root :policy :repair)))
+               (report (normalise-repository root :policy :repair
+                                             :disposition :contributing)))
           (is equalp before (%octets gate) "the gate file is byte-identical")
           (false (%gate-file-entry (report-changed report))
                  "the gate file is not reported as a change")
@@ -969,7 +994,7 @@ configured hooks leaves the file as it is and reports the gate not installed."
 
 (define-test a-gate-rendered-for-another-profile-is-replaced
   "PROFILE-CHANGE CONTROL. A repository adopted as foreign holds the
-informational gate. Once it is declared ours, the repair replaces that gate
+informational gate. Once it is declared ours on the call, the repair replaces that gate
 with the blocking rendering and rewires the command, rather than reporting the
 old gate already correct. A git without configured hooks leaves the old gate as
 it is and reports the gate not installed."
@@ -986,7 +1011,7 @@ it is and reports the gate not installed."
           (wire-gate-hook root :profile :foreign))
         (let* ((before (%octets gate))
                (report (normalise-repository root :policy :repair
-                                                  :declared-classification :ours)))
+                                                  :disposition :ours)))
           (is eq :ours (report-profile report))
           (false (member :pre-commit (report-already-correct report))
                  "the old gate is not reported already correct")
@@ -1009,7 +1034,93 @@ it is and reports the gate not installed."
                 (true (and (getf entry :reason)
                            (search "configured hooks" (getf entry :reason)))
                       "with the reason: ~S" entry))))
-        (%check-second-run-is-quiet root :declared-classification :ours)))))
+        (%check-second-run-is-quiet root)))))
+
+(define-test the-gate-mode-follows-the-recorded-disposition
+  "ours and forked install the blocking gate and render it byte for byte the
+same; contributing installs the informational gate. The disposition is recorded
+in each repository's .envrc."
+  (flet ((gate-after (disposition)
+           (with-fixture-template ()
+             (with-temp-git-repo (root :origin-url +ours-origin-url+
+                                       :initial-file "README.md" :initial-content "x")
+               (%foreign-fixture root)
+               (let ((report (normalise-repository root :policy :repair
+                                                        :disposition disposition)))
+                 (is eq disposition (report-disposition report))
+                 (is eq :argument (report-disposition-source report))
+                 (true (search (format nil "DSMR_PROJECT_DISPOSITION=~(~A~)"
+                                       disposition)
+                               (uiop:read-file-string
+                                (merge-pathnames ".envrc" root)))
+                       "~A is recorded in .envrc" disposition))
+               (when (probe-file (gate-hook-path root))
+                 (uiop:read-file-string (gate-hook-path root)))))))
+    (let ((ours (gate-after :ours))
+          (forked (gate-after :forked))
+          (contributing (gate-after :contributing)))
+      (when (and ours forked contributing)
+        (true (search "GATE_MODE='blocking'" ours) "ours is blocking")
+        (is equal ours forked "forked renders exactly as ours")
+        (true (search "GATE_MODE='informational'" contributing)
+              "contributing is informational")))))
+
+(define-test a-hand-edited-disposition-re-renders-the-gate
+  "Declared contributing and repaired, the gate is informational. The .envrc line
+is then edited by hand to ours: the gate reads stale for the new profile, and a
+repair with no disposition argument rewrites it blocking."
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +ours-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (normalise-repository root :policy :repair :disposition :contributing)
+      (when (configured-hooks-supported-p root)
+        (true (%gate-mode-p (gate-hook-path root) "informational")
+              "the contributing gate is informational")
+        (let* ((envrc (merge-pathnames ".envrc" root))
+               (text (uiop:read-file-string envrc))
+               (old "DSMR_PROJECT_DISPOSITION=contributing")
+               (at (search old text)))
+          (true at "the declaration is in the file")
+          (when at
+            (with-open-file (out envrc :direction :output :if-exists :supersede)
+              (write-string (concatenate 'string (subseq text 0 at)
+                                         "DSMR_PROJECT_DISPOSITION=ours"
+                                         (subseq text (+ at (length old))))
+                            out))))
+        (is eq :stale (gate-file-state root :ours)
+            "the informational gate is stale for the declared profile")
+        (let ((report (normalise-repository root :policy :repair)))
+          (is eq :ours (report-disposition report))
+          (is eq :ours (report-profile report))
+          (true (%gate-mode-p (gate-hook-path root) "blocking")
+                "the repair rewrote the gate blocking")
+          (is eq :replaced
+              (getf (%gate-file-entry (report-changed report)) :action-taken)))))))
+
+(define-test a-repair-of-our-own-repository-excludes-the-envrc
+  "A repair of a repository declared ours lists .envrc in the local exclude, so
+the file holding the declaration never shows in git status. A dry run of the
+same repository writes neither."
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +ours-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (let ((dry (normalise-repository root :policy :repair :disposition :ours
+                                            :dry-run t)))
+        (is eq :would-record (getf (report-disposition-recorded dry) :action-taken))
+        (false (probe-file (merge-pathnames ".envrc" root))
+               "the dry run wrote no .envrc")
+        (false (%has-pattern-p root ".envrc") "and did not exclude it"))
+      (let ((report (normalise-repository root :policy :repair :disposition :ours)))
+        (is eq :ours (report-profile report))
+        (true (member (getf (report-disposition-recorded report) :action-taken)
+                      '(:created :added))
+              "the declaration was recorded"))
+      (true (%has-pattern-p root ".envrc") ".envrc is in the local exclude")
+      (false (find-if (lambda (line) (search ".envrc" line))
+                      (git-status-porcelain root))
+             "and not in git status"))))
 
 (define-test a-file-at-the-gate-path-that-is-not-the-gate-is-left-alone
   "FOREIGN-FILE CONTROL. An executable script of somebody else's at the gate path
@@ -1026,7 +1137,8 @@ replaced and made executable."
                             (format nil "#!/bin/sh~%echo mine~%"))
         (uiop:run-program (list "chmod" "+x" (namestring gate)))
         (let* ((before (%octets gate))
-               (report (normalise-repository root :policy :repair)))
+               (report (normalise-repository root :policy :repair
+                                                  :disposition :contributing)))
           (is equalp before (%octets gate) "the file is byte-identical")
           (true (%gate-file-entry (report-unresolved report))
                 "the gate file is reported unresolved")
@@ -1041,7 +1153,8 @@ replaced and made executable."
       (let ((gate (write-fixture-file root ".git/hooks/lisp-gate"
                                       (render-pre-commit-hook :profile :foreign))))
         (false (%executable-p gate) "precondition: the gate is not executable")
-        (let ((report (normalise-repository root :policy :repair)))
+        (let ((report (normalise-repository root :policy :repair
+                                                 :disposition :contributing)))
           (true (%executable-p gate) "the gate is executable after the repair")
           (is eq :replaced
               (getf (%gate-file-entry (report-changed report)) :action-taken)
@@ -1058,7 +1171,8 @@ the wiring unresolved with a reason."
                      "echo somebody-else")
                :directory root)
       (let* ((before (%local-config-text root))
-             (report (normalise-repository root :policy :repair))
+             (report (normalise-repository root :policy :repair
+                                           :disposition :contributing))
              (entry (%wiring-entry (report-unresolved report))))
         (is string= before (%local-config-text root)
             "the local config is unchanged")
@@ -1087,6 +1201,7 @@ the reason. A dry run reports the same and writes nothing."
         (dolist (dry-run '(t nil))
           (let* ((before (%local-config-text root))
                  (report (normalise-repository root :policy :repair
+                                                    :disposition :contributing
                                                     :dry-run dry-run))
                  (entry (%gate-file-entry (report-unresolved report))))
             (false (probe-file (gate-hook-path root))
@@ -1112,7 +1227,8 @@ the reason. A dry run reports the same and writes nothing."
       (%foreign-fixture root)
       (let ((before (%snapshot root))
             (exclude-before (%exclude-patterns-in root)))
-        (let ((report (normalise-repository root :policy :repair :dry-run t)))
+        (let ((report (normalise-repository root :policy :repair :dry-run t
+                                                 :disposition :contributing)))
           (true (report-changed report)
                 "the report names what would change")
           (true (every (lambda (entry)
@@ -1139,7 +1255,7 @@ come back with the decisions each of them admits, for the caller to pick from."
       (%foreign-fixture root)
       (let ((before (%snapshot root))
             (exclude-before (%exclude-patterns-in root))
-            (report (normalise-repository root)))
+            (report (normalise-repository root :disposition :contributing)))
         (is equal '() (report-changed report))
         (true (report-unresolved report)
               "every finding comes back")
@@ -1169,7 +1285,8 @@ run reports it, says what could be decided about it instead, and carries on."
       (fixture-commit-file root "CLAUDE.md" "# committed by somebody")
       (true (member "CLAUDE.md" (git-tracked-files root) :test #'string=)
             "precondition: it really is in their index")
-      (let* ((report (normalise-repository root :policy :repair))
+      (let* ((report (normalise-repository root :policy :repair
+                                               :disposition :contributing))
              (leak (find-if (lambda (entry)
                               (typep (getf entry :deviation)
                                      'foreign-apparatus-tracked))
@@ -1187,13 +1304,18 @@ run reports it, says what could be decided about it instead, and carries on."
             "and still present"))))
 
 (define-test acceptance-writes-nothing-and-is-reported-separately
-  "A finding judged correct as written is recorded and not acted on."
+  "A finding judged correct as written is recorded and not acted on. The
+disposition is recorded before the snapshot, so the run has nothing of its own
+to record either."
   (with-fixture-template ()
     (with-temp-git-repo (root :origin-url +third-party-origin-url+
                               :initial-file "README.md" :initial-content "x")
       (%foreign-fixture root)
+      (record-disposition root :contributing)
       (let ((before (%snapshot root))
             (report (normalise-repository root :policy :accept-as-deliberate)))
+        (is eq :already-present
+            (getf (report-disposition-recorded report) :action-taken))
         (true (report-accepted report)
               "the findings are recorded as accepted")
         (is equal '() (report-changed report)
@@ -1206,9 +1328,8 @@ run reports it, says what could be decided about it instead, and carries on."
 ;;; ---------------------------------------------------------------------------
 
 (define-test a-supplied-upstream-is-added-and-reads-back
-  "A repository whose origin is ours and which records no upstream cannot be
-told apart from one of our own projects. Supplying the upstream is the repair,
-and it is reported like any other."
+  "A supplied upstream is recorded as the upstream remote, and the run reports it
+like any other change. It decides nothing: the disposition is the declared one."
   (with-fixture-template ()
     (with-temp-git-repo (root :origin-url +ours-origin-url+
                               :initial-file "README.md" :initial-content "x")
@@ -1217,12 +1338,72 @@ and it is reported like any other."
              "precondition: there is no upstream")
       (let ((report (normalise-repository
                      root :policy :repair
+                          :disposition :forked
                           :upstream-url +third-party-upstream-url+)))
+        (is eq :forked (report-disposition report))
         (true (report-remote-added report)
               "the run reports the remote it added")
         (is eq :added (getf (report-remote-added report) :action-taken)))
       (is equal +third-party-upstream-url+ (git-remote-url root "upstream")
           "and git can read it back"))))
+
+(defun %git-file-text (root relative)
+  "Return the text of RELATIVE under ROOT's git directory, or NIL when absent."
+  (let ((path (merge-pathnames relative (merge-pathnames ".git/" root))))
+    (when (probe-file path) (uiop:read-file-string path))))
+
+(define-test a-jail-refusal-comes-before-any-write
+  "JAIL CONTROL. The .envrc is a symlink to a file outside the session root, a
+common direnv arrangement, so a supplied answer cannot be recorded. The refusal
+arrives before the upstream remote, the exclude, the gate, the hooks config or
+any worktree file is written. The same run with a plain .envrc does write, so
+the comparison sees writes when there are some."
+  (with-fixture-template ()
+    (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                              :initial-file "README.md" :initial-content "x")
+      (%foreign-fixture root)
+      (let* ((outside (%make-temp-directory))
+             (shared (merge-pathnames "lisp.envrc" outside)))
+        (unwind-protect
+             (progn
+               (write-fixture-file outside "lisp.envrc"
+                                   (format nil "export FOO=1~%"))
+               (uiop:run-program (list "ln" "-s" (namestring shared)
+                                       (namestring (merge-pathnames ".envrc" root))))
+               (let ((tree (%snapshot root))
+                     (exclude (%git-file-text root "info/exclude"))
+                     (config (%git-file-text root "config"))
+                     (hooks (mapcar #'namestring
+                                    (uiop:directory-files
+                                     (merge-pathnames ".git/hooks/" root)))))
+                 (fail (normalise-repository root :policy :repair
+                                                  :disposition :contributing
+                                                  :upstream-url +third-party-upstream-url+)
+                       'dsmr-mcp/src/repo-classify:project-disposition-not-recordable)
+                 (false (git-remote-url root "upstream") "no upstream remote was added")
+                 (is equal exclude (%git-file-text root "info/exclude")
+                     "the exclude is unchanged")
+                 (is equal config (%git-file-text root "config")
+                     "the git config is unchanged")
+                 (is equal hooks (mapcar #'namestring
+                                         (uiop:directory-files
+                                          (merge-pathnames ".git/hooks/" root)))
+                     "nothing was added under hooks/")
+                 (is equal tree (%snapshot root) "the worktree is unchanged")
+                 (is equal (format nil "export FOO=1~%")
+                     (uiop:read-file-string shared)
+                     "the shared file is unchanged"))
+               (delete-file (merge-pathnames ".envrc" root))
+               (let ((config (%git-file-text root "config")))
+                 (normalise-repository root :policy :repair
+                                            :disposition :contributing
+                                            :upstream-url +third-party-upstream-url+)
+                 (true (git-remote-url root "upstream")
+                       "control: with a plain .envrc the same run writes")
+                 (false (equal config (%git-file-text root "config"))
+                        "control: the git config changed")))
+          (uiop:delete-directory-tree outside :validate t
+                                              :if-does-not-exist :ignore))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The post-condition, asked directly

@@ -1,330 +1,485 @@
 ;;;; src/repo-classify.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; Decide what a repository IS, before anything is written into it.
+;;;; The project disposition: what a repository is to the operator, declared once
+;;;; and recorded in the repository's own untracked .envrc.
 ;;;;
-;;;; Three terminal outcomes and one signalled ambiguity:
+;;;;   :ours          code originating with the operator
+;;;;   :contributing  a third-party project the operator only contributes to
+;;;;   :forked        forked to shorten the acceptance chain, or because upstream
+;;;;                  is unmaintained
 ;;;;
-;;;;   :ours                   our own project; our apparatus is tracked content
-;;;;   :foreign-with-upstream  somebody else's software, with an upstream to record
-;;;;   :foreign-orphan         somebody else's software, with no upstream left
+;;;; Remotes cannot decide it. Adoption forks upstream under the operator's own
+;;;; account and clones the fork, so an origin under that account says nothing
+;;;; about who wrote the code, and licence text is no more reliable. Remote facts
+;;;; produce consistency warnings only.
 ;;;;
-;;;; The obvious test, "does it have an upstream remote", is measurably wrong.
-;;;; Raw third-party clones sit in the workspace with origin pointing straight
-;;;; at the author's own account and no upstream remote at all. That test reads
-;;;; them as ours, and adopting them as ours would commit our tooling into
-;;;; somebody else's history.
+;;;; The declaration is the line `export DSMR_PROJECT_DISPOSITION=<value>`. It is
+;;;; read from the file as text and never from the process environment: the
+;;;; server's environment belongs to the directory it was launched in, the
+;;;; repository asked about may be another one, and the lint gate runs under git
+;;;; without direnv. The file is never sourced.
 ;;;;
-;;;; Origin ownership alone is not sufficient in the other direction either.
-;;;; Because everything is forked to our account before it is cloned, an origin
-;;;; under our account says nothing about who wrote the software. Measured
-;;;; across 251 repositories in the workspace: 161 carry a third-party origin,
-;;;; 22 carry our origin with an upstream recorded, and 68 carry our origin with
-;;;; no upstream at all. Nothing on disk tells that last group apart from one of
-;;;; our own projects, and it is the largest of the three our-origin outcomes.
+;;;; The disposition belongs to the repository, because the lint gate and the
+;;;; findings record are shared by all its worktrees. It is recorded in the main
+;;;; worktree's .envrc. Every worktree's .envrc that declares it must agree, and
+;;;; declarations that disagree are refused, never resolved.
 ;;;;
-;;;; So that case is asked, never guessed. There is no default return value in
-;;;; this module and no handler swallowing the question, because concluding
-;;;; "ours" wrongly is the single error that ends with our tooling tracked in a
-;;;; third party's repository. Concluding "foreign" wrongly costs nothing worse
-;;;; than an untracked file in one of our own trees.
-;;;;
-;;;; An absent upstream is not a defect. Orphaned projects are still working
-;;;; software, so :foreign-orphan is a place to stop rather than drift to
-;;;; repair.
+;;;; Recording writes only that one .envrc, only inside the write jail, only
+;;;; after .envrc is in the local exclude, and never rewrites a value already
+;;;; declared: a change of disposition is a hand edit.
 
 (defpackage #:dsmr-mcp/src/repo-classify
   (:use #:cl)
-  (:import-from #:cl-ppcre
-                #:create-scanner
-                #:scan)
   (:import-from #:dsmr-mcp/src/git
                 #:git-repository-p
+                #:git-toplevel
+                #:git-common-dir
                 #:git-remote-url
+                #:git-tracked-files
+                #:run-git
                 #:not-a-repository-error)
-  (:export #:*our-git-accounts*
-           #:our-git-accounts
-           #:parse-remote-owner
-           #:our-remote-p
-           #:*declared-hard-forks*
-           #:declared-hard-forks
-           #:parse-remote-repository
-           #:declared-hard-fork-p
-           #:classify-repository
-           #:repo-classification
-           #:repo-profile
-           #:+classifications+
-           #:repo-classification-ambiguous-error
-           #:repo-classification-ambiguous-directory
-           #:repo-classification-ambiguous-origin-url))
+  (:import-from #:dsmr-mcp/src/envrc-vars
+                #:declared-values
+                #:ensure-declaration-line
+                #:region-open-line
+                #:region-close-line)
+  (:import-from #:dsmr-mcp/src/project-exclude
+                #:repair-repo-exclude)
+  (:import-from #:dsmr-mcp/src/project-root
+                #:ensure-write-path)
+  (:import-from #:dsmr-mcp/src/fs
+                #:write-file-string-atomically)
+  (:export #:+dispositions+
+           #:+disposition-variable+
+           #:+disposition-meanings+
+           #:disposition
+           #:disposition-name
+           #:resolve-disposition
+           #:check-disposition-recordable
+           #:record-disposition
+           #:disposition-profile
+           #:disposition-gate-profile
+           #:disposition-writes-licence-p
+           #:disposition-warnings
+           #:project-disposition-error
+           #:project-disposition-required
+           #:disposition-required-directory
+           #:disposition-required-origin-url
+           #:disposition-required-upstream-url
+           #:project-disposition-conflict
+           #:disposition-conflict-declarations
+           #:project-disposition-unreadable
+           #:disposition-unreadable-path
+           #:disposition-unreadable-value
+           #:project-disposition-not-recordable
+           #:disposition-not-recordable-path
+           #:disposition-not-recordable-reason))
 
 (in-package #:dsmr-mcp/src/repo-classify)
 
 ;;; ---------------------------------------------------------------------------
-;;; The terminal outcomes
+;;; The vocabulary
 ;;; ---------------------------------------------------------------------------
 
-(defvar +classifications+ '(:ours :foreign-with-upstream :foreign-orphan)
-  "Every terminal classification a repository can reach.
+(defvar +dispositions+ '(:ours :contributing :forked)
+  "Every disposition a repository can be declared, in the order they are offered.
 
-Named as a constant but defined with DEFVAR on purpose: DEFCONSTANT on a list
-re-evaluates to a fresh, non-EQL list on reload and breaks a warm image. Every
-DEFCONSTANT in this codebase holds a number, for the same reason.")
+DEFVAR rather than DEFCONSTANT: DEFCONSTANT on a list re-evaluates to a fresh,
+non-EQL list on reload and breaks a warm image.")
 
-(deftype repo-classification ()
-  "One of the three terminal classifications a repository can reach."
-  '(member :ours :foreign-with-upstream :foreign-orphan))
+(deftype disposition ()
+  "One of the three declared project dispositions."
+  '(member :ours :contributing :forked))
+
+(defvar +disposition-variable+ "DSMR_PROJECT_DISPOSITION"
+  "The .envrc variable a disposition is recorded in.")
+
+(defvar +disposition-meanings+
+  '((:ours . "code originating with the operator; the lint gate refuses a commit whose changed forms carry a warning or an error")
+    (:contributing . "a third-party project the operator only contributes to; the lint gate reports and never refuses, and the licence is never touched")
+    (:forked . "forked to shorten the acceptance chain or because upstream is unmaintained; the operator has taken it over, so it is treated as ours, with our tooling tracked and the blocking lint gate, except that it keeps the licence it came with and no licence text is written"))
+  "An alist of each disposition and what declaring it means.")
+
+(defun disposition-name (disposition)
+  "Return DISPOSITION's name as a lower-case string."
+  (string-downcase (symbol-name disposition)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Conditions
 ;;; ---------------------------------------------------------------------------
 
-(define-condition repo-classification-ambiguous-error (error)
-  ((directory  :initarg :directory  :initform nil
-               :reader repo-classification-ambiguous-directory)
-   (origin-url :initarg :origin-url :initform nil
-               :reader repo-classification-ambiguous-origin-url))
+(define-condition project-disposition-error (error)
+  ()
+  (:documentation "Parent of every refusal concerning a project disposition."))
+
+(define-condition project-disposition-required (project-disposition-error)
+  ((directory    :initarg :directory    :initform nil
+                 :reader disposition-required-directory)
+   (origin-url   :initarg :origin-url   :initform nil
+                 :reader disposition-required-origin-url)
+   (upstream-url :initarg :upstream-url :initform nil
+                 :reader disposition-required-upstream-url))
   (:documentation
-   "Signalled when nothing on disk settles whether a repository is ours.
+   "Signalled when no disposition is recorded and none was supplied.
 
-Two shapes reach here: an origin under one of our own accounts with no upstream
-recorded anywhere, and no origin at all. Both are questions for the operator,
-and both carry the directory and whatever origin URL was found so the question
-can be put without re-reading the repository.
-
-This is a normal outcome rather than a fault. Among repositories whose origin is
-ours it is the most common one, so a caller that treats it as a rare failure
-will be wrong most of the time.")
+Carries the directory and the origin and upstream URLs found, as facts for the
+question; none of them answers it.")
   (:report
    (lambda (condition stream)
-     (format stream
-             "Cannot tell whether ~A is our own project or somebody else's~
-~@[ (origin ~A, no upstream recorded)~]. Supply the upstream, or declare the ~
-classification."
-             (repo-classification-ambiguous-directory condition)
-             (repo-classification-ambiguous-origin-url condition)))))
+     (format stream "No project disposition is recorded for ~A~
+~@[ (origin ~A)~]~@[ (upstream ~A)~]. Declare one of ~{~A~^, ~}."
+             (disposition-required-directory condition)
+             (disposition-required-origin-url condition)
+             (disposition-required-upstream-url condition)
+             (mapcar #'disposition-name +dispositions+)))))
 
-(setf (documentation 'repo-classification-ambiguous-directory 'function)
-      "Return the directory whose classification could not be decided.")
-(setf (documentation 'repo-classification-ambiguous-origin-url 'function)
-      "Return the origin URL found, or NIL when the repository has no origin.")
+(define-condition project-disposition-conflict (project-disposition-error)
+  ((declarations :initarg :declarations :initform '()
+                 :reader disposition-conflict-declarations))
+  (:documentation
+   "Signalled when two declarations of the disposition disagree.
 
-;;; ---------------------------------------------------------------------------
-;;; Which accounts are ours
-;;; ---------------------------------------------------------------------------
+DECLARATIONS is a list of (SOURCE . VALUE): SOURCE is the .envrc pathname or
+:ARGUMENT for a supplied answer, VALUE the text declared.")
+  (:report
+   (lambda (condition stream)
+     (format stream "The project disposition is declared more than once and the ~
+declarations disagree: ~{~A~^; ~}. Edit the .envrc so one value remains."
+             (mapcar (lambda (entry)
+                       (format nil "~A in ~A"
+                               (cdr entry)
+                               (if (eq :argument (car entry))
+                                   "the disposition argument"
+                                   (namestring (car entry)))))
+                     (disposition-conflict-declarations condition))))))
 
-(defvar *our-git-accounts* (list "fade" "deepsky")
-  "The hosting accounts whose repositories may be our own software.
+(define-condition project-disposition-unreadable (project-disposition-error)
+  ((path  :initarg :path  :initform nil :reader disposition-unreadable-path)
+   (value :initarg :value :initform nil :reader disposition-unreadable-value))
+  (:documentation
+   "Signalled when a declaration is not exactly one of the three names, bare or
+inside one pair of matching quotes.")
+  (:report
+   (lambda (condition stream)
+     (format stream "~A declares ~A=~A, which is not one of ~{~A~^, ~}. ~
+The value is read as text and never expanded."
+             (namestring (disposition-unreadable-path condition))
+             +disposition-variable+
+             (disposition-unreadable-value condition)
+             (mapcar #'disposition-name +dispositions+)))))
 
-A DEFVAR rather than a DEFPARAMETER so that reloading the system does not
-discard an override installed at runtime.")
-
-(defun %split-on-comma (string)
-  "Return the non-empty, whitespace-trimmed comma-separated fields of STRING.
-
-NIL and a string holding only separators both yield the empty list, so a caller
-can tell \"nothing was configured\" from \"one name was configured\"."
-  (if (null string)
-      '()
-      (remove ""
-              (mapcar (lambda (field)
-                        (string-trim '(#\Space #\Tab #\Newline #\Return) field))
-                      (uiop:split-string string :separator '(#\,)))
-              :test #'string=)))
-
-(defun our-git-accounts ()
-  "Return the list of hosting accounts currently treated as ours.
-
-DSMR_GIT_ACCOUNTS, read as a comma-separated list, wins whenever it names at
-least one account; otherwise the answer is *OUR-GIT-ACCOUNTS*. The variable is
-read on every call so a change takes effect without reloading anything."
-  (or (%split-on-comma (uiop:getenv "DSMR_GIT_ACCOUNTS"))
-      *our-git-accounts*))
-
-;;; ---------------------------------------------------------------------------
-;;; Reading an account out of a remote URL
-;;; ---------------------------------------------------------------------------
-
-;;; Three URL shapes occur across the repositories in $LISP_WORKSPACE. Both scanners
-;;; require a non-empty repository segment after the account, so a bare host
-;;; cannot be read as an account name.
-
-(defvar *scheme-url-scanner*
-  (create-scanner "^[a-zA-Z][a-zA-Z0-9+.-]*://(?:[^/@]+@)?[^/]+/([^/]+)/[^/]")
-  "Matches https://host/owner/repo and ssh://git@host/owner/repo, capturing the owner.")
-
-(defvar *scp-url-scanner*
-  (create-scanner "^[^/@]+@[^/:]+:([^/]+)/[^/]")
-  "Matches the scp shorthand git@host:owner/repo.git, capturing the owner.")
-
-(defun %first-group (scanner string)
-  "Return the first capture group SCANNER matches in STRING, or NIL."
-  (multiple-value-bind (start end group-starts group-ends)
-      (scan scanner string)
-    (declare (ignore end))
-    (when (and start
-               (plusp (length group-starts))
-               (aref group-starts 0))
-      (subseq string (aref group-starts 0) (aref group-ends 0)))))
-
-(defun parse-remote-owner (url)
-  "Return the hosting account named in URL as a string, or NIL when there is none.
-
-Pure string work: nothing here or below it opens a connection, so a crafted
-remote URL cannot cause a lookup. A URL in none of the recognized shapes returns
-NIL, which every caller reads as \"not ours\"."
-  (when (stringp url)
-    (let ((owner (or (%first-group *scheme-url-scanner* url)
-                     (%first-group *scp-url-scanner* url))))
-      (when (and owner (string/= owner ""))
-        owner))))
-
-(defun our-remote-p (url)
-  "Return T when URL names a repository under one of OUR-GIT-ACCOUNTS.
-
-A URL that cannot be parsed is not ours. That asymmetry is deliberate: reading
-an unrecognized URL as ours is what puts our tooling into somebody else's
-tracked tree, while reading one of ours as foreign only leaves the apparatus
-untracked in a repository we own.
-
-Accounts are compared without regard to case, which is how the hosts themselves
-resolve them."
-  (let ((owner (parse-remote-owner url)))
-    (when (and owner
-               (member owner (our-git-accounts) :test #'string-equal))
-      t)))
-
-(defvar *declared-hard-forks* (list "fade/zebra" "fade/boomer")
-  "The repositories declared hard forks, as owner/name strings.
-
-A hard fork is ours whatever its remotes say. An entry is added by the
-operator's decision in a reviewed commit and is never computed; there is no
-environment override.
-
-A DEFVAR rather than a DEFPARAMETER so that an override installed at runtime
-survives reloading the system, matching *OUR-GIT-ACCOUNTS*.")
-
-(defun declared-hard-forks ()
-  "Return the list of owner/name strings currently declared hard forks."
-  *declared-hard-forks*)
-
-(defvar *scheme-repository-scanner*
-  (create-scanner
-   "^[a-zA-Z][a-zA-Z0-9+.-]*://(?:[^/@]+@)?[^/]+/([^/]+)/([^/]+?)(?:\\.git)?/?$")
-  "Matches https://host/owner/repo and ssh://git@host/owner/repo, capturing
-owner and repository name without a trailing .git or slash.")
-
-(defvar *scp-repository-scanner*
-  (create-scanner "^[^/@]+@[^/:]+:([^/]+)/([^/]+?)(?:\\.git)?/?$")
-  "Matches the scp shorthand git@host:owner/repo.git, capturing owner and
-repository name without a trailing .git or slash.")
-
-(defun %owner-and-name (scanner string)
-  "Return \"owner/name\" from the two groups SCANNER captures in STRING, or NIL."
-  (multiple-value-bind (start end group-starts group-ends)
-      (scan scanner string)
-    (declare (ignore end))
-    (when (and start
-               (= 2 (length group-starts))
-               (aref group-starts 0)
-               (aref group-starts 1)
-               (< (aref group-starts 1) (aref group-ends 1)))
-      (format nil "~A/~A"
-              (subseq string (aref group-starts 0) (aref group-ends 0))
-              (subseq string (aref group-starts 1) (aref group-ends 1))))))
-
-(defun parse-remote-repository (url)
-  "Return \"owner/name\" for the repository URL names, or NIL.
-
-Recognizes the URL shapes PARSE-REMOTE-OWNER does, with a trailing .git and a
-trailing slash removed. Pure string work: no lookup is made."
-  (when (stringp url)
-    (or (%owner-and-name *scheme-repository-scanner* url)
-        (%owner-and-name *scp-repository-scanner* url))))
-
-(defun declared-hard-fork-p (url)
-  "Return T when URL names a repository in DECLARED-HARD-FORKS, else NIL.
-
-Requires OUR-REMOTE-P as well. Owner and name are compared as one whole string
-without regard to case, so a name that merely begins with a declared one never
-matches, and an unparseable URL never matches."
-  (let ((repository (parse-remote-repository url)))
-    (when (and repository
-               (our-remote-p url)
-               (member repository (declared-hard-forks) :test #'string-equal))
-      t)))
+(define-condition project-disposition-not-recordable (project-disposition-error)
+  ((path   :initarg :path   :initform nil :reader disposition-not-recordable-path)
+   (reason :initarg :reason :initform nil :reader disposition-not-recordable-reason))
+  (:documentation
+   "Signalled when a disposition cannot be recorded at PATH without the record
+becoming tracked content or leaving the write jail.")
+  (:report
+   (lambda (condition stream)
+     (format stream "The project disposition cannot be recorded in ~A: ~A."
+             (namestring (disposition-not-recordable-path condition))
+             (disposition-not-recordable-reason condition)))))
 
 ;;; ---------------------------------------------------------------------------
-;;; The classification itself
+;;; Reading
 ;;; ---------------------------------------------------------------------------
 
-(defun classify-repository (directory &key declared-classification upstream-url)
-  "Return the classification of the repository at DIRECTORY, and its upstream URL.
+(defun %parse-value (raw)
+  "Return the disposition RAW names, or NIL.
 
-Two values: a member of +CLASSIFICATIONS+, and the URL of the software this tree
-came from, or NIL when there is none to record. The second value spares a caller
-from reading the remotes again to write the upstream down.
+Accepts exactly one of the three names, optionally inside one pair of matching
+quotes. Any other text, a shell expansion included, is NIL."
+  (let ((text raw))
+    (when (and (>= (length text) 2)
+               (member (char text 0) '(#\" #\'))
+               (char= (char text 0) (char text (1- (length text)))))
+      (setf text (subseq text 1 (1- (length text)))))
+    (find text +dispositions+ :key #'disposition-name :test #'string=)))
 
-DECLARED-CLASSIFICATION carries an answer already given by the operator and
-outranks everything inferred here. A value outside +CLASSIFICATIONS+ signals a
-TYPE-ERROR rather than falling through to inference, so a mistyped declaration
-cannot quietly become a guess.
+(defun %worktree-root (directory)
+  "Return the root of the worktree containing DIRECTORY."
+  (uiop:ensure-directory-pathname (or (git-toplevel directory) directory)))
 
-Precedence: an explicit DECLARED-CLASSIFICATION, then a declared hard fork (an
-origin matching DECLARED-HARD-FORK-P is :OURS with no upstream), then inference
-from the remotes.
+(defun %envrc-path (root)
+  "Return the .envrc pathname under ROOT."
+  (merge-pathnames ".envrc" (uiop:ensure-directory-pathname root)))
 
-UPSTREAM-URL supplies an upstream that the repository does not yet record, which
-is how a repository is resolved without first repairing its remotes.
+(defun %same-directory-p (a b)
+  "Return true when A and B name the same existing directory."
+  (let ((ta (probe-file a))
+        (tb (probe-file b)))
+    (and ta tb (string= (namestring ta) (namestring tb)))))
 
-Signals NOT-A-REPOSITORY-ERROR when DIRECTORY lies outside any repository.
-Signals REPO-CLASSIFICATION-AMBIGUOUS-ERROR when the origin is one of ours and
-nothing records an upstream, and when there is no origin at all. Neither of
-those has a default: an origin under our account is at least as often somebody
-else's software as our own, and only the operator knows which."
+(defun %main-worktree-root (directory)
+  "Return the main worktree's root when DIRECTORY lies in a linked worktree, else NIL.
+
+The main worktree is the parent of the common git directory when that directory
+is named .git. A bare or separated git directory has no main worktree."
+  (let* ((common (git-common-dir directory))
+         (name (car (last (pathname-directory common)))))
+    (when (equal name ".git")
+      (let ((main (uiop:pathname-parent-directory-pathname common)))
+        (unless (%same-directory-p main (%worktree-root directory))
+          main)))))
+
+(defun %read-envrc (path)
+  "Return the text of the file at PATH, read as Latin-1.
+Latin-1 maps every byte to one character, so a file in any encoding reads
+without a decoding error and is written back byte for byte."
+  (uiop:read-file-string path :external-format :latin-1))
+
+(defun %file-declaration (path)
+  "Return the disposition the file at PATH declares, or NIL when it declares none.
+
+Signals PROJECT-DISPOSITION-UNREADABLE for a value that is not one of the names,
+and PROJECT-DISPOSITION-CONFLICT when the file declares two that disagree."
+  (when (probe-file path)
+    (let ((raws (declared-values (%read-envrc path) +disposition-variable+)))
+      (when raws
+        (let ((parsed (mapcar (lambda (raw)
+                                (or (%parse-value raw)
+                                    (error 'project-disposition-unreadable
+                                           :path path :value raw)))
+                              raws)))
+          (unless (every (lambda (d) (eq d (first parsed))) parsed)
+            (error 'project-disposition-conflict
+                   :declarations (mapcar (lambda (raw) (cons path raw)) raws)))
+          (first parsed))))))
+
+(defun %worktree-roots (directory)
+  "Return the root of every worktree of the repository at DIRECTORY that has a
+working tree, in the order git lists them."
+  (let ((roots '())
+        (current nil)
+        (bare nil))
+    (flet ((flush ()
+             (when (and current (not bare))
+               (push current roots))))
+      (dolist (line (uiop:split-string
+                     (values (run-git (list "worktree" "list" "--porcelain")
+                                      :directory directory))
+                     :separator '(#\Newline)))
+        (cond
+          ((uiop:string-prefix-p "worktree " line)
+           (flush)
+           (setf current (uiop:ensure-directory-pathname (subseq line 9))
+                 bare nil))
+          ((string= line "bare") (setf bare t))))
+      (flush))
+    (nreverse roots)))
+
+(defun %record-root (directory)
+  "Return the root of the worktree whose .envrc records the disposition for the
+repository at DIRECTORY: the main worktree's, or DIRECTORY's own when there is
+no main worktree or DIRECTORY lies in it."
+  (or (%main-worktree-root directory) (%worktree-root directory)))
+
+(defun %declarations (directory)
+  "Return (PATH . DISPOSITION) for every worktree .envrc of the repository at
+DIRECTORY that declares one: the recording worktree's first, then DIRECTORY's
+own, then the rest. Signals what %FILE-DECLARATION signals."
+  (let ((roots (remove-duplicates (list* (%record-root directory)
+                                         (%worktree-root directory)
+                                         (%worktree-roots directory))
+                                  :test #'%same-directory-p
+                                  :from-end t))
+        (found '()))
+    (dolist (root roots (nreverse found))
+      (let* ((path (%envrc-path root))
+             (declared (%file-declaration path)))
+        (when declared
+          (push (cons path declared) found))))))
+
+(defun resolve-disposition (directory &key supplied)
+  "Return the disposition of the repository at DIRECTORY, and where it came from.
+
+Two values: a member of +DISPOSITIONS+, and the .envrc pathname it was read from
+or :ARGUMENT when SUPPLIED was used because nothing is recorded.
+
+The disposition belongs to the repository, since the lint gate and the findings
+record are shared by all its worktrees. Every worktree's .envrc that declares it
+must agree. The value is read from the main worktree's .envrc, else from the
+first worktree's that declares it. The process environment is never read.
+
+Signals:
+  NOT-A-REPOSITORY-ERROR          DIRECTORY lies outside any repository.
+  PROJECT-DISPOSITION-REQUIRED    nothing recorded and SUPPLIED is NIL.
+  PROJECT-DISPOSITION-CONFLICT    two declarations disagree, or SUPPLIED differs
+                                  from the recorded value.
+  PROJECT-DISPOSITION-UNREADABLE  a declared value is not one of the names.
+  TYPE-ERROR                      SUPPLIED is not a disposition."
   (unless (git-repository-p directory)
     (error 'not-a-repository-error :path directory))
-  (when declared-classification
-    (unless (member declared-classification +classifications+)
-      (error 'type-error
-             :datum declared-classification
-             :expected-type 'repo-classification))
-    (return-from classify-repository
-      (values declared-classification
-              (when (eq declared-classification :foreign-with-upstream)
-                (or upstream-url (git-remote-url directory "upstream"))))))
-  (let ((origin (git-remote-url directory "origin")))
-    (unless origin
-      (error 'repo-classification-ambiguous-error
-             :directory directory
-             :origin-url nil))
-    ;; A declared hard fork is ours by the operator's word, whatever other
-    ;; remotes it records, so it is settled before any inference below.
-    (when (declared-hard-fork-p origin)
-      (return-from classify-repository (values :ours nil)))
-    (unless (our-remote-p origin)
-      ;; A third-party origin settles the question by itself, with no reference
-      ;; to any upstream remote. These are the raw clones that record no
-      ;; upstream at all, and they are the dangerous ones: every test that looks
-      ;; for an upstream first reads them as ours.
-      (return-from classify-repository
-        (values :foreign-with-upstream origin)))
-    (let ((upstream (or upstream-url (git-remote-url directory "upstream"))))
-      (when upstream
-        (return-from classify-repository
-          (values :foreign-with-upstream upstream)))
-      (error 'repo-classification-ambiguous-error
-             :directory directory
-             :origin-url origin))))
+  (when supplied
+    (check-type supplied disposition))
+  (let* ((declarations (%declarations directory))
+         (first (first declarations)))
+    (dolist (entry (rest declarations))
+      (unless (eq (cdr entry) (cdr first))
+        (error 'project-disposition-conflict
+               :declarations (list (cons (car first) (disposition-name (cdr first)))
+                                   (cons (car entry) (disposition-name (cdr entry)))))))
+    (cond
+      ((and first supplied (not (eq (cdr first) supplied)))
+       (error 'project-disposition-conflict
+              :declarations (list (cons (car first) (disposition-name (cdr first)))
+                                  (cons :argument (disposition-name supplied)))))
+      (first (values (cdr first) (car first)))
+      (supplied (values supplied :argument))
+      (t (error 'project-disposition-required
+                :directory directory
+                :origin-url (git-remote-url directory "origin")
+                :upstream-url (git-remote-url directory "upstream"))))))
 
-(defun repo-profile (classification)
-  "Return :OURS or :FOREIGN for CLASSIFICATION.
+;;; ---------------------------------------------------------------------------
+;;; Recording
+;;; ---------------------------------------------------------------------------
 
-The two foreign outcomes collapse into one profile because they call for
-identical treatment: the apparatus is present on disk and none of it is tracked.
-They differ only in whether there is an upstream to record. An unrecognized
-value signals rather than defaulting, because this profile sets
-whether a write becomes tracked content in a repository we do not own."
-  (ecase classification
-    (:ours :ours)
-    ((:foreign-with-upstream :foreign-orphan) :foreign)))
+(defun %envrc-tracked-p (root)
+  "Return true when the repository at ROOT tracks its .envrc."
+  (and (member ".envrc" (git-tracked-files root) :test #'string=) t))
+
+(defun check-disposition-recordable (directory &key jail)
+  "Return the resolved pathname a disposition for the repository at DIRECTORY
+would be written to. Writes nothing.
+
+The record goes in the main worktree's .envrc, or DIRECTORY's own worktree's
+when there is no main worktree. JAIL, defaulting to that worktree's root,
+bounds the write; a symlinked .envrc is followed before the check.
+
+Signals PROJECT-DISPOSITION-NOT-RECORDABLE when that .envrc is tracked, or
+resolves outside JAIL."
+  (let* ((root (%record-root directory))
+         (path (%envrc-path root)))
+    (when (%envrc-tracked-p root)
+      (error 'project-disposition-not-recordable
+             :path path
+             :reason "the repository tracks its .envrc, so a declaration written there would be committed"))
+    (or (ensure-write-path (namestring path) (or jail root))
+        (error 'project-disposition-not-recordable
+               :path path
+               :reason (if (%same-directory-p root (%worktree-root directory))
+                           "the .envrc lies outside the write jail"
+                           "it is the main worktree's .envrc, which records the disposition for every worktree of the repository, and it lies outside the write jail; record the disposition from the main worktree")))))
+
+(defun %declaration-text (text disposition)
+  "Return TEXT with the declaration of DISPOSITION added, every other line kept.
+The line joins the last dsmr-mcp managed region, or a new one is appended."
+  (let ((line (format nil "export ~A=~A" +disposition-variable+
+                      (disposition-name disposition))))
+    (if (zerop (length text))
+        (format nil "~A~%~A~%~A~%" (region-open-line) line (region-close-line))
+        (values (ensure-declaration-line text +disposition-variable+ line)))))
+
+(defun record-disposition (directory disposition &key jail dry-run)
+  "Record DISPOSITION for the repository containing DIRECTORY.
+
+The record goes in the main worktree's .envrc, which every worktree of the
+repository reads, or in DIRECTORY's own worktree's when there is no main
+worktree. Returns a plist (:PATH P :DISPOSITION D :ACTION-TAKEN A), where A is
+:CREATED (no .envrc existed), :ADDED (the line joined an existing file),
+:ALREADY-PRESENT (the same value is declared; P is the file declaring it), or
+:WOULD-RECORD (DRY-RUN; nothing written).
+
+Before writing, .envrc is added to the local exclude. Every other byte of an
+existing file is kept, and so are its permission bits and, where the process
+may set them, its owner. JAIL, defaulting to the recording worktree's root,
+bounds the write.
+
+Signals:
+  PROJECT-DISPOSITION-CONFLICT        a different value is already declared.
+  PROJECT-DISPOSITION-UNREADABLE      the declared value cannot be read.
+  PROJECT-DISPOSITION-NOT-RECORDABLE  the .envrc is tracked, or lies outside JAIL.
+  TYPE-ERROR                          DISPOSITION is not a disposition."
+  (check-type disposition disposition)
+  (multiple-value-bind (resolved source)
+      (resolve-disposition directory :supplied disposition)
+    (declare (ignore resolved))
+    (if (pathnamep source)
+        (list :path source :disposition disposition :action-taken :already-present)
+        (let* ((root (%record-root directory))
+               (path (%envrc-path root))
+               (target (check-disposition-recordable directory :jail jail)))
+          (if dry-run
+              (list :path path :disposition disposition :action-taken :would-record)
+              (let* ((existed (and (probe-file path) t))
+                     (text (if existed (%read-envrc path) "")))
+                (repair-repo-exclude root :template-patterns (list ".envrc"))
+                (write-file-string-atomically target
+                                              (%declaration-text text disposition)
+                                              :keep-mode t
+                                              :external-format :latin-1)
+                (list :path path
+                      :disposition disposition
+                      :action-taken (if existed :added :created))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; What the disposition implies
+;;; ---------------------------------------------------------------------------
+
+(defun disposition-profile (disposition)
+  "Return the shape profile for DISPOSITION: :OURS for ours and forked, :FOREIGN
+for contributing. Signals TYPE-ERROR for anything else.
+
+The shape profile selects which tiers a repository is held to and whether our
+apparatus in it is tracked or excluded. A fork is taken over as ours, so its
+apparatus is tracked; the licence is the one difference, answered by
+DISPOSITION-WRITES-LICENCE-P. The gate's mode is decided separately, by
+DISPOSITION-GATE-PROFILE."
+  (ecase disposition
+    ((:ours :forked) :ours)
+    (:contributing :foreign)))
+
+(defun disposition-gate-profile (disposition)
+  "Return the profile the lint gate is rendered for under DISPOSITION: :OURS,
+which blocks, for ours and forked; :FOREIGN, which only reports, for
+contributing. Signals TYPE-ERROR for anything else."
+  (ecase disposition
+    ((:ours :forked) :ours)
+    (:contributing :foreign)))
+
+(defun disposition-writes-licence-p (disposition)
+  "Return true when licence text may be written into a repository declared
+DISPOSITION: only ours. A contributing project's licence is its maintainer's,
+and a fork keeps the licence it came with. Signals TYPE-ERROR for anything else."
+  (ecase disposition
+    (:ours t)
+    ((:contributing :forked) nil)))
+
+(defun %declares-p (path)
+  "Return true when the file at PATH holds a disposition declaration of any value."
+  (and (probe-file path)
+       (declared-values (%read-envrc path) +disposition-variable+)
+       t))
+
+(defun disposition-warnings (directory disposition &key upstream-url)
+  "Return a list of warning strings about DISPOSITION against the repository's
+remotes and files. Each states a fact that does not fit the declaration; none
+changes it.
+
+UPSTREAM-URL is an upstream about to be recorded, counted as recorded."
+  (let* ((root (%worktree-root directory))
+         (upstream (or (git-remote-url directory "upstream") upstream-url))
+         (main-root (%main-worktree-root directory))
+         (warnings '()))
+    (when (and (eq disposition :ours) upstream)
+      (push (format nil "declared ours, but an upstream remote is recorded (~A); ~
+code that originates here has no upstream, so forked may be the disposition meant"
+                    upstream)
+            warnings))
+    (when (and (eq disposition :contributing) (null upstream))
+      (push "declared contributing, but no upstream remote is recorded; supply upstream_url to record the project contributed to"
+            warnings))
+    (when (and (%declares-p (%envrc-path root)) (%envrc-tracked-p root))
+      (push "the .envrc holding the declaration is tracked, so the declaration is committed content"
+            warnings))
+    (when (and main-root
+               (%declares-p (%envrc-path root))
+               (not (%declares-p (%envrc-path main-root))))
+      (push (format nil "the disposition is declared only in this linked worktree's ~A; ~
+the main worktree's ~A records it for every worktree of the repository, so move the line there"
+                    (namestring (%envrc-path root))
+                    (namestring (%envrc-path main-root)))
+            warnings))
+    (nreverse warnings)))

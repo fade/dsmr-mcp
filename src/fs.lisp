@@ -19,6 +19,7 @@
                 #:subdirectories)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
+  (:import-from #:sb-posix)
   (:export #:read-file-string
            #:write-file-string-atomically
            #:list-directory-entries
@@ -95,10 +96,29 @@ Returns four values:
 
 ;;; Atomic file write -------------------------------------------------------
 
-(defun write-file-string-atomically (pathname content)
+(defun %copy-file-mode (from to)
+  "Give TO the permission bits of FROM, and its owner and group where the
+process may set them. Returns NIL; a step that cannot run is skipped."
+  (handler-case
+      (let ((stat (sb-posix:stat (uiop:native-namestring from)))
+            (target (uiop:native-namestring to)))
+        (sb-posix:chmod target (logand (sb-posix:stat-mode stat) #o7777))
+        (handler-case
+            (sb-posix:chown target (sb-posix:stat-uid stat)
+                            (sb-posix:stat-gid stat))
+          (sb-posix:syscall-error () nil)))
+    (sb-posix:syscall-error () nil))
+  nil)
+
+(defun write-file-string-atomically (pathname content
+                                     &key keep-mode (external-format :default))
   "Write CONTENT to PATHNAME atomically via tmp-then-rename.
 Parent directories are created if absent.
 The original file is preserved on failure (unwind-protect cleanup).
+
+KEEP-MODE true gives the new file the permission bits, owner and group of the
+file it replaces, where the process may set them; otherwise the new file takes
+the process umask. EXTERNAL-FORMAT is the encoding CONTENT is written in.
 
 The rename-done flag ensures the unwind-protect cleanup only deletes the
 temp file when the rename did not complete.  A post-rename failure (e.g.
@@ -112,9 +132,12 @@ in log-event) cannot delete the now-live destination file."
     (unwind-protect
          (progn
            (with-open-file (out tmp :direction :output :if-exists :supersede
-                                    :if-does-not-exist :create :element-type 'character)
+                                    :if-does-not-exist :create :element-type 'character
+                                    :external-format external-format)
              (write-string content out)
              (finish-output out))
+           (when (and keep-mode (probe-file pathname))
+             (%copy-file-mode pathname tmp))
            (rename-file tmp pathname)
            (setf rename-done t)
            (log-event :debug "fs.write.atomic"

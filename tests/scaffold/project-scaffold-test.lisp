@@ -394,3 +394,78 @@ Returns the result payload hash-table."
       (true (search "No lint gate was installed" (%content-text payload))
             "the content does not say why no lint gate was installed")
       (asdf:clear-system "verb-nogate-proj"))))
+
+(define-test the-verb-records-ours-when-it-creates-the-repository
+  "A scaffold that creates its own repository records the disposition ours in
+the new project's .envrc and lists .envrc in that repository's local exclude,
+reporting both."
+  (with-temp-project-root (session root)
+    (let* ((payload (%call-scaffold root "name" "verb-ours-proj" "license" "MIT"))
+           (recorded (gethash "disposition" payload))
+           (project (merge-pathnames "scaffolds/verb-ours-proj/" root))
+           (envrc (merge-pathnames ".envrc" project))
+           (exclude (merge-pathnames ".git/info/exclude" project)))
+      (true (hash-table-p recorded) "the result has no disposition object")
+      (when (hash-table-p recorded)
+        (is string= "ours" (gethash "disposition" recorded))
+        (true (member (gethash "action_taken" recorded) '("created" "added")
+                      :test #'equal)
+              "the declaration was written: ~S" (gethash "action_taken" recorded)))
+      (true (search (format nil "~%export DSMR_PROJECT_DISPOSITION=ours~%")
+                    (read-file-into-string envrc))
+            "the .envrc declares ours")
+      (true (member ".envrc"
+                    (mapcar (lambda (line) (string-trim " " line))
+                            (uiop:split-string (read-file-into-string exclude)
+                                               :separator '(#\Newline)))
+                    :test #'string=)
+            "the local exclude lists .envrc")
+      (true (search "disposition" (%content-text payload))
+            "the content reports the disposition")
+      (asdf:clear-system "verb-ours-proj"))))
+
+(define-test a-scaffold-in-an-existing-repository-asks-then-records
+  "Inside an existing repository with nothing recorded, the verb returns the
+disposition question with the three answers and their meanings and writes
+nothing. Called again with an answer, it records the answer in the repository's
+.envrc and then writes the project. With init_git false and no repository at
+all, nothing is recorded and the result says why."
+  (with-temp-project-root (session root)
+    (uiop:run-program (list "git" "-C" (namestring root) "init" "-q"))
+    (let* ((payload (%call-scaffold root "name" "verb-nested-proj"))
+           (project (merge-pathnames "scaffolds/verb-nested-proj/" root)))
+      (is string= "project-disposition-required" (gethash "error_type" payload)
+          "the verb asks: ~S" (%content-text payload))
+      (true (gethash "requires_disposition" payload) "requires_disposition is set")
+      (is equalp #("ours" "contributing" "forked")
+          (gethash "accepted_dispositions" payload) "the three answers, in order")
+      (true (hash-table-p (gethash "disposition_meanings" payload))
+            "each answer's meaning is given")
+      (true (search "project-scaffold" (%content-text payload))
+            "the question names the verb to call again")
+      (false (probe-file project) "nothing was scaffolded")
+      (false (probe-file (merge-pathnames ".envrc" root)) "no .envrc was written"))
+    (let* ((payload (%call-scaffold root "name" "verb-nested-proj"
+                                    "disposition" "contributing"))
+           (recorded (gethash "disposition" payload)))
+      (true (gethash "created" payload) "the project is written once answered: ~A"
+            (%content-text payload))
+      (true (hash-table-p recorded) "the result has no disposition object")
+      (when (hash-table-p recorded)
+        (is string= "contributing" (gethash "disposition" recorded)))
+      (true (search (format nil "~%export DSMR_PROJECT_DISPOSITION=contributing~%")
+                    (read-file-into-string (merge-pathnames ".envrc" root)))
+            "the repository's .envrc declares contributing")
+      (false (probe-file (merge-pathnames "scaffolds/verb-nested-proj/LICENSE" root))
+             "no LICENSE is written into a contributing repository")
+      (true (search "No licence text was written" (%content-text payload))
+            "the content says no licence was written: ~A" (%content-text payload))
+      (asdf:clear-system "verb-nested-proj")))
+  (with-temp-project-root (session root)
+    (let* ((payload (%call-scaffold root "name" "verb-nogit-proj" "init_git" nil))
+           (recorded (gethash "disposition" payload)))
+      (true (hash-table-p recorded) "the result has no disposition object")
+      (when (hash-table-p recorded)
+        (is string= "not-recorded" (gethash "action_taken" recorded))
+        (true (stringp (gethash "reason" recorded)) "the result says why"))
+      (asdf:clear-system "verb-nogit-proj"))))

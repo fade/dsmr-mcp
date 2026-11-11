@@ -40,7 +40,8 @@
                 #:assess-repository
                 #:item-satisfied-p
                 #:assessment-root
-                #:assessment-classification
+                #:assessment-disposition
+                #:assessment-disposition-source
                 #:assessment-profile
                 #:assessment-deviations
                 #:assessment-satisfied)
@@ -179,6 +180,7 @@ so this is the whole of what it takes for such a repository to report clean."
   (%seed-quality-gate root)
   (write-fixture-file root "AGENTS.md" "# notes for an agent")
   (write-fixture-file root "CLAUDE.md" "# notes for an agent")
+  (write-fixture-file root "prompts/repl-driven-development.md" "# a guide for an agent")
   (write-fixture-file root ".envrc" "# the environment this project wants")
   root)
 
@@ -280,7 +282,7 @@ gate, it would make the doctor report the gate installed and never install it."
       (let ((hook (write-fixture-file root ".git/hooks/pre-commit"
                                       (format nil "#!/bin/sh~%exit 0~%"))))
         (uiop:run-program (list "chmod" "+x" (namestring hook))))
-      (let* ((assessment (assess-repository root))
+      (let* ((assessment (assess-repository root :disposition :contributing))
              (gate (find-if (lambda (deviation)
                               (and (typep deviation 'missing-shape-item)
                                    (%mentions-p deviation "hooks/lisp-gate")))
@@ -296,7 +298,7 @@ gate, it would make the doctor report the gate installed and never install it."
 ;;; ---------------------------------------------------------------------------
 
 (define-test a-satisfied-repository-reports-nothing-and-says-what-it-checked
-  "An empty deviation list arrives with the classification, the profile and the
+  "An empty deviation list arrives with the disposition, the profile and the
 items found already correct, so it is distinguishable from an assessment that
 never ran.
 
@@ -310,9 +312,10 @@ never asked."
       (%seed-library root)
       (%seed-apparatus root)
       (%seed-clean-exclude root)
-      (let ((assessment (assess-repository root)))
+      (let ((assessment (assess-repository root :disposition :contributing)))
         (is equal '() (assessment-deviations assessment))
-        (is eq :foreign-with-upstream (assessment-classification assessment))
+        (is eq :contributing (assessment-disposition assessment))
+        (is eq :argument (assessment-disposition-source assessment))
         (is eq :foreign (assessment-profile assessment))
         (true (assessment-root assessment))
         (true (member :mallet-config (assessment-satisfied assessment)))
@@ -336,7 +339,7 @@ repository of that kind has."
       (uiop:delete-directory-tree (merge-pathnames "src/" root)
                                   :validate t :if-does-not-exist :ignore)
       (let* ((assessment (assess-repository root
-                                            :declared-classification :ours))
+                                            :disposition :ours))
              (missing (%of-type assessment 'missing-shape-item)))
         (is = 1 (length missing))
         (is equal '(:src-dir) (%keys missing))))))
@@ -353,7 +356,7 @@ repository with the blocking gate assesses with no gate finding."
       (%seed-clean-exclude root)
       (when (configured-hooks-supported-p root)
         (let* ((assessment (assess-repository root
-                                              :declared-classification :ours))
+                                              :disposition :ours))
                (missing (%of-type assessment 'missing-shape-item)))
           (is = 1 (length missing) "one finding: ~S" missing)
           (true (and missing (%mentions-p (first missing) "another profile"))
@@ -361,7 +364,7 @@ repository with the blocking gate assesses with no gate finding."
         (%write-gate-file root :ours)
         (wire-gate-hook root :profile :ours)
         (is equal '()
-            (%of-type (assess-repository root :declared-classification :ours)
+            (%of-type (assess-repository root :disposition :ours)
                       'missing-shape-item)
             "the blocking gate satisfies a repository of ours")))))
 
@@ -385,7 +388,7 @@ an assessment holding the strictest opinion imaginable."
       (false (item-satisfied-p (catalog-item :dev-boot) root))
       (false (item-satisfied-p (catalog-item :src-dir) root))
       (false (item-satisfied-p (catalog-item :tests-dir) root))
-      (let ((keys (%keys (assessment-deviations (assess-repository root)))))
+      (let ((keys (%keys (assessment-deviations (assess-repository root :disposition :contributing)))))
         (false (member :build-script keys))
         (false (member :dev-boot keys))
         (false (member :readme keys))
@@ -416,17 +419,20 @@ first two."
       (%seed-library root)
       (%seed-apparatus root)
       (%seed-clean-exclude root)
-      (is equal '() (assessment-deviations (assess-repository root)))
+      (is equal '() (assessment-deviations
+                     (assess-repository root :disposition :contributing)))
       ;; Their layout, one directory lighter, and the answer must not change.
       (uiop:delete-directory-tree (merge-pathnames "src/" root)
                                   :validate t :if-does-not-exist :ignore)
       (false (item-satisfied-p (catalog-item :src-dir) root)
              "the directory really is gone")
-      (is equal '() (assessment-deviations (assess-repository root))
+      (is equal '() (assessment-deviations
+                     (assess-repository root :disposition :contributing))
           "and a repository we do not own is not reported for it")
       ;; Ours, one file lighter, and the answer must change.
       (uiop:delete-file-if-exists (merge-pathnames ".mallet.lisp" root))
-      (let ((deviations (assessment-deviations (assess-repository root))))
+      (let ((deviations (assessment-deviations
+                         (assess-repository root :disposition :contributing))))
         (is = 1 (length deviations))
         (is equal '(:mallet-config) (%keys deviations))))))
 
@@ -452,7 +458,8 @@ is unfounded, and the suite would look exactly as healthy as it does now."
       (fixture-commit-file root "CLAUDE.md" "# apparatus")
       (%seed-clean-exclude root)
       (true (member "CLAUDE.md" (git-tracked-files root) :test #'string=))
-      (let ((leaks (%of-type (assess-repository root) 'foreign-apparatus-tracked)))
+      (let ((leaks (%of-type (assess-repository root :disposition :contributing)
+                             'foreign-apparatus-tracked)))
         (is = 1 (length leaks))
         (is equal '(:claude-doc) (%keys leaks))))
     ;; Present and untracked, everything else identical.
@@ -463,7 +470,8 @@ is unfounded, and the suite would look exactly as healthy as it does now."
       (write-fixture-file root "CLAUDE.md" "# apparatus")
       (false (member "CLAUDE.md" (git-tracked-files root) :test #'string=))
       (is equal '()
-          (%of-type (assess-repository root) 'foreign-apparatus-tracked)))))
+          (%of-type (assess-repository root :disposition :contributing)
+                    'foreign-apparatus-tracked)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CONTROL: the same file, two profiles, opposite answers
@@ -487,9 +495,8 @@ two-mode rule has quietly become one mode."
       (fixture-commit-file root ".mallet.lisp" ";; linter configuration")
       (%seed-clean-exclude root)
       (true (member ".mallet.lisp" (git-tracked-files root) :test #'string=))
-      (let ((foreign (assess-repository
-                      root :declared-classification :foreign-with-upstream))
-            (ours (assess-repository root :declared-classification :ours)))
+      (let ((foreign (assess-repository root :disposition :contributing))
+            (ours (assess-repository root :disposition :ours)))
         (is = 1 (length (%of-type foreign 'foreign-apparatus-tracked)))
         (is equal '(:mallet-config)
             (%keys (%of-type foreign 'foreign-apparatus-tracked)))
@@ -515,7 +522,7 @@ report by two entries that say nothing the first does not."
       ;; Remove two of the gate's three parts, leaving the configuration.
       (uiop:delete-file-if-exists (merge-pathnames "scripts/lint-lisp.sh" root))
       (uiop:delete-file-if-exists (gate-hook-path root))
-      (let* ((assessment (assess-repository root :declared-classification :ours))
+      (let* ((assessment (assess-repository root :disposition :ours))
              (deviations (assessment-deviations assessment)))
         (is = 1 (length deviations))
         (is equal '(:mallet-config) (%keys deviations))
@@ -538,14 +545,16 @@ answer is not something this check gives to every repository."
                               :initial-file "README.md" :initial-content "x")
       (%seed-library root)
       (seed-exclude-patterns root (butlast +fixture-template-patterns+))
-      (let ((drift (%of-type (assess-repository root) 'drifted-shape-item)))
+      (let ((drift (%of-type (assess-repository root :disposition :contributing)
+                             'drifted-shape-item)))
         (is = 1 (length drift))
         (true (%mentions-p (first drift) (car (last +fixture-template-patterns+))))))
     (with-temp-git-repo (root :origin-url +third-party-origin-url+
                               :initial-file "README.md" :initial-content "x")
       (%seed-library root)
       (%seed-clean-exclude root)
-      (is equal '() (%of-type (assess-repository root) 'drifted-shape-item)))))
+      (is equal '() (%of-type (assess-repository root :disposition :contributing)
+                              'drifted-shape-item)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The repository is not touched
@@ -563,7 +572,7 @@ assessment, including one that has findings to report."
              (tracked-before (git-tracked-files root))
              (status-before (git-status-porcelain root))
              (exclude-before (uiop:read-file-string exclude))
-             (assessment (assess-repository root)))
+             (assessment (assess-repository root :disposition :contributing)))
         ;; There is something to report, so the run is not trivially inert.
         (true (plusp (length (assessment-deviations assessment))))
         (is equal tracked-before (git-tracked-files root))

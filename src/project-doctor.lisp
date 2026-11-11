@@ -49,10 +49,13 @@
                 #:assess-repository
                 #:item-satisfied-p
                 #:gate-file-state
-                #:assessment-classification
+                #:assessment-disposition
+                #:assessment-disposition-source
                 #:assessment-profile
                 #:assessment-deviations
                 #:assessment-satisfied)
+  (:import-from #:dsmr-mcp/src/project-scaffold-core
+                #:without-licence-text)
   (:import-from #:dsmr-mcp/src/project-deviation
                 #:deviation-item
                 #:signal-deviation
@@ -66,6 +69,12 @@
   (:import-from #:dsmr-mcp/src/project-exclude
                 #:repair-repo-exclude
                 #:template-exclude-patterns)
+  ;; The disposition is recorded after the exclude step, for the same reason.
+  (:import-from #:dsmr-mcp/src/repo-classify
+                #:record-disposition
+                #:check-disposition-recordable
+                #:disposition-gate-profile
+                #:disposition-warnings)
   (:import-from #:dsmr-mcp/src/project-shape
                 #:shape-item-key
                 #:shape-item-path
@@ -109,7 +118,10 @@
            #:doctor-report
            #:doctor-report-p
            #:report-root
-           #:report-classification
+           #:report-disposition
+           #:report-disposition-source
+           #:report-disposition-recorded
+           #:report-warnings
            #:report-profile
            #:report-changed
            #:report-already-correct
@@ -217,11 +229,19 @@ lists on purpose. A single list of findings cannot say which of them the run
 acted on, and a report that cannot say what it changed is not a record of a run,
 it is a description of one.
 
+DISPOSITION and DISPOSITION-SOURCE are as the assessment resolved them.
+DISPOSITION-RECORDED is the plist RECORD-DISPOSITION returned, or one with
+:ALREADY-PRESENT naming the file the disposition was read from. WARNINGS are
+the strings DISPOSITION-WARNINGS returned.
+
 HEAD-SHA-BEFORE and HEAD-SHA-AFTER are both carried even though they are
 required to match, because a reader checking that nothing was committed should
 be able to see the two values rather than take the claim on trust."
   (root            nil :read-only t)
-  (classification  nil :read-only t)
+  (disposition     nil :read-only t)
+  (disposition-source nil :read-only t)
+  (disposition-recorded nil :read-only t)
+  (warnings        '() :type list :read-only t)
   (profile         nil :read-only t)
   (changed         '() :type list :read-only t)
   (already-correct '() :type list :read-only t)
@@ -344,7 +364,8 @@ being decided again here. The gate script is rendered for PROFILE, :FOREIGN or
 :OURS: informational in a repository we do not own, blocking in one we do.
 Everything else comes from the item's own generator, which is the same one the
 scaffold writes a new project from, with the licence lines the empty licence
-bindings leave behind removed."
+bindings leave behind removed. Under :FOREIGN every line of licence text is
+removed, by the rule the scaffold applies in a repository declared contributing."
   (if (%gate-item-p item)
       (ecase (shape-item-key item)
         (:mallet-config (render-gate-config :severity severity
@@ -354,8 +375,10 @@ bindings leave behind removed."
         (:pre-commit (render-pre-commit-hook :severity severity
                                              :project-name project-name
                                              :profile profile)))
-      (%without-empty-licence-lines
-       (funcall (shape-item-generator item) bindings))))
+      (let ((content (funcall (shape-item-generator item) bindings)))
+        (if (eq profile :foreign)
+            (without-licence-text content)
+            (%without-empty-licence-lines content)))))
 
 (defun %executable-item-p (item)
   "Return true when ITEM is a script that has to be executable to do anything."
@@ -563,7 +586,7 @@ Its entry here reports that repair rather than repeating it."
 ;;; Freezing the debt
 ;;; ---------------------------------------------------------------------------
 
-(defun %record-debt-baseline (root catalog bindings jail dry-run classification
+(defun %record-debt-baseline (root catalog bindings jail dry-run disposition
                               severity)
   "Return two values: the baseline's report plist, and a reason it is absent or NIL.
 
@@ -589,7 +612,7 @@ written, and the written one is believed."
                   (let* ((sites (collect-debt-sites root))
                          (content (render-debt-baseline
                                    :repo-name (%repo-name root)
-                                   :classification classification
+                                   :disposition disposition
                                    :severity severity
                                    :sites sites)))
                     (if dry-run
@@ -615,7 +638,7 @@ written, and the written one is believed."
 ;;; The run
 ;;; ---------------------------------------------------------------------------
 
-(defun normalise-repository (root &key policy declared-classification upstream-url
+(defun normalise-repository (root &key policy disposition upstream-url
                                        dry-run session-root
                                        (catalog *shape-catalog*))
   "Bring the repository at ROOT up to the declared shape under POLICY and report it.
@@ -625,14 +648,16 @@ is written anywhere, including the local exclude, and every finding is returned
 unresolved with the decisions it admits, for the caller to choose between. An
 unattended run must not decide on its own what to do to a repository.
 
-An ambiguous classification propagates. Whether a tree whose origin is ours but
-which records no upstream is our own project is not inferable from anything on
-disk, and guessing wrong in the ours direction is precisely the leak this module
-exists to prevent.
+DISPOSITION answers the disposition question when the repository records none.
+The disposition refusals propagate before anything is written: the question,
+a conflict with the recorded value, an unreadable value, and, when the answer
+would be recorded, a tracked .envrc or one outside the write jail. A supplied
+answer is recorded in the main worktree's .envrc after the exclude step and the
+repairs; a run with no policy
+or a dry run reports :WOULD-RECORD instead. A recorded value is never rewritten.
 
 UPSTREAM-URL, when supplied for a repository that records no upstream, adds that
-remote. That is the offer to repair the one piece of missing evidence that makes
-a foreign repository indistinguishable from one of ours.
+remote. It decides nothing about the disposition.
 
 DRY-RUN writes nothing at all and still names what would change.
 
@@ -647,10 +672,10 @@ Returns a DOCTOR-REPORT."
          (jail (or session-root root))
          (head-before (git-head-sha root))
          (assessment (assess-repository root
-                                        :declared-classification declared-classification
-                                        :upstream-url upstream-url
+                                        :disposition disposition
                                         :catalog catalog))
-         (classification (assessment-classification assessment))
+         (declared (assessment-disposition assessment))
+         (source (assessment-disposition-source assessment))
          (profile (assessment-profile assessment))
          (bindings (%bindings root))
          (severity (adopted-repo-gate-severity))
@@ -662,7 +687,14 @@ Returns a DOCTOR-REPORT."
          (unresolved '())
          (kept '())
          (baseline nil)
-         (remote-added nil))
+         (remote-added nil)
+         (recorded nil))
+
+    ;; A disposition that will have to be recorded is checked for being
+    ;; recordable, tracked file and write jail both, before any write, so the
+    ;; refusal leaves nothing behind.
+    (when (eq source :argument)
+      (check-disposition-recordable root :jail jail))
 
     ;; The offer to record where a repository came from, before anything else is
     ;; decided about it.
@@ -699,7 +731,8 @@ Returns a DOCTOR-REPORT."
                   (:repaired
                    (multiple-value-bind (entries problems keys)
                        (%repair-deviation deviation root catalog bindings jail
-                                          dry-run severity exclude profile)
+                                          dry-run severity exclude
+                                          (disposition-gate-profile declared))
                      (dolist (entry entries) (push entry changed))
                      (dolist (problem problems) (push problem unresolved))
                      (dolist (key keys) (pushnew key kept))))
@@ -707,7 +740,7 @@ Returns a DOCTOR-REPORT."
                    (unless baseline
                      (multiple-value-bind (report reason)
                          (%record-debt-baseline root catalog bindings jail
-                                                dry-run classification severity)
+                                                dry-run declared severity)
                        (setf baseline report)
                        (when reason
                          (push (list :deviation deviation
@@ -726,6 +759,14 @@ Returns a DOCTOR-REPORT."
                             :reason (princ-to-string condition))
                       unresolved)))))
 
+      ;; Recorded after the exclude step and the repairs, so the line joins a
+      ;; freshly repaired .envrc whose path is already excluded.
+      (setf recorded
+            (if (eq source :argument)
+                (record-disposition root declared :jail jail :dry-run silent)
+                (list :path source :disposition declared
+                      :action-taken :already-present)))
+
       ;; A post-condition on our own writes, not a finding about the repository.
       (verify-no-tracked-apparatus root profile catalog
                                    :already-tracked already-tracked)
@@ -737,7 +778,10 @@ Returns a DOCTOR-REPORT."
                                    :after head-after))
         (%make-doctor-report
          :root root
-         :classification classification
+         :disposition declared
+         :disposition-source source
+         :disposition-recorded recorded
+         :warnings (disposition-warnings root declared :upstream-url upstream-url)
          :profile profile
          :changed (nreverse changed)
          :already-correct (append (assessment-satisfied assessment)

@@ -19,11 +19,22 @@
   (:import-from #:dsmr-mcp/src/state
                 #:session-project-root)
   (:import-from #:dsmr-mcp/src/project-scaffold
-                #:write-scaffold)
+                #:write-scaffold
+                #:scaffold-failed-after-writing)
   (:import-from #:dsmr-mcp/src/project-scaffold-core
                 #:invalid-argument-error
                 #:invalid-argument-field
                 #:invalid-argument-reason)
+  (:import-from #:dsmr-mcp/src/tools/project-doctor
+                #:+accepted-dispositions+
+                #:disposition-argument
+                #:disposition-question-result
+                #:disposition-refusal-result)
+  (:import-from #:dsmr-mcp/src/repo-classify
+                #:project-disposition-required
+                #:project-disposition-conflict
+                #:project-disposition-unreadable
+                #:project-disposition-not-recordable)
   (:export #:project-scaffold-tool))
 
 (in-package #:dsmr-mcp/src/tools/project-scaffold)
@@ -39,8 +50,17 @@ Emits a package-inferred-system with a mode-dispatching executable, Zebra \
 test suite, build recipe, dev-boot script, dependency-preference agent docs, \
 a copied REPL-development guide, and a selectable license with per-file SPDX \
 headers. The new project includes the lint gate (linter config, lint script, \
-and a pre-commit gate) whenever the scaffold creates its repository. Returns a \
-manifest of created files and next-step commands.")
+and a pre-commit gate) whenever the scaffold creates its repository, and then \
+records the disposition ours in the project's untracked .envrc. Inside an \
+existing repository with no disposition recorded, the call returns the \
+question, the three answers (ours, contributing, or forked), and what each \
+means, and writes nothing; a second call carries the answer in disposition, \
+which is recorded in that repository's .envrc before the project is written. \
+In a repository declared contributing or forked the project carries no licence \
+text at all, and in a contributing one our agent and lint files are added to \
+that repository's local exclude before they are written. A forked repository is \
+otherwise treated as ours, with those files tracked. \
+Returns a manifest of created files and next-step commands.")
    (dsmr-mcp/src/tools/base::input-schema
     :allocation :class
     :initform '(:object
@@ -78,7 +98,16 @@ where <name>/ is created (default: scaffolds). No leading / or .. segments.")
                   :type :boolean
                   :description "When false, skip repository initialization. \
 Default: true. A repository is created only when the new project would not sit \
-inside an existing one."))
+inside an existing one.")
+                 (disposition
+                  :type :string
+                  :enum ("ours" "contributing" "forked")
+                  :description "What the existing repository the project goes \
+into is, when its .envrc records nothing: ours, code originating with the \
+operator; contributing, a third-party project the operator only contributes to; \
+forked, forked to shorten the acceptance chain or because upstream is \
+unmaintained. Recorded in that repository's .envrc before the project is \
+written. A repository the scaffold creates takes only ours."))
                 :required ("name"))))
   (:metaclass mcp-tool-class)
   (:documentation "MCP tool: generate a DSMR-discipline Lisp project skeleton.
@@ -125,6 +154,40 @@ touches a failing form."
        (format nil "Installed the lint gate at ~A, but it is not wired: ~A."
                (namestring (getf gate :path)) (getf wiring :reason))))))
 
+(defun %disposition-object (recorded)
+  "Return the disposition result object for RECORDED, the :DISPOSITION plist of
+write-scaffold. Carries action_taken always, and disposition and path when one
+was recorded, reason when none was."
+  (let ((object (make-ht "action_taken" (%wire-name (getf recorded :action-taken)))))
+    (when (getf recorded :disposition)
+      (setf (gethash "disposition" object)
+            (%wire-name (getf recorded :disposition))))
+    (when (getf recorded :path)
+      (setf (gethash "path" object) (namestring (getf recorded :path))))
+    (when (getf recorded :reason)
+      (setf (gethash "reason" object) (getf recorded :reason)))
+    object))
+
+(defun %disposition-line (recorded)
+  "Return the content line saying whether the disposition was recorded, and why not."
+  (cond
+    ((null (getf recorded :disposition))
+     (format nil "No disposition was recorded: ~A." (getf recorded :reason)))
+    ((eq :already-present (getf recorded :action-taken))
+     (format nil "The disposition ~A is already recorded in ~A."
+             (%wire-name (getf recorded :disposition))
+             (namestring (getf recorded :path))))
+    (t
+     (format nil "Recorded the disposition ~A in ~A."
+             (%wire-name (getf recorded :disposition))
+             (namestring (getf recorded :path))))))
+
+(defun %licence-line (licence)
+  "Return the content line saying whether licence text was written, and why not."
+  (if (eq :omitted (getf licence :action-taken))
+      (format nil "No licence text was written: ~A." (getf licence :reason))
+      (format nil "Licence: ~A." (getf licence :license))))
+
 (defmethod tool-handle ((tool project-scaffold-tool) id args)
   (let* ((session (tool-session tool))
          (root    (session-project-root session)))
@@ -151,7 +214,16 @@ Call fs-set-project-root first.")))))
            ;; false, and those two must not answer the same way.
            (init-git    (if (nth-value 1 (gethash "init_git" args))
                             (and (gethash "init_git" args) t)
-                            t)))
+                            t))
+           (disposition (disposition-argument (gethash "disposition" args))))
+      (when (eq disposition :invalid)
+        (return-from tool-handle
+          (result id (make-ht "isError" t
+                              "error_type" "invalid-argument"
+                              "content"
+                              (text-content
+                               (format nil "project-scaffold: disposition must be one of ~{~A~^, ~}."
+                                       (coerce +accepted-dispositions+ 'list)))))))
       (unless (and name (stringp name))
         (return-from tool-handle
           (result id (make-ht "isError" t
@@ -171,7 +243,8 @@ Call fs-set-project-root first.")))))
                                :year year
                                :destination (or destination "scaffolds")
                                :overwrite overwrite
-                               :init-git init-git))
+                               :init-git init-git
+                               :disposition disposition))
                  (target-dir  (getf res :target-dir))
                  (relative    (getf res :relative-path))
                  (files       (getf res :files))
@@ -212,16 +285,24 @@ ASDF source-registry tree. Elsewhere: (asdf:load-asd ~S)"
                              "files" (coerce files 'vector)
                              "git_initialised" git-init-p
                              "gate_hook" (%gate-hook-object (getf res :gate-hook))
+                             "disposition" (%disposition-object
+                                            (getf res :disposition))
+                             "licence" (make-ht "action_taken"
+                                                (%wire-name
+                                                 (getf (getf res :licence)
+                                                       :action-taken)))
                              "next_steps" next-steps
                              "content"
                              (text-content
-                              (format nil "Scaffolded ~A at ~A (~D files)~%Path: ~A~%~A~%~A~%~{~A~%~}"
+                              (format nil "Scaffolded ~A at ~A (~D files)~%Path: ~A~%~A~%~A~%~A~%~A~%~{~A~%~}"
                                       name relative (length files)
                                       (namestring target-dir)
                                       (if git-init-p
                                           "Initialized a git repository here."
                                           "No git repository was created here.")
                                       (%gate-hook-line (getf res :gate-hook))
+                                      (%disposition-line (getf res :disposition))
+                                      (%licence-line (getf res :licence))
                                       (coerce next-steps 'list))))))
         (invalid-argument-error (e)
           (result id
@@ -232,4 +313,25 @@ ASDF source-registry tree. Elsewhere: (asdf:load-asd ~S)"
                                           (if (string= field "destination")
                                               "sandbox-violation"
                                               "invalid-argument"))
-                           "content" (text-content (princ-to-string e)))))))))
+                           "content" (text-content (princ-to-string e)))))
+        ;; A failure after the enclosing repository was written names those
+        ;; writes, so the caller learns that repository changed.
+        (scaffold-failed-after-writing (e)
+          (result id
+                  (make-ht "isError" t
+                           "created" nil
+                           "error_type" "scaffold-failed-after-writing"
+                           "content" (text-content (princ-to-string e)))))
+        ;; The question. Nothing has been written: the disposition is settled
+        ;; before the project is.
+        (project-disposition-required (condition)
+          (disposition-question-result id condition "project-scaffold"))
+        (project-disposition-conflict (condition)
+          (disposition-refusal-result
+           id "project-disposition-conflict" condition "project-scaffold"))
+        (project-disposition-unreadable (condition)
+          (disposition-refusal-result
+           id "project-disposition-unreadable" condition "project-scaffold"))
+        (project-disposition-not-recordable (condition)
+          (disposition-refusal-result
+           id "project-disposition-not-recordable" condition "project-scaffold"))))))

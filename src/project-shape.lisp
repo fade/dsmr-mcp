@@ -36,6 +36,7 @@
            #:shape-item-tier
            #:shape-item-group
            #:shape-item-apparatus-p
+           #:shape-item-local-only-p
            #:shape-item-assertion
            #:shape-item-match
            #:shape-item-generator
@@ -142,6 +143,7 @@ answer only the first."
   (tier               nil :type keyword           :read-only t)
   (group              nil :type (or null keyword) :read-only t)
   (apparatus-p        nil :type boolean           :read-only t)
+  (local-only-p       nil :type boolean           :read-only t)
   (assertion          nil :type keyword           :read-only t)
   (match              nil :type string            :read-only t)
   (generator          nil :type (or null function) :read-only t)
@@ -156,7 +158,8 @@ answer only the first."
            :reason (format nil "must be one of ~{~S~^, ~}" permitted)))
   value)
 
-(defun make-shape-item (&key key path tier group apparatus-p assertion match
+(defun make-shape-item (&key key path tier group apparatus-p local-only-p
+                             assertion match
                              generator emit-on-scaffold-p
                              (install-target :worktree))
   "Return a validated SHAPE-ITEM, or signal INVALID-SHAPE-ITEM-ERROR.
@@ -172,6 +175,10 @@ will run it at pre-commit; a file at the path alone does not satisfy it.
 KEY names the item in reports and must be a keyword. MATCH is the argument the
 assertion needs and is required for every kind: without it the item asserts
 nothing and would report satisfied in any repository at all.
+
+LOCAL-ONLY-P marks a file that must never be committed, such as the .envrc
+holding the recorded project disposition. Such a file is never tracked, under
+any profile.
 
 PATH may be NIL for an item that is matched rather than named, such as a system
 definition found by glob. GENERATOR may be NIL for an item that can be asserted
@@ -200,6 +207,7 @@ but not written, such as one whose content is computed per repository."
                     :tier tier
                     :group group
                     :apparatus-p (and apparatus-p t)
+                    :local-only-p (and local-only-p t)
                     :assertion assertion
                     :match match
                     :generator generator
@@ -216,8 +224,9 @@ but not written, such as one whose content is computed per repository."
 Our operational apparatus is ordinary tracked content in a repository we own, and
 must be present but untracked in one we do not. Under :FOREIGN every apparatus
 item is therefore :EXCLUDED, and no argument to this function can change that.
+A local-only item must never be committed and is :EXCLUDED under every profile.
 
-The disposition is computed here and never stored on the item, which is the whole
+The tracking is computed here and never stored on the item, which is the whole
 of the design. No accessor can report a foreign repository's apparatus as tracked,
 because the structure has no slot able to hold that claim: it cannot be
 constructed, written down, or read back. The rule has exactly one place it could
@@ -227,8 +236,10 @@ An unrecognized profile signals rather than defaulting. A default would have to
 answer :TRACKED, and that is the answer that puts our files into somebody else's
 commit."
   (ecase profile
-    (:foreign (if (shape-item-apparatus-p item) :excluded :tracked))
-    (:ours :tracked)))
+    (:foreign (if (or (shape-item-apparatus-p item) (shape-item-local-only-p item))
+                  :excluded
+                  :tracked))
+    (:ours (if (shape-item-local-only-p item) :excluded :tracked))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Reading a catalogue
