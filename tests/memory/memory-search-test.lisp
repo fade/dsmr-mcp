@@ -572,7 +572,7 @@ from the frontmatter."
     (let ((outcome (search-memory "superseded" :session-root repo)))
       (dolist (file '("marked.md" "listed.md"))
         (let ((hit (%hit-named outcome file)))
-          (true hit "~A is returned" file)
+          (true hit "~A is not returned" file)
           (when hit
             (is = 0 (hit-body-hits hit))
             (dolist (excerpt (hit-excerpts hit))
