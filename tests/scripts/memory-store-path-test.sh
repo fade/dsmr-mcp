@@ -48,14 +48,14 @@ spec.loader.exec_module(mod)
 for cwd in sys.argv[2:]:
     print(mod.store_name(cwd))'
 
-load_out=$(python3 -I -c "$LOADER" "$CHECK_STORE" 2>&1)
+load_out=$(python3 -I -B -c "$LOADER" "$CHECK_STORE" 2>&1)
 load_rc=$?
 try "[python] loading as a module prints nothing" "rc=$load_rc out=$load_out" \
     test "$load_rc" = 0 -a -z "$load_out"
 
 for fx in "${FIXTURES[@]}"; do
     IFS='|' read -r label cwd want <<<"$fx"
-    got=$(python3 -I -c "$LOADER" "$CHECK_STORE" "$cwd" 2>&1)
+    got=$(python3 -I -B -c "$LOADER" "$CHECK_STORE" "$cwd" 2>&1)
     try "[python] $label fixture: $cwd" "got=$got expected=$want" test "$got" = "$want"
 done
 
