@@ -24,7 +24,17 @@ prove it fires.
 
 Exit: 0 clean, 1 findings, 2 could not run (including a control that failed).
 """
-import sys, pathlib, tempfile, yaml
+import re, sys, pathlib, tempfile, yaml
+
+
+def store_name(cwd):
+    """The store directory name Claude Code derives for CWD: every character
+    outside ASCII letters, digits and the hyphen becomes a hyphen.
+
+    The class is spelled out because \\w and str.isalnum accept non-ASCII
+    letters, which the harness maps to a hyphen.
+    """
+    return re.sub(r'[^A-Za-z0-9-]', '-', cwd)
 
 
 def frontmatter(text):
@@ -116,37 +126,42 @@ def controls():
           f"(hide truncates {truncated!r})")
 
 
-controls()
+def main():
+    controls()
 
-store = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else
-                     f"~/.claude/projects/{pathlib.Path.cwd().as_posix().replace('/', '-').replace('.', '-')}/memory"
-                     ).expanduser()
-files = sorted(store.glob("*.md"))
-if not files:
-    # A scan that reads nothing reports the same clean as a healthy store.
-    print(f"REACH CONTROL FAILED: 0 files under {store}")
-    sys.exit(2)
+    store = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else
+                         f"~/.claude/projects/{store_name(pathlib.Path.cwd().as_posix())}/memory"
+                         ).expanduser()
+    files = sorted(store.glob("*.md"))
+    if not files:
+        # A scan that reads nothing reports the same clean as a healthy store.
+        print(f"REACH CONTROL FAILED: 0 files under {store}")
+        sys.exit(2)
 
-r = audit(files)
-print(f"reach        ok  {len(files)} files under {store}")
-print(f"parse        {r['seen']} with frontmatter / {r['ok']} ok / {len(r['bad'])} BAD"
-      f"   ({len(r['nofm'])} without, expected for MEMORY.md)")
+    r = audit(files)
+    print(f"reach        ok  {len(files)} files under {store}")
+    print(f"parse        {r['seen']} with frontmatter / {r['ok']} ok / {len(r['bad'])} BAD"
+          f"   ({len(r['nofm'])} without, expected for MEMORY.md)")
 
-unquoted = [(n, ln, s) for n, ln, s in r["hashes"]
-            if s.partition(":")[2].strip()[:1] not in ('"', "'")]
-print(f"' #' present  {len(r['hashes'])} line(s), {len(unquoted)} UNQUOTED")
-print(f"continuations {len(r['conts'])}")
+    unquoted = [(n, ln, s) for n, ln, s in r["hashes"]
+                if s.partition(":")[2].strip()[:1] not in ('"', "'")]
+    print(f"' #' present  {len(r['hashes'])} line(s), {len(unquoted)} UNQUOTED")
+    print(f"continuations {len(r['conts'])}")
 
-for n, why in r["bad"]:
-    print(f"  BAD  {n}: {why}")
-for n, ln, s in unquoted:
-    print(f"  HIDE {n}:{ln}  {s[:90]}")
-for n, ln, s in r["conts"]:
-    print(f"  CONT {n}:{ln}  {s[:90]}   <- check the scalar it continues")
+    for n, why in r["bad"]:
+        print(f"  BAD  {n}: {why}")
+    for n, ln, s in unquoted:
+        print(f"  HIDE {n}:{ln}  {s[:90]}")
+    for n, ln, s in r["conts"]:
+        print(f"  CONT {n}:{ln}  {s[:90]}   <- check the scalar it continues")
 
-if r["bad"] or unquoted or r["conts"]:
-    print("\nNEEDS ATTENTION. Quote the scalar; never trim it. ⛔ Before editing, "
-          "confirm the discarded tail exists in the body: it has held sha pins "
-          "recorded nowhere else.")
-    sys.exit(1)
-print("\nclean")
+    if r["bad"] or unquoted or r["conts"]:
+        print("\nNEEDS ATTENTION. Quote the scalar; never trim it. ⛔ Before editing, "
+              "confirm the discarded tail exists in the body: it has held sha pins "
+              "recorded nowhere else.")
+        sys.exit(1)
+    print("\nclean")
+
+
+if __name__ == "__main__":
+    main()
