@@ -487,6 +487,100 @@ a needle
       (is equal '("current.md") (%hit-files outcome))
       (is = 2 (%coverage outcome :hidden-retired)))))
 
+;;; status as a search term ---------------------------------------------------
+
+(defun %plant-status-fixture (tmp store)
+  "Plant three pages about the build cache in STORE. Only a status field
+mentions superseded. The pages:
+  - marked.md: flow status list, needle in the body
+  - listed.md: block status list, no needle
+  - plain.md: no status, needle in the body"
+  (%plant tmp store "marked.md" :name "marked"
+                                :description "a page about the build cache"
+                                :status "[superseded]"
+                                :body "a needle in the body
+")
+  (write-fixture-file tmp (format nil "projects/~A/memory/listed.md" store)
+                      "---
+name: listed
+description: another page about the build cache
+status:
+  - superseded
+---
+the body says nothing more
+")
+  (%plant tmp store "plain.md" :name "plain"
+                               :description "a page about the build cache"
+                               :body "a needle in the body
+"))
+
+(define-test status-value-matches-as-term
+  "A search for a status value finds the pages that hold it in their status.
+The flow and block forms of the status list both match."
+  (with-search-fixture (tmp repo store)
+    (%plant-status-fixture tmp store)
+    (let ((outcome (search-memory "superseded" :session-root repo)))
+      (is equal '("listed.md" "marked.md") (%hit-files outcome)))))
+
+(define-test status-reason-matches-as-term
+  "A search for a word found only in a status_reason finds that page."
+  (with-search-fixture (tmp repo store)
+    (write-fixture-file tmp (format nil "projects/~A/memory/old-cache.md" store)
+                        "---
+name: old-cache
+description: where the build cache lives
+status:
+  - superseded
+status_reason: Replaced by fasl-cache-is-keyed-to-the-sbcl-build
+---
+the cache lives under the home directory
+")
+    (%plant tmp store "other.md" :name "other"
+                                 :description "where the build cache lives"
+                                 :body "the cache lives under the home directory
+")
+    (let ((outcome (search-memory "fasl-cache-is-keyed" :session-root repo)))
+      (is equal '("old-cache.md") (%hit-files outcome)))))
+
+(define-test status-match-is-metadata-tier
+  "A status match is a metadata match. The status word alone gives tier 0.
+Adding a term found only in the body gives tier 1."
+  (with-search-fixture (tmp repo store)
+    (%plant-status-fixture tmp store)
+    (let ((hit (%hit-named (search-memory "superseded" :session-root repo) "marked.md")))
+      (true hit)
+      (is eql 0 (and hit (hit-tier hit))))
+    (let ((outcome (search-memory "superseded needle" :session-root repo)))
+      (is equal '("marked.md") (%hit-files outcome))
+      (is equal '(1) (mapcar #'hit-tier (outcome-hits outcome))))))
+
+(define-test status-word-does-not-match-status-less-page
+  "A page with no status does not match a status word absent from its text.
+It still matches a word in its body, and its hit carries no status."
+  (with-search-fixture (tmp repo store)
+    (%plant-status-fixture tmp store)
+    (false (%hit-named (search-memory "superseded" :session-root repo) "plain.md"))
+    (let ((plain (%hit-named (search-memory "needle" :session-root repo) "plain.md")))
+      (true plain)
+      (false (and plain (page-status (hit-page plain)))))))
+
+(define-test status-match-adds-no-frontmatter-excerpt
+  "A page found by its status has no body hits. None of its excerpts comes
+from the frontmatter."
+  (with-search-fixture (tmp repo store)
+    (%plant-status-fixture tmp store)
+    (let ((outcome (search-memory "superseded" :session-root repo)))
+      (dolist (file '("marked.md" "listed.md"))
+        (let ((hit (%hit-named outcome file)))
+          (true hit "~A is not returned" file)
+          (when hit
+            (is = 0 (hit-body-hits hit))
+            (dolist (excerpt (hit-excerpts hit))
+              (let ((text (getf excerpt :text)))
+                (false (or (eql 0 (search "status:" text))
+                           (eql 0 (search "  - superseded" text)))
+                       "excerpt ~S is frontmatter" text)))))))))
+
 ;;; pagination ----------------------------------------------------------------
 
 (define-test limit-and-offset-slice-after-ranking
