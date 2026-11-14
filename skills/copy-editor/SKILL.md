@@ -1,6 +1,6 @@
 ---
 name: copy-editor
-description: Read a PR body, commit message, diff comments, or any artifact about to be placed in front of the operator, as a person who knows the codebase and did not attend the session that produced it. Asks first whether the text reads as its author writing about his own work, since an impersonal body is a defect and not a clean result, then catches register and voice failures no pattern match can express: personification, an agent's first person, relay attribution, bus vocabulary, prose narrating how instead of what and why, and summaries answering the adjacent question. A third pass checks technical documentation against a catalogue of stock patterns (announced answers, manufactured emphasis, inflated vocabulary, unsourced claims, cycling synonyms for one referent), and a fourth checks mechanics (acronyms, numbers and units, tense, pronoun reference, the Oxford comma, Canadian spelling, inclusive terms). Use before any PR is filed, before any review buffer or handoff file is displayed, and whenever the operator asks for a copy-edit pass.
+description: Read a PR body, commit message, diff comments, or any artifact about to be placed in front of the operator, as a person who knows the codebase and did not attend the session that produced it. Asks first whether the text reads as its author writing about his own work, since an impersonal commit, PR, issue or review body is a defect and not a clean result, then catches register and voice failures no pattern match can express: personification, an agent's first person, relay attribution, bus vocabulary, prose narrating how instead of what and why, and summaries answering the adjacent question. A third pass checks technical documentation against a catalogue of stock patterns (announced answers, manufactured emphasis, inflated vocabulary, unsourced claims, cycling synonyms for one referent), and a fourth checks mechanics (acronyms, numbers and units, tense, pronoun reference, the Oxford comma, Canadian spelling, inclusive terms). Use before any PR is filed, before any review buffer or handoff file is displayed, and whenever the operator asks for a copy-edit pass.
 ---
 
 # copy-editor
@@ -118,10 +118,15 @@ weighs, not mandates.
 
 **Does this read as the author writing about his own work?**
 
-He is the author of everything produced here, so exterior committed work product is written in his
-voice. Ask the positive question and answer it before you look for anything to remove.
+He is the author of everything produced here, so commit message bodies, PR bodies, and issue and
+review comments are written in his voice. For those, ask the positive question and answer it before
+you look for anything to remove. ⛔ **They are the ONLY places his personal register belongs**
+(operator, 2026-11-14). Every other kind of technical writing is judged against the style-guide
+register in the Scope section below, and the positive question does not apply to it.
 
-**Two registers, both in the same document, and a third thing that has no register at all:**
+**Two registers, both in the same document, and a third thing that has no register at all.** This
+table governs his correspondence only (see Scope); a manual or README never takes its first-person
+row:
 
 | what the sentence is doing | register | example |
 |---|---|---|
@@ -187,8 +192,27 @@ outright, as is a repo name as a subject, or an agent or tool as the one who dec
 found. "I made the enumeration signal" is correct;
 "I measured this on a scratch tree" from an agent is not, and neither is "valis measured it".
 
-⚠ **Scope, and it is narrower than "prose".** In: commit bodies, PR bodies, issue and review
-comments, README and shipped docs, release notes. Docstrings and code comments are in scope to
+⚠ **Scope, and it is narrower than "prose".** In: commit message bodies, PR bodies, and issue and
+review comments, and nothing else (operator, 2026-11-14). Issue and review comments are his
+correspondence and are judged exactly as a PR body is.
+
+⛔ **All other technical writing follows the accepted best practice of the researched style guides**
+(operator, 2026-11-14), the Google developer documentation style guide first. That covers manuals,
+reference docs, README and shipped docs, and release notes. Judge it against this register:
+- impersonal: no first person and no motive narrative;
+- what the software does in the third person;
+- what the reader does in the imperative for steps, and in the second person otherwise;
+- present tense, and no history.
+
+Stock patterns, mechanics, the code-with-a-mind hunt, Canadian spelling and the Oxford comma still
+apply in full. ⚠ **An impersonal manual or README is CORRECT, never an impersonal-body finding:**
+that finding applies only to the in-scope items above. ⚠ **Every rule elsewhere in this skill and in
+`stock-patterns.md` that requires the author's first person applies to correspondence only.** In
+this register, a code-with-a-mind fix recasts the decision impersonally, never as "I": "The gate
+refuses an image holding a timeout, because a frozen value would otherwise win", or an imperative
+addressed to the reader.
+
+Docstrings and code comments are in scope to
 FLAG, never to edit (see the authority limit above), against the technical register, not this one. Out: subject lines
 and PR titles, which are active and descriptive and too short to carry a voice (operator,
 2026-08-22). Also out, and never euphemise these: `.planning/`, `BLOCKED.md`, `PARK.md`, `STATE.md`,
