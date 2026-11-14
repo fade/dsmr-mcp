@@ -25,7 +25,7 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 
 .PHONY: bridge bus-watch bus-host install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
-        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe
+        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -309,6 +309,14 @@ test-restart-session:
 ##   and must make `routing-probe.sh check` exit 1 (a cap case, exit 3).
 test-routing-probe:
 	@bash tests/scripts/routing-probe-test.sh
+
+## test-memory-store-path: check the memory store name derivation against fixtures.
+##
+##   Needs no session and reads no live store. Each fixture is a directory name
+##   Claude Code created under ~/.claude/projects, paired with the recorded cwd of
+##   the sessions that created it.
+test-memory-store-path:
+	@bash tests/scripts/memory-store-path-test.sh
 
 ## check-hooks: report where a deployed hook differs from this tree.
 ##
