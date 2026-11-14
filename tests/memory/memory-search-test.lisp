@@ -490,10 +490,11 @@ a needle
 ;;; status as a search term ---------------------------------------------------
 
 (defun %plant-status-fixture (tmp store)
-  "Plant three pages in STORE that share a description and never mention
-superseded outside a status field: marked.md with a flow status list and a
-needle in its body, listed.md with a block status list and no needle, and
-plain.md with no status and a needle in its body."
+  "Plant three pages about the build cache in STORE. Only a status field
+mentions superseded. The pages:
+  - marked.md: flow status list, needle in the body
+  - listed.md: block status list, no needle
+  - plain.md: no status, needle in the body"
   (%plant tmp store "marked.md" :name "marked"
                                 :description "a page about the build cache"
                                 :status "[superseded]"
@@ -514,16 +515,15 @@ the body says nothing more
 "))
 
 (define-test status-value-matches-as-term
-  "A query for a status value finds the pages whose only mention of it is the
-status field, in flow and in block form."
+  "A search for a status value finds the pages that hold it in their status.
+The flow and block forms of the status list both match."
   (with-search-fixture (tmp repo store)
     (%plant-status-fixture tmp store)
     (let ((outcome (search-memory "superseded" :session-root repo)))
       (is equal '("listed.md" "marked.md") (%hit-files outcome)))))
 
 (define-test status-reason-matches-as-term
-  "A query for a word that appears only in a page's status_reason finds that
-page."
+  "A search for a word found only in a status_reason finds that page."
   (with-search-fixture (tmp repo store)
     (write-fixture-file tmp (format nil "projects/~A/memory/old-cache.md" store)
                         "---
@@ -543,8 +543,8 @@ the cache lives under the home directory
       (is equal '("old-cache.md") (%hit-files outcome)))))
 
 (define-test status-match-is-metadata-tier
-  "A status match counts as a metadata match: tier 0 when it is the only
-term, tier 1 beside a term found only in the body."
+  "A status match is a metadata match. The status word alone gives tier 0.
+Adding a term found only in the body gives tier 1."
   (with-search-fixture (tmp repo store)
     (%plant-status-fixture tmp store)
     (let ((hit (%hit-named (search-memory "superseded" :session-root repo) "marked.md")))
@@ -555,8 +555,8 @@ term, tier 1 beside a term found only in the body."
       (is equal '(1) (mapcar #'hit-tier (outcome-hits outcome))))))
 
 (define-test status-word-does-not-match-status-less-page
-  "A page with no status is not returned for a status word its text lacks,
-and is returned for a word its body holds, carrying no status."
+  "A page with no status does not match a status word absent from its text.
+It still matches a word in its body, and its hit carries no status."
   (with-search-fixture (tmp repo store)
     (%plant-status-fixture tmp store)
     (false (%hit-named (search-memory "superseded" :session-root repo) "plain.md"))
@@ -565,8 +565,8 @@ and is returned for a word its body holds, carrying no status."
       (false (and plain (page-status (hit-page plain)))))))
 
 (define-test status-match-adds-no-frontmatter-excerpt
-  "A page found by its status carries no body hits and no excerpt taken from
-its frontmatter."
+  "A page found by its status has no body hits. None of its excerpts comes
+from the frontmatter."
   (with-search-fixture (tmp repo store)
     (%plant-status-fixture tmp store)
     (let ((outcome (search-memory "superseded" :session-root repo)))
