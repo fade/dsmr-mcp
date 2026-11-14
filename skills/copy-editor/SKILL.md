@@ -152,9 +152,15 @@ which is what the reader actually needs: *"I made order-fetch tolerant of broker
 dashboard stays usable during an outage."* Same for the second-person register: describe what the
 reader gets, never the mechanism that produces it.
 
-⛔ **Docstrings and code comments take a different register: terse, direct, technical**
-(operator, 2026-10-17). The register table above is for prose a person reads as prose; a docstring
-is read by a programmer at the call site.
+⛔ **Error strings, condition reports and test failure strings are CODE, not prose** (operator,
+2026-11-14). Judge them by the developer agent's terms for names: every word carries logical value,
+and there is no embodied voice, no argument and no narrative. A message states the condition, then
+the one thing to check. A message that argues its case or explains the design is a finding.
+
+⛔ **Docstrings and code comments are technical documentation, in a terse, direct, technical
+register** (operator, 2026-10-17; 2026-11-14): technical-writing best practice as a programmer
+applies it, for concision. The register table above is for prose a person reads as prose; a
+docstring is read by a programmer at the call site.
 - No first person, no motive narrative, no history ("used to", "changed because").
 - Lead with what it does or returns, in the present tense or the imperative (match the file's
   existing mood), then the contract: arguments, return value, conditions signalled, side effects.
