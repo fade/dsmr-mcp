@@ -671,12 +671,13 @@ signals nothing.
 
 ## Step 5 — Your own memory store
 
-Every repo gets an auto-memory store at `~/.claude/projects/<cwd-with-/-and-.-as->/memory/`,
+Every repo gets an auto-memory store at `~/.claude/projects/<cwd with every character outside A-Z, a-z, 0-9 and - replaced by ->/memory/`
+(`/home/fade/system_scripts` becomes `-home-fade-system-scripts`),
 created automatically and isolated by working directory. ⛔ It is AI coordination state: it is not
 in the repo and must never be moved there.
 
 ```bash
-M=~/.claude/projects/$(pwd | tr '/.' '--')/memory
+M=~/.claude/projects/$(pwd | sed 's/[^A-Za-z0-9-]/-/g')/memory
 idx=$(grep -oE '\]\([a-z0-9-]+\.md\)' "$M/MEMORY.md" | tr -d '](.)' | sed 's/md$//' | sort -u)
 fil=$(ls -1 "$M"/*.md | xargs -n1 basename | grep -v '^MEMORY.md$' | sed 's/\.md$//' | sort -u)
 comm -13 <(echo "$idx") <(echo "$fil")    # ORPHANS — files with no index line

@@ -253,7 +253,8 @@ signal nothing, producing a successful build of the WRONG source. Assert
 
 ## Step 4 — Verify your memory store
 
-Your auto-memory store is **created for you** at `~/.claude/projects/<cwd-with-/-and-.-as->/memory/`
+Your auto-memory store is **created for you** at `~/.claude/projects/<cwd with every character outside A-Z, a-z, 0-9 and - replaced by ->/memory/`
+(`/home/fade/system_scripts` becomes `-home-fade-system-scripts`)
 — one per repo, isolated by working directory. ⛔ It is **not** in the repo and must never be moved
 there: it is AI coordination state, and the path setting is ignored in a checked-in
 `.claude/settings.json` by design.
@@ -261,7 +262,7 @@ there: it is AI coordination state, and the path setting is ignored in a checked
 Nothing creates itself *correctly*, though. Run this; it takes seconds:
 
 ```bash
-M=~/.claude/projects/$(pwd | tr '/.' '--')/memory
+M=~/.claude/projects/$(pwd | sed 's/[^A-Za-z0-9-]/-/g')/memory
 idx=$(grep -oE '\]\([a-z0-9-]+\.md\)' "$M/MEMORY.md" | tr -d '](.)' | sed 's/md$//' | sort -u)
 fil=$(ls -1 "$M"/*.md | xargs -n1 basename | grep -v '^MEMORY.md$' | sed 's/\.md$//' | sort -u)
 comm -13 <(echo "$idx") <(echo "$fil")    # ORPHANS — files with no index line

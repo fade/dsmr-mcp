@@ -2,7 +2,8 @@
 #
 # Fixture test of the memory store name derivation, run by
 # `make test-memory-store-path`. Checks store_name in skills/worker/check-store.py
-# against fixed cwd values. Runs no session and reads no live store.
+# and the M= line in the worker and leader skills against fixed cwd values.
+# Runs no session and reads no live store.
 #
 # Each expected name is a directory Claude Code created under ~/.claude/projects
 # on the development host, matched to the recorded cwd of the sessions that
@@ -10,11 +11,14 @@
 #
 # Usage: tests/scripts/memory-store-path-test.sh
 #   CHECK_STORE  check-store.py to test (default: the one in this tree)
+#   SKILL_FILES  space-separated SKILL.md files whose M= line is tested
+#                (default: the worker and leader skills in this tree)
 
 set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 CHECK_STORE=${CHECK_STORE:-$REPO_ROOT/skills/worker/check-store.py}
+SKILL_FILES=${SKILL_FILES:-$REPO_ROOT/skills/worker/SKILL.md $REPO_ROOT/skills/leader/SKILL.md}
 
 PASSED=0
 FAILED=0
@@ -53,6 +57,27 @@ for fx in "${FIXTURES[@]}"; do
     IFS='|' read -r label cwd want <<<"$fx"
     got=$(python3 -I -c "$LOADER" "$CHECK_STORE" "$cwd" 2>&1)
     try "[python] $label fixture: $cwd" "got=$got expected=$want" test "$got" = "$want"
+done
+
+M_PATTERN='^M=~/\.claude/projects/\$\(pwd \| .*\)/memory$'
+# shellcheck disable=SC2016 # literal text of the skill line, not an expansion
+M_PREFIX='M=~/.claude/projects/$(pwd | '
+M_SUFFIX=')/memory'
+
+read -ra skill_files <<<"$SKILL_FILES"
+for file in "${skill_files[@]}"; do
+    tag=${file#"$REPO_ROOT"/}
+    matches=$(grep -cE "$M_PATTERN" "$file")
+    try "[$tag] exactly one M= line" "found $matches" test "$matches" = 1
+    [[ $matches == 1 ]] || continue
+    line=$(grep -E "$M_PATTERN" "$file")
+    pipeline=${line#"$M_PREFIX"}
+    pipeline=${pipeline%"$M_SUFFIX"}
+    for fx in "${FIXTURES[@]}"; do
+        IFS='|' read -r label cwd want <<<"$fx"
+        got=$(printf '%s\n' "$cwd" | bash -c "$pipeline" 2>&1)
+        try "[$tag] $label fixture: $cwd" "got=$got expected=$want" test "$got" = "$want"
+    done
 done
 
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
