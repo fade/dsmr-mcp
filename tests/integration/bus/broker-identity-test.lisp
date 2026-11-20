@@ -32,7 +32,11 @@
   (:local-nicknames (#:status #:dsmr-mcp/src/bus/status)
                     (#:broker #:dsmr-mcp/src/bus/broker))
   (:import-from #:dsmr-mcp/tests/integration/support
-                #:with-mcp-server-child-or-skip))
+                #:with-mcp-server-child-or-skip)
+  (:import-from #:dsmr-mcp/tests/support/socket-scratch
+                #:make-socket-scratch-directory
+                #:socket-path-fits-p
+                #:with-overlong-cache-home))
 
 (in-package #:dsmr-mcp/tests/integration/bus/broker-identity-test)
 
@@ -51,14 +55,10 @@
           do (sleep poll))))
 
 (defun scratch-bus-root ()
-  "A bus root of this test's own making, under the cache directory. Never a live
-   bus: everything here spawns and kills brokers."
-  (let ((dir (merge-pathnames
-              (format nil "broker-identity-probe-~D-~D/"
-                      (sb-posix:getpid) (random 100000000))
-              (merge-pathnames "dsmr-mcp/" (uiop:xdg-cache-home)))))
-    (ensure-directories-exist dir)
-    dir))
+  "A fresh mode-0700 bus root of this test's own, under the first cache
+   directory that leaves room for the socket. Never a live bus: everything here
+   spawns and kills brokers."
+  (make-socket-scratch-directory "dsmr-id-"))
 
 (defmacro with-scratch-bus ((paths) &body body)
   "Bind PATHS to a fresh bus of this test's own, removed entirely afterwards."
@@ -193,6 +193,22 @@
   plist)
 
 ;;; ------------------------------------------------------------------ tests
+
+(define-test the-scratch-bus-root-under-an-overlong-cache-directory-leaves-room-for-a-socket
+  "Under a cache directory too long for a socket, the scratch bus root moves to
+   the fallback cache directory, where the socket fits."
+  (with-overlong-cache-home (overlong fallback)
+    (let ((root (scratch-bus-root)))
+      (unwind-protect
+           (progn
+             (true (socket-path-fits-p root "submit.ipc")
+                   "the bus socket under ~A fits within the limit" root)
+             (false (uiop:subpathp root overlong)
+                    "the bus root is outside the overlong cache directory")
+             (true (uiop:subpathp root fallback)
+                   "the bus root is under the fallback cache directory"))
+        (ignore-errors (uiop:delete-directory-tree
+                        root :validate t :if-does-not-exist :ignore))))))
 
 (define-test a-broker-spawned-as-a-child-names-this-process-as-its-parent
   "The ordinary case, and the one that has to be plantable for the reparented
