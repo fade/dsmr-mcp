@@ -538,6 +538,19 @@ TEST_STATE_HOME = state=$$(mktemp -d /tmp/dsmr-test-state.XXXXXX) || exit 1; \
 	trap 'rm -rf "$$state"' EXIT; trap 'exit 130' HUP INT TERM; \
 	XDG_STATE_HOME=$$state; export XDG_STATE_HOME;
 
+## TEST_UNSET_DSMR: the shell prefix that drops the calling shell's DSMR_ settings.
+##
+##   Unsets every exported variable whose name starts with DSMR_, except names
+##   starting with DSMR_TEST_. The test image and every process it starts run
+##   with each setting's default instead of the calling shell's bus identity,
+##   attach target, and mode; a test that needs a setting sets it itself.
+##   DSMR_TEST_ variables configure the suite and pass through, for example
+##   DSMR_TEST_WORKER_CORE. A DSMR_ assignment on the make command line still
+##   reaches a nested make through MAKEFLAGS.
+TEST_UNSET_DSMR = for name in $$(env | sed -n 's/^\(DSMR_[A-Za-z0-9_]*\)=.*/\1/p'); do \
+	  case $$name in DSMR_TEST_*) ;; *) unset "$$name" ;; esac; \
+	done;
+
 ## TEST_TIMEOUT, TEST_INTEGRATION_TIMEOUT, TEST_KILL_GRACE: wall-clock limits on the suite targets.
 ##
 ##   TEST_TIMEOUT (30m) covers `test` and `test-warm`; TEST_INTEGRATION_TIMEOUT
@@ -579,10 +592,11 @@ TEST_LIMIT_STATUS = ; status=$$?; \
 ##   without the wrapper an unhandled :perform error is caught by that hook and
 ##   the process hangs waiting for a debugger connection instead of failing.
 ##
-##   Each run gets a fresh state home of its own (TEST_STATE_HOME above).
+##   Each run gets a fresh state home of its own (TEST_STATE_HOME above) and none
+##   of the calling shell's DSMR_ settings (TEST_UNSET_DSMR).
 ##   TEST_TIMEOUT limits the run.
 test:
-	$(TEST_STATE_HOME) $(call TEST_LIMIT,TEST_TIMEOUT) $(SBCL) --noinform --disable-debugger --non-interactive \
+	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(call TEST_LIMIT,TEST_TIMEOUT) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests")' \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))' $(call TEST_LIMIT_STATUS,TEST_TIMEOUT)
@@ -591,11 +605,11 @@ test:
 ##
 ##   Runs dsmr-mcp/tests/integration — each leaf spawns a real child SBCL and
 ##   skips cleanly when none can be spawned. Same CL_SOURCE_REGISTRY,
-##   fail-fast contract and private state home as `test`, because several
-##   leaves start a pool too. Run on a schedule / label, not every push.
+##   fail-fast contract, private state home, and DSMR_ removal as `test`,
+##   because several leaves start a pool too. Run on a schedule / label, not every push.
 ##   TEST_INTEGRATION_TIMEOUT limits the run.
 test-integration:
-	$(TEST_STATE_HOME) $(call TEST_LIMIT,TEST_INTEGRATION_TIMEOUT) $(SBCL) --noinform --disable-debugger --non-interactive \
+	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(call TEST_LIMIT,TEST_INTEGRATION_TIMEOUT) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests/integration")' \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests/integration") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))' $(call TEST_LIMIT_STATUS,TEST_INTEGRATION_TIMEOUT)
@@ -718,7 +732,8 @@ core-verify-worker:
 ##   holds dsmr-mcp + the test leaves — so only the assertions run. Build the
 ##   core first with `make core`. `make test` remains the no-core load path and
 ##   works whether or not a core is present. Like `test`, each run gets a fresh
-##   state home of its own (TEST_STATE_HOME). TEST_TIMEOUT limits the run.
+##   state home of its own (TEST_STATE_HOME) and none of the calling shell's
+##   DSMR_ settings (TEST_UNSET_DSMR). TEST_TIMEOUT limits the run.
 test-warm:
-	$(TEST_STATE_HOME) $(call TEST_LIMIT,TEST_TIMEOUT) $(SBCL) --core $(CORE) --noinform --disable-debugger --non-interactive \
+	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(call TEST_LIMIT,TEST_TIMEOUT) $(SBCL) --core $(CORE) --noinform --disable-debugger --non-interactive \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))' $(call TEST_LIMIT_STATUS,TEST_TIMEOUT)
