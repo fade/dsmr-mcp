@@ -35,6 +35,8 @@
                 #:read-envrc-template)
   (:import-from #:dsmr-mcp/src/envrc-init
                 #:envrc-content-with-derived-port)
+  (:import-from #:dsmr-mcp/src/envrc-vars
+                #:setup-complete-p)
   (:import-from #:dsmr-mcp/tests/integration/support
                 #:sbcl-path
                 #:with-mcp-server-child-or-skip))
@@ -439,28 +441,26 @@ trigger produces no further prompt."
                 ".envrc is the template with the project-derived port")))))))
 
 (define-test stdio-elicitation-no-clobber
-  "A pre-existing COMPLETE .envrc (one that declares every marker variable:
-DSMR_SLYNK_ATTACH, DSMR_BUS_AGENT and DSMR_BUS_SELECTOR) yields ZERO
-elicitation/create and is left unchanged: neither the create nor the update
-trigger fires.
-
-The fixture gained the fleet selector when the selector joined the marker set.
-The contract proven here is the one it always was, over real stdio: a file that
-carries everything is never re-offered the settings and is never rewritten."
-  (with-mcp-server-child-or-skip
-    (%with-temp-root (root :envrc-content "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+  "A pre-existing `.envrc` that declares every setup marker variable yields zero
+elicitation/create over real stdio and is left byte-for-byte unchanged. The
+fixture is checked against SETUP-COMPLETE-P before a server is spawned, so a
+marker added to the managed table fails that check instead of surfacing as a
+prompt."
+  (let ((complete-envrc "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 export DSMR_BUS_AGENT=stub
 export DSMR_BUS_SELECTOR=\"\"
-")
-      (let ((objs (%run-scenario root :elicitation t :response-action nil)))
-        (is = 0 (%count-elicitation-creates objs)
-            "no prompt when a complete .envrc already exists")
-        (is string= "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
-export DSMR_BUS_AGENT=stub
-export DSMR_BUS_SELECTOR=\"\"
-"
-            (uiop:read-file-string (merge-pathnames ".envrc" root))
-            "pre-existing complete .envrc content unchanged")))))
+export DSMR_BUS_DIRECT_ADDRESSING=1
+"))
+    (true (setup-complete-p complete-envrc)
+          "fixture declares every setup marker in +managed-variables+")
+    (with-mcp-server-child-or-skip
+      (%with-temp-root (root :envrc-content complete-envrc)
+        (let ((objs (%run-scenario root :elicitation t :response-action nil)))
+          (is = 0 (%count-elicitation-creates objs)
+              "no prompt when a complete .envrc already exists")
+          (is string= complete-envrc
+              (uiop:read-file-string (merge-pathnames ".envrc" root))
+              "pre-existing complete .envrc content unchanged"))))))
 
 (define-test stdio-elicitation-update-appends-block
   "An existing .envrc that lacks the dsmr-mcp setup fires exactly ONE
