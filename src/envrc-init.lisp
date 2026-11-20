@@ -526,14 +526,14 @@ session's project root is matched against two mutually exclusive trigger states,
 in order:
   - no `.envrc` at all (a qualifying Lisp project): prompt to CREATE one from
     the template; on :accept write through the write jail.
-  - an `.envrc` that exists but lacks the dsmr-mcp setup (missing either marker):
-    prompt to APPEND the missing half; on :accept append (the user's lines are
-    preserved).
-A complete `.envrc` (one that already exports BOTH DSMR_SLYNK_ATTACH and
-DSMR_BUS_AGENT) matches neither state, so it is never re-prompted. When a branch fires, the once-per-session
-guard is set FIRST (inside the branch) so even a decline / cancel / timeout
-suppresses any later prompt this session; when neither state qualifies the guard
-is left untouched so a later qualifying call can still prompt.
+  - an `.envrc` that exists but for which SETUP-COMPLETE-P is false (a setup
+    marker variable in the managed table is undeclared): prompt to APPEND the
+    missing declarations; on :accept append (the user's lines are preserved).
+A `.envrc` for which SETUP-COMPLETE-P is true matches neither state, so it is
+never re-prompted. When a branch fires, the once-per-session guard is set FIRST
+(inside the branch) so even a decline / cancel / timeout suppresses any later
+prompt this session; when neither state qualifies the guard is left untouched so
+a later qualifying call can still prompt.
 
 OUT is the JSON-RPC output stream; IN-READER selects the stdio vs non-stdio
 consent path (see %prompt-and-act). Returns T when a `.envrc` was written or
