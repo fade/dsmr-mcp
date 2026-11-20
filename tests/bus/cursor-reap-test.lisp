@@ -347,3 +347,125 @@
       (is = 7 (cursor-seq path))
       (broker:custodial-tick br :advance-seconds 0)
       (is = 11 (cursor-seq path)))))
+
+;;; ------------------------------------------------ the cursor-advance interval
+;;; DSMR_BUS_CURSOR_ADVANCE_SECONDS sets how often a broker advances held
+;;; cursors. The literal 30 below is the default on purpose: changing the
+;;; default fails these cases.
+
+(defmacro with-environment-setting ((name value) &body body)
+  "Run BODY with the environment variable NAME set to VALUE, then restore the
+   earlier value. NAME is evaluated once. A variable that was unset before is
+   unset again rather than left empty, because every later child process would
+   inherit it."
+  (let ((var (gensym "NAME"))
+        (saved (gensym "SAVED")))
+    `(let* ((,var ,name)
+            (,saved (uiop:getenv ,var)))
+       (unwind-protect
+            (progn (setf (uiop:getenv ,var) ,value)
+                   ,@body)
+         (if ,saved
+             (setf (uiop:getenv ,var) ,saved)
+             (sb-posix:unsetenv ,var))))))
+
+(define-test the-cursor-advance-interval-defaults-to-thirty-seconds
+  "An unset, empty, or blank value gives 30 s and reports nothing."
+  (dolist (value '(nil "" "   "))
+    (multiple-value-bind (interval report) (interval-from value)
+      (is = 30 interval "~S gives the default" value)
+      (is string= "" report "~S writes nothing to standard error" value))))
+
+(define-test the-cursor-advance-interval-takes-a-positive-whole-number
+  "A whole number of at least 1, surrounding whitespace allowed, is the interval.
+   The stub answers only for DSMR_BUS_CURSOR_ADVANCE_SECONDS, which pins the
+   variable's name."
+  (loop for (value expected) in '(("1" 1) ("45" 45) (" 5 " 5))
+        do (multiple-value-bind (interval report) (interval-from value)
+             (is = expected interval "~S gives ~D" value expected)
+             (is string= "" report "~S writes nothing to standard error" value))))
+
+(define-test an-unusable-cursor-advance-interval-keeps-the-default-and-says-so
+  "A value that is not a whole number of at least 1 gives 30 s and writes one
+   line naming the variable and the refused text."
+  (dolist (value '("0" "-5" "1.5" "30s" "abc"))
+    (multiple-value-bind (interval report) (interval-from value)
+      (is = 30 interval "~S keeps the default" value)
+      (is = 1 (count #\Newline report)
+          "~S writes exactly one line to standard error" value)
+      (true (search "DSMR_BUS_CURSOR_ADVANCE_SECONDS" report)
+            "the report for ~S names the variable" value)
+      (true (search value report)
+            "the report for ~S names the refused value" value))))
+
+(define-test starting-a-broker-reads-the-interval-from-the-environment
+  "START-BROKER takes the interval from DSMR_BUS_CURSOR_ADVANCE_SECONDS when it
+   starts, and an explicit :ADVANCE-SECONDS overrides it."
+  (with-environment-setting ("DSMR_BUS_CURSOR_ADVANCE_SECONDS" "7")
+    (with-bus-root (paths)
+      (let ((br (broker:start-broker paths :block nil :join nil)))
+        (unwind-protect
+             (is = 7 (broker:broker-advance-seconds br)
+                 "the broker took its interval from the environment")
+          (broker:stop-broker br :archive nil))))
+    (with-bus-root (paths)
+      (let ((br (broker:start-broker paths :block nil :join nil
+                                           :advance-seconds 3)))
+        (unwind-protect
+             (is = 3 (broker:broker-advance-seconds br)
+                 "an explicit interval overrides the environment")
+          (broker:stop-broker br :archive nil))))))
+
+(define-test starting-a-broker-refuses-an-interval-that-is-not-a-positive-whole-number
+  "An explicit :ADVANCE-SECONDS that is not an integer of at least 1 signals
+   TYPE-ERROR before START-BROKER takes the broker lock."
+  (dolist (bad '(0 -1 "5"))
+    (with-bus-root (paths)
+      (fail (let ((br (broker:start-broker paths :block nil :join nil
+                                                 :advance-seconds bad)))
+              (when br (broker:stop-broker br :archive nil))
+              br)
+          type-error
+          "~S is refused" bad)
+      (false (broker:broker-running-p paths)
+             "the refused call for ~S left the lock free" bad))))
+
+(define-test the-custodial-tick-follows-the-brokers-own-interval
+  "With no :ADVANCE-SECONDS, CUSTODIAL-TICK uses the interval the broker was
+   made with."
+  (with-bus-root (paths)
+    (let* ((id (stable-id "slow-ticking"))
+           (path (seed-cursor paths id :seq 0))
+           (br (dsmr-mcp/src/bus/broker::%make-broker :paths paths :seq 7
+                                                      :advance-seconds 3600)))
+      (record-departure paths id)
+      (broker:custodial-tick br)
+      (is = 7 (cursor-seq path) "the first tick sweeps")
+      (setf (dsmr-mcp/src/bus/broker::broker-seq br) 11)
+      (broker:custodial-tick br)
+      (is = 7 (cursor-seq path) "a second tick inside an hour does not sweep")))
+  (with-bus-root (paths)
+    (let* ((id (stable-id "fast-ticking"))
+           (path (seed-cursor paths id :seq 0))
+           (br (dsmr-mcp/src/bus/broker::%make-broker :paths paths :seq 7
+                                                      :advance-seconds 0)))
+      (record-departure paths id)
+      (broker:custodial-tick br)
+      (is = 7 (cursor-seq path) "the first tick sweeps")
+      (setf (dsmr-mcp/src/bus/broker::broker-seq br) 11)
+      (broker:custodial-tick br)
+      (is = 11 (cursor-seq path) "a zero interval sweeps on every tick"))))
+
+(defun interval-from (value)
+  "Read the interval through a GETENV stub that answers VALUE for
+   DSMR_BUS_CURSOR_ADVANCE_SECONDS and NIL for any other name. Returns the
+   interval and the text written to *ERROR-OUTPUT* as two values."
+  (let (interval)
+    (let ((report
+            (with-output-to-string (*error-output*)
+              (setf interval
+                    (broker:cursor-advance-interval-from-environment
+                     :getenv (lambda (name)
+                               (when (string= name "DSMR_BUS_CURSOR_ADVANCE_SECONDS")
+                                 value)))))))
+      (values interval report))))

@@ -523,20 +523,25 @@
 
    An unset, empty, or blank value returns +DEFAULT-CURSOR-ADVANCE-SECONDS+ (30).
    A whole number of at least 1, with surrounding whitespace allowed, returns
-   that number; anything else returns the default. Never signals. The
+   that number; anything else returns the default and writes one line naming
+   the variable and the refused value to *ERROR-OUTPUT*. Never signals. The
    environment is read at call time, so START-BROKER calls this and nothing
    reads it at load time: a saved image would otherwise carry the build host's
    value."
-  (let ((text (funcall getenv "DSMR_BUS_CURSOR_ADVANCE_SECONDS")))
+  (let* ((name "DSMR_BUS_CURSOR_ADVANCE_SECONDS")
+         (text (funcall getenv name)))
     (if (or (null text)
             (zerop (length (string-trim '(#\Space #\Tab #\Newline #\Return)
                                         text))))
         +default-cursor-advance-seconds+
         (let ((n (handler-case (parse-integer text)
                    (error () nil))))
-          (if (and (integerp n) (>= n 1))
-              n
-              +default-cursor-advance-seconds+)))))
+          (cond ((and (integerp n) (>= n 1)) n)
+                (t (ignore-errors
+                    (format *error-output*
+                            "dsmr-mcp bus: ~A=~S is not a whole number of seconds, at least 1; using ~D~%"
+                            name text +default-cursor-advance-seconds+))
+                   +default-cursor-advance-seconds+))))))
 
 (defstruct (broker (:constructor %make-broker))
   "A serving broker and the two clocks its custodial work runs on.
@@ -561,7 +566,8 @@
 
    ADVANCE-SECONDS sets the broker's cursor-advance interval; NIL reads
    DSMR_BUS_CURSOR_ADVANCE_SECONDS when the broker starts, after the role is
-   won.
+   won. Signals TYPE-ERROR for an ADVANCE-SECONDS that is neither NIL nor an
+   integer of at least 1.
 
    Also records who won the role, since winning it is the only moment at which
    that is knowable from inside. A failure to write that record is swallowed:
@@ -573,6 +579,7 @@
    place that runs rarely enough for a full scan to cost nothing. The second
    sweep also runs periodically while serving, for the reason SERVE-BROKER
    gives."
+  (check-type advance-seconds (or null (integer 1)))
   (ensure-bus-dirs paths)
   (reap-orphaned-cursors paths)
   (age-departed-cursors paths)
