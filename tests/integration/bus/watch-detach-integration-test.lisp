@@ -33,7 +33,9 @@
   ;; look where the binary writes and can never drift from it.
   (:import-from #:dsmr-bus-watch/src/bus/watch
                 #:%detach-stem
-                #:%legacy-detach-stem))
+                #:%legacy-detach-stem)
+  (:import-from #:dsmr-mcp/tests/integration/bus/host-support
+                #:run-within))
 
 (in-package #:dsmr-mcp/tests/integration/bus/watch-detach-integration-test)
 
@@ -137,14 +139,14 @@
 (defun run-in (state bin &rest args)
   "Run BIN with ARGS under the state root STATE, with no ambient bus identity or
    bus selector and the stub notify-send first on PATH, and return (values
-   stdout stderr exit-code)."
-  (uiop:run-program (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR")
-                            (watcher-env state)
-                            (list (uiop:native-namestring bin))
-                            args)
-                    :output '(:string :stripped t)
-                    :error-output '(:string :stripped t)
-                    :ignore-error-status t))
+   stdout stderr exit-code). Past *RUN-SECONDS* the run is stopped and
+   DEADLINE-PASSED is signalled."
+  (run-within (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR")
+                      (watcher-env state)
+                      (list (uiop:native-namestring bin))
+                      args)
+              :state state
+              :operation (format nil "~A~{ ~A~}" (file-namestring bin) args)))
 
 (defun identity-args ()
   (list "--bus" *bus* "--agent" *agent* "--namespace" *namespace*))
@@ -1024,14 +1026,13 @@
    seconds), SECONDS being how long it took."
   (let ((start (get-internal-real-time)))
     (multiple-value-bind (out err code)
-        (uiop:run-program (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR")
-                                  (watcher-env state)
-                                  (list (uiop:native-namestring bin))
-                                  args)
-                          :input (and input (make-string-input-stream input))
-                          :output '(:string :stripped t)
-                          :error-output '(:string :stripped t)
-                          :ignore-error-status t)
+        (run-within (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR")
+                            (watcher-env state)
+                            (list (uiop:native-namestring bin))
+                            args)
+                    :state state
+                    :input input
+                    :operation (format nil "~A~{ ~A~}" (file-namestring bin) args))
       (values out err code
               (/ (- (get-internal-real-time) start)
                  internal-time-units-per-second)))))

@@ -4,7 +4,9 @@
 ;;;; What every cross-process test of the host bus service shares: a private
 ;;;; state root with stub desktop notifiers, a way to run the watcher and the
 ;;;; service binaries under it, the stand-in service, the small probes the
-;;;; cases assert with, and the deadlines on the waits those cases make.
+;;;; cases assert with, and the deadlines on the waits those cases make. The
+;;;; bounded run, RUN-WITHIN, and the deadlines are shared with the other bus
+;;;; integration leaves as well.
 ;;;;
 ;;;; Every case gets its own state root directly under /tmp. The default state
 ;;;; directory holds the pid files, logs and registrations of the agents this
@@ -45,6 +47,7 @@
            #:fresh-state-home
            #:run-in
            #:run-in-env
+           #:run-within
            #:deadline-passed
            #:deadline-passed-operation
            #:deadline-passed-seconds
@@ -183,8 +186,8 @@
     zebra does not fail a case for an escaping SBCL timeout."))
 
 (defparameter *run-seconds* 120
-  "Seconds RUN-IN-ENV waits for a run to exit before stopping it and signalling
-   DEADLINE-PASSED. A LET binding reaches only the thread that makes it.")
+  "Seconds RUN-WITHIN waits by default for a run to exit before stopping it
+   and signalling DEADLINE-PASSED. A LET binding reaches only the thread that makes it.")
 
 (defun %hang-snapshot (pid state)
   "A description of PID for a passed deadline: its state letter and wait
@@ -283,52 +286,79 @@
            (error (%captured-condition (first results))))
           (t (values-list results)))))
 
+(defun run-within (argv &key state input (seconds *run-seconds*) operation)
+  "Run ARGV, a list of strings naming the program first, and return (values
+   stdout stderr exit-code), each output with one trailing line end removed.
+
+   Standard input is /dev/null, or the string INPUT when given. The outputs,
+   and INPUT, go through files with unique names in STATE's run-in/
+   subdirectory when STATE is given, else in the UIOP temporary directory, and
+   are removed afterwards. The outputs are read once the process exits, so a
+   descendant that inherits them cannot hold the call open.
+
+   The wait goes through FINISH-WITHIN with SECONDS and STATE: past that bound
+   the process is stopped and DEADLINE-PASSED is signalled, naming OPERATION,
+   or ARGV joined by spaces when OPERATION is NIL. The child is never added to
+   *STARTED-PIDS*; on any non-local exit it gets SIGKILL and is reaped."
+  (let ((dir (if state
+                 (merge-pathnames "run-in/" state)
+                 (uiop:temporary-directory)))
+        (operation (or operation (format nil "~{~A~^ ~}" argv))))
+    (ensure-directories-exist dir)
+    (labels ((with-temp (prefix function)
+               (uiop:call-with-temporary-file function :want-stream-p nil
+                                                       :directory dir
+                                                       :prefix prefix))
+             (run (out-file err-file in-file)
+               (let ((process (uiop:launch-program
+                               argv
+                               :input (and in-file (uiop:native-namestring in-file))
+                               :output (uiop:native-namestring out-file)
+                               :if-output-exists :supersede
+                               :error-output (uiop:native-namestring err-file)
+                               :if-error-output-exists :supersede))
+                     (done nil))
+                 (unwind-protect
+                      (let ((code (finish-within process seconds operation
+                                                 :state state)))
+                        (setf done t)
+                        (values (values (uiop:stripln (uiop:read-file-string out-file)))
+                                (values (uiop:stripln (uiop:read-file-string err-file)))
+                                code))
+                   (unless done
+                     (when (uiop:process-alive-p process)
+                       (ignore-errors (sb-posix:kill (uiop:process-info-pid process)
+                                                     sb-posix:sigkill)))
+                     (ignore-errors (uiop:wait-process process)))))))
+      (with-temp "dsmr-run-out"
+        (lambda (out-file)
+          (with-temp "dsmr-run-err"
+            (lambda (err-file)
+              (if input
+                  (with-temp "dsmr-run-in"
+                    (lambda (in-file)
+                      (with-open-file (stream in-file :direction :output
+                                                      :if-exists :supersede)
+                        (write-string input stream))
+                      (run out-file err-file in-file)))
+                  (run out-file err-file nil)))))))))
+
 (defun run-in-env (state extra bin &rest args)
   "Run BIN with ARGS under the state root STATE with no ambient bus identity,
    bus selector or agent session, plus the assignments in EXTRA, and return
    (values stdout stderr exit-code), each output with one trailing line end
    removed.
 
-   Standard input is /dev/null. Both outputs go to files with unique names in
-   STATE's run-in/ subdirectory, read once the process exits and then removed,
-   so a descendant that inherits them cannot hold the call open. The wait goes
-   through FINISH-WITHIN with *RUN-SECONDS*: past that bound the process is
-   stopped and DEADLINE-PASSED is signalled. The child is never added to
-   *STARTED-PIDS*; on any non-local exit it gets SIGKILL and is reaped."
-  (let ((dir (merge-pathnames "run-in/" state))
-        (operation (format nil "~A~{ ~A~}" (file-namestring bin) args)))
-    (ensure-directories-exist dir)
-    (flet ((run (out-file err-file)
-             (let ((process (uiop:launch-program
-                             (append (list "env" "-u" "DSMR_BUS_AGENT"
-                                           "-u" "DSMR_BUS_SELECTOR" "-u" "CLAUDE_PID")
-                                     (watcher-env state extra)
-                                     (list (uiop:native-namestring bin))
-                                     args)
-                             :input nil
-                             :output (uiop:native-namestring out-file)
-                             :if-output-exists :supersede
-                             :error-output (uiop:native-namestring err-file)
-                             :if-error-output-exists :supersede))
-                   (done nil))
-               (unwind-protect
-                    (let ((code (finish-within process *run-seconds* operation
-                                               :state state)))
-                      (setf done t)
-                      (values (values (uiop:stripln (uiop:read-file-string out-file)))
-                              (values (uiop:stripln (uiop:read-file-string err-file)))
-                              code))
-                 (unless done
-                   (when (uiop:process-alive-p process)
-                     (ignore-errors (sb-posix:kill (uiop:process-info-pid process)
-                                                   sb-posix:sigkill)))
-                   (ignore-errors (uiop:wait-process process)))))))
-      (uiop:call-with-temporary-file
-       (lambda (out-file)
-         (uiop:call-with-temporary-file
-          (lambda (err-file) (run out-file err-file))
-          :want-stream-p nil :directory dir :prefix "err"))
-       :want-stream-p nil :directory dir :prefix "out"))))
+   The run goes through RUN-WITHIN with STATE and *RUN-SECONDS*: standard input
+   is /dev/null, both outputs go to files under STATE's run-in/ subdirectory,
+   and past the bound the process is stopped and DEADLINE-PASSED is signalled."
+  (run-within (append (list "env" "-u" "DSMR_BUS_AGENT"
+                            "-u" "DSMR_BUS_SELECTOR" "-u" "CLAUDE_PID")
+                      (watcher-env state extra)
+                      (list (uiop:native-namestring bin))
+                      args)
+              :state state
+              :operation (format nil "~A~{ ~A~}" (file-namestring bin) args)))
 
 (defun run-in (state bin &rest args)
   "RUN-IN-ENV with nothing extra."
