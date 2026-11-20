@@ -33,10 +33,17 @@
 ;;;; workers use, the cost is paid once and reused, not doubled. The WITH-*-OR-SKIP
 ;;;; macros run their body only on a buildable environment and otherwise SKIP
 ;;;; without evaluating it, so the skip actually takes effect.
+;;;;
+;;;; Server children run under a private state root in /tmp with no inherited
+;;;; DSMR_ setting. A process still running under that root after the server
+;;;; child exits fails the test, and the cleanup stops it by root, never by name.
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-posix))
 
 (defpackage #:dsmr-mcp/tests/integration/support
   (:use #:cl)
-  (:import-from #:zebra #:skip)
+  (:import-from #:zebra #:skip #:true #:false)
   (:export #:sbcl-path
            #:quicklisp-setup-path
            #:worker-child-buildable
@@ -47,7 +54,13 @@
            #:with-foreign-slynk-child-or-skip
            #:with-mcp-server-child-or-skip
            #:worker-core-for-tests
-           #:with-worker-core-or-skip))
+           #:with-worker-core-or-skip
+           #:fresh-server-child-state-home
+           #:server-child-environment
+           #:launch-server-child
+           #:processes-under-state-home
+           #:stop-processes-under-state-home
+           #:with-server-child-state-home))
 
 (in-package #:dsmr-mcp/tests/integration/support)
 
@@ -378,3 +391,195 @@ that builds but whose workers misbehave runs BODY and is free to fail."
        (if ,var
            (progn ,@body)
            (skip ("no worker core could be built here (make core-worker): ~A" ,detail))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Server children under a private state root
+;;;
+;;; A server child starts with none of the caller's DSMR_ settings and with
+;;; XDG_STATE_HOME naming a fresh directory under /tmp. Anything it leaves
+;;; running there, such as a broker it elected, is found through /proc by that
+;;; root and stopped by pid.
+;;; ---------------------------------------------------------------------------
+
+(defparameter *server-child-leftover-grace* 5
+  "Seconds a finished test waits for processes under its state root to exit on
+their own before reporting them as left running.")
+
+(defun fresh-server-child-state-home ()
+  "Create a fresh mode-0700 directory under /tmp and return it as a directory
+pathname. The literal /tmp keeps socket paths derived under the root within the
+sun_path limit whatever TMPDIR names."
+  (uiop:ensure-directory-pathname
+   (string-trim '(#\Newline #\Return #\Space)
+                (uiop:run-program '("mktemp" "-d" "/tmp/dsmr-child.XXXXXXXX")
+                                  :output :string))))
+
+(defun %state-home-root (state-home)
+  "The native namestring of STATE-HOME in directory form, with its trailing slash."
+  (uiop:native-namestring (uiop:ensure-directory-pathname state-home)))
+
+(defun %environment-entry-name (entry)
+  "The text of the environment ENTRY before its first equals sign, or all of
+ENTRY when it has none."
+  (subseq entry 0 (or (position #\= entry) (length entry))))
+
+(defun server-child-environment (state-home &key assignments
+                                                 (inherited (sb-ext:posix-environ)))
+  "Return the environment for a server child as a list of NAME=VALUE strings:
+ASSIGNMENTS verbatim, then XDG_STATE_HOME naming STATE-HOME, then every
+INHERITED entry whose name is neither XDG_STATE_HOME nor starts with DSMR_.
+INHERITED defaults to this process's environment. Touches no file."
+  (append assignments
+          (list (concatenate 'string "XDG_STATE_HOME=" (%state-home-root state-home)))
+          (remove-if (lambda (entry)
+                       (let ((name (%environment-entry-name entry)))
+                         (or (string= name "XDG_STATE_HOME")
+                             (uiop:string-prefix-p "DSMR_" name))))
+                     inherited)))
+
+(defun launch-server-child (command state-home &key assignments
+                                                    (inherited nil inherited-p))
+  "Start COMMAND with the environment SERVER-CHILD-ENVIRONMENT builds for
+STATE-HOME and ASSIGNMENTS, with input, output and error output as streams, and
+return its process-info. INHERITED, when supplied, stands in for this process's
+environment.
+
+Signal an ERROR, starting nothing, unless STATE-HOME is an existing directory
+under /tmp/ and the environment holds exactly one XDG_STATE_HOME entry, naming it."
+  (let* ((root (%state-home-root state-home))
+         (environment (apply #'server-child-environment state-home
+                             :assignments assignments
+                             (when inherited-p (list :inherited inherited))))
+         (state-entries (remove "XDG_STATE_HOME" environment
+                                :key #'%environment-entry-name
+                                :test-not #'string=)))
+    (unless (uiop:string-prefix-p "/tmp/" root)
+      (error "Server child state root ~A is not under /tmp/; pass a root from ~
+FRESH-SERVER-CHILD-STATE-HOME." root))
+    (unless (uiop:directory-exists-p root)
+      (error "Server child state root ~A does not exist; check that it was ~
+created before the launch." root))
+    (unless (equal state-entries
+                   (list (concatenate 'string "XDG_STATE_HOME=" root)))
+      (error "Server child environment for state root ~A holds the XDG_STATE_HOME ~
+entries ~S, not one naming the root; check ASSIGNMENTS." root state-entries))
+    (uiop:launch-program command
+                         :input :stream
+                         :output :stream
+                         :error-output :stream
+                         :environment environment)))
+
+(defun %proc-text (pid file)
+  "The /proc FILE of PID as text, read byte for byte, or NIL when it cannot be
+read."
+  (ignore-errors
+   (uiop:read-file-string (format nil "/proc/~D/~A" pid file)
+                          :external-format :latin-1)))
+
+(defun %own-process-p (pid)
+  "True when PID belongs to the user this process runs as."
+  (eql (ignore-errors (sb-posix:stat-uid (sb-posix:stat (format nil "/proc/~D" pid))))
+       (sb-posix:getuid)))
+
+(defun %process-under-state-home-p (pid root)
+  "True when PID is a process of this user, other than this one, whose
+environment holds XDG_STATE_HOME=ROOT exactly or whose command line contains
+ROOT. ROOT is a native directory namestring with its trailing slash. A process
+whose /proc entries cannot be read answers false."
+  (let ((nul (string (code-char 0))))
+    (and (/= pid (sb-posix:getpid))
+         (%own-process-p pid)
+         (let ((environ (%proc-text pid "environ"))
+               (cmdline (%proc-text pid "cmdline")))
+           (or (and environ
+                    (member (concatenate 'string "XDG_STATE_HOME=" root)
+                            (uiop:split-string environ :separator nul)
+                            :test #'string=)
+                    t)
+               (and cmdline (search root cmdline) t))))))
+
+(defun processes-under-state-home (state-home)
+  "Every process of this user, other than this one, whose environment names
+STATE-HOME as XDG_STATE_HOME or whose command line contains it, as a list of
+(PID . COMMAND-LINE) with the command line's arguments joined by spaces."
+  (let ((root (%state-home-root state-home))
+        (nul (string (code-char 0))))
+    (loop for dir in (ignore-errors (uiop:subdirectories "/proc/"))
+          for name = (car (last (pathname-directory dir)))
+          for pid = (and (stringp name) (plusp (length name))
+                         (every #'digit-char-p name)
+                         (parse-integer name))
+          when (and pid (%process-under-state-home-p pid root))
+            collect (cons pid (substitute #\Space (code-char 0)
+                                          (string-right-trim
+                                           nul (or (%proc-text pid "cmdline") "")))))))
+
+(defun %await-true (thunk seconds)
+  "Call THUNK every tenth of a second until it returns true or SECONDS pass, and
+return its last value."
+  (loop repeat (max 1 (round (* 10 seconds)))
+        for answer = (funcall thunk)
+        when answer do (return answer)
+        do (sleep 0.1)
+        finally (return (funcall thunk))))
+
+(defun stop-processes-under-state-home (state-home &key (grace-seconds 5))
+  "Stop every process PROCESSES-UNDER-STATE-HOME lists for STATE-HOME: SIGTERM,
+then SIGKILL to whatever is still listed after GRACE-SECONDS, then up to 2 s
+more. Each pid is re-checked against the root immediately before each signal,
+and only that pid is signalled, never a process group. Return true when nothing
+is left under the root."
+  (let ((root (%state-home-root state-home)))
+    (flet ((signal-listed (signal)
+             (dolist (entry (processes-under-state-home state-home))
+               (when (%process-under-state-home-p (car entry) root)
+                 (ignore-errors (sb-posix:kill (car entry) signal)))))
+           (none-left-p ()
+             (null (processes-under-state-home state-home))))
+      (unless (none-left-p)
+        (signal-listed sb-posix:sigterm)
+        (unless (%await-true #'none-left-p grace-seconds)
+          (signal-listed sb-posix:sigkill)
+          (%await-true #'none-left-p 2)))
+      (none-left-p))))
+
+(defun %leftovers-after-grace (state-home)
+  "Wait up to *SERVER-CHILD-LEFTOVER-GRACE* seconds for nothing to be running
+under STATE-HOME, and return what PROCESSES-UNDER-STATE-HOME lists then."
+  (%await-true (lambda () (null (processes-under-state-home state-home)))
+               *server-child-leftover-grace*)
+  (processes-under-state-home state-home))
+
+(defun %remove-server-child-state-home (state-home)
+  "Delete the STATE-HOME tree, refusing any root whose native namestring does not
+start with /tmp/dsmr-child."
+  (uiop:delete-directory-tree
+   (uiop:ensure-directory-pathname state-home)
+   :if-does-not-exist :ignore
+   :validate (lambda (path)
+               (uiop:string-prefix-p "/tmp/dsmr-child."
+                                     (uiop:native-namestring path)))))
+
+(defmacro with-server-child-state-home ((var &key (check-leftovers t)) &body body)
+  "Evaluate BODY with VAR bound to a fresh state root from
+FRESH-SERVER-CHILD-STATE-HOME, and return BODY's values.
+
+After BODY, when CHECK-LEFTOVERS is true, assert that nothing is running under
+the root once *SERVER-CHILD-LEFTOVER-GRACE* has passed. On every exit, stop
+whatever still runs under the root and delete it."
+  (let ((root (gensym "ROOT")) (leftovers (gensym "LEFTOVERS")))
+    `(let* ((,root (fresh-server-child-state-home))
+            (,var ,root))
+       (declare (ignorable ,var))
+       (unwind-protect
+            (multiple-value-prog1 (progn ,@body)
+              (when ,check-leftovers
+                (let ((,leftovers (%leftovers-after-grace ,root)))
+                  (false ,leftovers
+                         "processes are still running under the state root ~A ~
+after the server child exited:~:{~%  ~D ~A~}"
+                         (%state-home-root ,root)
+                         (mapcar (lambda (entry) (list (car entry) (cdr entry)))
+                                 ,leftovers)))))
+         (ignore-errors (stop-processes-under-state-home ,root))
+         (ignore-errors (%remove-server-child-state-home ,root))))))
