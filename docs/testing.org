@@ -51,14 +51,34 @@ The cost of a full run lives almost entirely in that integration system's
 process spawning; keeping it off the push hot-path is what makes the fast suite
 fast.
 
-** A state home of its own for each unit run
+** A state home of its own for each run
 
-=make test= and =make test-warm= run under a fresh =XDG_STATE_HOME= made for
-the run and removed when it ends, however it ends. Several unit leaves start a
-session pool, and a pool publishes a record of its workers where the host bus
-service looks for workers to stop or hibernate. A test run must never be
-something a live service on your machine acts on. The fasl cache is shared
-between runs as before.
+=make test=, =make test-integration=, and =make test-warm= run under a fresh
+=XDG_STATE_HOME= made for the run and removed when it ends, however it ends.
+Several leaves start a session pool, and a pool publishes a record of its
+workers where the host bus service looks for workers to stop or hibernate. A
+test run must never be something a live service on your machine acts on. The
+fasl cache is shared between runs as before.
+
+** No =DSMR_= settings from the calling shell
+
+The same three targets unset every environment variable whose name starts with
+=DSMR_= before the test image starts, except names that start with
+=DSMR_TEST_=. An assignment on the make command line is unset too. The test
+image and every process it starts run with each setting's default, whatever the
+calling shell or a project's =.envrc= exports.
+
+A server started under the shell's bus identity joins that bus and can leave a
+broker running after the run. A server started under the shell's attach target
+can evaluate in the image you are working in. A test that needs a setting sets
+it for itself and restores it afterwards.
+
+=DSMR_TEST_= variables configure the suite rather than the server and pass
+through unchanged. =DSMR_TEST_WORKER_CORE= is one; see
+[[*Hermetic workers from the worker core]]. A setting that locates an optional
+resource does not reach the run either: the HyperSpec leaf looks in
+=$LISP_WORKSPACE/HyperSpec/= and skips when nothing is there, whatever
+=DSMR_HYPERSPEC_DIR= says.
 
 ** A time limit on each run
 
