@@ -109,8 +109,8 @@ An interrupt (=C-c=) stops the run at once and is not subject to the grace.
 
 =make test-integration= runs each test under a per-test bound,
 =DSMR_TEST_WATCHDOG_SECONDS=. The default is 600 s, several times the run time
-of the slowest test in the suite. The first line of the run states the bound in
-force.
+of the slowest test in the suite. The first line of the test output states the
+bound in force.
 
 A test still running at its bound is stopped and fails. Above its result line,
 the log shows a block with:
@@ -118,7 +118,7 @@ the log shows a block with:
 - the stopped thread's backtrace;
 - the threads the test started, each with its backtrace;
 - the descendant processes of the test process;
-- the =/proc/locks= lines of those processes.
+- the =/proc/locks= lines of the test process and those processes.
 
 The Failures section names the test and the bound, and the run continues with
 the next test. The run's final error lists every stopped test.
@@ -128,12 +128,14 @@ abandoned, and the block says so. The block ends with the processes and threads
 still running after the stop. They are listed and never signalled: stopping them
 is the test's own cleanup's job.
 
-0 turns the bound off. A value that is not digits with an optional decimal point
-stops the run before the first test, with an error that names the variable:
+To set a different bound, pass the variable to the run:
 
 #+begin_src sh
 DSMR_TEST_WATCHDOG_SECONDS=900 make test-integration
 #+end_src
+
+0 turns the bound off. A value that is not digits with an optional decimal point
+stops the run before the first test, with an error that names the variable.
 
 =TEST_INTEGRATION_TIMEOUT= still limits the whole run, and ends a test the
 per-test bound cannot stop, for example one blocked where interrupts are
