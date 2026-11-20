@@ -5,10 +5,11 @@
 ;;;; around each top-level test. A test still running when its bound passes is
 ;;;; stopped by a THROW delivered to its thread, recorded as failed in zebra's
 ;;;; result tree with a description naming the test and the bound, and the run
-;;;; continues with the next test. The stop is never a signalled condition:
-;;;; zebra counts an escaping SBCL timeout as a pass, and a handler in the test
-;;;; could swallow a condition. The stopped test's cleanups run; one still
-;;;; running after the grace is abandoned by a second stop.
+;;;; continues with the next test. The stop is never a signalled condition, so a
+;;;; test past its bound is recorded as failed however the test framework
+;;;; classifies an escaping timeout, and no handler in the test can swallow the
+;;;; stop. The stopped test's cleanups run; one still running after the grace is
+;;;; abandoned by a second stop.
 ;;;;
 ;;;; Above the stopped test's result line the report prints the stopped
 ;;;; thread's backtrace, the threads the test started, this image's descendant

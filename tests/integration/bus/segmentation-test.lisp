@@ -357,7 +357,7 @@
                          (wait-until (lambda () (>= (cursor-at paths leaver-id) head))
                                      :timeout *advance-timeout* :poll 1)
                          (is = head (cursor-at paths leaver-id)
-                             "the busmaster advanced the departed agent's cursor to the head within ~D s at a ~D s interval"
+                             "the busmaster did not advance the departed agent's cursor to the head within ~D s at a ~D s interval"
                              *advance-timeout* *advance-seconds*)
                          (is = 2 (cursor-at paths stayer-id)
                              "a still-connected agent's cursor was not written by the broker")

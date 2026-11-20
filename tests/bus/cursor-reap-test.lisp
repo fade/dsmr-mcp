@@ -373,8 +373,8 @@
   "An unset, empty, or blank value gives 30 s and reports nothing."
   (dolist (value '(nil "" "   "))
     (multiple-value-bind (interval report) (interval-from value)
-      (is = 30 interval "~S gives the default" value)
-      (is string= "" report "~S writes nothing to standard error" value))))
+      (is = 30 interval "~S did not give the default 30 s" value)
+      (is string= "" report "~S wrote to standard error" value))))
 
 (define-test the-cursor-advance-interval-takes-a-positive-whole-number
   "A whole number of at least 1, surrounding whitespace allowed, is the interval.
@@ -382,21 +382,21 @@
    variable's name."
   (loop for (value expected) in '(("1" 1) ("45" 45) (" 5 " 5))
         do (multiple-value-bind (interval report) (interval-from value)
-             (is = expected interval "~S gives ~D" value expected)
-             (is string= "" report "~S writes nothing to standard error" value))))
+             (is = expected interval "~S did not give ~D" value expected)
+             (is string= "" report "~S wrote to standard error" value))))
 
 (define-test an-unusable-cursor-advance-interval-keeps-the-default-and-says-so
   "A value that is not a whole number of at least 1 gives 30 s and writes one
    line naming the variable and the refused text."
   (dolist (value '("0" "-5" "1.5" "30s" "abc"))
     (multiple-value-bind (interval report) (interval-from value)
-      (is = 30 interval "~S keeps the default" value)
+      (is = 30 interval "~S did not keep the default 30 s" value)
       (is = 1 (count #\Newline report)
-          "~S writes exactly one line to standard error" value)
+          "~S did not write exactly one line to standard error" value)
       (true (search "DSMR_BUS_CURSOR_ADVANCE_SECONDS" report)
-            "the report for ~S names the variable" value)
+            "the report for ~S does not name the variable" value)
       (true (search value report)
-            "the report for ~S names the refused value" value))))
+            "the report for ~S does not name the refused value" value))))
 
 (define-test starting-a-broker-reads-the-interval-from-the-environment
   "START-BROKER takes the interval from DSMR_BUS_CURSOR_ADVANCE_SECONDS when it
@@ -406,14 +406,14 @@
       (let ((br (broker:start-broker paths :block nil :join nil)))
         (unwind-protect
              (is = 7 (broker:broker-advance-seconds br)
-                 "the broker took its interval from the environment")
+                 "the broker did not take its interval from the environment")
           (broker:stop-broker br :archive nil))))
     (with-bus-root (paths)
       (let ((br (broker:start-broker paths :block nil :join nil
                                            :advance-seconds 3)))
         (unwind-protect
              (is = 3 (broker:broker-advance-seconds br)
-                 "an explicit interval overrides the environment")
+                 "the explicit interval did not override the environment")
           (broker:stop-broker br :archive nil))))))
 
 (define-test starting-a-broker-refuses-an-interval-that-is-not-a-positive-whole-number
@@ -426,9 +426,9 @@
               (when br (broker:stop-broker br :archive nil))
               br)
           type-error
-          "~S is refused" bad)
+          "~S did not signal TYPE-ERROR" bad)
       (false (broker:broker-running-p paths)
-             "the refused call for ~S left the lock free" bad))))
+             "the refused call for ~S left a broker running" bad))))
 
 (define-test the-custodial-tick-follows-the-brokers-own-interval
   "With no :ADVANCE-SECONDS, CUSTODIAL-TICK uses the interval the broker was
@@ -440,10 +440,10 @@
                                                       :advance-seconds 3600)))
       (record-departure paths id)
       (broker:custodial-tick br)
-      (is = 7 (cursor-seq path) "the first tick sweeps")
+      (is = 7 (cursor-seq path) "the first tick did not sweep")
       (setf (dsmr-mcp/src/bus/broker::broker-seq br) 11)
       (broker:custodial-tick br)
-      (is = 7 (cursor-seq path) "a second tick inside an hour does not sweep")))
+      (is = 7 (cursor-seq path) "a second tick inside an hour swept")))
   (with-bus-root (paths)
     (let* ((id (stable-id "fast-ticking"))
            (path (seed-cursor paths id :seq 0))
@@ -451,10 +451,10 @@
                                                       :advance-seconds 0)))
       (record-departure paths id)
       (broker:custodial-tick br)
-      (is = 7 (cursor-seq path) "the first tick sweeps")
+      (is = 7 (cursor-seq path) "the first tick did not sweep")
       (setf (dsmr-mcp/src/bus/broker::broker-seq br) 11)
       (broker:custodial-tick br)
-      (is = 11 (cursor-seq path) "a zero interval sweeps on every tick"))))
+      (is = 11 (cursor-seq path) "a zero interval did not sweep on every tick"))))
 
 (defun interval-from (value)
   "Read the interval through a GETENV stub that answers VALUE for
