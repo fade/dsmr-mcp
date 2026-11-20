@@ -148,20 +148,19 @@
            :report-fn #'collect-report keys)))
 
 (defun sample-around (state thunk &key (lead 1.0))
-  "Sample --check-live for 3 s at 20 Hz in all, calling THUNK LEAD seconds in;
-   return the samples and THUNK's value.
+  "Sample --check-live for 3 s, calling THUNK LEAD seconds in; return the
+   samples and THUNK's value.
 
-   One run of the binary takes about as long as the pause a sampler leaves
-   between runs, so a single sampler only reaches half the rate. Two samplers,
-   the second started 50 ms after the first, together take a sample every
-   50 ms or so."
+   Two samplers at 20 Hz, the second 25 ms behind the first, take a sample
+   about every 25 ms while one run of the binary takes under 50 ms, and about
+   two per run when it takes longer."
   (flet ((sampler (delay)
            (sb-thread:make-thread
             (lambda ()
               (sleep delay)
               (sample-check-live state (id-args) 20 3))
             :name "check-live sampler")))
-    (let* ((samplers (list (sampler 0) (sampler 0.05)))
+    (let* ((samplers (list (sampler 0) (sampler 0.025)))
            (value (progn (sleep lead) (funcall thunk))))
       (values (loop for thread in samplers append (sb-thread:join-thread thread))
               value))))

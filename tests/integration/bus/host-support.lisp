@@ -356,15 +356,20 @@
 
 (defun sample-check-live (state id-args hz seconds)
   "Run `--check-live` with ID-ARGS under STATE HZ times a second for SECONDS,
-   and return the status word of every answer, in order."
+   back to back while one run takes longer than 1/HZ, and return the status
+   word of every answer, in order."
   (let ((bin (watcher-binary))
-        (interval (/ 1.0 hz))
+        (period (round internal-time-units-per-second hz))
         (deadline (+ (get-internal-real-time)
                      (* seconds internal-time-units-per-second))))
-    (loop while (< (get-internal-real-time) deadline)
+    (loop with next = (get-internal-real-time)
+          while (< (get-internal-real-time) deadline)
           collect (let ((out (apply #'run-in state bin "--check-live" id-args)))
                     (subseq out 0 (or (position #\Space out) (length out))))
-          do (sleep interval))))
+          do (incf next period)
+             (let ((wait (- next (get-internal-real-time))))
+               (when (plusp wait)
+                 (sleep (/ wait internal-time-units-per-second)))))))
 
 ;;; the real service ------------------------------------------------------------
 
