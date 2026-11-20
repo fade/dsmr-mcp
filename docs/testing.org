@@ -104,6 +104,35 @@ make test-integration TEST_INTEGRATION_TIMEOUT=2h
 
 An interrupt (=C-c=) stops the run at once and is not subject to the grace.
 
+** Bus binaries rebuilt before the run
+
+=make test-integration= first runs =make bus-binaries=. It rebuilds
+=bin/dsmr-bus-watch= with =make bus-watch= and =bin/dsmr-bus-host= with
+=make bus-host= when the binary is absent or older than any file it is built
+from, and leaves a current binary alone. The integration cases run these two
+files from the checkout's =bin/=; nothing is installed anywhere else.
+
+A binary is built from its system definition file and every file of every
+system in its ASDF dependency closure, resolved with the same ASDF setup as its
+build. For the host service that includes the Lisp workspace checkouts and the
+Quicklisp libraries it links. An edit to =dsmr-mcp.asd= or to
+=src/bus/watch.lisp= rebuilds both binaries. Two changes fall outside that set:
+a change to a build recipe alone, and a system that an =.asd= file loads by
+itself rather than declaring. After either, run =make bus-watch= or
+=make bus-host= yourself.
+
+A stale binary is removed before it is rebuilt, and a failed listing or rebuild
+stops make before the suite starts, so no case runs against old code. Listing
+takes about ten seconds on a warm fasl cache, and a rebuild adds one build. The
+step runs before =TEST_INTEGRATION_TIMEOUT= starts counting, and without the
+calling shell's =DSMR_= settings, like the suite.
+
+#+begin_src sh
+make bus-binaries                              # bring both binaries up to date alone
+make -n test-integration                       # show a pending rebuild; changes nothing
+make bus-sources BUS_SOURCES_DIR=/tmp/lists    # list the files each binary is built from
+#+end_src
+
 ** Hermetic workers from the worker core
 
 Integration leaves that need workers booted from the worker core get one from
