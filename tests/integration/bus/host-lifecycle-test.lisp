@@ -200,7 +200,7 @@
           (true first "no beat file within 10 s")
           (sleep 1.5)
           (let ((later (beat-mtime state)))
-            (true (and first later (> later first)) "the beat moved")))
+            (true (and first later (> later first)) "the beat did not move")))
         (true (await-serving state process))
         (is = (pid process) (getf (summary state) :pid))
         (true (alive-p (pid process)))))))

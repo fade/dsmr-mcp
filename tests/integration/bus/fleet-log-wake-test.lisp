@@ -115,20 +115,31 @@
 (defun settle (state wake &key (seconds 10))
   "Wait up to SECONDS until WAKE holds the identity's fleet-log listener lock
    under STATE and, when the fleet log exists, holds it open for reading.
-   Returns true once both hold, and NIL as soon as WAKE exits or when SECONDS
-   pass. Asked from the test process, which never holds the lock:
-   %LOCK-HOLDER drops the asker's own record locks on the file."
+   Returns true once both hold. Otherwise returns NIL and, as a second value,
+   :EXITED as soon as WAKE exits or :TIMED-OUT when SECONDS pass. Asked from
+   the test process, which never holds the lock: %LOCK-HOLDER drops the
+   asker's own record locks on the file."
   (let ((pid (uiop:process-info-pid wake))
         (lock (fleet-armed-lock state))
         (log (fleet-log state)))
-    (await-true (lambda ()
-                  (unless (uiop:process-alive-p wake)
-                    (return-from settle nil))
-                  (and (eql pid (%lock-holder lock))
-                       (or (not (probe-file log))
-                           (let ((readers (%log-readers log)))
-                             (and (integerp readers) (plusp readers))))))
-                seconds)))
+    (if (await-true (lambda ()
+                      (unless (uiop:process-alive-p wake)
+                        (return-from settle (values nil :exited)))
+                      (and (eql pid (%lock-holder lock))
+                           (or (not (probe-file log))
+                               (let ((readers (%log-readers log)))
+                                 (and (integerp readers) (plusp readers))))))
+                    seconds)
+        t
+        (values nil :timed-out))))
+
+(defun expect-armed (state wake)
+  "Assert that WAKE arms under STATE within SETTLE's bound. The failure names
+   whether WAKE exited first or the bound passed."
+  (multiple-value-bind (armed outcome) (settle state wake)
+    (true armed "the fleet-log wake ~:[did not arm within the bound~;~
+                 exited before it armed~]"
+          (eq outcome :exited))))
 
 ;;; the wake ---------------------------------------------------------------------
 
@@ -142,7 +153,7 @@ that is not a fleet line, or one written before the wake started, is not."
       (let ((wake (apply #'start-wake state "--wake" "--fleet-log"
                          "--wake-seconds" "30" (id-args)))
             (line (a-fleet-line "after")))
-        (true (settle state wake) "the fleet-log wake did not arm within the bound")
+        (expect-armed state wake)
         (append-line state "an ordinary line with no fleet marker")
         (append-line state line)
         (multiple-value-bind (out code) (finish-fleet-wake state wake 10)
@@ -171,7 +182,7 @@ name, never beside the shared log."
                          "--wake-seconds" "30" (id-args)))
             (first (a-fleet-line "first"))
             (between (a-fleet-line "between")))
-        (true (settle state wake) "the fleet-log wake did not arm within the bound")
+        (expect-armed state wake)
         (append-line state first)
         (multiple-value-bind (out code) (finish-fleet-wake state wake 10)
           (is eql 0 code)
@@ -205,7 +216,7 @@ new file's fleet line is printed."
                          "--wake-seconds" "30" (id-args)))
             (log (fleet-log state))
             (line (a-fleet-line "rolled")))
-        (true (settle state wake) "the fleet-log wake did not arm within the bound")
+        (expect-armed state wake)
         (rename-file log (make-pathname :type "log-2026-10-12" :defaults log))
         (append-line state line)
         (multiple-value-bind (out code) (finish-fleet-wake state wake 10)
@@ -220,7 +231,7 @@ the identity's bus listener is not held back by it."
       (install-service state)
       (let ((wake (apply #'start-wake state "--wake" "--fleet-log"
                          "--wake-seconds" "30" (id-args))))
-        (true (settle state wake) "the fleet-log wake did not arm within the bound")
+        (expect-armed state wake)
         (multiple-value-bind (out err code)
             (apply #'run-in state bin "--wake" "--fleet-log" "--wake-seconds" "5"
                    (id-args))
@@ -275,7 +286,7 @@ leaves the wake running, and the WARN line after it ends the wait."
       (install-service state)
       (let ((wake (apply #'start-wake state "--wake" "--fleet-log"
                          "--wake-seconds" "30" (id-args))))
-        (true (settle state wake) "the fleet-log wake did not arm within the bound")
+        (expect-armed state wake)
         (append-line state *recorded-info-roster-gap*)
         (false (await-exit wake 2) "an INFO line ended the default wait")
         (append-line state *recorded-warn-memory-pressure*)
@@ -290,7 +301,7 @@ leaves the wake running, and the WARN line after it ends the wait."
       (install-service state)
       (let ((wake (apply #'start-wake state "--wake" "--fleet-log"
                          "--min-level" "INFO" "--wake-seconds" "30" (id-args))))
-        (true (settle state wake) "the fleet-log wake did not arm within the bound")
+        (expect-armed state wake)
         (append-line state *recorded-info-roster-gap*)
         (multiple-value-bind (out code) (finish-fleet-wake state wake 10)
           (is eql 0 code)
@@ -344,7 +355,7 @@ is never printed by a later one, even at --min-level INFO."
       (install-service state)
       (let ((wake (apply #'start-wake state "--wake" "--fleet-log"
                          "--wake-seconds" "30" (id-args))))
-        (true (settle state wake) "the fleet-log wake did not arm within the bound")
+        (expect-armed state wake)
         (append-line state *recorded-warn-memory-pressure*)
         (multiple-value-bind (out code) (finish-fleet-wake state wake 10)
           (is eql 0 code)
@@ -464,7 +475,7 @@ arm at --min-level INFO."
       (append-line state *recorded-warn-memory-pressure*)
       (let ((wake (apply #'start-wake state "--wake" "--fleet-log"
                          "--wake-seconds" "4" (id-args))))
-        (true (settle state wake) "the fleet-log wake did not arm within the bound")
+        (expect-armed state wake)
         (append-line state *recorded-info-roster-gap*)
         (multiple-value-bind (out code) (finish-fleet-wake state wake 10)
           (is eql 0 code)

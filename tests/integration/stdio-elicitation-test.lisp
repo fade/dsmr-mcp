@@ -454,15 +454,15 @@ export DSMR_BUS_SELECTOR=\"\"
 export DSMR_BUS_DIRECT_ADDRESSING=1
 "))
     (true (setup-complete-p complete-envrc)
-          "fixture declares every setup marker in +managed-variables+")
+          "the fixture .envrc lacks a setup marker; check +MANAGED-VARIABLES+")
     (with-mcp-server-child-or-skip
       (%with-temp-root (root :envrc-content complete-envrc)
         (let ((objs (%run-scenario root :elicitation t :response-action nil)))
           (is = 0 (%count-elicitation-creates objs)
-              "no prompt when a complete .envrc already exists")
+              "a complete .envrc drew a prompt")
           (is string= complete-envrc
               (uiop:read-file-string (merge-pathnames ".envrc" root))
-              "pre-existing complete .envrc content unchanged"))))))
+              "the complete .envrc was changed"))))))
 
 (define-test stdio-elicitation-update-appends-block
   "An existing .envrc that lacks the dsmr-mcp setup fires exactly ONE

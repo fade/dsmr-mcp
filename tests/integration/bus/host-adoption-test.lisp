@@ -264,7 +264,7 @@
                             (%unix-time))
                            "the service wrote a wake line")
                      (let ((code (await-exit wake 10)))
-                       (is eql 0 code "the wake returned")
+                       (is eql 0 code "the wake did not exit 0")
                        (let ((line (if code
                                        (within-deadline ("reading the wake's line" 10)
                                          (read-line (uiop:process-info-output wake)

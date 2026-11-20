@@ -173,7 +173,7 @@ assert it exits within *CHILD-EXIT-DEADLINE*, and reap it on every exit."
          (true (not (eq :timeout
                         (%wait-process-with-deadline
                          proc *child-exit-deadline*)))
-               "the child exited within ~D s of its stdin closing"
+               "the child did not exit within ~D s of its stdin closing"
                *child-exit-deadline*))
     (ignore-errors (close (uiop:process-info-input proc)))
     (ignore-errors (uiop:terminate-process proc))
@@ -218,7 +218,7 @@ a structurally correct JSON-RPC response containing protocolVersion."
                (true (not (eq :timeout
                               (%wait-process-with-deadline
                                proc *child-exit-deadline*)))
-                     "the child exited within ~D s of its stdin closing"
+                     "the child did not exit within ~D s of its stdin closing"
                      *child-exit-deadline*))
 
           ;; Ensure the process is reaped even if assertions fail.
@@ -254,7 +254,7 @@ logged its start."
                (true (not (eq :timeout
                               (%wait-process-with-deadline
                                proc *child-exit-deadline*)))
-                     "the child exited within ~D s of its stdin closing"
+                     "the child did not exit within ~D s of its stdin closing"
                      *child-exit-deadline*)
                ;; Drain stderr into a string (the stream is now at EOF
                ;; because the child has exited and closed its end).
@@ -263,7 +263,7 @@ logged its start."
                               *child-exit-deadline*)))
                  (true (stringp stderr))
                  (true (search "stdio.start" stderr)
-                       "child stderr carried a stdio.start event")))
+                       "child stderr carried no stdio.start event")))
 
           ;; Ensure process cleanup.
           (ignore-errors (close (uiop:process-info-input proc)))
@@ -290,20 +290,20 @@ passes explicit assignments through, and keeps every other inherited entry."
                        :inherited inherited
                        :assignments '("DSMR_PROJECT_ROOT=/tmp/"))))
     (true (member "DSMR_BUS_AGENT=planted" inherited :test #'string=)
-          "the inherited list carries DSMR_BUS_AGENT=planted; check MANAGED-VARIABLES")
+          "the inherited list lacks DSMR_BUS_AGENT=planted; check MANAGED-VARIABLES")
     (is equal '("DSMR_PROJECT_ROOT=/tmp/")
         (remove-if-not (lambda (entry) (uiop:string-prefix-p "DSMR_" entry))
                        environment)
-        "the only DSMR_ entry left is the explicit DSMR_PROJECT_ROOT assignment")
+        "DSMR_ entries other than the explicit DSMR_PROJECT_ROOT assignment remain; check SERVER-CHILD-ENVIRONMENT")
     (is equal '("XDG_STATE_HOME=/tmp/dsmr-child.fixture/")
         (remove-if-not (lambda (entry) (uiop:string-prefix-p "XDG_STATE_HOME=" entry))
                        environment)
-        "the only XDG_STATE_HOME entry names the private root")
+        "the XDG_STATE_HOME entries are not exactly one naming the private root")
     (dolist (kept '("PATH=/usr/bin:/bin"
                     "HOME=/home/developer"
                     "CL_SOURCE_REGISTRY=/src/dsmr-mcp/:"))
       (true (member kept environment :test #'string=)
-            "the inherited entry ~A survives verbatim" kept))))
+            "the inherited entry ~A is missing or altered" kept))))
 
 (define-test server-child-ignores-an-inherited-bus-identity
   "A server child spawned from an environment carrying DSMR_BUS_AGENT joins no
@@ -345,4 +345,4 @@ bus listener's broker election" root)
         (true (stop-processes-under-state-home state)
               "processes remain under ~A after the cleanup signalled them" root)
         (is equal nil (processes-under-state-home state)
-            "nothing runs under ~A after the cleanup" root)))))
+            "processes still run under ~A after the cleanup" root)))))

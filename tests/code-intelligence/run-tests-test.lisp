@@ -1331,8 +1331,8 @@ this in the calling thread, so a LET binding there changes it.")
        (let ((backtrace (reload-probe-overran-backtrace condition)))
          (if backtrace
              (format stream "~%Backtrace of the stuck thread:~%~A" backtrace)
-             (format stream " The thread took no interrupt within ~A s, so it ~
-                             is running with interrupts disabled; no backtrace."
+             (format stream " The thread took no interrupt within ~A s; ~
+                             no backtrace."
                      (reload-probe-overran-interrupt-wait condition)))))))
   (:documentation
    "Signalled when a bounded reload probe does not finish within its bound.

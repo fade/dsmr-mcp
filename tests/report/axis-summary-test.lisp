@@ -148,7 +148,7 @@ the other side is our arithmetic."
                                         :report 'ar:axis-summary
                                         :controls-are-not-checks t))))
     (is = 1 (ar:axes-failed axes)
-        "controls-are-not-checks drops a failed test that has no children")))
+        "controls-are-not-checks dropped a failed test that has no children")))
 
 (define-test the-deviations-are-off-until-they-are-asked-for
   ;; A caller who asks for nothing gets zebra's numbers, so adopting the

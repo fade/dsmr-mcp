@@ -155,11 +155,11 @@
       (unwind-protect
            (progn
              (true (socket-path-fits-p dir "dsmr-mcp/bus/submit.ipc")
-                   "the bus socket under ~A fits within the limit" dir)
+                   "the bus socket under ~A exceeds the socket path limit" dir)
              (false (uiop:subpathp dir overlong)
-                    "the state root is outside the overlong cache directory")
+                    "the state root is under the overlong cache directory")
              (true (uiop:subpathp dir fallback)
-                   "the state root is under the fallback cache directory"))
+                   "the state root is not under the fallback cache directory"))
         (ignore-errors (uiop:delete-directory-tree
                         dir :validate t :if-does-not-exist :ignore))))))
 
@@ -169,9 +169,9 @@
   (with-overlong-cache-home (overlong)
     (with-scratch-bus (paths session)
       (true (probe-file (merge-pathnames "submit.ipc" (broker:bus-paths-root paths)))
-            "the broker bound its socket")
+            "no broker socket under the bus root")
       (is eq nil (gethash "isError" (inspect-result session))
-          "bus-inspect answers without an error"))))
+          "bus-inspect answered with an error"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Driving the verbs

@@ -440,7 +440,7 @@ INHERITED defaults to this process's environment. Touches no file."
 (defun launch-server-child (command state-home &key assignments
                                                     (inherited nil inherited-p))
   "Start COMMAND with the environment SERVER-CHILD-ENVIRONMENT builds for
-STATE-HOME and ASSIGNMENTS, with input, output and error output as streams, and
+STATE-HOME and ASSIGNMENTS, with input, output, and error output as streams, and
 return its process-info. INHERITED, when supplied, stands in for this process's
 environment.
 

@@ -213,11 +213,11 @@
       (unwind-protect
            (progn
              (true (socket-path-fits-p root "submit.ipc")
-                   "the bus socket under ~A fits within the limit" root)
+                   "the bus socket under ~A exceeds the socket path limit" root)
              (false (uiop:subpathp root overlong)
-                    "the bus root is outside the overlong cache directory")
+                    "the bus root is under the overlong cache directory")
              (true (uiop:subpathp root fallback)
-                   "the bus root is under the fallback cache directory"))
+                   "the bus root is not under the fallback cache directory"))
         (ignore-errors (uiop:delete-directory-tree
                         root :validate t :if-does-not-exist :ignore))))))
 
