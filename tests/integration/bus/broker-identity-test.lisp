@@ -36,7 +36,10 @@
   (:import-from #:dsmr-mcp/tests/support/socket-scratch
                 #:make-socket-scratch-directory
                 #:socket-path-fits-p
-                #:with-overlong-cache-home))
+                #:with-overlong-cache-home)
+  (:import-from #:dsmr-mcp/tests/integration/bus/host-support
+                #:run-within
+                #:deadline-passed))
 
 (in-package #:dsmr-mcp/tests/integration/bus/broker-identity-test)
 
@@ -120,7 +123,11 @@
 
    The broker's own output goes to the bus's log rather than being inherited. An
    inherited descriptor keeps this caller waiting on the broker instead of on the
-   shell, which is the wait this is arranged to avoid."
+   shell, which is the wait this is arranged to avoid.
+
+   The run is bounded at 240 s, a minute past the shell's own 180 s wait for
+   the record; past it the shell is stopped and DEADLINE-PASSED is
+   signalled."
   (broker:ensure-bus-dirs paths)
   (let* ((args (broker::%broker-spawn-args (broker:bus-paths-root paths)
                                            :block nil))
@@ -133,7 +140,10 @@
                           (uiop:escape-sh-command args)
                           (uiop:escape-sh-token log)
                           (uiop:escape-sh-token record))))
-    (uiop:run-program (list "sh" "-c" command) :ignore-error-status t)))
+    (run-within (list "sh" "-c" command)
+                :seconds 240
+                :operation (format nil "the shell waiting for the broker's record at ~A"
+                                   record))))
 
 (defun measured-parent-pid (pid)
   "The parent PID reports right now, read with the system's own process tool.
@@ -141,12 +151,14 @@
    Deliberately not the reader these tests are checking. A value taken with the
    instrument under test agrees with it by construction, and agreement is not
    verification: pinning the reader to a constant would silently pin this to the
-   same constant and the comparison would still pass."
-  (let ((printed (ignore-errors
-                  (uiop:run-program (list "ps" "-o" "ppid=" "-p"
-                                          (princ-to-string pid))
-                                    :output :string
-                                    :ignore-error-status t))))
+   same constant and the comparison would still pass.
+
+   A ps that cannot run gives NIL; a ps that passes *RUN-SECONDS* signals
+   DEADLINE-PASSED, which fails the case."
+  (let ((printed (handler-case
+                     (run-within (list "ps" "-o" "ppid=" "-p" (princ-to-string pid)))
+                   (deadline-passed (condition) (error condition))
+                   (error () nil))))
     (and printed
          (parse-integer (string-trim '(#\Space #\Tab #\Newline #\Return) printed)
                         :junk-allowed t))))
@@ -159,9 +171,8 @@
    host running a subreaper adopts to something other than the init process, and
    a hardcoded number would make this test wrong there rather than failing
    there."
-  (let* ((printed (uiop:run-program
-                   '("sh" "-c" "sleep 30 >/dev/null 2>&1 & echo $!")
-                   :output :string :ignore-error-status t))
+  (let* ((printed (run-within
+                   (list "sh" "-c" "sleep 30 >/dev/null 2>&1 & echo $!")))
          (pid (parse-integer (string-trim '(#\Space #\Tab #\Newline #\Return) printed)
                              :junk-allowed t)))
     (unwind-protect (and pid (measured-parent-pid pid))
