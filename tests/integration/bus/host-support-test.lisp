@@ -2,9 +2,10 @@
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
 ;;;; Cover for the deadlines host-support puts on the waits every host case
-;;;; makes. Each case plants the hang it proves against with /bin/sh and sleep,
-;;;; records the planted pid in a file under its own state root, and stops that
-;;;; pid on the way out, so the cases need no built binary and never skip.
+;;;; makes. Each case plants the hang it proves against with /bin/sh, sleep, or
+;;;; a thread of its own, and stops what it planted on the way out: a process
+;;;; by the pid it recorded, a thread through a stop flag. The cases need no
+;;;; built binary and never skip.
 
 ;; Package evolution guard
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -91,3 +92,61 @@
       (is string= "out" out)
       (is string= "err" err)
       (is eql 3 code))))
+
+(define-test an-error-in-a-case-thread-reaches-the-joining-case
+  (is equal '(1 2)
+      (multiple-value-list
+       (join-within (start-case-thread "two values" (lambda () (values 1 2)))
+                    5 "a thread returning two values")))
+  (let ((condition
+          (handler-case
+              (progn (join-within (start-case-thread
+                                   "planted error"
+                                   (lambda () (error "planted error in a case thread")))
+                                  5 "a thread signalling an error")
+                     nil)
+            (error (c) c))))
+    (of-type simple-error condition)
+    (is string= "planted error in a case thread"
+        (and condition (princ-to-string condition)))))
+
+(define-test a-join-past-its-bound-fails-naming-the-operation
+  (let* ((stop (vector nil))
+         (thread (start-case-thread "sleeper"
+                                    (lambda ()
+                                      (loop until (svref stop 0) do (sleep 0.05))
+                                      :stopped))))
+    (unwind-protect
+         (let* ((started (get-internal-real-time))
+                (condition (handler-case
+                               (progn (join-within thread 1 "joining the sleeper") nil)
+                             (deadline-passed (c) c)))
+                (elapsed (seconds-since started)))
+           (true condition "the join did not signal DEADLINE-PASSED")
+           (true (< elapsed 3) "the join took ~,1F s to fail" elapsed)
+           (when condition
+             (is string= "joining the sleeper" (deadline-passed-operation condition))
+             (is = 1 (deadline-passed-seconds condition))))
+      (setf (svref stop 0) t)
+      (is eq :stopped (join-within thread 5 "joining the stopped sleeper")))))
+
+(define-test a-read-past-its-deadline-fails-as-an-error-not-a-timeout
+  (let* ((process (uiop:launch-program (list "sleep" "600")
+                                       :input nil :output :stream :error-output nil))
+         (pid (uiop:process-info-pid process)))
+    (unwind-protect
+         (let* ((started (get-internal-real-time))
+                (condition (handler-case
+                               (progn
+                                 (within-deadline ("reading the sleeper's output" 1)
+                                   (read-line (uiop:process-info-output process) nil))
+                                 nil)
+                             (serious-condition (c) c)))
+                (elapsed (seconds-since started)))
+           (true (< elapsed 3) "the read took ~,1F s to fail" elapsed)
+           (of-type deadline-passed condition)
+           (true (typep condition 'error) "~S is not an ERROR" condition)
+           (false (typep condition 'sb-ext:timeout) "~S is an SBCL timeout" condition))
+      (stop-process pid)
+      (unless (uiop:process-alive-p process)
+        (ignore-errors (uiop:wait-process process))))))

@@ -51,6 +51,9 @@
            #:deadline-passed-detail
            #:*run-seconds*
            #:finish-within
+           #:within-deadline
+           #:start-case-thread
+           #:join-within
            #:identity-args
            #:full-id
            #:stem
@@ -232,6 +235,53 @@
                                            :detail snapshot)))
                (sleep (if (< now young) 0.002 0.05))))
     (uiop:wait-process process)))
+
+(defmacro within-deadline ((operation seconds) &body body)
+  "Run BODY under an SBCL deadline of SECONDS and return its values. A blocking
+   read, SLEEP, or mutex or condition wait in BODY that passes the deadline
+   signals DEADLINE-PASSED naming OPERATION and SECONDS, in place of the SBCL
+   timeout, which zebra counts as a pass when it escapes a case. For reads from
+   a child's stream; a process exit goes through FINISH-WITHIN."
+  (let ((op (gensym "OPERATION"))
+        (limit (gensym "SECONDS")))
+    `(let ((,op ,operation)
+           (,limit ,seconds))
+       (handler-case (sb-sys:with-deadline (:seconds ,limit) ,@body)
+         (sb-sys:deadline-timeout ()
+           (error 'deadline-passed :operation ,op :seconds ,limit))))))
+
+(defstruct (%captured (:constructor %capture (condition)))
+  "A condition a case thread signalled, returned in place of its values."
+  condition)
+
+(defun start-case-thread (name thunk)
+  "Start a thread named NAME that runs THUNK and returns its values. A
+   SERIOUS-CONDITION signalled by THUNK is returned as a captured value instead
+   of reaching the debugger hook, and JOIN-WITHIN re-signals it in the joining
+   thread, so it is never lost. The thread sees the global values of the
+   case's special variables, *STARTED-PIDS* and *RUN-SECONDS* among them, not
+   the case's bindings."
+  (sb-thread:make-thread (lambda ()
+                           (handler-case (funcall thunk)
+                             (serious-condition (condition) (%capture condition))))
+                         :name name))
+
+(defun join-within (thread seconds operation)
+  "Join THREAD, started by START-CASE-THREAD, within SECONDS and return its
+   thunk's values. A condition the thunk signalled is re-signalled here. Past
+   SECONDS, signal DEADLINE-PASSED naming OPERATION and leave the thread to
+   finish; it is never terminated. A thread that ended with no result signals
+   an ERROR naming it."
+  (let* ((none (list :none))
+         (results (multiple-value-list
+                   (sb-thread:join-thread thread :default none :timeout seconds))))
+    (cond ((and (eq (first results) none) (eq (second results) :timeout))
+           (error 'deadline-passed :operation operation :seconds seconds))
+          ((eq (first results) none)
+           (error "thread ~S ended with no result" (sb-thread:thread-name thread)))
+          ((%captured-p (first results))
+           (error (%captured-condition (first results))))
+          (t (values-list results)))))
 
 (defun run-in-env (state extra bin &rest args)
   "Run BIN with ARGS under the state root STATE with no ambient bus identity,
@@ -557,7 +607,8 @@
 (defun finish-wake (process seconds)
   "Wait up to SECONDS for PROCESS, started by LAUNCH-WAKE, to exit, then return
    (values exit-code stdout stderr), both outputs whole and trimmed. The exit
-   code is NIL when it was still running and had to be stopped."
+   code is NIL when it was still running and had to be stopped. Reading the
+   outputs takes at most 10 s; past that, DEADLINE-PASSED is signalled."
   (let ((code (await-exit process seconds)))
     (unless code
       (stop-process (uiop:process-info-pid process))
@@ -565,9 +616,12 @@
     (flet ((slurp (stream)
              (string-trim '(#\Newline #\Space)
                           (or (ignore-errors (uiop:slurp-stream-string stream)) ""))))
-      (values code
-              (slurp (uiop:process-info-output process))
-              (slurp (uiop:process-info-error-output process))))))
+      (within-deadline ((format nil "reading the output of wake pid ~D"
+                                (uiop:process-info-pid process))
+                        10)
+        (values code
+                (slurp (uiop:process-info-output process))
+                (slurp (uiop:process-info-error-output process)))))))
 
 (defun publish-batch (state bus specs)
   "Append one record per spec in SPECS to BUS's log under STATE, numbered on
