@@ -66,7 +66,20 @@
                 #:%dispatch-attach-run-tests
                 #:%decode-run-tests-result)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
-                #:%handle-run-tests))
+                #:%handle-run-tests)
+  (:import-from #:dsmr-mcp/src/test-runner-core
+                #:run-tests-guarded)
+  (:import-from #:dsmr-mcp/src/system-loader-core
+                #:load-system)
+  (:import-from #:dsmr-mcp/src/load-guard
+                #:running-operation
+                #:wait-for-guarded-operations)
+  (:import-from #:dsmr-mcp/tests/support/gated-load-fixture
+                #:make-gated-system
+                #:remove-gated-system
+                #:open-gate
+                #:close-gate
+                #:wait-for-gate-entered))
 
 (in-package #:dsmr-mcp/tests/code-intelligence/run-tests-test)
 
@@ -1607,3 +1620,78 @@ no outcome, no counts_parsed, and no content block saying it is not a pass."
          (let ((text (gethash "text" (aref (gethash "content" result) 0))))
            (true (search "NOT a pass" text))))
     (ignore-errors (asdf:clear-system "dsmr-probe-unverified"))))
+
+;;; ---------------------------------------------------------------------------
+;;; Guarded in-process run: the time limit and busy replies
+;;;
+;;; A run or load parked at a closed gate outlasts its limit. The reply comes
+;;; at the limit with still_running true and the work runs on; while it runs,
+;;; load-system and run-tests answer busy in either direction.
+;;; ---------------------------------------------------------------------------
+
+(defmacro with-gated-run-system ((var) &body body)
+  "Bind VAR to a fresh gated system with the gate closed and run BODY.
+Cleanup opens the gate, asserts the guard clears within 30 s, and removes the
+system, so no abandoned operation outlives the test."
+  `(let ((,var (make-gated-system "dsmr-gated-run")))
+     (close-gate)
+     (unwind-protect (progn ,@body)
+       (open-gate)
+       (true (wait-for-guarded-operations 30))
+       (remove-gated-system ,var "dsmr-gated-run"))))
+
+(define-test run-tests-timeout-answers-at-its-limit
+  "run-tests-guarded on a system whose reload waits at a closed gate, with a
+0.5 s limit, returns the timeout envelope with still_running true within
+2.5 s. Once the gate opens the run finishes and the system is loaded."
+  (with-gated-run-system (sys)
+    (let* ((start  (get-internal-real-time))
+           (result (run-tests-guarded sys :reload t :timeout-seconds 0.5))
+           (wall   (/ (- (get-internal-real-time) start)
+                      internal-time-units-per-second)))
+      (true (< wall 2.5))
+      (is = 0 (gethash "passed" result))
+      (is = 1 (gethash "failed" result))
+      (is string= "timeout" (gethash "framework" result))
+      (let ((failed (gethash "failed_tests" result)))
+        (is = 1 (length failed))
+        (is string= "TIMEOUT" (gethash "test_name" (aref failed 0)))
+        (true (search "timed out" (gethash "reason" (aref failed 0)))))
+      (is eq t (gethash "still_running" result))
+      (true (wait-for-gate-entered 30))
+      (open-gate)
+      (true (wait-for-guarded-operations 30))
+      (true (asdf:component-loaded-p sys)))))
+
+(define-test run-tests-during-abandoned-load-answers-busy
+  "While an abandoned load-system waits at the closed gate, the worker
+handler's run-tests answers the busy envelope naming the load, and starts
+nothing."
+  (with-gated-run-system (sys)
+    (is string= "timeout"
+        (gethash "status" (load-system sys :timeout-seconds 0.5 :force t)))
+    (true (wait-for-gate-entered 30))
+    (let ((result (%handle-run-tests
+                   (make-ht "system" "alexandria" "timeout_seconds" 5)
+                   nil)))
+      (is string= "busy" (gethash "framework" result))
+      (is = 1 (gethash "failed" result))
+      (let ((failed (gethash "failed_tests" result)))
+        (is = 1 (length failed))
+        (is string= "BUSY" (gethash "test_name" (aref failed 0))))
+      (is string= "load-system" (gethash "running_operation" result))
+      (is string= sys (gethash "running_system" result))
+      (true (integerp (gethash "elapsed_seconds" result))))))
+
+(define-test load-during-abandoned-test-run-answers-busy
+  "While an abandoned run-tests-guarded waits at the closed gate, load-system
+answers status=busy naming the test run, and starts nothing."
+  (with-gated-run-system (sys)
+    (is string= "timeout"
+        (gethash "framework"
+                 (run-tests-guarded sys :reload t :timeout-seconds 0.5)))
+    (true (wait-for-gate-entered 30))
+    (let ((result (load-system "alexandria" :timeout-seconds 30)))
+      (is string= "busy" (gethash "status" result))
+      (is string= "run-tests" (gethash "running_operation" result))
+      (is string= sys (gethash "running_system" result)))))

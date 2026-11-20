@@ -19,10 +19,11 @@
 ;;;; image — by design, because the agent is already trusted to repl-eval
 ;;;; arbitrary code, and recompiling to pick up edits is the whole point.
 ;;;;
-;;;; The attached path wraps the load in sb-ext:with-timeout inside the image
-;;;; so a runaway compile is interrupted rather than observed from
-;;;; the dispatcher side. The hermetic path defers to the worker handler which
-;;;; calls load-system from system-loader-core (also wrapped in with-timeout).
+;;;; The attached path wraps the load in sb-ext:with-timeout inside the image,
+;;;; so the limit interrupts the load there. The hermetic path defers to the
+;;;; worker handler, which calls load-system from system-loader-core: the
+;;;; reply comes at the limit with still_running set, the load keeps running,
+;;;; and further load-system and run-tests calls answer busy until it finishes.
 
 (defpackage #:dsmr-mcp/src/tools/load-system
   (:use #:cl)
@@ -78,8 +79,10 @@ Solves three problems with using (asdf:load-system) via repl-eval: \
 1. Staleness: force=true (default) clears loaded state so edits from \
 lisp-edit-form become live. 2. Output noise: warnings are collected and \
 returned in a structured list rather than flooding the terminal. \
-3. Timeout: the load is wrapped in a real in-image timeout that actually \
-interrupts a runaway compile. Requires attached or hermetic mode.")
+3. Timeout: in attached mode the limit interrupts the load inside the target \
+image; in hermetic mode the reply comes at the limit with still_running set, \
+the load keeps running, and further load-system and run-tests calls answer \
+busy until it finishes. Requires attached or hermetic mode.")
    (dsmr-mcp/src/tools/base::input-schema
     :allocation :class
     :initform '(:object
@@ -99,9 +102,11 @@ changes from lisp-edit-form (default: true).")
 the ASDF output cache before loading (default: false).")
                  (timeout-seconds
                   :type :integer
-                  :description "Timeout in seconds before the load is \
-interrupted (default: 120). The timeout fires inside the target image \
-so a runaway compile is actually aborted."))
+                  :description "Time limit in seconds (default: 120). \
+Attached mode: the limit interrupts the load inside the target image. \
+Hermetic mode: the reply comes at the limit with still_running set, the \
+load keeps running, and further load-system and run-tests calls answer \
+busy until it finishes."))
                 :required ("system"))))
   (:metaclass mcp-tool-class)
   (:documentation "MCP tool: load an ASDF system with force / clear-fasls /
@@ -109,7 +114,10 @@ timeout and severity-bucketed warning capture.
 Attached mode injects an sb-ext:with-timeout + handler-bind form into the
 live image so edits from lisp-edit-form become live and compiler output
 stays off the developer's terminal.
-Hermetic mode routes to worker/load-system via dispatch-hermetic-call.
+The injected form's timer interrupts the load inside the image.
+Hermetic mode routes to worker/load-system via dispatch-hermetic-call; at the
+limit the reply carries still_running, the load keeps running, and further
+load-system and run-tests calls answer busy until it finishes.
 Both paths return the same wire envelope."))
 
 ;; ensure-finalized fires the metaclass :after method immediately, registering

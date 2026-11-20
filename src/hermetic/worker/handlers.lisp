@@ -40,7 +40,7 @@
   (:import-from #:dsmr-mcp/src/system-loader-core
                 #:load-system)
   (:import-from #:dsmr-mcp/src/test-runner-core
-                #:run-tests)
+                #:run-tests-guarded)
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht
                 #:text-content)
@@ -400,9 +400,12 @@ strips the epoch/session prefix before forwarding)."
 (defun %handle-load-system (params registry)
   "Worker handler for load-system: calls system-loader-core:load-system
 in-process (already inside the worker) and returns the structured result.
-The core's own sb-ext:with-timeout applies, so a runaway compile is
-interrupted within the worker. The pool's pool-rpc-with-hard-kill provides
-the outer hard-kill backstop.
+
+The load runs on a thread of its own and is never interrupted. At the limit
+the reply is status=timeout with still_running true, and the load runs on to
+completion; until it does, further load-system and run-tests calls answer
+busy. The pool's pool-rpc-with-hard-kill remains the backstop for a worker
+that does not answer at all.
 
 Reads system (required), force (boolean, default true), clear_fasls
 (boolean, default false), and timeout_seconds (integer, default 120) from
@@ -416,21 +419,20 @@ PARAMS. Returns the make-ht wire envelope produced by load-system."
          (timeout-seconds (or (gethash "timeout_seconds" params) 120)))
     (unless (and (stringp sys-name) (plusp (length sys-name)))
       (error "system is required"))
-    ;; load-system from system-loader-core wraps the work in
-    ;; sb-ext:with-timeout internally, so a runaway compile is interrupted
-    ;; within this handler call.
     (load-system sys-name
                  :force           force
                  :clear-fasls     clear-fasls
                  :timeout-seconds timeout-seconds)))
 
 (defun %handle-run-tests (params registry)
-  "Worker handler for run-tests: calls test-runner-core:run-tests in-process
-and returns the structured result envelope.
+  "Worker handler for run-tests: calls test-runner-core:run-tests-guarded
+in-process and returns the structured result envelope.
 
-The core's own sb-ext:with-timeout applies (300 s default), so a runaway
-test run is interrupted within the worker. The pool's pool-rpc-with-hard-kill
-provides the outer hard-kill backstop.
+The run happens on a thread of its own and is never interrupted. At the limit
+(300 s default) the reply is the timeout envelope with still_running true,
+and the run continues to completion; until it does, further load-system and
+run-tests calls answer busy. The pool's pool-rpc-with-hard-kill remains the
+backstop for a worker that does not answer at all.
 
 Reads system (required), framework, test, tests, timeout_seconds (default 300),
 and reload (boolean, default true) from PARAMS."
@@ -451,14 +453,12 @@ and reload (boolean, default true) from PARAMS."
                         (if (vectorp tests)
                             (coerce tests 'list)
                             tests))))
-      ;; test-runner-core:run-tests wraps the work in sb-ext:with-timeout
-      ;; internally, so a runaway test is interrupted within this handler.
-      (run-tests sys-name
-                 :framework framework
-                 :test test
-                 :tests tests-list
-                 :timeout-seconds timeout-seconds
-                 :reload reload))))
+      (run-tests-guarded sys-name
+                         :framework framework
+                         :test test
+                         :tests tests-list
+                         :timeout-seconds timeout-seconds
+                         :reload reload))))
 
 (defun %handle-inspect-thread (params registry)
   "Enumerate threads in the worker process.
