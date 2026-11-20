@@ -567,7 +567,9 @@ FRESH-SERVER-CHILD-STATE-HOME, and return BODY's values.
 After BODY, when CHECK-LEFTOVERS is true, assert that nothing is running under
 the root once *SERVER-CHILD-LEFTOVER-GRACE* has passed. On every exit, stop
 whatever still runs under the root and delete it."
-  (let ((root (gensym "ROOT")) (leftovers (gensym "LEFTOVERS")))
+  ;; Zebra prints the asserted form, so this binding's name is the label in the report.
+  (let ((root (gensym "ROOT"))
+        (leftovers (make-symbol "PROCESSES-STILL-RUNNING-UNDER-STATE-ROOT")))
     `(let* ((,root (fresh-server-child-state-home))
             (,var ,root))
        (declare (ignorable ,var))
