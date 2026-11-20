@@ -39,7 +39,9 @@
                 #:setup-complete-p)
   (:import-from #:dsmr-mcp/tests/integration/support
                 #:sbcl-path
-                #:with-mcp-server-child-or-skip))
+                #:with-mcp-server-child-or-skip
+                #:launch-server-child
+                #:with-server-child-state-home))
 
 (in-package #:dsmr-mcp/tests/integration/stdio-elicitation-test)
 
@@ -52,25 +54,22 @@
 Reused verbatim so this test guards the SAME launch command operators run."
   (coerce (gethash "args" (canonical-server-entry)) 'list))
 
-(defun %spawn-server (&key project-root)
+(defun %spawn-server (state-home &key project-root)
   "Spawn a child sbcl running dsmr-mcp :stdio with the generated launch args.
 Returns a UIOP process-info with :stream input/output/error.  The caller
 closes the input stream to trigger EOF and reaps the process.
 
-When PROJECT-ROOT is supplied, DSMR_PROJECT_ROOT is set in the CHILD's
-environment to that path so run seeds the stdio session's root at launch
-(precedence: explicit :project-root > DSMR_PROJECT_ROOT > getcwd).  The child's
-cwd is not relied upon -- it is harder to control across spawn backends, and the
-env var is exactly the launch seam the operator's .envrc itself exports."
-  (apply #'uiop:launch-program
-         (cons (sbcl-path) (%launch-args))
-         :input        :stream
-         :output       :stream
-         :error-output :stream
-         (when project-root
-           (list :environment
-                 (cons (format nil "DSMR_PROJECT_ROOT=~A" (namestring project-root))
-                       (sb-ext:posix-environ))))))
+The child runs under STATE-HOME with the inherited environment minus every
+DSMR_ variable.  PROJECT-ROOT, when given, reaches it as DSMR_PROJECT_ROOT,
+which seeds the session root at launch.  The child's cwd is not relied upon --
+it is harder to control across spawn backends, and the env var is exactly the
+launch seam the operator's .envrc itself exports."
+  (launch-server-child (cons (sbcl-path) (%launch-args))
+                       state-home
+                       :assignments
+                       (when project-root
+                         (list (format nil "DSMR_PROJECT_ROOT=~A"
+                                       (namestring project-root))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; JSON-RPC line plumbing
@@ -273,27 +272,28 @@ directory), which IS qualifying, and the intercept would fire on the
 fs-set-project-root line itself -- writing a `.envrc` into the project tree.
 
 stdin is closed after the last line so the child reaches EOF and exits."
-  (let ((proc (%spawn-server :project-root #p"/tmp/"))
-        (root-str (namestring root)))
-    (unwind-protect
-         (let ((in  (uiop:process-info-input proc))
-               (out (uiop:process-info-output proc)))
-           (write-line (%initialize-line :elicitation elicitation) in)
-           (write-line (%initialized-line) in)
-           (write-line (%set-root-line 2 root-str) in)
-           (write-line (%trigger-line 3) in)
-           (when (and elicitation response-action)
-             (write-line (%elicit-response-line :action response-action) in))
-           (when second-trigger
-             (write-line (%trigger-line 4) in))
-           (force-output in)
-           ;; Close stdin -> child hits EOF on the loop -> exits cleanly.
-           (close in)
-           (prog1 (%drain-stdout out :deadline-seconds 120)
-             (ignore-errors (uiop:wait-process proc))))
-      (ignore-errors (close (uiop:process-info-input proc)))
-      (ignore-errors (uiop:terminate-process proc))
-      (ignore-errors (uiop:wait-process proc)))))
+  (with-server-child-state-home (state)
+    (let ((proc (%spawn-server state :project-root #p"/tmp/"))
+          (root-str (namestring root)))
+      (unwind-protect
+           (let ((in  (uiop:process-info-input proc))
+                 (out (uiop:process-info-output proc)))
+             (write-line (%initialize-line :elicitation elicitation) in)
+             (write-line (%initialized-line) in)
+             (write-line (%set-root-line 2 root-str) in)
+             (write-line (%trigger-line 3) in)
+             (when (and elicitation response-action)
+               (write-line (%elicit-response-line :action response-action) in))
+             (when second-trigger
+               (write-line (%trigger-line 4) in))
+             (force-output in)
+             ;; Close stdin -> child hits EOF on the loop -> exits cleanly.
+             (close in)
+             (prog1 (%drain-stdout out :deadline-seconds 120)
+               (ignore-errors (uiop:wait-process proc))))
+        (ignore-errors (close (uiop:process-info-input proc)))
+        (ignore-errors (uiop:terminate-process proc))
+        (ignore-errors (uiop:wait-process proc))))))
 
 (defun %run-launch-seeded-scenario (root &key elicitation (response-action "accept"))
   "Spawn a real server with the launch root seeded via DSMR_PROJECT_ROOT in the
@@ -308,22 +308,23 @@ and RESPONSE-ACTION are set, the elicitation response line is queued right after
 the trigger so the in-line read loop consumes it.
 
 stdin is closed after the last line so the child reaches EOF and exits."
-  (let ((proc (%spawn-server :project-root root)))
-    (unwind-protect
-         (let ((in  (uiop:process-info-input proc))
-               (out (uiop:process-info-output proc)))
-           (write-line (%initialize-line :elicitation elicitation) in)
-           (write-line (%initialized-line) in)
-           (write-line (%trigger-line 1) in)
-           (when (and elicitation response-action)
-             (write-line (%elicit-response-line :action response-action) in))
-           (force-output in)
-           (close in)
-           (prog1 (%drain-stdout out :deadline-seconds 120)
-             (ignore-errors (uiop:wait-process proc))))
-      (ignore-errors (close (uiop:process-info-input proc)))
-      (ignore-errors (uiop:terminate-process proc))
-      (ignore-errors (uiop:wait-process proc)))))
+  (with-server-child-state-home (state)
+    (let ((proc (%spawn-server state :project-root root)))
+      (unwind-protect
+           (let ((in  (uiop:process-info-input proc))
+                 (out (uiop:process-info-output proc)))
+             (write-line (%initialize-line :elicitation elicitation) in)
+             (write-line (%initialized-line) in)
+             (write-line (%trigger-line 1) in)
+             (when (and elicitation response-action)
+               (write-line (%elicit-response-line :action response-action) in))
+             (force-output in)
+             (close in)
+             (prog1 (%drain-stdout out :deadline-seconds 120)
+               (ignore-errors (uiop:wait-process proc))))
+        (ignore-errors (close (uiop:process-info-input proc)))
+        (ignore-errors (uiop:terminate-process proc))
+        (ignore-errors (uiop:wait-process proc))))))
 
 (defun %run-set-root-fires-scenario (root &key (response-action "accept")
                                               second-trigger)
@@ -342,25 +343,26 @@ When SECOND-TRIGGER is true, a trigger tools/call follows the response so the
 test can prove the once-per-session guard yields no further prompt and the
 server stays alive to answer it.  stdin is closed after the last line so the
 child reaches EOF and exits."
-  (let ((proc (%spawn-server :project-root #p"/tmp/"))
-        (root-str (namestring root)))
-    (unwind-protect
-         (let ((in  (uiop:process-info-input proc))
-               (out (uiop:process-info-output proc)))
-           (write-line (%initialize-line :elicitation t) in)
-           (write-line (%initialized-line) in)
-           (write-line (%set-root-line 2 root-str) in)
-           (when response-action
-             (write-line (%elicit-response-line :action response-action) in))
-           (when second-trigger
-             (write-line (%trigger-line 3) in))
-           (force-output in)
-           (close in)
-           (prog1 (%drain-stdout out :deadline-seconds 120)
-             (ignore-errors (uiop:wait-process proc))))
-      (ignore-errors (close (uiop:process-info-input proc)))
-      (ignore-errors (uiop:terminate-process proc))
-      (ignore-errors (uiop:wait-process proc)))))
+  (with-server-child-state-home (state)
+    (let ((proc (%spawn-server state :project-root #p"/tmp/"))
+          (root-str (namestring root)))
+      (unwind-protect
+           (let ((in  (uiop:process-info-input proc))
+                 (out (uiop:process-info-output proc)))
+             (write-line (%initialize-line :elicitation t) in)
+             (write-line (%initialized-line) in)
+             (write-line (%set-root-line 2 root-str) in)
+             (when response-action
+               (write-line (%elicit-response-line :action response-action) in))
+             (when second-trigger
+               (write-line (%trigger-line 3) in))
+             (force-output in)
+             (close in)
+             (prog1 (%drain-stdout out :deadline-seconds 120)
+               (ignore-errors (uiop:wait-process proc))))
+        (ignore-errors (close (uiop:process-info-input proc)))
+        (ignore-errors (uiop:terminate-process proc))
+        (ignore-errors (uiop:wait-process proc))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Scenarios (mirror 13-UAT.md, all assert hard)
