@@ -3,8 +3,8 @@
 ;;;;
 ;;;; What every cross-process test of the host bus service shares: a private
 ;;;; state root with stub desktop notifiers, a way to run the watcher and the
-;;;; service binaries under it, the stand-in service, and the small probes the
-;;;; cases assert with.
+;;;; service binaries under it, the stand-in service, the small probes the
+;;;; cases assert with, and the deadlines on the waits those cases make.
 ;;;;
 ;;;; Every case gets its own state root directly under /tmp. The default state
 ;;;; directory holds the pid files, logs and registrations of the agents this
@@ -16,6 +16,10 @@
 ;;;; sleepers through STOP-PROCESS, and on the way out of WITH-HOST-STATE the
 ;;;; watchers whose pid files sit in that case's own root and whose environment
 ;;;; names that root.
+;;;;
+;;;; A wait that passes its deadline signals DEADLINE-PASSED, naming what it
+;;;; waited for and the bound, with a snapshot of what was running when the run
+;;;; was a process.
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :sb-posix))
@@ -41,6 +45,12 @@
            #:fresh-state-home
            #:run-in
            #:run-in-env
+           #:deadline-passed
+           #:deadline-passed-operation
+           #:deadline-passed-seconds
+           #:deadline-passed-detail
+           #:*run-seconds*
+           #:finish-within
            #:identity-args
            #:full-id
            #:stem
@@ -155,18 +165,120 @@
 
 ;;; running --------------------------------------------------------------------
 
+(define-condition deadline-passed (error)
+  ((operation :initarg :operation :reader deadline-passed-operation)
+   (seconds :initarg :seconds :reader deadline-passed-seconds)
+   (detail :initarg :detail :initform nil :reader deadline-passed-detail))
+  (:report (lambda (condition stream)
+             (format stream "~A did not finish within ~A s~@[~%~A~]"
+                     (deadline-passed-operation condition)
+                     (deadline-passed-seconds condition)
+                     (deadline-passed-detail condition))))
+  (:documentation
+   "OPERATION, a string, did not finish within SECONDS. DETAIL, a string or NIL,
+    says what was running when the bound passed. An ERROR and never a timeout:
+    zebra does not fail a case for an escaping SBCL timeout."))
+
+(defparameter *run-seconds* 120
+  "Seconds RUN-IN-ENV waits for a run to exit before stopping it and signalling
+   DEADLINE-PASSED. A LET binding reaches only the thread that makes it.")
+
+(defun %hang-snapshot (pid state)
+  "A description of PID for a passed deadline: its state letter and wait
+   channel; when STATE is given, every process under STATE with its command
+   line cut at 160 characters; and every /proc/locks line naming one of those
+   pids. Never signals."
+  (or (ignore-errors
+       (with-output-to-string (out)
+         (let* ((stat (%proc-text pid "stat"))
+                (close (and stat (position #\) stat :from-end t)))
+                (letter (and close (< (+ close 2) (length stat))
+                             (char stat (+ close 2))))
+                (wchan (%proc-text pid "wchan"))
+                (processes (and state (ignore-errors (processes-under-state state))))
+                (names (mapcar #'princ-to-string
+                               (cons pid (mapcar #'car processes)))))
+           (format out "pid ~D state ~:[gone~;~:*~A~] wchan ~:[-~;~:*~A~]"
+                   pid letter (and wchan (plusp (length wchan)) wchan))
+           (dolist (process processes)
+             (format out "~%  ~D ~A" (car process)
+                     (let ((line (cdr process)))
+                       (subseq line 0 (min 160 (length line))))))
+           (dolist (line (ignore-errors (uiop:read-file-lines "/proc/locks")))
+             (when (intersection names (uiop:split-string line :separator " ")
+                                 :test #'string=)
+               (format out "~%  lock ~A" line))))))
+      (format nil "pid ~D: no snapshot" pid)))
+
+(defun finish-within (process seconds operation &key state)
+  "Return PROCESS's exit code once it exits, polling every 2 ms during the first
+   second and every 50 ms after. When SECONDS pass first, snapshot it and the
+   processes under STATE, stop it by pid through STOP-PROCESS (its group when
+   it leads one), reap it, and signal DEADLINE-PASSED naming OPERATION and
+   SECONDS with the snapshot as its detail."
+  (let* ((start (get-internal-real-time))
+         (young (+ start internal-time-units-per-second))
+         (limit (+ start (round (* seconds internal-time-units-per-second)))))
+    (loop while (uiop:process-alive-p process)
+          do (let ((now (get-internal-real-time)))
+               (when (>= now limit)
+                 (let* ((pid (uiop:process-info-pid process))
+                        (snapshot (%hang-snapshot pid state)))
+                   (stop-process pid)
+                   (unless (uiop:process-alive-p process)
+                     (ignore-errors (uiop:wait-process process)))
+                   (error 'deadline-passed :operation operation
+                                           :seconds seconds
+                                           :detail snapshot)))
+               (sleep (if (< now young) 0.002 0.05))))
+    (uiop:wait-process process)))
+
 (defun run-in-env (state extra bin &rest args)
   "Run BIN with ARGS under the state root STATE with no ambient bus identity,
    bus selector or agent session, plus the assignments in EXTRA, and return
-   (values stdout stderr exit-code)."
-  (uiop:run-program (append (list "env" "-u" "DSMR_BUS_AGENT"
-                                  "-u" "DSMR_BUS_SELECTOR" "-u" "CLAUDE_PID")
-                            (watcher-env state extra)
-                            (list (uiop:native-namestring bin))
-                            args)
-                    :output '(:string :stripped t)
-                    :error-output '(:string :stripped t)
-                    :ignore-error-status t))
+   (values stdout stderr exit-code), each output with one trailing line end
+   removed.
+
+   Standard input is /dev/null. Both outputs go to files with unique names in
+   STATE's run-in/ subdirectory, read once the process exits and then removed,
+   so a descendant that inherits them cannot hold the call open. The wait goes
+   through FINISH-WITHIN with *RUN-SECONDS*: past that bound the process is
+   stopped and DEADLINE-PASSED is signalled. The child is never added to
+   *STARTED-PIDS*; on any non-local exit it gets SIGKILL and is reaped."
+  (let ((dir (merge-pathnames "run-in/" state))
+        (operation (format nil "~A~{ ~A~}" (file-namestring bin) args)))
+    (ensure-directories-exist dir)
+    (flet ((run (out-file err-file)
+             (let ((process (uiop:launch-program
+                             (append (list "env" "-u" "DSMR_BUS_AGENT"
+                                           "-u" "DSMR_BUS_SELECTOR" "-u" "CLAUDE_PID")
+                                     (watcher-env state extra)
+                                     (list (uiop:native-namestring bin))
+                                     args)
+                             :input nil
+                             :output (uiop:native-namestring out-file)
+                             :if-output-exists :supersede
+                             :error-output (uiop:native-namestring err-file)
+                             :if-error-output-exists :supersede))
+                   (done nil))
+               (unwind-protect
+                    (let ((code (finish-within process *run-seconds* operation
+                                               :state state)))
+                      (setf done t)
+                      (values (values (uiop:stripln (uiop:read-file-string out-file)))
+                              (values (uiop:stripln (uiop:read-file-string err-file)))
+                              code))
+                 (unless done
+                   (when (uiop:process-alive-p process)
+                     (ignore-errors (sb-posix:kill (uiop:process-info-pid process)
+                                                   sb-posix:sigkill)))
+                   (ignore-errors (uiop:wait-process process)))))))
+      (uiop:call-with-temporary-file
+       (lambda (out-file)
+         (uiop:call-with-temporary-file
+          (lambda (err-file) (run out-file err-file))
+          :want-stream-p nil :directory dir :prefix "err"))
+       :want-stream-p nil :directory dir :prefix "out"))))
 
 (defun run-in (state bin &rest args)
   "RUN-IN-ENV with nothing extra."
