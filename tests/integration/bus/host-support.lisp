@@ -857,7 +857,7 @@
     (ensure-directories-exist log)
     (with-open-file (stream log :direction :output :if-exists :append
                                 :if-does-not-exist :create)
-      (declare (ignore stream)))
+      (declare (ignorable stream)))
     (let* ((process (uiop:launch-program
                      (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR"
                                    "-u" "CLAUDE_PID")
