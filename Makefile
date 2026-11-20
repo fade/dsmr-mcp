@@ -538,6 +538,36 @@ TEST_STATE_HOME = state=$$(mktemp -d /tmp/dsmr-test-state.XXXXXX) || exit 1; \
 	trap 'rm -rf "$$state"' EXIT; trap 'exit 130' HUP INT TERM; \
 	XDG_STATE_HOME=$$state; export XDG_STATE_HOME;
 
+## TEST_TIMEOUT, TEST_INTEGRATION_TIMEOUT, TEST_KILL_GRACE: wall-clock limits on the suite targets.
+##
+##   TEST_TIMEOUT (30m) covers `test` and `test-warm`; TEST_INTEGRATION_TIMEOUT
+##   (90m) covers `test-integration`. A run past its limit gets SIGTERM, then
+##   SIGKILL TEST_KILL_GRACE later. The grace exceeds SBCL's 60 s default exit
+##   timeout, so an orderly exit can still stop the session pool. Values use
+##   timeout(1) syntax and 0 disables a limit. Set them on the command line or
+##   in the environment.
+TEST_TIMEOUT ?= 30m
+TEST_INTEGRATION_TIMEOUT ?= 90m
+TEST_KILL_GRACE ?= 90s
+
+## TEST_LIMIT, TEST_LIMIT_STATUS: the prefix and suffix that apply a limit to a recipe.
+##
+##   Each takes the NAME of a limit variable: $(call TEST_LIMIT,TEST_TIMEOUT).
+##   TEST_LIMIT wraps the command in timeout(1). --foreground keeps timeout in
+##   make's process group, so an interrupt or a signal to the group reaches the
+##   run; timeout signals only the SBCL process, and the run's own cleanup stops
+##   the children it started. TEST_LIMIT_STATUS follows the command: it prints
+##   one line on stderr for status 124 (SIGTERM at the limit) or 137 (SIGKILL),
+##   then exits with the command's status. Every other status passes through
+##   with no line.
+TEST_LIMIT = timeout --foreground --kill-after=$(TEST_KILL_GRACE) $($(1))
+TEST_LIMIT_STATUS = ; status=$$?; \
+	if [ "$$status" = 124 ]; then \
+	  printf '%s\n' "$@: stopped by SIGTERM at $(1)=$($(1)); the last test the log names was running; set $(1)=<duration> to change the limit, 0 for none" >&2; \
+	elif [ "$$status" = 137 ]; then \
+	  printf '%s\n' "$@: killed by SIGKILL; if $(1)=$($(1)) had passed, the run ignored SIGTERM for TEST_KILL_GRACE=$(TEST_KILL_GRACE)" >&2; \
+	fi; exit $$status
+
 ## test: fast in-process unit suite (the push hot-path).
 ##
 ##   Runs the dsmr-mcp/tests umbrella — true in-process units, no child SBCLs.
@@ -549,12 +579,13 @@ TEST_STATE_HOME = state=$$(mktemp -d /tmp/dsmr-test-state.XXXXXX) || exit 1; \
 ##   without the wrapper an unhandled :perform error is caught by that hook and
 ##   the process hangs waiting for a debugger connection instead of failing.
 ##
-##   Each run gets a fresh state home of its own (TEST_STATE_HOME below).
+##   Each run gets a fresh state home of its own (TEST_STATE_HOME above).
+##   TEST_TIMEOUT limits the run.
 test:
-	$(TEST_STATE_HOME) $(SBCL) --noinform --disable-debugger --non-interactive \
+	$(TEST_STATE_HOME) $(call TEST_LIMIT,TEST_TIMEOUT) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests")' \
-	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))'
+	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))' $(call TEST_LIMIT_STATUS,TEST_TIMEOUT)
 
 ## test-integration: slow cross-process suite (gated, off the push hot-path).
 ##
@@ -562,11 +593,12 @@ test:
 ##   skips cleanly when none can be spawned. Same CL_SOURCE_REGISTRY,
 ##   fail-fast contract and private state home as `test`, because several
 ##   leaves start a pool too. Run on a schedule / label, not every push.
+##   TEST_INTEGRATION_TIMEOUT limits the run.
 test-integration:
-	$(TEST_STATE_HOME) $(SBCL) --noinform --disable-debugger --non-interactive \
+	$(TEST_STATE_HOME) $(call TEST_LIMIT,TEST_INTEGRATION_TIMEOUT) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests/integration")' \
-	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests/integration") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))'
+	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests/integration") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))' $(call TEST_LIMIT_STATUS,TEST_INTEGRATION_TIMEOUT)
 
 ## core: build the prebuilt deps+system+test-deps core image ($(CORE)).
 ##
@@ -686,7 +718,7 @@ core-verify-worker:
 ##   holds dsmr-mcp + the test leaves — so only the assertions run. Build the
 ##   core first with `make core`. `make test` remains the no-core load path and
 ##   works whether or not a core is present. Like `test`, each run gets a fresh
-##   state home of its own (TEST_STATE_HOME).
+##   state home of its own (TEST_STATE_HOME). TEST_TIMEOUT limits the run.
 test-warm:
-	$(TEST_STATE_HOME) $(SBCL) --core $(CORE) --noinform --disable-debugger --non-interactive \
-	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))'
+	$(TEST_STATE_HOME) $(call TEST_LIMIT,TEST_TIMEOUT) $(SBCL) --core $(CORE) --noinform --disable-debugger --non-interactive \
+	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))' $(call TEST_LIMIT_STATUS,TEST_TIMEOUT)

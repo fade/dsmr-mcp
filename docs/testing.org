@@ -60,6 +60,30 @@ service looks for workers to stop or hibernate. A test run must never be
 something a live service on your machine acts on. The fasl cache is shared
 between runs as before.
 
+** A time limit on each run
+
+=make test= and =make test-warm= stop after =TEST_TIMEOUT= (default 30 minutes).
+=make test-integration= stops after =TEST_INTEGRATION_TIMEOUT= (default 90
+minutes). A run past its limit receives SIGTERM, and SIGKILL =TEST_KILL_GRACE=
+(default 90 s) later if it is still running. The grace exceeds SBCL's default
+exit timeout of 60 s, so an orderly exit can still stop the session pool.
+
+When a limit fires, stderr carries one line that names the target and the limit
+as =VAR=value=. The recipe exits 124 when SIGTERM sufficed and 137 when SIGKILL
+was needed, and make reports =Error 124= or =Error 137=. Every other exit status
+passes through unchanged with no limit line. The run's private state home is
+removed in every case.
+
+The last test the log names is the one that was running when the limit fired.
+Set a limit on the command line or in the environment, in =timeout(1)= duration
+syntax; 0 turns a limit off:
+
+#+begin_src sh
+make test-integration TEST_INTEGRATION_TIMEOUT=2h
+#+end_src
+
+An interrupt (=C-c=) stops the run at once and is not subject to the grace.
+
 ** Hermetic workers from the worker core
 
 Integration leaves that need workers booted from the worker core get one from
