@@ -23,7 +23,7 @@ CORE ?= dsmr.core
 WORKER_CORE ?= dsmr.core.worker
 WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 
-.PHONY: bridge bus-watch bus-host install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
+.PHONY: bridge bus-watch bus-host bus-sources bus-binaries install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
         preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path
 
@@ -74,6 +74,16 @@ bridge:
 	     --eval '(asdf:make :dsmr-mcp-bridge)' \
 	     --eval '(quit)'
 
+## BUS_WATCH_SBCL: the SBCL command and ASDF setup the watcher is built under.
+##
+##   The bus-watch recipe and the bus-sources listing both start with it, so
+##   the files listed for bin/dsmr-bus-watch resolve exactly as its build
+##   resolves them.
+BUS_WATCH_SBCL = sbcl --noinform --no-sysinit --no-userinit --disable-debugger \
+	     --eval '(require :asdf)' \
+	     --eval '(asdf:load-asd (truename "dsmr-mcp.asd"))' \
+	     --eval '(asdf:load-asd (truename "dsmr-bus-watch.asd"))'
+
 ## bus-watch: build the standalone coordination-bus wakeup watcher binary.
 ##
 ##   Produces bin/dsmr-bus-watch via ASDF program-op (save-lisp-and-die).
@@ -86,10 +96,7 @@ bridge:
 ##   nothing beyond CL, so both .asd files are registered explicitly.
 bus-watch:
 	@mkdir -p bin
-	sbcl --noinform --no-sysinit --no-userinit --disable-debugger \
-	     --eval '(require :asdf)' \
-	     --eval '(asdf:load-asd (truename "dsmr-mcp.asd"))' \
-	     --eval '(asdf:load-asd (truename "dsmr-bus-watch.asd"))' \
+	$(BUS_WATCH_SBCL) \
 	     --eval '(asdf:make :dsmr-bus-watch)' \
 	     --eval '(quit)'
 
@@ -133,6 +140,54 @@ bus-host:
 	     --eval '(asdf:make :dsmr-bus-host)' \
 	     --eval '(quit)'
 	@test -x bin/dsmr-bus-host || { echo "bin/dsmr-bus-host was not written" >&2; exit 1; }
+
+## bus-sources: list the files each bus binary is built from.
+##
+##   Writes $(BUS_SOURCES_DIR)/dsmr-bus-watch.mk, one `bin/dsmr-bus-watch: PATH`
+##   line per file in the watcher's ASDF dependency closure, resolved under the
+##   watcher's own build setup by scripts/bus-binary-sources.lisp. Systems are
+##   found, never loaded or built, so listing changes nothing. BUS_SOURCES_DIR
+##   is required and must not contain quotes or backslashes. A system that
+##   cannot be resolved, an empty closure, or a path make cannot read as a
+##   prerequisite stops the target before any list is written. Every line
+##   carries `+`, so `make -n` still writes the lists that a dry run of
+##   bus-binaries reads.
+BUS_SOURCES_DIR ?=
+bus-sources:
+	+@if [ -z "$(BUS_SOURCES_DIR)" ]; then echo "bus-sources: BUS_SOURCES_DIR is empty; set it to the directory for the source lists" >&2; exit 1; fi
+	+@mkdir -p "$(BUS_SOURCES_DIR)"
+	+@$(BUS_WATCH_SBCL) --load scripts/bus-binary-sources.lisp \
+	     --eval '(bus-binary-sources:write-prerequisites "dsmr-bus-watch" "bin/dsmr-bus-watch" "$(BUS_SOURCES_DIR)/dsmr-bus-watch.mk")' \
+	     --eval '(quit)'
+
+## bin/dsmr-bus-watch: rebuild the watcher through `make bus-watch`.
+##
+##   Alone it builds only an absent binary: the files it is built from come
+##   from the list bus-binaries passes to it. Prints why it runs, removes the
+##   old binary, and checks the new one. Removing it first makes the image save
+##   certain even when only a file ASDF does not track has changed, and leaves
+##   no stale binary behind when the build fails.
+bin/dsmr-bus-watch:
+	@if [ -e $@ ]; then echo "$@: rebuilding: older than $(firstword $?)"; else echo "$@: building: absent"; fi
+	@rm -f $@
+	$(MAKE) --no-print-directory bus-watch
+	@test -x $@ || { echo "$@ was not written by make bus-watch" >&2; exit 1; }
+
+## bus-binaries: rebuild a bus binary that is absent or older than its sources.
+##
+##   Lists the files bin/dsmr-bus-watch is built from (bus-sources) into a
+##   temporary directory, then lets make compare the binary with every listed
+##   file and rebuild it through `make bus-watch` when it is absent or older
+##   than any of them. A current binary is left alone. A failed listing stops
+##   the target before anything is rebuilt. Runs without the calling shell's
+##   DSMR_ settings (TEST_UNSET_DSMR), like the suites. Writes only the
+##   checkout's bin/; nothing is installed.
+bus-binaries:
+	@$(TEST_UNSET_DSMR) set -e; \
+	sources=$$(mktemp -d "$${TMPDIR:-/tmp}/dsmr-bus-binaries.XXXXXX"); \
+	trap 'rm -rf "$$sources"' EXIT; trap 'exit 130' HUP INT TERM; \
+	$(MAKE) --no-print-directory bus-sources BUS_SOURCES_DIR="$$sources"; \
+	$(MAKE) --no-print-directory -f Makefile -f "$$sources/dsmr-bus-watch.mk" bin/dsmr-bus-watch
 
 ## install-bus-watch: publish the built watcher onto PATH.
 ##
@@ -607,8 +662,9 @@ test:
 ##   skips cleanly when none can be spawned. Same CL_SOURCE_REGISTRY,
 ##   fail-fast contract, private state home, and DSMR_ removal as `test`,
 ##   because several leaves start a pool too. Run on a schedule / label, not every push.
-##   TEST_INTEGRATION_TIMEOUT limits the run.
-test-integration:
+##   TEST_INTEGRATION_TIMEOUT limits the run. It first runs bus-binaries, so
+##   no case runs a bus binary older than a file it is built from.
+test-integration: bus-binaries
 	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(call TEST_LIMIT,TEST_INTEGRATION_TIMEOUT) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests/integration")' \
