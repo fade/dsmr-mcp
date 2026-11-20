@@ -16,7 +16,9 @@
 ;;;;
 ;;;; The custodial sweep that advances a held cursor runs inside the broker's
 ;;;; serve loop on an interval, so proving it needs a live broker and a wait
-;;;; past that interval. An in-process fixture cannot reach it at all.
+;;;; past that interval. An in-process fixture cannot reach it at all. The
+;;;; clean-departure case sets a one second interval through
+;;;; DSMR_BUS_CURSOR_ADVANCE_SECONDS, so that wait is seconds long.
 ;;;;
 ;;;; XDG_STATE_HOME is redirected to a fresh temp directory for every test and
 ;;;; restored on the way out. Every bus root in this file derives from it, so no
@@ -31,6 +33,8 @@
   (let ((pkg (find-package '#:dsmr-mcp/tests/integration/bus/segmentation-test)))
     (when pkg
       (sb-ext:without-package-locks (delete-package pkg)))))
+
+(require :sb-posix)
 
 (defpackage #:dsmr-mcp/tests/integration/bus/segmentation-test
   (:use #:cl #:zebra)
@@ -51,12 +55,15 @@
 (defparameter *ready-timeout* 120
   "Seconds to allow a cold-spawned broker to come up and bind its sockets.")
 
-(defparameter *advance-timeout* 180
-  "Seconds to allow a serving broker to run the sweep that moves a departed
-   agent's cursor up to the head. The sweep is due every thirty seconds and the
-   loop it rides ticks on the intake timeout, so this is several times the
-   interval rather than a guess at it: a false timeout here would report a
-   working busmaster as broken.")
+(defparameter *advance-seconds* 1
+  "Seconds between custodial sweeps that the clean-departure case asks its
+   broker for, through DSMR_BUS_CURSOR_ADVANCE_SECONDS.")
+
+(defparameter *advance-timeout* 15
+  "Seconds to allow a serving broker to move a departed agent's cursor up to
+   the head. Many times *ADVANCE-SECONDS*, and below the broker's 30 s default,
+   so a broker that does not apply the setting fails the case instead of
+   passing slowly.")
 
 (defparameter *first-bus* "alpha-fleet"
   "The name of the first bus these tests assemble. Two ordinary names, so the
@@ -110,6 +117,22 @@
          (setf (uiop:getenv "XDG_STATE_HOME") (or ,saved ""))
          (ignore-errors (uiop:delete-directory-tree
                          ,dir :validate t :if-does-not-exist :ignore))))))
+
+(defmacro with-environment-setting ((name value) &body body)
+  "Run BODY with the environment variable NAME set to VALUE, then restore the
+   earlier value. NAME is evaluated once. A variable that was unset before is
+   unset again rather than left empty, because every later child process would
+   inherit it."
+  (let ((var (gensym "NAME"))
+        (saved (gensym "SAVED")))
+    `(let* ((,var ,name)
+            (,saved (uiop:getenv ,var)))
+       (unwind-protect
+            (progn (setf (uiop:getenv ,var) ,value)
+                   ,@body)
+         (if ,saved
+             (setf (uiop:getenv ,var) ,saved)
+             (sb-posix:unsetenv ,var))))))
 
 (defun submit-socket-path (paths)
   (merge-pathnames "submit.ipc" (broker:bus-paths-root paths)))
@@ -280,71 +303,74 @@
       (let* ((paths (broker:make-bus-paths (selector:bus-root *first-bus*)))
              (roster-dir (broker:bus-paths-roster-dir paths))
              (namespace "/tmp/a-repository-that-joined-a-fleet"))
-        (with-killable (proc (spawn-ready-broker paths :block nil))
-          (let ((publisher (agent:connect-agent namespace :name "publisher"
-                                                          :bus *first-bus*
-                                                          :ensure-broker nil))
-                (leaver (agent:connect-agent namespace :name "leaver"
-                                                       :bus *first-bus*
-                                                       :ensure-broker nil))
-                (stayer (agent:connect-agent namespace :name "stayer"
-                                                       :bus *first-bus*
-                                                       :ensure-broker nil)))
-            (let ((leaver-id (agent:agent-id leaver))
-                  (stayer-id (agent:agent-id stayer)))
-              (unwind-protect
-                   (progn
-                     ;; Both readers take delivery of the same two messages, so
-                     ;; each has a cursor of its own at the same position.
-                     (agent:agent-publish publisher "first")
-                     (agent:agent-publish publisher "second")
-                     (is = 2 (length (agent:agent-receive leaver :timeout-ms 5000))
-                         "the departing agent read what was waiting for it")
-                     (is = 2 (length (agent:agent-receive stayer :timeout-ms 5000))
-                         "the staying agent read the same two messages")
-                     (is = 2 (cursor-at paths leaver-id)
-                         "the departing agent's cursor sits at what it read")
-                     (is = 2 (cursor-at paths stayer-id)
-                         "the staying agent's cursor sits at what it read")
-
-                     ;; Leave cleanly.
-                     (multiple-value-bind (drained departed-at)
-                         (agent:quiesce-and-leave leaver)
-                       (is = 0 drained
-                           "nothing was still waiting for the departing agent")
-                       (true (integerp departed-at)
-                             "leaving recorded a departure time"))
-                     (let ((entry (roster:entry leaver-id roster-dir)))
-                       (is eq :departed (roster:entry-status entry)
-                           "the roster records the agent as departed")
-                       (true (integerp (roster:entry-departed-at entry))
-                             "the roster entry carries the time it left"))
-                     (is equal (list leaver-id)
-                         (mapcar #'roster:entry-id
-                                 (roster:departed-members roster-dir))
-                         "only the agent that left is recorded as departed")
-
-                     ;; Traffic the departed agent will never read. Its cursor
-                     ;; must follow the head anyway, or it pins the log.
-                     (let ((head (agent:agent-publish publisher "third")))
-                       (setf head (agent:agent-publish publisher "fourth"))
-                       (setf head (agent:agent-publish publisher "fifth"))
-                       (wait-until (lambda () (>= (cursor-at paths leaver-id) head))
-                                   :timeout *advance-timeout* :poll 1)
-                       (is = head (cursor-at paths leaver-id)
-                           "the busmaster advanced the departed agent's cursor to the head")
+        (with-environment-setting ("DSMR_BUS_CURSOR_ADVANCE_SECONDS"
+                                   (princ-to-string *advance-seconds*))
+          (with-killable (proc (spawn-ready-broker paths :block nil))
+            (let ((publisher (agent:connect-agent namespace :name "publisher"
+                                                            :bus *first-bus*
+                                                            :ensure-broker nil))
+                  (leaver (agent:connect-agent namespace :name "leaver"
+                                                         :bus *first-bus*
+                                                         :ensure-broker nil))
+                  (stayer (agent:connect-agent namespace :name "stayer"
+                                                         :bus *first-bus*
+                                                         :ensure-broker nil)))
+              (let ((leaver-id (agent:agent-id leaver))
+                    (stayer-id (agent:agent-id stayer)))
+                (unwind-protect
+                     (progn
+                       ;; Both readers take delivery of the same two messages, so
+                       ;; each has a cursor of its own at the same position.
+                       (agent:agent-publish publisher "first")
+                       (agent:agent-publish publisher "second")
+                       (is = 2 (length (agent:agent-receive leaver :timeout-ms 5000))
+                           "the departing agent read what was waiting for it")
+                       (is = 2 (length (agent:agent-receive stayer :timeout-ms 5000))
+                           "the staying agent read the same two messages")
+                       (is = 2 (cursor-at paths leaver-id)
+                           "the departing agent's cursor sits at what it read")
                        (is = 2 (cursor-at paths stayer-id)
-                           "a still-connected agent's cursor was not written by the broker")
+                           "the staying agent's cursor sits at what it read")
 
-                       ;; And it keeps following: a held cursor that fell behind
-                       ;; once would be back to pinning the log.
-                       (let ((later (agent:agent-publish publisher "sixth")))
-                         (wait-until (lambda () (>= (cursor-at paths leaver-id) later))
+                       ;; Leave cleanly.
+                       (multiple-value-bind (drained departed-at)
+                           (agent:quiesce-and-leave leaver)
+                         (is = 0 drained
+                             "nothing was still waiting for the departing agent")
+                         (true (integerp departed-at)
+                               "leaving recorded a departure time"))
+                       (let ((entry (roster:entry leaver-id roster-dir)))
+                         (is eq :departed (roster:entry-status entry)
+                             "the roster records the agent as departed")
+                         (true (integerp (roster:entry-departed-at entry))
+                               "the roster entry carries the time it left"))
+                       (is equal (list leaver-id)
+                           (mapcar #'roster:entry-id
+                                   (roster:departed-members roster-dir))
+                           "only the agent that left is recorded as departed")
+
+                       ;; Traffic the departed agent will never read. Its cursor
+                       ;; must follow the head anyway, or it pins the log.
+                       (let ((head (agent:agent-publish publisher "third")))
+                         (setf head (agent:agent-publish publisher "fourth"))
+                         (setf head (agent:agent-publish publisher "fifth"))
+                         (wait-until (lambda () (>= (cursor-at paths leaver-id) head))
                                      :timeout *advance-timeout* :poll 1)
-                         (is = later (cursor-at paths leaver-id)
-                             "the held cursor tracks the head as the log grows")
+                         (is = head (cursor-at paths leaver-id)
+                             "the busmaster advanced the departed agent's cursor to the head within ~D s at a ~D s interval"
+                             *advance-timeout* *advance-seconds*)
                          (is = 2 (cursor-at paths stayer-id)
-                             "the staying agent's cursor is still its own"))))
-                (ignore-errors (agent:disconnect-agent publisher))
-                (ignore-errors (agent:disconnect-agent leaver))
-                (ignore-errors (agent:disconnect-agent stayer))))))))))
+                             "a still-connected agent's cursor was not written by the broker")
+
+                         ;; And it keeps following: a held cursor that fell behind
+                         ;; once would be back to pinning the log.
+                         (let ((later (agent:agent-publish publisher "sixth")))
+                           (wait-until (lambda () (>= (cursor-at paths leaver-id) later))
+                                       :timeout *advance-timeout* :poll 1)
+                           (is = later (cursor-at paths leaver-id)
+                               "the held cursor tracks the head as the log grows")
+                           (is = 2 (cursor-at paths stayer-id)
+                               "the staying agent's cursor is still its own"))))
+                  (ignore-errors (agent:disconnect-agent publisher))
+                  (ignore-errors (agent:disconnect-agent leaver))
+                  (ignore-errors (agent:disconnect-agent stayer)))))))))))
