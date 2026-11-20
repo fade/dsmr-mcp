@@ -148,23 +148,37 @@
            :report-fn #'collect-report keys)))
 
 (defun sample-around (state thunk &key (lead 1.0))
-  "Sample --check-live for 3 s at 20 Hz in all, calling THUNK LEAD seconds in;
-   return the samples and THUNK's value.
+  "Sample --check-live for 3 s, calling THUNK LEAD seconds in; return the
+   samples and THUNK's value.
 
-   One run of the binary takes about as long as the pause a sampler leaves
-   between runs, so a single sampler only reaches half the rate. Two samplers,
-   the second started 50 ms after the first, together take a sample every
-   50 ms or so."
+   Two samplers at 20 Hz, the second 25 ms behind the first, take a sample
+   about every 25 ms while one run of the binary takes under 50 ms, and about
+   two per run when it takes longer. Each sampler is joined within the 3 s
+   window plus *RUN-SECONDS* plus 10 s; an error in a sampler reaches the
+   caller. When THUNK unwinds, the samplers are still joined, errors ignored,
+   so none outlives the case's state root."
   (flet ((sampler (delay)
-           (sb-thread:make-thread
-            (lambda ()
-              (sleep delay)
-              (sample-check-live state (id-args) 20 3))
-            :name "check-live sampler")))
-    (let* ((samplers (list (sampler 0) (sampler 0.05)))
-           (value (progn (sleep lead) (funcall thunk))))
-      (values (loop for thread in samplers append (sb-thread:join-thread thread))
-              value))))
+           (start-case-thread "check-live sampler"
+                              (lambda ()
+                                (sleep delay)
+                                (sample-check-live state (id-args) 20 3)))))
+    (let ((samplers (list (sampler 0) (sampler 0.025)))
+          (joined nil))
+      (flet ((join (thread index)
+               (join-within thread (+ 3 *run-seconds* 10)
+                            (format nil "joining check-live sampler ~D of 2" index))))
+        (unwind-protect
+             (let ((value (progn (sleep lead) (funcall thunk))))
+               (multiple-value-prog1
+                   (values (loop for thread in samplers
+                                 for index from 1
+                                 append (join thread index))
+                           value)
+                 (setf joined t)))
+          (unless joined
+            (loop for thread in samplers
+                  for index from 1
+                  do (ignore-errors (join thread index)))))))))
 
 (defun publish-seq (seq)
   "Append record SEQ from *OTHER*, addressed to everyone, to the case's bus."
@@ -250,12 +264,16 @@
                             (%unix-time))
                            "the service wrote a wake line")
                      (let ((code (await-exit wake 10)))
-                       (is eql 0 code "the wake returned"))
-                     (let ((line (read-line (uiop:process-info-output wake) nil "")))
-                       (true (eql 0 (search "bus:1" line)) "the wake printed ~S" line)
-                       (false (search "nowatcher" line)))))))
-          (when (uiop:process-alive-p wake)
-            (ignore-errors (uiop:terminate-process wake))
+                       (is eql 0 code "the wake did not exit 0")
+                       (let ((line (if code
+                                       (within-deadline ("reading the wake's line" 10)
+                                         (read-line (uiop:process-info-output wake)
+                                                    nil ""))
+                                       "")))
+                         (true (eql 0 (search "bus:1" line)) "the wake printed ~S" line)
+                         (false (search "nowatcher" line))))))))
+          (when (or (not (uiop:process-alive-p wake))
+                    (stop-process (uiop:process-info-pid wake)))
             (ignore-errors (uiop:wait-process wake))))))))
 
 (define-test terminating-the-watcher-first-leaves-a-moment-without-one
@@ -275,13 +293,16 @@
 (defun start-name-only-watcher (state)
   "Start a process that holds the lock on this case's identity's name-only
    stem pid file under STATE, with the command line of a detached watcher, as
-   one started by an older build would. Returns its process."
+   one started by an older build would. Returns its process. Its first line is
+   read within 30 s; on any failure before returning, the process is killed
+   and reaped."
   (let* ((path (merge-pathnames (format nil "dsmr-mcp/watch/~A.pid"
                                         (%legacy-detach-stem *bus* (my-id)))
                                 state))
          (form (format nil "(let* ((fd (sb-posix:open ~S (logior sb-posix:o-creat sb-posix:o-rdwr) #o644)) (s (sb-sys:make-fd-stream fd :output t))) (sb-posix:fcntl fd sb-posix:f-setlk (make-instance (quote sb-posix:flock) :type sb-posix:f-wrlck :whence sb-posix:seek-set :start 0 :len 0)) (format s \"~~D~~%~~A~~%\" (sb-posix:getpid) ~S) (finish-output s) (write-line \"locked\") (finish-output) (sleep 120))"
                        (uiop:native-namestring path) (my-id)))
-         (process nil))
+         (process nil)
+         (started nil))
     (ensure-directories-exist path)
     (setf process (sb-ext:run-program
                    (uiop:native-namestring sb-ext:*runtime-pathname*)
@@ -290,9 +311,15 @@
                          "--end-toplevel-options" "--detached-child"
                          "/older/bin/dsmr-bus-watch" "--bus" *bus*)
                    :input nil :output :stream :error nil :wait nil))
-    (let ((line (read-line (sb-ext:process-output process) nil "")))
-      (unless (string= line "locked")
-        (error "the name-only watcher did not start: ~S" line)))
+    (unwind-protect
+         (let ((line (within-deadline ("reading the name-only watcher's first line" 30)
+                       (read-line (sb-ext:process-output process) nil ""))))
+           (unless (string= line "locked")
+             (error "the name-only watcher did not start: ~S" line))
+           (setf started t))
+      (unless started
+        (ignore-errors (sb-ext:process-kill process 9))
+        (ignore-errors (sb-ext:process-wait process))))
     process))
 
 (define-test a-watcher-under-a-name-only-stem-is-reported-and-left-running

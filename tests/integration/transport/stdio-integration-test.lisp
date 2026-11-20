@@ -1,4 +1,4 @@
-;;;; tests/transport/stdio-integration-test.lisp
+;;;; tests/integration/transport/stdio-integration-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
 ;;;; Spawned-subprocess integration tests.
@@ -7,7 +7,7 @@
 ;;;; child stderr capturing a stdio.start log event.
 ;;;;
 ;;;; Gated: skips cleanly when sbcl is not on PATH.
-;;;; Kept to one or two test cases — subprocess tests are slow and environment-dependent.
+;;;; Each child runs under a private state root with no inherited DSMR_ settings.
 
 (defpackage #:dsmr-mcp/tests/integration/transport/stdio-integration-test
   (:use #:cl #:zebra)
@@ -17,7 +17,15 @@
   (:import-from #:dsmr-mcp/tests/integration/support
                 #:sbcl-path
                 #:quicklisp-setup-path
-                #:with-mcp-server-child-or-skip))
+                #:with-mcp-server-child-or-skip
+                #:launch-server-child
+                #:with-server-child-state-home
+                #:server-child-environment
+                #:processes-under-state-home
+                #:stop-processes-under-state-home)
+  (:import-from #:dsmr-mcp/src/envrc-vars
+                #:managed-variables
+                #:variable-name))
 
 (in-package #:dsmr-mcp/tests/integration/transport/stdio-integration-test)
 
@@ -43,12 +51,16 @@ without a discoverable project directory still gets a well-formed config."
             "(asdf:initialize-source-registry '(:source-registry~@[ (:directory ~S)~] :inherit-configuration))"
             (and project (namestring project)))))
 
-(defun %spawn-dsmr-mcp ()
+(defun %spawn-dsmr-mcp (state-home &key (inherited nil inherited-p) assignments)
   "Spawn a child sbcl running dsmr-mcp in :stdio mode.
 Returns a UIOP process-info object with :input :stream :output :stream
 and :error-output :stream.  The caller is responsible for closing the
 input stream (triggering EOF and thus child exit) and waiting for the
 process.
+
+The child runs under STATE-HOME with the inherited environment minus every
+DSMR_ variable, plus ASSIGNMENTS. INHERITED, when supplied, stands in for this
+process's environment.
 
 Uses --no-userinit so the sbclrc does not run, then loads Quicklisp's setup.lisp
 explicitly (its load is silent on stdout) so dependencies resolve to their single
@@ -79,11 +91,9 @@ whole life, so the only thing that reaches stdout is the JSON-RPC traffic."
                 (list "--eval"
                       "(let ((*standard-output* *error-output*)) (asdf:load-system :dsmr-mcp))")
                 (list "--eval" "(dsmr-mcp:run :transport :stdio)"))))
-    (uiop:launch-program
-     args
-     :input        :stream
-     :output       :stream
-     :error-output :stream)))
+    (apply #'launch-server-child args state-home
+           :assignments assignments
+           (when inherited-p (list :inherited inherited)))))
 
 (defun %init-line ()
   "Return a well-formed initialize JSON-RPC request line."
@@ -146,6 +156,29 @@ better diagnostic than a suite that never finishes."
       (error () nil))
     (get-output-stream-string collected)))
 
+(defun %initialize-close-and-reap (proc)
+  "Send PROC one initialize line, assert a response arrives, close its stdin,
+assert it exits within *CHILD-EXIT-DEADLINE*, and reap it on every exit."
+  (unwind-protect
+       (let ((child-in  (uiop:process-info-input  proc))
+             (child-out (uiop:process-info-output proc)))
+         (write-line (%init-line) child-in)
+         (force-output child-in)
+         (multiple-value-bind (response detail)
+             (%read-line-with-deadline
+              child-out *child-response-deadline*
+              "the initialize response on child stdout")
+           (true response "~A" detail))
+         (close child-in)
+         (true (not (eq :timeout
+                        (%wait-process-with-deadline
+                         proc *child-exit-deadline*)))
+               "the child did not exit within ~D s of its stdin closing"
+               *child-exit-deadline*))
+    (ignore-errors (close (uiop:process-info-input proc)))
+    (ignore-errors (uiop:terminate-process proc))
+    (ignore-errors (uiop:wait-process proc))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Tests
 ;;; ---------------------------------------------------------------------------
@@ -154,83 +187,162 @@ better diagnostic than a suite that never finishes."
   "A spawned SBCL child answers an initialize line on its stdout with
 a structurally correct JSON-RPC response containing protocolVersion."
   (with-mcp-server-child-or-skip
-    (let ((proc (%spawn-dsmr-mcp)))
-      (unwind-protect
-           (let ((child-in  (uiop:process-info-input  proc))
-                 (child-out (uiop:process-info-output proc)))
-             ;; Send the initialize line.
-             (write-line (%init-line) child-in)
-             (force-output child-in)
+    (with-server-child-state-home (state)
+      (let ((proc (%spawn-dsmr-mcp state)))
+        (unwind-protect
+             (let ((child-in  (uiop:process-info-input  proc))
+                   (child-out (uiop:process-info-output proc)))
+               ;; Send the initialize line.
+               (write-line (%init-line) child-in)
+               (force-output child-in)
 
-             ;; Read one response line from child stdout, on a deadline.
-             (multiple-value-bind (response detail)
-                 (%read-line-with-deadline
-                  child-out *child-response-deadline*
-                  "the initialize response on child stdout")
-               (let ((parsed (and response
-                                  (ignore-errors (jzon:parse response)))))
-                 ;; Assert protocolVersion is present in the result.
-                 (true response "~A" detail)
-                 (true parsed "~A" detail)
-                 (when parsed
-                   (is equal "2.0" (gethash "jsonrpc" parsed))
-                   (is = 1 (gethash "id" parsed))
-                   (let ((ver (gethash* parsed "result" "protocolVersion")))
-                     (true (stringp ver))
-                     (true (and (stringp ver) (> (length ver) 0)))))))
+               ;; Read one response line from child stdout, on a deadline.
+               (multiple-value-bind (response detail)
+                   (%read-line-with-deadline
+                    child-out *child-response-deadline*
+                    "the initialize response on child stdout")
+                 (let ((parsed (and response
+                                    (ignore-errors (jzon:parse response)))))
+                   ;; Assert protocolVersion is present in the result.
+                   (true response "~A" detail)
+                   (true parsed "~A" detail)
+                   (when parsed
+                     (is equal "2.0" (gethash "jsonrpc" parsed))
+                     (is = 1 (gethash "id" parsed))
+                     (let ((ver (gethash* parsed "result" "protocolVersion")))
+                       (true (stringp ver))
+                       (true (and (stringp ver) (> (length ver) 0)))))))
 
-             ;; Close input to trigger EOF; child should exit.
-             (close child-in)
-             (true (not (eq :timeout
-                            (%wait-process-with-deadline
-                             proc *child-exit-deadline*)))
-                   "the child exited within ~D s of its stdin closing"
-                   *child-exit-deadline*))
+               ;; Close input to trigger EOF; child should exit.
+               (close child-in)
+               (true (not (eq :timeout
+                              (%wait-process-with-deadline
+                               proc *child-exit-deadline*)))
+                     "the child did not exit within ~D s of its stdin closing"
+                     *child-exit-deadline*))
 
-        ;; Ensure the process is reaped even if assertions fail.
-        (ignore-errors
-         (close (uiop:process-info-input proc)))
-        (ignore-errors
-         (uiop:terminate-process proc))
-        (ignore-errors
-         (uiop:wait-process proc))))))
+          ;; Ensure the process is reaped even if assertions fail.
+          (ignore-errors
+           (close (uiop:process-info-input proc)))
+          (ignore-errors
+           (uiop:terminate-process proc))
+          (ignore-errors
+           (uiop:wait-process proc)))))))
 
 (define-test stdio-start-appears-in-child-stderr
   "Child stderr contains a stdio.start log event, proving the transport
 logged its start."
   (with-mcp-server-child-or-skip
-    (let ((proc (%spawn-dsmr-mcp)))
-      (unwind-protect
-           (let ((child-in  (uiop:process-info-input  proc))
-                 (child-out (uiop:process-info-output proc)))
-             ;; Send and receive one initialize exchange so the server starts.
-             (write-line (%init-line) child-in)
-             (force-output child-in)
-             ;; Drain the response so the child has had a chance to write its
-             ;; log lines. Content is not asserted here, but arrival is: a child
-             ;; that never answers must fail this test rather than stall it.
-             (multiple-value-bind (response detail)
-                 (%read-line-with-deadline
-                  child-out *child-response-deadline*
-                  "the initialize response on child stdout")
-               (true response "~A" detail))
-             ;; Close to trigger EOF, wait for child to exit.
-             (close child-in)
-             (true (not (eq :timeout
-                            (%wait-process-with-deadline
-                             proc *child-exit-deadline*)))
-                   "the child exited within ~D s of its stdin closing"
-                   *child-exit-deadline*)
-             ;; Drain stderr into a string (the stream is now at EOF
-             ;; because the child has exited and closed its end).
-             (let ((stderr (%drain-with-deadline
-                            (uiop:process-info-error-output proc)
-                            *child-exit-deadline*)))
-               (true (stringp stderr))
-               (true (search "stdio.start" stderr)
-                     "child stderr carried a stdio.start event")))
+    (with-server-child-state-home (state)
+      (let ((proc (%spawn-dsmr-mcp state)))
+        (unwind-protect
+             (let ((child-in  (uiop:process-info-input  proc))
+                   (child-out (uiop:process-info-output proc)))
+               ;; Send and receive one initialize exchange so the server starts.
+               (write-line (%init-line) child-in)
+               (force-output child-in)
+               ;; Drain the response so the child has had a chance to write its
+               ;; log lines. Content is not asserted here, but arrival is: a child
+               ;; that never answers must fail this test rather than stall it.
+               (multiple-value-bind (response detail)
+                   (%read-line-with-deadline
+                    child-out *child-response-deadline*
+                    "the initialize response on child stdout")
+                 (true response "~A" detail))
+               ;; Close to trigger EOF, wait for child to exit.
+               (close child-in)
+               (true (not (eq :timeout
+                              (%wait-process-with-deadline
+                               proc *child-exit-deadline*)))
+                     "the child did not exit within ~D s of its stdin closing"
+                     *child-exit-deadline*)
+               ;; Drain stderr into a string (the stream is now at EOF
+               ;; because the child has exited and closed its end).
+               (let ((stderr (%drain-with-deadline
+                              (uiop:process-info-error-output proc)
+                              *child-exit-deadline*)))
+                 (true (stringp stderr))
+                 (true (search "stdio.start" stderr)
+                       "child stderr carried no stdio.start event")))
 
-        ;; Ensure process cleanup.
-        (ignore-errors (close (uiop:process-info-input proc)))
-        (ignore-errors (uiop:terminate-process proc))
-        (ignore-errors (uiop:wait-process proc))))))
+          ;; Ensure process cleanup.
+          (ignore-errors (close (uiop:process-info-input proc)))
+          (ignore-errors (uiop:terminate-process proc))
+          (ignore-errors (uiop:wait-process proc)))))))
+
+(define-test server-child-environment-replaces-inherited-dsmr-settings
+  "The server child environment drops every inherited DSMR_ variable and the
+inherited XDG_STATE_HOME, names the given root as the only XDG_STATE_HOME,
+passes explicit assignments through, and keeps every other inherited entry."
+  (let* ((inherited
+           (append (list "PATH=/usr/bin:/bin"
+                         "HOME=/home/developer"
+                         "CL_SOURCE_REGISTRY=/src/dsmr-mcp/:"
+                         "XDG_STATE_HOME=/home/developer/.local/state")
+                   (loop for variable in (managed-variables)
+                         for name = (variable-name variable)
+                         when (uiop:string-prefix-p "DSMR_" name)
+                           collect (concatenate 'string name "=planted"))
+                   (list "DSMR_RELATED_PROJECTS=planted"
+                         "DSMR_PROJECT_DISPOSITION=planted")))
+         (environment (server-child-environment
+                       #p"/tmp/dsmr-child.fixture/"
+                       :inherited inherited
+                       :assignments '("DSMR_PROJECT_ROOT=/tmp/"))))
+    (true (member "DSMR_BUS_AGENT=planted" inherited :test #'string=)
+          "the inherited list lacks DSMR_BUS_AGENT=planted; check MANAGED-VARIABLES")
+    (is equal '("DSMR_PROJECT_ROOT=/tmp/")
+        (remove-if-not (lambda (entry) (uiop:string-prefix-p "DSMR_" entry))
+                       environment)
+        "DSMR_ entries other than the explicit DSMR_PROJECT_ROOT assignment remain; check SERVER-CHILD-ENVIRONMENT")
+    (is equal '("XDG_STATE_HOME=/tmp/dsmr-child.fixture/")
+        (remove-if-not (lambda (entry) (uiop:string-prefix-p "XDG_STATE_HOME=" entry))
+                       environment)
+        "the XDG_STATE_HOME entries are not exactly one naming the private root")
+    (dolist (kept '("PATH=/usr/bin:/bin"
+                    "HOME=/home/developer"
+                    "CL_SOURCE_REGISTRY=/src/dsmr-mcp/:"))
+      (true (member kept environment :test #'string=)
+            "the inherited entry ~A is missing or altered" kept))))
+
+(define-test server-child-ignores-an-inherited-bus-identity
+  "A server child spawned from an environment carrying DSMR_BUS_AGENT joins no
+bus: no bus root appears under its state root and nothing is left running there."
+  (with-mcp-server-child-or-skip
+    (with-server-child-state-home (state)
+      (%initialize-close-and-reap
+       (%spawn-dsmr-mcp state
+                        :inherited (cons "DSMR_BUS_AGENT=inherited-probe"
+                                         (sb-ext:posix-environ))))
+      (false (uiop:directory-exists-p (merge-pathnames "dsmr-mcp/bus/" state))
+             "a bus root exists under ~A after a child spawned with an inherited ~
+DSMR_BUS_AGENT; check SERVER-CHILD-ENVIRONMENT"
+             state))))
+
+(define-test state-home-cleanup-stops-the-broker-a-server-child-elected
+  "Elects a broker on purpose under a private state root, through an explicit
+DSMR_BUS_AGENT assignment, to prove the state-root cleanup finds a real broker
+there and stops it."
+  (with-mcp-server-child-or-skip
+    (with-server-child-state-home (state :check-leftovers nil)
+      (%initialize-close-and-reap
+       (%spawn-dsmr-mcp state :assignments '("DSMR_BUS_AGENT=cleanup-probe")))
+      (true (uiop:directory-exists-p (merge-pathnames "dsmr-mcp/bus/" state))
+            "no bus root under ~A after a child spawned with DSMR_BUS_AGENT; ~
+check that the bus listener starts"
+            state)
+      (let* ((root (uiop:native-namestring state))
+             (broker (loop repeat 100
+                           for found = (find-if (lambda (entry)
+                                                  (and (search "broker-main" (cdr entry))
+                                                       (search root (cdr entry))))
+                                                (processes-under-state-home state))
+                           when found do (return found)
+                           do (sleep 0.1))))
+        (true broker
+              "no broker-main process found under ~A within 10 s; check the ~
+bus listener's broker election" root)
+        (true (stop-processes-under-state-home state)
+              "processes remain under ~A after the cleanup signalled them" root)
+        (is equal nil (processes-under-state-home state)
+            "processes still run under ~A after the cleanup" root)))))

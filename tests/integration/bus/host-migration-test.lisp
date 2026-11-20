@@ -41,6 +41,9 @@
                 #:host-binary
                 #:run-in
                 #:run-in-env
+                #:*run-seconds*
+                #:start-case-thread
+                #:join-within
                 #:full-id
                 #:detach-file
                 #:field
@@ -158,7 +161,8 @@
    One run of the binary takes most of a tenth of a second while several run
    at once, so each agent gets two samplers, the second 50 ms behind the
    first, each keeping to a schedule of ten probes a second so the time a
-   probe takes does not lower the rate."
+   probe takes does not lower the rate. An error in a sampler is held for
+   STOP-SAMPLERS, which re-signals it."
   (let ((stop (vector nil))
         (period (round internal-time-units-per-second 10)))
     (list stop
@@ -168,7 +172,8 @@
                           (cons agent
                                 (loop for delay in '(0 0.05)
                                       collect (let ((delay delay))
-                                                (sb-thread:make-thread
+                                                (start-case-thread
+                                                 (format nil "check-live ~A" agent)
                                                  (lambda ()
                                                    (sleep delay)
                                                    (loop with next = (get-internal-real-time)
@@ -178,18 +183,23 @@
                                                          do (incf next period)
                                                             (let ((wait (- next (get-internal-real-time))))
                                                               (when (plusp wait)
-                                                                (sleep (/ wait internal-time-units-per-second))))))
-                                                 :name (format nil "check-live ~A" agent))))))))))
+                                                                (sleep (/ wait internal-time-units-per-second)))))))))))))))
 
 (defun stop-samplers (samplers)
   "Stop SAMPLERS, from START-SAMPLERS, and return two values: an alist of each
-   agent and every status word read for it, and the seconds sampled."
+   agent and every status word read for it, and the seconds sampled. Each
+   sampler is joined within *RUN-SECONDS* plus 10 s; an error in a sampler
+   reaches the caller."
   (destructuring-bind (stop started threads) samplers
     (setf (svref stop 0) t)
     (let ((seconds (seconds-since started)))
       (values (loop for (agent . pair) in threads
-                    collect (cons agent (loop for thread in pair
-                                              append (sb-thread:join-thread thread))))
+                    collect (cons agent
+                                  (loop for thread in pair
+                                        append (join-within
+                                                thread (+ *run-seconds* 10)
+                                                (format nil "joining the check-live sampler of ~A"
+                                                        agent)))))
               seconds))))
 
 (defun wake-args (bus agent)

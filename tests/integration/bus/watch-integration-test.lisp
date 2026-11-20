@@ -18,7 +18,12 @@
 (defpackage #:dsmr-mcp/tests/integration/bus/watch-integration-test
   (:use #:cl #:zebra)
   (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal)
-                    (#:envelope #:dsmr-mcp/src/bus/envelope)))
+                    (#:envelope #:dsmr-mcp/src/bus/envelope))
+  (:import-from #:dsmr-mcp/tests/integration/bus/host-support
+                #:run-within
+                #:finish-within
+                #:within-deadline
+                #:*run-seconds*))
 
 (in-package #:dsmr-mcp/tests/integration/bus/watch-integration-test)
 
@@ -104,7 +109,8 @@
 
 (defun %spawn (bin env-args args)
   "Run BIN through env(1) with ENV-ARGS applied, returning
-   (values stdout stderr exit-code).
+   (values stdout stderr exit-code). Past *RUN-SECONDS* the run is stopped and
+   DEADLINE-PASSED is signalled.
 
    Everything goes through env(1) because DSMR_BUS_AGENT is INHERITED. A
    developer or CI runner carrying a bus identity of their own in the environment
@@ -112,10 +118,8 @@
    identity, or with a different one, and the case would pass or fail on whose
    shell started it. Setting the variable on the test process itself is not an
    alternative: that leaks into every case that runs after it."
-  (uiop:run-program (append (list "env") env-args (list (namestring bin)) args)
-                    :output '(:string :stripped t)
-                    :error-output '(:string :stripped t)
-                    :ignore-error-status t))
+  (run-within (append (list "env") env-args (list (namestring bin)) args)
+              :operation (format nil "~A~{ ~A~}" (file-namestring bin) args)))
 
 (defun run-watcher (bin &rest args)
   "Run BIN with ARGS synchronously and NO ambient bus identity, returning
@@ -134,18 +138,39 @@
    a record can only fire it by landing after the process is up. Appending a
    series rather than a single record is what takes the startup race out of it:
    wherever in the series the arm lands, records above it still follow. The loop
-   stops as soon as the watcher exits, so the log stays contiguous."
-  (let ((p (uiop:launch-program
-            (append (list "env" "-u" "DSMR_BUS_AGENT" (namestring bin)) args)
-            :output :stream :error-output :stream)))
-    (loop for s from 1 to 6
-          while (uiop:process-alive-p p)
-          do (sleep 0.2)
-             (wal:append-record wal s "a message from a sister agent"))
-    (let ((code (uiop:wait-process p)))
-      (values (uiop:slurp-stream-string (uiop:process-info-output p))
-              (uiop:slurp-stream-string (uiop:process-info-error-output p))
-              code))))
+   stops as soon as the watcher exits, so the log stays contiguous.
+
+   The exit wait goes through FINISH-WITHIN with *RUN-SECONDS*, and reading the
+   outputs takes at most 10 s; past either bound DEADLINE-PASSED is signalled.
+   On any non-local exit the process gets SIGKILL and is reaped."
+  (let ((process (uiop:launch-program
+                  (append (list "env" "-u" "DSMR_BUS_AGENT" (namestring bin)) args)
+                  :output :stream :error-output :stream))
+        (done nil))
+    (unwind-protect
+         (progn
+           (loop for s from 1 to 6
+                 while (uiop:process-alive-p process)
+                 do (sleep 0.2)
+                    (wal:append-record wal s "a message from a sister agent"))
+           (let ((code (finish-within process *run-seconds*
+                                      (format nil "~A~{ ~A~}" (file-namestring bin)
+                                              args))))
+             (multiple-value-prog1
+                 (within-deadline ((format nil "reading the output of pid ~D"
+                                           (uiop:process-info-pid process))
+                                   10)
+                   (values (uiop:slurp-stream-string
+                            (uiop:process-info-output process))
+                           (uiop:slurp-stream-string
+                            (uiop:process-info-error-output process))
+                           code))
+               (setf done t))))
+      (unless done
+        (when (uiop:process-alive-p process)
+          (ignore-errors (sb-posix:kill (uiop:process-info-pid process)
+                                        sb-posix:sigkill)))
+        (ignore-errors (uiop:wait-process process))))))
 
 (defun fast-watch-args (wal cursors)
   "The --wal/--cursors-dir/cadence arguments the identity-bearing cases share.

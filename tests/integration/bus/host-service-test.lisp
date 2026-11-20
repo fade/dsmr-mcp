@@ -95,6 +95,12 @@
   "True when AGENT's probe under STATE answers live with PID as its watcher."
   (eql 0 (search (format nil "live pid=~D " pid) (check-live state agent))))
 
+(defun await-reader (state agent &key (seconds 10))
+  "Wait up to SECONDS until AGENT's probe under STATE counts one reader of its
+   log. Returns true then, and NIL when SECONDS pass first."
+  (await-true (lambda () (equal "1" (field "readers" (check-live state agent))))
+              seconds))
+
 (defun service-status (state)
   "The service's status summary under STATE, or NIL."
   (with-state-home (state)
@@ -188,7 +194,8 @@
           (is equal "0" (field "readers" live)))
         (let ((wake (launch-wake state (list* "--wake" "--wake-seconds" "30"
                                               "--poll-ms" "50" (args "alpha")))))
-          (sleep 0.7)
+          (true (await-reader state "alpha")
+                "the waiting --wake was not counted as a reader")
           (true (uiop:process-alive-p wake))
           (is equal "1" (field "readers" (check-live state "alpha"))
               "a waiting --wake was not counted")
@@ -207,7 +214,8 @@
         (true (await-served state service "alpha"))
         (let ((wake (launch-wake state (list* "--wake" "--wake-seconds" "30"
                                               "--poll-ms" "50" (args "alpha")))))
-          (sleep 0.7)
+          (true (await-reader state "alpha")
+                "the waiting --wake was not counted as a reader")
           (let ((seq (publish state *bus* *other* :text "for the wake")))
             (multiple-value-bind (code out err) (finish-wake wake 5)
               (is eql 0 code "--wake did not return on the line: ~S" err)
@@ -216,7 +224,8 @@
         (let ((hook (launch-wake state (list* "--wake" "--hook" "--wake-seconds" "30"
                                               "--poll-ms" "50" (args "alpha"))
                                  :hook-input +hook-input+)))
-          (sleep 0.7)
+          (true (await-reader state "alpha")
+                "the waiting hook listener was not counted as a reader")
           (let ((seq (publish state *bus* *other* :text "for the hook")))
             (multiple-value-bind (code out err) (finish-wake hook 5)
               (is eql 2 code "the hook did not wake the session")

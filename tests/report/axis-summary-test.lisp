@@ -127,40 +127,46 @@ the other side is our arithmetic."
             "~a: an object appears more than once in the report vector" label)))))
 
 ;;; ------------------------------------------------------------------
-;;; The failure zebra's own summary cannot show
+;;; A test that dies before it asserts
 
 (define-test a-test-that-dies-before-asserting-is-counted
-  ;; The state this class exists to change. Under the default reporter this
-  ;; run prints no passes and no failures at all.
+  ;; Recorded from zebra a36e393, PLAIN report: this run prints 0 1 0.
   (let ((theirs (printed-triple
                  (nth-value 1 (run-fixtures #'shape-dies-before-asserting
                                             :report 'pa:plain)))))
-    (is equal '(0 0 0) theirs
-        "zebra prints a bare zero triple for a test that died"))
-  ;; The same run through this reporter, with the deviation selected.
+    (is equal '(0 1 0) theirs
+        "zebra PLAIN triple for a test that dies before asserting is not 0 1 0"))
   (multiple-value-bind (report output)
-      (run-fixtures #'shape-dies-before-asserting
-                    :report 'ar:axis-summary
-                    :uncarried-test-failures-are-failures t)
+      (run-fixtures #'shape-dies-before-asserting :report 'ar:axis-summary)
     (let ((axes (ar:axes-of report)))
       (is = 1 (ar:axes-test-failed-uncarried axes))
       (is = 1 (ar:axes-failed axes))
-      ;; and the compatibility number is untouched by the deviation.
-      (is = 0 (ar:axes-upstream-failed axes)))
-    (true (search "tests failed, nothing beneath accounts for it" output))))
+      (is = 1 (ar:axes-upstream-failed axes)))
+    (true (search "tests failed, nothing beneath accounts for it" output)))
+  ;; Excluding groups and controls leaves a test nothing beneath accounts for.
+  (let ((axes (ar:axes-of (run-fixtures #'shape-dies-before-asserting
+                                        :report 'ar:axis-summary
+                                        :controls-are-not-checks t))))
+    (is = 1 (ar:axes-failed axes)
+        "controls-are-not-checks dropped a failed test that has no children")))
 
 (define-test the-deviations-are-off-until-they-are-asked-for
   ;; A caller who asks for nothing gets zebra's numbers, so adopting the
   ;; class does not move any figure a gate already reads.
+  (dolist (entry +every-shape+)
+    (destructuring-bind (label . shape) entry
+      (let ((report (run-fixtures shape :report 'ar:axis-summary)))
+        (let ((axes (ar:axes-of report)))
+          (is equal
+              (list (ar:axes-upstream-passed axes)
+                    (ar:axes-upstream-failed axes)
+                    (ar:axes-upstream-skipped axes))
+              (multiple-value-list (ar:triple report))
+              "~a: default triple differs from the upstream triple" label)))))
   (multiple-value-bind (report output)
       (run-fixtures #'shape-dies-before-asserting :report 'ar:axis-summary)
-    (multiple-value-bind (passed failed skipped) (ar:triple report)
-      (is = 0 passed)
-      (is = 0 failed)
-      (is = 0 skipped))
     (true (search "Counted exactly as zebra counts" output))
-    ;; The axis still holds the failure whatever the triple says: the axes
-    ;; are facts about the run and no deviation moves them.
+    ;; The axes are facts about the run and no deviation moves them.
     (is = 1 (ar:axes-test-failed-uncarried (ar:axes-of report)))))
 
 ;;; ------------------------------------------------------------------
@@ -170,13 +176,7 @@ the other side is our arithmetic."
   ;; One side of this comparison is zebra's formatted text, the other is
   ;; this reporter's own walk of the raw vector. Nothing calls her counting
   ;; helpers, so the two can disagree, which is the only reason to run it.
-  (dolist (entry (list (cons "all pass" #'shape-all-pass)
-                       (cons "failing leaf" #'shape-failing-leaf)
-                       (cons "dies before asserting" #'shape-dies-before-asserting)
-                       (cons "skip" #'shape-skip)
-                       (cons "group wholly skipped" #'shape-group-wholly-skipped)
-                       (cons "asserts nothing" #'shape-asserts-nothing)
-                       (cons "empty run" #'shape-empty)))
+  (dolist (entry +every-shape+)
     (destructuring-bind (label . shape) entry
       (let ((theirs (printed-triple
                      (nth-value 1 (run-fixtures shape :report 'pa:plain))))
@@ -188,25 +188,18 @@ the other side is our arithmetic."
             "~a: derived compatibility triple disagrees with the printed one"
             label)))))
 
-(define-test the-time-limit-shape-is-where-the-loaded-zebra-diverges
-  ;; The compatibility numbers reproduce upstream, which drops every test
-  ;; result from the failed count. The checkout loaded here carries a local
-  ;; patch that keeps a test which outlived its limit, so on this one shape
-  ;; the printed number and the derived number differ, by design.
-  ;;
-  ;; If this test starts failing, the loaded zebra and upstream have
-  ;; converged. Recheck which semantics the compatibility line should
-  ;; reproduce; do not relax the assertion.
+(define-test a-test-that-outlives-its-limit-is-counted-as-one-failure
+  ;; Recorded from zebra a36e393, PLAIN report: this run prints 1 1 0.
   (let* ((theirs (printed-triple
                   (nth-value 1 (run-fixtures #'shape-outlives-its-limit
                                              :report 'pa:plain))))
          (axes (ar:axes-of (run-fixtures #'shape-outlives-its-limit
                                          :report 'ar:axis-summary))))
-    (is = 1 (second theirs) "the loaded checkout counts the overrun as a failure")
-    (is = 0 (ar:axes-upstream-failed axes) "upstream would count no failure")
-    ;; The overrun is not lost by reproducing upstream. It reaches the axes
-    ;; through a predicate that consults no clock: the test failed and
-    ;; nothing beneath it carries that failure.
+    (is = 1 (second theirs) "zebra PLAIN failed count for an overrun is not 1")
+    (is = 1 (ar:axes-upstream-failed axes))
+    (is = 1 (ar:axes-failed axes))
+    ;; The overrun reaches the axes through a predicate that consults no
+    ;; clock: the test failed and nothing beneath it carries that failure.
     (is = 1 (ar:axes-test-failed-uncarried axes))))
 
 (define-test the-two-numbers-behind-a-time-limit-are-reported-uncompared
@@ -277,11 +270,15 @@ the other side is our arithmetic."
 ;;; Zero triples that mean different things
 
 (define-test an-empty-run-and-a-run-that-asserted-nothing-are-distinguishable
-  ;; Zebra prints the same three zeroes for both.
-  (is equal
+  ;; Recorded from zebra a36e393, PLAIN report: the empty run prints 0 0 0
+  ;; and the run that asserted nothing prints 1 0 0, a pass with no check.
+  (is equal '(0 0 0)
       (printed-triple (nth-value 1 (run-fixtures #'shape-empty :report 'pa:plain)))
+      "zebra PLAIN triple for an empty run is not 0 0 0")
+  (is equal '(1 0 0)
       (printed-triple (nth-value 1 (run-fixtures #'shape-asserts-nothing
-                                                 :report 'pa:plain))))
+                                                 :report 'pa:plain)))
+      "zebra PLAIN triple for a run that asserted nothing is not 1 0 0")
   (multiple-value-bind (report output) (run-fixtures #'shape-empty
                                                      :report 'ar:axis-summary)
     (is = 0 (ar:axes-total (ar:axes-of report)))
@@ -290,6 +287,7 @@ the other side is our arithmetic."
                                                      :report 'ar:axis-summary)
     (let ((axes (ar:axes-of report)))
       (is = 1 (ar:axes-total axes))
+      (is = 0 (ar:axes-leaf-passed axes))
       (is = 1 (ar:axes-test-passed-uncarried axes)))
     (true (search "no leaf check among" output))))
 
@@ -330,8 +328,8 @@ the other side is our arithmetic."
 ;;; The deviations, one at a time
 
 (define-test controls-are-not-checks-removes-the-group-leak
-  ;; Zebra drops test results from the leaf counts but not groups or
-  ;; control objects, so a GROUP form is counted as though it asserted.
+  ;; Zebra excludes only a test whose status a child carries, never a group
+  ;; or control object, so a GROUP form is counted as though it asserted.
   (let ((theirs (ar:axes-of (run-fixtures #'shape-group-wholly-skipped
                                           :report 'ar:axis-summary)))
         (ours (ar:axes-of (run-fixtures #'shape-group-wholly-skipped
@@ -339,8 +337,8 @@ the other side is our arithmetic."
                                         :controls-are-not-checks t))))
     ;; The run contains no leaf check at all.
     (is = 0 (ar:axes-leaf-passed theirs))
-    ;; Yet the compatibility count reports passes, because the group and the
-    ;; test around it are counted.
+    ;; Yet the compatibility count reports a pass: zebra counts the group,
+    ;; and the test around it is carried by the group.
     (true (plusp (ar:axes-upstream-passed theirs)))
     (is = 0 (ar:axes-passed ours)
         "with controls excluded, a run with no check reports no pass")))
@@ -356,24 +354,24 @@ the other side is our arithmetic."
 
 (define-test a-selected-deviation-is-named-in-the-printed-report
   (multiple-value-bind (report output)
-      (run-fixtures #'shape-dies-before-asserting
+      (run-fixtures #'shape-group-wholly-skipped
                     :report 'ar:axis-summary
-                    :uncarried-test-failures-are-failures t)
+                    :controls-are-not-checks t)
     (declare (ignore report))
-    (true (search "uncarried-test-failures-are-failures" output))
+    (true (search "controls-are-not-checks" output))
     (true (search "without them the" output)
-          "the report says what zebra's own numbers would have been")))
+          "the printed report omits zebra's own triple under a deviation")))
 
 (define-test a-dynamic-default-selects-the-same-semantics-as-an-initarg
-  (let ((by-initarg (ar:axes-of (run-fixtures #'shape-dies-before-asserting
+  (let ((by-initarg (ar:axes-of (run-fixtures #'shape-group-wholly-skipped
                                               :report 'ar:axis-summary
-                                              :uncarried-test-failures-are-failures t)))
+                                              :controls-are-not-checks t)))
         (by-variable
-          (let ((ar:*uncarried-test-failures-are-failures* t))
-            (ar:axes-of (run-fixtures #'shape-dies-before-asserting
+          (let ((ar:*controls-are-not-checks* t))
+            (ar:axes-of (run-fixtures #'shape-group-wholly-skipped
                                       :report 'ar:axis-summary)))))
-    (is = (ar:axes-failed by-initarg) (ar:axes-failed by-variable))
-    (is = 1 (ar:axes-failed by-variable))))
+    (is = (ar:axes-passed by-initarg) (ar:axes-passed by-variable))
+    (is = 0 (ar:axes-passed by-variable))))
 
 ;;; ------------------------------------------------------------------
 ;;; Counts without a report of our own

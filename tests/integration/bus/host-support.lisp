@@ -3,8 +3,10 @@
 ;;;;
 ;;;; What every cross-process test of the host bus service shares: a private
 ;;;; state root with stub desktop notifiers, a way to run the watcher and the
-;;;; service binaries under it, the stand-in service, and the small probes the
-;;;; cases assert with.
+;;;; service binaries under it, the stand-in service, the small probes the
+;;;; cases assert with, and the deadlines on the waits those cases make. The
+;;;; bounded run, RUN-WITHIN, and the deadlines are shared with the other bus
+;;;; integration leaves as well.
 ;;;;
 ;;;; Every case gets its own state root directly under /tmp. The default state
 ;;;; directory holds the pid files, logs and registrations of the agents this
@@ -16,6 +18,10 @@
 ;;;; sleepers through STOP-PROCESS, and on the way out of WITH-HOST-STATE the
 ;;;; watchers whose pid files sit in that case's own root and whose environment
 ;;;; names that root.
+;;;;
+;;;; A wait that passes its deadline signals DEADLINE-PASSED, naming what it
+;;;; waited for and the bound, with a snapshot of what was running when the run
+;;;; was a process.
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :sb-posix))
@@ -41,6 +47,16 @@
            #:fresh-state-home
            #:run-in
            #:run-in-env
+           #:run-within
+           #:deadline-passed
+           #:deadline-passed-operation
+           #:deadline-passed-seconds
+           #:deadline-passed-detail
+           #:*run-seconds*
+           #:finish-within
+           #:within-deadline
+           #:start-case-thread
+           #:join-within
            #:identity-args
            #:full-id
            #:stem
@@ -155,18 +171,194 @@
 
 ;;; running --------------------------------------------------------------------
 
+(define-condition deadline-passed (error)
+  ((operation :initarg :operation :reader deadline-passed-operation)
+   (seconds :initarg :seconds :reader deadline-passed-seconds)
+   (detail :initarg :detail :initform nil :reader deadline-passed-detail))
+  (:report (lambda (condition stream)
+             (format stream "~A did not finish within ~A s~@[~%~A~]"
+                     (deadline-passed-operation condition)
+                     (deadline-passed-seconds condition)
+                     (deadline-passed-detail condition))))
+  (:documentation
+   "OPERATION, a string, did not finish within SECONDS. DETAIL, a string or NIL,
+    says what was running when the bound passed. An ERROR and never a timeout:
+    zebra does not fail a case for an escaping SBCL timeout."))
+
+(defparameter *run-seconds* 120
+  "Seconds RUN-WITHIN waits by default for a run to exit before stopping it
+   and signalling DEADLINE-PASSED. A LET binding reaches only the thread that makes it.")
+
+(defun %hang-snapshot (pid state)
+  "A description of PID for a passed deadline: its state letter and wait
+   channel; when STATE is given, every process under STATE with its command
+   line cut at 160 characters; and every /proc/locks line naming one of those
+   pids. Never signals."
+  (or (ignore-errors
+       (with-output-to-string (out)
+         (let* ((stat (%proc-text pid "stat"))
+                (close (and stat (position #\) stat :from-end t)))
+                (letter (and close (< (+ close 2) (length stat))
+                             (char stat (+ close 2))))
+                (wchan (%proc-text pid "wchan"))
+                (processes (and state (ignore-errors (processes-under-state state))))
+                (names (mapcar #'princ-to-string
+                               (cons pid (mapcar #'car processes)))))
+           (format out "pid ~D state ~:[gone~;~:*~A~] wchan ~:[-~;~:*~A~]"
+                   pid letter (and wchan (plusp (length wchan)) wchan))
+           (dolist (process processes)
+             (format out "~%  ~D ~A" (car process)
+                     (let ((line (cdr process)))
+                       (subseq line 0 (min 160 (length line))))))
+           (dolist (line (ignore-errors (uiop:read-file-lines "/proc/locks")))
+             (when (intersection names (uiop:split-string line :separator " ")
+                                 :test #'string=)
+               (format out "~%  lock ~A" line))))))
+      (format nil "pid ~D: no snapshot" pid)))
+
+(defun finish-within (process seconds operation &key state)
+  "Return PROCESS's exit code once it exits, polling every 2 ms during the first
+   second and every 50 ms after. When SECONDS pass first, snapshot it and the
+   processes under STATE, stop it by pid through STOP-PROCESS (its group when
+   it leads one), reap it, and signal DEADLINE-PASSED naming OPERATION and
+   SECONDS with the snapshot as its detail."
+  (let* ((start (get-internal-real-time))
+         (young (+ start internal-time-units-per-second))
+         (limit (+ start (round (* seconds internal-time-units-per-second)))))
+    (loop while (uiop:process-alive-p process)
+          do (let ((now (get-internal-real-time)))
+               (when (>= now limit)
+                 (let* ((pid (uiop:process-info-pid process))
+                        (snapshot (%hang-snapshot pid state)))
+                   (stop-process pid)
+                   (unless (uiop:process-alive-p process)
+                     (ignore-errors (uiop:wait-process process)))
+                   (error 'deadline-passed :operation operation
+                                           :seconds seconds
+                                           :detail snapshot)))
+               (sleep (if (< now young) 0.002 0.05))))
+    (uiop:wait-process process)))
+
+(defmacro within-deadline ((operation seconds) &body body)
+  "Run BODY under an SBCL deadline of SECONDS and return its values. A blocking
+   read, SLEEP, or mutex or condition wait in BODY that passes the deadline
+   signals DEADLINE-PASSED naming OPERATION and SECONDS, in place of the SBCL
+   timeout, which zebra counts as a pass when it escapes a case. For reads from
+   a child's stream; a process exit goes through FINISH-WITHIN."
+  (let ((op (gensym "OPERATION"))
+        (limit (gensym "SECONDS")))
+    `(let ((,op ,operation)
+           (,limit ,seconds))
+       (handler-case (sb-sys:with-deadline (:seconds ,limit) ,@body)
+         (sb-sys:deadline-timeout ()
+           (error 'deadline-passed :operation ,op :seconds ,limit))))))
+
+(defstruct (%captured (:constructor %capture (condition)))
+  "A condition a case thread signalled, returned in place of its values."
+  condition)
+
+(defun start-case-thread (name thunk)
+  "Start a thread named NAME that runs THUNK and returns its values. A
+   SERIOUS-CONDITION signalled by THUNK is returned as a captured value instead
+   of reaching the debugger hook, and JOIN-WITHIN re-signals it in the joining
+   thread, so it is never lost. The thread sees the global values of the
+   case's special variables, *STARTED-PIDS* and *RUN-SECONDS* among them, not
+   the case's bindings."
+  (sb-thread:make-thread (lambda ()
+                           (handler-case (funcall thunk)
+                             (serious-condition (condition) (%capture condition))))
+                         :name name))
+
+(defun join-within (thread seconds operation)
+  "Join THREAD, started by START-CASE-THREAD, within SECONDS and return its
+   thunk's values. A condition the thunk signalled is re-signalled here. Past
+   SECONDS, signal DEADLINE-PASSED naming OPERATION and leave the thread to
+   finish; it is never terminated. A thread that ended with no result signals
+   an ERROR naming it."
+  (let* ((none (list :none))
+         (results (multiple-value-list
+                   (sb-thread:join-thread thread :default none :timeout seconds))))
+    (cond ((and (eq (first results) none) (eq (second results) :timeout))
+           (error 'deadline-passed :operation operation :seconds seconds))
+          ((eq (first results) none)
+           (error "thread ~S ended with no result" (sb-thread:thread-name thread)))
+          ((%captured-p (first results))
+           (error (%captured-condition (first results))))
+          (t (values-list results)))))
+
+(defun run-within (argv &key state input (seconds *run-seconds*) operation)
+  "Run ARGV, a list of strings naming the program first, and return (values
+   stdout stderr exit-code), each output with one trailing line end removed.
+
+   Standard input is /dev/null, or the string INPUT when given. The outputs,
+   and INPUT, go through files with unique names in STATE's run-in/
+   subdirectory when STATE is given, else in the UIOP temporary directory, and
+   are removed afterwards. The outputs are read once the process exits, so a
+   descendant that inherits them cannot hold the call open.
+
+   The wait goes through FINISH-WITHIN with SECONDS and STATE: past that bound
+   the process is stopped and DEADLINE-PASSED is signalled, naming OPERATION,
+   or ARGV joined by spaces when OPERATION is NIL. The child is never added to
+   *STARTED-PIDS*; on any non-local exit it gets SIGKILL and is reaped."
+  (let ((dir (if state
+                 (merge-pathnames "run-in/" state)
+                 (uiop:temporary-directory)))
+        (operation (or operation (format nil "~{~A~^ ~}" argv))))
+    (ensure-directories-exist dir)
+    (labels ((with-temp (prefix function)
+               (uiop:call-with-temporary-file function :want-stream-p nil
+                                                       :directory dir
+                                                       :prefix prefix))
+             (run (out-file err-file in-file)
+               (let ((process (uiop:launch-program
+                               argv
+                               :input (and in-file (uiop:native-namestring in-file))
+                               :output (uiop:native-namestring out-file)
+                               :if-output-exists :supersede
+                               :error-output (uiop:native-namestring err-file)
+                               :if-error-output-exists :supersede))
+                     (done nil))
+                 (unwind-protect
+                      (let ((code (finish-within process seconds operation
+                                                 :state state)))
+                        (setf done t)
+                        (values (values (uiop:stripln (uiop:read-file-string out-file)))
+                                (values (uiop:stripln (uiop:read-file-string err-file)))
+                                code))
+                   (unless done
+                     (when (uiop:process-alive-p process)
+                       (ignore-errors (sb-posix:kill (uiop:process-info-pid process)
+                                                     sb-posix:sigkill)))
+                     (ignore-errors (uiop:wait-process process)))))))
+      (with-temp "dsmr-run-out"
+        (lambda (out-file)
+          (with-temp "dsmr-run-err"
+            (lambda (err-file)
+              (if input
+                  (with-temp "dsmr-run-in"
+                    (lambda (in-file)
+                      (with-open-file (stream in-file :direction :output
+                                                      :if-exists :supersede)
+                        (write-string input stream))
+                      (run out-file err-file in-file)))
+                  (run out-file err-file nil)))))))))
+
 (defun run-in-env (state extra bin &rest args)
   "Run BIN with ARGS under the state root STATE with no ambient bus identity,
    bus selector or agent session, plus the assignments in EXTRA, and return
-   (values stdout stderr exit-code)."
-  (uiop:run-program (append (list "env" "-u" "DSMR_BUS_AGENT"
-                                  "-u" "DSMR_BUS_SELECTOR" "-u" "CLAUDE_PID")
-                            (watcher-env state extra)
-                            (list (uiop:native-namestring bin))
-                            args)
-                    :output '(:string :stripped t)
-                    :error-output '(:string :stripped t)
-                    :ignore-error-status t))
+   (values stdout stderr exit-code), each output with one trailing line end
+   removed.
+
+   The run goes through RUN-WITHIN with STATE and *RUN-SECONDS*: standard input
+   is /dev/null, both outputs go to files under STATE's run-in/ subdirectory,
+   and past the bound the process is stopped and DEADLINE-PASSED is signalled."
+  (run-within (append (list "env" "-u" "DSMR_BUS_AGENT"
+                            "-u" "DSMR_BUS_SELECTOR" "-u" "CLAUDE_PID")
+                      (watcher-env state extra)
+                      (list (uiop:native-namestring bin))
+                      args)
+              :state state
+              :operation (format nil "~A~{ ~A~}" (file-namestring bin) args)))
 
 (defun run-in (state bin &rest args)
   "RUN-IN-ENV with nothing extra."
@@ -356,15 +548,20 @@
 
 (defun sample-check-live (state id-args hz seconds)
   "Run `--check-live` with ID-ARGS under STATE HZ times a second for SECONDS,
-   and return the status word of every answer, in order."
+   back to back while one run takes longer than 1/HZ, and return the status
+   word of every answer, in order."
   (let ((bin (watcher-binary))
-        (interval (/ 1.0 hz))
+        (period (round internal-time-units-per-second hz))
         (deadline (+ (get-internal-real-time)
                      (* seconds internal-time-units-per-second))))
-    (loop while (< (get-internal-real-time) deadline)
+    (loop with next = (get-internal-real-time)
+          while (< (get-internal-real-time) deadline)
           collect (let ((out (apply #'run-in state bin "--check-live" id-args)))
                     (subseq out 0 (or (position #\Space out) (length out))))
-          do (sleep interval))))
+          do (incf next period)
+             (let ((wait (- next (get-internal-real-time))))
+               (when (plusp wait)
+                 (sleep (/ wait internal-time-units-per-second)))))))
 
 ;;; the real service ------------------------------------------------------------
 
@@ -440,7 +637,8 @@
 (defun finish-wake (process seconds)
   "Wait up to SECONDS for PROCESS, started by LAUNCH-WAKE, to exit, then return
    (values exit-code stdout stderr), both outputs whole and trimmed. The exit
-   code is NIL when it was still running and had to be stopped."
+   code is NIL when it was still running and had to be stopped. Reading the
+   outputs takes at most 10 s; past that, DEADLINE-PASSED is signalled."
   (let ((code (await-exit process seconds)))
     (unless code
       (stop-process (uiop:process-info-pid process))
@@ -448,9 +646,12 @@
     (flet ((slurp (stream)
              (string-trim '(#\Newline #\Space)
                           (or (ignore-errors (uiop:slurp-stream-string stream)) ""))))
-      (values code
-              (slurp (uiop:process-info-output process))
-              (slurp (uiop:process-info-error-output process))))))
+      (within-deadline ((format nil "reading the output of wake pid ~D"
+                                (uiop:process-info-pid process))
+                        10)
+        (values code
+                (slurp (uiop:process-info-output process))
+                (slurp (uiop:process-info-error-output process)))))))
 
 (defun publish-batch (state bus specs)
   "Append one record per spec in SPECS to BUS's log under STATE, numbered on
@@ -686,7 +887,7 @@
     (ensure-directories-exist log)
     (with-open-file (stream log :direction :output :if-exists :append
                                 :if-does-not-exist :create)
-      (declare (ignore stream)))
+      (declare (ignorable stream)))
     (let* ((process (uiop:launch-program
                      (append (list "env" "-u" "DSMR_BUS_AGENT" "-u" "DSMR_BUS_SELECTOR"
                                    "-u" "CLAUDE_PID")

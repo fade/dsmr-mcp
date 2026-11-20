@@ -21,21 +21,19 @@
 ;;;; empty violation list is then equally consistent with a walker that never
 ;;;; looked at this payload shape at all.
 ;;;;
-;;;; The scratch state root lives under the cache directory rather than the
+;;;; The scratch state root lives under a cache directory rather than the
 ;;;; temporary directory. The rotation answer correlates the kernel's lock table
 ;;;; to a file by a device column learned from the filesystem, and a memory
 ;;;; filesystem answers differently from the disk filesystem the real bus roots
 ;;;; live on. Exercising the verb only in the temporary directory would be green
 ;;;; and would say nothing about where it has to work.
 ;;;;
-;;;; Its name is kept short for a reason that is easy to undo by accident. A bus
-;;;; puts a unix-domain socket under its own root, and a socket address carries
-;;;; its path in a fixed field with 107 usable characters, so every character of
-;;;; the state root is charged against that budget. A readable directory name
-;;;; here fits under a home cache directory and does not fit under the one the
-;;;; build sets inside the checkout, where the same test refuses to make a bus at
-;;;; all. Where even the short name will not fit, this states that and stands
-;;;; down rather than failing in a way that reads as a fault in the verb.
+;;;; A bus binds a unix-domain socket under its root, and the socket address
+;;;; holds at most 107 characters of path. The scratch root goes under the
+;;;; build's cache directory when the socket fits there, and under the home cache
+;;;; directory when it does not, as in a deep checkout. When neither leaves room,
+;;;; the fixture signals an error naming both paths, so a case fails instead of
+;;;; standing down.
 
 ;; Package evolution guard: drop a prior incarnation so a reload picks up the
 ;; current import set rather than stale symbols.
@@ -65,7 +63,11 @@
   (:import-from #:dsmr-mcp/src/state
                 #:make-session)
   (:import-from #:dsmr-mcp/tests/support/env-fixture
-                #:with-clean-resolution-env))
+                #:with-clean-resolution-env)
+  (:import-from #:dsmr-mcp/tests/support/socket-scratch
+                #:socket-path-fits-p
+                #:make-socket-scratch-directory
+                #:with-overlong-cache-home))
 
 (in-package #:dsmr-mcp/tests/tools/bus-inspect-test)
 
@@ -74,33 +76,13 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun scratch-directory (tag)
-  "A uniquely named directory of this test's own, on the filesystem the real bus
-   roots live on.
+  "A fresh mode-0700 directory of this test's own, on a disk filesystem, under
+   the first cache directory that leaves room for the bus socket.
 
-   TAG is one character, and the whole name is as short as it can be while
-   staying unique, because the state root is charged against the socket-path
-   budget described at the head of this file.
-
-   The suffix is drawn from a state seeded per call: SBCL's default random state
-   is identical in every fresh image, so without the seeding two runs walk the
-   same names and a tree left by an earlier run turns an absence assertion into
-   a flake."
-  (loop
-    (let ((dir (merge-pathnames
-                (format nil "dsmr-bi-~A~8,'0X/" tag
-                        (random #xFFFFFFFF (make-random-state t)))
-                (uiop:xdg-cache-home))))
-      (unless (probe-file dir)
-        (ensure-directories-exist dir)
-        (return dir)))))
-
-(defun socket-path-fits-p (state-root)
-  "True when a bus under STATE-ROOT can have a socket the kernel will accept.
-
-   Measured against the same bound the bus itself enforces, so this answers the
-   question the bus is about to answer rather than a guess at it."
-  (<= (length (namestring (merge-pathnames "dsmr-mcp/bus/submit.ipc" state-root)))
-      selector:+max-socket-path-length+))
+   TAG is one character. The name stays short because the state root counts
+   against the socket path limit described at the head of this file."
+  (make-socket-scratch-directory (format nil "dsmr-bi-~A" tag)
+                                 :socket-path "dsmr-mcp/bus/submit.ipc"))
 
 (defun serve-bus-in-process (paths)
   "Elect a broker on PATHS and serve it on a background thread. Returns a thunk
@@ -131,21 +113,16 @@
              (,root (scratch-directory "p"))
              (,saved (uiop:getenv "XDG_STATE_HOME")))
          (unwind-protect
-              (if (socket-path-fits-p ,state)
-                  (progn
-                    (setf (uiop:getenv "XDG_STATE_HOME") (namestring ,state))
-                    (let* ((,paths (broker:make-bus-paths))
-                           (,stop (serve-bus-in-process ,paths))
-                           (,session (make-session :id "bus-inspect"
-                                                   :project-root ,root)))
-                      (declare (ignorable ,paths))
-                      (unwind-protect (progn ,@body)
-                        (ignore-errors (disconnect-session-bus ,session))
-                        (funcall ,stop))))
-                  (skip ("this cache directory leaves no room for a bus socket ~
-                          within the ~D characters a socket address allows, so ~
-                          no bus can be made here to inspect"
-                         selector:+max-socket-path-length+)))
+              (progn
+                (setf (uiop:getenv "XDG_STATE_HOME") (namestring ,state))
+                (let* ((,paths (broker:make-bus-paths))
+                       (,stop (serve-bus-in-process ,paths))
+                       (,session (make-session :id "bus-inspect"
+                                               :project-root ,root)))
+                  (declare (ignorable ,paths))
+                  (unwind-protect (progn ,@body)
+                    (ignore-errors (disconnect-session-bus ,session))
+                    (funcall ,stop))))
            (setf (uiop:getenv "XDG_STATE_HOME") (or ,saved ""))
            (ignore-errors (uiop:delete-directory-tree
                            ,state :validate t :if-does-not-exist :ignore))
@@ -165,6 +142,36 @@
           position)
     (assert (> position (wal:scan log)))
     name))
+
+;;; ---------------------------------------------------------------------------
+;;; Scratch roots and the socket path limit
+;;; ---------------------------------------------------------------------------
+
+(define-test a-scratch-state-root-under-an-overlong-cache-directory-leaves-room-for-a-socket
+  "Under a cache directory too long for a socket, the scratch state root moves to
+   the fallback cache directory, where the bus socket fits."
+  (with-overlong-cache-home (overlong fallback)
+    (let ((dir (scratch-directory "s")))
+      (unwind-protect
+           (progn
+             (true (socket-path-fits-p dir "dsmr-mcp/bus/submit.ipc")
+                   "the bus socket under ~A exceeds the socket path limit" dir)
+             (false (uiop:subpathp dir overlong)
+                    "the state root is under the overlong cache directory")
+             (true (uiop:subpathp dir fallback)
+                   "the state root is not under the fallback cache directory"))
+        (ignore-errors (uiop:delete-directory-tree
+                        dir :validate t :if-does-not-exist :ignore))))))
+
+(define-test a-bus-is-served-under-an-overlong-cache-directory
+  "Under a cache directory too long for a socket, the fixture still serves a bus
+   and the verb answers it."
+  (with-overlong-cache-home (overlong)
+    (with-scratch-bus (paths session)
+      (true (probe-file (merge-pathnames "submit.ipc" (broker:bus-paths-root paths)))
+            "no broker socket under the bus root")
+      (is eq nil (gethash "isError" (inspect-result session))
+          "bus-inspect answered with an error"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Driving the verbs

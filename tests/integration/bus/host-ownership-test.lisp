@@ -41,6 +41,7 @@
                 #:watcher-binary
                 #:host-binary
                 #:run-in
+                #:finish-within
                 #:full-id
                 #:detach-file
                 #:alive-p
@@ -290,7 +291,7 @@
                               (+ 20 (- 6 (seconds-since began))))
                   "the client's last record never reached the log: ~S"
                   (last (publisher-lines state) 3))
-            (ignore-errors (uiop:wait-process publisher))
+            (finish-within publisher 60 "the publishing client's exit" :state state)
             (let ((sent (sent-count state)))
               (is = 60 sent "the client sent ~D" sent)
               (is equal (loop for n from 1 to sent collect n) (client-counts paths)

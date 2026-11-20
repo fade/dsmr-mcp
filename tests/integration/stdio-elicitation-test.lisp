@@ -35,9 +35,13 @@
                 #:read-envrc-template)
   (:import-from #:dsmr-mcp/src/envrc-init
                 #:envrc-content-with-derived-port)
+  (:import-from #:dsmr-mcp/src/envrc-vars
+                #:setup-complete-p)
   (:import-from #:dsmr-mcp/tests/integration/support
                 #:sbcl-path
-                #:with-mcp-server-child-or-skip))
+                #:with-mcp-server-child-or-skip
+                #:launch-server-child
+                #:with-server-child-state-home))
 
 (in-package #:dsmr-mcp/tests/integration/stdio-elicitation-test)
 
@@ -50,25 +54,22 @@
 Reused verbatim so this test guards the SAME launch command operators run."
   (coerce (gethash "args" (canonical-server-entry)) 'list))
 
-(defun %spawn-server (&key project-root)
+(defun %spawn-server (state-home &key project-root)
   "Spawn a child sbcl running dsmr-mcp :stdio with the generated launch args.
 Returns a UIOP process-info with :stream input/output/error.  The caller
 closes the input stream to trigger EOF and reaps the process.
 
-When PROJECT-ROOT is supplied, DSMR_PROJECT_ROOT is set in the CHILD's
-environment to that path so run seeds the stdio session's root at launch
-(precedence: explicit :project-root > DSMR_PROJECT_ROOT > getcwd).  The child's
-cwd is not relied upon -- it is harder to control across spawn backends, and the
-env var is exactly the launch seam the operator's .envrc itself exports."
-  (apply #'uiop:launch-program
-         (cons (sbcl-path) (%launch-args))
-         :input        :stream
-         :output       :stream
-         :error-output :stream
-         (when project-root
-           (list :environment
-                 (cons (format nil "DSMR_PROJECT_ROOT=~A" (namestring project-root))
-                       (sb-ext:posix-environ))))))
+The child runs under STATE-HOME with the inherited environment minus every
+DSMR_ variable.  PROJECT-ROOT, when given, reaches it as DSMR_PROJECT_ROOT,
+which seeds the session root at launch.  The child's cwd is not relied upon --
+it is harder to control across spawn backends, and the env var is exactly the
+launch seam the operator's .envrc itself exports."
+  (launch-server-child (cons (sbcl-path) (%launch-args))
+                       state-home
+                       :assignments
+                       (when project-root
+                         (list (format nil "DSMR_PROJECT_ROOT=~A"
+                                       (namestring project-root))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; JSON-RPC line plumbing
@@ -271,27 +272,28 @@ directory), which IS qualifying, and the intercept would fire on the
 fs-set-project-root line itself -- writing a `.envrc` into the project tree.
 
 stdin is closed after the last line so the child reaches EOF and exits."
-  (let ((proc (%spawn-server :project-root #p"/tmp/"))
-        (root-str (namestring root)))
-    (unwind-protect
-         (let ((in  (uiop:process-info-input proc))
-               (out (uiop:process-info-output proc)))
-           (write-line (%initialize-line :elicitation elicitation) in)
-           (write-line (%initialized-line) in)
-           (write-line (%set-root-line 2 root-str) in)
-           (write-line (%trigger-line 3) in)
-           (when (and elicitation response-action)
-             (write-line (%elicit-response-line :action response-action) in))
-           (when second-trigger
-             (write-line (%trigger-line 4) in))
-           (force-output in)
-           ;; Close stdin -> child hits EOF on the loop -> exits cleanly.
-           (close in)
-           (prog1 (%drain-stdout out :deadline-seconds 120)
-             (ignore-errors (uiop:wait-process proc))))
-      (ignore-errors (close (uiop:process-info-input proc)))
-      (ignore-errors (uiop:terminate-process proc))
-      (ignore-errors (uiop:wait-process proc)))))
+  (with-server-child-state-home (state)
+    (let ((proc (%spawn-server state :project-root #p"/tmp/"))
+          (root-str (namestring root)))
+      (unwind-protect
+           (let ((in  (uiop:process-info-input proc))
+                 (out (uiop:process-info-output proc)))
+             (write-line (%initialize-line :elicitation elicitation) in)
+             (write-line (%initialized-line) in)
+             (write-line (%set-root-line 2 root-str) in)
+             (write-line (%trigger-line 3) in)
+             (when (and elicitation response-action)
+               (write-line (%elicit-response-line :action response-action) in))
+             (when second-trigger
+               (write-line (%trigger-line 4) in))
+             (force-output in)
+             ;; Close stdin -> child hits EOF on the loop -> exits cleanly.
+             (close in)
+             (prog1 (%drain-stdout out :deadline-seconds 120)
+               (ignore-errors (uiop:wait-process proc))))
+        (ignore-errors (close (uiop:process-info-input proc)))
+        (ignore-errors (uiop:terminate-process proc))
+        (ignore-errors (uiop:wait-process proc))))))
 
 (defun %run-launch-seeded-scenario (root &key elicitation (response-action "accept"))
   "Spawn a real server with the launch root seeded via DSMR_PROJECT_ROOT in the
@@ -306,22 +308,23 @@ and RESPONSE-ACTION are set, the elicitation response line is queued right after
 the trigger so the in-line read loop consumes it.
 
 stdin is closed after the last line so the child reaches EOF and exits."
-  (let ((proc (%spawn-server :project-root root)))
-    (unwind-protect
-         (let ((in  (uiop:process-info-input proc))
-               (out (uiop:process-info-output proc)))
-           (write-line (%initialize-line :elicitation elicitation) in)
-           (write-line (%initialized-line) in)
-           (write-line (%trigger-line 1) in)
-           (when (and elicitation response-action)
-             (write-line (%elicit-response-line :action response-action) in))
-           (force-output in)
-           (close in)
-           (prog1 (%drain-stdout out :deadline-seconds 120)
-             (ignore-errors (uiop:wait-process proc))))
-      (ignore-errors (close (uiop:process-info-input proc)))
-      (ignore-errors (uiop:terminate-process proc))
-      (ignore-errors (uiop:wait-process proc)))))
+  (with-server-child-state-home (state)
+    (let ((proc (%spawn-server state :project-root root)))
+      (unwind-protect
+           (let ((in  (uiop:process-info-input proc))
+                 (out (uiop:process-info-output proc)))
+             (write-line (%initialize-line :elicitation elicitation) in)
+             (write-line (%initialized-line) in)
+             (write-line (%trigger-line 1) in)
+             (when (and elicitation response-action)
+               (write-line (%elicit-response-line :action response-action) in))
+             (force-output in)
+             (close in)
+             (prog1 (%drain-stdout out :deadline-seconds 120)
+               (ignore-errors (uiop:wait-process proc))))
+        (ignore-errors (close (uiop:process-info-input proc)))
+        (ignore-errors (uiop:terminate-process proc))
+        (ignore-errors (uiop:wait-process proc))))))
 
 (defun %run-set-root-fires-scenario (root &key (response-action "accept")
                                               second-trigger)
@@ -340,25 +343,26 @@ When SECOND-TRIGGER is true, a trigger tools/call follows the response so the
 test can prove the once-per-session guard yields no further prompt and the
 server stays alive to answer it.  stdin is closed after the last line so the
 child reaches EOF and exits."
-  (let ((proc (%spawn-server :project-root #p"/tmp/"))
-        (root-str (namestring root)))
-    (unwind-protect
-         (let ((in  (uiop:process-info-input proc))
-               (out (uiop:process-info-output proc)))
-           (write-line (%initialize-line :elicitation t) in)
-           (write-line (%initialized-line) in)
-           (write-line (%set-root-line 2 root-str) in)
-           (when response-action
-             (write-line (%elicit-response-line :action response-action) in))
-           (when second-trigger
-             (write-line (%trigger-line 3) in))
-           (force-output in)
-           (close in)
-           (prog1 (%drain-stdout out :deadline-seconds 120)
-             (ignore-errors (uiop:wait-process proc))))
-      (ignore-errors (close (uiop:process-info-input proc)))
-      (ignore-errors (uiop:terminate-process proc))
-      (ignore-errors (uiop:wait-process proc)))))
+  (with-server-child-state-home (state)
+    (let ((proc (%spawn-server state :project-root #p"/tmp/"))
+          (root-str (namestring root)))
+      (unwind-protect
+           (let ((in  (uiop:process-info-input proc))
+                 (out (uiop:process-info-output proc)))
+             (write-line (%initialize-line :elicitation t) in)
+             (write-line (%initialized-line) in)
+             (write-line (%set-root-line 2 root-str) in)
+             (when response-action
+               (write-line (%elicit-response-line :action response-action) in))
+             (when second-trigger
+               (write-line (%trigger-line 3) in))
+             (force-output in)
+             (close in)
+             (prog1 (%drain-stdout out :deadline-seconds 120)
+               (ignore-errors (uiop:wait-process proc))))
+        (ignore-errors (close (uiop:process-info-input proc)))
+        (ignore-errors (uiop:terminate-process proc))
+        (ignore-errors (uiop:wait-process proc))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Scenarios (mirror 13-UAT.md, all assert hard)
@@ -439,28 +443,26 @@ trigger produces no further prompt."
                 ".envrc is the template with the project-derived port")))))))
 
 (define-test stdio-elicitation-no-clobber
-  "A pre-existing COMPLETE .envrc (one that declares every marker variable:
-DSMR_SLYNK_ATTACH, DSMR_BUS_AGENT and DSMR_BUS_SELECTOR) yields ZERO
-elicitation/create and is left unchanged: neither the create nor the update
-trigger fires.
-
-The fixture gained the fleet selector when the selector joined the marker set.
-The contract proven here is the one it always was, over real stdio: a file that
-carries everything is never re-offered the settings and is never rewritten."
-  (with-mcp-server-child-or-skip
-    (%with-temp-root (root :envrc-content "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
+  "A pre-existing `.envrc` that declares every setup marker variable yields zero
+elicitation/create over real stdio and is left byte-for-byte unchanged. The
+fixture is checked against SETUP-COMPLETE-P before a server is spawned, so a
+marker added to the managed table fails that check instead of surfacing as a
+prompt."
+  (let ((complete-envrc "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
 export DSMR_BUS_AGENT=stub
 export DSMR_BUS_SELECTOR=\"\"
-")
-      (let ((objs (%run-scenario root :elicitation t :response-action nil)))
-        (is = 0 (%count-elicitation-creates objs)
-            "no prompt when a complete .envrc already exists")
-        (is string= "export DSMR_SLYNK_ATTACH=127.0.0.1:4005
-export DSMR_BUS_AGENT=stub
-export DSMR_BUS_SELECTOR=\"\"
-"
-            (uiop:read-file-string (merge-pathnames ".envrc" root))
-            "pre-existing complete .envrc content unchanged")))))
+export DSMR_BUS_DIRECT_ADDRESSING=1
+"))
+    (true (setup-complete-p complete-envrc)
+          "the fixture .envrc lacks a setup marker; check +MANAGED-VARIABLES+")
+    (with-mcp-server-child-or-skip
+      (%with-temp-root (root :envrc-content complete-envrc)
+        (let ((objs (%run-scenario root :elicitation t :response-action nil)))
+          (is = 0 (%count-elicitation-creates objs)
+              "a complete .envrc drew a prompt")
+          (is string= complete-envrc
+              (uiop:read-file-string (merge-pathnames ".envrc" root))
+              "the complete .envrc was changed"))))))
 
 (define-test stdio-elicitation-update-appends-block
   "An existing .envrc that lacks the dsmr-mcp setup fires exactly ONE

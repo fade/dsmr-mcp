@@ -130,10 +130,15 @@
               seconds))
 
 (defun beat-mtime (state)
-  "The service beat's modification time under STATE, in seconds."
+  "The service beat's modification time under STATE, in seconds, or NIL when
+   there is no beat file."
   (with-state-home (state)
-    (sb-posix:stat-mtime (sb-posix:stat (uiop:native-namestring
-                                         (hostfiles:service-beat-path))))))
+    (let ((path (uiop:native-namestring (hostfiles:service-beat-path))))
+      (handler-case (sb-posix:stat-mtime (sb-posix:stat path))
+        (sb-posix:syscall-error (e)
+          (if (= (sb-posix:syscall-errno e) sb-posix:enoent)
+              nil
+              (error e)))))))
 
 (defun fleet-lines (state code)
   "The fleet log lines under STATE carrying a WARN under CODE."
@@ -191,9 +196,11 @@
                             (eql (with-state-home (state) (hostfiles:read-service-pid))
                                  (pid process)))
                           6))
-        (let ((first (beat-mtime state)))
+        (let ((first (await-true (lambda () (beat-mtime state)) 10)))
+          (true first "no beat file within 10 s")
           (sleep 1.5)
-          (true (> (beat-mtime state) first) "the beat moved"))
+          (let ((later (beat-mtime state)))
+            (true (and first later (> later first)) "the beat did not move")))
         (true (await-serving state process))
         (is = (pid process) (getf (summary state) :pid))
         (true (alive-p (pid process)))))))
