@@ -297,7 +297,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/tools/restart-process-test"
                "dsmr-mcp/tests/tools/project-doctor-tool-test"
                "dsmr-mcp/tests/bus-listener-test"
-               "dsmr-mcp/tests/report/axis-summary-test")
+               "dsmr-mcp/tests/report/axis-summary-test"
+               "dsmr-mcp/tests/support/test-watchdog-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names
@@ -351,6 +352,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
 ;; umbrella so the inner-loop suite stays quick. Each leaf here spawns a real
 ;; dsmr-mcp server subprocess (~10-12s/scenario) and skips cleanly when the
 ;; environment cannot spawn one. Run explicitly: (asdf:test-system "dsmr-mcp/tests/integration").
+;; Each test runs under the per-test bound in tests/support/test-watchdog.lisp.
 
 (asdf:defsystem "dsmr-mcp/tests/integration"
   :class :package-inferred-system
@@ -359,6 +361,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "com.inuoe.jzon"
                "slynk"
                "dsmr-mcp"
+               "dsmr-mcp/tests/support/test-watchdog"
                "dsmr-mcp/tests/integration/stdio-elicitation-test"
                "dsmr-mcp/tests/integration/transport/stdio-integration-test"
                "dsmr-mcp/tests/integration/transport/bridge-test"
@@ -404,14 +407,15 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                              (lambda (dep)
                                (and (stringp dep)
                                     (uiop:string-prefix-p "dsmr-mcp/tests/integration/" dep)))
-                             (asdf:system-depends-on c)))
-                           (any-failed nil))
-                      (dolist (name test-package-names)
-                        (let* ((package (or (find-package (string-upcase name))
-                                            (error "Test package ~S not loaded." name)))
-                               (result (uiop:symbol-call :zebra :test package)))
-                          (when (uiop:symbol-call :zebra :results-with-status
-                                                  :failed result)
-                            (setf any-failed t))))
-                      (when any-failed
-                        (error "dsmr-mcp/tests/integration: one or more zebra tests failed.")))))
+                             (asdf:system-depends-on c))))
+                      ;; Called through SYMBOL-CALL: ASDF reads this file before the
+                      ;; runner's package exists.
+                      (multiple-value-bind (any-failed reports stopped)
+                          (uiop:symbol-call :dsmr-mcp/tests/support/test-watchdog
+                                            :run-test-packages
+                                            test-package-names)
+                        (declare (ignore reports))
+                        (when any-failed
+                          (error "dsmr-mcp/tests/integration: one or more zebra tests failed.~
+                                  ~@[~%Stopped at the per-test bound: ~{~A~^, ~}~]"
+                                 stopped))))))

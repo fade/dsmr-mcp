@@ -75,7 +75,8 @@ it for itself and restores it afterwards.
 
 =DSMR_TEST_= variables configure the suite rather than the server and pass
 through unchanged. =DSMR_TEST_WORKER_CORE= is one; see
-[[*Hermetic workers from the worker core]]. A setting that locates an optional
+[[*Hermetic workers from the worker core]]. =DSMR_TEST_WATCHDOG_SECONDS= is
+another; see [[*A time limit on each test]]. A setting that locates an optional
 resource does not reach the run either: the HyperSpec leaf looks in
 =$LISP_WORKSPACE/HyperSpec/= and skips when nothing is there, whatever
 =DSMR_HYPERSPEC_DIR= says.
@@ -103,6 +104,71 @@ make test-integration TEST_INTEGRATION_TIMEOUT=2h
 #+end_src
 
 An interrupt (=C-c=) stops the run at once and is not subject to the grace.
+
+** A time limit on each test
+
+=make test-integration= runs each test under a per-test bound,
+=DSMR_TEST_WATCHDOG_SECONDS=. The default is 600 s, several times the run time
+of the slowest test in the suite. The first line of the test output states the
+bound in force.
+
+A test still running at its bound is stopped and fails. Above its result line,
+the log shows a block with:
+
+- the stopped thread's backtrace;
+- the threads the test started, each with its backtrace;
+- the descendant processes of the test process;
+- the =/proc/locks= lines of the test process and those processes.
+
+The Failures section names the test and the bound, and the run continues with
+the next test. The run's final error lists every stopped test.
+
+The stopped test's own cleanup runs. A cleanup still running 60 s later is
+abandoned, and the block says so. The block ends with the processes and threads
+still running after the stop. They are listed and never signalled: stopping them
+is the test's own cleanup's job.
+
+To set a different bound, pass the variable to the run:
+
+#+begin_src sh
+DSMR_TEST_WATCHDOG_SECONDS=900 make test-integration
+#+end_src
+
+0 turns the bound off. A value that is not digits with an optional decimal point
+stops the run before the first test, with an error that names the variable.
+
+=TEST_INTEGRATION_TIMEOUT= still limits the whole run, and ends a test the
+per-test bound cannot stop, for example one blocked where interrupts are
+deferred. =make test= and =make test-warm= run without a per-test bound.
+
+** Bus binaries rebuilt before the run
+
+=make test-integration= first runs =make bus-binaries=. It rebuilds
+=bin/dsmr-bus-watch= with =make bus-watch= and =bin/dsmr-bus-host= with
+=make bus-host= when the binary is absent or older than any file it is built
+from, and leaves a current binary alone. The integration cases run these two
+files from the checkout's =bin/=; nothing is installed anywhere else.
+
+A binary is built from its system definition file and every file of every
+system in its ASDF dependency closure, resolved with the same ASDF setup as its
+build. For the host service that includes the Lisp workspace checkouts and the
+Quicklisp libraries it links. An edit to =dsmr-mcp.asd= or to
+=src/bus/watch.lisp= rebuilds both binaries. Two changes fall outside that set:
+a change to a build recipe alone, and a system that an =.asd= file loads by
+itself rather than declaring. After either, run =make bus-watch= or
+=make bus-host= yourself.
+
+A stale binary is removed before it is rebuilt, and a failed listing or rebuild
+stops make before the suite starts, so no case runs against old code. Listing
+takes about ten seconds on a warm fasl cache, and a rebuild adds one build. The
+step runs before =TEST_INTEGRATION_TIMEOUT= starts counting, and without the
+calling shell's =DSMR_= settings, like the suite.
+
+#+begin_src sh
+make bus-binaries                              # bring both binaries up to date alone
+make -n test-integration                       # show a pending rebuild; changes nothing
+make bus-sources BUS_SOURCES_DIR=/tmp/lists    # list the files each binary is built from
+#+end_src
 
 ** Hermetic workers from the worker core
 

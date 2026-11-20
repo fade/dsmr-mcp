@@ -51,6 +51,7 @@
            #:broker #:broker-seq
            #:start-broker #:broker-step #:serve-broker #:stop-broker
            #:custodial-tick
+           #:cursor-advance-interval-from-environment #:broker-advance-seconds
            #:join-members
            #:broker-running-p #:broker-main #:spawn-broker #:ensure-broker
            #:broker-spawned-here-p))
@@ -513,23 +514,60 @@
 
 ;;; --------------------------------------------------------------- broker
 
+(defconstant +default-cursor-advance-seconds+ 30
+  "Default least number of seconds between two advances of held cursors.")
+
+(defun cursor-advance-interval-from-environment (&key (getenv #'uiop:getenv))
+  "Return the broker's cursor-advance interval in seconds, read from
+   DSMR_BUS_CURSOR_ADVANCE_SECONDS through GETENV.
+
+   An unset, empty, or blank value returns +DEFAULT-CURSOR-ADVANCE-SECONDS+ (30).
+   A whole number of at least 1, with surrounding whitespace allowed, returns
+   that number; anything else returns the default and writes one line naming
+   the variable and the refused value to *ERROR-OUTPUT*. Never signals. The
+   environment is read at call time, so START-BROKER calls this and nothing
+   reads it at load time: a saved image would otherwise carry the build host's
+   value."
+  (let* ((name "DSMR_BUS_CURSOR_ADVANCE_SECONDS")
+         (text (funcall getenv name)))
+    (if (or (null text)
+            (zerop (length (string-trim '(#\Space #\Tab #\Newline #\Return)
+                                        text))))
+        +default-cursor-advance-seconds+
+        (let ((n (handler-case (parse-integer text)
+                   (error () nil))))
+          (cond ((and (integerp n) (>= n 1)) n)
+                (t (ignore-errors
+                    (format *error-output*
+                            "dsmr-mcp bus: ~A=~S is not a whole number of seconds, at least 1; using ~D~%"
+                            name text +default-cursor-advance-seconds+))
+                   +default-cursor-advance-seconds+))))))
+
 (defstruct (broker (:constructor %make-broker))
   "A serving broker and the two clocks its custodial work runs on.
 
    CURSORS-ADVANCED-AT and DEPARTURES-AGED-AT are the universal times those two
    sweeps last ran. Both start at zero so a broker coming up does its first pass
    immediately rather than waiting out an interval on a bus that may already
-   have departures on it."
+   have departures on it. ADVANCE-SECONDS is the least number of seconds
+   between two advances of held cursors."
   paths lock-fd members-fd intake publisher (seq 0)
   (cursors-advanced-at 0)
-  (departures-aged-at 0))
+  (departures-aged-at 0)
+  (advance-seconds +default-cursor-advance-seconds+))
 
-(defun start-broker (paths &key (block t) (intake-timeout-ms 100) (join t))
+(defun start-broker (paths &key (block t) (intake-timeout-ms 100) (join t)
+                               (advance-seconds nil))
   "Contend for the broker role on PATHS. If another broker holds it and BLOCK is
    true, wait until it dies and take over; if BLOCK is false and the role is
    taken, return NIL. On winning: recover the log (truncating any torn tail) to
    learn the next seq, optionally JOIN membership, and bind the intake and
    publisher sockets. Returns a BROKER.
+
+   ADVANCE-SECONDS sets the broker's cursor-advance interval; NIL reads
+   DSMR_BUS_CURSOR_ADVANCE_SECONDS when the broker starts, after the role is
+   won. Signals TYPE-ERROR for an ADVANCE-SECONDS that is neither NIL nor an
+   integer of at least 1.
 
    Also records who won the role, since winning it is the only moment at which
    that is knowable from inside. A failure to write that record is swallowed:
@@ -541,6 +579,7 @@
    place that runs rarely enough for a full scan to cost nothing. The second
    sweep also runs periodically while serving, for the reason SERVE-BROKER
    gives."
+  (check-type advance-seconds (or null (integer 1)))
   (ensure-bus-dirs paths)
   (reap-orphaned-cursors paths)
   (age-departed-cursors paths)
@@ -561,7 +600,10 @@
                                    :timeout-ms intake-timeout-ms))
            (publisher (tz:make-publisher (bus-paths-pub-endpoint paths))))
       (%make-broker :paths paths :lock-fd lock-fd :members-fd members-fd
-                    :intake intake :publisher publisher :seq seq))))
+                    :intake intake :publisher publisher :seq seq
+                    :advance-seconds
+                    (or advance-seconds
+                        (cursor-advance-interval-from-environment))))))
 
 (defun broker-step (broker)
   "Receive at most one submission (bounded by the intake's timeout), append it to
@@ -574,16 +616,19 @@
         (tz:send-message (broker-publisher broker) (princ-to-string seq))
         seq))))
 
-(defun custodial-tick (broker &key (advance-seconds 30) (age-seconds 3600))
+(defun custodial-tick (broker &key (advance-seconds
+                                    (broker-advance-seconds broker))
+                                   (age-seconds 3600))
   "Run whichever of the broker's custodial sweeps is due, and return the broker.
 
    Cheap to call on every turn of the serve loop: it reads a clock and compares
    two numbers, and does the work at most once per interval.
 
-   Held cursors are advanced at most every ADVANCE-SECONDS and departures aged
-   at most every AGE-SECONDS. Tracking the head within half a minute is what
-   advancing with fleet traffic asks for; advancing on every append would put
-   one file write per departed agent into the hot path and buy nothing."
+   Held cursors are advanced at most every ADVANCE-SECONDS, by default the
+   broker's own interval (30 s unless DSMR_BUS_CURSOR_ADVANCE_SECONDS sets
+   another), and departures aged at most every AGE-SECONDS. Advancing on every
+   append would put one file write per departed agent into the hot path and buy
+   nothing."
   (let ((now (get-universal-time))
         (paths (broker-paths broker)))
     (when (>= (- now (broker-cursors-advanced-at broker)) advance-seconds)
