@@ -35,6 +35,9 @@
   (:import-from #:asdf)
   (:import-from #:uiop)
   (:export #:run-tests
+           #:timeout-test-result
+           #:make-test-result
+           #:make-failure-detail
            #:detect-test-framework
            #:test-result-summary
            #:*zebra-system-name*
@@ -108,6 +111,16 @@ The engine may run inside an arbitrary attached image, so the timeout is a
 best-effort guard, not a portability promise."
   #+sbcl `(sb-ext:with-timeout ,seconds ,@body)
   #-sbcl `(progn ,seconds ,@body))
+
+(defmacro %with-optional-timeout ((seconds enabled) &body body)
+  "Run BODY under %WITH-TIMEOUT when ENABLED is true, else with no timer.
+BODY is expanded once, in a local function."
+  (let ((fn (gensym "BODY")))
+    `(flet ((,fn () ,@body))
+       (if ,enabled
+           (%with-timeout (,seconds) (,fn))
+           (,fn)))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; *test-debug-output*
 ;;;
@@ -235,6 +248,19 @@ Fields: test_name (required), plus optional description, form, values, reason, s
                          "line" (second source))
                 (princ-to-string source))))
     ht))
+
+(defun timeout-test-result (seconds)
+  "Envelope for a test run that outlasted SECONDS: passed 0, failed 1,
+framework timeout, one failure detail named TIMEOUT."
+  (make-test-result
+   :passed 0 :failed 1 :pending 0
+   :framework :timeout
+   :duration (round (* seconds 1000))
+   :failed-tests
+   (list (make-failure-detail
+          :test-name "TIMEOUT"
+          :reason (format nil "Test run timed out after ~A seconds"
+                          seconds)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Framework Detection
@@ -1710,7 +1736,8 @@ reloaded so an edit to the library is picked up whichever name was asked for."
 ;;; ---------------------------------------------------------------------------
 
 (defun run-tests (system-name &key framework test tests
-                                (timeout-seconds 300) (reload t))
+                                (timeout-seconds 300) (reload t)
+                                (interrupt-on-timeout t))
   "Run tests for SYSTEM-NAME using the specified or auto-detected FRAMEWORK.
 Returns a hash-table with structured results (the uniform envelope).
 
@@ -1724,11 +1751,13 @@ TIMEOUT-SECONDS — default 300; the entire purge+reload+run is wrapped in
   interrupted.
 RELOAD — default true; purges stale framework registrations and force-reloads
   the test system before running. Pass NIL to skip reload (for tight loops
-  where you have already managed the reload externally)."
+  where you have already managed the reload externally).
+INTERRUPT-ON-TIMEOUT - default true. NIL runs with no timer at all, for a
+  caller that bounds its own wait."
   (when (and test tests) (error "Specify either TEST or TESTS, not both"))
   (let ((effective-timeout (or timeout-seconds 300)))
     (handler-case
-        (%with-timeout (effective-timeout)
+        (%with-optional-timeout (effective-timeout interrupt-on-timeout)
           (multiple-value-bind (fw declaring-system)
               (detect-test-framework system-name
                                      (and framework
@@ -1808,12 +1837,4 @@ RELOAD — default true; purges stale framework registrations and force-reloads
       (sb-ext:timeout ()
         (%log :warn "test-runner.timeout" "system" system-name
                    "timeout" effective-timeout)
-        (make-test-result
-         :passed 0 :failed 1 :pending 0
-         :framework :timeout
-         :duration (round (* effective-timeout 1000))
-         :failed-tests
-         (list (make-failure-detail
-                :test-name "TIMEOUT"
-                :reason (format nil "Test run timed out after ~A seconds"
-                                effective-timeout))))))))
+        (timeout-test-result effective-timeout)))))

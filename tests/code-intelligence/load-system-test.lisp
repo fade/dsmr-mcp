@@ -35,6 +35,7 @@
                 #:%redefinition-warning-p
                 #:%build-load-system-form)
   (:import-from #:dsmr-mcp/src/load-guard
+                #:call-with-load-guard
                 #:running-operation
                 #:wait-for-guarded-operations)
   (:import-from #:dsmr-mcp/tests/support/gated-load-fixture
@@ -234,6 +235,34 @@ system returns status=loaded."
     (true (wait-for-guarded-operations 30))
     (is string= "loaded"
         (gethash "status" (load-system sys :timeout-seconds 30 :force t)))))
+
+(define-test nested-guarded-call-runs
+  "A load-system made from inside a guarded run-tests operation runs and
+returns status=loaded; the caller's own ancestors never make it busy."
+  (with-gated-system (sys)
+    (open-gate)
+    (let ((result (call-with-load-guard
+                   "run-tests" "dsmr-nested-outer" 60
+                   (lambda () (load-system sys :timeout-seconds 30 :force t))
+                   :on-timeout (lambda (ms) (declare (ignore ms)) :timeout)
+                   :on-busy (lambda (&rest args) (declare (ignore args)) :busy))))
+      (true (hash-table-p result))
+      (is string= "loaded" (gethash "status" result)))))
+
+(define-test escaped-condition-reaches-caller-and-clears-guard
+  "An error escaping a guarded thunk is signalled in the waiting caller with
+its own text, and leaves no operation registered."
+  (let ((caught nil))
+    (handler-case
+        (call-with-load-guard
+         "load-system" "dsmr-escaped-condition" 30
+         (lambda () (error "dsmr-guard-escaped-condition-marker"))
+         :on-timeout (lambda (ms) (declare (ignore ms)) :timeout)
+         :on-busy (lambda (&rest args) (declare (ignore args)) :busy))
+      (error (e)
+        (setf caught (princ-to-string e))))
+    (true (and caught (search "dsmr-guard-escaped-condition-marker" caught)))
+    (false (running-operation))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; load-system-attached-loads-known-system

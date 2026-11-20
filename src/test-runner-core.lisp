@@ -14,6 +14,11 @@
 ;;;; server's structured logger, and owns everything that must NOT enter a
 ;;;; foreign image:
 ;;;;
+;;;;   run-tests-guarded        - the in-process run through
+;;;;                              call-with-load-guard: the reply comes at
+;;;;                              the limit with still_running, the run is
+;;;;                              never interrupted, and later calls answer
+;;;;                              busy until it finishes.
 ;;;;   %build-run-tests-form    — the sexp injected into the attached image:
 ;;;;                              a version-gated engine bootstrap (load the
 ;;;;                              engine file when its package is absent OR
@@ -44,11 +49,21 @@
                 #:%rove-purge-ghost-suites
                 #:*test-debug-output*
                 #:*log-hook*
-                #:*loaded-fingerprint*)
+                #:*loaded-fingerprint*
+                #:timeout-test-result
+                #:make-test-result
+                #:make-failure-detail)
+  (:import-from #:dsmr-mcp/src/load-guard
+                #:call-with-load-guard
+                #:busy-message
+                #:busy-retry-text)
+  (:import-from #:dsmr-mcp/src/tools/helpers
+                #:text-content)
   (:import-from #:asdf)
   (:import-from #:uiop)
   (:import-from #:sb-ext)
   (:export #:run-tests
+           #:run-tests-guarded
            #:detect-test-framework
            #:test-result-summary
            #:%zebra-purge-ghost-suites
@@ -95,6 +110,69 @@ different Lisp image, so it must not depend on sxhash."
             do (setf hash (ldb (byte 64 0)
                                (* (logxor hash byte) 1099511628211))))
       (map 'string #'identity (format nil "fnv1a64:~16,'0X" hash)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Guarded in-process run
+;;; ---------------------------------------------------------------------------
+
+(defun %envelope-summary (envelope)
+  "Text of ENVELOPE's first content block, or the empty string."
+  (let ((content (gethash "content" envelope)))
+    (or (and (vectorp content) (plusp (length content))
+             (gethash "text" (aref content 0)))
+        "")))
+
+(defun run-tests-guarded (system-name &key framework test tests
+                                        (timeout-seconds 300) (reload t))
+  "Run the engine's RUN-TESTS through CALL-WITH-LOAD-GUARD, with the engine's
+own timer off, and return the uniform envelope.
+
+At the limit, return the timeout envelope with still_running true; the run
+continues on its own thread. While a guarded operation runs, return a busy
+envelope (framework busy, failed 1, one failure detail named BUSY) carrying
+running_operation, running_system and elapsed_seconds, and start nothing.
+Failed counts 1 on busy so the reply never reads as a pass."
+  (let ((limit (or timeout-seconds 300)))
+    (call-with-load-guard
+     "run-tests" system-name limit
+     (lambda ()
+       (run-tests system-name
+                  :framework framework
+                  :test test
+                  :tests tests
+                  :timeout-seconds limit
+                  :reload reload
+                  :interrupt-on-timeout nil))
+     :on-timeout
+     (lambda (elapsed-ms)
+       (declare (ignore elapsed-ms))
+       (let ((ht (timeout-test-result limit)))
+         (setf (gethash "still_running" ht) t
+               (gethash "content" ht)
+               (text-content
+                (format nil "~A The run continues in the background; ~
+                             load-system and run-tests answer busy until it ~
+                             finishes."
+                        (%envelope-summary ht))))
+         ht))
+     :on-busy
+     (lambda (operation system elapsed-seconds)
+       (let* ((msg (busy-message operation system elapsed-seconds))
+              (ht  (make-test-result
+                    :passed 0 :failed 1 :pending 0
+                    :framework :busy
+                    :duration 0
+                    :failed-tests
+                    (list (make-failure-detail :test-name "BUSY"
+                                               :reason msg)))))
+         (setf (gethash "running_operation" ht) operation
+               (gethash "running_system" ht) system
+               (gethash "elapsed_seconds" ht) elapsed-seconds
+               (gethash "content" ht)
+               (text-content
+                (format nil "~A ~A" (%envelope-summary ht)
+                        (busy-retry-text))))
+         ht)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Injected forms
