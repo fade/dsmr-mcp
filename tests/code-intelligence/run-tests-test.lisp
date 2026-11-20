@@ -1309,19 +1309,103 @@ now belongs."
     (is eq :zebra framework)
     (false declared-by)))
 
+(defparameter *reload-probe-seconds* 60
+  "Seconds a reload probe's ASDF work may run before the case fails.
+A healthy reload of the two probe systems takes milliseconds.  The join reads
+this in the calling thread, so a LET binding there changes it.")
+
+(define-condition reload-probe-overran (error)
+  ((stage :initarg :stage :reader reload-probe-overran-stage)
+   (seconds :initarg :seconds :reader reload-probe-overran-seconds)
+   (thread :initarg :thread :reader reload-probe-overran-thread)
+   (backtrace :initarg :backtrace :initform nil
+              :reader reload-probe-overran-backtrace)
+   (interrupt-wait :initarg :interrupt-wait :initform nil
+                   :reader reload-probe-overran-interrupt-wait))
+  (:report
+   (lambda (condition stream)
+     (let ((*print-pretty* nil))
+       (format stream "~A did not finish within ~A s."
+               (reload-probe-overran-stage condition)
+               (reload-probe-overran-seconds condition))
+       (let ((backtrace (reload-probe-overran-backtrace condition)))
+         (if backtrace
+             (format stream "~%Backtrace of the stuck thread:~%~A" backtrace)
+             (format stream " The thread took no interrupt within ~A s, so it ~
+                             is running with interrupts disabled; no backtrace."
+                     (reload-probe-overran-interrupt-wait condition)))))))
+  (:documentation
+   "Signalled when a bounded reload probe does not finish within its bound.
+An ERROR so zebra fails the case: an SBCL timeout escaping a case marks it
+passed."))
+
+(defun %call-bounded (stage seconds thunk &key (interrupt-wait 5))
+  "Call THUNK on a new thread named for STAGE and return its value.
+
+Wait at most SECONDS for the thread.  A SERIOUS-CONDITION in THUNK is caught on
+the worker, so nothing reaches the debugger hook, and is signalled here: an
+ERROR as itself, any other serious condition wrapped in an ERROR naming STAGE.
+
+Past the bound, request a backtrace from the worker and wait up to
+INTERRUPT-WAIT seconds for it, terminate the worker and wait up to
+INTERRUPT-WAIT seconds more for it to exit, then signal RELOAD-PROBE-OVERRAN.
+
+The worker runs with the global values of special variables, so THUNK binds
+what it needs.  A worker that never takes an interrupt may still be running
+when this returns."
+  (let* ((worker (sb-thread:make-thread
+                  (lambda ()
+                    (handler-case (list :value (funcall thunk))
+                      (serious-condition (c) (list :condition c))))
+                  :name (format nil "bounded ~A" stage)))
+         (outcome (sb-thread:join-thread worker :timeout seconds
+                                                :default :overran)))
+    (cond
+      ((and (consp outcome) (eq (first outcome) :value))
+       (second outcome))
+      ((consp outcome)
+       (let ((c (second outcome)))
+         (if (typep c 'error)
+             (error c)
+             (error "~A signalled ~S, a serious condition that is not an ERROR: ~A"
+                    stage (type-of c) c))))
+      (t
+       (let ((box (list nil))
+             (deadline (+ (get-internal-real-time)
+                          (* interrupt-wait internal-time-units-per-second))))
+         (ignore-errors
+          (sb-thread:interrupt-thread
+           worker
+           (lambda ()
+             (setf (car box)
+                   (with-output-to-string (s)
+                     (sb-debug:print-backtrace :count 40 :stream s))))))
+         (loop until (or (car box) (>= (get-internal-real-time) deadline))
+               do (sleep 0.05))
+         (let ((backtrace (car box)))
+           (ignore-errors (sb-thread:terminate-thread worker))
+           (sb-thread:join-thread worker :timeout interrupt-wait :default nil)
+           (error 'reload-probe-overran
+                  :stage stage :seconds seconds :thread worker
+                  :backtrace backtrace :interrupt-wait interrupt-wait)))))))
+
 (define-test ensure-system-loaded-loads-the-declaring-system
   "The reload step loads the system that declared the framework, not only the
 one named.  Loading the library alone leaves the framework package absent and
-the suites unregistered, which is what sent a detected project to the fallback.
+the suites unregistered, which sends a detected project to the fallback.
 
-RED when the declaring system is absent from the loaded set afterwards.
+RED when either probe system is not loaded afterwards.
 
 The probes are written to disk rather than defined in memory because the
 reload step clears each system before loading it, and a system with no source
 file cannot be recovered from a clear.  They are two separate primary systems
 in two files: a secondary system sharing its primary's file is not restored,
 because the second read of an already-read file is a no-op within one ASDF
-session and the clear has already removed the definition."
+session and the clear has already removed the definition.
+
+The reload runs on a thread of its own, outside the suite's ASDF session, with
+the probe directory bound into ASDF:*CENTRAL-REGISTRY* only on that thread,
+and is bounded by *RELOAD-PROBE-SECONDS*."
   (let* ((dir (uiop:ensure-directory-pathname
                (format nil "~Adsmr-probe-ensure-~D-~D"
                        (namestring (uiop:temporary-directory))
@@ -1338,19 +1422,105 @@ session and the clear has already removed the definition."
                                   :if-exists :supersede
                                   :if-does-not-exist :create)
                (format out "(asdf:defsystem ~S)~%" name)))
-           (push dir asdf:*central-registry*)
-           (%ensure-system-loaded lib-name :asdf test-name)
-           (let ((loaded (asdf:already-loaded-systems)))
-             (true (member lib-name loaded :test #'string-equal))
-             (true (member test-name loaded :test #'string-equal))))
-      (setf asdf:*central-registry*
-            (remove dir asdf:*central-registry* :test #'equal))
-      (dolist (name (list lib-name test-name))
-        (ignore-errors (asdf:clear-system name)))
+           (destructuring-bind (lib-loaded test-loaded)
+               (%call-bounded
+                (format nil "reload of ~A and ~A" lib-name test-name)
+                *reload-probe-seconds*
+                (lambda ()
+                  (let ((asdf:*central-registry*
+                          (cons dir asdf:*central-registry*)))
+                    (unwind-protect
+                         (progn
+                           (%ensure-system-loaded lib-name :asdf test-name)
+                           (list (and (asdf:component-loaded-p lib-name) t)
+                                 (and (asdf:component-loaded-p test-name) t)))
+                      (dolist (name (list lib-name test-name))
+                        (ignore-errors (asdf:clear-system name)))))))
+             (true lib-loaded)
+             (true test-loaded)))
       (ignore-errors (uiop:delete-directory-tree
                       dir :validate (lambda (p)
                                       (search "dsmr-probe-ensure"
                                               (namestring p))))))))
+
+(define-test a-reload-probe-that-never-returns-fails-within-its-bound
+  "A bounded probe that never returns fails with RELOAD-PROBE-OVERRAN, an
+ERROR, carrying the stuck thread's backtrace, and leaves no thread running.
+
+RED when the call does not signal RELOAD-PROBE-OVERRAN within 8 s, when the
+report omits the stage or the bound, when no backtrace is captured, or when
+the worker is still alive 5 s after it is released."
+  (let ((stop (vector nil))
+        (start (get-internal-real-time))
+        (condition nil))
+    (unwind-protect
+         (progn
+           (setf condition
+                 (handler-case
+                     (progn
+                       (%call-bounded "spin probe" 1
+                                      (lambda ()
+                                        (loop until (svref stop 0)
+                                              do (sb-thread:barrier (:read)))))
+                       nil)
+                   (error (c) c)))
+           (let ((elapsed (/ (- (get-internal-real-time) start)
+                             internal-time-units-per-second))
+                 (report (princ-to-string condition)))
+             (true (typep condition 'reload-probe-overran))
+             (true (typep condition 'error))
+             (true (< elapsed 8))
+             (true (search "spin probe did not finish within 1 s" report))
+             (true (stringp (and (typep condition 'reload-probe-overran)
+                                 (reload-probe-overran-backtrace condition))))
+             (true (plusp (length (or (and (typep condition 'reload-probe-overran)
+                                           (reload-probe-overran-backtrace
+                                            condition))
+                                      ""))))))
+      (setf (svref stop 0) t))
+    (when (typep condition 'reload-probe-overran)
+      (let ((thread (reload-probe-overran-thread condition)))
+        (sb-thread:join-thread thread :timeout 5 :default nil)
+        (false (sb-thread:thread-alive-p thread))))))
+
+(define-test an-uninterruptible-reload-probe-still-fails-within-its-bound
+  "A bounded probe spinning with interrupts disabled still fails with
+RELOAD-PROBE-OVERRAN within its bound, and the report says the thread took no
+interrupt.  The deferred backtrace request and termination run once the spin
+is released, so the worker then exits.
+
+RED when the call does not signal RELOAD-PROBE-OVERRAN within 8 s, when a
+backtrace is reported, when the report omits \"took no interrupt\", or when
+the worker is still alive 5 s after it is released."
+  (let ((stop (vector nil))
+        (start (get-internal-real-time))
+        (condition nil))
+    (unwind-protect
+         (progn
+           (setf condition
+                 (handler-case
+                     (progn
+                       (%call-bounded "uninterruptible probe" 1
+                                      (lambda ()
+                                        (sb-sys:without-interrupts
+                                          (loop until (svref stop 0)
+                                                do (sb-thread:barrier (:read)))))
+                                      :interrupt-wait 1)
+                       nil)
+                   (error (c) c)))
+           (let ((elapsed (/ (- (get-internal-real-time) start)
+                             internal-time-units-per-second))
+                 (report (princ-to-string condition)))
+             (true (typep condition 'reload-probe-overran))
+             (true (< elapsed 8))
+             (false (and (typep condition 'reload-probe-overran)
+                         (reload-probe-overran-backtrace condition)))
+             (true (search "took no interrupt" report))))
+      (setf (svref stop 0) t))
+    (when (typep condition 'reload-probe-overran)
+      (let ((thread (reload-probe-overran-thread condition)))
+        (sb-thread:join-thread thread :timeout 5 :default nil)
+        (false (sb-thread:thread-alive-p thread))))))
 
 (define-test library-name-runs-the-suite-its-sibling-holds
   "Naming a library runs the suite held by its test sibling and says so.
