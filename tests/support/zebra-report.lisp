@@ -15,9 +15,10 @@
 ;;;; Two counting rules live in this file and they DISAGREE ON PURPOSE.
 ;;;; Making them agree would destroy the reason the file exists:
 ;;;;
-;;;;   The compatibility rule drops exactly TEST-RESULT, quirks included,
-;;;;   because that is what zebra does and the point of the line is that
-;;;;   a reader sees the number they have always seen.
+;;;;   The compatibility rule counts every result on the line for its
+;;;;   status, except a TEST-RESULT whose status a direct child already
+;;;;   carries, quirks included, because that is what zebra does and the
+;;;;   point of the line is that a reader sees the number zebra prints.
 ;;;;
 ;;;;   The axes rule drops every PARENT-RESULT, because a group or a control
 ;;;;   object is not a check and counting it as one inflates the leaf counts.
@@ -36,10 +37,8 @@
   (:local-nicknames (#:pa #:zebra))
   (:export #:axis-summary
            #:*controls-are-not-checks*
-           #:*uncarried-test-failures-are-failures*
            #:*skips-are-not-passes*
            #:controls-are-not-checks-p
-           #:uncarried-test-failures-are-failures-p
            #:skips-are-not-passes-p
            #:tally
            #:axes-of
@@ -81,26 +80,16 @@
 ;;; Selectable semantics
 ;;;
 ;;; Each deviation is named for what it does and is set independently, so a
-;;; caller can adopt one without adopting the rest and so each is greppable
-;;; on its own name. Every one defaults to NIL, and with all three off the
-;;; triple this reporter returns and prints is zebra's own.
+;;; caller can adopt one without adopting the other and so each is greppable
+;;; on its own name. Both default to NIL, and with both off the triple this
+;;; reporter returns and prints is zebra's own.
 
 (defvar *controls-are-not-checks* nil
   "When true, group and control results are excluded from the passed and
-failed counts, leaving only genuine leaf checks. Zebra excludes only
-test results, so a GROUP or a WITH-FORCED-STATUS form is counted as though
-it were an assertion.")
-
-(defvar *uncarried-test-failures-are-failures* nil
-  "When true, a test that failed while no result beneath it carries that
-failure is counted as one failure. Zebra drops every test result from
-the failed count, so a test that dies before reaching its first assertion
-contributes nothing and the run reports zero failures.
-
-The predicate is mechanical: it asks whether any child result carries the
-test's own status. It cannot ask why the test failed, and does not try. A
-test that ran out of its declared time is one instance of the condition it
-does detect, reached without consulting any clock.")
+failed counts, leaving only genuine leaf checks. Zebra excludes only a test
+whose status a child carries, so a GROUP or a WITH-FORCED-STATUS form is
+counted as though it were an assertion. A test that nothing beneath accounts
+for stays counted under either setting.")
 
 (defvar *skips-are-not-passes* nil
   "When true, a result that passed while every result beneath it was skipped
@@ -189,8 +178,6 @@ so the two can be compared without running anything twice."
 (defun tally (report &key
                        ((:controls-are-not-checks controls)
                         *controls-are-not-checks*)
-                       ((:uncarried-test-failures-are-failures uncarried)
-                        *uncarried-test-failures-are-failures*)
                        ((:skips-are-not-passes skips) *skips-are-not-passes*))
   "Walk REPORT's raw result vector once and return an AXES structure.
 
@@ -199,12 +186,20 @@ an ordinary PLAIN report can still obtain the numbers as data."
   (let ((axes (make-axes
                :active-deviations
                (append (when controls '(:controls-are-not-checks))
-                       (when uncarried '(:uncarried-test-failures-are-failures))
                        (when skips '(:skips-are-not-passes))))))
     (loop for result across (pa:results report)
           for status = (pa:status result)
           for testp = (typep result 'pa:test-result)
           for parentp = (typep result 'pa:parent-result)
+          ;; Zebra's own rule, derived here rather than borrowed: every
+          ;; result counts on the line for its status, except a test result
+          ;; whose status a direct child already carries. One rule for all
+          ;; three lines. It filters TEST-RESULT and nothing else, which is
+          ;; not what the axes rule does, and that difference is the reason
+          ;; both exist. Do not reconcile them.
+          for zebra-counts-p = (not (and testp
+                                         (status-carried-by-a-child-p result)))
+          for controlp = (and parentp (not testp))
           do (incf (axes-total axes))
 
              ;; The partition. Facts, not policy.
@@ -243,35 +238,25 @@ an ordinary PLAIN report can still obtain the numbers as data."
                         :duration (pa:duration result))
                        (axes-declared-limits axes))))
 
-             ;; Zebra's own triple, derived here rather than borrowed.
-             ;; The rule below is upstream's whole rule: drop every test
-             ;; result from passed and from failed, count skipped raw.
-             ;; It filters TEST-RESULT and nothing else, which is not what
-             ;; the axes rule does, and that difference is the reason both
-             ;; exist. Do not reconcile them.
-             (unless testp
+             ;; Zebra's own triple.
+             (when zebra-counts-p
                (case status
                  (:passed (incf (axes-upstream-passed axes)))
-                 (:failed (incf (axes-upstream-failed axes)))))
-             (when (eql status :skipped)
-               (incf (axes-upstream-skipped axes)))
+                 (:failed (incf (axes-upstream-failed axes)))
+                 (:skipped (incf (axes-upstream-skipped axes)))))
 
-             ;; The policy triple. Same walk, one rule per deviation.
-             (let ((excluded-from-checks (if controls parentp testp)))
-               (unless excluded-from-checks
-                 (case status
-                   (:passed (unless (and skips
-                                         parentp
-                                         (wholly-skipped-body-p result))
-                              (incf (axes-passed axes))))
-                   (:failed (incf (axes-failed axes))))))
-             (when (eql status :skipped)
-               (incf (axes-skipped axes)))
-             (when (and uncarried
-                        testp
-                        (eql status :failed)
-                        (not (status-carried-by-a-child-p result)))
-               (incf (axes-failed axes))))
+             ;; The policy triple: zebra's triple, less what each selected
+             ;; deviation excludes. No deviation touches skipped.
+             (when zebra-counts-p
+               (case status
+                 (:passed (unless (or (and controls controlp)
+                                      (and skips
+                                           parentp
+                                           (wholly-skipped-body-p result)))
+                            (incf (axes-passed axes))))
+                 (:failed (unless (and controls controlp)
+                            (incf (axes-failed axes))))
+                 (:skipped (incf (axes-skipped axes))))))
     (setf (axes-declared-limits axes) (nreverse (axes-declared-limits axes)))
     axes))
 
@@ -282,41 +267,35 @@ an ordinary PLAIN report can still obtain the numbers as data."
   ((controls-are-not-checks
     :initarg :controls-are-not-checks
     :reader controls-are-not-checks-p)
-   (uncarried-test-failures-are-failures
-    :initarg :uncarried-test-failures-are-failures
-    :reader uncarried-test-failures-are-failures-p)
    (skips-are-not-passes
     :initarg :skips-are-not-passes
     :reader skips-are-not-passes-p)
    (axes :initform nil :accessor axes-of))
   (:default-initargs
    :controls-are-not-checks *controls-are-not-checks*
-   :uncarried-test-failures-are-failures *uncarried-test-failures-are-failures*
    :skips-are-not-passes *skips-are-not-passes*)
   (:documentation
    "Zebra report that keeps its counts as data and prints them second.
 
 Adopting it changes nothing an existing gate relies on: with no options set
 the Passed, Failed and Skipped line is zebra's own, so anyone switching
-a gate to this class reads the same three numbers they have read for years,
-with the unambiguous axes added beneath them.
+a gate to this class reads the same three numbers zebra prints, with the
+unambiguous axes added beneath them.
 
 Subclasses PLAIN deliberately. PLAIN and QUIET are where zebra contains
 an error raised inside a test; a report subclassed straight off REPORT lets
 such an error escape and take the rest of the run with it.
 
 Nothing in a zebra result records why a test failed, so no count here
-names a cause. The three deviations documented on *CONTROLS-ARE-NOT-CHECKS*,
-*UNCARRIED-TEST-FAILURES-ARE-FAILURES* and *SKIPS-ARE-NOT-PASSES* are
-selected per instance or globally, and govern both the printed triple and
-the triple returned in the AXES structure. The axes themselves are
-unaffected by them; they are facts about the run."))
+names a cause. The two deviations documented on *CONTROLS-ARE-NOT-CHECKS*
+and *SKIPS-ARE-NOT-PASSES* are selected per instance or globally, and
+govern both the printed triple and the triple returned in the AXES
+structure. The axes themselves are unaffected by them; they are facts
+about the run."))
 
 (defun tally-for (report)
   (tally report
          :controls-are-not-checks (controls-are-not-checks-p report)
-         :uncarried-test-failures-are-failures
-         (uncarried-test-failures-are-failures-p report)
          :skips-are-not-passes (skips-are-not-passes-p report)))
 
 (defmethod axes-of :around ((report axis-summary))
@@ -369,8 +348,8 @@ same shape as any other run rather than signalling on a zero denominator."
               (axes-upstream-passed axes)
               (axes-upstream-failed axes)
               (axes-upstream-skipped axes))
-      (format stream ";; Counted exactly as zebra counts: every test result~%~
-                      ;; dropped from passed and from failed, skipped counted raw.~%"))
+      (format stream ";; Counted exactly as zebra counts: every result except a~%~
+                      ;; test whose status a direct child already carries.~%"))
   (format stream "~%;; Axes. Facts about the run, unaffected by the semantics~%~
                   ;; above. Each line counts one kind of object, no object is on~%~
                   ;; two lines, and the lines sum to the total.~%")
@@ -408,7 +387,7 @@ same shape as any other run rather than signalling on a zero denominator."
                  (axes-total axes))))
   axes)
 
-(defun print-failures (report axes stream)
+(defun print-failures (report stream)
   "List the failures that would otherwise have to be inferred: every failing
 leaf check, and every test that failed with nothing beneath it carrying the
 failure. Failing parents whose child is already listed are left out, so one
@@ -423,19 +402,12 @@ failure appears once."
     (when interesting
       (format stream "~&~%;; Failures:~%")
       (dolist (result interesting)
-        (format stream "~&~a~%~%" (pa:format-result result :extensive))))
-    (when (and (plusp (axes-test-failed-uncarried axes))
-               (zerop (axes-upstream-failed axes)))
-      (format stream "~&;; ~d failure~:p above ~:[are~;is~] invisible in~%~
-                      ;; zebra's own failed count, which reads ~d.~%"
-              (axes-test-failed-uncarried axes)
-              (= 1 (axes-test-failed-uncarried axes))
-              (axes-upstream-failed axes)))))
+        (format stream "~&~a~%~%" (pa:format-result result :extensive))))))
 
 (defmethod pa:summarize ((report axis-summary))
   (let ((axes (axes-of report))
         (stream (pa:output report)))
     (print-axes axes stream)
-    (print-failures report axes stream)
+    (print-failures report stream)
     (force-output stream))
   report)
