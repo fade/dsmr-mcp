@@ -15,9 +15,10 @@
 ;;;;   :inline    — returns a typed "requires attached or hermetic mode" error.
 ;;;;
 ;;;; The attached path wraps the run in sb-ext:with-timeout inside the target
-;;;; image so a runaway test run is actually interrupted rather than polled from
-;;;; the dispatcher side.  The hermetic path defers to the worker handler, which
-;;;; also wraps the run in sb-ext:with-timeout via the core's run-tests function.
+;;;; image, so the limit interrupts the run there. The hermetic path defers to
+;;;; the worker handler, which calls run-tests-guarded: the reply comes at the
+;;;; limit with still_running set, the run keeps going, and further load-system
+;;;; and run-tests calls answer busy until it finishes.
 
 (defpackage #:dsmr-mcp/src/tools/run-tests
   (:use #:cl)
@@ -99,8 +100,11 @@ or \"auto\" (default: auto-detect from ASDF :depends-on).")
 \"package::test-name\" strings). Supported for Rove.")
                  (timeout-seconds
                   :type :integer
-                  :description "Timeout in seconds before the run is interrupted \
-(default: 300). The timeout fires inside the target image.")
+                  :description "Time limit in seconds (default: 300). \
+Attached mode: the limit interrupts the run inside the target image. \
+Hermetic mode: the reply comes at the limit with still_running set, the \
+run keeps going, and further load-system and run-tests calls answer busy \
+until it finishes.")
                  (reload
                   :type :boolean
                   :description "Reload the test system before running (default: true). \

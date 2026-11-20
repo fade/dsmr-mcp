@@ -1005,8 +1005,10 @@ Solves three problems with using (asdf:load-system) via repl-eval:
 1. Staleness: force=true (default) clears loaded state so edits from 
 lisp-edit-form become live. 2. Output noise: warnings are collected and 
 returned in a structured list rather than flooding the terminal. 
-3. Timeout: the load is wrapped in a real in-image timeout that actually 
-interrupts a runaway compile. Requires attached or hermetic mode.
+3. Timeout: in attached mode the limit interrupts the load inside the target 
+image; in hermetic mode the reply comes at the limit with still_running set, 
+the load keeps running, and further load-system and run-tests calls answer 
+busy until it finishes. Requires attached or hermetic mode.
 
 #+begin_src json
 {
@@ -1024,7 +1026,7 @@ interrupts a runaway compile. Requires attached or hermetic mode.
       "type": "string"
     },
     "timeout_seconds": {
-      "description": "Timeout in seconds before the load is \ninterrupted (default: 120). The timeout fires inside the target image \nso a runaway compile is actually aborted.",
+      "description": "Time limit in seconds (default: 120). \nAttached mode: the limit interrupts the load inside the target image. \nHermetic mode: the reply comes at the limit with still_running set, the \nload keeps running, and further load-system and run-tests calls answer \nbusy until it finishes.",
       "type": "integer"
     }
   },
@@ -1595,7 +1597,7 @@ Requires attached or hermetic mode.
       "type": "array"
     },
     "timeout_seconds": {
-      "description": "Timeout in seconds before the run is interrupted \n(default: 300). The timeout fires inside the target image.",
+      "description": "Time limit in seconds (default: 300). \nAttached mode: the limit interrupts the run inside the target image. \nHermetic mode: the reply comes at the limit with still_running set, the \nrun keeps going, and further load-system and run-tests calls answer busy \nuntil it finishes.",
       "type": "integer"
     }
   },
