@@ -5,34 +5,38 @@
 ;;;; the hermetic worker handler.
 ;;;;
 ;;;; Provides:
-;;;;   load-system          — the in-process entry point (hermetic path calls
-;;;;                          this directly; runs under its own with-timeout).
-;;;;   %build-load-system-form — builds the sexp injected into the attached
-;;;;                          image (attached path); contains the same
-;;;;                          with-timeout + handler-bind + force/clear-fasls
-;;;;                          logic as load-system, expressed as a quoted form
-;;;;                          with CL-USER symbol hygiene.
-;;;;   %redefinition-warning-p — recognises SBCL redefinition-warning by class
+;;;;   load-system          - the in-process entry point (the hermetic path
+;;;;                          calls this directly); runs the load through
+;;;;                          call-with-load-guard.
+;;;;   %build-load-system-form - builds the sexp injected into the attached
+;;;;                          image (attached path); wraps the load in
+;;;;                          sb-ext:with-timeout with handler-bind and the
+;;;;                          force/clear-fasls logic, as a quoted form with
+;;;;                          CL-USER symbol hygiene.
+;;;;   %redefinition-warning-p - recognises SBCL redefinition-warning by class
 ;;;;                          first, then by the "redefining ... in ..." text
 ;;;;                          prefix, so force-reload noise can be silently
 ;;;;                          muffled without hiding real warnings.
 ;;;;
 ;;;; Design notes:
 ;;;;   The attached path wraps asdf:load-system in sb-ext:with-timeout INSIDE
-;;;;   the target image so a runaway compile is actually interrupted,
-;;;;   not merely observed from the dispatcher side. sb-ext:timeout is a
-;;;;   serious-condition, not error, so the load's own handler-case (error ...)
-;;;;   cannot swallow it.
+;;;;   the target image, so the limit interrupts the load there. sb-ext:timeout
+;;;;   is a serious-condition, not error, so the load's own handler-case
+;;;;   (error ...) cannot swallow it.
+;;;;
+;;;;   The in-process path never interrupts a load. At the limit it answers
+;;;;   status=timeout with still_running true, the load runs on to completion
+;;;;   on its own thread, and later load-system and run-tests calls answer
+;;;;   status=busy until it finishes.
 ;;;;
 ;;;;   Warnings are collected non-fatally into a structured list and muffled
 ;;;;   off the host stderr. Errors abort the load and return the
-;;;;   structured error shape. The calling tool wrapper decides how to present
-;;;;   the result — load-system returns a hash-table with "status", "duration_ms",
-;;;;   and either "warnings"/"warning_details" (success) or "message" (error/timeout).
+;;;;   structured error shape. load-system returns a hash-table with "status",
+;;;;   "duration_ms", and either "warnings"/"warning_details" (success) or
+;;;;   "message" (error, timeout, busy).
 ;;;;
 ;;;;   The default timeout is 120 seconds, matching cl-mcp's default and
-;;;;   providing enough headroom for large first-time compiles while bounding
-;;;;   the worst-case runaway.
+;;;;   providing enough headroom for large first-time compiles.
 
 (defpackage #:dsmr-mcp/src/system-loader-core
   (:use #:cl)
@@ -41,7 +45,11 @@
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht
                 #:text-content)
-  ;; sb-ext for with-timeout (SBCL-specific, intentional):
+  (:import-from #:dsmr-mcp/src/load-guard
+                #:call-with-load-guard
+                #:busy-message
+                #:busy-retry-text)
+  ;; sb-ext: the attached form names sb-ext symbols.
   (:import-from #:sb-ext)
   ;; asdf always present:
   (:import-from #:asdf)
@@ -68,6 +76,9 @@ in-process (hermetic) path and the attached decoder."
              system (or duration-ms 0) (or warnings 0)))
     ((equal status "timeout")
      (or message (format nil "load of ~A timed out" system)))
+    ((equal status "busy")
+     (or message (format nil "load of ~A refused: another operation is running"
+                         system)))
     (t
      (format nil "load of ~A failed: ~A" system (or message "unknown error")))))
 
@@ -195,37 +206,44 @@ Returns (list :ok WARN-COUNT WARNS), (list :timeout TIMEOUT), or
 ;;; ---------------------------------------------------------------------------
 ;;; load-system
 ;;;
-;;; In-process entry point used by the hermetic worker handler. The worker is
-;;; already in-process, so this runs the same logic as the injected form but
-;;; as ordinary CL code rather than a quoted form. Wraps the work in
-;;; sb-ext:with-timeout so a runaway compile is interrupted in the worker
-;;; (the pool's pool-rpc-with-hard-kill provides the outer hard-kill backstop).
+;;; In-process entry point used by the hermetic worker handler. Runs the same
+;;; logic as the injected form as ordinary CL code, on a thread of its own
+;;; through call-with-load-guard. The limit bounds the reply, never the load:
+;;; nothing interrupts a load in progress. The pool's pool-rpc-with-hard-kill
+;;; remains the backstop for a worker that stops answering.
 ;;;
 ;;; Returns a hash-table with:
-;;;   "status"          : "loaded" | "timeout" | "error"
-;;;   "system"          : sys-name string
-;;;   "duration_ms"     : elapsed time in milliseconds
-;;;   "forced"          : boolean (on success)
-;;;   "warnings"        : integer warning count (on success)
-;;;   "warning_details" : list of warning message strings, when count > 0
-;;;   "message"         : error/timeout message string (on error/timeout)
+;;;   "status"            : "loaded" | "timeout" | "busy" | "error"
+;;;   "system"            : sys-name string
+;;;   "duration_ms"       : elapsed time in milliseconds
+;;;   "forced"            : boolean (on success)
+;;;   "warnings"          : integer warning count (on success)
+;;;   "warning_details"   : list of warning message strings, when count > 0
+;;;   "message"           : error, timeout or busy message string
+;;;   "still_running"     : true on timeout; the load continues
+;;;   "running_operation" : on busy, the operation still running
+;;;   "running_system"    : on busy, the system it works on
+;;;   "elapsed_seconds"   : on busy, whole seconds it has run
 ;;; ---------------------------------------------------------------------------
 
 (defun load-system (sys-name &key (force t) (clear-fasls nil) (timeout-seconds 120))
-  "Load ASDF system SYS-NAME in-process with structured result.
+  "Load ASDF system SYS-NAME in-process and return a structured result.
 
 FORCE (default true) clears loaded state before loading so changed files
 are picked up. CLEAR-FASLS forces full recompilation from source.
-TIMEOUT-SECONDS defaults to 120; the load is wrapped in sb-ext:with-timeout
-so a runaway compile is actually interrupted rather than polled.
+TIMEOUT-SECONDS (default 120) bounds the wait for the reply, not the load.
 
-Warnings are collected non-fatally via handler-bind and muffled off the
-host stderr. Errors abort the load and return status=error. A timeout
-returns status=timeout."
+The load runs through CALL-WITH-LOAD-GUARD on a thread of its own.
+Warnings are collected non-fatally and muffled off the host stderr; an
+error aborts the load and returns status=error. At the limit the reply is
+status=timeout with still_running true, and the load runs on to
+completion. While any guarded operation runs, the reply is status=busy
+naming it, and no load starts."
   (check-type sys-name string)
   (let ((sys-name  (string-downcase sys-name))
         (start     (get-internal-real-time))
-        (warns     nil))
+        (warns     nil)
+        (limit     (or timeout-seconds 120)))
     (log-event :info "load-system" "system" sys-name "force" force
                "clear_fasls" clear-fasls "timeout" timeout-seconds)
     (flet ((elapsed-ms ()
@@ -238,64 +256,83 @@ returns status=timeout."
                (push (map 'string #'identity (princ-to-string w)) warns))
              (when (find-restart 'muffle-warning)
                (invoke-restart 'muffle-warning))))
-      (handler-case
-          (sb-ext:with-timeout (or timeout-seconds 120)
-            ;; Force-reload: clear loaded state so edits become live.
-            (when (and force
-                       (member sys-name (asdf:already-loaded-systems)
-                               :test #'string-equal))
-              (let ((asd-src (ignore-errors
-                               (asdf:system-source-file
-                                (asdf:find-system sys-name nil)))))
-                (asdf:clear-system sys-name)
-                (when asd-src
-                  (ignore-errors (asdf:load-asd asd-src)))))
-            ;; collect warnings non-fatally, muffle off host stderr.
-            (handler-bind ((warning #'collect-warning))
-              (if clear-fasls
-                  (asdf:load-system sys-name :force t)
-                  (asdf:load-system sys-name)))
-            ;; Build success result hash-table.
-            (let* ((elapsed  (elapsed-ms))
-                   (n-warns  (length warns))
-                   (ht       (make-ht "status"   "loaded"
-                                      "system"   sys-name
-                                      "duration_ms" elapsed
-                                      "forced"   force
-                                      "warnings" n-warns)))
-              (when (plusp n-warns)
-                (setf (gethash "warning_details" ht) (nreverse warns)))
-              (setf (gethash "content" ht)
-                    (text-content
-                     (load-status-summary "loaded" sys-name elapsed n-warns nil)))
-              (log-event :info "load-system-complete"
-                         "system" sys-name "duration_ms" elapsed
-                         "warnings" n-warns)
-              ht))
-        ;; sb-ext:timeout is a serious-condition that passes through any
-        ;; inner (error ...) handler-case arms without being caught by them,
-        ;; so this arm reliably fires on true compile timeouts.
-        (sb-ext:timeout ()
-          (let ((elapsed (elapsed-ms)))
-            (log-event :warn "load-system-timeout"
-                       "system" sys-name "timeout" timeout-seconds)
-            (let ((msg (format nil "Load timed out after ~A seconds"
-                               (or timeout-seconds 120))))
-              (make-ht "status"      "timeout"
-                       "system"      sys-name
-                       "duration_ms" elapsed
-                       "message"     msg
-                       "content"
+      (call-with-load-guard
+       "load-system" sys-name limit
+       (lambda ()
+         (handler-case
+             (progn
+               ;; Force-reload: clear loaded state so edits become live.
+               (when (and force
+                          (member sys-name (asdf:already-loaded-systems)
+                                  :test #'string-equal))
+                 (let ((asd-src (ignore-errors
+                                  (asdf:system-source-file
+                                   (asdf:find-system sys-name nil)))))
+                   (asdf:clear-system sys-name)
+                   (when asd-src
+                     (ignore-errors (asdf:load-asd asd-src)))))
+               ;; Collect warnings non-fatally, muffle off host stderr.
+               (handler-bind ((warning #'collect-warning))
+                 (if clear-fasls
+                     (asdf:load-system sys-name :force t)
+                     (asdf:load-system sys-name)))
+               (let* ((elapsed  (elapsed-ms))
+                      (n-warns  (length warns))
+                      (ht       (make-ht "status"   "loaded"
+                                         "system"   sys-name
+                                         "duration_ms" elapsed
+                                         "forced"   force
+                                         "warnings" n-warns)))
+                 (when (plusp n-warns)
+                   (setf (gethash "warning_details" ht) (nreverse warns)))
+                 (setf (gethash "content" ht)
                        (text-content
-                        (load-status-summary "timeout" sys-name elapsed nil msg))))))
-        (error (e)
-          (let ((elapsed  (elapsed-ms))
-                (msg      (map 'string #'identity (princ-to-string e))))
-            (log-event :error "load-system-error" "system" sys-name "error" msg)
-            (make-ht "status"      "error"
-                     "system"      sys-name
-                     "duration_ms" elapsed
-                     "message"     msg
-                     "content"
-                     (text-content
-                      (load-status-summary "error" sys-name elapsed nil msg)))))))))
+                        (load-status-summary "loaded" sys-name elapsed n-warns nil)))
+                 (log-event :info "load-system-complete"
+                            "system" sys-name "duration_ms" elapsed
+                            "warnings" n-warns)
+                 ht))
+           (error (e)
+             (let ((elapsed  (elapsed-ms))
+                   (msg      (map 'string #'identity (princ-to-string e))))
+               (log-event :error "load-system-error" "system" sys-name "error" msg)
+               (make-ht "status"      "error"
+                        "system"      sys-name
+                        "duration_ms" elapsed
+                        "message"     msg
+                        "content"
+                        (text-content
+                         (load-status-summary "error" sys-name elapsed nil msg)))))))
+       :on-timeout
+       (lambda (elapsed)
+         (log-event :warn "load-system-timeout"
+                    "system" sys-name "timeout" timeout-seconds
+                    "still_running" t)
+         (let ((msg (format nil "Load timed out after ~A seconds" limit)))
+           (make-ht "status"        "timeout"
+                    "system"        sys-name
+                    "duration_ms"   elapsed
+                    "message"       msg
+                    "still_running" t
+                    "content"
+                    (text-content
+                     (format nil "~A The load continues in the background; ~
+                                  load-system and run-tests answer busy until ~
+                                  it finishes."
+                             (load-status-summary "timeout" sys-name elapsed
+                                                  nil msg))))))
+       :on-busy
+       (lambda (operation system elapsed-seconds)
+         (let ((msg (busy-message operation system elapsed-seconds)))
+           (make-ht "status"            "busy"
+                    "system"            sys-name
+                    "duration_ms"       (elapsed-ms)
+                    "running_operation" operation
+                    "running_system"    system
+                    "elapsed_seconds"   elapsed-seconds
+                    "message"           msg
+                    "content"
+                    (text-content
+                     (format nil "~A ~A"
+                             (load-status-summary "busy" sys-name nil nil msg)
+                             (busy-retry-text))))))))))

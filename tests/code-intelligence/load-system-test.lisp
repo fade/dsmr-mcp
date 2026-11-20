@@ -1,14 +1,20 @@
 ;;;; tests/code-intelligence/load-system-test.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; In-process tests for the load-system VERB-12 implementation.
+;;;; In-process tests for the load-system implementation.
 ;;;; Tests run without spawning a worker — they exercise the core engine
 ;;;; and handler directly, proving the hermetic path behaviors.
 ;;;;
 ;;;; Coverage:
 ;;;;   load-system-loads-known-system         — a loadable system returns status=loaded
 ;;;;   load-system-captures-warnings-non-fatally — warning does not abort; structured list returned
-;;;;   load-system-timeout-returns-structured-timeout — tiny timeout fires structured TIMEOUT marker
+;;;;   load-system-timeout-returns-structured-timeout - a load past its limit answers
+;;;;                                            timeout with still_running, uninterrupted
+;;;;   abandoned-load-runs-to-completion      - the abandoned load finishes once the gate opens
+;;;;   load-during-abandoned-load-answers-busy - a further load answers busy, naming it
+;;;;   load-after-abandoned-load-completes-succeeds - the next load after it succeeds
+;;;;   nested-guarded-call-runs               - a guarded call inside a guarded operation runs
+;;;;   escaped-condition-reaches-caller-and-clears-guard - an escaped error reaches the caller
 ;;;;   load-system-inline-returns-mode-error  — *mode* :inline returns the typed -32603 error
 ;;;;
 ;;;; NOT covered here (requires a live developer image with an uncommitted
@@ -28,6 +34,16 @@
                 #:load-system
                 #:%redefinition-warning-p
                 #:%build-load-system-form)
+  (:import-from #:dsmr-mcp/src/load-guard
+                #:running-operation
+                #:wait-for-guarded-operations)
+  (:import-from #:dsmr-mcp/tests/support/gated-load-fixture
+                #:make-gated-system
+                #:remove-gated-system
+                #:open-gate
+                #:close-gate
+                #:wait-for-gate-entered
+                #:gated-load-count)
   (:import-from #:dsmr-mcp/src/hermetic/worker/handlers
                 #:%handle-load-system)
   (:import-from #:dsmr-mcp/src/tools/helpers
@@ -134,25 +150,90 @@ and did not reach the host stderr (non-fatal warning bucketing)."
       (true (stringp (first details))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; load-system-timeout-returns-structured-timeout
+;;; load-system-timeout-returns-structured-timeout and the abandoned load
 ;;;
-;;; A load wrapped with a sub-millisecond timeout returns the structured
-;;; TIMEOUT marker rather than hanging or re-signalling. This confirms
-;;; the timeout fires inside the image and interrupts the compile rather than
-;;; being observed after the fact.
+;;; A load parked at a closed gate outlasts its limit. The reply is structured
+;;; and prompt, with still_running true; the load is left to finish and
+;;; nothing interrupts it. While it runs, later calls answer busy; once it has
+;;; finished, the next load succeeds.
 ;;; ---------------------------------------------------------------------------
 
+(defmacro with-gated-system ((var) &body body)
+  "Bind VAR to a fresh gated system with the gate closed and run BODY.
+Cleanup opens the gate, asserts the guard clears within 30 s, and removes the
+system, so no abandoned load outlives the test."
+  `(let ((,var (make-gated-system "dsmr-gated-load")))
+     (close-gate)
+     (unwind-protect (progn ,@body)
+       (open-gate)
+       (true (wait-for-guarded-operations 30))
+       (remove-gated-system ,var "dsmr-gated-load"))))
+
+(defun %wall-seconds-since (start)
+  "Seconds of wall time since internal real time START."
+  (/ (- (get-internal-real-time) start) internal-time-units-per-second))
+
 (define-test load-system-timeout-returns-structured-timeout
-  "load-system with an absurdly small timeout returns status=timeout and a
-descriptive message. The TIMEOUT condition is caught inside sb-ext:with-timeout
-and returned as a structured result rather than propagating as an unhandled
-condition — confirming in-image timeout interruption."
-  ;; 0.001 seconds is well below any real compile; the timeout must fire.
-  (let ((result (load-system "alexandria" :timeout-seconds 0.001 :force t)))
-    (true (hash-table-p result))
-    (is string= "timeout" (gethash "status" result))
-    (true (stringp (gethash "message" result)))
-    (true (search "timed out" (gethash "message" result)))))
+  "load-system on a load parked at a closed gate, with a 0.5 s limit, returns
+status=timeout within 2.5 s, with a message, an integer duration_ms and
+still_running true. The load is left to finish; nothing interrupts it."
+  (with-gated-system (sys)
+    (let* ((start  (get-internal-real-time))
+           (result (load-system sys :timeout-seconds 0.5 :force t)))
+      (true (< (%wall-seconds-since start) 2.5))
+      (true (hash-table-p result))
+      (is string= "timeout" (gethash "status" result))
+      (true (stringp (gethash "message" result)))
+      (true (search "timed out" (gethash "message" result)))
+      (is eq t (gethash "still_running" result))
+      (true (integerp (gethash "duration_ms" result))))))
+
+(define-test abandoned-load-runs-to-completion
+  "A load abandoned at its limit reaches the gate, and once the gate opens it
+finishes: the guard clears, the system is loaded, and exactly one more load
+passed the gate."
+  (with-gated-system (sys)
+    (let ((before (gated-load-count))
+          (result (load-system sys :timeout-seconds 0.5 :force t)))
+      (is string= "timeout" (gethash "status" result))
+      (true (wait-for-gate-entered 30))
+      (open-gate)
+      (true (wait-for-guarded-operations 30))
+      (true (asdf:component-loaded-p sys))
+      (is = (1+ before) (gated-load-count)))))
+
+(define-test load-during-abandoned-load-answers-busy
+  "While an abandoned load waits at the closed gate, the worker handler's
+load-system for another system answers status=busy naming the running load,
+and starts nothing."
+  (with-gated-system (sys)
+    (is string= "timeout"
+        (gethash "status" (load-system sys :timeout-seconds 0.5 :force t)))
+    (true (wait-for-gate-entered 30))
+    (let ((result (%handle-load-system
+                   (make-ht "system" "alexandria" "timeout_seconds" 30)
+                   nil)))
+      (is string= "busy" (gethash "status" result))
+      (is string= "load-system" (gethash "running_operation" result))
+      (is string= sys (gethash "running_system" result))
+      (let ((secs (gethash "elapsed_seconds" result)))
+        (true (and (integerp secs) (>= secs 0))))
+      (true (search sys (gethash "message" result)))
+      (let ((content (gethash "content" result)))
+        (true (vectorp content))
+        (true (plusp (length (gethash "text" (aref content 0)))))))))
+
+(define-test load-after-abandoned-load-completes-succeeds
+  "Once an abandoned load has finished, the next load-system on the same
+system returns status=loaded."
+  (with-gated-system (sys)
+    (is string= "timeout"
+        (gethash "status" (load-system sys :timeout-seconds 0.5 :force t)))
+    (true (wait-for-gate-entered 30))
+    (open-gate)
+    (true (wait-for-guarded-operations 30))
+    (is string= "loaded"
+        (gethash "status" (load-system sys :timeout-seconds 30 :force t)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; load-system-attached-loads-known-system
