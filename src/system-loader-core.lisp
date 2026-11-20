@@ -26,8 +26,8 @@
 ;;;;
 ;;;;   The in-process path never interrupts a load. At the limit it answers
 ;;;;   status=timeout with still_running true, the load runs on to completion
-;;;;   on its own thread, and later load-system and run-tests calls answer
-;;;;   status=busy until it finishes.
+;;;;   on its own thread, and later load-system and run-tests calls answer busy
+;;;;   until it finishes.
 ;;;;
 ;;;;   Warnings are collected non-fatally into a structured list and muffled
 ;;;;   off the host stderr. Errors abort the load and return the
@@ -237,8 +237,8 @@ The load runs through CALL-WITH-LOAD-GUARD on a thread of its own.
 Warnings are collected non-fatally and muffled off the host stderr; an
 error aborts the load and returns status=error. At the limit the reply is
 status=timeout with still_running true, and the load runs on to
-completion. While any guarded operation runs, the reply is status=busy
-naming it, and no load starts."
+completion. While any guarded operation other than the caller's own runs,
+the reply is status=busy naming it, and no load starts."
   (check-type sys-name string)
   (let ((sys-name  (string-downcase sys-name))
         (start     (get-internal-real-time))

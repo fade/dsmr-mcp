@@ -404,8 +404,8 @@ in-process (already inside the worker) and returns the structured result.
 The load runs on a thread of its own and is never interrupted. At the limit
 the reply is status=timeout with still_running true, and the load runs on to
 completion; until it does, further load-system and run-tests calls answer
-status=busy. The pool's pool-rpc-with-hard-kill remains the backstop for a
-worker that does not answer at all.
+busy. The pool's pool-rpc-with-hard-kill remains the backstop for a worker
+that does not answer at all.
 
 Reads system (required), force (boolean, default true), clear_fasls
 (boolean, default false), and timeout_seconds (integer, default 120) from

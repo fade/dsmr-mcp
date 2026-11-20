@@ -132,7 +132,7 @@ ELAPSED-SECONDS."
 
 (defun busy-retry-text ()
   "Sentence appended to the content text of every busy reply."
-  "Retry when it finishes; pool-kill-worker stops a worker whose load never does.")
+  "Retry when it finishes; pool-kill-worker stops a worker whose operation never finishes.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; call-with-load-guard

@@ -128,9 +128,10 @@ different Lisp image, so it must not depend on sxhash."
 own timer off, and return the uniform envelope.
 
 At the limit, return the timeout envelope with still_running true; the run
-continues on its own thread. While a guarded operation runs, return a busy
-envelope (framework busy, failed 1, one failure detail named BUSY) carrying
-running_operation, running_system and elapsed_seconds, and start nothing.
+continues on its own thread. While a guarded operation other than the
+caller's own runs, return a busy envelope (framework busy, failed 1, one
+failure detail named BUSY) carrying running_operation, running_system and
+elapsed_seconds, and start nothing.
 Failed counts 1 on busy so the reply never reads as a pass."
   (let ((limit (or timeout-seconds 300)))
     (call-with-load-guard
