@@ -35,7 +35,8 @@
                 #:%detach-stem
                 #:%legacy-detach-stem)
   (:import-from #:dsmr-mcp/tests/integration/bus/host-support
-                #:run-within))
+                #:run-within
+                #:within-deadline))
 
 (in-package #:dsmr-mcp/tests/integration/bus/watch-detach-integration-test)
 
@@ -346,23 +347,29 @@
         (skip ("dsmr-bus-watch not built; run 'make bus-watch' to enable this test"))
         (with-state (state bin)
           (let* ((pid-path (detach-file state "pid"))
+                 (loop-pid-path (merge-pathnames "planted-loop.pid" state))
                  ;; $0 names the binary so the loop reads as a watcher, which is
                  ;; how a loop started by hand shows up with no lock on its file.
+                 ;; The loop writes its own pid to planted-loop.pid under the
+                 ;; state root once its trap and its background sleep are in
+                 ;; place, and the case reads the pid from there.
                  (loop-process
                    (uiop:launch-program
                     (list "setsid" "sh" "-c"
-                          "trap '' TERM; sleep 600 & while :; do sleep 1; done"
+                          (format nil "trap '' TERM; sleep 600 & echo $$ > '~A'; ~
+                                       while :; do sleep 1; done"
+                                  (uiop:native-namestring loop-pid-path))
                           "dsmr-bus-watch")
                     :input nil :output nil :error-output nil)))
             (declare (ignore loop-process))
             (sleep 0.5)
-            (let ((pid (parse-integer
-                        (string-trim '(#\Newline #\Space)
-                                     (uiop:run-program
-                                      (list "pgrep" "-f" "-n"
-                                            "trap '' TERM; sleep 600")
-                                      :output :string))
-                        :junk-allowed t)))
+            (let ((pid (or (await 5 (lambda ()
+                                      (ignore-errors
+                                       (parse-integer
+                                        (uiop:read-file-string loop-pid-path)
+                                        :junk-allowed t))))
+                           (error "no pid recorded in ~A within 5 s"
+                                  loop-pid-path))))
               (ensure-directories-exist pid-path)
               (with-open-file (out pid-path :direction :output :if-exists :supersede)
                 (format out "~D~%" pid))
@@ -450,11 +457,15 @@
 (defun finish-and-read (process seconds)
   "Wait up to SECONDS for PROCESS to exit, then return (values exit-code
    first-line). The exit code is NIL when it had to be killed. It is stopped
-   before its output is read, so a process that never exits cannot hold the
-   read, and the suite, open for good."
+   before its output is read, and the read takes at most 10 s, past which
+   DEADLINE-PASSED is signalled."
   (let ((code (await-exit process seconds)))
     (stop-process process)
-    (values code (read-line (uiop:process-info-output process) nil ""))))
+    (values code
+            (within-deadline ((format nil "reading the first line of pid ~D"
+                                      (uiop:process-info-pid process))
+                              10)
+              (read-line (uiop:process-info-output process) nil "")))))
 
 (define-test wake-exits-at-once-when-no-watcher-runs
   "With no detached watcher there is nothing to wake on, and waiting would leave
@@ -1052,15 +1063,19 @@
 (defun finish-and-read-both (process seconds)
   "Wait up to SECONDS for PROCESS, started by LAUNCH-HOOK, to exit, then return
    (values exit-code stdout stderr), both outputs whole and stripped. The exit
-   code is NIL when it had to be killed."
+   code is NIL when it had to be killed. Reading the outputs takes at most
+   10 s; past that, DEADLINE-PASSED is signalled."
   (let ((code (await-exit process seconds)))
     (stop-process process)
     (flet ((slurp (stream)
              (string-trim '(#\Newline #\Space)
                           (or (ignore-errors (uiop:slurp-stream-string stream)) ""))))
-      (values code
-              (slurp (uiop:process-info-output process))
-              (slurp (uiop:process-info-error-output process))))))
+      (within-deadline ((format nil "reading the output of pid ~D"
+                                (uiop:process-info-pid process))
+                        10)
+        (values code
+                (slurp (uiop:process-info-output process))
+                (slurp (uiop:process-info-error-output process)))))))
 
 (define-test hook-wake-reports-idle-on-stderr-and-exits-two
   "A hook on a quiet bus must still wake the session when its wait ends, so the
