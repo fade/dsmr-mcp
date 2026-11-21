@@ -71,6 +71,13 @@ DSMR_HOME ?=
 ##   the sha is used afterwards. Required by `make deploy`.
 REF ?=
 
+## ALLOW_UNPUBLISHED: set to 1 to let `make deploy` build a REF that is on no origin branch.
+##
+##   The override is recorded in the release MANIFEST as
+##   `unpublished-ref-allowed yes`. For CI and scratch dry runs; leave it empty
+##   for a deploy to the host's release.
+ALLOW_UNPUBLISHED ?=
+
 ## QLOT: the qlot executable a release build takes its dependencies through.
 ##
 ##   Provisioned by cloning qlot into the Lisp workspace and running its
@@ -981,11 +988,15 @@ qlot-lock:
 ##   own launcher to answer initialize and tools/list. Only then does
 ##   $(DSMR_HOME)/current flip to the release, in one rename; the release it
 ##   replaces becomes previous. A failure at any stage leaves current and
-##   previous as they were. REF is required. DSMR_HOME redirects the whole
-##   deploy to a scratch home: make deploy REF=HEAD DSMR_HOME=$(mktemp -d)
+##   previous as they were. Refuses, before it creates anything under
+##   DSMR_HOME, a working tree with uncommitted tracked changes and a REF that
+##   is on no origin branch (ALLOW_UNPUBLISHED=1 overrides the second). One
+##   deploy runs at a time per DSMR_HOME. REF is required. DSMR_HOME redirects
+##   the whole deploy to a scratch home:
+##   make deploy REF=HEAD DSMR_HOME=$(mktemp -d) ALLOW_UNPUBLISHED=1
 deploy:
 	@REPO="$(CURDIR)" REF="$(REF)" DSMR_HOME="$(DSMR_HOME)" QLOT="$(QLOT)" QLOT_COMMIT="$(QLOT_COMMIT)" SBCL="$(SBCL)" \
-	   scripts/deploy.sh deploy
+	   ALLOW_UNPUBLISHED="$(ALLOW_UNPUBLISHED)" scripts/deploy.sh deploy
 
 ## core-verify-worker: boot a worker core image and assert it is fit for workers.
 ##
