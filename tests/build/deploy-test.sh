@@ -8,8 +8,11 @@
 # The stub SBCL answers the verify stage by replaying
 # tests/build/fixtures/release-initialize.jsonl, an initialize and tools/list
 # exchange recorded from a real release (provenance in
-# release-initialize.txt). Its behaviour is set per case through the file
-# $WORK/stub-mode, because the verify stage scrubs the environment.
+# release-initialize.txt). Started with the worker entry, it prints
+# tests/build/fixtures/worker-handshake.json, a handshake recorded from a real
+# release worker core (provenance in worker-handshake.txt), and waits for
+# SIGTERM. Its behaviour is set per case through the file $WORK/stub-mode,
+# because the verify stages scrub the environment.
 #
 # Everything lives under one mktemp directory; TMPDIR points into it so the
 # verify stage's scratch directories are removed with it.
@@ -20,6 +23,7 @@ set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 FIXTURE="$REPO_ROOT/tests/build/fixtures/release-initialize.jsonl"
+HANDSHAKE="$REPO_ROOT/tests/build/fixtures/worker-handshake.json"
 DEPLOY="$REPO_ROOT/scripts/deploy.sh"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/deploy-test.XXXXXX")
 trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
@@ -50,6 +54,10 @@ if [ ! -s "$FIXTURE" ]; then
     echo "deploy-test: missing recorded fixture $FIXTURE; record it with a scratch make deploy (see release-initialize.txt)" >&2
     exit 2
 fi
+if [ ! -s "$HANDSHAKE" ]; then
+    echo "deploy-test: missing recorded fixture $HANDSHAKE; record it with a scratch make deploy (see worker-handshake.txt)" >&2
+    exit 2
+fi
 
 # ---- stubs --------------------------------------------------------------
 
@@ -74,6 +82,18 @@ cat > "$WORK/bin/sbcl" <<STUB
 echo "\$*" >> "$WORK/sbcl.log"
 case "\$*" in
   --version) echo "SBCL 9.9.stub"; exit 0 ;;
+  *verify-core-worker.lisp*)
+      case "\$(cat "$WORK/stub-mode")" in
+        worker-rejected) echo "[verify-core-worker] 0 passed, 1 FAILED - image rejected"; exit 1 ;;
+      esac
+      exit 0 ;;
+  *dsmr-worker-entry*)
+      case "\$(cat "$WORK/stub-mode")" in
+        no-handshake) exit 0 ;;
+      esac
+      cat "$HANDSHAKE"
+      trap 'exit 0' TERM
+      while :; do sleep 0.1; done ;;
   *--core*)
       cat > /dev/null
       case "\$(cat "$WORK/stub-mode")" in
@@ -85,7 +105,7 @@ case "\$*" in
       exit 0 ;;
   *build-core.lisp*)
       echo stubcore > "\$DSMR_CORE_OUTPUT"
-      echo "sbcl-version 9.9.stub" > "\$DSMR_CORE_OUTPUT.manifest"
+      printf 'sbcl-version 9.9.stub\nkind %s\n' "\$DSMR_CORE_KIND" > "\$DSMR_CORE_OUTPUT.manifest"
       exit 0 ;;
 esac
 exit 0
@@ -156,6 +176,9 @@ try "tracked file is exported" "marker missing" test -f "$H/releases/$C1/marker"
 vcs=$(find "$H/releases/$C1/deps" -name .git 2>/dev/null | head -3)
 try "bundled dependencies hold no .git" "found: $vcs" test -z "$vcs"
 try "bundled dependency sources are kept" "dir-git.asd missing" test -f "$H/releases/$C1/deps/local-projects/dir-git/dir-git.asd"
+try "release holds a worker core" "no core/dsmr.core.worker" test -s "$H/releases/$C1/core/dsmr.core.worker"
+try "worker core was built as a release-worker" "manifest: $(cat "$H/releases/$C1/core/dsmr.core.worker.manifest" 2>/dev/null)" grep -qx 'kind release-worker' "$H/releases/$C1/core/dsmr.core.worker.manifest"
+try "release keeps the worker handshake" "verify-worker.json differs" cmp -s "$HANDSHAKE" "$H/releases/$C1/verify-worker.json"
 rm -f "$REPO/untracked.txt"
 
 note "flip"
@@ -242,11 +265,13 @@ note "verify failures"
 HV="$WORK/home-verify"
 deploy "$HV" "$C1"; deploy "$HV" "$C2"
 cur0=$(link "$HV/current"); prev0=$(link "$HV/previous")
-for mode in wrong-name crash silent; do
+for case_ in wrong-name:verify-initialize crash:verify-initialize silent:verify-initialize \
+             no-handshake:verify-worker worker-rejected:verify-worker; do
+    mode=${case_%%:*} stage=${case_#*:}
     echo "$mode" > "$WORK/stub-mode"
-    deploy "$HV" "$C3"
+    deploy "$HV" "$C3" DEPLOY_WORKER_TIMEOUT=3
     try "$mode: deploy fails" "rc=$RC" test "$RC" -eq 1
-    try "$mode: failing stage is named" "$OUT" has "$OUT" "deploy: verify-initialize failed:"
+    try "$mode: failing stage is named" "$OUT" has "$OUT" "deploy: $stage failed:"
     try "$mode: current is reported unchanged" "$OUT" has "$OUT" "current is unchanged"
     try "$mode: current unchanged" "now $(link "$HV/current")" test "$(link "$HV/current")" = "$cur0"
     try "$mode: previous unchanged" "now $(link "$HV/previous")" test "$(link "$HV/previous")" = "$prev0"
