@@ -78,6 +78,14 @@ REF ?=
 ##   for a deploy to the host's release.
 ALLOW_UNPUBLISHED ?=
 
+## HOST_LINKS: set to 0 to keep `make deploy` and `make rollback` off the host's own paths.
+##
+##   0 skips every host step: the bus binary links in BINDIR and the copies
+##   into SKILLDIR, AGENTDIR and SUBAGENTDIR. For CI and dry runs. A deploy
+##   with a scratch DSMR_HOME refuses unless this is 0 or those four
+##   directories are scratch directories too.
+HOST_LINKS ?=
+
 ## CLAUDE_CONFIG: the Claude Code config file `make register` writes.
 ##
 ##   Defaults to the host's own config. A run with a scratch DSMR_HOME must name
@@ -136,20 +144,38 @@ bridge:
 	     --eval '(asdf:make :dsmr-mcp-bridge)' \
 	     --eval '(quit)'
 
+## BUS_DEPS_SETUP: a dependency bundle's setup.lisp the bus binaries are built against.
+##
+##   Empty builds them as a development checkout always has: the watcher with
+##   ASDF alone, the host service with the user's Quicklisp and the Lisp
+##   workspace. A path loads that file, then ASDF, in place of both, so the
+##   binaries resolve every dependency from the bundle and nothing from the
+##   host's Quicklisp or workspace. `make deploy` sets it to the release's own
+##   <release>/deps/setup.lisp, so the bus binaries come from the same export
+##   and bundle as the server cores.
+BUS_DEPS_SETUP ?=
+ifeq ($(strip $(BUS_DEPS_SETUP)),)
+BUS_WATCH_SETUP = --eval '(require :asdf)'
+BUS_HOST_SETUP = --eval '(require :asdf)' \
+	     --eval '(let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file ql) (load ql)))' \
+	     --eval '(pushnew (uiop:ensure-directory-pathname "$(WORKSPACE)") asdf:*central-registry* :test (function equal))' \
+	     --eval '(pushnew (uiop:ensure-directory-pathname "$(WORKSPACE)/pzmq") asdf:*central-registry* :test (function equal))'
+else
+BUS_WATCH_SETUP = --load "$(BUS_DEPS_SETUP)" --eval '(require :asdf)'
+BUS_HOST_SETUP = $(BUS_WATCH_SETUP)
+endif
+
 ## BUS_WATCH_SBCL, BUS_HOST_SBCL: the SBCL command and ASDF setup each bus binary is built under.
 ##
 ##   The bus-watch and bus-host recipes and the bus-sources listing start with
 ##   them, so the files listed for each binary resolve exactly as its build
-##   resolves them.
-BUS_WATCH_SBCL = sbcl --noinform --no-sysinit --no-userinit --disable-debugger \
-	     --eval '(require :asdf)' \
+##   resolves them. BUS_DEPS_SETUP selects the dependency setup.
+BUS_WATCH_SBCL = $(SBCL) --noinform --no-sysinit --no-userinit --disable-debugger \
+	     $(BUS_WATCH_SETUP) \
 	     --eval '(asdf:load-asd (truename "dsmr-mcp.asd"))' \
 	     --eval '(asdf:load-asd (truename "dsmr-bus-watch.asd"))'
-BUS_HOST_SBCL = sbcl --noinform --no-sysinit --no-userinit --disable-debugger \
-	     --eval '(require :asdf)' \
-	     --eval '(let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file ql) (load ql)))' \
-	     --eval '(pushnew (uiop:ensure-directory-pathname "$(WORKSPACE)") asdf:*central-registry* :test (function equal))' \
-	     --eval '(pushnew (uiop:ensure-directory-pathname "$(WORKSPACE)/pzmq") asdf:*central-registry* :test (function equal))' \
+BUS_HOST_SBCL = $(SBCL) --noinform --no-sysinit --no-userinit --disable-debugger \
+	     $(BUS_HOST_SETUP) \
 	     --eval '(asdf:load-asd (truename "dsmr-mcp.asd"))' \
 	     --eval '(asdf:load-asd (truename "dsmr-bus-watch.asd"))' \
 	     --eval '(asdf:load-asd (truename "dsmr-bus-host.asd"))'
@@ -157,9 +183,12 @@ BUS_HOST_SBCL = sbcl --noinform --no-sysinit --no-userinit --disable-debugger \
 ## bus-watch: build the standalone coordination-bus wakeup watcher binary.
 ##
 ##   Produces bin/dsmr-bus-watch via ASDF program-op (save-lisp-and-die).
-##   A sister repo arms it by bare command name; the machine needs no SBCL or
-##   Python of its own. Build artefact is .gitignored; rebuild with
-##   'make bus-watch' after any change to src/bus/watch.lisp.
+##   The machine that runs it needs no SBCL or Python of its own. The binary in
+##   this checkout's bin/ is for tests and is never what the host runs: the
+##   host runs <DSMR_HOME>/current/bin/dsmr-bus-watch, which `make deploy`
+##   builds from the release with this same target. Build artefact is
+##   .gitignored; rebuild with 'make bus-watch' after any change to
+##   src/bus/watch.lisp.
 ##
 ##   Built with --no-userinit/--no-sysinit so the saved image carries ONLY the
 ##   WAL leaf + watcher (no Quicklisp/slynk) — the watcher's closure needs
@@ -172,7 +201,10 @@ bus-watch:
 
 ## bus-host: build the host bus service binary.
 ##
-##   Produces bin/dsmr-bus-host via ASDF program-op (save-lisp-and-die). One
+##   Produces bin/dsmr-bus-host via ASDF program-op (save-lisp-and-die). The
+##   binary in this checkout's bin/ is for tests and is never what the host
+##   runs: the service runs <DSMR_HOME>/current/bin/dsmr-bus-host, which `make
+##   deploy` builds from the release with this same target. One
 ##   process per host runs every bus broker and the watch for every agent
 ##   registered with it. While it runs it takes over from the broker elected by
 ##   whichever client came first and the detached watcher process per agent per
@@ -265,36 +297,13 @@ bus-binaries:
 	$(MAKE) --no-print-directory -f Makefile -f "$$sources/dsmr-bus-watch.mk" bin/dsmr-bus-watch; \
 	$(MAKE) --no-print-directory -f Makefile -f "$$sources/dsmr-bus-host.mk" bin/dsmr-bus-host
 
-## install-bus-watch: publish the built watcher onto PATH.
+## install-bus-watch, install-bus-host: retired; refuse and name `make deploy`.
 ##
-##   Agents invoke 'dsmr-bus-watch' by name, so the copy under $(BINDIR) — not
-##   bin/ — is the one every session actually runs. Skipping this step leaves
-##   the operator docs describing flags the deployed binary rejects, and a
-##   watcher that exits on them is deaf to the bus rather than noisy about it.
-##   Install atomically: agents arm watchers continuously, and cp over a running
-##   binary's inode can hand a session a half-written image.
-install-bus-watch: bus-watch
-	@mkdir -p "$(BINDIR)"
-	@cp bin/dsmr-bus-watch "$(BINDIR)/.dsmr-bus-watch.tmp"
-	@chmod 755 "$(BINDIR)/.dsmr-bus-watch.tmp"
-	@mv -f "$(BINDIR)/.dsmr-bus-watch.tmp" "$(BINDIR)/dsmr-bus-watch"
-	@echo "installed $(BINDIR)/dsmr-bus-watch"
-	@echo "running watchers keep the previous image until each is re-armed"
-
-## install-bus-host: publish the built host bus service binary onto PATH.
-##
-##   The service's unit runs the copy under $(BINDIR), so this is the step that
-##   changes what the host runs. Installed atomically for the same reason as the
-##   watcher. The running service keeps the image it started with until it is
-##   restarted, and a restart is a deliberate act because every agent on the
-##   host hears the bus through it.
-install-bus-host: bus-host
-	@mkdir -p "$(BINDIR)"
-	@cp bin/dsmr-bus-host "$(BINDIR)/.dsmr-bus-host.tmp"
-	@chmod 755 "$(BINDIR)/.dsmr-bus-host.tmp"
-	@mv -f "$(BINDIR)/.dsmr-bus-host.tmp" "$(BINDIR)/dsmr-bus-host"
-	@echo "installed $(BINDIR)/dsmr-bus-host"
-	@echo "the running service keeps the previous image until 'systemctl --user restart dsmr-bus-host'"
+##   The host's ~/.local/bin/dsmr-bus-watch and dsmr-bus-host are links into
+##   the deployed release. A checkout build copied over a link would silently
+##   undo the release, so these targets build and write nothing and exit 1.
+install-bus-watch install-bus-host:
+	@echo "$@: bus binaries come from the deployed release; run make deploy REF=<sha>" >&2; exit 1
 
 ## install-host-unit: deploy the host bus service's systemd user units.
 ##
@@ -999,27 +1008,37 @@ qlot-lock:
 ##   The only target that changes what a server runs. Exports the commit REF
 ##   names with git archive into $(DSMR_HOME)/releases/<sha>/, takes its
 ##   dependencies from the committed qlfile and qlfile.lock through qlot,
-##   builds a sealed server core there with plain SBCL, and boots the release's
-##   own launcher to answer initialize and tools/list. Only then does
-##   $(DSMR_HOME)/current flip to the release, in one rename; the release it
-##   replaces becomes previous. A failure at any stage leaves current and
+##   builds a sealed server core, a worker core and the two bus binaries there
+##   with plain SBCL, and boots the release's own launcher to answer initialize
+##   and tools/list. Only then does $(DSMR_HOME)/current flip to the release,
+##   in one rename; the release it replaces becomes previous. After the flip,
+##   $(BINDIR)/dsmr-bus-watch and dsmr-bus-host are links through
+##   $(DSMR_HOME)/current/bin, so the paths agents and the bus service use never
+##   change. A failure at any stage leaves current and
 ##   previous as they were. Refuses, before it creates anything under
 ##   DSMR_HOME, a working tree with uncommitted tracked changes and a REF that
 ##   is on no origin branch (ALLOW_UNPUBLISHED=1 overrides the second). One
 ##   deploy runs at a time per DSMR_HOME. REF is required. DSMR_HOME redirects
-##   the whole deploy to a scratch home:
-##   make deploy REF=HEAD DSMR_HOME=$(mktemp -d) ALLOW_UNPUBLISHED=1
+##   the whole deploy to a scratch home, and then HOST_LINKS=0 or scratch
+##   BINDIR, SKILLDIR, AGENTDIR and SUBAGENTDIR are required too:
+##   make deploy REF=HEAD DSMR_HOME=$(mktemp -d) ALLOW_UNPUBLISHED=1 HOST_LINKS=0
 deploy:
 	@REPO="$(CURDIR)" REF="$(REF)" DSMR_HOME="$(DSMR_HOME)" QLOT="$(QLOT)" QLOT_COMMIT="$(QLOT_COMMIT)" SBCL="$(SBCL)" \
-	   ALLOW_UNPUBLISHED="$(ALLOW_UNPUBLISHED)" scripts/deploy.sh deploy
+	   ALLOW_UNPUBLISHED="$(ALLOW_UNPUBLISHED)" HOST_LINKS="$(HOST_LINKS)" \
+	   BINDIR="$(BINDIR)" SKILLDIR="$(SKILLDIR)" AGENTDIR="$(AGENTDIR)" SUBAGENTDIR="$(SUBAGENTDIR)" \
+	   scripts/deploy.sh deploy
 
 ## rollback: make the previous release current again.
 ##
 ##   Swaps $(DSMR_HOME)/current and previous with two renames and prints the
-##   commit now current. Builds nothing and runs no git, qlot or sbcl. Running
-##   servers keep their release until they restart.
+##   commit now current, then repairs a missing bus binary link in $(BINDIR).
+##   Builds nothing and runs no git, qlot, sbcl or make. Running servers and
+##   the running bus service keep their release until they restart. The same
+##   scratch-home rule as deploy applies.
 rollback:
-	@DSMR_HOME="$(DSMR_HOME)" scripts/deploy.sh rollback
+	@DSMR_HOME="$(DSMR_HOME)" HOST_LINKS="$(HOST_LINKS)" \
+	   BINDIR="$(BINDIR)" SKILLDIR="$(SKILLDIR)" AGENTDIR="$(AGENTDIR)" SUBAGENTDIR="$(SUBAGENTDIR)" \
+	   scripts/deploy.sh rollback
 
 ## register: point Claude Code's dsmr-mcp entry at the deployed release.
 ##

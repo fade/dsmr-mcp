@@ -20,10 +20,18 @@
 #   DEPLOY_VERIFY_TIMEOUT  seconds the verify stage may run; default 120
 #   DEPLOY_WORKER_TIMEOUT  seconds verify-worker waits for the worker's
 #              handshake; default 30
+#   HOST_LINKS 0 skips every step that writes outside the home: the bus binary
+#              links in BINDIR
+#   BINDIR     where the bus binary links go; default $HOME/.local/bin
+#   SKILLDIR, AGENTDIR, SUBAGENTDIR  the host's skill, agent configuration and
+#              agent definition directories; defaults $HOME/.claude/skills,
+#              $HOME/.claude and $AGENTDIR/agents
 #
-# Gates, before anything is created under the home: the home is not inside a
-# git work tree, REPO has no uncommitted change to a tracked file, and REF is
-# reachable from a branch on origin. A refusal changes nothing.
+# Gates, before anything is created under the home: a home other than the
+# default does not write to the host's own BINDIR, SKILLDIR, AGENTDIR or
+# SUBAGENTDIR unless HOST_LINKS is 0, the home is not inside a git work tree,
+# REPO has no uncommitted change to a tracked file, and REF is reachable from a
+# branch on origin. A refusal changes nothing.
 #
 # One flock on <home>/deploy.lock covers a whole deploy or rollback;
 # <home>/deploy.holder names the process that holds it.
@@ -34,15 +42,22 @@
 #   build-server  the sealed release-server core, built by plain SBCL
 #   build-worker  the release-worker core, <release>/core/dsmr.core.worker,
 #                 built the same way with HOME kept so the host Quicklisp is found
+#   build-bus     <release>/bin/dsmr-bus-watch and dsmr-bus-host, built by the
+#                 release's own Makefile against the release's bundle
 #   manifest      <release>/MANIFEST, written once the build succeeded
 #   verify-initialize  the release's own launcher answers initialize and tools/list
 #   verify-worker the worker core passes scripts/verify-core-worker.lisp from the
 #                 inside, then boots as the pool boots a worker and prints a
 #                 handshake, kept as <release>/verify-worker.json
+#   verify-bus    each bus binary answers --help with exit 0 and some output
 #   flip          <home>/current names the release, by one rename
+#   links         $BINDIR/dsmr-bus-watch and dsmr-bus-host become links to
+#                 <home>/current/bin/<name>; a regular file there is kept as
+#                 <name>.pre-release-<UTC stamp> first. Skipped when HOST_LINKS=0
 #
-# A failure in any stage prints `deploy: <stage> failed: ...; current is
-# unchanged` and exits 1.
+# A failure in any stage before the flip prints `deploy: <stage> failed: ...;
+# current is unchanged` and exits 1. A failure after it names the release now
+# current and the redeploy that finishes the host steps.
 #
 # A release directory is built at its final path and never renamed: an SBCL
 # image records absolute source paths. A release with a MANIFEST is complete
@@ -50,8 +65,8 @@
 # that stopped and is removed. A failed verify removes the MANIFEST and leaves
 # current and previous untouched. A verified release is made read-only.
 #
-# rollback swaps current and previous with two renames. It runs no git, qlot,
-# sbcl or make.
+# rollback swaps current and previous with two renames, then runs the links
+# stage. It runs no git, qlot, sbcl or make.
 set -euo pipefail
 
 # shellcheck source=release-paths.sh
@@ -60,6 +75,9 @@ set -euo pipefail
 
 # Suffix fail() appends; set once the gates have passed and a stage can run.
 FAIL_NOTE=""
+
+# The bus binaries a release builds and the host reaches through links.
+BUS_BINARIES="dsmr-bus-watch dsmr-bus-host"
 
 die() { printf 'deploy: %s\n' "$*" >&2; exit 1; }
 say() { printf 'deploy: %s\n' "$*" >&2; }
@@ -150,6 +168,87 @@ lock_dependencies() {
   ' "$1"
 }
 
+# host_default <VAR>
+# Print the host's own directory for BINDIR, SKILLDIR, AGENTDIR or SUBAGENTDIR.
+host_default() {
+  case "$1" in
+    BINDIR) printf '%s\n' "${HOME:-}/.local/bin" ;;
+    SKILLDIR) printf '%s\n' "${HOME:-}/.claude/skills" ;;
+    AGENTDIR) printf '%s\n' "${HOME:-}/.claude" ;;
+    SUBAGENTDIR) printf '%s\n' "${HOME:-}/.claude/agents" ;;
+  esac
+}
+
+# Fill each host destination left empty with its default.
+BINDIR="${BINDIR:-$(host_default BINDIR)}"
+SKILLDIR="${SKILLDIR:-$(host_default SKILLDIR)}"
+AGENTDIR="${AGENTDIR:-$(host_default AGENTDIR)}"
+SUBAGENTDIR="${SUBAGENTDIR:-$AGENTDIR/agents}"
+
+# host_problem <home>
+# Print a refusal and return 1 when <home> is not the default deploy home,
+# HOST_LINKS is not 0, and one of BINDIR, SKILLDIR, AGENTDIR or SUBAGENTDIR
+# still names the host's own directory. Paths are compared resolved, so another
+# spelling of a host directory is caught too.
+host_problem() {
+  local home="$1" default var
+  [ "${HOST_LINKS:-}" = "0" ] && return 0
+  default="$(DSMR_HOME='' dsmr_home 2>/dev/null)" || default=""
+  if [ -n "$default" ] && [ "$(realpath -m -- "$home")" = "$(realpath -m -- "$default")" ]; then
+    return 0
+  fi
+  for var in BINDIR SKILLDIR AGENTDIR SUBAGENTDIR; do
+    if [ "$(realpath -m -- "${!var}")" = "$(realpath -m -- "$(host_default "$var")")" ]; then
+      printf 'DSMR_HOME %s is a scratch home but %s is the host'"'"'s %s; set HOST_LINKS=0 or point BINDIR, SKILLDIR, AGENTDIR and SUBAGENTDIR at scratch directories\n' \
+        "$home" "$var" "${!var}"
+      return 1
+    fi
+  done
+}
+
+# link_bus_binaries <home>
+# Make $BINDIR/<name> a symbolic link to <home>/current/bin/<name> for each bus
+# binary, so the host's fixed paths follow current. A regular file in the way is
+# kept as <name>.pre-release-<UTC stamp> (a hard link when the file system
+# allows one, else a copy) before the link is renamed over it. Skipped when
+# HOST_LINKS=0. Return 1 with LINK_PROBLEM set on a failure.
+LINK_PROBLEM=""
+link_bus_binaries() {
+  local home="$1" name dest target stamp tmp
+  if [ "${HOST_LINKS:-}" = "0" ]; then
+    say "links: skipped (HOST_LINKS=0)"
+    return 0
+  fi
+  mkdir -p "$BINDIR" || { LINK_PROBLEM="cannot create $BINDIR"; return 1; }
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  for name in $BUS_BINARIES; do
+    dest="$BINDIR/$name"
+    target="$home/current/bin/$name"
+    if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$target" ]; then
+      say "links: $dest -> $target"
+      continue
+    fi
+    if [ -e "$dest" ] && [ ! -L "$dest" ]; then
+      if [ ! -f "$dest" ]; then
+        LINK_PROBLEM="$dest is neither a regular file nor a link; move it away"
+        return 1
+      fi
+      ln "$dest" "$dest.pre-release-$stamp" 2>/dev/null \
+        || cp -p "$dest" "$dest.pre-release-$stamp" \
+        || { LINK_PROBLEM="cannot keep $dest as $dest.pre-release-$stamp"; return 1; }
+      say "links: kept $dest as $dest.pre-release-$stamp"
+    fi
+    tmp="$BINDIR/.$name.link.$$"
+    if ! { ln -sfn "$target" "$tmp" && mv -Tf "$tmp" "$dest"; }; then
+      rm -f "$tmp"
+      LINK_PROBLEM="cannot link $dest to $target"
+      return 1
+    fi
+    say "links: $dest -> $target"
+  done
+  say "links: a running dsmr-bus-host keeps its image until systemctl --user restart dsmr-bus-host, which is a deliberate act; a running watcher keeps its image until it is re-armed"
+}
+
 deploy() {
   local repo="${REPO:-}" ref="${REF:-}" qlot="${QLOT:-}" sbcl="${SBCL:-sbcl}"
   [ -n "$ref" ] || die "REF is empty; run make deploy REF=<sha>"
@@ -163,6 +262,10 @@ deploy() {
   home="$(dsmr_home)" || exit 1
 
   # Gates: nothing is created under the home until all have passed.
+  local problem
+  if ! problem="$(host_problem "$home")"; then
+    die "$problem"
+  fi
   if home_in_work_tree "$home"; then
     die "DSMR_HOME $home is inside a git work tree; point DSMR_HOME at a directory outside every checkout"
   fi
@@ -266,6 +369,23 @@ deploy() {
       || fail build-worker "$rel/core/dsmr.core.worker.manifest does not say kind release-worker; read $rel/build-worker.log"
     say "build-worker: done in $((SECONDS - t0))s, core $(stat -c %s "$rel/core/dsmr.core.worker") bytes"
 
+    t0=$SECONDS
+    say "build-bus: $BUS_BINARIES (log $rel/build-bus.log)"
+    if ! env "${scrub[@]}" -u MAKEFLAGS -u MFLAGS -u MAKELEVEL \
+           XDG_CACHE_HOME="$rel/cache" \
+           make -C "$rel" --no-print-directory bus-watch bus-host \
+           BUS_DEPS_SETUP="$rel/deps/setup.lisp" SBCL="$sbcl" \
+           >"$rel/build-bus.log" 2>&1; then
+      show_log_tail "$rel/build-bus.log"
+      fail build-bus "the bus binary build exited non-zero; read $rel/build-bus.log"
+    fi
+    local name
+    for name in $BUS_BINARIES; do
+      [ -f "$rel/bin/$name" ] && [ -x "$rel/bin/$name" ] \
+        || fail build-bus "no executable $rel/bin/$name; read $rel/build-bus.log"
+    done
+    say "build-bus: done in $((SECONDS - t0))s"
+
     [ -f "$rel/qlfile.lock" ] || fail manifest "no qlfile.lock in $rel; commit qlfile.lock"
     local sbcl_version
     sbcl_version="$(awk '/^sbcl-version /{ $1=""; sub(/^ /,""); print; exit }' "$rel/core/dsmr.core.manifest")"
@@ -298,6 +418,11 @@ deploy() {
     rm -f "$rel/MANIFEST"
     fail verify-worker "$VERIFY_PROBLEM (output kept in $vscratch)"
   fi
+  if ! verify_bus "$rel" "$vscratch"; then
+    chmod -R u+w "$rel"
+    rm -f "$rel/MANIFEST"
+    fail verify-bus "$VERIFY_PROBLEM (output kept in $vscratch)"
+  fi
   if [ ! -f "$rel/verify-initialize.jsonl" ]; then
     cp "$vscratch/verify-initialize.jsonl" "$vscratch/verify-initialize.log" "$rel/"
   fi
@@ -320,6 +445,9 @@ deploy() {
   ln -sfn "releases/$sha" "$home/current.new"
   mv -Tf "$home/current.new" "$current"
   say "flip: current -> releases/$sha"
+  FAIL_NOTE="; current is releases/$sha; fix the cause and run make deploy REF=$sha again to finish the host steps"
+
+  link_bus_binaries "$home" || fail links "$LINK_PROBLEM"
 }
 
 # manifest_commit <release dir>
@@ -332,10 +460,15 @@ manifest_commit() {
 rdie() { printf 'rollback: %s\n' "$*" >&2; exit 1; }
 
 # rollback
-# Swap current and previous with two renames. Runs no git, qlot, sbcl or make.
+# Swap current and previous with two renames, then repair the bus binary links.
+# Runs no git, qlot, sbcl or make.
 rollback() {
   local home cur prev
   home="$(dsmr_home)" || exit 1
+  local problem
+  if ! problem="$(host_problem "$home")"; then
+    rdie "$problem"
+  fi
   [ -d "$home" ] || rdie "no deploy home at $home; nothing to roll back to"
   take_lock "$home" "rollback"
 
@@ -353,6 +486,8 @@ rollback() {
   mv -Tf "$home/current.new" "$home/current"
   mv -Tf "$home/previous.new" "$home/previous"
   printf 'current -> %s (commit %s)\n' "$prev" "$(manifest_commit "$home/$prev")"
+  link_bus_binaries "$home" \
+    || rdie "links failed: $LINK_PROBLEM; current is $prev; run make rollback again only after fixing it, since a second rollback swaps back"
 }
 
 # verify_initialize <release> <sbcl> <scratch>
@@ -466,6 +601,40 @@ verify_worker() {
   fi
   printf '%s\n' "$line" >"$scratch/verify-worker.json"
   say "verify-worker: passed in $((SECONDS - t0))s"
+}
+
+# verify_bus <release> <scratch>
+# Run each bus binary with --help under scratch state and cache directories.
+# Return 0 when every one exits 0 within DEPLOY_VERIFY_TIMEOUT seconds and
+# prints something on stdout; otherwise set VERIFY_PROBLEM and return 1.
+verify_bus() {
+  local rel="$1" scratch="$2" name bin out status t0
+  t0=$SECONDS
+  say "verify-bus: $BUS_BINARIES --help"
+  for name in $BUS_BINARIES; do
+    bin="$rel/bin/$name"
+    out="$scratch/verify-bus-$name"
+    if [ ! -f "$bin" ] || [ ! -x "$bin" ]; then
+      VERIFY_PROBLEM="no executable $bin; deploy the commit again to rebuild the release"
+      return 1
+    fi
+    set +e
+    env -i HOME="$HOME" PATH="$PATH" \
+        XDG_STATE_HOME="$scratch/bus-state" XDG_CACHE_HOME="$scratch/bus-cache" \
+        timeout "${DEPLOY_VERIFY_TIMEOUT:-120}" "$bin" --help \
+        </dev/null >"$out.out" 2>"$out.err"
+    status=$?
+    set -e
+    if [ "$status" -ne 0 ]; then
+      VERIFY_PROBLEM="$name --help exited $status (stderr $out.err)"
+      return 1
+    fi
+    if [ ! -s "$out.out" ]; then
+      VERIFY_PROBLEM="$name --help printed nothing on stdout (stderr $out.err)"
+      return 1
+    fi
+  done
+  say "verify-bus: passed in $((SECONDS - t0))s"
 }
 
 case "${1:-}" in

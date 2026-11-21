@@ -12,7 +12,13 @@
 # tests/build/fixtures/worker-handshake.json, a handshake recorded from a real
 # release worker core (provenance in worker-handshake.txt), and waits for
 # SIGTERM. Its behaviour is set per case through the file $WORK/stub-mode,
-# because the verify stages scrub the environment.
+# because the verify stages scrub the environment. A stub make, first on PATH
+# for every deploy, stands in for the release's bus binary build: it writes two
+# stub binaries into <release>/bin that answer --help.
+#
+# Every deploy and rollback runs with HOME at $WORK/fakehome, so the host
+# defaults for BINDIR, SKILLDIR, AGENTDIR and SUBAGENTDIR name directories
+# inside the temporary tree even when a case leaves them unset.
 #
 # Everything lives under one mktemp directory; TMPDIR points into it so the
 # verify stage's scratch directories are removed with it.
@@ -61,8 +67,30 @@ fi
 
 # ---- stubs --------------------------------------------------------------
 
-mkdir -p "$WORK/bin" "$WORK/guard"
+mkdir -p "$WORK/bin" "$WORK/guard" "$WORK/fakehome"
 echo ok > "$WORK/stub-mode"
+
+# Stub make: `make -C <release> ... bus-watch bus-host BUS_DEPS_SETUP=...`
+# writes <release>/bin/dsmr-bus-watch and dsmr-bus-host. Each answers --help
+# unless the stub mode is bus-help-fails.
+cat > "$WORK/bin/make" <<STUB
+#!/bin/sh
+echo "\$*" >> "$WORK/make.log"
+dir=.
+while [ \$# -gt 0 ]; do
+  case "\$1" in -C) dir=\$2; shift ;; esac
+  shift
+done
+mkdir -p "\$dir/bin"
+for name in dsmr-bus-watch dsmr-bus-host; do
+  cat > "\$dir/bin/\$name" <<'BIN'
+#!/bin/sh
+case "\$(cat "$WORK/stub-mode")" in bus-help-fails) echo "stub: broken" >&2; exit 2 ;; esac
+echo "usage: stub bus binary"
+BIN
+  chmod +x "\$dir/bin/\$name"
+done
+STUB
 
 cat > "$WORK/bin/qlot" <<STUB
 #!/bin/sh
@@ -154,7 +182,9 @@ OUT=""; RC=0
 deploy() {
     local home=$1 ref=$2
     shift 2
-    OUT=$(env -u ALLOW_UNPUBLISHED REPO="$REPO" REF="$ref" DSMR_HOME="$home" \
+    OUT=$(env -u ALLOW_UNPUBLISHED -u BINDIR -u SKILLDIR -u AGENTDIR -u SUBAGENTDIR \
+              HOME="$WORK/fakehome" PATH="$WORK/bin:$PATH" HOST_LINKS=0 \
+              REPO="$REPO" REF="$ref" DSMR_HOME="$home" \
               QLOT="$WORK/bin/qlot" SBCL="$WORK/bin/sbcl" DEPLOY_VERIFY_TIMEOUT=5 \
               "$@" bash "$DEPLOY" deploy 2>&1)
     RC=$?
@@ -179,6 +209,13 @@ try "bundled dependency sources are kept" "dir-git.asd missing" test -f "$H/rele
 try "release holds a worker core" "no core/dsmr.core.worker" test -s "$H/releases/$C1/core/dsmr.core.worker"
 try "worker core was built as a release-worker" "manifest: $(cat "$H/releases/$C1/core/dsmr.core.worker.manifest" 2>/dev/null)" grep -qx 'kind release-worker' "$H/releases/$C1/core/dsmr.core.worker.manifest"
 try "release keeps the worker handshake" "verify-worker.json differs" cmp -s "$HANDSHAKE" "$H/releases/$C1/verify-worker.json"
+for name in dsmr-bus-watch dsmr-bus-host; do
+    try "release holds $name" "no executable bin/$name" test -x "$H/releases/$C1/bin/$name"
+done
+try "bus binaries are built against the release bundle" "$(tail -n 1 "$WORK/make.log" 2>/dev/null)" \
+    grep -q "BUS_DEPS_SETUP=$H/releases/$C1/deps/setup.lisp" "$WORK/make.log"
+try "deploy with HOST_LINKS=0 makes no link" "fakehome bin: $(ls "$WORK/fakehome/.local/bin" 2>&1)" \
+    test ! -e "$WORK/fakehome/.local/bin"
 rm -f "$REPO/untracked.txt"
 
 note "flip"
@@ -266,7 +303,7 @@ HV="$WORK/home-verify"
 deploy "$HV" "$C1"; deploy "$HV" "$C2"
 cur0=$(link "$HV/current"); prev0=$(link "$HV/previous")
 for case_ in wrong-name:verify-initialize crash:verify-initialize silent:verify-initialize \
-             no-handshake:verify-worker worker-rejected:verify-worker; do
+             no-handshake:verify-worker worker-rejected:verify-worker bus-help-fails:verify-bus; do
     mode=${case_%%:*} stage=${case_#*:}
     echo "$mode" > "$WORK/stub-mode"
     deploy "$HV" "$C3" DEPLOY_WORKER_TIMEOUT=3
@@ -306,7 +343,11 @@ HB="$WORK/home-rollback"
 deploy "$HB" "$C1"; deploy "$HB" "$C2"
 rm -f "$WORK/guard.hit"
 rollback() {
-    OUT=$(env PATH="$WORK/guard:$PATH" DSMR_HOME="$1" bash "$DEPLOY" rollback 2>&1)
+    local home=$1
+    shift
+    OUT=$(env -u BINDIR -u SKILLDIR -u AGENTDIR -u SUBAGENTDIR \
+              HOME="$WORK/fakehome" PATH="$WORK/guard:$PATH" HOST_LINKS=0 DSMR_HOME="$home" \
+              "$@" bash "$DEPLOY" rollback 2>&1)
     RC=$?
 }
 rollback "$HB"
@@ -323,6 +364,70 @@ rollback "$HN"
 try "rollback with no previous is refused" "rc=$RC: $OUT" test "$RC" -eq 1
 try "refusal says there is nothing to roll back to" "$OUT" has "$OUT" "no previous release at"
 try "refused rollback leaves current" "current=$(link "$HN/current")" test "$(link "$HN/current")" = "releases/$C1"
+
+# ---- host destinations -------------------------------------------------
+
+note "host-destination guard"
+HG="$WORK/home-guard"
+touch "$WORK/marker-guard"; sleep 1
+deploy "$HG" "$C1" HOST_LINKS=
+try "scratch home with host destinations is refused" "rc=$RC: $OUT" test "$RC" -eq 1
+try "refusal names the scratch home and the variable" "$OUT" has "$OUT" "DSMR_HOME $HG is a scratch home but BINDIR is the host's"
+try "refusal names the remedy" "$OUT" has "$OUT" "set HOST_LINKS=0 or point BINDIR, SKILLDIR, AGENTDIR and SUBAGENTDIR at scratch directories"
+try "refusal creates no home" "home exists" test ! -e "$HG"
+written=$(find "$WORK/fakehome" -newer "$WORK/marker-guard" 2>/dev/null | head -3)
+try "refusal writes nothing under the host directories" "written: $written" test -z "$written"
+D="$WORK/dest-guard"
+deploy "$HG" "$C1" HOST_LINKS= BINDIR="$D/bin" SKILLDIR="$D/claude/skills" AGENTDIR="$D/claude" \
+    SUBAGENTDIR="$WORK/fakehome/.claude/agents"
+try "one host directory left is still refused" "rc=$RC: $OUT" test "$RC" -eq 1
+try "refusal names SUBAGENTDIR" "$OUT" has "$OUT" "but SUBAGENTDIR is the host's"
+rollback "$HG" HOST_LINKS=
+try "rollback with a scratch home and host destinations is refused" "rc=$RC: $OUT" test "$RC" -eq 1
+try "rollback refusal names the scratch home" "$OUT" has "$OUT" "is a scratch home but BINDIR is the host's"
+
+note "bus binary links"
+HK="$WORK/home-links"
+D="$WORK/dest-links"
+DESTS=(HOST_LINKS= BINDIR="$D/bin" SKILLDIR="$D/claude/skills" AGENTDIR="$D/claude" SUBAGENTDIR="$D/claude/agents")
+mkdir -p "$D/bin"
+echo "old watcher" > "$D/bin/dsmr-bus-watch"
+chmod +x "$D/bin/dsmr-bus-watch"
+deploy "$HK" "$C1" "${DESTS[@]}"
+try "deploy with scratch destinations succeeds" "rc=$RC: $OUT" test "$RC" -eq 0
+for name in dsmr-bus-watch dsmr-bus-host; do
+    try "$name link names current" "link=$(link "$D/bin/$name")" test "$(link "$D/bin/$name")" = "$HK/current/bin/$name"
+    try "$name resolves to the first release" "resolves to $(readlink -f "$D/bin/$name")" \
+        test "$(readlink -f "$D/bin/$name")" = "$HK/releases/$C1/bin/$name"
+done
+backup=$(find "$D/bin" -name 'dsmr-bus-watch.pre-release-*' | head -1)
+try "a regular file is kept as a dated backup" "backups: $(ls "$D/bin")" \
+    test -n "$backup"
+case "$backup" in
+  *.pre-release-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) ok "backup name carries a UTC stamp" ;;
+  *) bad "backup name carries a UTC stamp" "$backup" ;;
+esac
+try "the backup keeps the old content" "content: $(cat "$backup" 2>/dev/null)" grep -qx 'old watcher' "$backup"
+try "deploy names the service restart" "$OUT" has "$OUT" "systemctl --user restart dsmr-bus-host"
+"$D/bin/dsmr-bus-watch" --help > "$WORK/help.out" 2>&1
+try "the linked watcher answers --help" "$(cat "$WORK/help.out")" grep -q usage "$WORK/help.out"
+deploy "$HK" "$C2" "${DESTS[@]}"
+try "second deploy succeeds" "rc=$RC: $OUT" test "$RC" -eq 0
+try "second deploy keeps the link through current" "link=$(link "$D/bin/dsmr-bus-watch")" \
+    test "$(link "$D/bin/dsmr-bus-watch")" = "$HK/current/bin/dsmr-bus-watch"
+try "the link resolves to the second release" "resolves to $(readlink -f "$D/bin/dsmr-bus-watch")" \
+    test "$(readlink -f "$D/bin/dsmr-bus-watch")" = "$HK/releases/$C2/bin/dsmr-bus-watch"
+try "second deploy makes no second backup" "backups: $(ls "$D/bin")" \
+    test "$(find "$D/bin" -name '*.pre-release-*' | wc -l)" -eq 1
+rm -f "$WORK/guard.hit"
+rm -f "$D/bin/dsmr-bus-host"
+rollback "$HK" "${DESTS[@]}"
+try "rollback with scratch destinations succeeds" "rc=$RC: $OUT" test "$RC" -eq 0
+try "after rollback the watcher resolves to the first release" "resolves to $(readlink -f "$D/bin/dsmr-bus-watch")" \
+    test "$(readlink -f "$D/bin/dsmr-bus-watch")" = "$HK/releases/$C1/bin/dsmr-bus-watch"
+try "rollback repairs a missing link" "link=$(link "$D/bin/dsmr-bus-host")" \
+    test "$(link "$D/bin/dsmr-bus-host")" = "$HK/current/bin/dsmr-bus-host"
+try "rollback ran no make, git, qlot or sbcl" "$(cat "$WORK/guard.hit" 2>/dev/null)" test ! -e "$WORK/guard.hit"
 
 printf '\ndeploy-test: %s passed, %s failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
