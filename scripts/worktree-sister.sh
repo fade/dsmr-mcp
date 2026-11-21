@@ -206,13 +206,25 @@ cmd_create() {
             refuse "$hookdir exists and is not empty; move it aside, then run again"
     fi
 
-    local start have_branch=0
+    local start have_branch=0 track=() remotes=() r
     if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
         have_branch=1
         [[ -z $base ]] || refuse "branch $branch exists, so --base $base would not be used; drop --base"
         start=$branch
     else
-        start=${base:-HEAD}
+        # A branch only a remote has is tracked, not started afresh from HEAD.
+        while IFS= read -r r; do
+            git -C "$repo" show-ref --verify --quiet "refs/remotes/$r/$branch" && remotes+=("$r")
+        done < <(git -C "$repo" remote)
+        if ((${#remotes[@]} > 1)); then
+            refuse "branch $branch exists on several remotes (${remotes[*]}); check it out in $repo first"
+        elif ((${#remotes[@]} == 1)); then
+            [[ -z $base ]] || refuse "branch $branch exists as ${remotes[0]}/$branch, so --base $base would not be used; drop --base"
+            start=${remotes[0]}/$branch
+            track=(--track)
+        else
+            start=${base:-HEAD}
+        fi
     fi
     git -C "$repo" rev-parse --verify --quiet "$start^{commit}" >/dev/null ||
         refuse "start point is not a commit: $start"
@@ -233,7 +245,7 @@ cmd_create() {
         if ((have_branch)); then
             printf 'would run: git -C %s worktree add %s %s\n' "$repo" "$dest" "$branch"
         else
-            printf 'would run: git -C %s worktree add -b %s %s %s\n' "$repo" "$branch" "$dest" "$start"
+            printf 'would run: git -C %s worktree add %s-b %s %s %s\n' "$repo" "${track[*]:+${track[*]} }" "$branch" "$dest" "$start"
         fi
         printf 'would write: %s, with a link to each shared entry of %s\n' "$reg" "$bucket"
         printf 'would link: %s -> %s\n' "$hookdir" "$bucket/sisters/$name"
@@ -251,7 +263,7 @@ cmd_create() {
     if ((have_branch)); then
         git -C "$repo" worktree add "$dest" "$branch" >&2 || refuse "git worktree add failed; nothing was created"
     else
-        git -C "$repo" worktree add -b "$branch" "$dest" "$start" >&2 || refuse "git worktree add failed; nothing was created"
+        git -C "$repo" worktree add ${track[@]+"${track[@]}"} -b "$branch" "$dest" "$start" >&2 || refuse "git worktree add failed; nothing was created"
     fi
 
     # From here a failure leaves a worktree; say which step and how to clear it.

@@ -343,6 +343,20 @@ rm "$HOOKD/note"
 ws create --no-launch --bus b "$G/repo" feature/thing
 try "an empty hook path directory is replaced by the link" "rc=$RC out=$OUT" same "$(readlink "$HOOKD" 2>&1)" "$G/bucket/sisters/repo-integration"
 
+fixture remote-branch
+git -C "$G/repo" switch -q -c release/v1
+printf 'release\n' >>"$G/repo/README"
+git -C "$G/repo" commit -qam 'Release work'
+git -C "$G/repo" push -q -u origin release/v1 2>/dev/null
+REL=$(git -C "$G/repo" rev-parse HEAD)
+git -C "$G/repo" switch -q main
+git -C "$G/repo" branch -q -D release/v1
+refused "a branch on a remote with --base" 1 create --no-launch --bus b --base main "$G/repo" release/v1
+ws create --no-launch --bus b "$G/repo" release/v1
+try "a branch only a remote has is created" "rc=$RC out=$OUT" same "$RC" 0
+try "it starts at the remote's tip, not at HEAD" "" same "$(git -C "$G/scratch/repo-v1" rev-parse HEAD 2>&1)" "$REL"
+try "it tracks the remote branch" "" same "$(git -C "$G/scratch/repo-v1" rev-parse --abbrev-ref '@{upstream}' 2>&1)" origin/release/v1
+
 # ---------------------------------------------------------------------------
 note "create: dry run and no launch"
 fixture dry
