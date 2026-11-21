@@ -431,8 +431,12 @@ cmd_teardown() {
 
     # g, h. Work that exists only in this worktree.
     if ((listed)) && [[ -d $wt ]]; then
-        [[ -z $(git -C "$wt" status --porcelain 2>/dev/null) ]] ||
-            soft+=("$wt has uncommitted or untracked changes")
+        # git worktree remove deletes ignored files too, so they count.
+        local dirty
+        dirty=$(git -C "$wt" status --porcelain --untracked-files=all --ignored 2>/dev/null |
+                grep -vxE '!! (\.planning|\.envrc)' || true)
+        [[ -z $dirty ]] ||
+            soft+=("$wt holds uncommitted, untracked or ignored files: $(head -3 <<<"$dirty" | tr '\n' ' ')")
         local unpushed
         unpushed=$(git -C "$wt" rev-list --count HEAD --not --remotes 2>/dev/null || echo unknown)
         [[ $unpushed == 0 ]] ||

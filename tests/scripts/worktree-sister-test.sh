@@ -535,6 +535,19 @@ sister untracked
 printf 'new\n' >"$WT/scratch-note"
 refused_td "an untracked file" repo-integration
 
+sister ignoredfile
+printf '*.log\n' >>"$(git -C "$WT" rev-parse --path-format=absolute --git-path info/exclude)"
+printf 'output\n' >"$WT/build.log"
+refused_td "an ignored file" repo-integration
+try "the refusal names the ignored file" "$OUT" has "$OUT" "!! build.log"
+td --force repo-integration
+try "an ignored file under --force is removed" "rc=$RC out=$OUT" same "$RC" 0
+
+sister hiddenuntracked
+git -C "$WT" config status.showUntrackedFiles no
+printf 'new\n' >"$WT/scratch-note"
+refused_td "an untracked file when git is set to hide them" repo-integration
+
 sister unpushed
 printf 'more\n' >>"$WT/README"
 git -C "$WT" commit -qam 'Change README'
@@ -571,7 +584,7 @@ rm "$SD/LEFT"
 printf 'changed\n' >>"$WT/README"
 refused_td "no LEFT and a dirty tree together" repo-integration
 try "one run reports the missing LEFT" "$OUT" has "$OUT" "has not left"
-try "one run reports the dirty tree" "$OUT" has "$OUT" "uncommitted or untracked changes"
+try "one run reports the dirty tree" "$OUT" has "$OUT" "uncommitted, untracked or ignored files"
 
 sister inside
 OUT=$(cd "$WT" && DSMR_BUS_WATCH=$STUBS/dsmr-bus-watch bash "$SCRIPT" teardown --repo "$G/repo" repo-integration 2>&1)
