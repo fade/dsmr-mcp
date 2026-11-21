@@ -210,13 +210,13 @@
 ;;; Release kind: seal the registry. Only the package-inferred search function
 ;;; remains, so a system already loaded still resolves and any other system
 ;;; signals MISSING-COMPONENT instead of being found on the host.
+
 (defun build-core-seal ()
-  (setf asdf:*central-registry* nil
-        asdf:*default-source-registries* nil
-        asdf:*system-definition-search-functions*
-        (list (uiop:find-symbol* '#:sysdef-package-inferred-system-search
-                                 '#:asdf/package-inferred-system)))
-  (asdf:clear-source-registry)
+  "Seal the registry with the server's own SEAL-SOURCE-REGISTRY, then exit 1
+unless SEALED-P confirms it."
+  (uiop:symbol-call '#:dsmr-mcp/src/release '#:seal-source-registry)
+  (unless (uiop:symbol-call '#:dsmr-mcp/src/release '#:sealed-p)
+    (build-core-die "the registry is not sealed after seal-source-registry; check dsmr-mcp/src/release"))
   (format *error-output* "~&[build-core] sealed: ~D search function, no source registry~%"
           (length asdf:*system-definition-search-functions*)))
 

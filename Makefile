@@ -764,13 +764,17 @@ test-integration: bus-binaries
 ##   fails and when the package holds no test, since a leaf that runs nothing
 ##   is a wiring fault. TEST_TIMEOUT limits the run, or
 ##   TEST_INTEGRATION_TIMEOUT when LEAF is under dsmr-mcp/tests/integration/.
+##   A leaf under dsmr-mcp/tests/integration/ runs test-core first and gets
+##   $(TEST_CORE) as DSMR_BROKER_CORE, as under test-integration.
 ##   The command is not echoed, so a search of the log for the source check's
 ##   refusal finds only a refusal the run printed.
 LEAF ?=
-LEAF_LIMIT = $(if $(filter dsmr-mcp/tests/integration/%,$(LEAF)),TEST_INTEGRATION_TIMEOUT,TEST_TIMEOUT)
+LEAF_INTEGRATION = $(filter dsmr-mcp/tests/integration/%,$(LEAF))
+LEAF_LIMIT = $(if $(LEAF_INTEGRATION),TEST_INTEGRATION_TIMEOUT,TEST_TIMEOUT)
 test-leaf:
 	@$(if $(strip $(LEAF)),:,echo "test-leaf: LEAF is empty; name a test system, for example LEAF=dsmr-mcp/tests/install/config-test" >&2; exit 1)
-	@$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(call TEST_LIMIT,$(LEAF_LIMIT)) $(SBCL) --noinform --disable-debugger --non-interactive \
+	$(if $(LEAF_INTEGRATION),+@$(MAKE) --no-print-directory test-core)
+	@$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(if $(LEAF_INTEGRATION),DSMR_BROKER_CORE="$(TEST_CORE)") $(call TEST_LIMIT,$(LEAF_LIMIT)) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests/support/test-watchdog")' \
 	     --eval '(asdf:load-system "$(LEAF)")' \
