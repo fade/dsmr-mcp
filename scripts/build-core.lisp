@@ -136,12 +136,24 @@
     (pushnew workspace asdf:*central-registry* :test #'equal)
     (format *error-output* "~&[build-core] source-registry root: ~A~%" workspace)))
 
-;;; Release kind: take ASDF from the bundle and refuse any other version, then
-;;; resolve dsmr-mcp from the release directory alone. The bundle's searcher,
-;;; installed by deps/setup.lisp, resolves every dependency.
+;;; Release kind: limit the source registry to the release, load the bundle's
+;;; asdf.lisp, and refuse any other ASDF version; then resolve dsmr-mcp from the
+;;; release directory alone. The bundle's searcher, installed by
+;;; deps/setup.lisp, resolves every dependency. The bundled asdf.lisp is loaded
+;;; as a file rather than through LOAD-SYSTEM: that searcher knows only primary
+;;; system names, so ASDF's build of asdf/defsystem would resolve through any
+;;; registry still open and regenerate another checkout's build/asdf.lisp.
 (when (build-core-release-p)
-  (let ((*standard-output* *error-output*))
-    (asdf:load-system "asdf"))
+  (asdf:initialize-source-registry
+   `(:source-registry (:directory ,*build-core-release-root*)
+                      :ignore-inherited-configuration))
+  (let ((asdf-source (merge-pathnames "deps/local-projects/asdf/build/asdf.lisp"
+                                      *build-core-release-root*))
+        (*standard-output* *error-output*))
+    (unless (probe-file asdf-source)
+      (build-core-die "no ASDF source at ~A; check the qlfile's asdf line"
+                      (namestring asdf-source)))
+    (load asdf-source))
   (let ((found (asdf:asdf-version)))
     (unless (string= found *build-core-release-asdf-version*)
       (build-core-die "ASDF ~A is loaded; a release build needs ~A from ~Adeps/; check the qlfile's asdf line"
