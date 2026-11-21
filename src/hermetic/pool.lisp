@@ -1169,18 +1169,9 @@ start reads the environment it runs under and a special bound around the
 call wins in every pool thread. The validation below checks those resolved
 values.
 
-Pre-warms the worker system's fasl cache in the parent process before
-allowing any concurrent worker spawn. When the cache is cold, two workers
-spawning in parallel (warmup standby + on-demand session) would race
-compiling the same package-inferred system files into the shared ASDF
-output path, causing a fatal compile error in one of the children. Loading
-the worker system here, under *init-lock*, ensures the fasls are on disk
-before the replenish thread or any get-or-assign-worker call launches a
-child. On a warm cache asdf:load-system returns immediately with no I/O.
-
-Returns immediately after pre-warm; warm standby workers spawn
-asynchronously via the replenish thread so the caller is not blocked on
-subprocess launches beyond the one-time fasl compile on a cold cache."
+Loads no system, so a start compiles nothing. Returns without waiting for
+workers: warm standby workers spawn asynchronously via the replenish
+thread."
   (bt:with-lock-held (*init-lock*)
     (let* ((settings (resolve-pool-settings))
            (max-size (pool-settings-max-pool-size settings))
@@ -1208,19 +1199,6 @@ subprocess launches beyond the one-time fasl compile on a cold cache."
                  attempts))))
     (when *pool-running*
       (shutdown-pool))
-    ;; Pre-warm the worker system's fasl cache so concurrent child spawns
-    ;; never race to compile the same files. This is the fix for the cold
-    ;; concurrent spawn race: both the warmup standby and an immediate
-    ;; session worker call (asdf:load-system :dsmr-mcp/src/hermetic/worker/main)
-    ;; in their SBCL child command line; without pre-warming, they compile
-    ;; into the same shared cache simultaneously and one fatally aborts.
-    ;; Loading here in the parent populates the cache once, serially, so
-    ;; every child thereafter reads cached fasls and skips compilation.
-    (handler-case
-        (asdf:load-system :dsmr-mcp/src/hermetic/worker/main)
-      (error (e)
-        (log-event :warn "pool.worker-system.preload-failed"
-                   "error" (princ-to-string e))))
     (bt:with-lock-held (*pool-lock*)
       (setf *affinity-map* (make-hash-table :test 'equal)
             *standby-workers* nil
