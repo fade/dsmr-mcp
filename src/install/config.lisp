@@ -93,26 +93,26 @@ takes over a now-pristine stdout on the stdio transport."
                     system-name)
    "--eval" (format nil "(~A:run :transport :stdio)" system-name)))
 
-(defun canonical-server-entry (&optional (system-name +dsmr-server-name+)
-                               &key launcher)
-  "Return a NEW jzon hash-table describing the canonical stdio MCP server
-entry for SYSTEM-NAME (default \"dsmr-mcp\").
+(defun canonical-server-entry (system-name &key launcher env)
+  "Return a new jzon hash-table for the stdio MCP server entry of SYSTEM-NAME,
+a string such as \"dsmr-mcp\".
 
-When LAUNCHER is a non-nil path string, the entry invokes that executable
-directly with no arguments — the lifecycle launch wrapper
-(scripts/dsmr-mcp-launch.sh), which boots the prebuilt core when it is fresh
-and regenerates it on SBCL/source/dependency drift. The shape is
-{\"type\":\"stdio\",\"command\":LAUNCHER,\"args\":[]}.
+With LAUNCHER, a path string, the entry runs that executable with no arguments:
+{\"type\":\"stdio\",\"command\":LAUNCHER,\"args\":[]}. Without it, the entry
+is the source-load shape {\"type\":\"stdio\",\"command\":\"sbcl\",\"args\":[...]},
+which loads SYSTEM-NAME and calls its run entry; sibling systems such as cl-mcp
+use it.
 
-When LAUNCHER is NIL the entry is the source-load fallback shape
-{\"type\":\"stdio\",\"command\":\"sbcl\",\"args\":[...]}, parameterized by
-SYSTEM-NAME so the same constructor can describe cl-mcp or any sibling
-system that follows the load-then-run convention."
-  (if launcher
-      (%ht "type" "stdio" "command" launcher "args" (%vec))
-      (%ht "type"    "stdio"
-           "command" "sbcl"
-           "args"    (%args-vector system-name))))
+ENV, a hash-table of string keys and values, becomes the entry's \"env\"
+object when it is non-empty."
+  (let ((entry (if launcher
+                   (%ht "type" "stdio" "command" launcher "args" (%vec))
+                   (%ht "type"    "stdio"
+                        "command" "sbcl"
+                        "args"    (%args-vector system-name)))))
+    (when (and (hash-table-p env) (plusp (hash-table-count env)))
+      (setf (gethash "env" entry) env))
+    entry))
 
 ;;; Detector -----------------------------------------------------------------
 
@@ -146,30 +146,38 @@ are copied here, so unrelated values stay untouched in the original."
 
 ;;; Core transform -----------------------------------------------------------
 
+(defun %entry-env (servers system-name)
+  "Return a new env hash-table for the SYSTEM-NAME entry in SERVERS: a copy of
+the existing entry's env when it is an object, with DSMR_READ_ROOTS set to
+~/SourceCode/lisp/ when that key is absent. SERVERS may be NIL."
+  (let* ((old (and (hash-table-p servers) (gethash system-name servers)))
+         (old-env (and (hash-table-p old) (gethash "env" old)))
+         (env (if (hash-table-p old-env)
+                  (%copy-ht old-env)
+                  (make-hash-table :test 'equal))))
+    (unless (nth-value 1 (gethash "DSMR_READ_ROOTS" env))
+      (setf (gethash "DSMR_READ_ROOTS" env)
+            (namestring (merge-pathnames "SourceCode/lisp/" (user-homedir-pathname)))))
+    env))
+
 (defun ensure-server (config &key (system-name +dsmr-server-name+)
                                   (on-existing-cl-mcp :keep)
                                   launcher)
-  "Return a NEW config object derived from parsed CONFIG with the
-SYSTEM-NAME server entry ensured under \"mcpServers\" and the cl-mcp
-migration policy applied. CONFIG is never mutated.
+  "Return a new config derived from parsed CONFIG with the SYSTEM-NAME entry
+set under \"mcpServers\" and the cl-mcp policy applied. CONFIG, a jzon
+hash-table or NIL for an empty config, is not mutated. Other top-level keys and
+other servers are kept as they are.
 
-CONFIG may be a jzon hash-table or NIL; NIL is treated as an empty config
-and a minimal {\"mcpServers\":{...}} object is produced. Unrelated
-top-level keys and unrelated mcpServers entries are preserved verbatim.
+The entry is canonical-server-entry with LAUNCHER (a path string, or NIL for
+the source-load shape) and the env of the existing entry, plus DSMR_READ_ROOTS
+when that key is absent (see %entry-env).
 
-LAUNCHER is threaded into canonical-server-entry: a non-nil path string
-makes the dsmr-mcp entry invoke that wrapper directly; NIL yields the
-source-load fallback shape.
+ON-EXISTING-CL-MCP selects what happens to an existing cl-mcp entry:
+  :keep    (default) leave it in place beside dsmr-mcp.
+  :remove  delete it.
+  :replace delete it; the same end state as :remove, accepted as a separate intent.
 
-ON-EXISTING-CL-MCP selects what happens to any existing cl-mcp entry:
-  :keep    (default) leave cl-mcp untouched; coexist with dsmr-mcp.
-  :remove  delete the cl-mcp entry if present; migrate away from it.
-  :replace delete cl-mcp and add dsmr-mcp (same end state as :remove for
-           this single-server case; accepted as a distinct intent).
-
-The transform is idempotent: applying it twice yields an object equal to
-applying it once, because the dsmr-mcp entry is always set to the
-canonical value and cl-mcp removal is a no-op when cl-mcp is absent."
+Applying the transform twice gives the same result as applying it once."
   (check-type on-existing-cl-mcp (member :keep :remove :replace))
   (let* ((base (if (hash-table-p config)
                    (%copy-ht config)
@@ -178,11 +186,11 @@ canonical value and cl-mcp removal is a no-op when cl-mcp is absent."
          (servers (if (hash-table-p existing-servers)
                       (%copy-ht existing-servers)
                       (make-hash-table :test 'equal))))
-    ;; cl-mcp policy.
     (when (member on-existing-cl-mcp '(:remove :replace))
       (remhash +cl-mcp-server-name+ servers))
-    ;; Always (re)set the dsmr-mcp entry to the canonical value.
     (setf (gethash system-name servers)
-          (canonical-server-entry system-name :launcher launcher))
+          (canonical-server-entry system-name
+                                  :launcher launcher
+                                  :env (%entry-env servers system-name)))
     (setf (gethash "mcpServers" base) servers)
     base))

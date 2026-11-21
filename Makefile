@@ -47,7 +47,7 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 .PHONY: bridge bus-watch bus-host bus-sources bus-binaries install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-server core-verify core-worker core-verify-worker core-sources test-core test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
         preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path \
-        deploy rollback test-leaf qlot-lock
+        deploy rollback register test-leaf qlot-lock
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -77,6 +77,12 @@ REF ?=
 ##   `unpublished-ref-allowed yes`. For CI and scratch dry runs; leave it empty
 ##   for a deploy to the host's release.
 ALLOW_UNPUBLISHED ?=
+
+## CLAUDE_CONFIG: the Claude Code config file `make register` writes.
+##
+##   Defaults to the host's own config. A run with a scratch DSMR_HOME must name
+##   a scratch file here too, or `make register` refuses.
+CLAUDE_CONFIG ?= $(HOME)/.claude.json
 
 ## QLOT: the qlot executable a release build takes its dependencies through.
 ##
@@ -1014,6 +1020,34 @@ deploy:
 ##   servers keep their release until they restart.
 rollback:
 	@DSMR_HOME="$(DSMR_HOME)" scripts/deploy.sh rollback
+
+## register: point Claude Code's dsmr-mcp entry at the deployed release.
+##
+##   Boots the release's own server core, <DSMR_HOME>/current/core/dsmr.core,
+##   and runs its installer against CLAUDE_CONFIG. The entry names
+##   <DSMR_HOME>/current/bin/dsmr-mcp-launch, so later deploys and rollbacks
+##   need no new registration. The installer backs the config up first, keeps
+##   the entry's env settings and adds DSMR_READ_ROOTS when it is absent, then
+##   prints the result. The leader runs it once per host, after the first
+##   deploy; running sessions pick it up only when they restart. Refuses when no
+##   release is deployed, and when DSMR_HOME names a scratch home while
+##   CLAUDE_CONFIG is still the host's config. A scratch run:
+##   make register DSMR_HOME=<scratch home> CLAUDE_CONFIG=<scratch file>
+register:
+	@default_home="$${XDG_DATA_HOME:-$(HOME)/.local/share}/dsmr-mcp"; \
+	home="$(DSMR_HOME)"; home="$${home%/}"; \
+	config="$$(realpath -m -- "$(CLAUDE_CONFIG)")"; \
+	if [ -n "$$home" ] && [ "$$(realpath -m -- "$$home")" != "$$(realpath -m -- "$$default_home")" ] \
+	   && [ "$$config" = "$$(realpath -m -- "$(HOME)/.claude.json")" ]; then \
+	  echo "register: DSMR_HOME is a scratch home but CLAUDE_CONFIG is the host's config; pass CLAUDE_CONFIG=<scratch file>" >&2; exit 1; \
+	fi; \
+	home="$${home:-$$default_home}"; core="$$home/current/core/dsmr.core"; \
+	if [ ! -f "$$core" ]; then \
+	  echo "register: no deployed release at $$home/current; run make deploy REF=<sha> first" >&2; exit 1; \
+	fi; \
+	DSMR_HOME="$$home" DSMR_REGISTER_CONFIG="$$config" "$(SBCL)" --core "$$core" \
+	   --noinform --non-interactive --no-sysinit --no-userinit \
+	   --eval '(format t "~&register: ~S~%" (dsmr-mcp/src/install/claude:install-into-claude :path (uiop:parse-native-namestring (uiop:getenv "DSMR_REGISTER_CONFIG"))))'
 
 ## core-verify-worker: boot a worker core image and assert it is fit for workers.
 ##
