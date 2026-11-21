@@ -3,15 +3,16 @@
 ;;;;
 ;;;; Automated proof of the launcher supervise loop.
 ;;;;
-;;;; scripts/dsmr-mcp-launch.sh relaunches the server ONLY when it exits with
+;;;; scripts/release-launch.sh relaunches the server ONLY when it exits with
 ;;;; the restart sentinel (75 / EX_TEMPFAIL) and exits the launcher on any other
 ;;;; code. A live MCP client cannot be scripted here, so the SBCL the launcher
-;;;; runs is replaced with a stub: the launcher is copied into a throwaway temp
-;;;; repo whose dsmr.core/manifest are present-and-fresh, so the launcher takes
-;;;; the fast (core) path and runs the stub instead of a real image. The stub
-;;;; counts its server invocations through a file and chooses an exit code by
-;;;; invocation number; the test then asserts the relaunch behavior from the
-;;;; invocation count and the launcher's own exit code.
+;;;; runs is replaced with a stub: the launcher is installed as bin/dsmr-mcp-launch
+;;;; of a throwaway fake release holding a decoy core whose manifest records the
+;;;; stub's SBCL version, so the launcher boots the stub in place of a real
+;;;; image. The stub passes the boot probe, counts its server invocations
+;;;; through a file and chooses an exit code by invocation number; the test
+;;;; then asserts the relaunch behaviour from the invocation count and the
+;;;; launcher's own exit code.
 ;;;;
 ;;;; Gated integration: spawns subprocesses, so it lives outside the fast
 ;;;; umbrella. Skips cleanly when bash is unavailable. Temp paths are seeded with
@@ -59,26 +60,30 @@ state per call so two calls in the same image never collide on the name."
   path)
 
 (defun %launcher-source ()
-  "Absolute path to the committed launcher script."
-  (asdf:system-relative-pathname "dsmr-mcp" "scripts/dsmr-mcp-launch.sh"))
+  "Absolute path to the release launcher script."
+  (asdf:system-relative-pathname "dsmr-mcp" "scripts/release-launch.sh"))
 
 (defun %install-launcher (repo)
-  "Copy the committed launcher into REPO/scripts/ and stand up a present,
-fresh-looking core + manifest there, so the launcher resolves REPO from its own
-location and takes the fast (core) path. The manifest is intentionally empty: no
-recorded sbcl-version and no source roots means core_is_fresh skips both
-staleness checks and trusts the core. Returns the installed launcher pathname."
-  (let ((launcher (merge-pathnames "scripts/dsmr-mcp-launch.sh" repo))
-        (core (merge-pathnames "dsmr.core" repo))
-        (manifest (merge-pathnames "dsmr.core.manifest" repo)))
+  "Make REPO a fake release: the release launcher as bin/dsmr-mcp-launch,
+scripts/release-paths.sh, a decoy core/dsmr.core whose manifest records
+sbcl-version 0.0.0 (the version the stub SBCL reports), and a MANIFEST. Removes
+group and world write so the launcher accepts it. Returns the launcher
+pathname."
+  (let ((launcher (merge-pathnames "bin/dsmr-mcp-launch" repo)))
     (%write-file launcher (uiop:read-file-string (%launcher-source)))
-    (%write-file core "")
-    (%write-file manifest "")
+    (%write-file (merge-pathnames "scripts/release-paths.sh" repo)
+                 (uiop:read-file-string
+                  (asdf:system-relative-pathname "dsmr-mcp" "scripts/release-paths.sh")))
+    (%write-file (merge-pathnames "core/dsmr.core" repo) "")
+    (%write-file (merge-pathnames "core/dsmr.core.manifest" repo)
+                 (format nil "sbcl-version 0.0.0~%"))
+    (%write-file (merge-pathnames "MANIFEST" repo) (format nil "commit 0~%"))
+    (uiop:run-program (list "chmod" "-R" "go-w" (namestring repo)))
     launcher))
 
 (defun %install-stub-sbcl (repo count-file exit-plan)
   "Install a stub that stands in for SBCL. On a --version probe it prints a
-version and exits 0 WITHOUT counting (core_is_fresh probes the version). On a
+version, and on the boot probe ((sb-ext:exit)) it exits 0, neither counted. On a
 server launch it increments COUNT-FILE and exits with the code EXIT-PLAN maps
 its invocation number to: EXIT-PLAN is an alist of (n . code); an invocation
 number absent from the plan exits 0. Returns the stub pathname (executable)."
@@ -93,6 +98,7 @@ number absent from the plan exits 0. Returns the stub pathname (executable)."
              "#!/usr/bin/env bash~%~
               for a in \"$@\"; do~%~
               ~2@Tif [ \"$a\" = \"--version\" ]; then echo \"SBCL 0.0.0\"; exit 0; fi~%~
+              ~2@Tif [ \"$a\" = \"(sb-ext:exit)\" ]; then exit 0; fi~%~
               done~%~
               count_file=~S~%~
               n=$(cat \"$count_file\" 2>/dev/null || echo 0)~%~
@@ -109,12 +115,21 @@ number absent from the plan exits 0. Returns the stub pathname (executable)."
   (uiop:run-program '("env") :output :lines :ignore-error-status t))
 
 (defun %launch (launcher stub)
-  "Run LAUNCHER under bash with SBCL overridden to STUB in an otherwise inherited
-environment. Returns the launcher's integer exit code."
-  (let ((bash (%bash-path))
-        (env (cons (format nil "SBCL=~A" (namestring stub))
-                   (remove-if (lambda (kv) (uiop:string-prefix-p "SBCL=" kv))
-                              (%inherited-env)))))
+  "Run LAUNCHER under bash with SBCL overridden to STUB and XDG_STATE_HOME
+inside the fake release, in an otherwise inherited environment with no DSMR_
+variable. Returns the launcher's integer exit code."
+  (let* ((bash (%bash-path))
+         (state (merge-pathnames "state/"
+                                 (uiop:pathname-parent-directory-pathname
+                                  (uiop:pathname-directory-pathname launcher))))
+         (env (list* (format nil "SBCL=~A" (namestring stub))
+                     (format nil "XDG_STATE_HOME=~A"
+                             (string-right-trim "/" (uiop:native-namestring state)))
+                     (remove-if (lambda (kv)
+                                  (or (uiop:string-prefix-p "SBCL=" kv)
+                                      (uiop:string-prefix-p "XDG_STATE_HOME=" kv)
+                                      (uiop:string-prefix-p "DSMR_" kv)))
+                                (%inherited-env)))))
     (nth-value
      2
      (uiop:run-program
