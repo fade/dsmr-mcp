@@ -137,9 +137,12 @@ in a checkout, a file in a linked work tree."
 
 (defun %preloaded-name-p (name)
   "True for the systems an SBCL image may carry without a source directory:
-asdf, uiop and the sb-* contribs."
+asdf, uiop, asdf-package-system and the sb-* contribs.
+asdf-package-system is registered by ASDF itself and has no source directory
+of its own."
   (or (string= name "asdf")
       (string= name "uiop")
+      (string= name "asdf-package-system")
       (and (< 3 (length name)) (string= "sb-" name :end2 3))))
 
 (defun loaded-system-directories ()
@@ -166,7 +169,8 @@ EXCEPTIONS is never a tie. Every comparison uses physical paths.
 Reasons:
   :CHECKOUT                  the directory lies in a git work tree, under ROOT or not
   :OUTSIDE-RELEASE           the directory is outside ROOT and the SBCL contrib directory
-  :NO-SOURCE                 no source directory, and not asdf, uiop or an sb-* contrib
+  :NO-SOURCE                 no source directory, and not asdf, uiop,
+                             asdf-package-system or an sb-* contrib
   :LAUNCHER-IN-WORK-TREE     the launcher lies in a git work tree
   :LAUNCHER-OUTSIDE-RELEASE  the launcher is outside ROOT"
   (let* ((root (%physical-directory root))

@@ -61,7 +61,11 @@ cat > "$WORK/bin/qlot" <<STUB
 echo "\$*" >> "$WORK/qlot.log"
 case "\$1" in
   install) mkdir -p .qlot ;;
-  bundle)  mkdir -p deps; : > deps/setup.lisp ;;
+  bundle)  mkdir -p deps/local-projects/dir-git/.git deps/local-projects/file-git
+           : > deps/setup.lisp
+           : > deps/local-projects/dir-git/.git/HEAD
+           : > deps/local-projects/dir-git/dir-git.asd
+           echo "gitdir: /nowhere" > deps/local-projects/file-git/.git ;;
 esac
 STUB
 
@@ -149,6 +153,9 @@ try "first deploy succeeds" "rc=$RC: $OUT" test "$RC" -eq 0
 try "untracked file is not exported" "found untracked.txt in release" test ! -e "$H/releases/$C1/untracked.txt"
 try "release holds no .git" "found .git in release" test ! -e "$H/releases/$C1/.git"
 try "tracked file is exported" "marker missing" test -f "$H/releases/$C1/marker"
+vcs=$(find "$H/releases/$C1/deps" -name .git 2>/dev/null | head -3)
+try "bundled dependencies hold no .git" "found: $vcs" test -z "$vcs"
+try "bundled dependency sources are kept" "dir-git.asd missing" test -f "$H/releases/$C1/deps/local-projects/dir-git/dir-git.asd"
 rm -f "$REPO/untracked.txt"
 
 note "flip"

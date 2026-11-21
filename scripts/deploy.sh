@@ -209,6 +209,10 @@ deploy() {
       fail dependencies "qlot exited non-zero; read $rel/dependencies.log"
     fi
     rm -rf "$rel/.qlot"
+    # A release carries no VCS metadata. qlot leaves .git entries in bundled
+    # git sources, and the release guard counts any .git entry as a checkout tie.
+    find "$rel/deps" -name .git -prune -exec rm -rf {} + \
+      || fail dependencies "cannot remove .git entries under $rel/deps; check its permissions"
     say "dependencies: done in $((SECONDS - t0))s"
 
     t0=$SECONDS

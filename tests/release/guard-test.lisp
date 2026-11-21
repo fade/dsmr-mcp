@@ -187,6 +187,30 @@ other system without one is a :no-source tie."
     (is equal '() (%ties tree :extra (list (cons "sb-md5" nil))))
     (is equal '(:no-source) (%reasons (%ties tree :extra (list (cons "mystery" nil)))))))
 
+(define-test asdf-package-system-without-source-is-allowed
+  "asdf-package-system, which ASDF registers itself with no source directory,
+is allowed."
+  (let ((tree (%plant)))
+    (is equal '() (%ties tree :extra (list (cons "asdf-package-system" nil))))))
+
+(define-test a-source-less-system-off-the-list-is-a-tie
+  "A system without a source directory whose name only resembles an allowed
+one is a :no-source tie."
+  (let ((tree (%plant)))
+    (dolist (name '("asdf-package-system-extra" "asdf-extra" "uiop-extra" "sb-"))
+      (is equal '(:no-source) (%reasons (%ties tree :extra (list (cons name nil))))
+          "~a without source is a tie" name))))
+
+(define-test a-bundled-dependency-holding-git-metadata-is-a-tie
+  "A dependency inside the release whose directory still holds a .git entry,
+as qlot leaves in a bundled git source, is a :checkout tie."
+  (let* ((tree (%plant))
+         (dep (%dir (tree-root tree) "deps/local-projects/asdf/"))
+         (extra (list (cons "asdf-source" dep))))
+    (%file (tree-root tree) "deps/local-projects/asdf/.git/HEAD")
+    (is equal '(:checkout) (%reasons (%ties tree :extra extra)))
+    (is equal dep (getf (first (%ties tree :extra extra)) :directory))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; guard-report
 ;;; ---------------------------------------------------------------------------
