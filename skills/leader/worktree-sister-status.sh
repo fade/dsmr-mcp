@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# worktree-sister-status.sh [DIR]
+# worktree-sister-status.sh [--park] [DIR]
 #
 # Report each worktree sister registered in DIR's planning bucket, park state
 # against her worktree's HEAD. Read-only: runs git and reads the bucket's
@@ -12,17 +12,26 @@
 #   OK            PARK.md names a sha of at least 7 characters that prefixes HEAD
 #   MISMATCH      PARK.md names another commit
 #   SCHEMA        PARK.md holds other than exactly one line matching ^sha:
-#   NO-PARK-FILE  no PARK.md yet; unresolved, not a failure
+#   NO-PARK-FILE  no PARK.md yet; unresolved, a failure only under --park
 #   NO-WORKTREE   the worktree is absent, or git does not list it
 # Then, for each non-empty BLOCKED.md:
 #   == <name> BLOCKED (<path>)
 #   <its content>
 #
+# --park gates a fleet park: any state other than OK exits 1, so FLEET-CLEAR
+# waits for every sister's park.
+#
 # Exit status: 0 nothing to act on, 1 a MISMATCH, SCHEMA or NO-WORKTREE state
-# or an open BLOCKED.md, 3 DIR has no .planning.
+# or an open BLOCKED.md (under --park, any state but OK), 3 DIR has no
+# .planning.
 set -u
 export LC_ALL=C
 
+park_mode=0
+if [ "${1:-}" = --park ]; then
+  park_mode=1
+  shift
+fi
 dir=${1:-.}
 if [ ! -d "$dir/.planning" ]; then
   echo "NO-GSD $dir"
@@ -71,7 +80,10 @@ for reg in "${regs[@]}"; do
       [ -n "$parked" ] || parked=-
     fi
   fi
-  case $state in MISMATCH|SCHEMA|NO-WORKTREE) status=1 ;; esac
+  case $state in
+    MISMATCH|SCHEMA|NO-WORKTREE) status=1 ;;
+    NO-PARK-FILE) [ "$park_mode" -eq 0 ] || status=1 ;;
+  esac
   printf '%-24s %-12s worktree=%s branch=%s parked=%.12s live=%.12s left=%s\n' \
     "$name" "$state" "${wt:--}" "${branch:--}" "$parked" "$live" "$left"
   if [ -s "$sdir/BLOCKED.md" ]; then

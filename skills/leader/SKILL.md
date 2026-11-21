@@ -344,7 +344,8 @@ done
 ```
 
 Read its states exactly as the loop above: **MISMATCH** stops that sister, **SCHEMA** is her repair,
-**NO-PARK-FILE** is unresolved, not a failure. **NO-WORKTREE** is a registration whose checkout is
+**NO-PARK-FILE** is unresolved, not a failure, except at park time: run the script with `--park`
+there, and any state but OK exits non-zero. **NO-WORKTREE** is a registration whose checkout is
 gone or that git no longer lists, and it is a FINDING. The script also prints any open block of
 hers; Step 3 collects those too.
 

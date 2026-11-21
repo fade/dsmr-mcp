@@ -399,7 +399,12 @@ state_is() { grep -qE "^$1 +$2 " <<<"$SOUT"; }
 status
 try "no PARK.md reads NO-PARK-FILE" "$SOUT" state_is repo-integration NO-PARK-FILE
 try "NO-PARK-FILE alone exits 0" "rc=$SRC" same "$SRC" 0
+SOUT=$(bash "$STATUS" --park "$G/repo" 2>&1); SRC=$?
+try "NO-PARK-FILE under --park exits 1" "rc=$SRC out=$SOUT" same "$SRC" 1
+try "NO-PARK-FILE under --park is still reported" "$SOUT" state_is repo-integration NO-PARK-FILE
 printf 'repo: repo-integration\nsha: %s\n' "$HEAD_SHA" >"$SD/PARK.md"
+SOUT=$(bash "$STATUS" --park "$G/repo" 2>&1); SRC=$?
+try "OK under --park exits 0" "rc=$SRC out=$SOUT" same "$SRC" 0
 status
 try "the full HEAD sha reads OK" "$SOUT" state_is repo-integration OK
 try "OK exits 0" "rc=$SRC" same "$SRC" 0

@@ -109,8 +109,9 @@ anything not in a file is not park state and will be lost — correctly.
 HEAD`**. Never confirm from a message. When every repo's file exists and its `sha` matches the live
 HEAD, broadcast `FLEET-CLEAR` (one word) and tell the operator it is safe to restart.
 A worktree sister's park is in her own directory, so confirm her with
-`bash ~/.claude/skills/leader/worktree-sister-status.sh <repo>` (state `OK` against her worktree's
-HEAD), never by reading the repo's `PARK.md`.
+`bash ~/.claude/skills/leader/worktree-sister-status.sh --park <repo>` (state `OK` against her
+worktree's HEAD; under `--park` any other state exits non-zero), never by reading the repo's
+`PARK.md`.
 
 ⛔ **`FLEET-CLEAR` IS ADDRESSED TO THE OPERATOR, NOT TO A WORKER. IT LIFTS NOTHING.** It reports that
 every park file matches live HEAD, so it is safe for HIM to take the fleet down. ⇒ **On a
