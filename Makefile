@@ -25,7 +25,8 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 
 .PHONY: bridge bus-watch bus-host bus-sources bus-binaries install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
-        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path
+        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path \
+        deploy
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -35,6 +36,25 @@ LIBDIR ?= $(PREFIX)/lib/dsmr-mcp
 # repositories are resolved from. The environment wins so a clone elsewhere
 # needs no edit here.
 WORKSPACE ?= $(or $(LISP_WORKSPACE),$(HOME)/SourceCode/lisp)
+
+## DSMR_HOME: the deploy home `make deploy` builds releases in and flips.
+##
+##   Empty means the deploy script's default,
+##   ${XDG_DATA_HOME:-$HOME/.local/share}/dsmr-mcp. Point it at a scratch
+##   directory to deploy without touching the host's release.
+DSMR_HOME ?=
+
+## REF: the commit `make deploy` exports, builds and makes current.
+##
+##   Any form git rev-parse accepts; it is resolved once to a full sha and only
+##   the sha is used afterwards. Required by `make deploy`.
+REF ?=
+
+## QLOT: the qlot executable a release build takes its dependencies through.
+##
+##   Provisioned by cloning qlot into the Lisp workspace and running its
+##   scripts/setup.sh. Used only at build time; a running server never calls it.
+QLOT ?= $(WORKSPACE)/qlot/bin/qlot
 
 # Where the harness skills are deployed for the agent that reads them. Claude is
 # the first target and deliberately not the only one; a second agent gets its own
@@ -783,6 +803,21 @@ core-worker:
 	@mv -f "$(WORKER_CORE).tmp" "$(WORKER_CORE)"
 	@mv -f "$(WORKER_CORE).tmp.manifest" "$(WORKER_CORE).manifest"
 	@echo "installed $(WORKER_CORE) (previous image kept as $(WORKER_CORE).prev)"
+
+## deploy: build a release of REF and make it the one servers run.
+##
+##   The only target that changes what a server runs. Exports the commit REF
+##   names with git archive into $(DSMR_HOME)/releases/<sha>/, takes its
+##   dependencies from the committed qlfile and qlfile.lock through qlot,
+##   builds a sealed server core there with plain SBCL, and boots the release's
+##   own launcher to answer initialize and tools/list. Only then does
+##   $(DSMR_HOME)/current flip to the release, in one rename; the release it
+##   replaces becomes previous. A failure at any stage leaves current and
+##   previous as they were. REF is required. DSMR_HOME redirects the whole
+##   deploy to a scratch home: make deploy REF=HEAD DSMR_HOME=$(mktemp -d)
+deploy:
+	@REPO="$(CURDIR)" REF="$(REF)" DSMR_HOME="$(DSMR_HOME)" QLOT="$(QLOT)" SBCL="$(SBCL)" \
+	   scripts/deploy.sh deploy
 
 ## core-verify-worker: boot a worker core image and assert it is fit for workers.
 ##
