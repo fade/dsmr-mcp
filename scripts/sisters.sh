@@ -89,7 +89,7 @@ case $leader in
         FLEET_DIR=~/SourceCode/lisp
         # Full fleet, set aside while the work is rhizome only:
         # args=(--no-scan --extra "dsmr-mcp,mallet,boomer,zebra,stumpwm-contrib,fade-stumpwm-init,stumpwm,rhizome,fade-rhizome-init,$HOME/system_scripts" --stagger 3-10)
-        args=(--no-scan --extra "dsmr-mcp,rhizome,fade-rhizome-init,fade-stumpwm-init,$HOME/system_scripts" --stagger 3-10)
+        args=(--no-scan --extra "dsmr-mcp,rhizome,fade-rhizome-init,fade-stumpwm-init,$HOME/system_scripts,$HOME/SourceCode/lisp-scratch/dsmr-mcp-release" --stagger 3-10)
         # Membership is declared, never found, for the same reason --no-scan is
         # set: this directory holds a dozen non-members that carry .git and
         # .planning too. Consenting to their .envrc files would be exactly the
