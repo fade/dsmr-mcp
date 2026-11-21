@@ -1,0 +1,17 @@
+{
+  "cwd": "/tmp/claude-1000/-home-fade-SourceCode-lisp-dsmr-mcp/dbe4730b-7d97-4a4c-a488-ec4472d202d2/scratchpad/cap/work",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "permission_mode": "default",
+  "prompt_id": "PROMPT-ID",
+  "session_id": "SESSION-ID",
+  "tool_input": {
+    "content": "(asdf:defsystem x)",
+    "file_path": "/tmp/claude-1000/-home-fade-SourceCode-lisp-dsmr-mcp/dbe4730b-7d97-4a4c-a488-ec4472d202d2/scratchpad/cap/work/work/rel.asd"
+  },
+  "tool_name": "Write",
+  "tool_use_id": "TOOL-USE-ID",
+  "transcript_path": "/TRANSCRIPT-PATH.jsonl"
+}

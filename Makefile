@@ -26,7 +26,7 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 .PHONY: bridge bus-watch bus-host bus-sources bus-binaries install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
         preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path \
-        test-worktree-sister install-worktree-sister check-worktree-sister
+        test-worktree-sister install-worktree-sister check-worktree-sister test-lisp-edit-guard
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -363,6 +363,15 @@ install-hooks:
 test-hooks:
 	@bash tests/githooks/workproduct-style-test.sh
 
+## test-lisp-edit-guard: drive the Lisp edit guard with recorded PreToolUse input.
+##
+##   Each deny case runs against a stub that allows everything and each allow
+##   case against one that denies everything, and both must fail there. Stubs
+##   that exit non-zero must fail every case. Fixture provenance is in
+##   tests/harness/fixtures/pretooluse/SOURCE.
+test-lisp-edit-guard:
+	@bash tests/harness/lisp-edit-guard-test.sh
+
 ## test-restart-session: drive the in-place session restart against a stub kitten.
 ##
 ##   No kitty is involved. Each refusal has a case that would fail if the
@@ -556,7 +565,7 @@ install-skills:
 ##   An agents directory is flat, so README.md at the top of agents/ is
 ##   documentation and is never deployed: in the deployed directory it would be
 ##   read as an agent. Only agents tracked here are inspected. The gsd-* roster
-##   and lisp-developer are deployed by other means and are never reported.
+##   is deployed by GSD's own installer and is never reported.
 ##
 ##   Reports drift in both directions: a tracked agent missing or different in
 ##   the deployed directory, and a deployed backup sibling of a tracked agent
@@ -585,7 +594,7 @@ check-agents:
 ##   has been edited in place, that edit is the newer one and this target would
 ##   destroy it. Run check-agents first and port the other way before deploying.
 ##   Deployment is per-file over the agents tracked here, so the gsd-* roster
-##   and lisp-developer are left alone.
+##   is left alone.
 install-agents:
 	@for f in $$(cd agents && find . -maxdepth 1 -type f -name '*.md' ! -name README.md | sed 's|^\./||'); do \
 	  mkdir -p "$(SUBAGENTDIR)"; \
