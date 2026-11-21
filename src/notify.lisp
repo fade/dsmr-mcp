@@ -16,7 +16,7 @@
 ;;;; Load order note: src/state.lisp loads BEFORE src/notify.lisp in the
 ;;;; package-inferred-system order.  src/state.lisp installs a null-channel on
 ;;;; new sessions via make-instance using runtime class lookup (find-symbol /
-;;;; find-package) to avoid a compile-time circular dependency.  This file
+;;;; support-package) to avoid a compile-time circular dependency.  This file
 ;;;; must NOT import from dsmr-mcp/src/state for the same reason.
 
 (defpackage #:dsmr-mcp/src/notify
@@ -30,6 +30,8 @@
   (:import-from #:com.inuoe.jzon)
   (:import-from #:dsmr-mcp/src/tools/helpers
                 #:make-ht)
+  (:import-from #:dsmr-mcp/src/support-package
+                #:support-symbol-call)
   (:export #:null-channel
            #:tcp-line-channel
            #:sse-channel
@@ -152,11 +154,11 @@ helps operators investigating dropped notifications."
           (write-line json (tcp-line-channel-stream channel))
           (force-output (tcp-line-channel-stream channel)))
       (stream-error (e)
-        (uiop:symbol-call :dsmr-mcp/src/log :log-event
-                          :debug "notify.tcp.stream-error"
-                          "method" method
-                          "error" (handler-case (princ-to-string e)
-                                    (error () "<unprintable>")))
+        (support-symbol-call "SRC/LOG" "LOG-EVENT"
+                             :debug "notify.tcp.stream-error"
+                             "method" method
+                             "error" (handler-case (princ-to-string e)
+                                       (error () "<unprintable>")))
         nil))))
 
 (defmethod emit ((channel sse-channel) method params)
