@@ -7,7 +7,7 @@
 # log their argv; kitten exits 1 and must never be called. The bus watcher is a
 # stub that replays answers recorded from the real binary. The fleet launcher
 # is the real scripts/start-sisters.sh, run only with --dry-run against an
-# empty socket directory. Nothing reaches kitty, a session or a bus.
+# empty socket directory. Nothing reaches kitty, a session, or a bus.
 #
 # Usage: tests/scripts/worktree-sister-test.sh
 
@@ -19,7 +19,7 @@ ORIG_HOME=$HOME
 PLAN=.planning
 STATUS=$REPO_ROOT/skills/leader/worktree-sister-status.sh
 
-# Isolation: no DSMR_ setting, kitty socket or git configuration from the
+# Isolation: no DSMR_ setting, kitty socket, or git configuration from the
 # calling shell. Without the git isolation the host's excludes file already
 # ignores .planning and .envrc, and its template directory copies hooks into
 # every scratch repository.

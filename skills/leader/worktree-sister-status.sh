@@ -21,7 +21,7 @@
 # --park gates a fleet park: any state other than OK exits 1, so FLEET-CLEAR
 # waits for every sister's park.
 #
-# Exit status: 0 nothing to act on, 1 a MISMATCH, SCHEMA or NO-WORKTREE state
+# Exit status: 0 nothing to act on, 1 a MISMATCH, SCHEMA, or NO-WORKTREE state
 # or an open BLOCKED.md (under --park, any state but OK), 3 DIR has no
 # .planning.
 set -u

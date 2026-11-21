@@ -391,8 +391,8 @@ test-memory-store-path:
 ## test-worktree-sister: drive the worktree sister helper and its status report in scratch repositories.
 ##
 ##   git runs for real in scratch repositories under an isolated configuration.
-##   direnv, kitten and the bus watcher are stubs, and the fleet launcher runs
-##   only with --dry-run, so nothing reaches kitty, a session or a bus.
+##   direnv, kitten, and the bus watcher are stubs, and the fleet launcher runs
+##   only with --dry-run, so nothing reaches kitty, a session, or a bus.
 test-worktree-sister:
 	@$(TEST_UNSET_DSMR) bash tests/scripts/worktree-sister-test.sh
 

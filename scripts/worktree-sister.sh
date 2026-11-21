@@ -10,7 +10,7 @@
 #
 # The view is the directory sisters/<name>/ in the bucket. It holds a relative
 # symlink to every other top-level bucket entry, and her own real PARK*,
-# BLOCKED*, CURRENT-CONTEXT* and LEFT files, so a write to one of those never
+# BLOCKED*, CURRENT-CONTEXT*, and LEFT files, so a write to one of those never
 # reaches the leader's copy. The worktree's .planning links to the path the
 # SessionStart hook computes for the worktree, and that path links to the view,
 # so the hook finds .planning already linked and leaves it alone.
@@ -36,7 +36,7 @@ create:
   Makes a worktree of REPO (a main checkout with a .planning bucket) at
   \$DSMR_SCRATCH_ROOT/<repo>-<slug> (default root: ~/SourceCode/lisp-scratch),
   on BRANCH. BRANCH is created from --base when it does not exist locally.
-  REPO's checked-out branch, HEAD and tracked files are not changed.
+  REPO's checked-out branch, HEAD, and tracked files are not changed.
 
       --name N      Sister name and bus identity (default: <repo>-integration)
       --bus B       Bus to join (default: \$DSMR_BUS_SELECTOR; one is required)
@@ -45,17 +45,17 @@ create:
       --no-launch   Create and register, but open no tab
   -n, --dry-run     Validate, print each step, and change nothing
 
-  Names, buses and slugs take [A-Za-z0-9._-] only, at most 32 characters, and
+  Names, buses, and slugs take [A-Za-z0-9._-] only, at most 32 characters, and
   not one of: ${RESERVED[*]}.
 
 teardown:
-  Removes a sister's worktree once she has parked at its HEAD, left the bus and
+  Removes a sister's worktree once she has parked at its HEAD, left the bus, and
   stopped her watcher, and the worktree is clean with every commit on a remote.
   Her records move to sisters-retired/ in the bucket, and the branch is kept.
 
       --repo R      Main checkout holding the registration (default: the
                     repository containing the working directory)
-      --force       Remove even when unparked, blocked, dirty or unpushed;
+      --force       Remove even when not left, unparked, blocked, dirty, or unpushed;
                     never while her watcher answers live
   -n, --dry-run     Run the checks, print what would be removed, change nothing
 
@@ -109,7 +109,7 @@ hook_planning_dir() {
 }
 
 # Bucket entries a sister keeps as her own files instead of links to the shared
-# ones: her park, block, context and departure records.
+# ones: her park, block, context, and departure records.
 own_entry() {
     case $1 in PARK*|BLOCKED*|CURRENT-CONTEXT*|LEFT|WORKTREE) return 0 ;; esac
     return 1
@@ -148,7 +148,7 @@ cmd_create() {
     local repo_arg=${args[0]} branch=${args[1]}
 
     command -v git >/dev/null || unsupported "git not found on PATH"
-    command -v direnv >/dev/null || unsupported "direnv not found on PATH; the worktree's .envrc needs it"
+    command -v direnv >/dev/null || unsupported "direnv not found on PATH; install it"
 
     # Every check runs before anything is changed.
     [[ -d $repo_arg ]] || refuse "not a directory: $repo_arg"
@@ -162,7 +162,7 @@ cmd_create() {
         refuse "$repo is not a main checkout; name the repository's main checkout, not a linked worktree or a subdirectory"
     local repo_name=${repo##*/}
     [[ -d $repo/.planning ]] ||
-        refuse "$repo/.planning does not resolve to a directory; the sister shares the repository's planning bucket"
+        refuse "$repo/.planning does not resolve to a directory; link it to the repository's planning bucket"
     local bucket
     bucket=$(readlink -f -- "$repo/.planning")
 
@@ -396,13 +396,13 @@ cmd_teardown() {
     local leave="send to $name by name, then run teardown again: LEAVE: commit and push $branch, park, bus-leave, reap your watcher"
     local hard=() soft=() advice=() need_leave=0 left_forced=0
 
-    # a. Removing the directory the caller stands in strands its shell.
+    # Removing the directory the caller stands in strands its shell.
     local here
     here=$(pwd -P)
     [[ $here == "$wt" || $here == "$wt"/* ]] &&
         hard+=("the working directory is inside $wt; run teardown from the main checkout")
 
-    # b. Only a directory git lists as a worktree is ever removed.
+    # Only a directory git lists as a worktree is ever removed.
     local listed=0
     if git -C "$repo" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $wt"; then
         listed=1
@@ -410,7 +410,7 @@ cmd_teardown() {
         hard+=("git does not list $wt as a worktree of $repo; nothing is removed, inspect it by hand")
     fi
 
-    # c. A live watcher means she is still listening; --force never overrides it.
+    # A live watcher means she is still listening; --force never overrides it.
     local watch=${DSMR_BUS_WATCH:-$HOME/.local/bin/dsmr-bus-watch} answer rc
     if [[ ! -x $watch ]]; then
         hard+=("cannot tell whether $name is listening: $watch not found; set DSMR_BUS_WATCH")
@@ -421,18 +421,18 @@ cmd_teardown() {
             1) ;;
             0)  hard+=("$name is still listening ($answer)")
                 need_leave=1
-                advice+=("if her session is gone, stop her watcher with: ~/.local/bin/dsmr-bus-watch --reap --all-buses --agent $name --namespace $wt/") ;;
+                advice+=("if her session is gone, stop her watcher with: $watch --reap --all-buses --agent $name --namespace $wt/") ;;
             *)  hard+=("cannot tell whether $name is listening: --check-live exited $rc (${answer:-no answer})") ;;
         esac
     fi
 
-    # d. Her LEFT file says she parked, replied and left the bus.
+    # Her LEFT file, written after she stops her watcher, must be non-empty.
     if [[ ! -s $sdir/LEFT ]]; then
         soft+=("$name has not left: $sdir/LEFT is missing or empty")
         if ((force)); then left_forced=1; else need_leave=1; fi
     fi
 
-    # e. PARK.md names the worktree's HEAD.
+    # PARK.md names the worktree's HEAD.
     local head="" parked
     if ((listed)); then head=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || head=""; fi
     if [[ ! -f $sdir/PARK.md ]]; then
@@ -446,10 +446,10 @@ cmd_teardown() {
         fi
     fi
 
-    # f. An open block is a question nobody has answered.
+    # An open block is a question nobody has answered.
     [[ -s $sdir/BLOCKED.md ]] && soft+=("$sdir/BLOCKED.md is open; resolve it first")
 
-    # g, h. Work that exists only in this worktree.
+    # Work that exists only in this worktree.
     if ((listed)) && [[ -d $wt ]]; then
         # git worktree remove deletes ignored files too, so they count.
         local dirty
