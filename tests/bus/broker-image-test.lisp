@@ -71,24 +71,37 @@
   "True when some argument in ARGS contains TEXT."
   (some (lambda (a) (and (stringp a) (search text a))) args))
 
-(defmacro with-broker-core-env ((value) &body body)
-  "Run BODY with DSMR_BROKER_CORE set to VALUE, or unset when VALUE is NIL.
-Restore the variable's prior state, set or unset, however BODY exits."
-  (let ((prior (gensym "PRIOR")))
-    `(let ((,prior (uiop:getenv "DSMR_BROKER_CORE")))
+(defmacro with-env-var ((name value) &body body)
+  "Run BODY with environment variable NAME set to VALUE, or unset when VALUE is
+NIL. Restore the variable's prior state, set or unset, however BODY exits."
+  (let ((prior (gensym "PRIOR"))
+        (var (gensym "NAME"))
+        (new (gensym "VALUE")))
+    `(let* ((,var ,name)
+            (,new ,value)
+            (,prior (uiop:getenv ,var)))
        (unwind-protect
             (progn
-              (if ,value
-                  (setf (uiop:getenv "DSMR_BROKER_CORE") ,value)
-                  (sb-posix:unsetenv "DSMR_BROKER_CORE"))
+              (if ,new
+                  (setf (uiop:getenv ,var) ,new)
+                  (sb-posix:unsetenv ,var))
               ,@body)
          (if ,prior
-             (setf (uiop:getenv "DSMR_BROKER_CORE") ,prior)
-             (sb-posix:unsetenv "DSMR_BROKER_CORE"))))))
+             (setf (uiop:getenv ,var) ,prior)
+             (sb-posix:unsetenv ,var))))))
+
+(defmacro with-broker-core-env ((value) &body body)
+  "Run BODY with DSMR_BROKER_CORE set to VALUE, or unset when VALUE is NIL, and
+with DSMR_RELEASE_ROOT unset, as in a development or test server. Restore both
+variables however BODY exits."
+  `(with-env-var ("DSMR_RELEASE_ROOT" nil)
+     (with-env-var ("DSMR_BROKER_CORE" ,value)
+       ,@body)))
 
 (defmacro with-temp-image ((path) &body body)
-  "Bind PATH to the namestring of an empty file created for BODY and removed
-afterwards."
+  "Bind PATH to the namestring of an empty file that stands in for a broker
+image: created for BODY and removed afterwards. The broker is never started, so
+the file only has to exist."
   `(let ((,path (uiop:native-namestring
                  (merge-pathnames (format nil "broker-image-~D-~D.core"
                                           (sb-posix:getpid) (random 100000000))
@@ -146,8 +159,9 @@ afterwards."
               "the bus root is named on the command line")))))
 
 (define-test the-image-dsmr-broker-core-names-is-launched
-  "With DSMR_BROKER_CORE naming an existing file, that file is the image the
-   broker boots, and nothing is built from source."
+  "With DSMR_BROKER_CORE naming an existing file, as the release launcher and
+   the test targets set it, that file is the image the broker boots, and
+   nothing is built from source."
   (with-temp-image (image)
     (with-broker-core-env (image)
       (let ((args (broker::%broker-spawn-args "/tmp/a-bus/" :block nil)))
@@ -157,8 +171,8 @@ afterwards."
                "and nothing is built from source")))))
 
 (define-test without-dsmr-broker-core-no-image-is-launched
-  "With DSMR_BROKER_CORE unset the broker is built from source, even when a
-   dsmr.core sits beside the dsmr-mcp source."
+  "Outside a release, with DSMR_BROKER_CORE unset, the broker is built from
+   source, even when a dsmr.core sits beside the dsmr-mcp source."
   (with-broker-core-env (nil)
     (let ((args (broker::%broker-spawn-args "/tmp/a-bus/" :block nil)))
       (false (member "--core" args :test #'string=)
@@ -167,14 +181,43 @@ afterwards."
             "and the broker subsystem is built from source"))))
 
 (define-test a-dsmr-broker-core-naming-no-file-launches-no-image
-  "A DSMR_BROKER_CORE naming a file that does not exist is ignored, and the
-   broker is built from source."
+  "Outside a release, a DSMR_BROKER_CORE naming a file that does not exist is
+   ignored, and the broker is built from source."
   (with-broker-core-env ("/nonexistent/dsmr-broker-image-test.core")
     (let ((args (broker::%broker-spawn-args "/tmp/a-bus/" :block nil)))
       (false (member "--core" args :test #'string=)
              "no image is named")
       (true (any-arg-contains "quickload" args)
             "and the broker subsystem is built from source"))))
+
+(define-test a-release-server-without-a-broker-image-refuses-to-spawn
+  "Inside a release (DSMR_RELEASE_ROOT set) with no broker image, the spawn
+   signals an error naming DSMR_BROKER_CORE instead of building the broker from
+   the host's source registry. Outside a release the same setting still yields
+   the source command line."
+  (let ((release (uiop:ensure-directory-pathname
+                  (merge-pathnames (format nil "broker-release-~D-~D"
+                                           (sb-posix:getpid) (random 100000000))
+                                   (uiop:temporary-directory)))))
+    (ensure-directories-exist release)
+    (unwind-protect
+         (with-env-var ("DSMR_BROKER_CORE" nil)
+           (with-env-var ("DSMR_RELEASE_ROOT" (uiop:native-namestring release))
+             (let ((message
+                     (handler-case
+                         (progn (broker::%broker-spawn-args "/tmp/a-bus/" :block nil)
+                                nil)
+                       (error (e) (princ-to-string e)))))
+               (true message
+                     "a release server with no broker image signals an error")
+               (true (and message (search "DSMR_BROKER_CORE" message))
+                     "the error names DSMR_BROKER_CORE")))
+           (with-env-var ("DSMR_RELEASE_ROOT" nil)
+             (let ((args (broker::%broker-spawn-args "/tmp/a-bus/" :block nil)))
+               (true (any-arg-contains "quickload" args)
+                     "outside a release the broker is built from source"))))
+      (ignore-errors (uiop:delete-directory-tree
+                      release :validate t :if-does-not-exist :ignore)))))
 
 ;;; -------------------------------------------------------- what it records
 
