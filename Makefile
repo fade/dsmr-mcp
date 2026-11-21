@@ -565,7 +565,7 @@ install-skills:
 ##   An agents directory is flat, so README.md at the top of agents/ is
 ##   documentation and is never deployed: in the deployed directory it would be
 ##   read as an agent. Only agents tracked here are inspected. The gsd-* roster
-##   and lisp-developer are deployed by other means and are never reported.
+##   is deployed by GSD's own installer and is never reported.
 ##
 ##   Reports drift in both directions: a tracked agent missing or different in
 ##   the deployed directory, and a deployed backup sibling of a tracked agent
@@ -594,7 +594,7 @@ check-agents:
 ##   has been edited in place, that edit is the newer one and this target would
 ##   destroy it. Run check-agents first and port the other way before deploying.
 ##   Deployment is per-file over the agents tracked here, so the gsd-* roster
-##   and lisp-developer are left alone.
+##   is left alone.
 install-agents:
 	@for f in $$(cd agents && find . -maxdepth 1 -type f -name '*.md' ! -name README.md | sed 's|^\./||'); do \
 	  mkdir -p "$(SUBAGENTDIR)"; \

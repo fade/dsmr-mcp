@@ -9,6 +9,7 @@ loads has a history and a review path like the rest of the code.
 | Agent | Purpose |
 |---|---|
 | `Explore` | Read-only fan-out search on Haiku, replacing the built-in Explore agent, which otherwise runs on whatever model the calling session uses |
+| `lisp-developer` | Writes, edits, and tests Common Lisp through the structure-aware dsmr-mcp tools; every Lisp change goes to it |
 | `shell-developer` | Writes the shell that builds, installs, and tests our systems: Makefiles, install scripts, git hooks, test drivers, and CI workflows |
 
 I gave shell work its own executor because it does not need the strongest model, and Lisp work
@@ -39,11 +40,8 @@ be read as one more agent.
 
 ## What is deliberately NOT here
 
-- **`lisp-developer`** stays global and on the strongest model. I maintain it where it lives, in the
-  deployed agents directory, because every Lisp project on the host uses it and its tool wiring
-  belongs to the host rather than to this project.
 - **The `gsd-*` agents** belong to GSD, which installs and upgrades them with its
   own installer. A copy here would be a fork that the next GSD upgrade overwrites.
 
 Both deploy targets work per file over the definitions tracked here, so neither one ever writes or
-reports on these agents.
+reports on the gsd-* agents.
