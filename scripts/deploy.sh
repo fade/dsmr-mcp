@@ -4,6 +4,7 @@
 # scripts/deploy.sh: build a release of one commit and make it current.
 #
 # Usage: scripts/deploy.sh deploy
+#        scripts/deploy.sh rollback
 #        scripts/deploy.sh check-qlot
 #
 # Reads from the environment (the Makefile's deploy target passes them):
@@ -41,6 +42,9 @@
 # and is verified again without rebuilding; one without is an earlier attempt
 # that stopped and is removed. A failed verify removes the MANIFEST and leaves
 # current and previous untouched. A verified release is made read-only.
+#
+# rollback swaps current and previous with two renames. It runs no git, qlot,
+# sbcl or make.
 set -euo pipefail
 
 # shellcheck source=release-paths.sh
@@ -279,6 +283,39 @@ deploy() {
   say "flip: current -> releases/$sha"
 }
 
+# manifest_commit <release dir>
+# Print the commit a release's MANIFEST records.
+manifest_commit() {
+  awk '$1 == "commit" { print $2; exit }' "$1/MANIFEST"
+}
+
+# rdie <message>: print a rollback refusal on stderr and exit 1.
+rdie() { printf 'rollback: %s\n' "$*" >&2; exit 1; }
+
+# rollback
+# Swap current and previous with two renames. Runs no git, qlot, sbcl or make.
+rollback() {
+  local home cur prev
+  home="$(dsmr_home)" || exit 1
+  [ -d "$home" ] || rdie "no deploy home at $home; nothing to roll back to"
+  take_lock "$home" "rollback"
+
+  [ -L "$home/previous" ] \
+    || rdie "no previous release at $home/previous; nothing to roll back to"
+  [ -L "$home/current" ] \
+    || rdie "no current release at $home/current; run make deploy REF=<sha>"
+  prev="$(readlink "$home/previous")"
+  cur="$(readlink "$home/current")"
+  [ -f "$home/$prev/MANIFEST" ] \
+    || rdie "$home/$prev has no MANIFEST; it is not a complete release, so deploy a known commit instead"
+
+  ln -sfn "$prev" "$home/current.new"
+  ln -sfn "$cur" "$home/previous.new"
+  mv -Tf "$home/current.new" "$home/current"
+  mv -Tf "$home/previous.new" "$home/previous"
+  printf 'current -> %s (commit %s)\n' "$prev" "$(manifest_commit "$home/$prev")"
+}
+
 # verify_initialize <release> <sbcl> <scratch>
 # Run the release's own launcher with a scrubbed environment and feed it an
 # initialize, the initialized notification and tools/list. Return 0 when the
@@ -326,6 +363,7 @@ verify_initialize() {
 
 case "${1:-}" in
   deploy) deploy ;;
+  rollback) rollback ;;
   check-qlot) check_qlot "${QLOT:-}" "${QLOT_COMMIT:-}" ;;
-  *) die "usage: scripts/deploy.sh deploy|check-qlot (REPO, REF, DSMR_HOME, QLOT, QLOT_COMMIT and SBCL from the environment)" ;;
+  *) die "usage: scripts/deploy.sh deploy|rollback|check-qlot (REPO, REF, DSMR_HOME, QLOT, QLOT_COMMIT and SBCL from the environment)" ;;
 esac

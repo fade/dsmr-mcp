@@ -47,7 +47,7 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 .PHONY: bridge bus-watch bus-host bus-sources bus-binaries install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-server core-verify core-worker core-verify-worker core-sources test-core test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
         preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path \
-        deploy test-leaf qlot-lock
+        deploy rollback test-leaf qlot-lock
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -997,6 +997,14 @@ qlot-lock:
 deploy:
 	@REPO="$(CURDIR)" REF="$(REF)" DSMR_HOME="$(DSMR_HOME)" QLOT="$(QLOT)" QLOT_COMMIT="$(QLOT_COMMIT)" SBCL="$(SBCL)" \
 	   ALLOW_UNPUBLISHED="$(ALLOW_UNPUBLISHED)" scripts/deploy.sh deploy
+
+## rollback: make the previous release current again.
+##
+##   Swaps $(DSMR_HOME)/current and previous with two renames and prints the
+##   commit now current. Builds nothing and runs no git, qlot or sbcl. Running
+##   servers keep their release until they restart.
+rollback:
+	@DSMR_HOME="$(DSMR_HOME)" scripts/deploy.sh rollback
 
 ## core-verify-worker: boot a worker core image and assert it is fit for workers.
 ##
