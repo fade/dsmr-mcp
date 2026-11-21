@@ -785,21 +785,36 @@ test-leaf:
 ##   it, so $(CORE) names a valid image at every instant: the final rename
 ##   replaces one complete file with another and there is no window where the
 ##   path is missing. Rollback is `mv $(CORE).prev $(CORE)`.
+##
+##   The whole build, check and install runs under `flock $(CORE).lock`, and
+##   the image is staged under a unique `$(CORE).tmp.XXXXXX` name removed on
+##   exit, so two builds of one image run one after the other and each installs
+##   only what it built. The staged image is checked in place, with the same
+##   check `make core-verify` runs. The installed core and manifest take the
+##   time the build started as their mtime, so a source edited during the build
+##   is newer than the core and the next test-core rebuilds it.
 core-server:
 	@mkdir -p "$(dir $(CORE))"
-	@rm -f "$(CORE).tmp" "$(CORE).tmp.manifest"
-	DSMR_CORE_OUTPUT=$(CORE).tmp $(SBCL) --noinform --disable-debugger \
-	     --load scripts/build-core.lisp
-	@test -s "$(CORE).tmp" || { echo "core build produced no image; $(CORE) left untouched" >&2; exit 1; }
-	@test -s "$(CORE).tmp.manifest" || { echo "core build produced no manifest; $(CORE) left untouched" >&2; exit 1; }
-	@$(MAKE) --no-print-directory core-verify CORE_IMAGE="$(CORE).tmp"
-	@rm -f "$(CORE).prev" "$(CORE).manifest.prev"
-	@if [ -e "$(CORE)" ]; then ln "$(CORE)" "$(CORE).prev" 2>/dev/null || cp -p "$(CORE)" "$(CORE).prev"; fi
-	@if [ -e "$(CORE).manifest" ]; then ln "$(CORE).manifest" "$(CORE).manifest.prev" 2>/dev/null || cp -p "$(CORE).manifest" "$(CORE).manifest.prev"; fi
-	@mv -f "$(CORE).tmp" "$(CORE)"
-	@mv -f "$(CORE).tmp.manifest" "$(CORE).manifest"
-	@echo "installed $(CORE) (previous image kept as $(CORE).prev)"
-	@echo "running servers keep the previous core until each restarts"
+	@set -e; exec 9>"$(CORE).lock"; flock 9; \
+	start=$$(date +%s); \
+	staged=$$(mktemp "$(CORE).tmp.XXXXXX"); \
+	trap 'rm -f "$$staged" "$$staged.manifest"' EXIT; trap 'exit 130' HUP INT TERM; \
+	echo "building $(CORE) (staged as $$staged)"; \
+	DSMR_CORE_OUTPUT="$$staged" $(SBCL) --noinform --disable-debugger \
+	     --load scripts/build-core.lisp; \
+	test -s "$$staged" || { echo "core build produced no image; $(CORE) left untouched" >&2; exit 1; }; \
+	test -s "$$staged.manifest" || { echo "core build produced no manifest; $(CORE) left untouched" >&2; exit 1; }; \
+	$(SBCL) --core "$$staged" --noinform --disable-debugger --non-interactive \
+	     --load scripts/verify-core.lisp; \
+	chmod go+r "$$staged" "$$staged.manifest"; \
+	rm -f "$(CORE).prev" "$(CORE).manifest.prev"; \
+	if [ -e "$(CORE)" ]; then ln "$(CORE)" "$(CORE).prev" 2>/dev/null || cp -p "$(CORE)" "$(CORE).prev"; fi; \
+	if [ -e "$(CORE).manifest" ]; then ln "$(CORE).manifest" "$(CORE).manifest.prev" 2>/dev/null || cp -p "$(CORE).manifest" "$(CORE).manifest.prev"; fi; \
+	mv -f "$$staged" "$(CORE)"; \
+	mv -f "$$staged.manifest" "$(CORE).manifest"; \
+	touch -d @$$start "$(CORE)" "$(CORE).manifest"; \
+	echo "installed $(CORE) (previous image kept as $(CORE).prev)"; \
+	echo "running servers keep the previous core until each restarts"
 
 ## core: build the server core ($(CORE)), then the worker core ($(WORKER_CORE)).
 ##
@@ -828,10 +843,12 @@ core-sources:
 
 ## $(TEST_CORE): build the test core through `make core-server`.
 ##
-##   Alone it builds only an absent core: the files it is built from come from
-##   the list test-core passes to it. Prints why it runs. The build always
-##   saves a new image, so nothing is removed first.
-$(TEST_CORE):
+##   Alone it builds an absent core, or one older than scripts/build-core.lisp:
+##   the other files it is built from come from the list test-core passes to
+##   it. Prints why it runs. The build always saves a new image, so nothing is
+##   removed first. core-server sets the installed core's mtime to the time the
+##   build started.
+$(TEST_CORE): $(CURDIR)/scripts/build-core.lisp
 	@if [ -e "$@" ]; then echo "$@: rebuilding: older than $(firstword $?)"; else echo "$@: building: absent"; fi
 	@mkdir -p "$(@D)"
 	$(MAKE) --no-print-directory core-server CORE="$@"
@@ -841,11 +858,23 @@ $(TEST_CORE):
 ##   Lists the files $(TEST_CORE) is built from (core-sources) into a temporary
 ##   directory, then lets make compare the core with every listed file and
 ##   rebuild it through `make core-server` when it is absent or older than any
-##   of them. A current core is left alone. Server kind only: integration
-##   cases that need a worker core build their own. Runs without the calling
-##   shell's DSMR_ settings (TEST_UNSET_DSMR). Writes only $(TEST_CORE_DIR).
+##   of them. A current core is left alone. A core whose manifest records a
+##   different SBCL version than `$(SBCL) --version` reports is removed first,
+##   so it is rebuilt. Server kind only: integration cases that need a worker
+##   core build their own. Runs without the calling shell's DSMR_ settings
+##   (TEST_UNSET_DSMR). Writes only $(TEST_CORE_DIR); a dry run (make -n)
+##   removes nothing.
+DRY_RUN = $(findstring n,$(firstword -$(MAKEFLAGS)))
 test-core:
 	@$(TEST_UNSET_DSMR) set -e; \
+	if [ -e "$(TEST_CORE)" ]; then \
+	  recorded=$$(sed -n 's/^sbcl-version //p' "$(TEST_CORE).manifest" 2>/dev/null); \
+	  running=$$($(SBCL) --version | awk '{print $$2}'); \
+	  if [ "$$recorded" != "$$running" ]; then \
+	    echo "$(TEST_CORE): rebuilding: built by SBCL $${recorded:-unknown}, running $$running"; \
+	    if [ -z "$(DRY_RUN)" ]; then rm -f "$(TEST_CORE)" "$(TEST_CORE).manifest"; fi; \
+	  fi; \
+	fi; \
 	sources=$$(mktemp -d "$${TMPDIR:-/tmp}/dsmr-test-core.XXXXXX"); \
 	trap 'rm -rf "$$sources"' EXIT; trap 'exit 130' HUP INT TERM; \
 	$(MAKE) --no-print-directory core-sources CORE_SOURCES_DIR="$$sources"; \
@@ -853,8 +882,8 @@ test-core:
 
 ## core-verify: boot a core image and assert it is a complete, working build.
 ##
-##   Run by `make core-server` against the staged image before it is installed,
-##   so the build refuses to replace a working core with a broken one. Also
+##   core-server runs the same check against its staged image before it is
+##   installed, so the build refuses to replace a working core with a broken one. Also
 ##   useful on its own: `make core-verify` checks $(CORE), which is the test
 ##   core unless CORE is set, and `make core-verify CORE_IMAGE=some.core`
 ##   checks any other image, without rebuilding anything.
@@ -889,7 +918,8 @@ core-verify:
 ##   personal init file is frozen into it, and core-verify-worker refuses an
 ##   image that holds a setting taken from the build host's environment.
 ##
-##   Same staged, verified, atomic install as `core`: build to .tmp, boot the
+##   Same locked, staged, verified, atomic install as core-server: under
+##   `flock $(WORKER_CORE).lock`, build to a unique .tmp.XXXXXX name, boot the
 ##   staged image and check it from the inside, keep the outgoing image as
 ##   .prev by hard link, then rename into place. A failed build or a rejected
 ##   image leaves the installed worker core untouched. `make core` runs this
@@ -897,18 +927,23 @@ core-verify:
 ##   $(CORE).
 core-worker:
 	@mkdir -p "$(dir $(WORKER_CORE))"
-	@rm -f "$(WORKER_CORE).tmp" "$(WORKER_CORE).tmp.manifest"
-	DSMR_CORE_KIND=worker DSMR_CORE_OUTPUT=$(WORKER_CORE).tmp $(SBCL) --noinform --disable-debugger \
-	     --no-userinit --non-interactive --load scripts/build-core.lisp
-	@test -s "$(WORKER_CORE).tmp" || { echo "worker core build produced no image; $(WORKER_CORE) left untouched" >&2; exit 1; }
-	@test -s "$(WORKER_CORE).tmp.manifest" || { echo "worker core build produced no manifest; $(WORKER_CORE) left untouched" >&2; exit 1; }
-	@$(MAKE) --no-print-directory core-verify-worker WORKER_CORE_IMAGE="$(WORKER_CORE).tmp"
-	@rm -f "$(WORKER_CORE).prev" "$(WORKER_CORE).manifest.prev"
-	@if [ -e "$(WORKER_CORE)" ]; then ln "$(WORKER_CORE)" "$(WORKER_CORE).prev" 2>/dev/null || cp -p "$(WORKER_CORE)" "$(WORKER_CORE).prev"; fi
-	@if [ -e "$(WORKER_CORE).manifest" ]; then ln "$(WORKER_CORE).manifest" "$(WORKER_CORE).manifest.prev" 2>/dev/null || cp -p "$(WORKER_CORE).manifest" "$(WORKER_CORE).manifest.prev"; fi
-	@mv -f "$(WORKER_CORE).tmp" "$(WORKER_CORE)"
-	@mv -f "$(WORKER_CORE).tmp.manifest" "$(WORKER_CORE).manifest"
-	@echo "installed $(WORKER_CORE) (previous image kept as $(WORKER_CORE).prev)"
+	@set -e; exec 9>"$(WORKER_CORE).lock"; flock 9; \
+	staged=$$(mktemp "$(WORKER_CORE).tmp.XXXXXX"); \
+	trap 'rm -f "$$staged" "$$staged.manifest"' EXIT; trap 'exit 130' HUP INT TERM; \
+	echo "building $(WORKER_CORE) (staged as $$staged)"; \
+	DSMR_CORE_KIND=worker DSMR_CORE_OUTPUT="$$staged" $(SBCL) --noinform --disable-debugger \
+	     --no-userinit --non-interactive --load scripts/build-core.lisp; \
+	test -s "$$staged" || { echo "worker core build produced no image; $(WORKER_CORE) left untouched" >&2; exit 1; }; \
+	test -s "$$staged.manifest" || { echo "worker core build produced no manifest; $(WORKER_CORE) left untouched" >&2; exit 1; }; \
+	$(SBCL) --core "$$staged" --noinform --disable-debugger --non-interactive \
+	     --no-userinit --load scripts/verify-core-worker.lisp; \
+	chmod go+r "$$staged" "$$staged.manifest"; \
+	rm -f "$(WORKER_CORE).prev" "$(WORKER_CORE).manifest.prev"; \
+	if [ -e "$(WORKER_CORE)" ]; then ln "$(WORKER_CORE)" "$(WORKER_CORE).prev" 2>/dev/null || cp -p "$(WORKER_CORE)" "$(WORKER_CORE).prev"; fi; \
+	if [ -e "$(WORKER_CORE).manifest" ]; then ln "$(WORKER_CORE).manifest" "$(WORKER_CORE).manifest.prev" 2>/dev/null || cp -p "$(WORKER_CORE).manifest" "$(WORKER_CORE).manifest.prev"; fi; \
+	mv -f "$$staged" "$(WORKER_CORE)"; \
+	mv -f "$$staged.manifest" "$(WORKER_CORE).manifest"; \
+	echo "installed $(WORKER_CORE) (previous image kept as $(WORKER_CORE).prev)"
 
 ## qlot-lock: refresh qlfile.lock from the working qlfile.
 ##
