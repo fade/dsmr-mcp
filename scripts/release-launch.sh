@@ -17,7 +17,11 @@
 #   any other status is the server's own and ends the launcher with it.
 #
 # DSMR_RELEASE_ROOT and DSMR_BROKER_CORE are always set from the release, never
-# taken from the caller. DSMR_WORKER_CORE is unset. stdout carries only
+# taken from the caller. DSMR_WORKER_CORE is set to the release's worker core,
+# <root>/core/dsmr.core.worker, only when that core and its manifest exist and
+# the manifest's sbcl-version is the running SBCL's; otherwise it is unset and
+# hermetic workers refuse to spawn. DSMR_ALLOW_SOURCE_WORKERS is always unset,
+# so a release never loads a worker from source. stdout carries only
 # JSON-RPC; every diagnostic goes to stderr and to
 # ${XDG_STATE_HOME:-$HOME/.local/state}/dsmr-mcp/launcher.log.
 set -u
@@ -68,6 +72,30 @@ RESTART_EXIT_CODE="${DSMR_RESTART_EXIT_CODE:-75}"
 # --non-interactive ends SBCL when the server returns, so no REPL prompt
 # reaches stdout after the client closes stdin.
 SETSID="$(command -v setsid || true)"
+
+# worker_core_withheld <root>
+# Print why the release's worker core must not be offered, and return 0; return
+# 1, printing nothing, when it may be. The core is offered only when it and its
+# manifest exist and the manifest's sbcl-version equals the version the running
+# SBCL reports, since SBCL refuses a core another build saved.
+worker_core_withheld() {
+  local wcore="$1/core/dsmr.core.worker" recorded current
+  if [ ! -f "$wcore" ]; then
+    printf 'no worker core at %s' "$wcore"
+    return 0
+  fi
+  if [ ! -f "$wcore.manifest" ]; then
+    printf 'no manifest at %s.manifest' "$wcore"
+    return 0
+  fi
+  recorded="$(awk '/^sbcl-version /{ $1=""; sub(/^ /,""); print; exit }' "$wcore.manifest")"
+  current="$("$SBCL" --version 2>/dev/null | awk '{print $2}')"
+  if [ -z "$recorded" ] || [ "$recorded" != "$current" ]; then
+    printf 'built by SBCL %s, running SBCL is %s' "${recorded:-unknown}" "${current:-unknown}"
+    return 0
+  fi
+  return 1
+}
 run_server() {
   local root
   if ! root="$(release_root)"; then
@@ -86,7 +114,14 @@ run_server() {
 
   export DSMR_RELEASE_ROOT="$root"
   export DSMR_BROKER_CORE="$core"
-  unset DSMR_WORKER_CORE
+  unset DSMR_ALLOW_SOURCE_WORKERS
+  local reason
+  if reason="$(worker_core_withheld "$root")"; then
+    unset DSMR_WORKER_CORE
+    log "worker core withheld: $reason; hermetic workers will refuse to spawn"
+  else
+    export DSMR_WORKER_CORE="$root/core/dsmr.core.worker"
+  fi
 
   log "booting release $root"
   ${SETSID:+"$SETSID" -w} "$SBCL" --core "$core" --noinform --disable-debugger \

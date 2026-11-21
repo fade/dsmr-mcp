@@ -18,6 +18,8 @@
 #   ALLOW_UNPUBLISHED  1 skips the check that REF is on an origin branch and
 #              records `unpublished-ref-allowed yes` in the MANIFEST
 #   DEPLOY_VERIFY_TIMEOUT  seconds the verify stage may run; default 120
+#   DEPLOY_WORKER_TIMEOUT  seconds verify-worker waits for the worker's
+#              handshake; default 30
 #
 # Gates, before anything is created under the home: the home is not inside a
 # git work tree, REPO has no uncommitted change to a tracked file, and REF is
@@ -30,8 +32,13 @@
 #   export        git archive of the commit into <home>/releases/<sha>/
 #   dependencies  qlot install and qlot bundle into <release>/deps
 #   build-server  the sealed release-server core, built by plain SBCL
+#   build-worker  the release-worker core, <release>/core/dsmr.core.worker,
+#                 built the same way with HOME kept so the host Quicklisp is found
 #   manifest      <release>/MANIFEST, written once the build succeeded
 #   verify-initialize  the release's own launcher answers initialize and tools/list
+#   verify-worker the worker core passes scripts/verify-core-worker.lisp from the
+#                 inside, then boots as the pool boots a worker and prints a
+#                 handshake, kept as <release>/verify-worker.json
 #   flip          <home>/current names the release, by one rename
 #
 # A failure in any stage prints `deploy: <stage> failed: ...; current is
@@ -239,6 +246,26 @@ deploy() {
     install -m 0755 "$rel/scripts/release-launch.sh" "$rel/bin/dsmr-mcp-launch"
     say "build-server: done in $((SECONDS - t0))s, core $(stat -c %s "$rel/core/dsmr.core") bytes"
 
+    t0=$SECONDS
+    say "build-worker: release-worker core (log $rel/build-worker.log)"
+    if ! env "${scrub[@]}" \
+           XDG_CACHE_HOME="$rel/cache" \
+           DSMR_CORE_KIND=release-worker \
+           DSMR_CORE_OUTPUT="$rel/core/dsmr.core.worker" \
+           DSMR_RELEASE_ROOT="$rel/" \
+           DSMR_RELEASE_COMMIT="$sha" \
+           "$sbcl" --noinform --no-sysinit --no-userinit --disable-debugger --non-interactive \
+           --load "$rel/deps/setup.lisp" \
+           --load "$rel/scripts/build-core.lisp" \
+           >"$rel/build-worker.log" 2>&1; then
+      show_log_tail "$rel/build-worker.log"
+      fail build-worker "the worker core build exited non-zero; read $rel/build-worker.log"
+    fi
+    [ -s "$rel/core/dsmr.core.worker" ] || fail build-worker "no worker core at $rel/core/dsmr.core.worker; read $rel/build-worker.log"
+    grep -qx 'kind release-worker' "$rel/core/dsmr.core.worker.manifest" 2>/dev/null \
+      || fail build-worker "$rel/core/dsmr.core.worker.manifest does not say kind release-worker; read $rel/build-worker.log"
+    say "build-worker: done in $((SECONDS - t0))s, core $(stat -c %s "$rel/core/dsmr.core.worker") bytes"
+
     [ -f "$rel/qlfile.lock" ] || fail manifest "no qlfile.lock in $rel; commit qlfile.lock"
     local sbcl_version
     sbcl_version="$(awk '/^sbcl-version /{ $1=""; sub(/^ /,""); print; exit }' "$rel/core/dsmr.core.manifest")"
@@ -266,8 +293,16 @@ deploy() {
     rm -f "$rel/MANIFEST"
     fail verify-initialize "$VERIFY_PROBLEM (output kept in $vscratch)"
   fi
+  if ! verify_worker "$rel" "$sbcl" "$vscratch"; then
+    chmod -R u+w "$rel"
+    rm -f "$rel/MANIFEST"
+    fail verify-worker "$VERIFY_PROBLEM (output kept in $vscratch)"
+  fi
   if [ ! -f "$rel/verify-initialize.jsonl" ]; then
     cp "$vscratch/verify-initialize.jsonl" "$vscratch/verify-initialize.log" "$rel/"
+  fi
+  if [ ! -f "$rel/verify-worker.json" ]; then
+    cp "$vscratch/verify-worker.json" "$rel/"
   fi
   rm -rf "$vscratch"
   chmod -R a-w "$rel"
@@ -363,6 +398,74 @@ verify_initialize() {
     return 1
   fi
   say "verify-initialize: passed in $((SECONDS - t0))s"
+}
+
+# verify_worker <release> <sbcl> <scratch>
+# Check the release's worker core in two steps. First boot it with
+# scripts/verify-core-worker.lisp under the DSMR-WORKER prefix and the release
+# root, which checks it from the inside. Then start it as the pool starts a
+# worker, with a random secret, the deploy's pid as parent and scratch state and
+# cache directories, and require its first JSON line on stdout within
+# DEPLOY_WORKER_TIMEOUT seconds (default 30) to carry a numeric tcp_port, a
+# numeric pid and a protocol_version. The worker is stopped with SIGTERM either
+# way. Return 0 and keep the line in <scratch>/verify-worker.json on success;
+# otherwise set VERIFY_PROBLEM and return 1.
+verify_worker() {
+  local rel="$1" sbcl="$2" scratch="$3" t0 status
+  local wcore="$rel/core/dsmr.core.worker"
+  local inside="$scratch/verify-worker-inside.log"
+  local out="$scratch/verify-worker.out" err="$scratch/verify-worker.err"
+  local limit="${DEPLOY_WORKER_TIMEOUT:-30}"
+  t0=$SECONDS
+  say "verify-worker: $wcore"
+  if [ ! -s "$wcore" ]; then
+    VERIFY_PROBLEM="no worker core at $wcore; deploy the commit again to rebuild the release"
+    return 1
+  fi
+  set +e
+  env -i HOME="$HOME" PATH="$PATH" \
+      DSMR_VERIFY_WORKER_PREFIX=DSMR-WORKER DSMR_RELEASE_ROOT="$rel/" \
+      XDG_STATE_HOME="$scratch/state" XDG_CACHE_HOME="$scratch/cache" \
+      "$sbcl" --core "$wcore" --noinform --disable-debugger --non-interactive \
+      --no-sysinit --no-userinit --load "$rel/scripts/verify-core-worker.lisp" \
+      </dev/null >"$inside" 2>&1
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    VERIFY_PROBLEM="the worker core failed its inside check, exit $status (log $inside)"
+    return 1
+  fi
+
+  local secret pid line="" waited=0
+  secret="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+  env -i HOME="$HOME" PATH="$PATH" \
+      DSMR_WORKER_SECRET="$secret" DSMR_WORKER_ID=deploy-verify \
+      DSMR_PARENT_PID="$$" DSMR_NO_WORKER_POOL=1 \
+      XDG_STATE_HOME="$scratch/worker-state" XDG_CACHE_HOME="$scratch/worker-cache" \
+      "$sbcl" --core "$wcore" --noinform --disable-debugger --no-sysinit --no-userinit \
+      --eval '(asdf:clear-source-registry)' --eval '(cl-user::dsmr-worker-entry)' \
+      </dev/null >"$out" 2>"$err" &
+  pid=$!
+  while [ "$waited" -lt $((limit * 10)) ]; do
+    line="$(grep -m 1 '^{' "$out" 2>/dev/null || true)"
+    [ -n "$line" ] && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  [ -n "$line" ] || line="$(grep -m 1 '^{' "$out" 2>/dev/null || true)"
+  kill -TERM "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  if [ -z "$line" ]; then
+    VERIFY_PROBLEM="the worker core printed no handshake within ${limit}s (stdout $out, stderr $err)"
+    return 1
+  fi
+  if ! printf '%s\n' "$line" | jq -e '(.tcp_port|type)=="number" and (.pid|type)=="number" and has("protocol_version")' >/dev/null 2>&1; then
+    VERIFY_PROBLEM="the worker's first line is not a handshake with a numeric tcp_port and pid and a protocol_version: $line"
+    return 1
+  fi
+  printf '%s\n' "$line" >"$scratch/verify-worker.json"
+  say "verify-worker: passed in $((SECONDS - t0))s"
 }
 
 case "${1:-}" in
