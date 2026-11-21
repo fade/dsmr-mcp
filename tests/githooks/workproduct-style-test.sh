@@ -65,18 +65,30 @@ fi
 
 # Exemptions.
 expect "skill file exempt"           accepted skills/x/SKILL.md "Delve ${EM} load-bearing."
+ATTR="Gener""ated with Cla""ude Code"
+IDX="pha""se-3"
 PLAN=".plan""ning/STATE.md"   # split so this file does not hold the string it tests
 expect "agent definition exempt"     accepted agents/x.md "Write to ${PLAN} ${EM} then stop."
 expect "agents README not exempt"    refused  agents/README.md "Agents ${EM} here."
-# A planning-file reference outside agents/ is refused by the universal tier, not the style tier.
-mkdir -p "$repo/docs"; printf '%s\n' "See ${PLAN}." > "$repo/docs/planref.md"
-git -C "$repo" add -- docs/planref.md
-if git -C "$repo" commit -q -m "add a file" >"$scratch/out" 2>&1; then
-  fail=$((fail + 1)); echo "FAIL  planning reference outside agents/: accepted"
-else
-  pass=$((pass + 1)); echo "ok    planning reference outside agents/ (refused)"
-fi
-git -C "$repo" reset -q --hard HEAD
+# expect_blocked NAME PATH CONTENT: refused by any tier.
+expect_blocked() {
+  local name="$1" path="$2" content="$3"
+  mkdir -p "$(dirname "$repo/$path")"
+  printf '%s\n' "$content" > "$repo/$path"
+  git -C "$repo" add -- "$path"
+  if git -C "$repo" commit -q -m "add a file" >"$scratch/out" 2>&1; then
+    fail=$((fail + 1)); echo "FAIL  $name: accepted"
+  else
+    pass=$((pass + 1)); echo "ok    $name (refused)"
+  fi
+  git -C "$repo" reset -q --hard HEAD
+}
+expect_blocked "planning reference outside agents/"   docs/planref.md "See ${PLAN}."
+expect_blocked "attribution in an agent definition"   agents/x.md "${ATTR}, and see ${PLAN}."
+expect_blocked "planning index in an agent definition" agents/x.md "Run ${IDX} first."
+expect_blocked "planning reference two levels down"   agents/sub/x.md "See ${PLAN}."
+expect "agents subdirectory README linted" refused agents/sub/README.md "Agents ${EM} here."
+expect_blocked "skill file still refuses a planning reference" skills/x/SKILL.md "See ${PLAN}."
 expect "licence file exempt"         accepted LICENSE "Copyright ${EM} all rights."
 expect "style guide exempt"          accepted docs/writing-style.org "Never write load-bearing or delve."
 git -C "$repo" config --add dsmr.workproductlint.styleexempt 'fixtures/*'

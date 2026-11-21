@@ -33,7 +33,9 @@
 set -u
 
 # grep -E alternations. Case-insensitive matching is applied at call time.
-UNIVERSAL='co-authored-by:[[:space:]]*(claude|codex|chatgpt|gpt-|copilot|gemini|anthropic)|generated (with|by)[^\n]*(claude|codex|copilot|gpt)|🤖|(^|[^[:alnum:]])\.planning/'
+UNIVERSAL='co-authored-by:[[:space:]]*(claude|codex|chatgpt|gpt-|copilot|gemini|anthropic)|generated (with|by)[^\n]*(claude|codex|copilot|gpt)|🤖'
+# Checked apart from UNIVERSAL: an agent definition may name the planning files.
+PLANNING_REF='(^|[^[:alnum:]])\.planning/'
 
 # High-precision only: hyphenated planning identifiers, constellation
 # requirement indices, and coordination phrases that have no legitimate use in
@@ -153,9 +155,11 @@ style_density() {
 # Which style treatment a staged path gets: "prose" takes the block tier, "source"
 # only warns (a string literal or a test fixture can legitimately hold any of
 # these), "exempt" is skipped. Licence texts are not ours to restyle, and skill
-# and agent definitions are agent-facing instructions written for the agent that
-# reads them (skills/ and agents/ are where this site keeps them, in any
-# repository; agents/README.md is for people and is not exempt). The hook's own
+# files are agent-facing instructions written for the agent that reads them
+# (skills/ is where this site keeps them, in any repository). An agent
+# definition (agents/<name>.md, one level deep, README.md excepted) is exempt
+# from the style tier only; the planning-path check below also skips it. The
+# hook's own
 # directory and the public writing-style guide are skipped because they spell
 # every phrase the hook rejects.
 style_class() {
@@ -168,7 +172,9 @@ style_class() {
   case "$f" in
     LICENSE*|LICENCE*|COPYING*|*/LICENSE*|*/LICENCE*|*/COPYING*) printf 'exempt' ;;
     agents/README.md) printf 'prose' ;;
-    skills/*|agents/*|scripts/githooks/*|docs/writing-style.org) printf 'exempt' ;;
+    skills/*|scripts/githooks/*|docs/writing-style.org) printf 'exempt' ;;
+    agents/*/*) printf 'prose' ;;
+    agents/*.md) printf 'exempt' ;;
     *.md|*.markdown|*.org|*.txt|*.rst|*.adoc|README*|*/README*|NEWS*|CHANGELOG*) printf 'prose' ;;
     *) printf 'source' ;;
   esac
@@ -242,7 +248,7 @@ run_style_msg() {
 
 # Returns 0 = clean, 1 = blocked. Prints a report on block.
 run_workproduct_lint() {
-  local mode="$1"; local text=""
+  local mode="$1"; local text="" text_plan=""
   case "$mode" in
     staged)
       # Added lines in the staged diff (strip the leading +, skip +++ headers).
@@ -258,12 +264,16 @@ run_workproduct_lint() {
       # vocabulary and nothing else. A repository without that directory matches
       # nothing here and is unaffected.
       #
-      # Agent definitions (agents/*.md except the README) are skipped for the
-      # same reason skill files are: they are instructions to the agent that
-      # loads them, and name the planning files that agent works with.
-      text=$({ git diff --cached --no-color -U0 -- . ':(exclude)scripts/githooks/*' ':(exclude)agents/*.md' 2>/dev/null
-               git diff --cached --no-color -U0 -- agents/README.md 2>/dev/null; } \
+      # An agent definition (agents/<name>.md, one level deep, not README.md)
+      # stays in this scan: attribution, planning indices and the mark are
+      # checked. Only the .planning/ path check skips it, because a definition
+      # names the planning files its agent reads and writes; text_plan is the
+      # same scan without those files.
+      text=$(git diff --cached --no-color -U0 -- . ':(exclude)scripts/githooks/*' 2>/dev/null \
              | grep -E '^\+' | grep -Ev '^\+\+\+' | sed 's/^+//')
+      text_plan=$({ git diff --cached --no-color -U0 -- . ':(exclude)scripts/githooks/*' ':(exclude,glob)agents/*.md' 2>/dev/null
+                    git diff --cached --no-color -U0 -- agents/README.md 2>/dev/null; } \
+                  | grep -E '^\+' | grep -Ev '^\+\+\+' | sed 's/^+//')
       ;;
     msg)
       # Stop at the scissors line: `git commit -v` appends the diff below it,
@@ -277,6 +287,7 @@ run_workproduct_lint() {
       ;;
   esac
   [ -z "$text" ] && return 0
+  [ "$mode" = staged ] || text_plan=$text
 
   local blocked=0 vocab_blocked=0 style_blocked=0 uni str
   if style_on; then
@@ -285,6 +296,7 @@ run_workproduct_lint() {
     if [ "$STYLE_BLOCKED" = 1 ]; then blocked=1; style_blocked=1; fi
   fi
   uni=$(printf '%s\n' "$text" | grep -nEi "$UNIVERSAL" 2>/dev/null) || true
+  [ -n "$text_plan" ] && uni="$uni$(printf '%s\n' "$text_plan" | grep -nEi "$PLANNING_REF" 2>/dev/null | sed '1s/^/\n/')"
   if [ -n "$uni" ]; then
     echo "✗ work-product lint: AI-attribution or .planning/ reference (never allowed):"
     printf '%s\n' "$uni" | sed 's/^/    /'
