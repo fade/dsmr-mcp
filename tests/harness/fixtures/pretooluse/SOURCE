@@ -1,0 +1,15 @@
+PreToolUse hook input recorded from a real Claude Code 2.1.329 process on 2026-11-21:
+  claude -p --model haiku --settings <settings> --setting-sources "" \
+    "<prompt that asks for one Write, Edit, or NotebookEdit call per case>"
+where <settings> registered a PreToolUse command hook for
+"Write|Edit|MultiEdit|NotebookEdit" that wrote its stdin to a file and denied.
+Each file is that stdin, key-sorted with jq -S and otherwise unchanged.
+
+Captured:  Write new.lisp, Edit existing.lisp, Write out.txt, Write alias.txt
+           (a symlink to existing.lisp), Write work/rel.asd.
+Not captured: NotebookEdit (the engine refused the call before the hook ran,
+           for want of a prior Read) and MultiEdit (absent from this build).
+           The tests derive those two by changing tool_name and the path key
+           of a captured Write, and name them derived.
+Not captured: a call from inside a subagent (the input then carries an extra
+           agent_id field the guard does not read).

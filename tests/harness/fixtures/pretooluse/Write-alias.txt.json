@@ -1,0 +1,17 @@
+{
+  "cwd": "/tmp/claude-1000/-home-fade-SourceCode-lisp-dsmr-mcp/dbe4730b-7d97-4a4c-a488-ec4472d202d2/scratchpad/cap/work",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "permission_mode": "default",
+  "prompt_id": "58820606-8c9c-4595-ab1e-fe31ed3bc245",
+  "session_id": "6d432d87-fa18-4e82-8dac-c97b7a156479",
+  "tool_input": {
+    "content": "y",
+    "file_path": "/tmp/claude-1000/-home-fade-SourceCode-lisp-dsmr-mcp/dbe4730b-7d97-4a4c-a488-ec4472d202d2/scratchpad/cap/work/alias.txt"
+  },
+  "tool_name": "Write",
+  "tool_use_id": "toolu_01G2RUkrCu9kXFqncRujBktp",
+  "transcript_path": "/home/fade/.claude/projects/-tmp-claude-1000--home-fade-SourceCode-lisp-dsmr-mcp-dbe4730b-7d97-4a4c-a488-ec4472d202d2-scratchpad-cap-work/6d432d87-fa18-4e82-8dac-c97b7a156479.jsonl"
+}

@@ -26,7 +26,7 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 .PHONY: bridge bus-watch bus-host bus-sources bus-binaries install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
         preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path \
-        test-worktree-sister install-worktree-sister check-worktree-sister
+        test-worktree-sister install-worktree-sister check-worktree-sister test-lisp-edit-guard
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -362,6 +362,15 @@ install-hooks:
 ##   lint that refuses everything fails, as does one that refuses nothing.
 test-hooks:
 	@bash tests/githooks/workproduct-style-test.sh
+
+## test-lisp-edit-guard: drive the Lisp edit guard with recorded PreToolUse input.
+##
+##   Every case also runs against a stub that gets it wrong, so a guard that
+##   allows everything fails the deny cases and one that denies everything
+##   fails the allow cases. Fixture provenance is in
+##   tests/harness/fixtures/pretooluse/SOURCE.
+test-lisp-edit-guard:
+	@bash tests/harness/lisp-edit-guard-test.sh
 
 ## test-restart-session: drive the in-place session restart against a stub kitten.
 ##
