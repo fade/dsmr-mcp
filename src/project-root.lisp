@@ -32,7 +32,7 @@
            #:ensure-write-path
            #:broad-root-p
            #:canonical-path
-           #:%asdf-source-dirs
+           #:%read-roots
            #:project-root-not-set-error
            #:sandbox-violation-error
            #:reroot-permission-required-error
@@ -58,7 +58,7 @@ Per D-16: silent fallback to process CWD is forbidden."))
              (format s "Path ~A is outside the read allow-list (root: ~A)"
                      (sandbox-violation-path c)
                      (sandbox-violation-root c))))
-  (:documentation "Signalled when a path is not in the session root or any ASDF source dir."))
+  (:documentation "Signalled when a path is not under the session root or any read root."))
 
 (define-condition reroot-permission-required-error (error)
   ((path :initarg :path :reader reroot-permission-required-path :initform nil)
@@ -173,56 +173,50 @@ resolved before the containment check (see D-14)."
                  (uiop:merge-pathnames* path session-root))))
     (%resolve-with-parent-fallback pn)))
 
-;;; ASDF source directory enumeration (D-15) --------------------------------
+;;; Read roots ---------------------------------------------------------------
 
-(defun %asdf-source-dirs ()
-  "Return a list of pathnames for all registered ASDF system source directories.
-Uses the dispatcher's own ASDF (D-15, Phase 6 scope). Attached-image
-enumeration is deferred to Phase 7.
-Nils are dropped; errors per-system are silently swallowed so one bad
-system entry does not abort the allow-list check."
-  (remove nil
-          (mapcar (lambda (name)
-                    (ignore-errors (asdf:system-source-directory name)))
-                  (asdf/system-registry:registered-systems))))
+(defun %read-roots ()
+  "Return the read roots as a list of directory truenames: the absolute
+directories named in DSMR_READ_ROOTS, separated by colons, or ~/SourceCode/lisp/
+when the variable is unset or empty. Drop an entry that is relative or does not
+name an existing directory."
+  (let* ((value (uiop:getenv "DSMR_READ_ROOTS"))
+         (names (if (and value (plusp (length value)))
+                    (uiop:split-string value :separator ":")
+                    (list (namestring (merge-pathnames "SourceCode/lisp/"
+                                                       (user-homedir-pathname)))))))
+    (loop for name in names
+          for dir = (and (plusp (length name))
+                         (uiop:absolute-pathname-p name)
+                         (uiop:directory-exists-p name)
+                         (handler-case (truename (uiop:ensure-directory-pathname name))
+                           (file-error () nil)))
+          when dir collect dir)))
 
 ;;; Read allow-list ---------------------------------------------------------
 
 (defun allowed-read-path (path session-root)
-  "Return canonical pathname if PATH is readable under SESSION-ROOT or any
-registered ASDF source dir. Return NIL when PATH is outside the allow-list.
+  "Return the canonical pathname of PATH when it lies under SESSION-ROOT or under
+a read root (see %read-roots), else NIL. A relative PATH is merged against
+SESSION-ROOT, which must be non-NIL; callers check it first.
 
-CONTRACT (D-16): SESSION-ROOT must be non-NIL; callers check and return
-a typed error before calling this function. This function does NOT signal
-on a nil SESSION-ROOT — that would make the contract too implicit.
-
-D-14 ordering: canonicalize with truename FIRST, then check containment.
-A symlink inside the root that resolves outside it returns NIL.
-%resolve-with-parent-fallback handles the nonexistent-leaf case: when the
-target file does not yet exist, the parent directory is truename-resolved so
-a symlinked parent cannot bypass the containment check."
+Symlinks are resolved before the containment check, so a link under a root
+whose target lies outside every root returns NIL. A path that does not exist
+yet is resolved through its deepest existing ancestor, so a symlinked parent
+cannot bypass the check either."
   (let* ((pn (if (uiop:absolute-pathname-p path)
                  (uiop:ensure-pathname path)
                  (uiop:merge-pathnames* path session-root)))
-         ;; Resolve symlinks before containment check (D-14).
-         ;; Use parent-fallback to handle the nonexistent-leaf case (CR-02).
          (resolved (%resolve-with-parent-fallback pn))
-         ;; Normalize directory status after resolution
          (normalized (if (uiop:directory-exists-p resolved)
                          (uiop:ensure-directory-pathname resolved)
                          resolved))
          (root-dir (uiop:ensure-directory-pathname session-root))
          (resolved-root (or (handler-case (truename root-dir) (file-error () nil))
                             root-dir)))
-    ;; Primary check: under the session root
-    (when (uiop:subpathp normalized resolved-root)
-      (return-from allowed-read-path normalized))
-    ;; Secondary check: under any registered ASDF source dir (D-15, read-only)
-    (dolist (dir (%asdf-source-dirs))
-      (let ((rdir (or (handler-case (truename dir) (file-error () nil)) dir)))
-        (when (and rdir (uiop:subpathp normalized rdir))
-          (return-from allowed-read-path normalized))))
-    nil))
+    (when (or (uiop:subpathp normalized resolved-root)
+              (some (lambda (dir) (uiop:subpathp normalized dir)) (%read-roots)))
+      normalized)))
 
 ;;; Write sandbox -----------------------------------------------------------
 
@@ -230,12 +224,10 @@ a symlinked parent cannot bypass the containment check."
   "Return the resolved pathname for PATH when it is under SESSION-ROOT.
 Return NIL when PATH is outside the session root or when SESSION-ROOT is NIL.
 
-D-13: writes are allowed only under the current session root. ASDF source
-dirs are read-only and are deliberately excluded from the write allow-list.
-D-14: truename runs before the containment check.
-%resolve-with-parent-fallback handles the nonexistent-leaf case (CR-01):
-when the target file does not yet exist, the parent directory is
-truename-resolved so a symlinked parent cannot bypass the write jail."
+Writes are allowed only under the session root; the read roots are not
+writable. Symlinks are resolved before the containment check, and a path that
+does not exist yet is resolved through its deepest existing ancestor, so a
+symlinked parent cannot bypass the write jail."
   (unless session-root
     (return-from ensure-write-path nil))
   (let* ((pn (if (uiop:absolute-pathname-p path)
