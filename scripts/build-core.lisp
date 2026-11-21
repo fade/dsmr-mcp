@@ -371,11 +371,19 @@ under its source names."
                        (find-package "DSMR-MCP/SRC/HERMETIC/WORKER/MAIN"))))
       (funcall (find-symbol "START" package)))))
 
-;;; Both worker kinds: forget the output translations the build computed, which
-;;; point into the build's XDG_CACHE_HOME (inside a read-only release, for a
-;;; release-worker). A worker computes them again from its own environment the
-;;; first time it compiles.
+;;; Both worker kinds: UIOP's user cache directory and ASDF's output translations
+;;; are computed from the build's XDG_CACHE_HOME (inside a read-only release, for
+;;; a release-worker). An init hook recomputes both from the worker's own
+;;; environment each time the image starts, a resumed saved world included.
+
 (when (or (build-core-worker-p) (build-core-release-worker-p))
+  (defun dsmr-worker-restore-environment ()
+    "Recompute what UIOP and ASDF derived from the build's environment: run
+UIOP's image restore hooks, which recompute the user cache directory, and clear
+ASDF's output translations so they follow it."
+    (uiop:call-image-restore-hook)
+    (asdf:clear-output-translations))
+  (pushnew 'dsmr-worker-restore-environment sb-ext:*init-hooks*)
   (asdf:clear-output-translations))
 
 ;;; Staleness manifest. A launch wrapper reads this (with plain shell tools, so
