@@ -4,12 +4,15 @@
 # scripts/deploy.sh: build a release of one commit and make it current.
 #
 # Usage: scripts/deploy.sh deploy
+#        scripts/deploy.sh check-qlot
 #
 # Reads from the environment (the Makefile's deploy target passes them):
 #   REPO       the git repository to export from (required)
 #   REF        the commit to deploy, any form git rev-parse accepts (required)
 #   DSMR_HOME  the deploy home; default ${XDG_DATA_HOME:-$HOME/.local/share}/dsmr-mcp
 #   QLOT       the qlot executable (required)
+#   QLOT_COMMIT  the commit the qlot checkout holding QLOT must have checked
+#              out with no tracked change; empty skips that check
 #   SBCL       the SBCL to build with; default sbcl
 #
 # Stages, each logged on stderr as `deploy: <stage>: ...`:
@@ -44,6 +47,24 @@ scrub_args() {
     printf -- '-u\n%s\n' "$name"
   done
   printf -- '-u\nCL_SOURCE_REGISTRY\n-u\nASDF_OUTPUT_TRANSLATIONS\n'
+}
+
+# check_qlot <qlot> <commit>
+# Exit 1 unless <qlot> is executable and, when <commit> is not empty, the git
+# checkout one level above <qlot>'s directory has <commit> checked out with no
+# tracked change. qlot reads a git source's dependencies, so a different qlot
+# can resolve a different dependency set from the same lock.
+check_qlot() {
+  local qlot="$1" want="$2" dir have
+  [ -x "$qlot" ] || die "dependencies: QLOT $qlot is not executable; provision qlot in \$LISP_WORKSPACE/qlot (run its scripts/setup.sh) or pass QLOT=<path>"
+  [ -n "$want" ] || return 0
+  dir="$(cd "$(dirname "$qlot")/.." && pwd)"
+  have="$(git -C "$dir" rev-parse --verify --quiet HEAD)" \
+    || die "dependencies: $dir is not a git checkout; QLOT_COMMIT needs QLOT inside a qlot checkout, or pass QLOT_COMMIT= to skip the check"
+  [ "$have" = "$want" ] \
+    || die "dependencies: qlot checkout $dir is at $have, not QLOT_COMMIT $want; check out $want there"
+  git -C "$dir" diff --quiet HEAD \
+    || die "dependencies: qlot checkout $dir has tracked changes; QLOT_COMMIT $want must be checked out clean"
 }
 
 deploy() {
@@ -82,7 +103,7 @@ deploy() {
     mkdir -p "$rel"
     git -C "$repo" archive --format=tar "$sha" | tar -x -C "$rel"
 
-    [ -x "$qlot" ] || die "dependencies: QLOT $qlot is not executable; provision qlot in \$LISP_WORKSPACE/qlot (run its scripts/setup.sh) or pass QLOT=<path>"
+    check_qlot "$qlot" "${QLOT_COMMIT:-}"
     # qlot runs with the cache it was set up with, not the XDG_CACHE_HOME the
     # Makefile exports for the checkout's tests. Nothing from that cache
     # reaches the release; the bundle holds copies.
@@ -201,5 +222,6 @@ verify_initialize() {
 
 case "${1:-}" in
   deploy) deploy ;;
-  *) die "usage: scripts/deploy.sh deploy (REPO, REF, DSMR_HOME, QLOT and SBCL from the environment)" ;;
+  check-qlot) check_qlot "${QLOT:-}" "${QLOT_COMMIT:-}" ;;
+  *) die "usage: scripts/deploy.sh deploy|check-qlot (REPO, REF, DSMR_HOME, QLOT, QLOT_COMMIT and SBCL from the environment)" ;;
 esac

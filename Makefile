@@ -77,6 +77,14 @@ REF ?=
 ##   scripts/setup.sh. Used only at build time; a running server never calls it.
 QLOT ?= $(WORKSPACE)/qlot/bin/qlot
 
+## QLOT_COMMIT: the qlot commit that deploy and qlot-lock require.
+##
+##   The checkout holding QLOT must have this commit checked out with no
+##   tracked change. It is the commit on the fade/qlot fork that drops a git
+##   source's (:feature ...) dependency when the feature is false, which the
+##   bordeaux-threads pin needs. Empty skips the check.
+QLOT_COMMIT ?= 1dc76d184a2847d83b0596966abf30fb7648a29c
+
 # Where the harness skills are deployed for the agent that reads them. Claude is
 # the first target and deliberately not the only one; a second agent gets its own
 # directory rather than this one being generalized in place.
@@ -954,6 +962,7 @@ core-worker:
 ##   directory, never in this checkout. Needs the network.
 qlot-lock:
 	@set -e; \
+	QLOT="$(QLOT)" QLOT_COMMIT="$(QLOT_COMMIT)" scripts/deploy.sh check-qlot; \
 	scratch=$$(mktemp -d "$${TMPDIR:-/tmp}/dsmr-qlot-lock.XXXXXX"); \
 	trap 'rm -rf "$$scratch"' EXIT; trap 'exit 130' HUP INT TERM; \
 	git archive --format=tar HEAD | tar -x -C "$$scratch"; \
@@ -975,7 +984,7 @@ qlot-lock:
 ##   previous as they were. REF is required. DSMR_HOME redirects the whole
 ##   deploy to a scratch home: make deploy REF=HEAD DSMR_HOME=$(mktemp -d)
 deploy:
-	@REPO="$(CURDIR)" REF="$(REF)" DSMR_HOME="$(DSMR_HOME)" QLOT="$(QLOT)" SBCL="$(SBCL)" \
+	@REPO="$(CURDIR)" REF="$(REF)" DSMR_HOME="$(DSMR_HOME)" QLOT="$(QLOT)" QLOT_COMMIT="$(QLOT_COMMIT)" SBCL="$(SBCL)" \
 	   scripts/deploy.sh deploy
 
 ## core-verify-worker: boot a worker core image and assert it is fit for workers.

@@ -12,6 +12,7 @@ git slynk https://github.com/fade/sly.git :ref 70350623eecd1f41837c9e57cbb6d5c06
 asdf 3.3.7.4
 # Dependencies this host builds from workspace checkouts, pinned to those checkouts' HEADs
 git log4cl https://github.com/sharplispers/log4cl.git :ref fe3da517147d023029782ced7cd989ba24f1e62d
+git bordeaux-threads https://github.com/sionescu/bordeaux-threads.git :ref a44d59ee2452b360369750a675d673abb2175e0f
 git usocket https://github.com/usocket/usocket.git :ref d492f746d33fed32283143394c7ead1cce59ba37
 git cl-ppcre https://github.com/edicl/cl-ppcre.git :ref a2ea581c23fdc184168423adbd4b4c1f48d42743
 git hunchentoot https://github.com/edicl/hunchentoot.git :ref 65a3a3cca7e6e91fb068efc2ef8069b5c78ee91f
@@ -20,5 +21,3 @@ git trivial-custom-debugger https://github.com/phoe/trivial-custom-debugger.git 
 git form-fiddle https://github.com/Shinmera/form-fiddle.git :ref 706c4fa07552d56b372f728a225021a14db3f62e
 git documentation-utils https://github.com/Shinmera/documentation-utils.git :ref fcbd927dee7f311915a27ee557e3db1d4510403c
 git trivial-indent https://github.com/Shinmera/trivial-indent.git :ref 87b35ff9202b107230e35790e93c471cc7880900
-# bordeaux-threads stays on the dist release: qlot bundle reads the git checkout's
-# (:feature :corman (:require "threads")) as an unconditional dependency and fails.
