@@ -34,6 +34,13 @@
 ;;;;
 ;;;; Any other value is an error naming the accepted ones.
 ;;;;
+;;;; List mode: with $DSMR_CORE_SOURCES set, nothing is built. The script writes
+;;;; to that file one `TARGET: PATH` line per file the image of this kind is
+;;;; built from, with $DSMR_CORE_OUTPUT as TARGET, and exits 0. It finds the
+;;;; systems through scripts/bus-binary-sources.lisp and never loads them. The
+;;;; mode lives in this file so the list resolves under exactly the setup the
+;;;; build uses, for every kind.
+;;;;
 ;;;; The server kind runs AFTER Quicklisp's setup.lisp (the `make core` target
 ;;;; and a dev box's ~/.sbclrc both arrange that). The worker kind is built with
 ;;;; --no-userinit, so nothing from a personal init file is frozen into it, and
@@ -85,6 +92,15 @@
 
 (defun build-core-release-p ()
   (string= *build-core-kind* "release-server"))
+
+(defun build-core-systems ()
+  "The systems loaded into the image of this kind, in load order."
+  (cond ((build-core-worker-p)
+         '("dsmr-mcp/src/hermetic/worker/main"))
+        ((build-core-release-p)
+         '("dsmr-mcp/release"))
+        (t
+         '("dsmr-mcp" "dsmr-mcp/tests" "dsmr-mcp/tests/integration"))))
 
 ;;; The ASDF version a release build accepts. SBCL's built-in ASDF is older and
 ;;; fails on :local-nicknames; the qlfile's asdf line supplies this one.
@@ -166,19 +182,27 @@
   (format *error-output* "~&[build-core] release root: ~A (ASDF ~A)~%"
           (namestring *build-core-release-root*) (asdf:asdf-version)))
 
+;;; List mode: with DSMR_CORE_SOURCES set, write the make prerequisite list for
+;;; the image and quit before any system of this kind is loaded. It runs after
+;;; this kind's registry setup, so the list resolves as the build below would.
+(let ((sources (build-core-getenv "DSMR_CORE_SOURCES" nil)))
+  (when sources
+    (load (merge-pathnames "bus-binary-sources.lisp" *load-truename*))
+    (let ((count (uiop:symbol-call '#:bus-binary-sources '#:write-prerequisites
+                                   (build-core-systems)
+                                   (build-core-getenv "DSMR_CORE_OUTPUT" "dsmr.core")
+                                   sources)))
+      (format *error-output* "~&[build-core] listed ~D source files in ~A~%"
+              count sources))
+    (uiop:quit 0)))
+
 ;;; Load the systems for this kind, all compilation chatter on stderr.
 ;;; For the server kind, loading dsmr-mcp/tests and dsmr-mcp/tests/integration
 ;;; puts zebra and every test leaf in the image, so both `make test` and
 ;;; `make test-integration` can run against the core without any load-system
 ;;; step. The worker kind loads the worker entry point and what it depends on.
 ;;; The release-server kind loads the release closure.
-
-(dolist (system (cond ((build-core-worker-p)
-                       '("dsmr-mcp/src/hermetic/worker/main"))
-                      ((build-core-release-p)
-                       '("dsmr-mcp/release"))
-                      (t
-                       '("dsmr-mcp" "dsmr-mcp/tests" "dsmr-mcp/tests/integration"))))
+(dolist (system (build-core-systems))
   (format *error-output* "~&[build-core] loading ~A …~%" system)
   (let ((*standard-output* *error-output*))
     (asdf:load-system system)))

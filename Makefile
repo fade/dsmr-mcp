@@ -1,8 +1,8 @@
 # Makefile — dsmr-mcp build targets
 
 # Canonical SBCL. CI overrides this to the pinned upstream sbcl-bin (a fixed
-# GENCGC build) for reproducibility; a core-image run may instead add
-# `--core dsmr.core`.
+# GENCGC build) for reproducibility; `make test-warm` adds
+# `--core $(TEST_CORE)`.
 SBCL ?= sbcl
 
 # Isolate the fasl cache to a project-local dir so a test run never loads the
@@ -20,18 +20,31 @@ export XDG_CACHE_HOME ?= $(CURDIR)/.ci-cache
 ##   from the host. A value already in the environment is kept (CI sets one).
 export CL_SOURCE_REGISTRY ?= $(CURDIR)/:
 
-# Prebuilt core image (deps+system+test-deps via save-lisp-and-die). Override
-# CORE to point `test-warm` at an alternate path; rebuild with `make core`
-# whenever the dependencies, the SBCL build, or the project source change.
-CORE ?= dsmr.core
+## TEST_CORE_DIR, TEST_CORE: the core image test runs build and boot.
+##
+##   One per checkout, under the git-ignored .ci-cache, so a current core is
+##   reused across runs. `make test-core` rebuilds it when it is older than any
+##   file it is built from; test-integration hands it to brokers and test-warm
+##   boots it.
+TEST_CORE_DIR ?= $(CURDIR)/.ci-cache/test-core
+TEST_CORE = $(TEST_CORE_DIR)/dsmr.core
 
-# Prebuilt worker core image: only the hermetic worker system, its dependencies
-# and Quicklisp. Hermetic workers boot from it instead of loading the system on
-# every spawn. WORKER_CORE_IMAGE is the image `core-verify-worker` checks.
-WORKER_CORE ?= dsmr.core.worker
+## CORE: the server core image `make core` builds (deps, system and test systems).
+##
+##   Defaults to the test core, so `make core` alone builds into
+##   $(TEST_CORE_DIR) and never touches the image a server runs; `make deploy`
+##   builds that one inside a release.
+CORE ?= $(TEST_CORE)
+
+## WORKER_CORE: the hermetic worker core image `make core-worker` builds.
+##
+##   Holds only the hermetic worker system, its dependencies and Quicklisp.
+##   Hermetic workers boot from it instead of loading the system on every
+##   spawn. WORKER_CORE_IMAGE is the image `core-verify-worker` checks.
+WORKER_CORE ?= $(TEST_CORE_DIR)/dsmr.core.worker
 WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 
-.PHONY: bridge bus-watch bus-host bus-sources bus-binaries install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
+.PHONY: bridge bus-watch bus-host bus-sources bus-binaries install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-server core-verify core-worker core-verify-worker core-sources test-core test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
         preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path \
         deploy test-leaf qlot-lock
@@ -715,9 +728,12 @@ test:
 ##   fail-fast contract, private state home, and DSMR_ removal as `test`,
 ##   because several leaves start a pool too. Run on a schedule / label, not every push.
 ##   TEST_INTEGRATION_TIMEOUT limits the run. It first runs bus-binaries, so
-##   no case runs a bus binary older than a file it is built from.
+##   no case runs a bus binary older than a file it is built from. It then runs
+##   test-core and passes $(TEST_CORE) to the suite as DSMR_BROKER_CORE, so
+##   every broker a case spawns boots the core built from this tree.
 test-integration: bus-binaries
-	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(call TEST_LIMIT,TEST_INTEGRATION_TIMEOUT) $(SBCL) --noinform --disable-debugger --non-interactive \
+	+@$(MAKE) --no-print-directory test-core
+	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) DSMR_BROKER_CORE="$(TEST_CORE)" $(call TEST_LIMIT,TEST_INTEGRATION_TIMEOUT) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests/integration")' \
 	     $(TEST_SOURCE_CHECK) \
@@ -746,7 +762,7 @@ test-leaf:
 	     $(TEST_SOURCE_CHECK) \
 	     --eval '(handler-case (multiple-value-bind (failed reports) (uiop:symbol-call :dsmr-mcp/tests/support/test-watchdog :run-test-packages (list "$(LEAF)")) (let ((class (uiop:find-symbol* :test-result :zebra)) (ran 0)) (dolist (report reports) (incf ran (count-if (lambda (r) (typep r class)) (uiop:symbol-call :zebra :results report)))) (when (zerop ran) (uiop:die 1 "test-leaf: $(LEAF) ran no test; check that its package registers its tests")) (when failed (uiop:die 1 "test-leaf: a test in $(LEAF) failed")))) (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))' $(call TEST_LIMIT_STATUS,$(LEAF_LIMIT))
 
-## core: build the prebuilt deps+system+test-deps core image ($(CORE)).
+## core-server: build the prebuilt deps+system+test-deps core image ($(CORE)).
 ##
 ##   Runs scripts/build-core.lisp (save-lisp-and-die) to amortize the Quicklisp
 ##   load and the system+test compile. The core is GC-safe (SBCL refuses a
@@ -769,11 +785,8 @@ test-leaf:
 ##   it, so $(CORE) names a valid image at every instant: the final rename
 ##   replaces one complete file with another and there is no window where the
 ##   path is missing. Rollback is `mv $(CORE).prev $(CORE)`.
-##
-##   Once $(CORE) is installed it builds the worker core too (core-worker), so a
-##   worker core that fails to build or verify does so after $(CORE) is already
-##   in place and cannot touch it.
-core:
+core-server:
+	@mkdir -p "$(dir $(CORE))"
 	@rm -f "$(CORE).tmp" "$(CORE).tmp.manifest"
 	DSMR_CORE_OUTPUT=$(CORE).tmp $(SBCL) --noinform --disable-debugger \
 	     --load scripts/build-core.lisp
@@ -787,14 +800,64 @@ core:
 	@mv -f "$(CORE).tmp.manifest" "$(CORE).manifest"
 	@echo "installed $(CORE) (previous image kept as $(CORE).prev)"
 	@echo "running servers keep the previous core until each restarts"
-	@$(MAKE) --no-print-directory core-worker
+
+## core: build the server core ($(CORE)), then the worker core ($(WORKER_CORE)).
+##
+##   Runs core-server, then core-worker with the same CORE and WORKER_CORE, so
+##   a worker core that fails to build or verify does so after $(CORE) is
+##   already in place and cannot touch it. With no arguments both land in
+##   $(TEST_CORE_DIR).
+core:
+	@$(MAKE) --no-print-directory core-server CORE="$(CORE)"
+	@$(MAKE) --no-print-directory core-worker WORKER_CORE="$(WORKER_CORE)"
+
+## core-sources: list the files the test core is built from.
+##
+##   Writes $(CORE_SOURCES_DIR)/test-core.mk, one `$(TEST_CORE): PATH` line per
+##   file in the ASDF dependency closure of the server core's systems, resolved
+##   by scripts/build-core.lisp in list mode under the core build's own setup.
+##   Systems are found, never loaded or built. CORE_SOURCES_DIR is required.
+##   Every line carries `+`, so `make -n` still writes the list a dry run of
+##   test-core reads.
+CORE_SOURCES_DIR ?=
+core-sources:
+	+@$(if $(strip $(CORE_SOURCES_DIR)),:,echo "core-sources: CORE_SOURCES_DIR is empty; set it to the directory for the source list" >&2; exit 1)
+	+@mkdir -p "$(CORE_SOURCES_DIR)"
+	+@DSMR_CORE_OUTPUT="$(TEST_CORE)" DSMR_CORE_SOURCES="$(CORE_SOURCES_DIR)/test-core.mk" \
+	  $(SBCL) --noinform --disable-debugger --non-interactive --load scripts/build-core.lisp
+
+## $(TEST_CORE): build the test core through `make core-server`.
+##
+##   Alone it builds only an absent core: the files it is built from come from
+##   the list test-core passes to it. Prints why it runs. The build always
+##   saves a new image, so nothing is removed first.
+$(TEST_CORE):
+	@if [ -e "$@" ]; then echo "$@: rebuilding: older than $(firstword $?)"; else echo "$@: building: absent"; fi
+	@mkdir -p "$(@D)"
+	$(MAKE) --no-print-directory core-server CORE="$@"
+
+## test-core: rebuild the test core when it is absent or older than its sources.
+##
+##   Lists the files $(TEST_CORE) is built from (core-sources) into a temporary
+##   directory, then lets make compare the core with every listed file and
+##   rebuild it through `make core-server` when it is absent or older than any
+##   of them. A current core is left alone. Server kind only: integration
+##   cases that need a worker core build their own. Runs without the calling
+##   shell's DSMR_ settings (TEST_UNSET_DSMR). Writes only $(TEST_CORE_DIR).
+test-core:
+	@$(TEST_UNSET_DSMR) set -e; \
+	sources=$$(mktemp -d "$${TMPDIR:-/tmp}/dsmr-test-core.XXXXXX"); \
+	trap 'rm -rf "$$sources"' EXIT; trap 'exit 130' HUP INT TERM; \
+	$(MAKE) --no-print-directory core-sources CORE_SOURCES_DIR="$$sources"; \
+	$(MAKE) --no-print-directory -f Makefile -f "$$sources/test-core.mk" "$(TEST_CORE)"
 
 ## core-verify: boot a core image and assert it is a complete, working build.
 ##
-##   Run by `make core` against the staged image before it is installed, so the
-##   build refuses to replace a working core with a broken one. Also useful on
-##   its own to check the installed image (`make core-verify`) or any other
-##   (`make core-verify CORE_IMAGE=some.core`) without rebuilding anything.
+##   Run by `make core-server` against the staged image before it is installed,
+##   so the build refuses to replace a working core with a broken one. Also
+##   useful on its own: `make core-verify` checks $(CORE), which is the test
+##   core unless CORE is set, and `make core-verify CORE_IMAGE=some.core`
+##   checks any other image, without rebuilding anything.
 ##
 ##   Two kinds of broken image fail here by two different routes, and only one
 ##   of them reaches the script. An image damaged badly enough not to boot kills
@@ -833,6 +896,7 @@ core-verify:
 ##   after it has installed $(CORE); run on its own, this target never touches
 ##   $(CORE).
 core-worker:
+	@mkdir -p "$(dir $(WORKER_CORE))"
 	@rm -f "$(WORKER_CORE).tmp" "$(WORKER_CORE).tmp.manifest"
 	DSMR_CORE_KIND=worker DSMR_CORE_OUTPUT=$(WORKER_CORE).tmp $(SBCL) --noinform --disable-debugger \
 	     --no-userinit --non-interactive --load scripts/build-core.lisp
@@ -891,15 +955,15 @@ core-verify-worker:
 	@$(SBCL) --core "$(WORKER_CORE_IMAGE)" --noinform --disable-debugger --non-interactive \
 	     --no-userinit --load scripts/verify-core-worker.lisp
 
-## test-warm: run the fast suite against the prebuilt core ($(CORE)).
+## test-warm: run the fast suite against the test core ($(TEST_CORE)).
 ##
-##   Skips the Quicklisp load and the recompile entirely — the core already
-##   holds dsmr-mcp + the test leaves — so only the assertions run. Build the
-##   core first with `make core`. `make test` remains the no-core load path and
-##   works whether or not a core is present. Like `test`, each run gets a fresh
-##   state home of its own (TEST_STATE_HOME) and none of the calling shell's
-##   DSMR_ settings (TEST_UNSET_DSMR). TEST_TIMEOUT limits the run.
-test-warm:
-	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(call TEST_LIMIT,TEST_TIMEOUT) $(SBCL) --core $(CORE) --noinform --disable-debugger --non-interactive \
+##   Runs test-core first, so the core is rebuilt when it is older than a file
+##   it is built from. The core already holds dsmr-mcp and the test leaves, so
+##   only the assertions run. `make test` boots no core. Like `test`, each run
+##   gets a fresh state home of its own (TEST_STATE_HOME) and none of the
+##   calling shell's DSMR_ settings (TEST_UNSET_DSMR). TEST_TIMEOUT limits the
+##   run.
+test-warm: test-core
+	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(call TEST_LIMIT,TEST_TIMEOUT) $(SBCL) --core "$(TEST_CORE)" --noinform --disable-debugger --non-interactive \
 	     $(TEST_SOURCE_CHECK) \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))' $(call TEST_LIMIT_STATUS,TEST_TIMEOUT)

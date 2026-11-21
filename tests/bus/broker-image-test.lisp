@@ -71,6 +71,36 @@
   "True when some argument in ARGS contains TEXT."
   (some (lambda (a) (and (stringp a) (search text a))) args))
 
+(defmacro with-broker-core-env ((value) &body body)
+  "Run BODY with DSMR_BROKER_CORE set to VALUE, or unset when VALUE is NIL.
+Restore the variable's prior state, set or unset, however BODY exits."
+  (let ((prior (gensym "PRIOR")))
+    `(let ((,prior (uiop:getenv "DSMR_BROKER_CORE")))
+       (unwind-protect
+            (progn
+              (if ,value
+                  (setf (uiop:getenv "DSMR_BROKER_CORE") ,value)
+                  (sb-posix:unsetenv "DSMR_BROKER_CORE"))
+              ,@body)
+         (if ,prior
+             (setf (uiop:getenv "DSMR_BROKER_CORE") ,prior)
+             (sb-posix:unsetenv "DSMR_BROKER_CORE"))))))
+
+(defmacro with-temp-image ((path) &body body)
+  "Bind PATH to the namestring of an empty file created for BODY and removed
+afterwards."
+  `(let ((,path (uiop:native-namestring
+                 (merge-pathnames (format nil "broker-image-~D-~D.core"
+                                          (sb-posix:getpid) (random 100000000))
+                                  (uiop:temporary-directory)))))
+     (unwind-protect
+          (progn
+            (with-open-file (s ,path :direction :output :if-exists :supersede
+                                     :if-does-not-exist :create)
+              (declare (ignore s)))
+            ,@body)
+       (ignore-errors (delete-file ,path)))))
+
 ;;; ------------------------------------------------------------ how it launches
 
 (define-test a-prebuilt-image-is-launched-directly-and-builds-nothing
@@ -114,6 +144,37 @@
       (let ((args (broker::%broker-spawn-args "/tmp/a-particular-bus/" :block nil)))
         (true (any-arg-contains "/tmp/a-particular-bus/" args)
               "the bus root is named on the command line")))))
+
+(define-test the-image-dsmr-broker-core-names-is-launched
+  "With DSMR_BROKER_CORE naming an existing file, that file is the image the
+   broker boots, and nothing is built from source."
+  (with-temp-image (image)
+    (with-broker-core-env (image)
+      (let ((args (broker::%broker-spawn-args "/tmp/a-bus/" :block nil)))
+        (is string= image (arg-after "--core" args)
+            "the image DSMR_BROKER_CORE names is launched")
+        (false (any-arg-contains "quickload" args)
+               "and nothing is built from source")))))
+
+(define-test without-dsmr-broker-core-no-image-is-launched
+  "With DSMR_BROKER_CORE unset the broker is built from source, even when a
+   dsmr.core sits beside the dsmr-mcp source."
+  (with-broker-core-env (nil)
+    (let ((args (broker::%broker-spawn-args "/tmp/a-bus/" :block nil)))
+      (false (member "--core" args :test #'string=)
+             "no image is named")
+      (true (any-arg-contains "quickload" args)
+            "and the broker subsystem is built from source"))))
+
+(define-test a-dsmr-broker-core-naming-no-file-launches-no-image
+  "A DSMR_BROKER_CORE naming a file that does not exist is ignored, and the
+   broker is built from source."
+  (with-broker-core-env ("/nonexistent/dsmr-broker-image-test.core")
+    (let ((args (broker::%broker-spawn-args "/tmp/a-bus/" :block nil)))
+      (false (member "--core" args :test #'string=)
+             "no image is named")
+      (true (any-arg-contains "quickload" args)
+            "and the broker subsystem is built from source"))))
 
 ;;; -------------------------------------------------------- what it records
 
