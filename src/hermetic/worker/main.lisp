@@ -262,6 +262,17 @@ is left for ASDF to redo at the worker's first system lookup, as a worker
 booted from the worker core does."
   (asdf:clear-source-registry))
 
+(defun %register-project-root (dir)
+  "Put DIR first in asdf:*central-registry*, so the rooted project's .asd files
+are found before any same-named system elsewhere in the source registry. DIR
+is the project root from %setup-project-root, or NIL, in which case nothing
+changes. Logs worker.project-root.registered. Returns DIR."
+  (when dir
+    (setf asdf:*central-registry*
+          (cons dir (remove dir asdf:*central-registry* :test #'equal)))
+    (log-event :info "worker.project-root.registered" "path" (namestring dir)))
+  dir)
+
 (defun register-worker-methods (server registry)
   "Install every worker method on SERVER: the handler table over REGISTRY,
 plus the method that saves this worker's world to a core so a later process
@@ -290,7 +301,8 @@ Follows the mandatory startup order:
   3. configure-log4cl-for-server, second: any earlier log would corrupt stdout;
      then resolve-eval-timeout, so the eval timeout comes from this process's
      environment and not from the image it booted from
-  4. log worker.starting
+  4. log worker.starting; SIGTERM handler; the project root from
+     DSMR_PROJECT_ROOT, registered first in ASDF's lookup
   5. make-worker-server (ephemeral TCP), kept in *server*
   6. register-worker-methods with a new object registry, kept in *registry*
   7. %output-handshake (ONE line to stdout, then done)
@@ -322,7 +334,7 @@ worker saved itself to a core), the process exits cleanly."
   ;; Install SIGTERM handler for clean pool shutdown.
   (%install-signal-handlers)
   ;; Set project root when injected (fs verbs read this for path resolution).
-  (%setup-project-root)
+  (%register-project-root (%setup-project-root))
   ;; Step 5: open ephemeral TCP port.
   (handler-case
       (let* ((server   (setf *server* (make-worker-server)))
@@ -366,8 +378,9 @@ belongs to the process rather than the heap is redone, in the resume order:
   3. restore *standard-output*, configure-log4cl-for-server,
      resolve-eval-timeout, then the first log, which also reports the
      placeholders
-  4. SIGTERM handler and project root from this process's environment, and
-     the ASDF source registry scan dropped so it is redone on first lookup
+  4. SIGTERM handler and project root from this process's environment, the
+     ASDF source registry scan dropped so it is redone on first lookup, and
+     the project root registered first in ASDF's lookup
   5. reopen-worker-server: new listener, new port, not yet authenticated
   6. %output-handshake, %redirect-stdout-to-devnull
   7. start-parent-watchdog, which reads this process's DSMR_PARENT_PID
@@ -396,8 +409,9 @@ environment, so the process that resumes the core decides the secret."
     (when problem
       (log-event :error "worker.resume.placeholders-failed" "error" problem)))
   (%install-signal-handlers)
-  (%setup-project-root)
-  (%forget-source-registry-scan)
+  (let ((root (%setup-project-root)))
+    (%forget-source-registry-scan)
+    (%register-project-root root))
   (handler-case
       (let ((tcp-port (reopen-worker-server *server*)))
         (let ((swank-port (%maybe-start-swank)))

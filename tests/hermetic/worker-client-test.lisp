@@ -39,6 +39,23 @@
                       out))
     path))
 
+(defun %call-with-env (bindings thunk)
+  "Call THUNK with each (NAME . VALUE) in BINDINGS set in the process
+environment, VALUE NIL meaning unset; restore every previous value after."
+  (let ((saved (mapcar (lambda (b) (cons (car b) (sb-posix:getenv (car b))))
+                       bindings)))
+    (unwind-protect
+         (progn
+           (dolist (b bindings)
+             (if (cdr b)
+                 (sb-posix:setenv (car b) (cdr b) 1)
+                 (sb-posix:unsetenv (car b))))
+           (funcall thunk))
+      (dolist (s saved)
+        (if (cdr s)
+            (sb-posix:setenv (car s) (cdr s) 1)
+            (sb-posix:unsetenv (car s)))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Secrets
 ;;; ---------------------------------------------------------------------------
@@ -171,6 +188,83 @@ while loading are not final."
             (make-condition 'worker-spawn-failed :kind kind :message "x"))
            "~A was taken as final" kind))
   (false (worker-spawn-failure-final-p (make-condition 'simple-error))))
+
+;;; ---------------------------------------------------------------------------
+;;; What a worker is started from, and what it inherits
+;;; ---------------------------------------------------------------------------
+
+(define-test a-spawn-without-a-worker-core-is-refused
+  "With no worker core and no source opt-in, building the command line and
+spawning both fail as final with the kind no-worker-core, naming the core
+variable and the opt-in, and start nothing."
+  (%call-with-env
+   '(("DSMR_ALLOW_SOURCE_WORKERS" . nil))
+   (lambda ()
+     (let ((condition (handler-case (progn (wc::%build-sbcl-args) nil)
+                        (worker-spawn-failed (c) c))))
+       (true condition "a command line was built without a core")
+       (is eq :no-worker-core (and condition (worker-spawn-failed-kind condition)))
+       (true (worker-spawn-failure-final-p condition))
+       (let ((text (princ-to-string condition)))
+         (true (search "DSMR_WORKER_CORE" text) "~A" text)
+         (true (search "DSMR_ALLOW_SOURCE_WORKERS" text) "~A" text)))
+     (let ((condition (handler-case
+                          (let ((worker (spawn-worker :core nil)))
+                            (ignore-errors (wc::kill-worker worker))
+                            nil)
+                        (worker-spawn-failed (c) c))))
+       (true condition "a worker was spawned without a core")
+       (is eq :no-worker-core
+           (and condition (worker-spawn-failed-kind condition))
+           "~A" condition)))))
+
+(define-test the-source-worker-opt-in-allows-a-source-command-line
+  "With DSMR_ALLOW_SOURCE_WORKERS=1 and no core, the command line loads the
+worker system from source and starts it."
+  (%call-with-env
+   '(("DSMR_ALLOW_SOURCE_WORKERS" . "1"))
+   (lambda ()
+     (let ((args (wc::%build-sbcl-args)))
+       (false (member "--core" args :test #'string=))
+       (true (member "(asdf:load-system :dsmr-mcp/src/hermetic/worker/main)" args
+                     :test #'string=)
+             "~S" args)
+       (true (member "(dsmr-mcp/src/hermetic/worker/main:start)" args
+                     :test #'string=)
+             "~S" args)))))
+
+(define-test a-core-command-line-names-no-tool-directory
+  "A worker booted from a core is given the core, no sysinit or userinit, and
+a registry reset; no argument names this server's own dsmr-mcp directory or
+ASDF's central registry."
+  (let* ((tool-dir (namestring (asdf:system-source-directory :dsmr-mcp)))
+         (args (wc::%build-sbcl-args :core "/nonexistent/worker.core")))
+    (is string= "--core" (first args))
+    (is string= "/nonexistent/worker.core" (second args))
+    (dolist (flag '("--noinform" "--disable-debugger" "--no-userinit" "--no-sysinit"))
+      (true (member flag args :test #'string=) "~A missing from ~S" flag args))
+    (true (member "(asdf:clear-source-registry)" args :test #'string=) "~S" args)
+    (dolist (arg args)
+      (false (search tool-dir arg) "argument ~S names ~A" arg tool-dir)
+      (false (search "central-registry" (string-downcase arg))
+             "argument ~S names the central registry" arg))))
+
+(define-test release-and-core-variables-are-not-inherited
+  "Each variable naming a core or a release is dropped from the environment a
+worker inherits, while an ordinary variable passes through."
+  (let ((names '("DSMR_BROKER_CORE" "DSMR_WORKER_CORE" "DSMR_RELEASE_ROOT"
+                 "DSMR_HOME" "DSMR_LAUNCHER_PATH")))
+    (%call-with-env
+     (list* '("DSMR_TEST_PASSES_THROUGH" . "yes")
+            (mapcar (lambda (n) (cons n "/inherited/value")) names))
+     (lambda ()
+       (let ((env (wc::%build-environment "secret" 1)))
+         (true (member "DSMR_TEST_PASSES_THROUGH=yes" env :test #'string=))
+         (dolist (name names)
+           (false (find-if (lambda (e) (uiop:string-prefix-p
+                                        (concatenate 'string name "=") e))
+                           env)
+                  "~A was inherited" name)))))))
 
 (define-test a-worker-gives-up-its-save-well-before-the-pool-stops-waiting
   "The deadline a worker is given for a save leaves the pool's whole answer

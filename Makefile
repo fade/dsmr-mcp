@@ -746,9 +746,12 @@ test:
 ##   no case runs a bus binary older than a file it is built from. It then runs
 ##   test-core and passes $(TEST_CORE) to the suite as DSMR_BROKER_CORE, so
 ##   every broker a case spawns boots the core built from this tree.
+## DSMR_ALLOW_SOURCE_WORKERS=1: the integration suite starts source-loaded
+##   workers deliberately; nothing else sets it, so a worker without a worker
+##   core is refused everywhere else.
 test-integration: bus-binaries
 	+@$(MAKE) --no-print-directory test-core
-	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) DSMR_BROKER_CORE="$(TEST_CORE)" $(call TEST_LIMIT,TEST_INTEGRATION_TIMEOUT) $(SBCL) --noinform --disable-debugger --non-interactive \
+	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) DSMR_ALLOW_SOURCE_WORKERS=1 DSMR_BROKER_CORE="$(TEST_CORE)" $(call TEST_LIMIT,TEST_INTEGRATION_TIMEOUT) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests/integration")' \
 	     $(TEST_SOURCE_CHECK) \
@@ -766,6 +769,8 @@ test-integration: bus-binaries
 ##   TEST_INTEGRATION_TIMEOUT when LEAF is under dsmr-mcp/tests/integration/.
 ##   A leaf under dsmr-mcp/tests/integration/ runs test-core first and gets
 ##   $(TEST_CORE) as DSMR_BROKER_CORE, as under test-integration.
+## DSMR_ALLOW_SOURCE_WORKERS=1 is set for an integration LEAF only, as under
+##   test-integration: those leaves start source-loaded workers deliberately.
 ##   The command is not echoed, so a search of the log for the source check's
 ##   refusal finds only a refusal the run printed.
 LEAF ?=
@@ -774,7 +779,7 @@ LEAF_LIMIT = $(if $(LEAF_INTEGRATION),TEST_INTEGRATION_TIMEOUT,TEST_TIMEOUT)
 test-leaf:
 	@$(if $(strip $(LEAF)),:,echo "test-leaf: LEAF is empty; name a test system, for example LEAF=dsmr-mcp/tests/install/config-test" >&2; exit 1)
 	$(if $(LEAF_INTEGRATION),+@$(MAKE) --no-print-directory test-core)
-	@$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(if $(LEAF_INTEGRATION),DSMR_BROKER_CORE="$(TEST_CORE)") $(call TEST_LIMIT,$(LEAF_LIMIT)) $(SBCL) --noinform --disable-debugger --non-interactive \
+	@$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(if $(LEAF_INTEGRATION),DSMR_ALLOW_SOURCE_WORKERS=1 DSMR_BROKER_CORE="$(TEST_CORE)") $(call TEST_LIMIT,$(LEAF_LIMIT)) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests/support/test-watchdog")' \
 	     --eval '(asdf:load-system "$(LEAF)")' \

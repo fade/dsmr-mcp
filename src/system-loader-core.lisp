@@ -235,7 +235,9 @@ TIMEOUT-SECONDS (default 120) bounds the wait for the reply, not the load.
 
 The load runs through CALL-WITH-LOAD-GUARD on a thread of its own.
 Warnings are collected non-fatally and muffled off the host stderr; an
-error aborts the load and returns status=error. At the limit the reply is
+error aborts the load and returns status=error. A status=loaded reply
+carries source_directory, the directory the system was loaded from, or null
+when ASDF names none. At the limit the reply is
 status=timeout with still_running true, and the load runs on to
 completion. While any guarded operation other than the caller's own runs,
 the reply is status=busy naming it, and no load starts."
@@ -282,7 +284,12 @@ the reply is status=busy naming it, and no load starts."
                                          "system"   sys-name
                                          "duration_ms" elapsed
                                          "forced"   force
-                                         "warnings" n-warns)))
+                                         "warnings" n-warns
+                                         "source_directory"
+                                         (let ((dir (ignore-errors
+                                                     (asdf:system-source-directory
+                                                      sys-name))))
+                                           (if dir (namestring dir) 'null)))))
                  (when (plusp n-warns)
                    (setf (gethash "warning_details" ht) (nreverse warns)))
                  (setf (gethash "content" ht)
