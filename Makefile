@@ -25,7 +25,8 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 
 .PHONY: bridge bus-watch bus-host bus-sources bus-binaries install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
-        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path
+        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path \
+        test-worktree-sister install-worktree-sister check-worktree-sister
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -387,6 +388,14 @@ test-routing-probe:
 test-memory-store-path:
 	@bash tests/scripts/memory-store-path-test.sh
 
+## test-worktree-sister: drive the worktree sister helper and its status report in scratch repositories.
+##
+##   git runs for real in scratch repositories under an isolated configuration.
+##   direnv, kitten, and the bus watcher are stubs, and the fleet launcher runs
+##   only with --dry-run, so nothing reaches kitty, a session, or a bus.
+test-worktree-sister:
+	@$(TEST_UNSET_DSMR) bash tests/scripts/worktree-sister-test.sh
+
 ## check-hooks: report where a deployed hook differs from this tree.
 ##
 ##   Never edits. Checks the SHARED files across every repository in the
@@ -439,6 +448,30 @@ check-sisters:
 	elif cmp -s scripts/sisters.sh "$(BINDIR)/sisters.sh"; then echo "match: $(BINDIR)/sisters.sh"; \
 	else echo "DIFFERS: $(BINDIR)/sisters.sh"; diff -u "$(BINDIR)/sisters.sh" scripts/sisters.sh | head -40; \
 	     echo "run 'make install-sisters' to deploy this tree, or port the other way first"; fi
+
+## install-worktree-sister: publish the worktree sister helper onto PATH.
+##
+##   A leader runs it by name to give a branch its own worktree and sister, so
+##   the copy under $(BINDIR) is the one that runs. The leader deploys it after
+##   review. Install atomically: a half-written helper can leave a worktree
+##   with no registration, which teardown cannot find.
+install-worktree-sister:
+	@mkdir -p "$(BINDIR)"
+	@cp scripts/worktree-sister.sh "$(BINDIR)/.worktree-sister.sh.tmp"
+	@chmod 755 "$(BINDIR)/.worktree-sister.sh.tmp"
+	@mv -f "$(BINDIR)/.worktree-sister.sh.tmp" "$(BINDIR)/worktree-sister.sh"
+	@echo "installed $(BINDIR)/worktree-sister.sh"
+	@command -v worktree-sister.sh >/dev/null 2>&1 \
+	  || echo "NOTE: $(BINDIR) is not on this shell's PATH, so 'worktree-sister.sh' will not resolve by name"
+
+## check-worktree-sister: report whether the deployed helper matches this tree.
+##
+##   Never edits. A tree edited without a deploy is a fix nobody is getting.
+check-worktree-sister:
+	@if [ ! -f "$(BINDIR)/worktree-sister.sh" ]; then echo "NOT DEPLOYED: $(BINDIR)/worktree-sister.sh"; \
+	elif cmp -s scripts/worktree-sister.sh "$(BINDIR)/worktree-sister.sh"; then echo "match: $(BINDIR)/worktree-sister.sh"; \
+	else echo "DIFFERS: $(BINDIR)/worktree-sister.sh"; diff -u "$(BINDIR)/worktree-sister.sh" scripts/worktree-sister.sh | head -40; \
+	     echo "run 'make install-worktree-sister' to deploy this tree, or port the other way first"; fi
 
 ## install-restart-session: publish the in-place session restart onto PATH.
 ##

@@ -39,6 +39,15 @@ next:      <the single next action a successor takes>
 written:   <ISO-8601>
 ```
 
+   **A worktree sister** (her environment sets `DSMR_WORKTREE_SISTER`) writes this file in her own
+   directory instead, with `repo:` holding her name. Her worktree's `.planning` is the main
+   checkout's bucket, so the repo's `PARK.md` there is never hers (see **worker**, Step 0):
+
+```bash
+S=.planning${DSMR_WORKTREE_SISTER:+/sisters/$DSMR_WORKTREE_SISTER}
+echo "$S/PARK.md"   # the file to write
+```
+
 ⚠ **Derive the `sha` from `git rev-parse HEAD`, never from a short form you have
    seen quoted.** One agent nearly parked on a **fabricated** 40-char sha, expanded from an
    abbreviation it had only read. It caught it by verifying the field against `rev-parse` after
@@ -89,7 +98,8 @@ written:   <ISO-8601>
    while you are down, which is what a park looks like under the service. Mark the park exactly as
    above either way.
 
-5. Send the leader **exactly one line**: `PARKED <repo> @<short-sha>`
+5. Send the leader **exactly one line**: `PARKED <repo> @<short-sha>`. A worktree sister names
+   herself: `PARKED <name> @<short-sha>`.
 
 ⛔ **No park announcement longer than that line.** No summaries, no findings, no lessons, no
 state-of-the-repo. Anything a successor needs belongs in `PARK.md` and the repo's `.planning`;
@@ -98,6 +108,10 @@ anything not in a file is not park state and will be lost — correctly.
 **Leader:** confirm each worker by **reading its `PARK.md` and running `git -C <repo> rev-parse
 HEAD`**. Never confirm from a message. When every repo's file exists and its `sha` matches the live
 HEAD, broadcast `FLEET-CLEAR` (one word) and tell the operator it is safe to restart.
+A worktree sister's park is in her own directory, so confirm her with
+`bash ~/.claude/skills/leader/worktree-sister-status.sh --park <repo>` (state `OK` against her
+worktree's HEAD; under `--park` any other state exits non-zero), never by reading the repo's
+`PARK.md`.
 
 ⛔ **`FLEET-CLEAR` IS ADDRESSED TO THE OPERATOR, NOT TO A WORKER. IT LIFTS NOTHING.** It reports that
 every park file matches live HEAD, so it is safe for HIM to take the fleet down. ⇒ **On a
@@ -165,7 +179,8 @@ re-announces.
 4. **Read `.planning/STATE.md` and `.planning/ROADMAP.md` before anything else.** State the phase
    number you are resuming under.
 5. Expect a quiet bus. Workers are not up. Do not block on them.
-6. As each worker checks in, confirm its live HEAD against its `PARK.md`. **A mismatch is a STOP —
+6. As each worker checks in, confirm its live HEAD against its `PARK.md` (a worktree sister's with
+   `worktree-sister-status.sh`). **A mismatch is a STOP —
    reconcile before any work.** Then run the reader check for it (`--check-live --bus <TAG>
    --agent <sister> --namespace <sister-root>/`; see **leader**). A `deaf=` field once it has
    announced is a deaf sister: surface it to the operator, who must type in its terminal.
@@ -178,7 +193,10 @@ re-announces.
 2. Rejoin the bus under your own stable identity; drain forward to 0.
 3. Read **your own** `.planning/PARK.md`. Check out its `branch`; confirm `git rev-parse HEAD`
    equals its `sha`. **Mismatch ⇒ stop and report; do not work.**
-4. Send **one line**: `RESUMED <repo> @<short-sha>`
+   A worktree sister reads `$S/PARK.md` instead, after the registration control in **worker**
+   Step 0, and her blocks are `$S/BLOCKED.md`.
+4. Send **one line**: `RESUMED <repo> @<short-sha>`. A worktree sister sends
+   `RESUMED <name> @<short-sha>`, naming herself.
 5. Arm your watch (`--detach` once, which adopts the watcher your park left running and clears
    your park marker, then the background `--wake`, with `--wait-for-arm` and re-armed after each
    fire when the session Stop hook is installed) and **confirm it with `--check-live` (must print `live`, your `bus=`, and
@@ -241,3 +259,5 @@ not summarise last session — it is in your files.
   minutes); `parked=1` is a park. `readers=0` alone is only a moment with no listener armed.
 - Boot: `fs-set-project-root {"path":"."}` → `load-system {"system":"<sys>"}`.
 - Park state: `.planning/PARK.md` per repo. Blocks: `.planning/BLOCKED.md` per repo.
+- A worktree sister's park, blocks and `LEFT`: `sisters/<name>/` in her repository's planning
+  bucket (`$S` in **worker**). The leader reads them with `worktree-sister-status.sh`.
