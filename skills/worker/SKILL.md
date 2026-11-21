@@ -36,8 +36,47 @@ window — and the permission preflight in Step 3 can occupy a whole turn on its
 ⇒ **If a task arrives before you have finished this file, arm first and answer second.** A dispatch
 you can hear is worth more than a preflight you have completed.
 
+### A worktree sister keeps her records in her own directory
+
+A **worktree sister** runs in a git worktree under lisp-scratch that `worktree-sister.sh create`
+made for one branch. Her `.envrc` sets `DSMR_WORKTREE_SISTER=<name>`, and her bus name is that same
+`<name>`. Her `.planning` is a symlink to **the same directory as the main checkout's**, so
+`PARK.md` and `BLOCKED.md` at its top are the leader's. ⛔ **She never writes either of them.**
+
+Every snippet in this file that reads or writes a park, block or `LEFT` file starts with this line:
+
 ```bash
-cat .planning/PARK.md
+S=.planning${DSMR_WORKTREE_SISTER:+/sisters/$DSMR_WORKTREE_SISTER}
+```
+
+For every other sister `$S` is `.planning` and nothing changes. For a worktree sister it is her own
+directory, `sisters/<name>` inside the bucket. Each Bash call starts a fresh shell, so the line is
+repeated in each snippet; never carry `$S` from one call to the next. Within this file and
+**fleet-restart**, every mention of the repo's `PARK.md` or `BLOCKED.md` means `$S/PARK.md` and
+`$S/BLOCKED.md` for her. `STATE.md` and the rest of the bucket stay shared on purpose: she works
+under the repository's plan.
+
+⛔ **Control first, before reading anything under `$S`.** When `DSMR_WORKTREE_SISTER` is set, the
+registration must name the checkout you are standing in:
+
+```bash
+S=.planning${DSMR_WORKTREE_SISTER:+/sisters/$DSMR_WORKTREE_SISTER}
+[ -z "${DSMR_WORKTREE_SISTER:-}" ] || [ "$(awk '$1=="worktree:"{print $2}' "$S/WORKTREE")" = "$(pwd -P)" ] \
+  && echo REGISTRATION-OK || echo REGISTRATION-MISMATCH
+```
+
+`REGISTRATION-MISMATCH` (including a missing `WORKTREE`) ⇒ **STOP.** The variable came from another
+tree, or the registration is stale, and every path below would point at someone else's records.
+Your own `BLOCKED.md` cannot be located, so the bus is the only channel, exactly as in
+"When you cannot write your own `BLOCKED.md`" below:
+
+```
+BLOCKED <name>: worktree registration does not name this checkout
+```
+
+```bash
+S=.planning${DSMR_WORKTREE_SISTER:+/sisters/$DSMR_WORKTREE_SISTER}
+cat "$S/PARK.md"
 git rev-parse HEAD; git branch --show-current
 git status --porcelain --untracked-files=no | wc -l
 ```
@@ -51,7 +90,8 @@ resume from a silent divergence.
 halts a repo that parked perfectly cleanly, inverting the one signal this protocol exists to provide.
 
 ```bash
-parked=$(awk '/^sha:/{print $2}' .planning/PARK.md)
+S=.planning${DSMR_WORKTREE_SISTER:+/sisters/$DSMR_WORKTREE_SISTER}
+parked=$(awk '/^sha:/{print $2}' "$S/PARK.md")
 case "$parked" in
   [0-9a-f]*) [ ${#parked} -eq 40 ] || echo "FORMAT DEFECT: sha is ${#parked} chars, not 40" ;;
   *)         echo "FORMAT DEFECT: sha unreadable" ;;
@@ -139,7 +179,13 @@ into an errand boy paging between every terminal in the fleet. **Find every gran
    Say plainly when a modest-looking rule is broad in substance — a shell that carries `tofu` and
    `libvirt` authorises VM destruction whatever the rule is called.
 
-Write every denial into `.planning/BLOCKED.md`, one block each, ≤5 lines:
+Write every denial into `$S/BLOCKED.md` (the repo's own for every sister but a worktree sister),
+one block each, ≤5 lines:
+
+```bash
+S=.planning${DSMR_WORKTREE_SISTER:+/sisters/$DSMR_WORKTREE_SISTER}
+echo "$S/BLOCKED.md"   # the file the blocks below go in
+```
 
 ```
 BLOCKED: <what you cannot do>
@@ -343,6 +389,18 @@ arrived. If Step 0 was skipped, arm now, before this line goes out.
 RESUMED <repo> @<short-sha>
 ```
 Add, only if applicable: `BLOCKED <repo>: <n> — see .planning/BLOCKED.md`
+
+**A worktree sister names herself, not the repository:** `RESUMED <name> @<short-sha>`, and her
+block line points at `$S/BLOCKED.md`. Before announcing, after arming, she enrolls on her bus from
+her own session, with her **bare** name, which the verb qualifies with her worktree's namespace:
+
+```
+bus-roster {"action": "enroll", "agent": "<name>", "bus": "<tag>"}
+```
+
+An enroll the gate refuses comes back as a normal answer with `enrolled: false`. Put that in the
+announcement line (`RESUMED <name> @<short-sha> (enroll refused: <reason>)`); do not retry it. The
+roster records intent only, so a refused enroll does not make her unreachable.
 
 ⛔ **That is the entire announcement.** No summary of last session, no findings, no state-of-the-repo,
 no lessons learned. Anything a successor needs is already in your files. If it is not in a file it is
@@ -636,3 +694,30 @@ Where the host bus service watches you, `--reap` deregisters you from it
 ⛔ **Do not use the roster as proof you are connected.** Being enrolled is not
 being reachable, and being unenrolled does not stop you reaching the bus. The
 roster records intent; `--check-live` is the only evidence.
+
+### Leaving the fleet: a worktree sister answering LEAVE
+
+A worktree sister is retired by her leader's `LEAVE` dispatch, sent to her by name. The leader's
+`worktree-sister.sh teardown` refuses to remove her worktree until her `LEFT` file exists **and** her
+watcher answers dead, so the order below matters. On `LEAVE`, in order:
+
+1. Finish the atomic unit in hand; start nothing new.
+2. Commit and push her branch. It is her own repository's feature branch, an internal act, and
+   teardown refuses a worktree holding commits on no remote.
+3. Write `$S/PARK.md` in the **fleet-restart** schema, with `repo:` holding her name and `sha` from
+   `git rev-parse HEAD`.
+4. Reply to her leader by name: `LEAVING <name> @<short-sha>`. This is the last thing she publishes.
+5. Run `bus-leave`.
+6. Stop her watcher:
+   `~/.local/bin/dsmr-bus-watch --reap --all-buses --agent <name> --namespace <absolute-worktree-root>/`
+   with her literal name and the worktree's own path. Exit 1 is said in the reply above, never left
+   silently.
+7. Write `LEFT`, then stop:
+
+```bash
+S=.planning${DSMR_WORKTREE_SISTER:+/sisters/$DSMR_WORKTREE_SISTER}
+printf 'left: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$S/LEFT"
+```
+
+⛔ **`LEFT` before the reap is a defect.** `LEFT` is her statement that she has gone; written while
+her watcher still runs, it is false, and teardown reads it as evidence.

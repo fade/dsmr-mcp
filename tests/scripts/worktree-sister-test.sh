@@ -491,5 +491,29 @@ RC=$?
 try "teardown from inside the worktree is refused" "rc=$RC out=$OUT" same "$RC" 1
 try "teardown from inside the worktree deletes nothing" "$OUT" kept
 
+# ---------------------------------------------------------------------------
+note "skills: the worker's state directory line finds the registration"
+
+# shellcheck disable=SC2016  # the literal text of the skill line
+S_LINE='S=.planning${DSMR_WORKTREE_SISTER:+/sisters/$DSMR_WORKTREE_SISTER}'
+fixture skill
+ws create --no-launch --bus testbus "$G/repo" feature/thing
+WT=$G/scratch/repo-thing
+for spec in "skills/worker/SKILL.md|3" "skills/fleet-restart/SKILL.md|1"; do
+    file=${spec%|*} least=${spec#*|}
+    n=$(grep -cF -- "$S_LINE" "$REPO_ROOT/$file")
+    try "[$file] the state directory line appears at least $least times" "found $n" \
+        test "$n" -ge "$least"
+    line=$(grep -m1 -xF -- "$S_LINE" "$REPO_ROOT/$file")
+    try "[$file] the line stands alone, as a snippet runs it" "" same "$line" "$S_LINE"
+    got=$(cd "$WT" && DSMR_WORKTREE_SISTER=repo-integration bash -c "$line"'
+        [ -f "$S/WORKTREE" ] && [ "$(awk '"'"'$1=="worktree:"{print $2}'"'"' "$S/WORKTREE")" = "$(pwd -P)" ] &&
+            echo match' 2>&1)
+    try "[$file] in her worktree it names her registration" "got=$got" same "$got" match
+    # shellcheck disable=SC2016  # expanded by the inner shell
+    got=$(cd "$WT" && env -u DSMR_WORKTREE_SISTER bash -c "$line"'; printf %s "$S"' 2>&1)
+    try "[$file] for any other sister it is .planning" "got=$got" same "$got" .planning
+done
+
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 ((FAILED == 0 && PASSED > 0))
