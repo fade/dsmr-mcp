@@ -526,19 +526,23 @@ the published record says the server is full."
 ;;; ---------------------------------------------------------------------------
 
 (defparameter +slow-save-code+
-  "(defun dsmr-mcp/src/hermetic/worker/hibernate::%child-save (tmp toplevel)
-     (declare (ignore toplevel))
-     (handler-case
-         (progn
-           (dsmr-mcp/src/hermetic/worker/hibernate::%close-inherited-descriptors)
-           (dsmr-mcp/src/hermetic/worker/hibernate::%silence-stdout)
-           (with-open-file (s tmp :direction :output :if-exists :supersede)
-             (format s \"~D\" (sb-posix:getpid)))
-           (loop (sleep 1)))
-       (serious-condition () (sb-ext:exit :code 3 :abort t))))"
+  "(let ((p (or (find-package \"DSMR-WORKER/SRC/HERMETIC/WORKER/HIBERNATE\")
+                (find-package \"DSMR-MCP/SRC/HERMETIC/WORKER/HIBERNATE\"))))
+     (setf (fdefinition (find-symbol \"%CHILD-SAVE\" p))
+           (lambda (tmp toplevel)
+             (declare (ignore toplevel))
+             (handler-case
+                 (progn
+                   (funcall (find-symbol \"%CLOSE-INHERITED-DESCRIPTORS\" p))
+                   (funcall (find-symbol \"%SILENCE-STDOUT\" p))
+                   (with-open-file (s tmp :direction :output :if-exists :supersede)
+                     (format s \"~D\" (sb-posix:getpid)))
+                   (loop (sleep 1)))
+               (serious-condition () (sb-ext:exit :code 3 :abort t))))))"
   "Code that makes a worker's saving child behave like a save on a hung disk:
 it starts as a real one does, writes its own pid into the partial core, and
-never finishes.")
+never finishes. It finds the hibernate package under DSMR-WORKER, the name a
+release worker core gives it, or else DSMR-MCP.")
 
 (defun %scratch-path (worker)
   "The partial core a save of WORKER writes."

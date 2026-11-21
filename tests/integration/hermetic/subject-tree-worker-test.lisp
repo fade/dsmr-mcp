@@ -124,6 +124,13 @@ when the image renamed its support packages, else in DSMR-MCP.")
   "Observations of the subject load, keyed by core path, so tests sharing a core
 load the subject once.")
 
+(defun %outside-subject (redefinitions)
+  "The REDEFINITIONS that name no DSMR-MCP/ package. A fresh compile of the
+subject tree redefines a few of its own macros (a DEFMACRO the file compiler
+has already evaluated is defined again at load), so a redefinition inside the
+subject's own packages says nothing about the worker; one anywhere else does."
+  (remove-if (lambda (text) (search "DSMR-MCP/" text)) redefinitions))
+
 (defun observe-subject-load (core)
   "Spawn a worker from CORE rooted at the subject tree, load the subject system
 without force so redefinitions are reported, and return a plist of what was
@@ -163,7 +170,8 @@ and :ping (round trip in ms after the load, or NIL)."
 (define-test a-renamed-worker-loads-a-dsmr-mcp-subject-from-its-tree
   "A release worker core rooted at a dsmr-mcp tree loads the subject system
 from that tree, reports the tree as its source directory, reports no
-redefinition, and the subject's own function is there afterwards."
+redefinition outside the subject's own packages, and the subject's own function
+is there afterwards."
   (with-release-worker-core-or-skip (core)
     (let ((seen (observe-subject-load core)))
       (is equal "loaded" (getf seen :status) "~S" seen)
@@ -172,7 +180,9 @@ redefinition, and the subject's own function is there afterwards."
                                       (truename (subject-tree))))
             "source_directory ~S; expected the subject tree ~A"
             (getf seen :source-directory) (subject-tree))
-      (is equal nil (getf seen :redefinitions))
+      (is equal nil (%outside-subject (getf seen :redefinitions))
+          "redefinitions outside the subject's packages: ~S"
+          (%outside-subject (getf seen :redefinitions)))
       (is equal ":SUBJECT-TREE" (getf seen :marker) "~S" seen))))
 
 (define-test the-renamed-worker-keeps-its-own-code-after-the-subject-loads
@@ -197,11 +207,12 @@ release tree rather than the subject's, and the worker still answers a ping."
 (define-test an-unrenamed-worker-is-clobbered-by-the-subject
   "Control: a dev worker core keeps its support code under the DSMR-MCP names,
 so the same load redefines that code, which the main assertions catch as a
-reported redefinition or START defined from the subject tree."
+redefinition outside the subject's packages or START defined from the subject
+tree."
   (with-worker-core-or-skip (core)
     (let* ((seen (observe-subject-load core))
            (start-from (getf seen :start-from)))
-      (true (or (getf seen :redefinitions)
+      (true (or (%outside-subject (getf seen :redefinitions))
                 (and start-from (%under-p start-from (subject-tree))))
             "the unrenamed worker was not clobbered: ~S" seen))))
 

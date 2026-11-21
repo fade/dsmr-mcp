@@ -115,7 +115,9 @@ starts and not frozen into the image."
                          w (concatenate
                             'string
                             "(format nil \"eval-timeout=~D\" "
-                            "(dsmr-mcp/src/hermetic/worker/handlers:effective-eval-timeout))"))))
+                            "(funcall (find-symbol \"EFFECTIVE-EVAL-TIMEOUT\" "
+                            "(or (find-package \"DSMR-WORKER/SRC/HERMETIC/WORKER/HANDLERS\") "
+                            "(find-package \"DSMR-MCP/SRC/HERMETIC/WORKER/HANDLERS\")))))"))))
               (true (search "eval-timeout=11\"" (or text "")) "~A" text))))))))
 
 (define-test a-core-booted-worker-finds-workspace-and-quicklisp-systems
