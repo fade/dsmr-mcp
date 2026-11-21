@@ -46,7 +46,7 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 
 .PHONY: bridge bus-watch bus-host bus-sources bus-binaries install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-server core-verify core-worker core-verify-worker core-sources test-core test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
-        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path \
+        preflight check-preflight self-test-preflight check-release install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path \
         deploy rollback register test-leaf qlot-lock
 
 PREFIX ?= $(HOME)/.local
@@ -385,11 +385,14 @@ check-host-unit:
 
 ## preflight: check this host can run a fleet, establishing what is safe to.
 ##
-##   Registers the MCP server if it is absent, consents to the named repos'
-##   .envrc files, and verifies the prebuilt core actually boots here. Anything
-##   needing root, and anything that takes minutes, is reported with a remedy
-##   instead of being run: a check that rebuilt the core on every launch would
-##   ship whatever branch happens to be checked out to the whole fleet.
+##   Checks the deployed release under DSMR_HOME with the release launcher's
+##   own checks, boots its server core and runs the release guard against it,
+##   registers the MCP server at the release launcher if it is absent and a
+##   release exists, blocks a registration that names a launcher inside a
+##   checkout, and consents to the named repos' .envrc files. Anything needing
+##   root, and anything that takes minutes, is reported with a remedy instead
+##   of being run: deploying a release is `make deploy REF=<sha>`, which the
+##   leader runs after review.
 ##
 ##   `sisters.sh` runs this before it starts anything and refuses to launch on a
 ##   non-zero answer. Run it by hand to provision a new host, or to find out why
@@ -414,6 +417,17 @@ check-preflight:
 ##   suite.
 self-test-preflight:
 	@./scripts/preflight.sh --self-test
+
+## check-release: run the release guard against the deployed release.
+##
+##   Applies the release launcher's checks to <DSMR_HOME>/current, then boots
+##   its server core with that release's root and launcher and prints the guard
+##   report: whether the image is sealed, each tie to a checkout or to a path
+##   outside the release, and `ties <n>`. Exits non-zero when the release would
+##   be refused or the report is red. For CI and for the leader after a deploy:
+##   make check-release DSMR_HOME=<scratch home>
+check-release:
+	@DSMR_HOME="$(DSMR_HOME)" SBCL="$(SBCL)" ./scripts/preflight.sh --check-release
 
 ## install-hooks: install this tree's git hooks into a repository.
 ##
