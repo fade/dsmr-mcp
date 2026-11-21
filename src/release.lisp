@@ -148,11 +148,16 @@ of its own."
 (defun loaded-system-directories ()
   "Return a list of (NAME . DIRECTORY), one per system ASDF has loaded, where
 DIRECTORY is the physical namestring of the system's source directory, or NIL
-when it has none or asking signals an error."
+when it has none or asking signals an error.
+
+Reads each registered system object and never calls FIND-SYSTEM: finding a
+package-inferred subsystem again registers a fresh object without load
+stamps, so the next call would no longer list it."
   (mapcar (lambda (name)
             (cons name
                   (ignore-errors
-                   (%physical-directory (asdf:system-source-directory name)))))
+                   (%physical-directory
+                    (asdf:system-source-directory (asdf:registered-system name))))))
           (asdf:already-loaded-systems)))
 
 (defun release-ties (root &key (systems nil systems-p)

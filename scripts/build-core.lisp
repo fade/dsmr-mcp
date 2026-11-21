@@ -405,8 +405,12 @@ ASDF's output translations so they follow it."
       ;; Every other loaded system contributes its source directory. Test-only
       ;; systems resolve to the project root and are skipped here on purpose:
       ;; the server core does not change behavior when only tests change.
+      ;; REGISTERED-SYSTEM, not FIND-SYSTEM: finding a package-inferred
+      ;; subsystem again replaces it with an object that has no load stamps,
+      ;; and the saved image would then list none of the project's systems
+      ;; as loaded.
       (dolist (name (asdf:already-loaded-systems))
-        (let ((sys (asdf:find-system name nil)))
+        (let ((sys (asdf:registered-system name)))
           (when sys
             (let ((dir (ignore-errors (asdf:system-source-directory sys))))
               (when (and dir

@@ -324,3 +324,15 @@ kept, and its commit is the release commit."
     (is eq nil (release-manifest))
     (is eq nil (release-commit))
     (is equal "0.1.0" (version))))
+
+(define-test reading-loaded-systems-keeps-them-loaded
+  "LOADED-SYSTEM-DIRECTORIES lists dsmr-mcp/src/release, which this image has
+loaded, and a second call still lists it: reading a system's directory leaves
+its load stamps in place."
+  (flet ((listed-p ()
+           (and (assoc "dsmr-mcp/src/release"
+                       (dsmr-mcp/src/release:loaded-system-directories)
+                       :test #'string=)
+                t)))
+    (true (listed-p) "the first call did not list dsmr-mcp/src/release as loaded")
+    (true (listed-p) "the second call did not list dsmr-mcp/src/release; the first call dropped its load stamps")))
