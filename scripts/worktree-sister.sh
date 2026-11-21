@@ -188,6 +188,9 @@ cmd_create() {
     if [[ -e $reg ]]; then
         refuse "$name is already registered for $(field "$reg" worktree); retire it first with: $PROGNAME teardown --repo $repo $name"
     fi
+    if [[ -e $bucket/sisters/$name || -L $bucket/sisters/$name ]]; then
+        refuse "$bucket/sisters/$name exists without a registration; move it to $bucket/sisters-retired/ first"
+    fi
 
     local root=$SCRATCH_ROOT
     [[ -d $root ]] && root=$(cd -- "$root" && pwd -P)
@@ -274,7 +277,9 @@ cmd_create() {
     }
 
     dest=$(cd -- "$dest" && pwd -P) || failed "resolving the worktree path"
-    mkdir -p -- "$bucket/sisters" "$bucket/sisters/$name" || failed "creating the registration directory"
+    # No -p on the last mkdir: a concurrent create for the same name fails here.
+    mkdir -p -- "$bucket/sisters" || failed "creating $bucket/sisters"
+    mkdir -- "$bucket/sisters/$name" || failed "creating the registration directory"
     printf 'name: %s\nrepo: %s\nworktree: %s\nbranch: %s\nbus: %s\ncreated: %s\n' \
         "$name" "$repo" "$dest" "$branch" "$bus" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         >"$reg" || failed "writing $reg"

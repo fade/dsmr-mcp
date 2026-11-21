@@ -306,6 +306,12 @@ mkdir -p "$G/bucket/sisters/repo-integration"
 printf 'worktree: /elsewhere\n' >"$G/bucket/sisters/repo-integration/WORKTREE"
 refused "a name already registered" 1 create --bus b "$G/repo" feature/thing
 try "the refusal names the teardown command" "$OUT" has "$OUT" "teardown"
+fixture refuse-stale
+mkdir -p "$G/bucket/sisters/repo-integration"
+printf 'left: 2026-01-01T00:00:00Z\n' >"$G/bucket/sisters/repo-integration/LEFT"
+refused "a sister directory without a registration" 1 create --bus b "$G/repo" feature/thing
+try "the stale LEFT is kept" "" test -s "$G/bucket/sisters/repo-integration/LEFT"
+try "the refusal says where to move it" "$OUT" has "$OUT" "sisters-retired"
 fixture refuse-dest
 mkdir "$G/scratch/repo-thing"
 refused "an existing destination" 1 create --bus b "$G/repo" feature/thing
