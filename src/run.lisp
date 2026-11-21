@@ -43,6 +43,7 @@
                 #:session-bus)
   (:import-from #:dsmr-mcp/src/release
                 #:release-root
+                #:release-ties
                 #:sealed-p)
   ;; process-json-line is re-exported from here so src/main.lisp's
   ;; existing :import-from dsmr-mcp/src/run #:process-json-line
@@ -486,7 +487,19 @@ The dsmr-mcp:run nickname (re-exported by src/main.lisp) resolves to this functi
                                                      (prin1-to-string f))
                                                    (princ-to-string f)))
                                    asdf:*system-definition-search-functions*)))
-        (uiop:quit 78)))
+        (uiop:quit 78))
+      ;; Nothing a release server runs may come from a checkout or from
+      ;; outside the release; only the SBCL contrib directory is allowed beside it.
+      (when release
+        (let ((ties (release-ties release)))
+          (when ties
+            (dolist (tie ties)
+              (log-event :error "run.release.tied"
+                         "release_root" (namestring release)
+                         "reason" (string-downcase (symbol-name (getf tie :reason)))
+                         "name" (getf tie :name)
+                         "directory" (or (getf tie :directory) "")))
+            (uiop:quit 78)))))
 
     ;; Apply attach-concurrency policy before any session accepts requests.
     (setf *attach-concurrency* resolved-attach-concurrency)
