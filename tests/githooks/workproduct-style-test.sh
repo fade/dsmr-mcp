@@ -65,6 +65,18 @@ fi
 
 # Exemptions.
 expect "skill file exempt"           accepted skills/x/SKILL.md "Delve ${EM} load-bearing."
+PLAN=".plan""ning/STATE.md"   # split so this file does not hold the string it tests
+expect "agent definition exempt"     accepted agents/x.md "Write to ${PLAN} ${EM} then stop."
+expect "agents README not exempt"    refused  agents/README.md "Agents ${EM} here."
+# A planning-file reference outside agents/ is refused by the universal tier, not the style tier.
+mkdir -p "$repo/docs"; printf '%s\n' "See ${PLAN}." > "$repo/docs/planref.md"
+git -C "$repo" add -- docs/planref.md
+if git -C "$repo" commit -q -m "add a file" >"$scratch/out" 2>&1; then
+  fail=$((fail + 1)); echo "FAIL  planning reference outside agents/: accepted"
+else
+  pass=$((pass + 1)); echo "ok    planning reference outside agents/ (refused)"
+fi
+git -C "$repo" reset -q --hard HEAD
 expect "licence file exempt"         accepted LICENSE "Copyright ${EM} all rights."
 expect "style guide exempt"          accepted docs/writing-style.org "Never write load-bearing or delve."
 git -C "$repo" config --add dsmr.workproductlint.styleexempt 'fixtures/*'

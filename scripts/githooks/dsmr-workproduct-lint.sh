@@ -153,8 +153,9 @@ style_density() {
 # Which style treatment a staged path gets: "prose" takes the block tier, "source"
 # only warns (a string literal or a test fixture can legitimately hold any of
 # these), "exempt" is skipped. Licence texts are not ours to restyle, and skill
-# files are agent-facing instructions written for the agent that reads them
-# (skills/ is where this site keeps them, in any repository). The hook's own
+# and agent definitions are agent-facing instructions written for the agent that
+# reads them (skills/ and agents/ are where this site keeps them, in any
+# repository; agents/README.md is for people and is not exempt). The hook's own
 # directory and the public writing-style guide are skipped because they spell
 # every phrase the hook rejects.
 style_class() {
@@ -166,7 +167,8 @@ style_class() {
   done < <(git config --get-all dsmr.workproductlint.styleexempt 2>/dev/null)
   case "$f" in
     LICENSE*|LICENCE*|COPYING*|*/LICENSE*|*/LICENCE*|*/COPYING*) printf 'exempt' ;;
-    skills/*|scripts/githooks/*|docs/writing-style.org) printf 'exempt' ;;
+    agents/README.md) printf 'prose' ;;
+    skills/*|agents/*|scripts/githooks/*|docs/writing-style.org) printf 'exempt' ;;
     *.md|*.markdown|*.org|*.txt|*.rst|*.adoc|README*|*/README*|NEWS*|CHANGELOG*) printf 'prose' ;;
     *) printf 'source' ;;
   esac
@@ -255,7 +257,12 @@ run_workproduct_lint() {
       # Scoped to the hook directory by exact path, so it silences the tool's own
       # vocabulary and nothing else. A repository without that directory matches
       # nothing here and is unaffected.
-      text=$(git diff --cached --no-color -U0 -- . ':(exclude)scripts/githooks/*' 2>/dev/null \
+      #
+      # Agent definitions (agents/*.md except the README) are skipped for the
+      # same reason skill files are: they are instructions to the agent that
+      # loads them, and name the planning files that agent works with.
+      text=$({ git diff --cached --no-color -U0 -- . ':(exclude)scripts/githooks/*' ':(exclude)agents/*.md' 2>/dev/null
+               git diff --cached --no-color -U0 -- agents/README.md 2>/dev/null; } \
              | grep -E '^\+' | grep -Ev '^\+\+\+' | sed 's/^+//')
       ;;
     msg)
