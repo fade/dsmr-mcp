@@ -147,25 +147,32 @@ TEMP-DIR must already be inside SESSION-ROOT; this is asserted per-file."
                             :ignore-error-status t))))))
 
 (defun %register-with-asdf (name abs-asd)
-  "Make the freshly emitted system findable in this image and report how.
+  "Report how system NAME, defined in ABS-ASD, can be found.
 
-A long-running image caches the source registry at its first lookup, so a
-directory created afterwards stays invisible even when it sits squarely on a
-configured tree. Dropping that cache is what makes the new project findable;
-its only cost to the caller is one rescan of the configured trees at the next
-lookup, since loaded code and loaded systems are left alone. A definition
-already recorded under NAME is dropped as well, so the answer below reflects
-what the registry can find rather than what an earlier call left behind.
+Return :SOURCE-REGISTRY when the host's default source-registry configuration
+resolves NAME to ABS-ASD, so any image on the host finds it. Otherwise load
+ABS-ASD into this image and return :LOAD-ASD. Drop an earlier definition of
+NAME first.
 
-Returns :SOURCE-REGISTRY when the rescan resolves NAME to this very .asd, which
-also means any other image on this host will find it. Returns :LOAD-ASD when
-the project sits outside every configured tree and had to be registered by
-hand, which reaches no image but this one."
-  (asdf:clear-source-registry)
+The host configuration is read into dynamic bindings only: this image's search
+functions, source registry, and registry parameter are never changed, so a
+sealed image stays sealed."
   (ignore-errors (asdf:clear-system name))
-  (let* ((found (ignore-errors (asdf:find-system name nil)))
-         (source (and found (ignore-errors
-                             (truename (asdf:system-source-file found))))))
+  (let* ((found (ignore-errors
+                 (let ((asdf/source-registry:*source-registry* nil)
+                       (asdf/source-registry:*source-registry-parameter* nil)
+                       (asdf:*default-source-registries*
+                         (mapcar (lambda (name)
+                                   (uiop:find-symbol* name '#:asdf/source-registry))
+                                 '(#:environment-source-registry
+                                   #:user-source-registry
+                                   #:user-source-registry-directory
+                                   #:default-user-source-registry
+                                   #:system-source-registry
+                                   #:system-source-registry-directory
+                                   #:default-system-source-registry))))
+                   (asdf/source-registry:sysdef-source-registry-search name))))
+         (source (and found (ignore-errors (truename found)))))
     (if (and source (equal source (ignore-errors (truename abs-asd))))
         :source-registry
         (progn (ignore-errors (asdf:load-asd abs-asd))
