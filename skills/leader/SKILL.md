@@ -354,8 +354,9 @@ hers; Step 3 collects those too.
   `<repo>-integration`. ⛔ **She is up only when `RESUMED <name>` arrives**, never because a tab
   opened: a new directory may stop at Claude Code's folder-trust question, which nothing here
   can answer.
-- **Retiring one:** dispatch `LEAVE` to her **by name**, wait for `LEAVING <name> @<sha>`, then run
-  `worktree-sister.sh teardown <name>` from the main checkout. A refusal names what is missing, and
+- **Retiring one:** dispatch `LEAVE` to her **by name**, wait for `LEAVING <name> @<sha>`, then for her `LEFT` file
+  (`left=yes` in the status report), then run `worktree-sister.sh teardown <name>` from the main
+  checkout. A teardown run on `LEAVING` alone may be refused as "has not left". A refusal names what is missing, and
   when the refusal is about her it prints the dispatch to send. Use `--force` only on fade's
   direction or for a sister whose session is gone, and then run the `bus-roster` disenroll line it
   prints. `--force` never removes a worktree whose watcher still answers live.

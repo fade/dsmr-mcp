@@ -710,18 +710,24 @@ watcher answers dead, so the order below matters. On `LEAVE`, in order:
    teardown refuses a worktree holding commits on no remote.
 3. Write `$S/PARK.md` in the **fleet-restart** schema, with `repo:` holding her name and `sha` from
    `git rev-parse HEAD`.
-4. Reply to her leader by name: `LEAVING <name> @<short-sha>`. This is the last thing she publishes.
-5. Run `bus-leave`.
-6. Stop her watcher:
+4. Stop her watcher:
    `~/.local/bin/dsmr-bus-watch --reap --all-buses --agent <name> --namespace <absolute-worktree-root>/`
-   with her literal name and the worktree's own path. Exit 1 is said in the reply above, never left
-   silently.
-7. Write `LEFT`, then stop:
+   with her literal name and the worktree's own path. Note its exit status.
+5. Reply to her leader by name: `LEAVING <name> @<short-sha>`, or
+   `LEAVING <name> @<short-sha> (reap exit 1: <what it printed>)` when the reap failed. This is the
+   last thing she publishes.
+6. Run `bus-leave`.
+7. When the reap exited 0, write `LEFT`, then stop. When it did not, write `$S/BLOCKED.md` instead,
+   leave `LEFT` unwritten, and stop.
 
 ```bash
 S=.planning${DSMR_WORKTREE_SISTER:+/sisters/$DSMR_WORKTREE_SISTER}
 printf 'left: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$S/LEFT"
 ```
+
+After `LEFT` exists, the Stop hook may wake her with "no detached watcher is running". That wake is
+expected. ⛔ **Do not run `--detach`:** a running watcher makes `LEFT` false and teardown refuses
+it. End the turn.
 
 ⛔ **`LEFT` before the reap is a defect.** `LEFT` is her statement that she has gone; written while
 her watcher still runs, it is false, and teardown reads it as evidence.
