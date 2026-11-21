@@ -16,7 +16,11 @@
   (:use #:cl #:zebra)
   (:import-from #:dsmr-mcp/src/release
                 #:release-ties
-                #:guard-report))
+                #:guard-report
+                #:release-manifest
+                #:release-commit)
+  (:import-from #:dsmr-mcp/src/main
+                #:version))
 
 (in-package #:dsmr-mcp/tests/release/guard-test)
 
@@ -231,3 +235,68 @@ stays green; unset, there is no residual."
                                              :systems (%clean-systems tree)
                                              :launcher (tree-launcher tree)
                                              :sealed t)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; The release MANIFEST and the server version
+;;; ---------------------------------------------------------------------------
+
+(defparameter *recorded-manifest*
+  "commit c9189ea76b7974ee9c11ca4151361dd63de8a7b3
+ref HEAD
+dirty false
+sbcl-version 2.6.10
+build-host ghost
+build-time 2026-11-21T15:30:33Z
+unpublished-ref-allowed yes
+qlfile-lock-sha256 aad1973881891e9679a560202a64b5489ccdd8112e11213ca306351d68bb7674
+dependency quicklisp 2026-01-01
+dependency slynk-client github-67b65da7210b4f9a6e373077373528a4c7bed4b5
+dependency zebra git-a36e393027746c65e41031f9c111f3fdf46877e7
+"
+  "The head of a MANIFEST written by `make deploy REF=HEAD` into a scratch
+deploy home, release c9189ea76b7974ee9c11ca4151361dd63de8a7b3.")
+
+(defun %release-with-manifest (text)
+  "A fresh directory holding a MANIFEST with TEXT, or none when TEXT is NIL."
+  (let ((dir (%temporary-directory)))
+    (when text
+      (with-open-file (out (merge-pathnames "MANIFEST" dir)
+                           :direction :output :if-exists :supersede)
+        (write-string text out)))
+    (namestring dir)))
+
+(define-test a-release-manifest-names-its-commit
+  "The recorded MANIFEST parses into its key values, with every dependency line
+kept, and its commit is the release commit."
+  (with-env (("DSMR_RELEASE_ROOT" (%release-with-manifest *recorded-manifest*)))
+    (let ((manifest (release-manifest)))
+      (is equal "c9189ea76b7974ee9c11ca4151361dd63de8a7b3"
+          (cdr (assoc "commit" manifest :test #'string=)))
+      (is equal "2.6.10" (cdr (assoc "sbcl-version" manifest :test #'string=)))
+      (is equal '("quicklisp 2026-01-01"
+                  "slynk-client github-67b65da7210b4f9a6e373077373528a4c7bed4b5"
+                  "zebra git-a36e393027746c65e41031f9c111f3fdf46877e7")
+          (cdr (assoc "dependency" manifest :test #'string=))))
+    (is equal "c9189ea76b7974ee9c11ca4151361dd63de8a7b3" (release-commit))))
+
+(define-test the-version-carries-the-release-commit
+  "Inside a release the version is 0.1.0+<commit>; with no release root it is
+0.1.0."
+  (with-env (("DSMR_RELEASE_ROOT" (%release-with-manifest *recorded-manifest*)))
+    (is equal "0.1.0+c9189ea76b7974ee9c11ca4151361dd63de8a7b3" (version)))
+  (with-env (("DSMR_RELEASE_ROOT" nil))
+    (is eq nil (release-commit))
+    (is eq nil (release-manifest))
+    (is equal "0.1.0" (version))))
+
+(define-test a-manifest-without-a-commit-leaves-the-version-plain
+  "A MANIFEST with no commit line, and a release root with no MANIFEST, give
+0.1.0 and signal nothing."
+  (with-env (("DSMR_RELEASE_ROOT" (%release-with-manifest
+                                   (format nil "ref HEAD~%dirty false~%"))))
+    (is eq nil (release-commit))
+    (is equal "0.1.0" (version)))
+  (with-env (("DSMR_RELEASE_ROOT" (%release-with-manifest nil)))
+    (is eq nil (release-manifest))
+    (is eq nil (release-commit))
+    (is equal "0.1.0" (version))))

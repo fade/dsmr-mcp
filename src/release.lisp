@@ -12,7 +12,9 @@
            #:loaded-system-directories
            #:release-ties
            #:guard-report
-           #:guard-main))
+           #:guard-main
+           #:release-manifest
+           #:release-commit))
 
 (in-package #:dsmr-mcp/src/release)
 
@@ -55,6 +57,43 @@ registries are empty."
               (list (%package-inferred-search)))
        (null asdf:*central-registry*)
        (null asdf:*default-source-registries*)))
+
+(defun release-manifest ()
+  "Return the MANIFEST of the release at RELEASE-ROOT as an alist of key to
+value strings, in file order, with every `dependency` line's value collected in
+one list under \"dependency\". NIL when there is no release root or the
+MANIFEST is absent or unreadable; never signals."
+  (let ((root (release-root)))
+    (when root
+      (ignore-errors
+       (with-open-file (in (merge-pathnames "MANIFEST" root)
+                           :direction :input :if-does-not-exist nil)
+         (when in
+           (let ((entries '())
+                 (dependencies '()))
+             (loop for line = (read-line in nil)
+                   while line
+                   do (let* ((line (string-right-trim '(#\Return #\Space) line))
+                             (space (position #\Space line))
+                             (key (if space (subseq line 0 space) line))
+                             (value (if space (subseq line (1+ space)) "")))
+                        (cond ((zerop (length key)))
+                              ((string= key "dependency")
+                               (unless dependencies
+                                 (push (cons key nil) entries))
+                               (push value dependencies))
+                              (t (push (cons key value) entries)))))
+             (let ((entries (nreverse entries)))
+               (when dependencies
+                 (setf (cdr (assoc "dependency" entries :test #'string=))
+                       (nreverse dependencies)))
+               entries))))))))
+
+(defun release-commit ()
+  "Return the commit the release's MANIFEST records, or NIL when there is no
+release, no MANIFEST or no non-empty commit line."
+  (let ((commit (cdr (assoc "commit" (release-manifest) :test #'string=))))
+    (and (stringp commit) (plusp (length commit)) commit)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The guard: what ties a release image to a checkout or to a path outside it

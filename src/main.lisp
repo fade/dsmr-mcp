@@ -16,6 +16,8 @@
   (:import-from #:dsmr-mcp/src/state
                 #:make-session
                 #:*current-session-id*)
+  (:import-from #:dsmr-mcp/src/release
+                #:release-commit)
   (:export #:version
            #:*default-mode*
            ;; Re-exported entry points wired here so callers use the top-level
@@ -38,5 +40,9 @@ parallel workers that intentionally want isolation from the host
 image).")
 
 (defun version ()
-  "Return the dsmr-mcp version string."
-  +version+)
+  "Return the dsmr-mcp version string: +VERSION+, followed by `+` and the
+release commit when the server runs from a release whose MANIFEST records one."
+  (let ((commit (release-commit)))
+    (if commit
+        (concatenate 'string +version+ "+" commit)
+        +version+)))
