@@ -11,7 +11,8 @@
                 #:support-prefix
                 #:support-package
                 #:support-symbol-call)
-  (:import-from #:dsmr-mcp/src/notify))
+  (:import-from #:dsmr-mcp/src/notify)
+  (:import-from #:cl-ppcre))
 
 (in-package #:dsmr-mcp/tests/release/support-package-test)
 
@@ -49,3 +50,65 @@ naming the package from support-symbol-call."
     (true (and condition
                (search "DSMR-MCP/SRC/NO-SUCH-PACKAGE" (princ-to-string condition)))
           "~A" condition)))
+
+;;; ---------------------------------------------------------------------------
+;;; Run-time designators in the worker's code
+;;; ---------------------------------------------------------------------------
+
+(defparameter *run-time-designator-scanner*
+  (cl-ppcre:create-scanner
+   "\\b(?:symbol-call|find-package|find-symbol)\\s+(?:\"[^\"]*\"\\s+)?(?:#?:|\")dsmr-mcp/"
+   :case-insensitive-mode t)
+  "Matches symbol-call, find-package or find-symbol followed, across any
+whitespace including newlines, by a dsmr-mcp/ package designator. A
+find-symbol name string may sit between the two.")
+
+(defun %worker-closure-files ()
+  "Source files of every dsmr-mcp/src/ system in the dependency closure of
+dsmr-mcp/src/hermetic/worker/main."
+  (let ((seen (make-hash-table :test #'equal))
+        (files '()))
+    (labels ((visit (name)
+               (when (and (stringp name)
+                          (uiop:string-prefix-p "dsmr-mcp/src/" name)
+                          (not (gethash name seen)))
+                 (setf (gethash name seen) t)
+                 (let ((system (asdf:find-system name nil)))
+                   (when system
+                     (let ((source (find-if (lambda (c)
+                                              (typep c 'asdf:cl-source-file))
+                                            (asdf:component-children system))))
+                       (when source
+                         (pushnew (asdf:component-pathname source) files
+                                  :test #'equal)))
+                     (dolist (dep (asdf:system-depends-on system))
+                       (visit (if (consp dep) (car (last dep)) dep))))))))
+      (visit "dsmr-mcp/src/hermetic/worker/main"))
+    files))
+
+(defun %blank-comment-lines (text)
+  "TEXT with every line whose first non-blank character is a semicolon emptied,
+keeping the line count."
+  (cl-ppcre:regex-replace-all "(?m)^[ \\t]*;.*$" text ""))
+
+(defun %run-time-designators (file)
+  "Each \"FILE:LINE\" where a run-time lookup names a dsmr-mcp/ package."
+  (let ((text (%blank-comment-lines (uiop:read-file-string file)))
+        (hits '()))
+    (cl-ppcre:do-matches (start end *run-time-designator-scanner* text)
+      (declare (ignore end))
+      (push (format nil "~A:~D" (uiop:native-namestring file)
+                    (1+ (count #\Newline text :end start)))
+            hits))
+    (nreverse hits)))
+
+(define-test no-worker-file-names-a-dsmr-mcp-package-at-run-time
+  "No file in the worker's closure looks up a dsmr-mcp/ package by name at run
+time; such a lookup goes through support-package or support-symbol-call."
+  (let ((files (%worker-closure-files)))
+    (true (> (length files) 10) "worker closure has only ~D files" (length files))
+    (true (find "connection" files :key #'pathname-name :test #'string=)
+          "attach/connection.lisp is not in the worker closure")
+    (let ((hits (mapcan #'%run-time-designators files)))
+      (false hits "run-time dsmr-mcp/ package designators; use support-package:~{~%  ~A~}"
+             hits))))

@@ -54,6 +54,9 @@
                 #:decode-object-id)
   (:import-from #:dsmr-mcp/src/attach/probe
                 #:probe-image-liveness)
+  (:import-from #:dsmr-mcp/src/support-package
+                #:support-package
+                #:support-symbol-call)
   (:import-from #:slynk-client
                 #:slime-network-error)
   (:import-from #:bordeaux-threads
@@ -149,7 +152,7 @@ Signals INVALID-CONFIG-VALUE (from dsmr-mcp/src/run) for any other value."
       (:serialised :serialised)
       (:parallel   :parallel)
       (t (error (find-symbol "INVALID-CONFIG-VALUE"
-                             (find-package :dsmr-mcp/src/run))
+                             (support-package "SRC/RUN"))
                 :name "DSMR_ATTACH_CONCURRENCY"
                 :raw  value)))))
 
@@ -831,5 +834,5 @@ Returns NIL in all cases."
   ;; Release any coordination-bus participants this session opened. Soft-called
   ;; so this file carries no hard dependency on the bus tool layer.
   (ignore-errors
-    (uiop:symbol-call :dsmr-mcp/src/tools/bus-helpers :disconnect-session-bus session))
+    (support-symbol-call "SRC/TOOLS/BUS-HELPERS" "DISCONNECT-SESSION-BUS" session))
   nil)
