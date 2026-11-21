@@ -606,7 +606,8 @@ verify_worker() {
 # verify_bus <release> <scratch>
 # Run each bus binary with --help under scratch state and cache directories.
 # Return 0 when every one exits 0 within DEPLOY_VERIFY_TIMEOUT seconds and
-# prints something on stdout; otherwise set VERIFY_PROBLEM and return 1.
+# prints something; otherwise set VERIFY_PROBLEM and return 1. The watcher
+# prints its usage on stderr, since its stdout carries only signal lines.
 verify_bus() {
   local rel="$1" scratch="$2" name bin out status t0
   t0=$SECONDS
@@ -629,8 +630,8 @@ verify_bus() {
       VERIFY_PROBLEM="$name --help exited $status (stderr $out.err)"
       return 1
     fi
-    if [ ! -s "$out.out" ]; then
-      VERIFY_PROBLEM="$name --help printed nothing on stdout (stderr $out.err)"
+    if [ ! -s "$out.out" ] && [ ! -s "$out.err" ]; then
+      VERIFY_PROBLEM="$name --help printed nothing (stdout $out.out, stderr $out.err)"
       return 1
     fi
   done

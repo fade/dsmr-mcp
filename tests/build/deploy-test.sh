@@ -72,7 +72,9 @@ echo ok > "$WORK/stub-mode"
 
 # Stub make: `make -C <release> ... bus-watch bus-host BUS_DEPS_SETUP=...`
 # writes <release>/bin/dsmr-bus-watch and dsmr-bus-host. Each answers --help
-# unless the stub mode is bus-help-fails.
+# unless the stub mode is bus-help-fails, or prints nothing in mode
+# bus-help-silent. The watcher stub prints its usage on stderr and the host
+# stub on stdout, as the real binaries do.
 cat > "$WORK/bin/make" <<STUB
 #!/bin/sh
 echo "\$*" >> "$WORK/make.log"
@@ -85,8 +87,14 @@ mkdir -p "\$dir/bin"
 for name in dsmr-bus-watch dsmr-bus-host; do
   cat > "\$dir/bin/\$name" <<'BIN'
 #!/bin/sh
-case "\$(cat "$WORK/stub-mode")" in bus-help-fails) echo "stub: broken" >&2; exit 2 ;; esac
-echo "usage: stub bus binary"
+case "\$(cat "$WORK/stub-mode")" in
+  bus-help-fails) echo "stub: broken" >&2; exit 2 ;;
+  bus-help-silent) exit 0 ;;
+esac
+case "\$0" in
+  *dsmr-bus-watch) echo "usage: stub bus binary" >&2 ;;
+  *) echo "usage: stub bus binary" ;;
+esac
 BIN
   chmod +x "\$dir/bin/\$name"
 done
@@ -303,7 +311,8 @@ HV="$WORK/home-verify"
 deploy "$HV" "$C1"; deploy "$HV" "$C2"
 cur0=$(link "$HV/current"); prev0=$(link "$HV/previous")
 for case_ in wrong-name:verify-initialize crash:verify-initialize silent:verify-initialize \
-             no-handshake:verify-worker worker-rejected:verify-worker bus-help-fails:verify-bus; do
+             no-handshake:verify-worker worker-rejected:verify-worker bus-help-fails:verify-bus \
+             bus-help-silent:verify-bus; do
     mode=${case_%%:*} stage=${case_#*:}
     echo "$mode" > "$WORK/stub-mode"
     deploy "$HV" "$C3" DEPLOY_WORKER_TIMEOUT=3
