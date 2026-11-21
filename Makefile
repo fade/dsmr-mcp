@@ -148,11 +148,17 @@ bridge:
 ##
 ##   Empty builds them as a development checkout always has: the watcher with
 ##   ASDF alone, the host service with the user's Quicklisp and the Lisp
-##   workspace. A path loads that file, then ASDF, in place of both, so the
-##   binaries resolve every dependency from the bundle and nothing from the
-##   host's Quicklisp or workspace. `make deploy` sets it to the release's own
-##   <release>/deps/setup.lisp, so the bus binaries come from the same export
-##   and bundle as the server cores.
+##   workspace. A path loads that file in place of both, limits the source
+##   registry to the current directory, loads the bundle's own
+##   local-projects/asdf/build/asdf.lisp as a file and empties the central
+##   registry, so the binaries resolve every dependency from the bundle and
+##   nothing from the host's Quicklisp, workspace or source registry
+##   configuration. The bundled ASDF is loaded as a file because the bundle's
+##   searcher knows only primary system names: a build of asdf/defsystem
+##   through any registry still open regenerates another checkout's
+##   build/asdf.lisp. `make deploy` sets it to the release's own
+##   <release>/deps/setup.lisp and runs the build in the release, so the bus
+##   binaries come from the same export and bundle as the server cores.
 BUS_DEPS_SETUP ?=
 ifeq ($(strip $(BUS_DEPS_SETUP)),)
 BUS_WATCH_SETUP = --eval '(require :asdf)'
@@ -161,7 +167,12 @@ BUS_HOST_SETUP = --eval '(require :asdf)' \
 	     --eval '(pushnew (uiop:ensure-directory-pathname "$(WORKSPACE)") asdf:*central-registry* :test (function equal))' \
 	     --eval '(pushnew (uiop:ensure-directory-pathname "$(WORKSPACE)/pzmq") asdf:*central-registry* :test (function equal))'
 else
-BUS_WATCH_SETUP = --load "$(BUS_DEPS_SETUP)" --eval '(require :asdf)'
+BUS_ONLY_CWD = (asdf:initialize-source-registry (list :source-registry (list :directory (uiop:getcwd)) :ignore-inherited-configuration))
+BUS_WATCH_SETUP = --load "$(BUS_DEPS_SETUP)" \
+	     --eval '$(BUS_ONLY_CWD)' \
+	     --eval '(let ((*standard-output* *error-output*)) (load (merge-pathnames "local-projects/asdf/build/asdf.lisp" (uiop:pathname-directory-pathname "$(BUS_DEPS_SETUP)"))))' \
+	     --eval '$(BUS_ONLY_CWD)' \
+	     --eval '(setf asdf:*central-registry* nil)'
 BUS_HOST_SETUP = $(BUS_WATCH_SETUP)
 endif
 
