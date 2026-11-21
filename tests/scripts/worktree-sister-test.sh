@@ -332,6 +332,12 @@ tree=$(printf '100644 blob %s\t.envrc\n' "$blob" | git -C "$G/repo" mktree)
 git -C "$G/repo" branch withenvrc "$(git -C "$G/repo" commit-tree "$tree" -p HEAD -m 'Track .envrc')"
 refused "a start point that tracks .envrc" 1 create --bus b --base withenvrc "$G/repo" feature/thing
 refused "an existing branch that tracks .envrc" 1 create --bus b "$G/repo" withenvrc
+fixture refuse-tracked-planning
+blob=$(printf 'x\n' | git -C "$G/repo" hash-object -w --stdin)
+tree=$(printf '100644 blob %s\t.planning\n' "$blob" | git -C "$G/repo" mktree)
+git -C "$G/repo" branch withplanning "$(git -C "$G/repo" commit-tree "$tree" -p HEAD -m 'Track planning')"
+refused "a start point that tracks .planning" 1 create --bus b --base withplanning "$G/repo" feature/thing
+refused "an existing branch that tracks .planning" 1 create --bus b "$G/repo" withplanning
 fixture refuse-direnv
 printf '1\n' >"$G/logs/direnv-exec-status"
 refused "an .envrc direnv will not load" 1 create --bus b "$G/repo" feature/thing

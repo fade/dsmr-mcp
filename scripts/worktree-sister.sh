@@ -232,7 +232,10 @@ cmd_create() {
     git -C "$repo" rev-parse --verify --quiet "$start^{commit}" >/dev/null ||
         refuse "start point is not a commit: $start"
     if git -C "$repo" cat-file -e "$start:.envrc" 2>/dev/null; then
-        refuse "$start tracks .envrc, which the worktree's generated .envrc would overwrite; start from a commit without it"
+        refuse "$start tracks .envrc; start from a commit without it"
+    fi
+    if git -C "$repo" cat-file -e "$start:.planning" 2>/dev/null; then
+        refuse "$start tracks .planning; start from a commit without it"
     fi
     if [[ -e $repo/.envrc ]] && ! direnv exec "$repo" true >/dev/null 2>&1; then
         refuse "direnv will not load $repo/.envrc; run 'direnv allow $repo' after reading it, then run again"
@@ -294,7 +297,7 @@ cmd_create() {
     [[ -L $hookdir ]] && { rm -- "$hookdir" || failed "replacing $hookdir"; }
     [[ -d $hookdir ]] && { rmdir -- "$hookdir" || failed "replacing $hookdir"; }
     ln -s -- "$bucket/sisters/$name" "$hookdir" || failed "linking $hookdir"
-    ln -s -- "$hookdir" "$dest/.planning" || failed "linking $dest/.planning"
+    ln -sT -- "$hookdir" "$dest/.planning" || failed "linking $dest/.planning"
 
     local exclude path
     exclude=$(git -C "$dest" rev-parse --path-format=absolute --git-path info/exclude) ||
