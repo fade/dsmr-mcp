@@ -614,6 +614,8 @@ resumes the worker, and CORE is ignored.
 
 With CORE, the path of a worker core image, the worker boots from that image,
 which already holds the worker system, so nothing is loaded before start. The
+worker starts through CL-USER::DSMR-WORKER-ENTRY, which every worker core
+defines, so the arguments name no package a release image may have renamed. The
 image carries the source registry as it stood when it was built; the arguments
 discard it, so the worker sees the workspace as it is now. No directory of this
 server is added to the worker's ASDF lookup: the worker registers the project
@@ -650,7 +652,7 @@ handshake JSON line."
       (list "--core" (namestring core)
             "--noinform" "--disable-debugger" "--no-sysinit" "--no-userinit"
             "--eval" "(asdf:clear-source-registry)"
-            "--eval" "(dsmr-mcp/src/hermetic/worker/main:start)")))
+            "--eval" "(cl-user::dsmr-worker-entry)")))
   (unless (equal (uiop:getenv "DSMR_ALLOW_SOURCE_WORKERS") "1")
     (error 'worker-spawn-failed
            :kind :no-worker-core

@@ -235,8 +235,9 @@ worker system from source and starts it."
 
 (define-test a-core-command-line-names-no-tool-directory
   "A worker booted from a core is given the core, no sysinit or userinit, and
-a registry reset; no argument names this server's own dsmr-mcp directory or
-ASDF's central registry."
+a registry reset, and ends with the one worker entry function; no argument
+names this server's own dsmr-mcp directory, a dsmr-mcp package or ASDF's
+central registry."
   (let* ((tool-dir (namestring (asdf:system-source-directory :dsmr-mcp)))
          (args (wc::%build-sbcl-args :core "/nonexistent/worker.core")))
     (is string= "--core" (first args))
@@ -244,6 +245,10 @@ ASDF's central registry."
     (dolist (flag '("--noinform" "--disable-debugger" "--no-userinit" "--no-sysinit"))
       (true (member flag args :test #'string=) "~A missing from ~S" flag args))
     (true (member "(asdf:clear-source-registry)" args :test #'string=) "~S" args)
+    (is equal '("--eval" "(cl-user::dsmr-worker-entry)") (last args 2))
+    (dolist (arg args)
+      (false (search "dsmr-mcp/" (string-downcase arg))
+             "argument ~S names a dsmr-mcp package" arg))
     (dolist (arg args)
       (false (search tool-dir arg) "argument ~S names ~A" arg tool-dir)
       (false (search "central-registry" (string-downcase arg))

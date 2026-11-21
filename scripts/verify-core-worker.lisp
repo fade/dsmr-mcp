@@ -13,10 +13,19 @@
 ;;;;   sbcl --core <staged-image> --noinform --disable-debugger \
 ;;;;        --non-interactive --no-userinit --load scripts/verify-core-worker.lisp
 ;;;;
+;;;; Environment:
+;;;;
+;;;;   DSMR_VERIFY_WORKER_PREFIX  the prefix of the support package names, default
+;;;;                              DSMR-MCP; `make deploy` passes DSMR-WORKER for a
+;;;;                              release worker image.
+;;;;   DSMR_RELEASE_ROOT          when set, the release directory every loaded
+;;;;                              system must come from.
+;;;;
 ;;;; What a worker image must be, and therefore what is asserted:
 ;;;;
-;;;;   - it holds the worker entry point and its method table, so a worker can
-;;;;     reach its handshake without loading anything;
+;;;;   - it holds the worker entry point, CL-USER::DSMR-WORKER-ENTRY and its
+;;;;     method table, so a worker can reach its handshake without loading
+;;;;     anything;
 ;;;;   - it can save a worker's world to a core and come back from one: the
 ;;;;     resume entry point is there and a worker server answers the save method;
 ;;;;   - it holds no test systems and no test framework, because a worker image
@@ -25,7 +34,11 @@
 ;;;;     worker reads its timeouts from its own environment when it starts, and a
 ;;;;     value frozen at build time would silently win over the one it was given;
 ;;;;   - it holds Quicklisp and can still find a Quicklisp system, so a worker
-;;;;     asked to load one is not stranded.
+;;;;     asked to load one is not stranded;
+;;;;   - under a prefix other than DSMR-MCP, no package keeps a DSMR-MCP name and
+;;;;     no dsmr-mcp system is registered;
+;;;;   - with DSMR_RELEASE_ROOT set, every loaded system's source lies in the
+;;;;     release, the SBCL contrib directory or the Quicklisp client directory.
 ;;;;
 ;;;; Package and system counts are printed for the build log and never asserted,
 ;;;; so a new dependency cannot turn the build red.
@@ -81,15 +94,34 @@ run has not passed."
 
 ;;; Name resolution helpers --------------------------------------------------
 
-(defparameter *verify-core-worker-main* "DSMR-MCP/SRC/HERMETIC/WORKER/MAIN")
-(defparameter *verify-core-worker-handlers* "DSMR-MCP/SRC/HERMETIC/WORKER/HANDLERS")
-(defparameter *verify-core-worker-client* "DSMR-MCP/SRC/HERMETIC/WORKER-CLIENT")
+(defparameter *verify-core-prefix*
+  (let ((given (uiop:getenv "DSMR_VERIFY_WORKER_PREFIX")))
+    (if (and given (plusp (length given))) given "DSMR-MCP"))
+  "The name prefix the image's support packages carry: DSMR_VERIFY_WORKER_PREFIX,
+else DSMR-MCP. A release worker image carries DSMR-WORKER.")
 
-(defparameter *verify-core-worker-hibernate* "DSMR-MCP/SRC/HERMETIC/WORKER/HIBERNATE")
+(defun verify-core-package-name (suffix)
+  "The name of the support package SUFFIX, such as \"SRC/HERMETIC/WORKER/MAIN\",
+under *VERIFY-CORE-PREFIX*."
+  (concatenate 'string *verify-core-prefix* "/" suffix))
 
-(defparameter *verify-core-worker-server* "DSMR-MCP/SRC/HERMETIC/WORKER/SERVER")
+(defparameter *verify-core-worker-main*
+  (verify-core-package-name "SRC/HERMETIC/WORKER/MAIN"))
 
-(defparameter *verify-core-worker-registry* "DSMR-MCP/SRC/HERMETIC/WORKER/REGISTRY")
+(defparameter *verify-core-worker-handlers*
+  (verify-core-package-name "SRC/HERMETIC/WORKER/HANDLERS"))
+
+(defparameter *verify-core-worker-client*
+  (verify-core-package-name "SRC/HERMETIC/WORKER-CLIENT"))
+
+(defparameter *verify-core-worker-hibernate*
+  (verify-core-package-name "SRC/HERMETIC/WORKER/HIBERNATE"))
+
+(defparameter *verify-core-worker-server*
+  (verify-core-package-name "SRC/HERMETIC/WORKER/SERVER"))
+
+(defparameter *verify-core-worker-registry*
+  (verify-core-package-name "SRC/HERMETIC/WORKER/REGISTRY"))
 
 (defun verify-core-symbol (package name)
   "Return the symbol NAME in PACKAGE, or NIL if either is absent.
@@ -139,6 +171,10 @@ image that does not hold the worker at all."
   (verify-core-fbound-check "worker entry point fbound"
                             *verify-core-worker-main* "START"))
 
+(defun verify-core-check-worker-entry ()
+  (verify-core-fbound-check "worker start entry fbound"
+                            "COMMON-LISP-USER" "DSMR-WORKER-ENTRY"))
+
 (defun verify-core-check-handlers ()
   (verify-core-fbound-check "worker method table installer fbound"
                             *verify-core-worker-handlers* "REGISTER-ALL-HANDLERS"))
@@ -179,12 +215,12 @@ that saves it."
 
 (defun verify-core-check-no-test-systems ()
   (verify-core-checking "no test packages in image"
-    (let ((test-packages
-            (loop for pkg in (list-all-packages)
-                  for name = (package-name pkg)
-                  when (and (>= (length name) 14)
-                            (string= "DSMR-MCP/TESTS" name :end2 14))
-                    collect name)))
+    (let* ((prefix (verify-core-package-name "TESTS"))
+           (test-packages
+             (loop for pkg in (list-all-packages)
+                   for name = (package-name pkg)
+                   when (uiop:string-prefix-p prefix name)
+                     collect name)))
       (if test-packages
           (values nil (format nil "~D present, first ~A"
                               (length test-packages) (first test-packages)))
@@ -223,6 +259,55 @@ that saves it."
                                 "unknown")))
           (values nil "asdf:find-system \"alexandria\" returned NIL")))))
 
+(defun verify-core-check-renamed ()
+  "When the prefix is not DSMR-MCP, check that no package keeps a DSMR-MCP name
+and no dsmr-mcp system is registered, so a subject's own can be loaded."
+  (unless (string= *verify-core-prefix* "DSMR-MCP")
+    (verify-core-checking "no package keeps a DSMR-MCP name"
+      (let ((left (loop for pkg in (list-all-packages)
+                        for name = (package-name pkg)
+                        when (or (string= name "DSMR-MCP")
+                                 (uiop:string-prefix-p "DSMR-MCP/" name))
+                          collect name)))
+        (if left
+            (values nil (format nil "~D left, first ~A" (length left) (first left)))
+            (values t (format nil "support packages under ~A" *verify-core-prefix*)))))
+    (verify-core-checking "no dsmr-mcp system registered"
+      (let ((left (remove-if-not (lambda (name) (uiop:string-prefix-p "dsmr-mcp" name))
+                                 (asdf:registered-systems))))
+        (if left
+            (values nil (format nil "~D registered, first ~A" (length left) (first left)))
+            (values t "none"))))))
+
+(defun verify-core-check-inside-release ()
+  "When DSMR_RELEASE_ROOT is set, check that every loaded system's source lies
+under that root, the SBCL contrib directory or the Quicklisp client directory.
+Systems with no source directory are allowed."
+  (let ((root (uiop:getenv "DSMR_RELEASE_ROOT")))
+    (when (and root (plusp (length root)))
+      (verify-core-checking "every loaded system comes from the release"
+        (flet ((truename-or-self (p) (or (ignore-errors (truename p)) p)))
+          (let* ((ql-home (and (find-package "QL")
+                               (find-symbol "*QUICKLISP-HOME*" "QL")))
+                 (allowed (mapcar #'truename-or-self
+                                  (remove nil
+                                          (list (uiop:ensure-directory-pathname root)
+                                                (merge-pathnames "contrib/" (sb-int:sbcl-homedir-pathname))
+                                                (and ql-home (boundp ql-home)
+                                                     (merge-pathnames "quicklisp/"
+                                                                      (symbol-value ql-home)))))))
+                 (outside '()))
+            (dolist (name (asdf:already-loaded-systems))
+              (let* ((system (asdf:registered-system name))
+                     (dir (and system (ignore-errors (asdf:system-source-directory system)))))
+                (when (and dir
+                           (notany (lambda (a) (uiop:subpathp (truename-or-self dir) a))
+                                   allowed))
+                  (push (format nil "~A ~A" name (namestring dir)) outside))))
+            (if outside
+                (values nil (format nil "outside ~A: ~{~A~^; ~}" root (nreverse outside)))
+                (values t (format nil "~D systems" (length (asdf:already-loaded-systems)))))))))))
+
 ;;; Driver -------------------------------------------------------------------
 
 (defun verify-core-run ()
@@ -232,7 +317,9 @@ that saves it."
                     (or (ignore-errors (namestring sb-ext:*core-pathname*))
                         "unknown"))
   (verify-core-note "sbcl ~A" (lisp-implementation-version))
+  (verify-core-note "support package prefix: ~A" *verify-core-prefix*)
   (verify-core-check-entry-point)
+  (verify-core-check-worker-entry)
   (verify-core-check-handlers)
   (verify-core-check-hibernate-wiring)
   (verify-core-check-no-test-systems)
@@ -241,6 +328,8 @@ that saves it."
   (verify-core-check-startup-timeout-unset)
   (verify-core-check-quicklisp)
   (verify-core-check-quicklisp-system-findable)
+  (verify-core-check-renamed)
+  (verify-core-check-inside-release)
   (let ((failures (nreverse *verify-core-failures*)))
     (if failures
         (progn
