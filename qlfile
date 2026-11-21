@@ -1,0 +1,12 @@
+# Quicklisp dist pinned to the month the current cores were built against
+dist quicklisp https://beta.quicklisp.org/dist/quicklisp.txt 2026-01-01
+# Forks on GitHub/Codeberg, pinned to the sha the workspace builds today
+github fade/slynk-client :ref 67b65da7210b4f9a6e373077373528a4c7bed4b5
+git zebra https://github.com/fade/zebra.git :ref a36e393027746c65e41031f9c111f3fdf46877e7
+git pzmq https://github.com/fade/pzmq.git :ref 6f7b2ca02c23ea53510a9b0e0f181d5364ce9d32
+git jzon https://github.com/fade/jzon.git :ref d5feb465244ac94630e8155f5bfbb45fc1d87b53
+git eclector https://github.com/fade/Eclector.git :ref 1088a7998f0d205da12ff48de7238b1008a31792
+git acclimation https://github.com/fade/Acclimation.git :ref 9339b92e16e6a6784488f8bac82c189ae4bab4aa
+git ubiquitous https://codeberg.org/fade/ubiquitous.git :ref f6af0c2a2d7855942dd66467166ddf0dac3ab8d7
+git slynk https://github.com/fade/sly.git :ref 70350623eecd1f41837c9e57cbb6d5c06678a60d
+asdf 3.3.7.4

@@ -157,6 +157,14 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/bus-listener")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
+(asdf:defsystem "dsmr-mcp/release"
+  :description "The closure a release server core loads: the server, its installer, and the HyperSpec lookup."
+  :author "Brian O'Reilly <fade@deepsky.com>"
+  :license "AGPL-3.0-or-later"
+  :depends-on ("dsmr-mcp"
+               "dsmr-mcp/src/install"
+               "clhs"))
+
 (asdf:defsystem "dsmr-mcp/tests"
   :class :package-inferred-system
   :description "Test suite for dsmr-mcp."
