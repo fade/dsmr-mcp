@@ -227,10 +227,6 @@ its bundled dependencies."
   (let ((*standard-output* *error-output*))
     (asdf:load-system system)))
 
-;;; Release kind: seal the registry. Only the package-inferred search function
-;;; remains, so a system already loaded still resolves and any other system
-;;; signals MISSING-COMPONENT instead of being found on the host.
-
 ;;; The project's source directory, read once the systems are loaded and before
 ;;; a release-worker build clears them: a lookup after the clear would search the
 ;;; host and could register another checkout's dsmr-mcp in the image.
@@ -239,7 +235,9 @@ its bundled dependencies."
 
 (defun build-core-seal ()
   "Seal the registry with the server's own SEAL-SOURCE-REGISTRY, then exit 1
-unless SEALED-P confirms it."
+unless SEALED-P confirms it. Only the package-inferred search function
+remains, so a system already loaded still resolves and any other system
+signals MISSING-COMPONENT instead of being found on the host."
   (uiop:symbol-call '#:dsmr-mcp/src/release '#:seal-source-registry)
   (unless (uiop:symbol-call '#:dsmr-mcp/src/release '#:sealed-p)
     (build-core-die "the registry is not sealed after seal-source-registry; check dsmr-mcp/src/release"))
@@ -372,6 +370,13 @@ under its source names."
     (let ((package (or (find-package "DSMR-WORKER/SRC/HERMETIC/WORKER/MAIN")
                        (find-package "DSMR-MCP/SRC/HERMETIC/WORKER/MAIN"))))
       (funcall (find-symbol "START" package)))))
+
+;;; Both worker kinds: forget the output translations the build computed, which
+;;; point into the build's XDG_CACHE_HOME (inside a read-only release, for a
+;;; release-worker). A worker computes them again from its own environment the
+;;; first time it compiles.
+(when (or (build-core-worker-p) (build-core-release-worker-p))
+  (asdf:clear-output-translations))
 
 ;;; Staleness manifest. A launch wrapper reads this (with plain shell tools, so
 ;;; an SBCL upgrade can't break the check) to decide whether the image is still
