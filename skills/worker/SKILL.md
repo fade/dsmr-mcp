@@ -40,8 +40,10 @@ you can hear is worth more than a preflight you have completed.
 
 A **worktree sister** runs in a git worktree under lisp-scratch that `worktree-sister.sh create`
 made for one branch. Her `.envrc` sets `DSMR_WORKTREE_SISTER=<name>`, and her bus name is that same
-`<name>`. Her `.planning` is a symlink to **the same directory as the main checkout's**, so
-`PARK.md` and `BLOCKED.md` at its top are the leader's. ⛔ **She never writes either of them.**
+`<name>`. Her `.planning` resolves to her **own view** of the bucket, `sisters/<name>` inside it:
+a symlink to every shared top-level entry, plus her own real `PARK*`, `BLOCKED*`,
+`CURRENT-CONTEXT*` and `LEFT` files. A park, block or context write at the top of `.planning` lands
+in her view and never in the leader's copy.
 
 Every snippet in this file that reads or writes a park, block or `LEFT` file starts with this line:
 
@@ -53,8 +55,10 @@ For every other sister `$S` is `.planning` and nothing changes. For a worktree s
 directory, `sisters/<name>` inside the bucket. Each Bash call starts a fresh shell, so the line is
 repeated in each snippet; never carry `$S` from one call to the next. Within this file and
 **fleet-restart**, every mention of the repo's `PARK.md` or `BLOCKED.md` means `$S/PARK.md` and
-`$S/BLOCKED.md` for her. `STATE.md` and the rest of the bucket stay shared on purpose: she works
-under the repository's plan.
+`$S/BLOCKED.md` for her. `STATE.md`, `ROADMAP.md` and the rest of the bucket stay shared on
+purpose: she works under the repository's plan, so she reads them and ⛔ **never writes a shared
+top-level entry**. A GSD step that would update `STATE.md` or `ROADMAP.md` runs from the main
+checkout, or she parks the ask in `$S/BLOCKED.md`.
 
 ⛔ **Control first, before reading anything under `$S`.** When `DSMR_WORKTREE_SISTER` is set, the
 registration must name the checkout you are standing in:

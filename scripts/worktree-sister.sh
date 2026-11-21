@@ -2,15 +2,18 @@
 #
 # Give a branch its own git worktree and its own sister session.
 #
-# create makes a worktree of a main checkout under the scratch root, links its
-# .planning to the repository's planning bucket, writes an .envrc that gives
+# create makes a worktree of a main checkout under the scratch root, gives it a
+# private view of the repository's planning bucket, writes an .envrc that gives
 # the session a stable bus identity and a hermetic worker rooted at the
 # worktree, registers the sister in the bucket as sisters/<name>/WORKTREE, and
 # opens a /worker tab for it through the fleet launcher.
 #
-# The worktree's .planning is the same directory as the repository's, so the
-# sister keeps her park, block and departure records under sisters/<name>/ and
-# never writes the leader's PARK.md or BLOCKED.md.
+# The view is the directory sisters/<name>/ in the bucket. It holds a relative
+# symlink to every other top-level bucket entry, and her own real PARK*,
+# BLOCKED*, CURRENT-CONTEXT* and LEFT files, so a write to one of those never
+# reaches the leader's copy. The worktree's .planning links to the path the
+# SessionStart hook computes for the worktree, and that path links to the view,
+# so the hook finds .planning already linked and leaves it alone.
 #
 # Exit status: 0 done, 1 refused, 2 usage error, 3 environment unsupported.
 
@@ -92,6 +95,26 @@ has_space() { [[ $1 =~ [[:space:]] ]]; }
 # Print the value of KEY from a key: value registration FILE.
 field() { awk -v k="$2:" '$1 == k { print $2; exit }' "$1"; }
 
+# Print the planning directory the SessionStart hook computes for the project
+# root DIR (a real path): <cache>/opencode/projects/<name>_<hash>/planning,
+# where name is the lowercased basename cut to 32 characters of [a-z0-9-] and
+# hash the first 8 hex digits of the SHA-256 of DIR.
+hook_planning_dir() {
+    local real=$1 name hash LC_ALL=C
+    name=$(printf '%s' "${real##*/}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | tr -s '-' |
+           sed 's/^-//; s/-$//' | cut -c1-32)
+    [[ -n $name ]] || name=project
+    hash=$(printf '%s' "$real" | sha256sum | cut -c1-8)
+    printf '%s/opencode/projects/%s_%s/planning\n' "${XDG_CACHE_HOME:-$HOME/.cache}" "$name" "$hash"
+}
+
+# Bucket entries a sister keeps as her own files instead of links to the shared
+# ones: her park, block, context and departure records.
+own_entry() {
+    case $1 in PARK*|BLOCKED*|CURRENT-CONTEXT*|LEFT|WORKTREE) return 0 ;; esac
+    return 1
+}
+
 # The fleet launcher: $DSMR_START_SISTERS, else the one beside this script,
 # else the maintained checkout's copy.
 find_launcher() {
@@ -171,6 +194,17 @@ cmd_create() {
     local dest=$root/$repo_name-$slug
     has_space "$dest" && refuse "destination path holds whitespace: $dest; set DSMR_SCRATCH_ROOT"
     [[ -e $dest || -L $dest ]] && refuse "destination exists: $dest; choose another with --slug"
+    # The hook path the worktree's .planning will link to. Only an empty
+    # directory or a link into a sisters/ view may already stand there.
+    local hookdir
+    hookdir=$(hook_planning_dir "$dest")
+    if [[ -L $hookdir ]]; then
+        [[ $(readlink -- "$hookdir") == "$bucket"/sisters/* ]] ||
+            refuse "$hookdir is a link that points elsewhere; remove it, then run again"
+    elif [[ -e $hookdir ]]; then
+        [[ -d $hookdir && -z $(ls -A -- "$hookdir") ]] ||
+            refuse "$hookdir exists and is not empty; move it aside, then run again"
+    fi
 
     local start have_branch=0
     if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
@@ -201,8 +235,9 @@ cmd_create() {
         else
             printf 'would run: git -C %s worktree add -b %s %s %s\n' "$repo" "$branch" "$dest" "$start"
         fi
-        printf 'would write: %s\n' "$reg"
-        printf 'would link: %s/.planning -> %s\n' "$dest" "$bucket"
+        printf 'would write: %s, with a link to each shared entry of %s\n' "$reg" "$bucket"
+        printf 'would link: %s -> %s\n' "$hookdir" "$bucket/sisters/$name"
+        printf 'would link: %s/.planning -> %s\n' "$dest" "$hookdir"
         printf 'would ignore .planning and .envrc in the common info/exclude, where not already ignored\n'
         printf 'would write: %s/.envrc (bus %s, agent %s, hermetic)\n' "$dest" "$bus" "$name"
         printf 'would run: direnv allow %s\n' "$dest"
@@ -227,11 +262,22 @@ cmd_create() {
     }
 
     dest=$(cd -- "$dest" && pwd -P) || failed "resolving the worktree path"
-    mkdir -p -- "$bucket/sisters/$name" || failed "creating the registration directory"
+    mkdir -p -- "$bucket/sisters" "$bucket/sisters/$name" || failed "creating the registration directory"
     printf 'name: %s\nrepo: %s\nworktree: %s\nbranch: %s\nbus: %s\ncreated: %s\n' \
         "$name" "$repo" "$dest" "$branch" "$bus" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         >"$reg" || failed "writing $reg"
-    ln -s -- "$bucket" "$dest/.planning" || failed "linking $dest/.planning"
+    local entry
+    while IFS= read -r -d '' entry; do
+        entry=${entry##*/}
+        own_entry "$entry" && continue
+        ln -s -- "../../$entry" "$bucket/sisters/$name/$entry" || failed "linking $entry into the view"
+    done < <(find "$bucket" -mindepth 1 -maxdepth 1 -print0)
+    hookdir=$(hook_planning_dir "$dest")
+    mkdir -p -- "${hookdir%/*}" || failed "creating ${hookdir%/*}"
+    [[ -L $hookdir ]] && { rm -- "$hookdir" || failed "replacing $hookdir"; }
+    [[ -d $hookdir ]] && { rmdir -- "$hookdir" || failed "replacing $hookdir"; }
+    ln -s -- "$bucket/sisters/$name" "$hookdir" || failed "linking $hookdir"
+    ln -s -- "$hookdir" "$dest/.planning" || failed "linking $dest/.planning"
 
     local exclude path
     exclude=$(git -C "$dest" rev-parse --path-format=absolute --git-path info/exclude) ||
@@ -417,19 +463,29 @@ cmd_teardown() {
         return 0
     fi
 
-    # The link goes first and alone, so nothing below can reach the bucket.
-    local link=$wt/.planning target=""
+    # The links go first and alone, so nothing below can reach the bucket. The
+    # hook path is removed only when it links to her own view.
+    local link=$wt/.planning target="" hookdir hooktarget=""
+    hookdir=$(hook_planning_dir "$wt")
     if [[ -L $link ]]; then
         target=$(readlink -- "$link")
         rm -- "$link"
     elif [[ -e $link ]]; then
         refuse "$link is not a symlink; nothing is removed, inspect it by hand"
     fi
+    if [[ -L $hookdir && $(readlink -- "$hookdir") == "$sdir" ]]; then
+        hooktarget=$sdir
+        rm -- "$hookdir"
+        rmdir -- "${hookdir%/*}" 2>/dev/null || true
+    fi
     local remove=(worktree remove)
     ((force)) && remove+=(--force)
     if ! git -C "$repo" "${remove[@]}" "$wt"; then
+        if [[ -n $hooktarget ]]; then
+            mkdir -p -- "${hookdir%/*}" && ln -s -- "$hooktarget" "$hookdir"
+        fi
         [[ -n $target ]] && ln -s -- "$target" "$link"
-        refuse "git worktree remove $wt failed; the .planning link is restored"
+        refuse "git worktree remove $wt failed; the .planning links are restored"
     fi
     mkdir -p -- "$bucket/sisters-retired"
     mv -- "$sdir" "$archive"

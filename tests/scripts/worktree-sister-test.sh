@@ -14,7 +14,9 @@
 set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-SCRIPT=$REPO_ROOT/scripts/worktree-sister.sh
+SCRIPT=${WST_SCRIPT:-$REPO_ROOT/scripts/worktree-sister.sh}
+ORIG_HOME=$HOME
+PLAN=.planning
 STATUS=$REPO_ROOT/skills/leader/worktree-sister-status.sh
 
 # Isolation: no DSMR_ setting, kitty socket or git configuration from the
@@ -26,7 +28,7 @@ unset KITTY_LISTEN_ON KITTY_WINDOW_ID GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_C
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/worktree-sister-test.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 WORK=$(cd "$WORK" && pwd -P)
-export HOME=$WORK/home XDG_STATE_HOME=$WORK/state XDG_CONFIG_HOME=$WORK/config
+export HOME=$WORK/home XDG_STATE_HOME=$WORK/state XDG_CONFIG_HOME=$WORK/config XDG_CACHE_HOME=$WORK/cache
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=$WORK/gitconfig
 mkdir -p "$HOME" "$XDG_CONFIG_HOME"
 cat >"$GIT_CONFIG_GLOBAL" <<'EOF'
@@ -109,6 +111,11 @@ fixture() {
     git init -q --bare "$G/origin.git"
     git clone -q "$G/origin.git" "$G/repo" 2>/dev/null
     printf 'sentinel\n' >"$G/bucket/STATE.md"
+    printf 'leader park\n' >"$G/bucket/PARK.md"
+    printf 'leader block\n' >"$G/bucket/BLOCKED.md"
+    printf 'leader context\n' >"$G/bucket/CURRENT-CONTEXT.md"
+    printf 'hidden\n' >"$G/bucket/.continue-here.md"
+    mkdir -p "$G/bucket/codebase"
     ln -s "$G/bucket" "$G/repo/.planning"
     printf 'fixture\n' >"$G/repo/README"
     git -C "$G/repo" add README
@@ -177,8 +184,8 @@ try "the worktree is listed by git" "$(git -C "$G/repo" worktree list --porcelai
     grep -qxF "worktree $WT" <(git -C "$G/repo" worktree list --porcelain)
 try "the worktree is on feature/thing" "" \
     same "$(git -C "$WT" symbolic-ref --short HEAD 2>&1)" feature/thing
-try ".planning resolves to the repository's bucket" "" \
-    same "$(readlink -f "$WT/.planning")" "$(readlink -f "$G/repo/.planning")"
+try ".planning resolves to the sister's view in the bucket" "" \
+    same "$(readlink -f "$WT/.planning")" "$(readlink -f "$G/repo/.planning")/sisters/repo-integration"
 try "git status in the worktree is empty" "$(git -C "$WT" status --porcelain 2>&1)" \
     same "$(git -C "$WT" status --porcelain 2>&1)" ""
 try ".planning is in the exclude file once" "" same "$(count_line "$(exclude_file)" .planning)" 1
@@ -214,6 +221,59 @@ ws create --bus testbus --name other "$G/repo" feature/other
 try "a second create exits 0" "rc=$RC out=$OUT" same "$RC" 0
 try "a second create adds no second .planning line" "" same "$(count_line "$(exclude_file)" .planning)" 1
 try "a second create adds no second .envrc line" "" same "$(count_line "$(exclude_file)" .envrc)" 1
+
+# ---------------------------------------------------------------------------
+note "create: the planning view"
+fixture view
+ws create --no-launch --bus testbus "$G/repo" feature/thing
+WT=$G/scratch/repo-thing
+VIEW=$G/bucket/sisters/repo-integration
+try "the view holds the sister's registration as a real file" "" test -f "$VIEW/WORKTREE" -a ! -L "$VIEW/WORKTREE"
+for e in STATE.md codebase .continue-here.md sisters; do
+    try "the view links the shared entry $e" "$(ls -la "$VIEW" 2>&1)" test -L "$VIEW/$e"
+done
+for e in PARK.md BLOCKED.md CURRENT-CONTEXT.md LEFT; do
+    try "the view holds no copy of the leader's $e" "" test ! -e "$VIEW/$e" -a ! -L "$VIEW/$e"
+done
+try "a shared entry resolves to the leader's file" "" same "$(cat "$WT/$PLAN/STATE.md" 2>&1)" sentinel
+try "the registration resolves through the sisters link in the view" "" \
+    test -f "$WT/$PLAN/sisters/repo-integration/WORKTREE"
+for e in PARK.md BLOCKED.md CURRENT-CONTEXT.md; do
+    printf 'sister %s\n' "$e" >"$WT/$PLAN/$e"
+done
+try "her PARK.md write leaves the leader's alone" "" same "$(cat "$G/bucket/PARK.md")" "leader park"
+try "her BLOCKED.md write leaves the leader's alone" "" same "$(cat "$G/bucket/BLOCKED.md")" "leader block"
+try "her CURRENT-CONTEXT.md write leaves the leader's alone" "" \
+    same "$(cat "$G/bucket/CURRENT-CONTEXT.md")" "leader context"
+try "her writes land in her view" "" same "$(cat "$VIEW/PARK.md" 2>&1)" "sister PARK.md"
+
+# The SessionStart hook relinks any .planning that does not point at the path it
+# computes for the project root, so that path must lead to the view.
+HOOKD=$(readlink "$WT/.planning")
+try ".planning links to a path under the cache's project directory" "$HOOKD" \
+    grep -qE "^$XDG_CACHE_HOME/opencode/projects/repo-thing_[0-9a-f]{8}/planning$" <<<"$HOOKD"
+try "the hook path is a link to the view" "$(ls -la "${HOOKD%/*}" 2>&1)" \
+    test -L "$HOOKD" -a "$(readlink "$HOOKD")" = "$VIEW"
+HOOK_JS=$ORIG_HOME/.claude/hooks/gsd-planning-symlinks.js
+IDENT_JS=$ORIG_HOME/.claude/scripts/project-identity.js
+if command -v node >/dev/null && [[ -f $HOOK_JS && -f $IDENT_JS ]]; then
+    want=$(cd "$WT" && node -e 'console.log(require(process.argv[1]).resolveProjectIdentity(process.cwd()).planningDir)' "$IDENT_JS" 2>&1)
+    try "the hook path is the one the SessionStart hook computes" "hook=$want ours=$HOOKD" same "$HOOKD" "$want"
+    (cd "$WT" && node "$HOOK_JS" >/dev/null 2>&1)
+    try "after the hook runs .planning still resolves to the view" "$(readlink -f "$WT/.planning")" \
+        same "$(readlink -f "$WT/.planning")" "$VIEW"
+    try "after the hook runs her own PARK.md is still hers" "" same "$(cat "$WT/$PLAN/PARK.md")" "sister PARK.md"
+    # Control: a .planning linked straight at the view, as an unfixed create left
+    # it, is relinked by the hook to an empty bucket.
+    CTL=$G/scratch/repo-control
+    git -C "$G/repo" worktree add -q "$CTL" -b control 2>/dev/null
+    ln -s "$VIEW" "$CTL/.planning"
+    (cd "$CTL" && node "$HOOK_JS" >/dev/null 2>&1)
+    try "control: a direct link to the view is reset by the hook" "$(readlink -f "$CTL/.planning")" \
+        test "$(readlink -f "$CTL/.planning")" != "$VIEW"
+else
+    ok "(skipped) the SessionStart hook is not installed here; the hook path is not compared with it"
+fi
 
 # ---------------------------------------------------------------------------
 note "create: refusals change nothing"
@@ -270,6 +330,18 @@ fixture refuse-direnv
 printf '1\n' >"$G/logs/direnv-exec-status"
 refused "an .envrc direnv will not load" 1 create --bus b "$G/repo" feature/thing
 try "an unloadable .envrc is never approved" "$(cat "$G/logs/direnv.log" 2>/dev/null)" not_logged direnv.log allow
+
+fixture refuse-hookdir
+ws create --no-launch --bus b "$G/repo" feature/thing
+HOOKD=$(readlink "$G/scratch/repo-thing/.planning")
+(cd "$G/repo" && DSMR_BUS_WATCH=$STUBS/dsmr-bus-watch bash "$SCRIPT" teardown --force repo-integration >/dev/null 2>&1)
+mkdir -p "$HOOKD"
+printf 'keep\n' >"$HOOKD/note"
+refused "a hook path holding files" 1 create --no-launch --bus b "$G/repo" feature/thing
+try "the refusal leaves the files" "" test -s "$HOOKD/note"
+rm "$HOOKD/note"
+ws create --no-launch --bus b "$G/repo" feature/thing
+try "an empty hook path directory is replaced by the link" "rc=$RC out=$OUT" same "$(readlink "$HOOKD" 2>&1)" "$G/bucket/sisters/repo-integration"
 
 # ---------------------------------------------------------------------------
 note "create: dry run and no launch"
@@ -381,8 +453,14 @@ refused_td() {
 sister removable
 saved_park=$(cat "$SD/PARK.md"); saved_left=$(cat "$SD/LEFT"); saved_reg=$(cat "$SD/WORKTREE")
 before=$(git -C "$G/repo" symbolic-ref --short HEAD; git -C "$G/repo" rev-parse HEAD)
+HOOKD=$(readlink "$WT/.planning")
 td repo-integration
 try "a removable sister is removed" "rc=$RC out=$OUT" same "$RC" 0
+try "the hook path link is removed" "$(ls -la "${HOOKD%/*}" 2>&1)" test ! -e "$HOOKD" -a ! -L "$HOOKD"
+try "the hook path's empty project directory is removed" "" test ! -e "${HOOKD%/*}"
+try "the leader's PARK.md survives" "" same "$(cat "$G/bucket/PARK.md")" "leader park"
+try "the leader's other bucket entries survive" "" test -f "$G/bucket/.continue-here.md" -a -d "$G/bucket/codebase"
+try "the archive holds her view with its links" "" test -L "$(archives)/STATE.md"
 try "the worktree is gone and unlisted, the registration moved" "$OUT" gone
 try "the branch is kept" "" git -C "$G/repo" show-ref --verify -q refs/heads/feature/thing
 try "the bucket's STATE.md survives" "" same "$(cat "$G/bucket/STATE.md" 2>&1)" sentinel
@@ -396,6 +474,16 @@ try "the watcher is asked about her identity" "$(cat "$G/logs/buswatch.log" 2>/d
 try "the main checkout's branch and HEAD are unchanged" "" \
     same "$(git -C "$G/repo" symbolic-ref --short HEAD; git -C "$G/repo" rev-parse HEAD)" "$before"
 try "the output names the tab to close" "$OUT" has "$OUT" "close the tab titled repo-thing"
+
+sister lockedwt
+HOOKD=$(readlink "$WT/.planning")
+git -C "$G/repo" worktree lock "$WT"
+td --force repo-integration
+try "a failed git removal is refused" "rc=$RC out=$OUT" same "$RC" 1
+try "a failed git removal restores .planning" "$(readlink "$WT/.planning" 2>&1)" same "$(readlink "$WT/.planning" 2>&1)" "$HOOKD"
+try "a failed git removal restores the hook path" "" same "$(readlink "$HOOKD" 2>&1)" "$SD"
+try "a failed git removal leaves the registration" "$OUT" kept
+git -C "$G/repo" worktree unlock "$WT"
 
 sister live
 printf 'live\n' >"$G/logs/checklive"
