@@ -12,6 +12,14 @@ SBCL ?= sbcl
 # cache miss + recompile. Safe to override in the environment on a warm runner.
 export XDG_CACHE_HOME ?= $(CURDIR)/.ci-cache
 
+## CL_SOURCE_REGISTRY: where ASDF looks for systems in every Lisp this Makefile starts.
+##
+##   Lists this checkout's own directory first and inherits the host
+##   configuration after it, so dsmr-mcp resolves to this checkout even from a
+##   worktree outside the scanned tree, while the dependencies still resolve
+##   from the host. A value already in the environment is kept (CI sets one).
+export CL_SOURCE_REGISTRY ?= $(CURDIR)/:
+
 # Prebuilt core image (deps+system+test-deps via save-lisp-and-die). Override
 # CORE to point `test-warm` at an alternate path; rebuild with `make core`
 # whenever the dependencies, the SBCL build, or the project source change.
@@ -26,7 +34,7 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 .PHONY: bridge bus-watch bus-host bus-sources bus-binaries install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
         preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path \
-        deploy
+        deploy test-leaf
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -670,6 +678,15 @@ TEST_LIMIT_STATUS = ; status=$$?; \
 	  printf '%s\n' "$@: killed by SIGKILL; if $(1)=$($(1)) had passed, the run ignored SIGTERM for TEST_KILL_GRACE=$(TEST_KILL_GRACE)" >&2; \
 	fi; exit $$status
 
+## TEST_SOURCE_CHECK: the --eval that proves a run loaded this checkout's dsmr-mcp.
+##
+##   Compares the truename of the directory dsmr-mcp resolves to with this
+##   checkout's. On a match it prints `dsmr-mcp source: <dir>` on stderr; on a
+##   mismatch the run dies with status 2 before any test runs. The suites place
+##   it after their load, because the registry can read correctly while the
+##   system resolved somewhere else.
+TEST_SOURCE_CHECK = --eval '(let ((found (namestring (truename (asdf:system-source-directory "dsmr-mcp")))) (here (namestring (truename "$(CURDIR)/")))) (if (string= found here) (format *error-output* "~&dsmr-mcp source: ~A~%" found) (uiop:die 2 "dsmr-mcp resolves to ~A, not this checkout ~A; put this checkout first in CL_SOURCE_REGISTRY" found here)))'
+
 ## test: fast in-process unit suite (the push hot-path).
 ##
 ##   Runs the dsmr-mcp/tests umbrella — true in-process units, no child SBCLs.
@@ -688,6 +705,7 @@ test:
 	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(call TEST_LIMIT,TEST_TIMEOUT) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests")' \
+	     $(TEST_SOURCE_CHECK) \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))' $(call TEST_LIMIT_STATUS,TEST_TIMEOUT)
 
 ## test-integration: slow cross-process suite (gated, off the push hot-path).
@@ -702,7 +720,31 @@ test-integration: bus-binaries
 	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(call TEST_LIMIT,TEST_INTEGRATION_TIMEOUT) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests/integration")' \
+	     $(TEST_SOURCE_CHECK) \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests/integration") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))' $(call TEST_LIMIT_STATUS,TEST_INTEGRATION_TIMEOUT)
+
+## test-leaf: run the tests of one test system, named by LEAF.
+##
+##   make test-leaf LEAF=dsmr-mcp/tests/install/config-test
+##
+##   Same private state home, DSMR_ removal and source check as `test`. Loads
+##   the test runner and LEAF, checks that dsmr-mcp resolved to this checkout,
+##   then runs LEAF's package under the per-test bound. Fails when a test
+##   fails and when the package holds no test, since a leaf that runs nothing
+##   is a wiring fault. TEST_TIMEOUT limits the run, or
+##   TEST_INTEGRATION_TIMEOUT when LEAF is under dsmr-mcp/tests/integration/.
+##   The command is not echoed, so a search of the log for the source check's
+##   refusal finds only a refusal the run printed.
+LEAF ?=
+LEAF_LIMIT = $(if $(filter dsmr-mcp/tests/integration/%,$(LEAF)),TEST_INTEGRATION_TIMEOUT,TEST_TIMEOUT)
+test-leaf:
+	@$(if $(strip $(LEAF)),:,echo "test-leaf: LEAF is empty; name a test system, for example LEAF=dsmr-mcp/tests/install/config-test" >&2; exit 1)
+	@$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(call TEST_LIMIT,$(LEAF_LIMIT)) $(SBCL) --noinform --disable-debugger --non-interactive \
+	     --eval '(require :asdf)' \
+	     --eval '(asdf:load-system "dsmr-mcp/tests/support/test-watchdog")' \
+	     --eval '(asdf:load-system "$(LEAF)")' \
+	     $(TEST_SOURCE_CHECK) \
+	     --eval '(handler-case (multiple-value-bind (failed reports) (uiop:symbol-call :dsmr-mcp/tests/support/test-watchdog :run-test-packages (list "$(LEAF)")) (let ((class (uiop:find-symbol* :test-result :zebra)) (ran 0)) (dolist (report reports) (incf ran (count-if (lambda (r) (typep r class)) (uiop:symbol-call :zebra :results report)))) (when (zerop ran) (uiop:die 1 "test-leaf: $(LEAF) ran no test; check that its package registers its tests")) (when failed (uiop:die 1 "test-leaf: a test in $(LEAF) failed")))) (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))' $(call TEST_LIMIT_STATUS,$(LEAF_LIMIT))
 
 ## core: build the prebuilt deps+system+test-deps core image ($(CORE)).
 ##
@@ -841,4 +883,5 @@ core-verify-worker:
 ##   DSMR_ settings (TEST_UNSET_DSMR). TEST_TIMEOUT limits the run.
 test-warm:
 	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(call TEST_LIMIT,TEST_TIMEOUT) $(SBCL) --core $(CORE) --noinform --disable-debugger --non-interactive \
+	     $(TEST_SOURCE_CHECK) \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))' $(call TEST_LIMIT_STATUS,TEST_TIMEOUT)
