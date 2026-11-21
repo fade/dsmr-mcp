@@ -365,9 +365,9 @@ test-hooks:
 
 ## test-lisp-edit-guard: drive the Lisp edit guard with recorded PreToolUse input.
 ##
-##   Every case also runs against a stub that gets it wrong, so a guard that
-##   allows everything fails the deny cases and one that denies everything
-##   fails the allow cases. Fixture provenance is in
+##   Each deny case runs against a stub that allows everything and each allow
+##   case against one that denies everything, and both must fail there. Stubs
+##   that exit non-zero must fail every case. Fixture provenance is in
 ##   tests/harness/fixtures/pretooluse/SOURCE.
 test-lisp-edit-guard:
 	@bash tests/harness/lisp-edit-guard-test.sh
