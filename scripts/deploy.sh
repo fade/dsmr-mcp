@@ -83,13 +83,16 @@ deploy() {
     git -C "$repo" archive --format=tar "$sha" | tar -x -C "$rel"
 
     [ -x "$qlot" ] || die "dependencies: QLOT $qlot is not executable; provision qlot in \$LISP_WORKSPACE/qlot (run its scripts/setup.sh) or pass QLOT=<path>"
+    # qlot runs with the cache it was set up with, not the XDG_CACHE_HOME the
+    # Makefile exports for the checkout's tests. Nothing from that cache
+    # reaches the release; the bundle holds copies.
     t0=$SECONDS
     say "dependencies: qlot install and qlot bundle (log $rel/dependencies.log)"
     if ! (cd "$rel" \
-            && env -u CL_SOURCE_REGISTRY -u ASDF_OUTPUT_TRANSLATIONS \
-                   LISP=sbcl XDG_CACHE_HOME="$home/cache" "$qlot" install \
-            && env -u CL_SOURCE_REGISTRY -u ASDF_OUTPUT_TRANSLATIONS \
-                   LISP=sbcl XDG_CACHE_HOME="$home/cache" "$qlot" bundle --output deps) \
+            && env -u CL_SOURCE_REGISTRY -u ASDF_OUTPUT_TRANSLATIONS -u XDG_CACHE_HOME \
+                   LISP=sbcl "$qlot" install \
+            && env -u CL_SOURCE_REGISTRY -u ASDF_OUTPUT_TRANSLATIONS -u XDG_CACHE_HOME \
+                   LISP=sbcl "$qlot" bundle --output deps) \
           >"$rel/dependencies.log" 2>&1; then
       show_log_tail "$rel/dependencies.log"
       die "dependencies: qlot failed; current is unchanged"
