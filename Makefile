@@ -86,6 +86,14 @@ ALLOW_UNPUBLISHED ?=
 ##   directories are scratch directories too.
 HOST_LINKS ?=
 
+## FORCE: set to 1 to replace a deployed file that was edited in place.
+##
+##   `make deploy` and `make rollback` refuse, before they change anything, when
+##   a deployed skill, agent definition or harness file differs from both the
+##   release being installed and the release it replaces; FORCE=1 replaces it.
+##   install-host-unit reads it the same way for the systemd units.
+FORCE ?=
+
 ## CLAUDE_CONFIG: the Claude Code config file `make register` writes.
 ##
 ##   Defaults to the host's own config. A run with a scratch DSMR_HOME must name
@@ -583,22 +591,17 @@ check-skills:
 	  fi; \
 	done; \
 	if [ $$status -eq 0 ]; then echo "skills in sync with $(SKILLDIR)"; \
-	else echo "run 'make install-skills' to deploy this tree, or port the other way first"; fi; \
+	else echo "run 'make deploy REF=<sha>' to deploy a commit of this tree, or port the other way first"; fi; \
 	exit $$status
 
-## install-skills: deploy this tree's harness skills to the agent that reads them.
+## install-skills: retired; refuses and names `make deploy`.
 ##
-##   ⛔ The migration direction is global -> repo. If a deployed skill has been
-##   edited in place, that edit is the newer one and this target would destroy
-##   it. Run check-skills first and port the other way before deploying.
-##   Deployment is per-file so an agent's unrelated skills are left alone.
+##   Skills, agent definitions and harness files are copied from the deployed
+##   release by `make deploy` and `make rollback`. A copy from this checkout
+##   would also make the next deploy's divergence check refuse, so this target
+##   writes nothing and exits 1.
 install-skills:
-	@for f in $$(cd skills && find . -mindepth 2 -type f ! -path '*__pycache__*' | sed 's|^\./||'); do \
-	  mkdir -p "$(SKILLDIR)/$$(dirname $$f)"; \
-	  cp -p "skills/$$f" "$(SKILLDIR)/$$f"; \
-	  echo "  deployed $$f"; \
-	done
-	@echo "installed into $(SKILLDIR)"
+	@echo "$@: skills, agents and harness files come from the deployed release; run make deploy REF=<sha>" >&2; exit 1
 
 ## check-agents: report where the deployed agent definitions differ from this tree.
 ##
@@ -625,29 +628,23 @@ check-agents:
 	  done; \
 	done; \
 	if [ $$status -eq 0 ]; then echo "agents in sync with $(SUBAGENTDIR)"; \
-	else echo "run 'make install-agents' to deploy this tree, or port the other way first"; fi; \
+	else echo "run 'make deploy REF=<sha>' to deploy a commit of this tree, or port the other way first"; fi; \
 	exit $$status
 
-## install-agents: deploy this tree's agent definitions to the agent that reads them.
+## install-agents: retired; refuses and names `make deploy`.
 ##
-##   ⛔ The migration direction is deployed -> repo. If a deployed definition
-##   has been edited in place, that edit is the newer one and this target would
-##   destroy it. Run check-agents first and port the other way before deploying.
-##   Deployment is per-file over the agents tracked here, so the gsd-* roster
-##   and lisp-developer are left alone.
+##   Skills, agent definitions and harness files are copied from the deployed
+##   release by `make deploy` and `make rollback`. A copy from this checkout
+##   would also make the next deploy's divergence check refuse, so this target
+##   writes nothing and exits 1.
 install-agents:
-	@for f in $$(cd agents && find . -maxdepth 1 -type f -name '*.md' ! -name README.md | sed 's|^\./||'); do \
-	  mkdir -p "$(SUBAGENTDIR)"; \
-	  cp -p "agents/$$f" "$(SUBAGENTDIR)/$$f"; \
-	  echo "  deployed $$f"; \
-	done
-	@echo "installed into $(SUBAGENTDIR)"
+	@echo "$@: skills, agents and harness files come from the deployed release; run make deploy REF=<sha>" >&2; exit 1
 
 ## check-harness: report drift between harness/ and the deployed agent root.
 ##
 ##   Same contract as check-skills, and the same hazard: a live correction is
 ##   usually made to the DEPLOYED copy, so the tracked tree is the stale one
-##   more often than not. Always run this before install-harness, and when it
+##   more often than not. Always run this before make deploy, and when it
 ##   reports DIFFERS, look before deciding which way to copy.
 check-harness:
 	@status=0; \
@@ -659,22 +656,17 @@ check-harness:
 	  fi; \
 	done; \
 	if [ $$status -eq 0 ]; then echo "harness in sync with $(AGENTDIR)"; \
-	else echo "run 'make install-harness' to deploy this tree, or port the other way first"; fi; \
+	else echo "run 'make deploy REF=<sha>' to deploy a commit of this tree, or port the other way first"; fi; \
 	exit $$status
 
-## install-harness: deploy harness/ into the agent configuration root.
+## install-harness: retired; refuses and names `make deploy`.
 ##
-##   Reaches every session on the host, not just this project's. The status
-##   line lands immediately for sessions started afterwards; a running session
-##   keeps the one it started with.
+##   Skills, agent definitions and harness files are copied from the deployed
+##   release by `make deploy` and `make rollback`. A copy from this checkout
+##   would also make the next deploy's divergence check refuse, so this target
+##   writes nothing and exits 1.
 install-harness:
-	@for f in $$(cd harness && find . -type f | sed 's|^\./||'); do \
-	  mkdir -p "$(AGENTDIR)/$$(dirname $$f)"; \
-	  cp -p "harness/$$f" "$(AGENTDIR)/$$f"; \
-	  chmod +x "$(AGENTDIR)/$$f"; \
-	  echo "  deployed $$f"; \
-	done
-	@echo "installed into $(AGENTDIR)"
+	@echo "$@: skills, agents and harness files come from the deployed release; run make deploy REF=<sha>" >&2; exit 1
 
 ## TEST_STATE_HOME: the shell prefix that gives a test run its own state.
 ##
@@ -1025,7 +1017,11 @@ qlot-lock:
 ##   in one rename; the release it replaces becomes previous. After the flip,
 ##   $(BINDIR)/dsmr-bus-watch and dsmr-bus-host are links through
 ##   $(DSMR_HOME)/current/bin, so the paths agents and the bus service use never
-##   change. A failure at any stage leaves current and
+##   change, and the release's skills, agent definitions and harness files are
+##   copied into $(SKILLDIR), $(SUBAGENTDIR) and $(AGENTDIR). A deployed file
+##   edited in place since the last deploy stops the deploy before the flip
+##   unless FORCE=1. The verify requires serverInfo.version to carry the commit
+##   being deployed. A failure at any stage before the flip leaves current and
 ##   previous as they were. Refuses, before it creates anything under
 ##   DSMR_HOME, a working tree with uncommitted tracked changes and a REF that
 ##   is on no origin branch (ALLOW_UNPUBLISHED=1 overrides the second). One
@@ -1035,19 +1031,21 @@ qlot-lock:
 ##   make deploy REF=HEAD DSMR_HOME=$(mktemp -d) ALLOW_UNPUBLISHED=1 HOST_LINKS=0
 deploy:
 	@REPO="$(CURDIR)" REF="$(REF)" DSMR_HOME="$(DSMR_HOME)" QLOT="$(QLOT)" QLOT_COMMIT="$(QLOT_COMMIT)" SBCL="$(SBCL)" \
-	   ALLOW_UNPUBLISHED="$(ALLOW_UNPUBLISHED)" HOST_LINKS="$(HOST_LINKS)" \
+	   ALLOW_UNPUBLISHED="$(ALLOW_UNPUBLISHED)" HOST_LINKS="$(HOST_LINKS)" FORCE="$(FORCE)" \
 	   BINDIR="$(BINDIR)" SKILLDIR="$(SKILLDIR)" AGENTDIR="$(AGENTDIR)" SUBAGENTDIR="$(SUBAGENTDIR)" \
 	   scripts/deploy.sh deploy
 
 ## rollback: make the previous release current again.
 ##
 ##   Swaps $(DSMR_HOME)/current and previous with two renames and prints the
-##   commit now current, then repairs a missing bus binary link in $(BINDIR).
+##   commit now current, then repairs a missing bus binary link in $(BINDIR)
+##   and copies the restored release's skills, agent definitions and harness
+##   files, behind the same in-place-edit check as deploy.
 ##   Builds nothing and runs no git, qlot, sbcl or make. Running servers and
 ##   the running bus service keep their release until they restart. The same
 ##   scratch-home rule as deploy applies.
 rollback:
-	@DSMR_HOME="$(DSMR_HOME)" HOST_LINKS="$(HOST_LINKS)" \
+	@DSMR_HOME="$(DSMR_HOME)" HOST_LINKS="$(HOST_LINKS)" FORCE="$(FORCE)" \
 	   BINDIR="$(BINDIR)" SKILLDIR="$(SKILLDIR)" AGENTDIR="$(AGENTDIR)" SUBAGENTDIR="$(SUBAGENTDIR)" \
 	   scripts/deploy.sh rollback
 

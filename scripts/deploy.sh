@@ -21,7 +21,9 @@
 #   DEPLOY_WORKER_TIMEOUT  seconds verify-worker waits for the worker's
 #              handshake; default 30
 #   HOST_LINKS 0 skips every step that writes outside the home: the bus binary
-#              links in BINDIR
+#              links in BINDIR and the copies into SKILLDIR, AGENTDIR and
+#              SUBAGENTDIR
+#   FORCE      1 replaces deployed files that were edited in place
 #   BINDIR     where the bus binary links go; default $HOME/.local/bin
 #   SKILLDIR, AGENTDIR, SUBAGENTDIR  the host's skill, agent configuration and
 #              agent definition directories; defaults $HOME/.claude/skills,
@@ -45,15 +47,22 @@
 #   build-bus     <release>/bin/dsmr-bus-watch and dsmr-bus-host, built by the
 #                 release's own Makefile against the release's bundle
 #   manifest      <release>/MANIFEST, written once the build succeeded
-#   verify-initialize  the release's own launcher answers initialize and tools/list
+#   verify-initialize  the release's own launcher answers initialize and
+#                 tools/list, and serverInfo.version carries the full commit
 #   verify-worker the worker core passes scripts/verify-core-worker.lisp from the
 #                 inside, then boots as the pool boots a worker and prints a
 #                 handshake, kept as <release>/verify-worker.json
 #   verify-bus    each bus binary answers --help with exit 0 and some output
+#   check-copies  no destination of a copy below was edited in place since the
+#                 last deploy (see check_copies); FORCE=1 overrides. Skipped
+#                 when HOST_LINKS=0
 #   flip          <home>/current names the release, by one rename
 #   links         $BINDIR/dsmr-bus-watch and dsmr-bus-host become links to
 #                 <home>/current/bin/<name>; a regular file there is kept as
 #                 <name>.pre-release-<UTC stamp> first. Skipped when HOST_LINKS=0
+#   copies        the release's skills, agent definitions and harness files are
+#                 copied, never linked, into SKILLDIR, SUBAGENTDIR and AGENTDIR.
+#                 Skipped when HOST_LINKS=0
 #
 # A failure in any stage before the flip prints `deploy: <stage> failed: ...;
 # current is unchanged` and exits 1. A failure after it names the release now
@@ -65,8 +74,9 @@
 # that stopped and is removed. A failed verify removes the MANIFEST and leaves
 # current and previous untouched. A verified release is made read-only.
 #
-# rollback swaps current and previous with two renames, then runs the links
-# stage. It runs no git, qlot, sbcl or make.
+# rollback runs check-copies with the release it leaves as the base, swaps
+# current and previous with two renames, then runs the links and copies
+# stages. It runs no git, qlot, sbcl or make.
 set -euo pipefail
 
 # shellcheck source=release-paths.sh
@@ -79,8 +89,11 @@ FAIL_NOTE=""
 # The bus binaries a release builds and the host reaches through links.
 BUS_BINARIES="dsmr-bus-watch dsmr-bus-host"
 
+# The word say() starts each line with; rollback sets it to rollback.
+LOG_PREFIX=deploy
+
 die() { printf 'deploy: %s\n' "$*" >&2; exit 1; }
-say() { printf 'deploy: %s\n' "$*" >&2; }
+say() { printf '%s: %s\n' "$LOG_PREFIX" "$*" >&2; }
 
 # fail <stage> <reason>
 # Exit 1 naming the stage that failed.
@@ -249,6 +262,93 @@ link_bus_binaries() {
   say "links: a running dsmr-bus-host keeps its image until systemctl --user restart dsmr-bus-host, which is a deliberate act; a running watcher keeps its image until it is re-armed"
 }
 
+# copy_plan <release>
+# Print one line per file the copies stage deploys from <release>, as
+# <path in release> TAB <destination> TAB <mode>, where mode x marks the copy
+# executable and p keeps the source's executable bit. The selection matches the
+# Makefile's check targets: files at depth two or more under skills/, outside
+# __pycache__, into SKILLDIR; agents/*.md except README.md into SUBAGENTDIR;
+# every file under harness/ into AGENTDIR.
+copy_plan() {
+  local rel="$1" f
+  if [ -d "$rel/skills" ]; then
+    (cd "$rel/skills" && find . -mindepth 2 -type f ! -path '*__pycache__*' | sed 's|^\./||' | sort) \
+      | while IFS= read -r f; do printf 'skills/%s\t%s/%s\tp\n' "$f" "$SKILLDIR" "$f"; done
+  fi
+  if [ -d "$rel/agents" ]; then
+    (cd "$rel/agents" && find . -maxdepth 1 -type f -name '*.md' ! -name README.md | sed 's|^\./||' | sort) \
+      | while IFS= read -r f; do printf 'agents/%s\t%s/%s\tp\n' "$f" "$SUBAGENTDIR" "$f"; done
+  fi
+  if [ -d "$rel/harness" ]; then
+    (cd "$rel/harness" && find . -type f | sed 's|^\./||' | sort) \
+      | while IFS= read -r f; do printf 'harness/%s\t%s/%s\tx\n' "$f" "$AGENTDIR" "$f"; done
+  fi
+}
+
+# check_copies <new release> <base release or empty>
+# Return 0 when every destination in copy_plan <new release> is absent, equal
+# to the new release's copy, or equal to the base release's copy: the base is
+# the release current named before this change, so a destination equal to it
+# is the one the last deploy wrote. Any other destination was edited in place
+# and is listed on stderr. With no base, any destination that differs from the
+# new copy counts as edited. FORCE=1 lists them and returns 0. Otherwise set
+# COPY_PROBLEM and return 1. Skipped when HOST_LINKS=0.
+COPY_PROBLEM=""
+check_copies() {
+  local new="$1" base="$2" src dest mode edited=0
+  if [ "${HOST_LINKS:-}" = "0" ]; then
+    say "check-copies: skipped (HOST_LINKS=0)"
+    return 0
+  fi
+  while IFS=$'\t' read -r src dest mode; do
+    [ -e "$dest" ] || [ -L "$dest" ] || continue
+    cmp -s "$new/$src" "$dest" && continue
+    if [ -n "$base" ] && [ -f "$base/$src" ] && cmp -s "$base/$src" "$dest"; then
+      continue
+    fi
+    say "copies: $dest was edited in place since the last deploy; port the edit into the tree, or pass FORCE=1 to replace it"
+    edited=$((edited + 1))
+  done < <(copy_plan "$new")
+  [ "$edited" -eq 0 ] && return 0
+  if [ "${FORCE:-}" = "1" ]; then
+    say "check-copies: FORCE=1: replacing $edited file(s) edited in place"
+    return 0
+  fi
+  COPY_PROBLEM="$edited deployed file(s) listed above were edited in place since the last deploy; port each edit into the tree, or pass FORCE=1 to replace them"
+  return 1
+}
+
+# copy_files <release>
+# Copy each file in copy_plan <release> to a temporary name beside its
+# destination and rename it into place, mode 0755 when marked x or executable
+# in the release, else 0644. A destination already equal to the release's copy
+# is left alone. Never makes a link. Skipped when HOST_LINKS=0. Return 1 with
+# COPY_PROBLEM set on a failure.
+copy_files() {
+  local rel="$1" src dest mode dir tmp perm copied=0 same=0
+  if [ "${HOST_LINKS:-}" = "0" ]; then
+    say "copies: skipped (HOST_LINKS=0)"
+    return 0
+  fi
+  while IFS=$'\t' read -r src dest mode; do
+    if [ -f "$dest" ] && [ ! -L "$dest" ] && cmp -s "$rel/$src" "$dest"; then
+      same=$((same + 1))
+      continue
+    fi
+    dir="$(dirname "$dest")"
+    tmp="$dir/.$(basename "$dest").copy.$$"
+    perm=0644
+    if [ "$mode" = x ] || [ -x "$rel/$src" ]; then perm=0755; fi
+    if ! { mkdir -p "$dir" && cp "$rel/$src" "$tmp" && chmod "$perm" "$tmp" && mv -Tf "$tmp" "$dest"; }; then
+      rm -f "$tmp"
+      COPY_PROBLEM="cannot copy $rel/$src to $dest"
+      return 1
+    fi
+    copied=$((copied + 1))
+  done < <(copy_plan "$rel")
+  say "copies: $copied copied, $same already equal, into $SKILLDIR, $SUBAGENTDIR and $AGENTDIR"
+}
+
 deploy() {
   local repo="${REPO:-}" ref="${REF:-}" qlot="${QLOT:-}" sbcl="${SBCL:-sbcl}"
   [ -n "$ref" ] || die "REF is empty; run make deploy REF=<sha>"
@@ -408,7 +508,7 @@ deploy() {
 
   local vscratch
   vscratch="$(mktemp -d "${TMPDIR:-/tmp}/dsmr-deploy-verify.XXXXXX")"
-  if ! verify_initialize "$rel" "$sbcl" "$vscratch"; then
+  if ! verify_initialize "$rel" "$sbcl" "$vscratch" "$sha"; then
     chmod -R u+w "$rel"
     rm -f "$rel/MANIFEST"
     fail verify-initialize "$VERIFY_PROBLEM (output kept in $vscratch)"
@@ -432,7 +532,12 @@ deploy() {
   rm -rf "$vscratch"
   chmod -R a-w "$rel"
 
-  local current="$home/current"
+  local current="$home/current" base=""
+  if [ -L "$current" ]; then
+    base="$home/$(readlink "$current")"
+  fi
+  check_copies "$rel" "$base" || fail check-copies "$COPY_PROBLEM"
+
   if [ -L "$current" ]; then
     local old
     old="$(readlink "$current")"
@@ -448,6 +553,7 @@ deploy() {
   FAIL_NOTE="; current is releases/$sha; fix the cause and run make deploy REF=$sha again to finish the host steps"
 
   link_bus_binaries "$home" || fail links "$LINK_PROBLEM"
+  copy_files "$rel" || fail copies "$COPY_PROBLEM"
 }
 
 # manifest_commit <release dir>
@@ -460,10 +566,13 @@ manifest_commit() {
 rdie() { printf 'rollback: %s\n' "$*" >&2; exit 1; }
 
 # rollback
-# Swap current and previous with two renames, then repair the bus binary links.
-# Runs no git, qlot, sbcl or make.
+# Check the copies against the release being left, swap current and previous
+# with two renames, then repair the bus binary links and copy the restored
+# release's skills, agent definitions and harness files. Runs no git, qlot, sbcl
+# or make.
 rollback() {
   local home cur prev
+  LOG_PREFIX=rollback
   home="$(dsmr_home)" || exit 1
   local problem
   if ! problem="$(host_problem "$home")"; then
@@ -480,6 +589,8 @@ rollback() {
   cur="$(readlink "$home/current")"
   [ -f "$home/$prev/MANIFEST" ] \
     || rdie "$home/$prev has no MANIFEST; it is not a complete release, so deploy a known commit instead"
+  check_copies "$home/$prev" "$home/$cur" \
+    || rdie "check-copies failed: $COPY_PROBLEM; current is unchanged"
 
   ln -sfn "$prev" "$home/current.new"
   ln -sfn "$cur" "$home/previous.new"
@@ -487,19 +598,21 @@ rollback() {
   mv -Tf "$home/previous.new" "$home/previous"
   printf 'current -> %s (commit %s)\n' "$prev" "$(manifest_commit "$home/$prev")"
   link_bus_binaries "$home" \
-    || rdie "links failed: $LINK_PROBLEM; current is $prev; run make rollback again only after fixing it, since a second rollback swaps back"
+    || rdie "links failed: $LINK_PROBLEM; current is $prev; fix the cause and run make deploy REF=$(manifest_commit "$home/$prev") to finish the host steps, since a second rollback swaps back"
+  copy_files "$home/$prev" \
+    || rdie "copies failed: $COPY_PROBLEM; current is $prev; fix the cause and run make deploy REF=$(manifest_commit "$home/$prev") to finish the host steps, since a second rollback swaps back"
 }
 
-# verify_initialize <release> <sbcl> <scratch>
+# verify_initialize <release> <sbcl> <scratch> <commit>
 # Run the release's own launcher with a scrubbed environment and feed it an
 # initialize, the initialized notification and tools/list. Return 0 when the
-# launcher exits 0, id 1 names the server dsmr-mcp and id 2 lists at least one
-# tool. Otherwise set VERIFY_PROBLEM and return 1. stdout is kept in
+# launcher exits 0, id 1 names the server dsmr-mcp with a serverInfo.version
+# that contains <commit>, and id 2 lists at least one tool. Otherwise set VERIFY_PROBLEM and return 1. stdout is kept in
 # <scratch>/verify-initialize.jsonl, stderr in <scratch>/verify-initialize.log;
 # the release is not written, because it is read-only once verified.
 VERIFY_PROBLEM=""
 verify_initialize() {
-  local rel="$1" sbcl="$2" scratch="$3" status t0
+  local rel="$1" sbcl="$2" scratch="$3" commit="$4" status t0
   local out="$scratch/verify-initialize.jsonl" err="$scratch/verify-initialize.log"
   t0=$SECONDS
   say "verify-initialize: $rel/bin/dsmr-mcp-launch"
@@ -525,6 +638,12 @@ verify_initialize() {
   if ! jq -s -e 'any(.[]; .id == 1 and .result.serverInfo.name == "dsmr-mcp")' \
          "$out" >/dev/null 2>&1; then
     VERIFY_PROBLEM="no initialize reply naming dsmr-mcp in $out"
+    return 1
+  fi
+  if ! jq -s -e --arg commit "$commit" \
+         'any(.[]; .id == 1 and ((.result.serverInfo.version // "") | type == "string" and contains($commit)))' \
+         "$out" >/dev/null 2>&1; then
+    VERIFY_PROBLEM="serverInfo.version in $out does not carry $commit, so the launcher is not running this release"
     return 1
   fi
   if ! jq -s -e 'any(.[]; .id == 2 and ((.result.tools // []) | length) > 0)' \

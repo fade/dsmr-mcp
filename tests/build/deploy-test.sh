@@ -8,7 +8,9 @@
 # The stub SBCL answers the verify stage by replaying
 # tests/build/fixtures/release-initialize.jsonl, an initialize and tools/list
 # exchange recorded from a real release (provenance in
-# release-initialize.txt). Started with the worker entry, it prints
+# release-initialize.txt), with one change to the recorded bytes: the commit
+# in the first line's serverInfo.version becomes the commit of the release it
+# was booted from. Stub mode stale-version replays the recording unchanged. Started with the worker entry, it prints
 # tests/build/fixtures/worker-handshake.json, a handshake recorded from a real
 # release worker core (provenance in worker-handshake.txt), and waits for
 # SIGTERM. Its behaviour is set per case through the file $WORK/stub-mode,
@@ -58,6 +60,10 @@ lacks() { ! has "$1" "$2"; }
 
 if [ ! -s "$FIXTURE" ]; then
     echo "deploy-test: missing recorded fixture $FIXTURE; record it with a scratch make deploy (see release-initialize.txt)" >&2
+    exit 2
+fi
+if ! head -n 1 "$FIXTURE" | jq -e '.id == 1 and (.result.serverInfo.version | test("\\+[0-9a-f]{40}$"))' >/dev/null; then
+    echo "deploy-test: the first line of $FIXTURE is not the id 1 reply with a 0.1.0+<commit> version; re-record it (see release-initialize.txt)" >&2
     exit 2
 fi
 if [ ! -s "$HANDSHAKE" ]; then
@@ -132,11 +138,19 @@ case "\$*" in
       while :; do sleep 0.1; done ;;
   *--core*)
       cat > /dev/null
+      sha=\$(printf '%s\n' "\$*" | sed -n 's|.*releases/\([0-9a-f]\{40\}\)/core/.*|\1|p')
+      # The single change to the recorded bytes: the commit in id 1's
+      # serverInfo.version becomes the commit of the release booted.
+      replay() {
+        head -n 1 "$FIXTURE" | jq -c --arg sha "\$sha" '.result.serverInfo.version |= sub("[0-9a-f]{40}\$"; \$sha)'
+        tail -n +2 "$FIXTURE"
+      }
       case "\$(cat "$WORK/stub-mode")" in
-        crash)      exit 3 ;;
-        silent)     exit 0 ;;
-        wrong-name) sed 's/"dsmr-mcp"/"other-server"/' "$FIXTURE" ;;
-        *)          cat "$FIXTURE" ;;
+        crash)         exit 3 ;;
+        silent)        exit 0 ;;
+        wrong-name)    replay | sed 's/"dsmr-mcp"/"other-server"/' ;;
+        stale-version) cat "$FIXTURE" ;;
+        *)             replay ;;
       esac
       exit 0 ;;
   *build-core.lisp*)
@@ -169,12 +183,24 @@ git -C "$REPO" config commit.gpgsign false
 git -C "$REPO" checkout -q -b main 2>/dev/null || true
 mkdir -p "$REPO/scripts"
 cp "$REPO_ROOT/qlfile" "$REPO_ROOT/qlfile.lock" "$REPO/"
+# Files the copies stage selects (5) and files it must leave out.
+mkdir -p "$REPO/skills/alpha/scripts" "$REPO/skills/alpha/__pycache__" "$REPO/agents" \
+         "$REPO/harness/mods/m"
+echo "skills index" > "$REPO/skills/README.md"
+printf '#!/bin/sh\necho run\n' > "$REPO/skills/alpha/scripts/run.sh"
+chmod +x "$REPO/skills/alpha/scripts/run.sh"
+echo "cache" > "$REPO/skills/alpha/__pycache__/x.pyc"
+echo "agents index" > "$REPO/agents/README.md"
+echo "helper agent" > "$REPO/agents/helper.md"
+echo "status line" > "$REPO/harness/statusline.sh"
+echo "hook" > "$REPO/harness/mods/m/hook.ts"
 cp "$REPO_ROOT/scripts/release-launch.sh" "$REPO_ROOT/scripts/release-paths.sh" "$REPO/scripts/"
 echo ';; placeholder' > "$REPO/scripts/build-core.lisp"
 
 # commit_to <tag> <push|local>: add a commit; print its sha.
 commit_to() {
     echo "$1" > "$REPO/marker"
+    echo "skill $1" > "$REPO/skills/alpha/SKILL.md"
     git -C "$REPO" add -A
     git -C "$REPO" commit -q -m "$1"
     if [ "$2" = push ]; then git -C "$REPO" push -q origin main 2>/dev/null; fi
@@ -224,6 +250,8 @@ try "bus binaries are built against the release bundle" "$(tail -n 1 "$WORK/make
     grep -q "BUS_DEPS_SETUP=$H/releases/$C1/deps/setup.lisp" "$WORK/make.log"
 try "deploy with HOST_LINKS=0 makes no link" "fakehome bin: $(ls "$WORK/fakehome/.local/bin" 2>&1)" \
     test ! -e "$WORK/fakehome/.local/bin"
+try "deploy with HOST_LINKS=0 copies nothing" "fakehome .claude: $(ls -R "$WORK/fakehome/.claude" 2>&1)" \
+    test ! -e "$WORK/fakehome/.claude"
 rm -f "$REPO/untracked.txt"
 
 note "flip"
@@ -311,8 +339,8 @@ HV="$WORK/home-verify"
 deploy "$HV" "$C1"; deploy "$HV" "$C2"
 cur0=$(link "$HV/current"); prev0=$(link "$HV/previous")
 for case_ in wrong-name:verify-initialize crash:verify-initialize silent:verify-initialize \
-             no-handshake:verify-worker worker-rejected:verify-worker bus-help-fails:verify-bus \
-             bus-help-silent:verify-bus; do
+             stale-version:verify-initialize no-handshake:verify-worker worker-rejected:verify-worker \
+             bus-help-fails:verify-bus bus-help-silent:verify-bus; do
     mode=${case_%%:*} stage=${case_#*:}
     echo "$mode" > "$WORK/stub-mode"
     deploy "$HV" "$C3" DEPLOY_WORKER_TIMEOUT=3
@@ -322,6 +350,9 @@ for case_ in wrong-name:verify-initialize crash:verify-initialize silent:verify-
     try "$mode: current unchanged" "now $(link "$HV/current")" test "$(link "$HV/current")" = "$cur0"
     try "$mode: previous unchanged" "now $(link "$HV/previous")" test "$(link "$HV/previous")" = "$prev0"
     try "$mode: release has no MANIFEST" "MANIFEST present" test ! -e "$HV/releases/$C3/MANIFEST"
+    if [ "$mode" = stale-version ]; then
+        try "stale-version: the reason names the commit" "$OUT" has "$OUT" "does not carry $C3"
+    fi
 done
 echo ok > "$WORK/stub-mode"
 
@@ -437,6 +468,74 @@ try "after rollback the watcher resolves to the first release" "resolves to $(re
 try "rollback repairs a missing link" "link=$(link "$D/bin/dsmr-bus-host")" \
     test "$(link "$D/bin/dsmr-bus-host")" = "$HK/current/bin/dsmr-bus-host"
 try "rollback ran no make, git, qlot or sbcl" "$(cat "$WORK/guard.hit" 2>/dev/null)" test ! -e "$WORK/guard.hit"
+
+# ---- copies --------------------------------------------------------------
+
+note "copies"
+HC="$WORK/home-copies"
+D="$WORK/dest-copies"
+DESTS=(HOST_LINKS= BINDIR="$D/bin" SKILLDIR="$D/claude/skills" AGENTDIR="$D/claude" SUBAGENTDIR="$D/claude/agents")
+SKILL="$D/claude/skills/alpha/SKILL.md"
+deploy "$HC" "$C1" "${DESTS[@]}"
+try "deploy with scratch copy destinations succeeds" "rc=$RC: $OUT" test "$RC" -eq 0
+R1="$HC/releases/$C1"
+for pair in "skills/alpha/SKILL.md:$D/claude/skills/alpha/SKILL.md" \
+            "skills/alpha/scripts/run.sh:$D/claude/skills/alpha/scripts/run.sh" \
+            "agents/helper.md:$D/claude/agents/helper.md" \
+            "harness/statusline.sh:$D/claude/statusline.sh" \
+            "harness/mods/m/hook.ts:$D/claude/mods/m/hook.ts"; do
+    src=${pair%%:*} dst=${pair#*:}
+    try "$src is copied" "missing or different: $dst" cmp -s "$R1/$src" "$dst"
+    try "$src is a regular file, not a link" "$(ls -l "$dst" 2>&1)" test ! -L "$dst"
+    try "$src copy is writable" "$(ls -l "$dst" 2>&1)" test -w "$dst"
+done
+copied=$(find "$D/claude" -type f | wc -l)
+try "exactly the five selected files are copied" "found $copied: $(find "$D/claude" -type f)" test "$copied" -eq 5
+try "skills/README.md is not copied" "found" test ! -e "$D/claude/skills/README.md"
+try "agents/README.md is not copied" "found" test ! -e "$D/claude/agents/README.md"
+try "__pycache__ is not copied" "found" test ! -e "$D/claude/skills/alpha/__pycache__"
+try "harness files are executable" "$(ls -l "$D/claude/mods/m/hook.ts")" test -x "$D/claude/mods/m/hook.ts"
+try "an executable skill file stays executable" "$(ls -l "$D/claude/skills/alpha/scripts/run.sh")" \
+    test -x "$D/claude/skills/alpha/scripts/run.sh"
+try "a skill document is not executable" "$(ls -l "$SKILL")" test ! -x "$SKILL"
+
+deploy "$HC" "$C2" "${DESTS[@]}"
+try "a destination equal to the base copy is replaced" "rc=$RC: $(cat "$SKILL")" grep -qx 'skill two' "$SKILL"
+
+echo "local fix" >> "$SKILL"
+cur0=$(link "$HC/current")
+deploy "$HC" "$C3" "${DESTS[@]}"
+try "an in-place edit stops the deploy" "rc=$RC" test "$RC" -eq 1
+try "the stop names check-copies" "$OUT" has "$OUT" "deploy: check-copies failed:"
+try "the edited file is listed" "$OUT" has "$OUT" "copies: $SKILL was edited in place since the last deploy; port the edit into the tree, or pass FORCE=1 to replace it"
+try "current is unchanged by the stop" "current=$(link "$HC/current")" test "$(link "$HC/current")" = "$cur0"
+try "the edit survives the stop" "$(cat "$SKILL")" grep -qx 'local fix' "$SKILL"
+deploy "$HC" "$C3" "${DESTS[@]}" FORCE=1
+try "FORCE=1 deploys over the edit" "rc=$RC: $OUT" test "$RC" -eq 0
+try "FORCE=1 says it replaced the edit" "$OUT" has "$OUT" "FORCE=1: replacing 1 file(s) edited in place"
+try "FORCE=1 replaced the edited file" "$(cat "$SKILL")" grep -qx 'skill three' "$SKILL"
+
+rm -f "$WORK/guard.hit"
+rollback "$HC" "${DESTS[@]}"
+try "rollback with copies succeeds" "rc=$RC: $OUT" test "$RC" -eq 0
+try "rollback restores the previous release's copy" "$(cat "$SKILL")" grep -qx 'skill two' "$SKILL"
+try "rollback ran no make, git, qlot or sbcl" "$(cat "$WORK/guard.hit" 2>/dev/null)" test ! -e "$WORK/guard.hit"
+echo "fix after rollback" >> "$SKILL"
+cur0=$(link "$HC/current")
+rollback "$HC" "${DESTS[@]}"
+try "rollback stops on an in-place edit" "rc=$RC: $OUT" test "$RC" -eq 1
+try "rollback lists the edited file" "$OUT" has "$OUT" "rollback: copies: $SKILL was edited in place"
+try "rollback stop leaves current" "current=$(link "$HC/current")" test "$(link "$HC/current")" = "$cur0"
+try "rollback stop keeps the edit" "$(cat "$SKILL")" grep -qx 'fix after rollback' "$SKILL"
+
+HF="$WORK/home-copies-first"
+D="$WORK/dest-first"
+mkdir -p "$D/claude/agents"
+echo "someone else's helper" > "$D/claude/agents/helper.md"
+deploy "$HF" "$C1" HOST_LINKS= BINDIR="$D/bin" SKILLDIR="$D/claude/skills" AGENTDIR="$D/claude" SUBAGENTDIR="$D/claude/agents"
+try "with no base release, a differing destination stops the deploy" "rc=$RC: $OUT" test "$RC" -eq 1
+try "the first deploy lists it" "$OUT" has "$OUT" "copies: $D/claude/agents/helper.md was edited in place"
+try "the first deploy flips nothing" "current=$(link "$HF/current")" test ! -e "$HF/current"
 
 printf '\ndeploy-test: %s passed, %s failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

@@ -3,16 +3,23 @@ release-initialize.jsonl: provenance
 What it is: the stdout of a real release's launcher given an initialize, the
 initialized notification and tools/list, byte for byte as the deploy verify
 stage kept it (<release>/verify-initialize.jsonl). The stub SBCL in
-tests/build/deploy-test.sh replays it when booted with --core.
+tests/build/deploy-test.sh replays it when booted with --core, with one change:
+the commit in the first line's serverInfo.version becomes the commit of the
+release under test. The recorded version is
+0.1.0+484ab3846bffd586c438f6047a394e552d201fc7.
 
-Recorded: 2026-11-21 (UTC), host ghost, commit 6d38e0b8e350eb081f8fb6654d28b64ff7885b67
+Recorded: 2026-11-21 (UTC), host ghost, commit 484ab3846bffd586c438f6047a394e552d201fc7
 SBCL: SBCL 2.6.10 (sbcl --version)
 Command: make deploy REF=HEAD DSMR_HOME=<scratch dir>/home ALLOW_UNPUBLISHED=1
+         BINDIR=<scratch dir>/dest/bin SKILLDIR=<scratch dir>/dest/claude/skills
+         AGENTDIR=<scratch dir>/dest/claude SUBAGENTDIR=<scratch dir>/dest/claude/agents
          (from a clean checkout of that commit; then
-         cp <scratch dir>/home/releases/<sha>/verify-initialize.jsonl
+         install -m 0644 <scratch dir>/home/releases/<sha>/verify-initialize.jsonl
          tests/build/fixtures/release-initialize.jsonl)
 
 Re-record it whenever the server's initialize or tools/list reply changes shape.
+The first line must stay the id 1 reply; deploy-test.sh refuses to run otherwise.
 Only the success state is recorded: the failure cases in deploy-test.sh derive
-from it (a renamed server, no output, a crash exit) rather than from a capture,
-and test the deploy script's reading of that reply, not the server's output.
+from it (a renamed server, no output, a crash exit, the recorded commit left in
+place) rather than from a capture, and test the deploy script's reading of that
+reply, not the server's output.
