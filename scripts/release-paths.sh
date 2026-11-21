@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # scripts/release-paths.sh: path helpers for the deploy home and its state
-# directory. Sourced, never executed. Every function reports a refusal on
-# stderr and returns 1; none creates anything.
+# directory, and the checks a release must pass before it boots. Sourced, never
+# executed. dsmr_home and dsmr_state_dir report a refusal on stderr and return
+# 1; release_problem prints its reason on stdout. None creates anything.
 
 # dsmr_home
 # Print the deploy home: DSMR_HOME when set and not empty, else
@@ -62,4 +63,76 @@ physical_dir() {
 # Return 0 when DIR is inside a git work tree.
 inside_work_tree() {
   [ "$(git -C "$1" rev-parse --is-inside-work-tree 2>/dev/null)" = "true" ]
+}
+
+# manifest_sbcl_version MANIFEST
+# Print the sbcl-version a core manifest records, or nothing.
+manifest_sbcl_version() {
+  awk '/^sbcl-version /{ $1=""; sub(/^ /,""); print; exit }' "$1" 2>/dev/null
+}
+
+# running_sbcl_version
+# Print the version "${SBCL:-sbcl}" --version reports, or nothing.
+running_sbcl_version() {
+  "${SBCL:-sbcl}" --version 2>/dev/null | awk '{print $2; exit}'
+}
+
+# foreign_owned PATH
+# Return 0 when PATH exists and is not owned by the running user.
+foreign_owned() {
+  [ -e "$1" ] && [ ! -O "$1" ]
+}
+
+# others_can_write PATH
+# Return 0 when PATH exists and is group or world writable.
+others_can_write() {
+  [ -e "$1" ] && [ -n "$(find "$1" -maxdepth 0 -perm /022 2>/dev/null)" ]
+}
+
+# release_problem ROOT
+# Check the release at ROOT before anything boots from it. Print
+# `<reason>; <remedy>` for the first problem found and return 1, or print
+# nothing and return 0. Checks in order: ownership of the root, the server core
+# and bin/dsmr-mcp-launch; group or world write on the root and the core; the
+# core, its manifest and MANIFEST present; the core's sbcl-version equal to the
+# running SBCL's; a boot of the core that exits 0, with stdin and stdout closed
+# and DSMR_BOOT_PROBE_TIMEOUT seconds (default 30) to do it.
+release_problem() {
+  local root="$1" core="$1/core/dsmr.core" path recorded current status
+  for path in "$root" "$core" "$root/bin/dsmr-mcp-launch"; do
+    if foreign_owned "$path"; then
+      printf '%s is not owned by %s; restore ownership and permissions of %s\n' \
+             "$path" "$(id -un)" "$path"
+      return 1
+    fi
+  done
+  for path in "$root" "$core"; do
+    if others_can_write "$path"; then
+      printf '%s is group or world writable; restore ownership and permissions of %s\n' \
+             "$path" "$path"
+      return 1
+    fi
+  done
+  for path in "$core" "$core.manifest" "$root/MANIFEST"; do
+    if [ ! -f "$path" ]; then
+      printf 'no %s; run make deploy REF=<sha>\n' "$path"
+      return 1
+    fi
+  done
+  recorded="$(manifest_sbcl_version "$core.manifest")"
+  current="$(running_sbcl_version)"
+  if [ -z "$recorded" ] || [ "$recorded" != "$current" ]; then
+    printf '%s was built by SBCL %s, running SBCL is %s; run make deploy REF=<sha> with this SBCL\n' \
+           "$core" "${recorded:-unknown}" "${current:-unknown}"
+    return 1
+  fi
+  timeout "${DSMR_BOOT_PROBE_TIMEOUT:-30}" "${SBCL:-sbcl}" --core "$core" \
+          --noinform --non-interactive --no-sysinit --no-userinit \
+          --eval '(sb-ext:exit)' <&- >&- 2>/dev/null
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    printf '%s does not boot (probe exited %s); run make deploy REF=<sha>\n' "$core" "$status"
+    return 1
+  fi
+  return 0
 }

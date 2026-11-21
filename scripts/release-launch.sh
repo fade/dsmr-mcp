@@ -6,47 +6,70 @@
 # bin/dsmr-mcp-launch.
 #
 # Boots the release's own server core, <root>/core/dsmr.core, where <root> is
-# the release directory above this script's invoked path. It builds nothing,
-# loads no source, and reads nothing from a development checkout.
+# the physical directory above the directory of this script's invoked path. The
+# root is resolved again before every boot, so a relaunch follows a moved
+# `current`. It builds nothing, runs no build tool, loads no source and derives
+# nothing from a development checkout.
 #
-# Exit codes:
-#   78  refused: the release has no core or no MANIFEST. One line on stderr
-#       names the reason and `make deploy`.
-#   75  the server asks for a relaunch; the launcher boots again. The release
-#       root is resolved again first, so a relaunch follows a moved `current`.
-#   any other status is the server's own and ends the launcher with it.
+# Before each boot it refuses, with exit 78 and one line on stderr naming the
+# reason and the remedy, when:
+#   - HOME is unset or empty;
+#   - the launcher's physical path or the release root is inside a git work
+#     tree;
+#   - the root, the core or the launcher is not owned by the running user, or
+#     the root or the core is group or world writable;
+#   - the core, its manifest or MANIFEST is missing;
+#   - the core manifest's sbcl-version is not the running SBCL's;
+#   - the core does not boot.
+# The release checks are release_problem in <root>/scripts/release-paths.sh,
+# which preflight shares.
 #
-# DSMR_RELEASE_ROOT and DSMR_BROKER_CORE are always set from the release, never
-# taken from the caller. DSMR_WORKER_CORE is set to the release's worker core,
-# <root>/core/dsmr.core.worker, only when that core and its manifest exist and
-# the manifest's sbcl-version is the running SBCL's; otherwise it is unset and
-# hermetic workers refuse to spawn. DSMR_ALLOW_SOURCE_WORKERS is always unset,
-# so a release never loads a worker from source. stdout carries only
-# JSON-RPC; every diagnostic goes to stderr and to
+# Exports, always from the release and never from the caller:
+#   DSMR_RELEASE_ROOT   the release root
+#   DSMR_BROKER_CORE    the server core
+#   DSMR_LAUNCHER_PATH  this launcher's physical path
+#   DSMR_WORKER_CORE    <root>/core/dsmr.core.worker when it and its manifest
+#                       exist and the running SBCL built it; unset otherwise,
+#                       and hermetic workers then refuse to spawn
+# DSMR_ALLOW_SOURCE_WORKERS is always unset.
+#
+# Exit codes: 78 refused; 75 from the server asks for a relaunch; any other
+# status is the server's own and ends the launcher with it.
+#
+# stdout carries only JSON-RPC. Every diagnostic goes to stderr and to
 # ${XDG_STATE_HOME:-$HOME/.local/state}/dsmr-mcp/launcher.log.
 set -u
 
 SBCL="${SBCL:-sbcl}"
+export SBCL
 INVOKED="$0"
 
 # Exit code for a refused start.
 REFUSE_EXIT_CODE=78
 
-LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dsmr-mcp"
-LOG_FILE="$LOG_DIR/launcher.log"
-mkdir -p "$LOG_DIR" 2>/dev/null || true
+LOG_FILE=""
+if [ -n "${XDG_STATE_HOME:-}" ] || [ -n "${HOME:-}" ]; then
+  LOG_DIR="${XDG_STATE_HOME:-${HOME:-}/.local/state}/dsmr-mcp"
+  mkdir -p "$LOG_DIR" 2>/dev/null && LOG_FILE="$LOG_DIR/launcher.log"
+fi
 
 log() {
   local line
   line="$(date -Is) [dsmr-launch] $*"
   printf '%s\n' "$line" >&2
-  printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null || true
+  if [ -n "$LOG_FILE" ]; then printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null || true; fi
+}
+
+# refuse REASON
+# Log `cannot start: REASON` and return 78.
+refuse() {
+  log "cannot start: $*"
+  return "$REFUSE_EXIT_CODE"
 }
 
 # release_root
 # Print the physical path of the directory above the directory holding the
-# invoked script. Resolved on every call, never cached, so a relaunch after a
-# flip of `current` boots the release `current` names at that moment.
+# invoked script. Resolved on every call, never cached.
 release_root() {
   local bindir
   bindir="$(cd -P "$(dirname "$INVOKED")" 2>/dev/null && pwd -P)" || return 1
@@ -58,26 +81,24 @@ release_root() {
 # else, so it cannot collide with an ordinary error exit. Override for testing.
 RESTART_EXIT_CODE="${DSMR_RESTART_EXIT_CODE:-75}"
 
-# Launch the server as a SUBPROCESS (no `exec`) so the shell survives to inspect
-# the exit status and decide whether to relaunch.
+# The server runs as a subprocess, not by `exec`, so the shell survives to read
+# its exit status and relaunch.
 #
 # setsid puts the server in its own session with no controlling terminal. SBCL
 # opens /dev/tty when one exists, on a descriptor of its own that no stream
 # rebinding reaches, so a library writing to the terminal rather than to a
 # stream lands in the operator's session and overwrites whatever is there.
 # Redirecting stdout and stderr does not close that route; removing the
-# terminal does. `-w` waits for the server and returns its exit status, which
-# the relaunch loop below reads.
+# terminal does. `-w` waits for the server and returns its exit status.
 #
 # --non-interactive ends SBCL when the server returns, so no REPL prompt
 # reaches stdout after the client closes stdin.
 SETSID="$(command -v setsid || true)"
 
-# worker_core_withheld <root>
-# Print why the release's worker core must not be offered, and return 0; return
-# 1, printing nothing, when it may be. The core is offered only when it and its
-# manifest exist and the manifest's sbcl-version equals the version the running
-# SBCL reports, since SBCL refuses a core another build saved.
+# worker_core_withheld ROOT
+# Print why the release's worker core must not be offered and return 0, or
+# print nothing and return 1 when it may be. SBCL refuses a core another build
+# saved, so the manifest's sbcl-version must equal the running SBCL's.
 worker_core_withheld() {
   local wcore="$1/core/dsmr.core.worker" recorded current
   if [ ! -f "$wcore" ]; then
@@ -88,32 +109,56 @@ worker_core_withheld() {
     printf 'no manifest at %s.manifest' "$wcore"
     return 0
   fi
-  recorded="$(awk '/^sbcl-version /{ $1=""; sub(/^ /,""); print; exit }' "$wcore.manifest")"
-  current="$("$SBCL" --version 2>/dev/null | awk '{print $2}')"
+  recorded="$(manifest_sbcl_version "$wcore.manifest")"
+  current="$(running_sbcl_version)"
   if [ -z "$recorded" ] || [ "$recorded" != "$current" ]; then
     printf 'built by SBCL %s, running SBCL is %s' "${recorded:-unknown}" "${current:-unknown}"
     return 0
   fi
   return 1
 }
+
+# run_server
+# Check the release `current` names now, export its paths and boot its server
+# core. Return 78 on a refusal, else the server's exit status.
 run_server() {
-  local root
+  if [ -z "${HOME:-}" ]; then
+    refuse "HOME is unset or empty; start the server with HOME set"
+    return
+  fi
+  local root launcher path
   if ! root="$(release_root)"; then
-    log "cannot start: no release directory above $INVOKED; run 'make deploy REF=<sha>'"
-    return "$REFUSE_EXIT_CODE"
-  fi
-  local core="$root/core/dsmr.core"
-  if [ ! -f "$core" ]; then
-    log "cannot start: no core at $core; run 'make deploy REF=<sha>'"
-    return "$REFUSE_EXIT_CODE"
-  fi
-  if [ ! -f "$root/MANIFEST" ]; then
-    log "cannot start: no MANIFEST at $root/MANIFEST; run 'make deploy REF=<sha>'"
-    return "$REFUSE_EXIT_CODE"
+    refuse "no release directory above $INVOKED; run make deploy REF=<sha>"
+    return
   fi
 
+  # Checked before anything from the release is sourced, so code inside a
+  # checkout never runs.
+  launcher="$(readlink -f "$INVOKED")"
+  for path in "$(dirname "$launcher")" "$root"; do
+    if [ "$(git -C "$path" rev-parse --is-inside-work-tree 2>/dev/null)" = "true" ]; then
+      refuse "$path is inside a git work tree; a release is never run from a checkout; run make deploy REF=<sha> and make register"
+      return
+    fi
+  done
+
+  if [ ! -f "$root/scripts/release-paths.sh" ]; then
+    refuse "no $root/scripts/release-paths.sh; run make deploy REF=<sha>"
+    return
+  fi
+  # shellcheck source=release-paths.sh
+  . "$root/scripts/release-paths.sh"
+
+  local problem
+  if ! problem="$(release_problem "$root")"; then
+    refuse "$problem"
+    return
+  fi
+
+  local core="$root/core/dsmr.core"
   export DSMR_RELEASE_ROOT="$root"
   export DSMR_BROKER_CORE="$core"
+  export DSMR_LAUNCHER_PATH="$launcher"
   unset DSMR_ALLOW_SOURCE_WORKERS
   local reason
   if reason="$(worker_core_withheld "$root")"; then
@@ -123,15 +168,14 @@ run_server() {
     export DSMR_WORKER_CORE="$root/core/dsmr.core.worker"
   fi
 
-  log "booting release $root"
+  log "booting release $(awk '$1 == "commit" { print $2; exit }' "$root/MANIFEST") from $root"
   ${SETSID:+"$SETSID" -w} "$SBCL" --core "$core" --noinform --disable-debugger \
        --no-sysinit --no-userinit --non-interactive \
        --eval '(dsmr-mcp:run :transport :stdio)'
 }
 
-# Supervise loop: relaunch the server ONLY when it exits with the restart
-# sentinel; any other exit code is a real shutdown and exits the launcher with
-# that same code.
+# Supervise loop: relaunch the server only when it exits with the restart
+# sentinel; any other status ends the launcher with that status.
 while true; do
   run_server
   status=$?
