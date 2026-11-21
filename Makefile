@@ -25,7 +25,8 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 
 .PHONY: bridge bus-watch bus-host bus-sources bus-binaries install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
-        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path
+        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path \
+        test-worktree-sister
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -386,6 +387,14 @@ test-routing-probe:
 ##   the sessions that created it.
 test-memory-store-path:
 	@bash tests/scripts/memory-store-path-test.sh
+
+## test-worktree-sister: drive the worktree sister helper and its status report in scratch repositories.
+##
+##   git runs for real in scratch repositories under an isolated configuration.
+##   direnv, kitten and the bus watcher are stubs, and the fleet launcher runs
+##   only with --dry-run, so nothing reaches kitty, a session or a bus.
+test-worktree-sister:
+	@$(TEST_UNSET_DSMR) bash tests/scripts/worktree-sister-test.sh
 
 ## check-hooks: report where a deployed hook differs from this tree.
 ##
