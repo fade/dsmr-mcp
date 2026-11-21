@@ -38,3 +38,39 @@
  (:class qlot/source/asdf:source-asdf
   :initargs (:version "3.3.7.4")
   :version "3.3.7.4"))
+("log4cl" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/sharplispers/log4cl.git" :ref "fe3da517147d023029782ced7cd989ba24f1e62d")
+  :version "git-fe3da517147d023029782ced7cd989ba24f1e62d"))
+("usocket" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/usocket/usocket.git" :ref "d492f746d33fed32283143394c7ead1cce59ba37")
+  :version "git-d492f746d33fed32283143394c7ead1cce59ba37"))
+("cl-ppcre" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/edicl/cl-ppcre.git" :ref "a2ea581c23fdc184168423adbd4b4c1f48d42743")
+  :version "git-a2ea581c23fdc184168423adbd4b4c1f48d42743"))
+("hunchentoot" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/edicl/hunchentoot.git" :ref "65a3a3cca7e6e91fb068efc2ef8069b5c78ee91f")
+  :version "git-65a3a3cca7e6e91fb068efc2ef8069b5c78ee91f"))
+("cffi" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/cffi/cffi.git" :ref "787d3cd94404f85c0324b0f8d6b9c535fc091720")
+  :version "git-787d3cd94404f85c0324b0f8d6b9c535fc091720"))
+("trivial-custom-debugger" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/phoe/trivial-custom-debugger.git" :ref "802473c75d9db625b8f37b05c95dde47b67c52fa")
+  :version "git-802473c75d9db625b8f37b05c95dde47b67c52fa"))
+("form-fiddle" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/Shinmera/form-fiddle.git" :ref "706c4fa07552d56b372f728a225021a14db3f62e")
+  :version "git-706c4fa07552d56b372f728a225021a14db3f62e"))
+("documentation-utils" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/Shinmera/documentation-utils.git" :ref "fcbd927dee7f311915a27ee557e3db1d4510403c")
+  :version "git-fcbd927dee7f311915a27ee557e3db1d4510403c"))
+("trivial-indent" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/Shinmera/trivial-indent.git" :ref "87b35ff9202b107230e35790e93c471cc7880900")
+  :version "git-87b35ff9202b107230e35790e93c471cc7880900"))

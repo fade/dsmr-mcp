@@ -10,3 +10,15 @@ git acclimation https://github.com/fade/Acclimation.git :ref 9339b92e16e6a678448
 git ubiquitous https://codeberg.org/fade/ubiquitous.git :ref f6af0c2a2d7855942dd66467166ddf0dac3ab8d7
 git slynk https://github.com/fade/sly.git :ref 70350623eecd1f41837c9e57cbb6d5c06678a60d
 asdf 3.3.7.4
+# Dependencies this host builds from workspace checkouts, pinned to those checkouts' HEADs
+git log4cl https://github.com/sharplispers/log4cl.git :ref fe3da517147d023029782ced7cd989ba24f1e62d
+git usocket https://github.com/usocket/usocket.git :ref d492f746d33fed32283143394c7ead1cce59ba37
+git cl-ppcre https://github.com/edicl/cl-ppcre.git :ref a2ea581c23fdc184168423adbd4b4c1f48d42743
+git hunchentoot https://github.com/edicl/hunchentoot.git :ref 65a3a3cca7e6e91fb068efc2ef8069b5c78ee91f
+git cffi https://github.com/cffi/cffi.git :ref 787d3cd94404f85c0324b0f8d6b9c535fc091720
+git trivial-custom-debugger https://github.com/phoe/trivial-custom-debugger.git :ref 802473c75d9db625b8f37b05c95dde47b67c52fa
+git form-fiddle https://github.com/Shinmera/form-fiddle.git :ref 706c4fa07552d56b372f728a225021a14db3f62e
+git documentation-utils https://github.com/Shinmera/documentation-utils.git :ref fcbd927dee7f311915a27ee557e3db1d4510403c
+git trivial-indent https://github.com/Shinmera/trivial-indent.git :ref 87b35ff9202b107230e35790e93c471cc7880900
+# bordeaux-threads stays on the dist release: qlot bundle reads the git checkout's
+# (:feature :corman (:require "threads")) as an unconditional dependency and fails.

@@ -34,7 +34,7 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 .PHONY: bridge bus-watch bus-host bus-sources bus-binaries install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
         preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path \
-        deploy test-leaf
+        deploy test-leaf qlot-lock
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -845,6 +845,24 @@ core-worker:
 	@mv -f "$(WORKER_CORE).tmp" "$(WORKER_CORE)"
 	@mv -f "$(WORKER_CORE).tmp.manifest" "$(WORKER_CORE).manifest"
 	@echo "installed $(WORKER_CORE) (previous image kept as $(WORKER_CORE).prev)"
+
+## qlot-lock: refresh qlfile.lock from the working qlfile.
+##
+##   Exports HEAD with git archive into a temporary directory, puts the working
+##   qlfile over the exported one, runs `qlot install` and then `qlot update`
+##   there (update needs an installed project), and copies the resulting
+##   qlfile.lock back. qlot writes its .qlot directory only in the temporary
+##   directory, never in this checkout. Needs the network.
+qlot-lock:
+	@set -e; \
+	scratch=$$(mktemp -d "$${TMPDIR:-/tmp}/dsmr-qlot-lock.XXXXXX"); \
+	trap 'rm -rf "$$scratch"' EXIT; trap 'exit 130' HUP INT TERM; \
+	git archive --format=tar HEAD | tar -x -C "$$scratch"; \
+	cp qlfile "$$scratch/qlfile"; \
+	(cd "$$scratch" && env -u CL_SOURCE_REGISTRY -u ASDF_OUTPUT_TRANSLATIONS -u XDG_CACHE_HOME LISP=sbcl "$(QLOT)" install \
+	   && env -u CL_SOURCE_REGISTRY -u ASDF_OUTPUT_TRANSLATIONS -u XDG_CACHE_HOME LISP=sbcl "$(QLOT)" update); \
+	cp "$$scratch/qlfile.lock" qlfile.lock; \
+	echo "qlot-lock: wrote qlfile.lock"
 
 ## deploy: build a release of REF and make it the one servers run.
 ##
