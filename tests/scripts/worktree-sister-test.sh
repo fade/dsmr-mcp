@@ -4,7 +4,8 @@
 # skills/leader/worktree-sister-status.sh, run by `make test-worktree-sister`.
 #
 # git runs for real in scratch repositories. direnv and kitten are stubs that
-# log their argv; kitten exits 1 and must never be called. The fleet launcher
+# log their argv; kitten exits 1 and must never be called. The bus watcher is a
+# stub that replays answers recorded from the real binary. The fleet launcher
 # is the real scripts/start-sisters.sh, run only with --dry-run against an
 # empty socket directory. Nothing reaches kitty, a session or a bus.
 #
@@ -75,6 +76,25 @@ cat >"$STUBS/start-sisters-dry" <<EOF
 #!/usr/bin/env bash
 mkdir -p "\$WST_LOGS/sockets"
 DSMR_KITTY_SOCKET_DIR=\$WST_LOGS/sockets bash "$REPO_ROOT/scripts/start-sisters.sh" "\$@" --dry-run >>"\$WST_LOGS/launch.out" 2>&1
+EOF
+# The bus watcher stub prints the recorded answer named in $WST_LOGS/checklive
+# (live, dead or unknown; default dead) and exits with the status the real
+# binary gave for it. Recorded 2026-11-21 from ~/.local/bin/dsmr-bus-watch,
+# sha256 dacded8b9f81, stdout only:
+#   live     exit 0  --check-live --bus dsmr-mcp --agent dsmr-mcp
+#                      --namespace /home/fade/SourceCode/lisp/dsmr-mcp/
+#                    (the leader's identity, armed while the fleet was up)
+#   dead     exit 1  --check-live --bus dsmr-mcp --agent worktree-sister-capture
+#                      --namespace /nonexistent/
+#   unknown  exit 2  env -u DSMR_BUS_AGENT dsmr-bus-watch --check-live --bus dsmr-mcp
+FIXTURES=$REPO_ROOT/tests/scripts/fixtures
+cat >"$STUBS/dsmr-bus-watch" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"\$WST_LOGS/buswatch.log"
+answer=\$(cat "\$WST_LOGS/checklive" 2>/dev/null || echo dead)
+case \$answer in live) rc=0 ;; dead) rc=1 ;; *) rc=2 ;; esac
+cat "$FIXTURES/bus-watch-check-live-\$answer.out"
+exit \$rc
 EOF
 chmod 755 "$STUBS"/*
 export PATH=$STUBS:$PATH
@@ -314,6 +334,162 @@ try "the healthy sister still reads OK beside it" "$SOUT" state_is repo-integrat
 mkdir -p "$WORK/plain"
 SOUT=$(bash "$STATUS" "$WORK/plain" 2>&1); SRC=$?
 try "a directory without .planning exits 3" "rc=$SRC out=$SOUT" same "$SRC" 3
+
+# ---------------------------------------------------------------------------
+note "teardown"
+
+# sister LABEL: a fresh fixture with repo-integration created on feature/thing
+# and brought to the removable state: branch pushed, parked at HEAD, LEFT
+# written, watcher dead. Sets WT and SD.
+sister() {
+    fixture "td-$1"
+    ws create --no-launch --bus testbus "$G/repo" feature/thing
+    WT=$G/scratch/repo-thing
+    SD=$G/bucket/sisters/repo-integration
+    git -C "$WT" push -q -u origin feature/thing 2>/dev/null
+    park
+    printf 'left: 2026-11-21T12:00:00Z\n' >"$SD/LEFT"
+    printf 'dead\n' >"$G/logs/checklive"
+}
+park() { printf 'repo: repo-integration\nsha: %s\n' "$(git -C "$WT" rev-parse HEAD)" >"$SD/PARK.md"; }
+
+# td ARGS...: run teardown from the main checkout; sets OUT and RC.
+td() {
+    OUT=$(cd "$G/repo" && DSMR_BUS_WATCH=$STUBS/dsmr-bus-watch bash "$SCRIPT" teardown "$@" 2>&1)
+    RC=$?
+}
+
+kept() {
+    [[ -d $WT ]] && grep -qxF "worktree $WT" <(git -C "$G/repo" worktree list --porcelain) &&
+        [[ -s $SD/WORKTREE && -L $WT/.planning ]]
+}
+gone() {
+    [[ ! -e $WT ]] && ! grep -qxF "worktree $WT" <(git -C "$G/repo" worktree list --porcelain) &&
+        [[ ! -e $SD ]]
+}
+archives() { find "$G/bucket/sisters-retired" -mindepth 1 -maxdepth 1 -name 'repo-integration-*' 2>/dev/null; }
+
+# refused_td LABEL ARGS...: teardown must exit 1 and leave everything in place.
+refused_td() {
+    local label=$1
+    shift
+    td "$@"
+    try "$label is refused" "rc=$RC out=$OUT" same "$RC" 1
+    try "$label leaves the worktree and registration" "$OUT" kept
+}
+
+sister removable
+saved_park=$(cat "$SD/PARK.md"); saved_left=$(cat "$SD/LEFT"); saved_reg=$(cat "$SD/WORKTREE")
+before=$(git -C "$G/repo" symbolic-ref --short HEAD; git -C "$G/repo" rev-parse HEAD)
+td repo-integration
+try "a removable sister is removed" "rc=$RC out=$OUT" same "$RC" 0
+try "the worktree is gone and unlisted, the registration moved" "$OUT" gone
+try "the branch is kept" "" git -C "$G/repo" show-ref --verify -q refs/heads/feature/thing
+try "the bucket's STATE.md survives" "" same "$(cat "$G/bucket/STATE.md" 2>&1)" sentinel
+try "exactly one archive is made" "$(archives)" same "$(archives | wc -l)" 1
+A=$(archives)
+try "the archive keeps WORKTREE unchanged" "" same "$(cat "$A/WORKTREE" 2>&1)" "$saved_reg"
+try "the archive keeps PARK.md unchanged" "" same "$(cat "$A/PARK.md" 2>&1)" "$saved_park"
+try "the archive keeps LEFT unchanged" "" same "$(cat "$A/LEFT" 2>&1)" "$saved_left"
+try "the watcher is asked about her identity" "$(cat "$G/logs/buswatch.log" 2>/dev/null)" \
+    logged buswatch.log "--check-live --bus testbus --agent repo-integration --namespace $WT/"
+try "the main checkout's branch and HEAD are unchanged" "" \
+    same "$(git -C "$G/repo" symbolic-ref --short HEAD; git -C "$G/repo" rev-parse HEAD)" "$before"
+try "the output names the tab to close" "$OUT" has "$OUT" "close the tab titled repo-thing"
+
+sister live
+printf 'live\n' >"$G/logs/checklive"
+refused_td "a live watcher" repo-integration
+try "a live watcher prints the LEAVE dispatch" "$OUT" has "$OUT" "LEAVE: commit and push feature/thing"
+try "a live watcher prints the reap line" "$OUT" \
+    has "$OUT" "--reap --all-buses --agent repo-integration --namespace $WT/"
+refused_td "a live watcher under --force" --force repo-integration
+printf 'unknown\n' >"$G/logs/checklive"
+refused_td "an unknown watcher answer" repo-integration
+refused_td "an unknown watcher answer under --force" --force repo-integration
+
+sister noleft
+rm "$SD/LEFT"
+refused_td "no LEFT" repo-integration
+try "no LEFT prints the LEAVE dispatch" "$OUT" has "$OUT" "send to repo-integration by name"
+td --force repo-integration
+try "no LEFT under --force is removed" "rc=$RC out=$OUT" same "$RC" 0
+try "no LEFT under --force prints the disenroll line" "$OUT" \
+    has "$OUT" "\"agent\": \"$WT/repo-integration\""
+
+sister nopark
+rm "$SD/PARK.md"
+refused_td "no PARK.md" repo-integration
+sister otherpark
+OTHER=$(git -C "$WT" commit-tree "$(git -C "$WT" rev-parse 'HEAD^{tree}')" -p HEAD -m 'Another commit')
+printf 'repo: repo-integration\nsha: %s\n' "$OTHER" >"$SD/PARK.md"
+refused_td "PARK.md naming another commit" repo-integration
+sister twosha
+printf 'sha: %s\n' "$(git -C "$WT" rev-parse HEAD)" >>"$SD/PARK.md"
+refused_td "PARK.md with two sha lines" repo-integration
+
+sister blocked
+printf 'BLOCKED repo-integration: fixture block\n' >"$SD/BLOCKED.md"
+refused_td "an open BLOCKED.md" repo-integration
+td --force repo-integration
+try "an open BLOCKED.md under --force is removed" "rc=$RC out=$OUT" same "$RC" 0
+try "the archive keeps BLOCKED.md" "" grep -qF 'fixture block' "$(archives)/BLOCKED.md"
+
+sister modified
+printf 'changed\n' >>"$WT/README"
+refused_td "a modified tracked file" repo-integration
+td --force repo-integration
+try "a modified tracked file under --force is removed" "rc=$RC out=$OUT" same "$RC" 0
+try "the forced removal still keeps the branch" "" \
+    git -C "$G/repo" show-ref --verify -q refs/heads/feature/thing
+
+sister untracked
+printf 'new\n' >"$WT/scratch-note"
+refused_td "an untracked file" repo-integration
+
+sister unpushed
+printf 'more\n' >>"$WT/README"
+git -C "$WT" commit -qam 'Change README'
+park
+refused_td "a commit on no remote" repo-integration
+try "the refusal names the push" "$OUT" has "$OUT" "push feature/thing"
+git -C "$WT" push -q 2>/dev/null
+td repo-integration
+try "after the push it is removed" "rc=$RC out=$OUT" same "$RC" 0
+
+sister dryrun
+td -n repo-integration
+try "a dry run on a removable sister exits 0" "rc=$RC out=$OUT" same "$RC" 0
+try "a dry run removes and archives nothing" "$OUT" kept
+try "a dry run makes no archive" "$(archives)" same "$(archives)" ""
+
+sister unregistered
+td nobody
+try "an unregistered name is refused" "rc=$RC out=$OUT" same "$RC" 1
+try "an unregistered name lists the registered ones" "$OUT" has "$OUT" "registered: repo-integration"
+try "an unregistered name deletes nothing" "$OUT" kept
+mkdir -p "$G/scratch/stray" "$G/bucket/sisters/stray"
+printf 'keep\n' >"$G/scratch/stray/file"
+sed "s|^name: .*|name: stray|; s|^worktree: .*|worktree: $G/scratch/stray|" "$SD/WORKTREE" \
+    >"$G/bucket/sisters/stray/WORKTREE"
+printf 'left: 2026-11-21T12:00:00Z\n' >"$G/bucket/sisters/stray/LEFT"
+td --force stray
+try "a registration git does not list is refused, even under --force" "rc=$RC out=$OUT" same "$RC" 1
+try "the unlisted directory is not touched" "" test -s "$G/scratch/stray/file"
+try "the unlisted registration is kept" "" test -s "$G/bucket/sisters/stray/WORKTREE"
+
+sister everything
+rm "$SD/LEFT"
+printf 'changed\n' >>"$WT/README"
+refused_td "no LEFT and a dirty tree together" repo-integration
+try "one run reports the missing LEFT" "$OUT" has "$OUT" "has not left"
+try "one run reports the dirty tree" "$OUT" has "$OUT" "uncommitted or untracked changes"
+
+sister inside
+OUT=$(cd "$WT" && DSMR_BUS_WATCH=$STUBS/dsmr-bus-watch bash "$SCRIPT" teardown --repo "$G/repo" repo-integration 2>&1)
+RC=$?
+try "teardown from inside the worktree is refused" "rc=$RC out=$OUT" same "$RC" 1
+try "teardown from inside the worktree deletes nothing" "$OUT" kept
 
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 ((FAILED == 0 && PASSED > 0))

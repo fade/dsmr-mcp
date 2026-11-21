@@ -280,7 +280,166 @@ cmd_create() {
 }
 
 cmd_teardown() {
-    usage_error "teardown: not implemented"
+    local repo_opt="" force=0 dry=0 args=()
+    while (($#)); do
+        case $1 in
+            --repo=*)       set -- --repo "${1#*=}" "${@:2}"; continue ;;
+            --repo)         (($# >= 2)) || usage_error "$1 needs a value"; repo_opt=$2; shift 2 ;;
+            --force)        force=1; shift ;;
+            -n|--dry-run)   dry=1; shift ;;
+            -h|--help)      usage; exit 0 ;;
+            --)             shift; args+=("$@"); break ;;
+            -*)             usage_error "unknown option: $1" ;;
+            *)              args+=("$1"); shift ;;
+        esac
+    done
+    ((${#args[@]} == 1)) || usage_error "teardown takes NAME"
+    local name=${args[0]}
+    command -v git >/dev/null || unsupported "git not found on PATH"
+
+    local problem
+    problem=$(name_problem name "$name")
+    [[ -z $problem ]] || refuse "$problem"
+    local where
+    if [[ -n $repo_opt ]]; then
+        where=$repo_opt
+    else
+        where=$(git rev-parse --show-toplevel 2>/dev/null) ||
+            refuse "the working directory is not in a repository; pass --repo"
+    fi
+    [[ -d $where/.planning ]] || refuse "$where/.planning does not resolve to a directory; pass --repo"
+    local bucket sdir reg
+    bucket=$(readlink -f -- "$where/.planning")
+    sdir=$bucket/sisters/$name
+    reg=$sdir/WORKTREE
+    if [[ ! -f $reg ]]; then
+        local registered=() r
+        for r in "$bucket"/sisters/*/WORKTREE; do
+            [[ -f $r ]] && registered+=("$(basename -- "$(dirname -- "$r")")")
+        done
+        refuse "$name is not registered in $bucket; registered: ${registered[*]:-none}"
+    fi
+    local repo wt branch bus
+    repo=$(field "$reg" repo)
+    wt=$(field "$reg" worktree)
+    branch=$(field "$reg" branch)
+    bus=$(field "$reg" bus)
+    [[ -n $repo && -n $wt && -n $branch && -n $bus ]] ||
+        refuse "$reg lacks a repo, worktree, branch or bus field; repair it by hand"
+
+    local leave="send to $name by name, then run teardown again: LEAVE: commit and push $branch, park, bus-leave, reap your watcher"
+    local hard=() soft=() advice=() need_leave=0 left_forced=0
+
+    # a. Removing the directory the caller stands in strands its shell.
+    local here
+    here=$(pwd -P)
+    [[ $here == "$wt" || $here == "$wt"/* ]] &&
+        hard+=("the working directory is inside $wt; run teardown from the main checkout")
+
+    # b. Only a directory git lists as a worktree is ever removed.
+    local listed=0
+    if git -C "$repo" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $wt"; then
+        listed=1
+    else
+        hard+=("git does not list $wt as a worktree of $repo; nothing is removed, inspect it by hand")
+    fi
+
+    # c. A live watcher means she is still listening; --force never overrides it.
+    local watch=${DSMR_BUS_WATCH:-$HOME/.local/bin/dsmr-bus-watch} answer rc
+    if [[ ! -x $watch ]]; then
+        hard+=("cannot tell whether $name is listening: $watch not found; set DSMR_BUS_WATCH")
+    else
+        rc=0
+        answer=$("$watch" --check-live --bus "$bus" --agent "$name" --namespace "$wt/" 2>/dev/null) || rc=$?
+        case $rc in
+            1) ;;
+            0)  hard+=("$name is still listening ($answer)")
+                need_leave=1
+                advice+=("if her session is gone, stop her watcher with: ~/.local/bin/dsmr-bus-watch --reap --all-buses --agent $name --namespace $wt/") ;;
+            *)  hard+=("cannot tell whether $name is listening: --check-live exited $rc (${answer:-no answer})") ;;
+        esac
+    fi
+
+    # d. Her LEFT file says she parked, replied and left the bus.
+    if [[ ! -s $sdir/LEFT ]]; then
+        soft+=("$name has not left: $sdir/LEFT is missing or empty")
+        if ((force)); then left_forced=1; else need_leave=1; fi
+    fi
+
+    # e. PARK.md names the worktree's HEAD.
+    local head="" parked
+    if ((listed)); then head=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || head=""; fi
+    if [[ ! -f $sdir/PARK.md ]]; then
+        soft+=("$name has not parked: $sdir/PARK.md is missing")
+    elif [[ $(grep -c '^sha:' "$sdir/PARK.md") != 1 ]]; then
+        soft+=("$sdir/PARK.md holds other than exactly one sha: line")
+    else
+        parked=$(awk '/^sha:/ { print $2 }' "$sdir/PARK.md")
+        if ((${#parked} < 7)) || [[ -z $head || ${head#"$parked"} == "$head" ]]; then
+            soft+=("$sdir/PARK.md names ${parked:-no sha}, not the worktree HEAD ${head:-(unreadable)}")
+        fi
+    fi
+
+    # f. An open block is a question nobody has answered.
+    [[ -s $sdir/BLOCKED.md ]] && soft+=("$sdir/BLOCKED.md is open; resolve it first")
+
+    # g, h. Work that exists only in this worktree.
+    if ((listed)) && [[ -d $wt ]]; then
+        [[ -z $(git -C "$wt" status --porcelain 2>/dev/null) ]] ||
+            soft+=("$wt has uncommitted or untracked changes")
+        local unpushed
+        unpushed=$(git -C "$wt" rev-list --count HEAD --not --remotes 2>/dev/null || echo unknown)
+        [[ $unpushed == 0 ]] ||
+            soft+=("$wt holds $unpushed commit(s) on no remote-tracking ref; push $branch")
+    fi
+
+    local m
+    if ((${#hard[@]})) || { ((${#soft[@]})) && ((!force)); }; then
+        for m in ${hard[@]+"${hard[@]}"} ${soft[@]+"${soft[@]}"}; do
+            printf '%s: refused: %s\n' "$PROGNAME" "$m" >&2
+        done
+        ((need_leave)) && printf '%s: %s\n' "$PROGNAME" "$leave" >&2
+        for m in ${advice[@]+"${advice[@]}"}; do printf '%s: %s\n' "$PROGNAME" "$m" >&2; done
+        ((${#soft[@]})) && ((!${#hard[@]})) &&
+            printf '%s: --force removes it anyway, keeping the branch and her records\n' "$PROGNAME" >&2
+        exit 1
+    fi
+    for m in ${soft[@]+"${soft[@]}"}; do
+        printf '%s: forced past: %s\n' "$PROGNAME" "$m" >&2
+    done
+
+    local stamp archive
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    archive=$bucket/sisters-retired/$name-$stamp
+    if ((dry)); then
+        printf 'would remove the worktree %s (branch %s is kept)\n' "$wt" "$branch"
+        printf 'would archive %s to %s\n' "$sdir" "$archive"
+        return 0
+    fi
+
+    # The link goes first and alone, so nothing below can reach the bucket.
+    local link=$wt/.planning target=""
+    if [[ -L $link ]]; then
+        target=$(readlink -- "$link")
+        rm -- "$link"
+    elif [[ -e $link ]]; then
+        refuse "$link is not a symlink; nothing is removed, inspect it by hand"
+    fi
+    local remove=(worktree remove)
+    ((force)) && remove+=(--force)
+    if ! git -C "$repo" "${remove[@]}" "$wt"; then
+        [[ -n $target ]] && ln -s -- "$target" "$link"
+        refuse "git worktree remove $wt failed; the .planning link is restored"
+    fi
+    mkdir -p -- "$bucket/sisters-retired"
+    mv -- "$sdir" "$archive"
+
+    printf 'removed   %s\nbranch    %s (kept)\narchived  %s\n' "$wt" "$branch" "$archive"
+    if ((left_forced)); then
+        printf 'she never left the bus; disenroll her with:\n'
+        printf '  bus-roster {"action": "disenroll", "agent": "%s/%s", "bus": "%s"}\n' "$wt" "$name" "$bus"
+    fi
+    printf 'close the tab titled %s\n' "${wt##*/}"
 }
 
 (($#)) || { usage >&2; exit 2; }
