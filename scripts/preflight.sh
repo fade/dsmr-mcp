@@ -245,8 +245,10 @@ release_guard() {
 # deploy of the commit that is current runs the host steps and builds nothing.
 worker_core_remedy() {
     case $1 in
-        *" is not owned by "*|*" is group or world writable")
-            printf 'restore ownership and permissions of %s' "${1%% is *}" ;;
+        *" is not owned by "*)
+            printf 'restore ownership and permissions of %s' "${1% is not owned by *}" ;;
+        *" is group or world writable")
+            printf 'restore ownership and permissions of %s' "${1% is group or world writable}" ;;
         *)
             printf 'make deploy REF=<sha of a commit that has no release yet>; a commit that already has a release is reused, so its worker core is not rebuilt' ;;
     esac
@@ -488,6 +490,16 @@ self_test() {
         printf '  pass  a writable worker manifest names a permission repair\n'
     else printf '  FAIL  a writable worker manifest names no repair: %s\n' "$remedy"; status=1; fi
     chmod o-w "$drel/core/dsmr.core.worker.manifest"
+    # A path holding " is " is named whole in the repair.
+    local spaced='/srv/this is home/releases/x/core/dsmr.core.worker'
+    remedy=$(worker_core_remedy "$spaced is group or world writable")
+    if [[ $remedy == "restore ownership and permissions of $spaced" ]]; then
+        printf '  pass  a repair names a writable path containing " is " whole\n'
+    else printf '  FAIL  repair for a writable path containing " is " reads: %s\n' "$remedy"; status=1; fi
+    remedy=$(worker_core_remedy "$spaced is not owned by uid 1000")
+    if [[ $remedy == "restore ownership and permissions of $spaced" ]]; then
+        printf '  pass  a repair names a foreign-owned path containing " is " whole\n'
+    else printf '  FAIL  repair for a foreign-owned path containing " is " reads: %s\n' "$remedy"; status=1; fi
     mv "$drel/core/dsmr.core.worker" "$drel/core/dsmr.core.worker.away"
     if checks_release; then
         printf '  FAIL  release check passed a release with no worker core\n'; status=1
