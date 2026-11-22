@@ -175,8 +175,8 @@ make bus-sources BUS_SOURCES_DIR=/tmp/lists    # list the files each binary is b
 Integration leaves that need workers booted from the worker core get one from
 the fixture =worker-core-for-tests= in =tests/integration/support.lisp=. It
 builds a worker core from this tree into a scratch directory once per test
-process, removes it when the process exits, and never touches the
-=dsmr.core.worker= in the checkout. A leaf that cannot get a core skips and says
+process, removes it when the process exits, and never touches the test core
+directory or a deployed release. A leaf that cannot get a core skips and says
 why, through =with-worker-core-or-skip=. The build takes about ten seconds on a
 warm fasl cache; to skip it while iterating, build one yourself and point
 =DSMR_TEST_WORKER_CORE= at it:
@@ -190,6 +190,106 @@ The leaves that save and resume worlds (=worker-hibernate-test=,
 =pool-hibernate-test=, =pool-resume-test=, =pool-requests-test= and the end to
 end =pressure-relief-test=) spawn real workers and live in
 =make test-integration= only; =make test= never hibernates anything.
+
+** The test core
+
+=make test-integration=, a =make test-leaf= run of an integration leaf, and
+=make test-warm= boot the /test core/, =.ci-cache/test-core/dsmr.core=, a
+server image built from this checkout. =make test-core= rebuilds it when it is
+absent, when it is older than any file it is built from, or when its manifest
+names an SBCL other than the one =sbcl --version= reports, and leaves a current
+core alone. Brokers started by the integration suite boot it through
+=DSMR_BROKER_CORE=. Set =TEST_CORE_DIR= to keep the test core elsewhere.
+
+The test core is for tests only. No server, worker, bus service or watcher on
+the host starts from it; a host runs what =make deploy= built (see
+[[file:operations.org::*Releases][Releases]]). =make core= and
+=make core-worker= also build into =TEST_CORE_DIR= unless =CORE= or
+=WORKER_CORE= says otherwise.
+
+** One test system at a time
+
+#+begin_src sh
+make test-leaf LEAF=dsmr-mcp/tests/install/config-test
+#+end_src
+
+Runs one test system with the same private state home, =DSMR_= removal and
+source check as =make test=, and fails when a test fails or when the system
+holds no test. A leaf under =dsmr-mcp/tests/integration/= runs =test-core=
+first and gets the integration suite's environment.
+
+** Which tree a run loaded
+
+Every test target prints
+
+#+begin_src text
+dsmr-mcp source: <directory>
+#+end_src
+
+on standard error after loading, naming the directory =dsmr-mcp= resolved to.
+When that directory is not the checkout =make= ran in, the run dies with
+status 2 before any test runs. The Makefile puts the checkout's own directory
+first in =CL_SOURCE_REGISTRY=, so a run from a worktree outside the scanned
+workspace tree loads that worktree, while dependencies still resolve from the
+host configuration. An image attached over Slynk resolves =dsmr-mcp= by its own
+registry, so verify a worktree with the Makefile targets, not with an attached
+image's =load-system=.
+
+** Launching a server by hand
+
+A launcher, a release core, =dsmr-bus-watch= or =dsmr-bus-host= started by
+hand or by a test joins the bus its environment names. Start each one with a
+scratch state and cache directory and no =DSMR_BUS_= variables, so it never
+joins a live bus or writes into the host's state:
+
+#+begin_src sh
+scratch=$(mktemp -d)
+env -i HOME="$HOME" PATH="$PATH" \
+    XDG_STATE_HOME="$scratch/state" XDG_CACHE_HOME="$scratch/cache" \
+    DSMR_HOME="$scratch/home" DSMR_MODE=hermetic \
+    "$scratch/home/current/bin/dsmr-mcp-launch" < requests.jsonl
+#+end_src
+
+** Release tests
+
+Two shell suites test the release scripts with stubs, in seconds, and build
+nothing real:
+
+#+begin_src sh
+bash tests/build/deploy-test.sh        # scripts/deploy.sh: gates, lock, stages, reuse, rollback
+bash tests/build/core-install-test.sh  # core install sequence and the test core
+#+end_src
+
+=deploy-test.sh= drives the deploy against a temporary origin and clone with
+a stub qlot, a stub SBCL and a stub make. The stub SBCL replays
+=tests/build/fixtures/release-initialize.jsonl= and =worker-handshake.json=,
+recorded from a real release. Every case runs with =HOME= in its own
+temporary tree.
+
+The release leaves of =make test-integration= need a real release, and skip
+without one:
+
+| Leaf                                              | Variable                         |
+|---------------------------------------------------+----------------------------------|
+| =release/release-ties-test= (green case)          | =DSMR_TEST_RELEASE_HOME=         |
+| =hermetic/subject-tree-worker-test=, renamed worker core cases | =DSMR_TEST_RELEASE_WORKER_CORE= |
+| =scripts/launcher-release-test= (launcher under test) | =DSMR_TEST_RELEASE_LAUNCHER=, default =scripts/release-launch.sh= |
+
+To build a release for them, and to check a deploy, rollback and re-deploy
+end to end, run a scratch dry run:
+
+#+begin_src sh
+home=$(mktemp -d)/home
+make deploy REF=HEAD DSMR_HOME=$home ALLOW_UNPUBLISHED=1 HOST_LINKS=0
+make check-release DSMR_HOME=$home
+make rollback DSMR_HOME=$home HOST_LINKS=0     # needs a previous release
+DSMR_TEST_RELEASE_HOME=$home \
+DSMR_TEST_RELEASE_WORKER_CORE=$home/current/core/dsmr.core.worker \
+    make test-integration
+#+end_src
+
+The deploy needs a clean tree, so commit first. =HOST_LINKS=0= keeps every
+step inside the scratch home.
 
 * Pinned SBCL build, and why it matters
 
@@ -227,8 +327,8 @@ If you ever hit =INVALID-FASL-FEATURES= from a tool that does *not* go through
 the Makefile, the fix is the same: clear the offending cache directory and let
 it recompile, or point =XDG_CACHE_HOME= at a fresh directory for that run.
 
-=.ci-cache/= (and the profiling harness's =.measure-cache/=, and any prebuilt
-=dsmr.core=) are build artifacts — they are git-ignored and never committed.
+=.ci-cache/= (including the test core), the profiling harness's
+=.measure-cache/=, and any other =dsmr.core= are build artifacts: they are git-ignored and never committed.
 
 * Measured numbers
 
@@ -245,8 +345,9 @@ Development box:
 |-----+---------+------------+--------|
 | Cold fast suite (empty cache) | =make test= | ~2 min 33 s | 1364 pass / 0 fail |
 | Warm fast suite (core image) | =make test-warm= | ~1 min 25 s | 1364 pass / 0 fail |
-| Core image build | =make core= | ~14 s (warm) | 175 MB =dsmr.core= |
-| Worker core build | =make core-worker= | ~12 s (warm fasl cache) | 149 MB =dsmr.core.worker= |
+| Test core build | =make test-core= | ~51 s (warm fasl cache) | 278 MB =.ci-cache/test-core/dsmr.core= |
+| Test worker core build | =make core-worker= | ~12 s (warm fasl cache) | 149 MB =.ci-cache/test-core/dsmr.core.worker= |
+| Release build | =make deploy= (scratch home) | ~2 min 20 s (warm qlot cache): dependencies 54 s, server 60 s, worker 8 s, bus binaries 14 s | release core about 430 MB |
 
 CI runner (observed on the first pull-request run):
 

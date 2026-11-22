@@ -5,12 +5,35 @@
 
 Fixes on =main= after the v0.1.0 tag, ahead of the next release:
 
+- *A host runs a deployed release, never a checkout.* =make deploy REF=<sha>=
+  exports one pushed commit into =~/.local/share/dsmr-mcp/releases/<sha>/=,
+  installs its dependencies from the committed =qlfile.lock= with qlot, builds
+  the server image, the worker image and both bus binaries there, checks that
+  the release answers =initialize= with its commit, and only then makes it
+  =current=. It is the only step that changes what a host runs; building or
+  testing in a checkout no longer reaches a running server. =make rollback=
+  makes the previous release current again, and =make check-release= reports
+  whether the deployed release is sealed and free of ties to a checkout.
+  =make register= points Claude Code at the release launcher once per host.
+  The server image is sealed, so nothing it loads at run time comes from a
+  checkout; a release server refuses to start (exit 78) when it is unsealed or
+  tied. =serverInfo.version= and =backend-status= name the commit a server
+  runs. Hermetic workers start only from the release's worker image, which
+  keeps its support code under =DSMR-WORKER= package names so a project that
+  is itself dsmr-mcp loads beside it; a worker never loads from source outside
+  the test targets. File reads outside the session root are limited to
+  =DSMR_READ_ROOTS= (default =~/SourceCode/lisp/=). =~/.local/bin/dsmr-bus-watch=
+  and =dsmr-bus-host= become links into the release, and a deploy copies the
+  release's skills, agent definitions and harness files. =make install-bus-watch=,
+  =make install-bus-host=, =make install-skills=, =make install-agents= and
+  =make install-harness= are retired and refuse. A first deploy on a host needs
+  qlot provisioned; see [[file:installation.org::*First deploy on a host][First
+  deploy on a host]] and [[file:operations.org::*Releases][Releases]].
 - *Hermetic workers boot from a core and survive memory pressure.* A hermetic
   worker now boots from its own prebuilt image, =dsmr.core.worker=, in about a
   tenth of a second, so the pool keeps no warm standby: a worker starts on a
   session's first hermetic call (=DSMR_WORKER_POOL_WARMUP= now defaults to 0 and
-  is still honoured when set). =make core= builds the worker image after
-  =dsmr.core=, and the launcher keeps it fresh. A worker is held for as long as
+  is still honoured when set). Each release carries the worker image. A worker is held for as long as
   its session lives and is never reaped for being idle. When the host runs short
   of memory, the host bus service asks a pool to stop a fresh idle worker or to
   hibernate a stateful one: its whole Lisp world is saved to disk and resumed,
