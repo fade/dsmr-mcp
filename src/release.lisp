@@ -1,7 +1,7 @@
 ;;;; src/release.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; What a release image needs to know about itself: the release directory it
+;;;; What a release image reports about itself: the release directory it
 ;;;; runs from, how its ASDF registry is sealed, and whether it is sealed.
 
 (defpackage #:dsmr-mcp/src/release

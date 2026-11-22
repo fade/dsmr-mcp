@@ -282,9 +282,10 @@ directory. Systems with no source directory are allowed."
 
 ;;; Release-worker kind: the support code moves out of a subject's way. A worker
 ;;; rooted at a dsmr-mcp tree loads that tree under the DSMR-MCP names, so the
-;;; image keeps its own copy under DSMR-WORKER names, forgets its dsmr-mcp
-;;; systems so the subject's are found and loaded, and holds every dependency
-;;; immutable so the subject does not reload them from another directory.
+;;; image keeps its own copy under DSMR-WORKER names, clears its dsmr-mcp
+;;; systems from ASDF so the subject's are found and loaded, and holds every
+;;; dependency immutable so the subject does not reload them from another
+;;; directory.
 
 (defun build-core-worker-name (name)
   "NAME with its leading DSMR-MCP replaced by DSMR-WORKER when NAME is DSMR-MCP or

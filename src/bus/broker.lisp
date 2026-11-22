@@ -732,7 +732,8 @@
    the release launcher sets it to its release's server core, the test targets
    to the test core. An image is used because the alternative is measured in
    tens of seconds: booting plain sbcl and building the broker subsystem from
-   source takes 22 to 33 seconds on this host against 0.03 for the image, and
+   source takes 22 to 33 seconds against 0.03 for the image, measured on the
+   development workspace, and
    every one of those seconds is time the bus has no broker and a caller asking
    after it learns nothing useful. Outside a release, without an image, the
    broker is built from source, so a bus still comes up.

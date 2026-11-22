@@ -214,7 +214,9 @@ load from source. Returns a second value, the reason, when the answer is NIL.
 *worker-core* wins when non-NIL, else DSMR_WORKER_CORE; either way the path is
 used only when it names an existing regular file. Once the runtime has refused
 the core (*worker-core-disabled*) this answers NIL for the rest of the process;
-a boot failure that may pass leaves the core offered. The launcher sets DSMR_WORKER_CORE only when the image is fresh."
+a boot failure that may pass leaves the core offered. The launcher leaves
+DSMR_WORKER_CORE unset when worker_core_withheld in scripts/release-paths.sh
+reports a reason, or when that check is absent or fails."
   (if *worker-core-disabled*
       (values nil (format nil "disabled ~A" *worker-core-disabled*))
       (%offered-core (or *worker-core* (uiop:getenv "DSMR_WORKER_CORE")))))
@@ -629,8 +631,8 @@ which already holds the worker system, so nothing is loaded before start. The
 worker starts through CL-USER::DSMR-WORKER-ENTRY, which every worker core
 defines, so the arguments name no package a release image may have renamed. The
 image carries the source registry as it stood when it was built; the arguments
-discard it, so the worker sees the workspace as it is now. No directory of this
-server is added to the worker's ASDF lookup: the worker registers the project
+discard it, so the worker resolves systems against the workspace as it is
+now. No directory of this server is added to the worker's ASDF lookup: the worker registers the project
 it is rooted at itself. Discarding rather than re-scanning matters: a scan of a
 large workspace takes seconds, and ASDF repeats it lazily at the worker's first
 system lookup instead of before its handshake.
