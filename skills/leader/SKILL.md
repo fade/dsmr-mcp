@@ -327,6 +327,41 @@ Enrollment is dynamic, so both of these are normal on a running fleet:
 
 Assembling a fleet in the first place, and handing each repo its tag, is the **fleet** skill.
 
+### Worktree sisters
+
+A **worktree sister** runs in a git worktree under lisp-scratch, one per branch, for integration or
+release work that must not move the main checkout off `main`. She is registered in her repository's
+planning bucket as `sisters/<name>/`, which holds `WORKTREE` (written by the helper) and her own
+`PARK.md`, `BLOCKED.md` and `LEFT`. Her worktree's `.planning` is the same bucket as the main
+checkout's, so ⛔ **the loop above never sees her park**: the repo's `PARK.md` is the main checkout's
+sister's, or yours. Check every registered one:
+
+```bash
+ls -1d "$(dirname "$PWD")"/*/ "$LISP_WORKSPACE"/*/ 2>/dev/null | while read -r d; do
+  [ -d "${d%/}/.planning"/sisters ] || continue
+  bash ~/.claude/skills/leader/worktree-sister-status.sh "${d%/}"
+done
+```
+
+Read its states exactly as the loop above: **MISMATCH** stops that sister, **SCHEMA** is her repair,
+**NO-PARK-FILE** is unresolved, not a failure, except at park time: run the script with `--park`
+there, and any state but OK exits non-zero. **NO-WORKTREE** is a registration whose checkout is
+gone or that git no longer lists, and it is a FINDING. The script also prints any open block of
+hers; Step 3 collects those too.
+
+- **Creating one**, from your own session, so your `DSMR_BUS_SELECTOR` becomes her bus:
+  `worktree-sister.sh create <repo> <branch> [--name N] [--bus B]`. Her name defaults to
+  `<repo>-integration`. ⛔ **She is up only when `RESUMED <name>` arrives**, never because a tab
+  opened: a new directory may stop at Claude Code's folder-trust question, which nothing here
+  can answer.
+- **Retiring one:** dispatch `LEAVE` to her **by name**, wait for `LEAVING <name> @<sha>`, then for her `LEFT` file
+  (`left=yes` in the status report), then run `worktree-sister.sh teardown <name>` from the main
+  checkout. A teardown run on `LEAVING` alone may be refused as "has not left". A refusal names what is missing, and
+  when the refusal is about her it prints the dispatch to send. Use `--force` only on fade's
+  direction or for a sister whose session is gone, and then run the `bus-roster` disenroll line it
+  prints. `--force` never removes a worktree whose watcher still answers live.
+- `bash ~/.claude/skills/leader/gsd-drift.sh <worktree>` reports her branch's process drift.
+
 ### ⛔ ONE LEADER, ONE BUS, ONE FLEET. There may be OTHER leaders, and they are not yours.
 
 **A leader implies a separate bus.** Your fleet is the repos on YOUR bus. More than one leader
@@ -363,11 +398,17 @@ behaviour. Join it, arm a watcher on it like any other bus, and state your fleet
 
 ```bash
 ls -1d "$(dirname "$PWD")"/*/ "$LISP_WORKSPACE"/*/ 2>/dev/null | while read -r d; do
-  [ -s "${d%/}/.planning/BLOCKED.md" ] || continue
-  echo "== $(basename "${d%/}")"; cat "${d%/}/.planning/BLOCKED.md"
+  p="${d%/}/.planning"
+  [ -s "$p"/BLOCKED.md ] && { echo "== $(basename "${d%/}")"; cat "$p"/BLOCKED.md; }
+  find "$p/sisters" -mindepth 2 -maxdepth 2 -name BLOCKED.md 2>/dev/null | sort | while read -r b; do
+    [ -s "$b" ] || continue
+    echo "== $(basename "${d%/}")/$(basename "$(dirname "$b")") (worktree sister)"; cat "$b"
+  done
 done
 ```
-⚠ `while read`, not `for … in $VAR` — same zsh word-splitting trap as Step 2.
+⚠ `while read`, not `for … in $VAR` — same zsh word-splitting trap as Step 2. The inner loop prints
+each worktree sister's non-empty `sisters/*/BLOCKED.md`; `find` stands in for a glob because zsh
+aborts a command whose glob matches nothing.
 
 **Carry all of these into your first reply to the operator, as a standing footer — always, even when
 the reply is about something else.** The operator must never discover a block by getting impatient.
