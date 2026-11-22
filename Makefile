@@ -1074,18 +1074,19 @@ rollback:
 ##   the entry's env settings and adds DSMR_READ_ROOTS when it is absent, then
 ##   prints the result. The leader runs it once per host, after the first
 ##   deploy; running sessions pick it up only when they restart. Refuses when no
-##   release is deployed, and when DSMR_HOME names a scratch home while
-##   CLAUDE_CONFIG is still the host's config. A scratch run:
+##   release is deployed, and when the deploy home is a scratch home (any home
+##   other than $HOME/.local/share/dsmr-mcp, or $XDG_DATA_HOME/dsmr-mcp with
+##   XDG_DATA_HOME under $HOME) while CLAUDE_CONFIG is still the host's
+##   config. A scratch run:
 ##   make register DSMR_HOME=<scratch home> CLAUDE_CONFIG=<scratch file>
 register:
-	@default_home="$${XDG_DATA_HOME:-$(HOME)/.local/share}/dsmr-mcp"; \
-	home="$(DSMR_HOME)"; home="$${home%/}"; \
+	@. "$(CURDIR)/scripts/release-paths.sh"; \
+	home="$$(DSMR_HOME="$(DSMR_HOME)" dsmr_home)" || exit 1; home="$${home%/}"; \
 	config="$$(realpath -m -- "$(CLAUDE_CONFIG)")"; \
-	if [ -n "$$home" ] && [ "$$(realpath -m -- "$$home")" != "$$(realpath -m -- "$$default_home")" ] \
-	   && [ "$$config" = "$$(realpath -m -- "$(HOME)/.claude.json")" ]; then \
-	  echo "register: DSMR_HOME is a scratch home but CLAUDE_CONFIG is the host's config; pass CLAUDE_CONFIG=<scratch file>" >&2; exit 1; \
+	if ! host_home_p "$$home" && [ "$$config" = "$$(realpath -m -- "$(HOME)/.claude.json")" ]; then \
+	  echo "register: deploy home $$home is a scratch home but CLAUDE_CONFIG is the host's config; pass CLAUDE_CONFIG=<scratch file>" >&2; exit 1; \
 	fi; \
-	home="$${home:-$$default_home}"; core="$$home/current/core/dsmr.core"; \
+	core="$$home/current/core/dsmr.core"; \
 	if [ ! -f "$$core" ]; then \
 	  echo "register: no deployed release at $$home/current; run make deploy REF=<sha> first" >&2; exit 1; \
 	fi; \
