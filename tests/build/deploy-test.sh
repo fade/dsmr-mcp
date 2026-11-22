@@ -22,6 +22,9 @@
 # defaults for BINDIR, SKILLDIR, AGENTDIR and SUBAGENTDIR name directories
 # inside the temporary tree even when a case leaves them unset.
 #
+# The release build's ASDF check runs scripts/build-core.lisp with the real
+# SBCL against a stub bundle whose asdf.lisp only sets the version string.
+#
 # Everything lives under one mktemp directory; TMPDIR points into it so the
 # verify stage's scratch directories are removed with it.
 #
@@ -536,6 +539,45 @@ deploy "$HF" "$C1" HOST_LINKS= BINDIR="$D/bin" SKILLDIR="$D/claude/skills" AGENT
 try "with no base release, a differing destination stops the deploy" "rc=$RC: $OUT" test "$RC" -eq 1
 try "the first deploy lists it" "$OUT" has "$OUT" "copies: $D/claude/agents/helper.md was edited in place"
 try "the first deploy flips nothing" "current=$(link "$HF/current")" test ! -e "$HF/current"
+
+# ---- release build ASDF ------------------------------------------------
+
+# scripts/build-core.lisp, release-server kind, run by the real SBCL against a
+# stub release whose bundled build/asdf.lisp only sets ASDF's version string.
+# A version other than 3.3.7.4 must stop the build before anything loads; the
+# same stub at 3.3.7.4 must pass that check, so the refusal is the version's.
+build_core_with_asdf() {
+    local version=$1 rel="$WORK/asdf-stub-$1"
+    mkdir -p "$rel/deps/local-projects/asdf/build"
+    printf '(setf (symbol-value (find-symbol "*ASDF-VERSION*" "ASDF")) "%s")\n' "$version" \
+        > "$rel/deps/local-projects/asdf/build/asdf.lisp"
+    OUT=$(env -u CL_SOURCE_REGISTRY -u ASDF_OUTPUT_TRANSLATIONS \
+              XDG_CACHE_HOME="$WORK/cache" \
+              DSMR_CORE_KIND=release-server \
+              DSMR_CORE_OUTPUT="$rel/dsmr.core" \
+              DSMR_RELEASE_ROOT="$rel/" \
+              DSMR_RELEASE_COMMIT=0000000000000000000000000000000000000000 \
+              timeout 120 "$REAL_SBCL" --noinform --no-sysinit --no-userinit \
+              --disable-debugger --non-interactive \
+              --load "$REPO_ROOT/scripts/build-core.lisp" 2>&1)
+    RC=$?
+}
+
+note "release build ASDF"
+REAL_SBCL=$(command -v sbcl || true)
+if [ -z "$REAL_SBCL" ]; then
+    bad "a release build refuses another ASDF" "no sbcl on PATH"
+else
+    build_core_with_asdf 3.3.6
+    try "a release build with ASDF 3.3.6 exits 1" "rc=$RC: $OUT" test "$RC" -eq 1
+    try "it names the version it needs" "$OUT" \
+        has "$OUT" "[build-core] ASDF 3.3.6 is loaded; a release build needs 3.3.7.4 from $WORK/asdf-stub-3.3.6/deps/"
+    try "it writes no core" "$(ls "$WORK/asdf-stub-3.3.6")" test ! -e "$WORK/asdf-stub-3.3.6/dsmr.core"
+    build_core_with_asdf 3.3.7.4
+    try "the same stub at 3.3.7.4 passes the version check" "$OUT" \
+        has "$OUT" "[build-core] release root: $WORK/asdf-stub-3.3.7.4/ (ASDF 3.3.7.4)"
+    try "and is not refused for its ASDF" "$OUT" lacks "$OUT" "a release build needs"
+fi
 
 printf '\ndeploy-test: %s passed, %s failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
