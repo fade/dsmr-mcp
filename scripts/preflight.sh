@@ -415,15 +415,19 @@ self_test() {
     # A release whose core is not a core, otherwise complete. The launcher's own
     # check must refuse it at the boot probe.
     local rel="$tmp/fake-home/releases/fake"
-    mkdir -p "$rel/core" "$rel/bin"
+    mkdir -p "$rel/core" "$rel/bin" "$rel/scripts"
     chmod -R go-w "$tmp/fake-home"
     printf 'not a core' > "$rel/core/dsmr.core"
     printf 'sbcl-version %s\n' "$(running_sbcl_version)" > "$rel/core/dsmr.core.manifest"
     printf 'commit 0000000\n' > "$rel/MANIFEST"
     printf '#!/bin/sh\n' > "$rel/bin/dsmr-mcp-launch"
+    : > "$rel/scripts/release-paths.sh"
     chmod -R go-w "$rel"
-    if release_problem "$rel" >/dev/null; then
+    local boot_problem
+    if boot_problem=$(release_problem "$rel"); then
         printf '  FAIL  release check accepted a core that does not boot\n'; status=1
+    elif [[ $boot_problem != *"does not boot"* ]]; then
+        printf '  FAIL  release check refused the unbootable core for another reason: %s\n' "$boot_problem"; status=1
     else printf '  pass  release check fires on a core that does not boot\n'; fi
 
     # A deploy home others can write is refused by the launcher, so the release
