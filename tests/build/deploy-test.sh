@@ -460,8 +460,8 @@ try "the current release is still read-only" "writable: $(find "$HX/releases/$C2
 
 deploy "$HX" "$C1"
 try "a failed verify of the previous release fails the deploy" "rc=$RC: $OUT" test "$RC" -eq 1
-try "the failure says the previous release was left as it is" "$OUT" \
-    has "$OUT" "$HX/releases/$C1 is the release previous names, so it was left as it is"
+try "the failure says the previous release is unchanged" "$OUT" \
+    has "$OUT" "$HX/releases/$C1 is the release previous names and is unchanged"
 try "the previous release keeps its MANIFEST" "MANIFEST gone" test -f "$HX/releases/$C1/MANIFEST"
 try "current is unchanged by it" "current=$(link "$HX/current")" test "$(link "$HX/current")" = "releases/$C2"
 try "previous is unchanged by it" "previous=$(link "$HX/previous")" test "$(link "$HX/previous")" = "releases/$C1"

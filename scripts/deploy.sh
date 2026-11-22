@@ -624,7 +624,7 @@ live_role() {
 reject_release() {
   local stage="$1" problem="$2" rel="$3" role="$4"
   if [ -n "$role" ]; then
-    fail "$stage" "$problem; $rel is the release $role names, so it was left as it is"
+    fail "$stage" "$problem; $rel is the release $role names and is unchanged"
   fi
   chmod -R u+w "$rel"
   rm -f "$rel/MANIFEST"

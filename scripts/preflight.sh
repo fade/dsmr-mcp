@@ -209,7 +209,7 @@ check_mcp() {
 }
 
 # ---------------------------------------------------------------------------
-# The deployed release. Checked in two steps, and never rebuilt here.
+# The deployed release. Checked in three steps, and never rebuilt here.
 #
 # First release_refusal, the function the release launcher and `make register`
 # refuse with: HOME set, no git work tree around the release, ownership and
