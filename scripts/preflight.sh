@@ -33,9 +33,9 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 CONSTELLATION="$REPO_ROOT/docs/CONSTELLATION.org"
 
-# dsmr_home, physical_dir, inside_work_tree and release_problem: the checks the
-# release launcher refuses with, so preflight cannot pass a release the
-# launcher would refuse.
+# dsmr_home, physical_dir, inside_work_tree and release_refusal: the checks the
+# release launcher and `make register` refuse with, so preflight cannot pass a
+# release either would refuse.
 # shellcheck source=release-paths.sh
 . "$REPO_ROOT/scripts/release-paths.sh"
 
@@ -211,20 +211,21 @@ check_mcp() {
 # ---------------------------------------------------------------------------
 # The deployed release. Checked in two steps, and never rebuilt here.
 #
-# First release_problem, the function the release launcher refuses with:
-# ownership and write permission of every path the release's code or cores can
-# be replaced through (release_path_problem), the core and its manifests
-# present, the core built by this host's SBCL, and a boot probe. Then
-# worker_core_withheld, the launcher's own test of the worker core, which a
+# First release_refusal, the function the release launcher and `make register`
+# refuse with: HOME set, no git work tree around the release, ownership and
+# write permission of every path the release's code or cores can be replaced
+# through (release_path_problem), the core and its manifests present, the
+# core's recorded SBCL version equal to the running SBCL's, and a boot probe.
+# Then worker_core_withheld, the launcher's own test of the worker core, which a
 # deploy always builds, so a withheld one is a failure. Then the release guard,
 # booted from the release's own server core with the release root and launcher
 # the launcher would pass, which reports any loaded system or launcher tied to
 # a checkout or outside the release, and whether the image is sealed.
 #
 # Booting is the only reliable test. A recorded SBCL version cannot tell one
-# host's build from another's of the same version, and a truncated or
-# interrupted image passes every file check; only SBCL loading the image
-# catches those. A rebuild takes minutes and is a deploy, which the leader runs.
+# build from another of the same version, and a truncated or interrupted image
+# passes every file check; only SBCL loading the image catches those. A rebuild
+# takes minutes and is a deploy, which the operator runs.
 # ---------------------------------------------------------------------------
 
 # release_guard ROOT
@@ -266,7 +267,7 @@ check_release() {
         bad "$home/current does not name a directory" "make deploy REF=<sha>"
         return
     fi
-    if ! problem=$(release_problem "$root"); then
+    if ! problem=$(release_refusal "$root"); then
         bad "${problem%%; *}" "${problem#*; }"
         return
     fi
@@ -440,7 +441,7 @@ self_test() {
     : > "$rel/scripts/release-paths.sh"
     chmod -R go-w "$rel"
     local boot_problem
-    if boot_problem=$(release_problem "$rel"); then
+    if boot_problem=$(release_refusal "$rel"); then
         printf '  FAIL  release check accepted a core that does not boot\n'; status=1
     elif [[ $boot_problem != *"does not boot"* ]]; then
         printf '  FAIL  release check refused the unbootable core for another reason: %s\n' "$boot_problem"; status=1
@@ -477,6 +478,17 @@ self_test() {
         printf '  FAIL  release check passed a deploy home others can write\n'; status=1
     else printf '  pass  release check fires on a deploy home others can write\n'; fi
     chmod g-w "$dhome"
+
+    # The launcher also refuses a release root inside a git work tree and an
+    # empty HOME, which release_problem alone does not check.
+    git init -q "$dhome" 2>/dev/null
+    if checks_release; then
+        printf '  FAIL  release check passed a release root inside a git work tree\n'; status=1
+    else printf '  pass  release check fires on a release root inside a git work tree\n'; fi
+    rm -rf "$dhome/.git"
+    if HOME='' checks_release; then
+        printf '  FAIL  release check passed with HOME empty\n'; status=1
+    else printf '  pass  release check fires with HOME empty\n'; fi
 
     # A worker core the launcher withholds fails every hermetic spawn: o+w
     # manifest, then no worker core at all.
@@ -572,7 +584,7 @@ self_test() {
     else printf '  pass  registration refuses a scratch XDG_DATA_HOME\n'; fi
     if registers CLAUDE_CONFIG="$tmp/other.json"; then
         printf '  FAIL  registration ran while CLAUDE_CONFIG names another file\n'; status=1
-    else printf '  pass  registration refuses a CLAUDE_CONFIG it cannot write\n'; fi
+    else printf '  pass  registration refuses a CLAUDE_CONFIG that claude mcp add does not write\n'; fi
     if registers && registers CLAUDE_CONFIG="$acct/.claude.json"; then
         printf '  pass  registration runs for the account'"'"'s own home and config\n'
     else printf '  FAIL  registration cannot run for the account'"'"'s own home\n'; status=1; fi
