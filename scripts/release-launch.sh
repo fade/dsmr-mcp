@@ -178,7 +178,7 @@ run_server() {
   export DSMR_LAUNCHER_PATH="$launcher"
   unset DSMR_ALLOW_SOURCE_WORKERS
   # Offered only on status 1, the check's answer for "may be offered". Any
-  # other status, including 127 for a function the sourced file lacks, withholds.
+  # other status withholds, and a missing function leaves wstatus at 0.
   local reason wstatus=0
   if declare -F worker_core_withheld >/dev/null; then
     reason="$(worker_core_withheld "$root")" || wstatus=$?

@@ -162,7 +162,7 @@ bridge:
 ##   registry, so the binaries resolve every dependency from the bundle and
 ##   nothing from the host's Quicklisp, workspace or source registry
 ##   configuration. The bundled ASDF is loaded as a file because the bundle's
-##   searcher knows only primary system names: a build of asdf/defsystem
+##   searcher resolves only primary system names: a build of asdf/defsystem
 ##   through any registry still open regenerates another checkout's
 ##   build/asdf.lisp. `make deploy` sets it to the release's own
 ##   <release>/deps/setup.lisp and runs the build in the release, so the bus
@@ -392,7 +392,7 @@ check-host-unit:
 ##   checkout, and consents to the named repos' .envrc files. Anything needing
 ##   root, and anything that takes minutes, is reported with a remedy instead
 ##   of being run: deploying a release is `make deploy REF=<sha>`, which the
-##   leader runs after review.
+##   operator runs after review.
 ##
 ##   `sisters.sh` runs this before it starts anything and refuses to launch on a
 ##   non-zero answer. Run it by hand to provision a new host, or to find out why
@@ -424,7 +424,7 @@ self-test-preflight:
 ##   its server core with that release's root and launcher and prints the guard
 ##   report: whether the image is sealed, each tie to a checkout or to a path
 ##   outside the release, and `ties <n>`. Exits non-zero when the release would
-##   be refused or the report is red. For CI and for the leader after a deploy:
+##   be refused or the report is red. For CI and for the operator after a deploy:
 ##   make check-release DSMR_HOME=<scratch home>
 check-release:
 	@DSMR_HOME="$(DSMR_HOME)" SBCL="$(SBCL)" ./scripts/preflight.sh --check-release
@@ -1090,7 +1090,7 @@ rollback:
 ##   <DSMR_HOME>/current/bin/dsmr-mcp-launch, so later deploys and rollbacks
 ##   need no new registration. The installer backs the config up first, keeps
 ##   the entry's env settings and adds DSMR_READ_ROOTS when it is absent, then
-##   prints the result. The leader runs it once per host, after the first
+##   prints the result. The operator runs it once per host, after the first
 ##   deploy; running sessions pick it up only when they restart. Refuses when no
 ##   release is deployed, when the launcher would refuse the release (the
 ##   launcher's own checks, release_refusal, which it boots through once, by
