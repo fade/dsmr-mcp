@@ -14,9 +14,11 @@
 ;;;; workers were started with before the rename, which put this server's own
 ;;;; tree first in ASDF's lookup, never loads the subject at all.
 ;;;;
-;;;; A last release case roots the worker at a copy of jzon, a dependency the
+;;;; The last release cases root the worker at a copy of a dependency the
 ;;;; release worker core itself loads and holds immutable, with one extra
-;;;; function, and checks that the copy is what loads.
+;;;; function, and check that the copy is what loads: jzon with its .asd at the
+;;;; root, jzon with its .asd one directory down, and a sly tree, whose
+;;;; slynk.asd is in slynk/.
 
 (defpackage #:dsmr-mcp/tests/integration/hermetic/subject-tree-worker-test
   (:use #:cl #:zebra)
@@ -241,10 +243,12 @@ the process exits."
                 (format out "~%(defun subject-marker () :subject-tree)~%"))
               (setf (gethash release *dependency-subjects*) dir)))))))
 
-(defun observe-dependency-load (core subject)
-  "Spawn a worker from CORE rooted at SUBJECT, load *dependency-system* without
-force, and return a plist of :status, :source-directory and :marker, the value
-SUBJECT-MARKER returns in jzon's package, or NIL when it is absent."
+(defun observe-dependency-load (core subject &key (system *dependency-system*)
+                                                  (package "COM.INUOE.JZON"))
+  "Spawn a worker from CORE rooted at SUBJECT, load SYSTEM (default
+*dependency-system*) without force, and return a plist of :status,
+:source-directory and :marker, the value SUBJECT-MARKER returns in PACKAGE, or
+NIL when it is absent."
   (let ((*error-output* (make-string-output-stream))
         (*worker-core-disabled* nil)
         (worker nil))
@@ -252,7 +256,7 @@ SUBJECT-MARKER returns in jzon's package, or NIL when it is absent."
     (unwind-protect
          (let ((params (make-hash-table :test 'equal)))
            (setf worker (spawn-worker :core core :root subject))
-           (setf (gethash "system" params) *dependency-system*
+           (setf (gethash "system" params) system
                  (gethash "force" params) nil
                  (gethash "timeout_seconds" params) *load-timeout-seconds*)
            (let ((reply (worker-rpc worker "worker/load-system" params
@@ -261,9 +265,10 @@ SUBJECT-MARKER returns in jzon's package, or NIL when it is absent."
                    :source-directory (gethash "source_directory" reply)
                    :marker (%between
                             (%eval-text worker
-                                        "(let* ((p (find-package \"COM.INUOE.JZON\"))
+                                        (format nil "(let* ((p (find-package ~S))
                                                 (s (and p (find-symbol \"SUBJECT-MARKER\" p))))
-                                           (format nil \"marker=~S\" (and s (fboundp s) (funcall s))))")
+                                           (format nil \"marker=~~S\" (and s (fboundp s) (funcall s))))"
+                                                package))
                             "marker=" "\""))))
       (when worker (ignore-errors (kill-worker worker))))))
 
@@ -283,6 +288,84 @@ directory, and the copy's own function is there afterwards."
                   "source_directory ~S; expected the subject tree ~A"
                   (getf seen :source-directory) subject)
             (is equal ":SUBJECT-TREE" (getf seen :marker) "~S" seen))))))
+
+(defvar *nested-subjects* (make-hash-table :test 'equal)
+  "The nested subject trees made by NESTED-SUBJECT, keyed by release and layout.")
+
+(defun nested-subject (core layout)
+  "A writable subject tree whose .asd sits one directory below the root, made
+from the sources bundled in the release holding CORE, with SUBJECT-MARKER
+appended to one source file. LAYOUT :jzon puts a copy of jzon under src/, as
+upstream jzon lays out its sources; LAYOUT :slynk copies the sly tree, which
+keeps slynk.asd in slynk/. Returns (root . asd-directory) as namestrings, or
+NIL when the release bundles no such system. Made once per release and layout
+and removed when the process exits."
+  (let* ((release (namestring (%release-root core)))
+         (key (format nil "~A|~A" release layout)))
+    (or (gethash key *nested-subjects*)
+        (destructuring-bind (pattern up below marker-file)
+            (ecase layout
+              (:jzon '("deps/software/*/com.inuoe.jzon.asd" 0 "src/" "src/jzon.lisp"))
+              (:slynk '("deps/software/*/slynk/slynk.asd" 1 "" "slynk/slynk.lisp")))
+          (let ((asd (first (directory (merge-pathnames pattern release)))))
+            (when asd
+              (let* ((from (uiop:pathname-directory-pathname asd))
+                     (from (if (= up 1) (uiop:pathname-parent-directory-pathname from) from))
+                     (root (namestring
+                            (uiop:ensure-directory-pathname
+                             (string-right-trim
+                              '(#\Newline)
+                              (uiop:run-program '("mktemp" "-d" "/tmp/dsmr-subject-nested.XXXXXX")
+                                                :output :string)))))
+                     (copy (namestring (merge-pathnames below root))))
+                (push (lambda () (ignore-errors (uiop:delete-directory-tree
+                                                 (pathname root) :validate t)))
+                      sb-ext:*exit-hooks*)
+                (uiop:run-program
+                 (list "sh" "-c"
+                       (format nil "mkdir -p ~A && cp -R ~A/. ~A && chmod -R u+w ~A"
+                               (uiop:escape-sh-token copy)
+                               (uiop:escape-sh-token (namestring from))
+                               (uiop:escape-sh-token copy)
+                               (uiop:escape-sh-token root)))
+                 :error-output :string)
+                (with-open-file (out (merge-pathnames marker-file copy)
+                                     :direction :output :if-exists :append)
+                  (format out "~%(defun subject-marker () :subject-tree)~%"))
+                (setf (gethash key *nested-subjects*)
+                      (cons root (namestring (uiop:pathname-directory-pathname
+                                              (merge-pathnames (enough-namestring asd from)
+                                                               copy))))))))))))
+
+(defun %check-nested-load (core layout system package)
+  "Root a release worker from CORE at the LAYOUT subject of NESTED-SUBJECT, load
+SYSTEM, and assert that it loaded from the subject's nested .asd directory and
+that SUBJECT-MARKER is defined in PACKAGE afterwards."
+  (let ((subject (nested-subject core layout)))
+    (if (null subject)
+        (skip ("the release holding ~A bundles no ~A" core system))
+        (destructuring-bind (root . asd-dir) subject
+          (let ((seen (observe-dependency-load core root :system system :package package)))
+            (is equal "loaded" (getf seen :status) "~S" seen)
+            (true (and (getf seen :source-directory)
+                       (uiop:pathname-equal (truename (getf seen :source-directory))
+                                            (truename asd-dir)))
+                  "source_directory ~S; expected the subject's ~A"
+                  (getf seen :source-directory) asd-dir)
+            (is equal ":SUBJECT-TREE" (getf seen :marker) "~S" seen))))))
+
+(define-test a-dependency-with-a-nested-asd-loads-from-the-subject
+  "A release worker rooted at a tree that keeps jzon's .asd in src/, as upstream
+jzon does, loads com.inuoe.jzon from that directory rather than the copy the
+worker core holds."
+  (with-release-worker-core-or-skip (core)
+    (%check-nested-load core :jzon "com.inuoe.jzon" "COM.INUOE.JZON")))
+
+(define-test a-sly-tree-loads-its-own-slynk
+  "A release worker rooted at a sly tree, which keeps slynk.asd in slynk/, loads
+slynk from that directory rather than the copy the worker core holds."
+  (with-release-worker-core-or-skip (core)
+    (%check-nested-load core :slynk "slynk" "SLYNK")))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Controls

@@ -262,40 +262,84 @@ is left for ASDF to redo at the worker's first system lookup, as a worker
 booted from the worker core does."
   (asdf:clear-source-registry))
 
+(defparameter *subject-asd-depth* 2
+  "How many directories below the project root %subject-asd-files looks for
+.asd files. A subject whose .asd lies deeper still loads the image's copy.")
+
+(defparameter *subject-skipped-directories* '("deps" "build" "_build" "target")
+  "Directory names %subject-asd-files never descends into, besides hidden ones:
+vendored dependencies and build output, whose .asd files are not the subject's.")
+
+(defun %subject-asd-files (dir)
+  "Return the .asd files in DIR and in its subdirectories at most
+*subject-asd-depth* levels down, shallowest first and sorted by name within a
+level. Hidden directories, those named in *subject-skipped-directories*, and
+any whose truename lies outside DIR are not entered."
+  (let* ((root (truename dir))
+         (found '())
+         (level (list root)))
+    (flet ((sorted (paths)
+             (sort (copy-list paths) #'string< :key #'namestring))
+           (descend-p (sub)
+             (let ((name (car (last (pathname-directory sub)))))
+               (and (stringp name)
+                    (not (uiop:string-prefix-p "." name))
+                    (not (member name *subject-skipped-directories* :test #'string=))
+                    (let ((true (ignore-errors (truename sub))))
+                      (and true (uiop:subpathp true root)))))))
+      (loop repeat (1+ *subject-asd-depth*)
+            while level
+            do (dolist (d level)
+                 (dolist (file (sorted (uiop:directory-files d "*.asd")))
+                   (push file found)))
+               (setf level (loop for d in level
+                                 nconc (remove-if-not #'descend-p
+                                                      (sorted (uiop:subdirectories d)))))))
+    (nreverse found)))
+
 (defun %release-subject-systems (dir)
-  "Make every immutable system that a .asd file directly in DIR defines
-loadable from DIR again, and return the names released.
+  "Make every immutable system that a .asd file of the subject tree DIR defines
+loadable from that tree again, and return the names released.
 
 A release worker core registers its dependencies immutable, and ASDF's
 find-system answers an immutable system from the image before any search
 function runs, so without this a worker rooted at a checkout of one of those
 dependencies loads the image's copy instead of the tree. A system counts as
-defined by DIR when its primary system name is the name of a .asd file
-directly in DIR, the files asdf:*central-registry* finds there. Each released
-system is removed from ASDF's immutable set and cleared, and logged as
-worker.subject-shadows-dependency. ASDF has no public call to undo
-register-immutable-system, so the set is reached by name and an image without
-one releases nothing."
+defined by the tree when its primary system name is the name of a .asd file
+%subject-asd-files finds; the shallowest such file wins. Each released system
+is removed from ASDF's immutable set and cleared, the directory of its .asd is
+placed in asdf:*central-registry* right after DIR unless it is DIR, and the
+release is logged as worker.subject-shadows-dependency with that directory.
+ASDF has no public call to undo register-immutable-system, so the set is
+reached by name and an image without one releases nothing."
   (let* ((symbol (and dir (uiop:find-symbol* '#:*immutable-systems*
                                              '#:asdf/system-registry nil)))
          (table (and symbol (symbol-value symbol)))
-         (primaries (and (hash-table-p table)
-                         (mapcar #'pathname-name (uiop:directory-files dir "*.asd"))))
+         (asds (and (hash-table-p table) (%subject-asd-files dir)))
          (released '()))
-    (when primaries
+    (when asds
       (maphash (lambda (name flag)
                  (declare (ignore flag))
-                 (when (member (asdf:primary-system-name name) primaries
-                               :test #'string-equal)
-                   (push name released)))
+                 (let ((asd (find (asdf:primary-system-name name) asds
+                                  :key #'pathname-name :test #'string-equal)))
+                   (when asd
+                     (push (cons name (uiop:pathname-directory-pathname asd)) released))))
                table)
-      (dolist (name released)
-        (remhash name table)
-        (asdf:clear-system name)
-        (log-event :info "worker.subject-shadows-dependency"
-                   "system" name
-                   "path" (namestring dir))))
-    released))
+      (dolist (entry released)
+        (destructuring-bind (name . home) entry
+          (remhash name table)
+          (asdf:clear-system name)
+          (unless (uiop:pathname-equal home (truename dir))
+            (setf asdf:*central-registry*
+                  (if (and asdf:*central-registry*
+                           (equal (first asdf:*central-registry*) dir))
+                      (list* dir home (remove home (rest asdf:*central-registry*)
+                                              :test #'equal))
+                      (cons home (remove home asdf:*central-registry* :test #'equal)))))
+          (log-event :info "worker.subject-shadows-dependency"
+                     "system" name
+                     "path" (namestring home)))))
+    (mapcar #'car released)))
 
 (defun %register-project-root (dir)
   "Put DIR first in asdf:*central-registry*, so the rooted project's .asd files

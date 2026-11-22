@@ -183,7 +183,15 @@ packages, =DSMR-WORKER/...= rather than =dsmr-mcp/...=, its own dsmr-mcp
 system definitions are cleared, and its dependencies are marked immutable. A
 worker registers the project it is rooted at ahead of anything else, so a
 subject that is a dsmr-mcp tree loads from that tree, beside the worker's own
-code, without redefining it. Every run-time lookup of a support package goes
+code, without redefining it.
+
+A subject may also be one of those dependencies. At start the worker looks for
+=.asd= files in the project root and up to two directories below it, skipping
+hidden directories and =deps/=, =build/=, =_build/= and =target/=. Each
+immutable system one of them defines is released and loads from the subject's
+directory, and the worker logs =worker.subject-shadows-dependency= with the
+system and that directory. A subject whose =.asd= lies deeper loads the
+image's copy. Every run-time lookup of a support package goes
 through a helper that follows the image's prefix, so the same code serves
 under either name.
 
