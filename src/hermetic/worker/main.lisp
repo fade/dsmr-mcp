@@ -266,9 +266,21 @@ booted from the worker core does."
   "How many directories below the project root %subject-asd-files looks for
 .asd files. A subject whose .asd lies deeper still loads the image's copy.")
 
-(defparameter *subject-skipped-directories* '("deps" "build" "_build" "target")
-  "Directory names %subject-asd-files never descends into, besides hidden ones:
-vendored dependencies and build output, whose .asd files are not the subject's.")
+(defparameter *subject-skipped-directories*
+  '("ocicl" "vendor" "vendored" "third_party" "third-party" "lib"
+    "quicklisp" "local-projects" "dists" "systems" "bundle" "deps"
+    "build" "_build" "target")
+  "Directory names %subject-asd-files never descends into, besides hidden ones
+such as .qlot and .bundle-libs. Each holds .asd files that are not the
+subject's own:
+
+- ocicl: ocicl's project-local systems, ocicl/<name>-<version>/.
+- vendor, vendored, third_party, third-party, lib: vendored checkouts and git
+  submodules.
+- quicklisp, local-projects, dists: a Quicklisp installation or its parts.
+- systems: an ASDF directory of .asd links.
+- bundle, deps: a ql:bundle-systems bundle and a release's dependencies.
+- build, _build, target: build output.")
 
 (defun %subject-asd-files (dir)
   "Return the .asd files in DIR and in its subdirectories at most

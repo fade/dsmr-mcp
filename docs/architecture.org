@@ -187,7 +187,11 @@ code, without redefining it.
 
 A subject may also be one of those dependencies. At start the worker looks for
 =.asd= files in the project root and up to two directories below it, skipping
-hidden directories and =deps/=, =build/=, =_build/= and =target/=. Each
+hidden directories (=.qlot/= among them), directories that hold vendored
+dependencies (=ocicl/=, =vendor/=, =vendored/=, =third_party/=,
+=third-party/=, =lib/=, =quicklisp/=, =local-projects/=, =dists/=,
+=systems/=, =bundle/= and =deps/=) and build output (=build/=, =_build/= and
+=target/=). Each
 immutable system one of them defines is released and loads from the subject's
 directory, and the worker logs =worker.subject-shadows-dependency= with the
 system and that directory. A subject whose =.asd= lies deeper loads the

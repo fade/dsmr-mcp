@@ -18,7 +18,8 @@
 ;;;; release worker core itself loads and holds immutable, with one extra
 ;;;; function, and check that the copy is what loads: jzon with its .asd at the
 ;;;; root, jzon with its .asd one directory down, and a sly tree, whose
-;;;; slynk.asd is in slynk/.
+;;;; slynk.asd is in slynk/. A tree that vendors jzon under ocicl/ or vendor/
+;;;; loads the worker core's copy instead.
 
 (defpackage #:dsmr-mcp/tests/integration/hermetic/subject-tree-worker-test
   (:use #:cl #:zebra)
@@ -293,11 +294,13 @@ directory, and the copy's own function is there afterwards."
   "The nested subject trees made by NESTED-SUBJECT, keyed by release and layout.")
 
 (defun nested-subject (core layout)
-  "A writable subject tree whose .asd sits one directory below the root, made
+  "A writable subject tree whose .asd sits below the root, made
 from the sources bundled in the release holding CORE, with SUBJECT-MARKER
 appended to one source file. LAYOUT :jzon puts a copy of jzon under src/, as
 upstream jzon lays out its sources; LAYOUT :slynk copies the sly tree, which
-keeps slynk.asd in slynk/. Returns (root . asd-directory) as namestrings, or
+keeps slynk.asd in slynk/. LAYOUT :ocicl and :vendor put a copy of jzon two
+directories down, as ocicl vendors it into ocicl/<name>-<version>/ and a
+submodule into vendor/<name>/. Returns (root . asd-directory) as namestrings, or
 NIL when the release bundles no such system. Made once per release and layout
 and removed when the process exits."
   (let* ((release (namestring (%release-root core)))
@@ -306,7 +309,11 @@ and removed when the process exits."
         (destructuring-bind (pattern up below marker-file)
             (ecase layout
               (:jzon '("deps/software/*/com.inuoe.jzon.asd" 0 "src/" "src/jzon.lisp"))
-              (:slynk '("deps/software/*/slynk/slynk.asd" 1 "" "slynk/slynk.lisp")))
+              (:slynk '("deps/software/*/slynk/slynk.asd" 1 "" "slynk/slynk.lisp"))
+              (:ocicl '("deps/software/*/com.inuoe.jzon.asd" 0 "ocicl/jzon-1.0/"
+                        "src/jzon.lisp"))
+              (:vendor '("deps/software/*/com.inuoe.jzon.asd" 0 "vendor/jzon/"
+                         "src/jzon.lisp")))
           (let ((asd (first (directory (merge-pathnames pattern release)))))
             (when asd
               (let* ((from (uiop:pathname-directory-pathname asd))
@@ -366,6 +373,22 @@ worker core holds."
 slynk from that directory rather than the copy the worker core holds."
   (with-release-worker-core-or-skip (core)
     (%check-nested-load core :slynk "slynk" "SLYNK")))
+
+(define-test a-vendored-dependency-is-not-loaded-from-the-subject
+  "A release worker rooted at a tree that vendors jzon under ocicl/ or vendor/
+loads com.inuoe.jzon from the copy the worker core holds, not the vendored one."
+  (with-release-worker-core-or-skip (core)
+    (dolist (layout '(:ocicl :vendor))
+      (let ((subject (nested-subject core layout)))
+        (if (null subject)
+            (skip ("the release holding ~A bundles no jzon" core))
+            (let ((seen (observe-dependency-load core (car subject))))
+              (is equal "loaded" (getf seen :status) "~A: ~S" layout seen)
+              (false (and (getf seen :source-directory)
+                          (%under-p (getf seen :source-directory) (car subject)))
+                     "~A: source_directory ~S is inside the subject ~A"
+                     layout (getf seen :source-directory) (car subject))
+              (is equal "NIL" (getf seen :marker) "~A: ~S" layout seen)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Controls
