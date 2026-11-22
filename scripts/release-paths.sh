@@ -109,31 +109,44 @@ others_can_write() {
   [ -e "$1" ] && [ -n "$(find "$1" -maxdepth 0 -perm /022 2>/dev/null)" ]
 }
 
-# release_problem ROOT
-# Check the release at ROOT before anything boots from it. Print
-# `<reason>; <remedy>` for the first problem found and return 1, or print
-# nothing and return 0. Checks in order: ownership of the root, core/, the
-# server core, its manifest and bin/dsmr-mcp-launch; group or world write on the
-# root, core/, the core and its manifest; the core, its manifest and MANIFEST
-# present; the core's sbcl-version equal to the
-# running SBCL's; a boot of the core that exits 0, with stdin and stdout closed
-# and DSMR_BOOT_PROBE_TIMEOUT seconds (default 30) to do it.
-release_problem() {
-  local root="$1" core="$1/core/dsmr.core" path recorded current status
-  for path in "$root" "$root/core" "$core" "$core.manifest" "$root/bin/dsmr-mcp-launch"; do
+# release_path_problem ROOT [LAUNCHER]
+# Print `<reason>; <remedy>` and return 1 when a path the release's code or
+# cores can be replaced through is owned by another user or is group or world
+# writable; print nothing and return 0 when all are sound. The paths: the
+# deploy home and releases/ above ROOT, ROOT, scripts/,
+# scripts/release-paths.sh, bin/, LAUNCHER (default bin/dsmr-mcp-launch),
+# core/, the server core and its manifest. A path that does not exist is left
+# to the presence checks of release_problem. The launcher and preflight both
+# refuse with this list.
+release_path_problem() {
+  local root="$1" launcher="${2:-$1/bin/dsmr-mcp-launch}" path
+  for path in "$(dirname "$(dirname "$root")")" "$(dirname "$root")" "$root" \
+              "$root/scripts" "$root/scripts/release-paths.sh" "$root/bin" "$launcher" \
+              "$root/core" "$root/core/dsmr.core" "$root/core/dsmr.core.manifest"; do
     if foreign_owned "$path"; then
       printf '%s is not owned by %s; restore ownership and permissions of %s\n' \
              "$path" "$(id -un)" "$path"
       return 1
     fi
-  done
-  for path in "$root" "$root/core" "$core" "$core.manifest"; do
     if others_can_write "$path"; then
       printf '%s is group or world writable; restore ownership and permissions of %s\n' \
              "$path" "$path"
       return 1
     fi
   done
+  return 0
+}
+
+# release_problem ROOT [LAUNCHER]
+# Check the release at ROOT before anything boots from it. Print
+# `<reason>; <remedy>` for the first problem found and return 1, or print
+# nothing and return 0. Checks in order: release_path_problem ROOT LAUNCHER;
+# the core, its manifest and MANIFEST present; the core's sbcl-version equal to
+# the running SBCL's; a boot of the core that exits 0, with stdin and stdout
+# closed and DSMR_BOOT_PROBE_TIMEOUT seconds (default 30) to do it.
+release_problem() {
+  local root="$1" core="$1/core/dsmr.core" path recorded current status
+  release_path_problem "$root" "${2:-}" || return 1
   for path in "$core" "$core.manifest" "$root/MANIFEST"; do
     if [ ! -f "$path" ]; then
       printf 'no %s; run make deploy REF=<sha>\n' "$path"

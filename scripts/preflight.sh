@@ -213,8 +213,9 @@ check_mcp() {
 # The deployed release. Checked in two steps, and never rebuilt here.
 #
 # First release_problem, the function the release launcher refuses with:
-# ownership, write permission, the core and its manifests present, the core
-# built by this host's SBCL, and a boot probe. Then the release guard, booted
+# ownership and write permission of every path the release's code or cores can
+# be replaced through (release_path_problem), the core and its manifests
+# present, the core built by this host's SBCL, and a boot probe. Then the release guard, booted
 # from the release's own server core with the release root and launcher the
 # launcher would pass, which reports any loaded system or launcher tied to a
 # checkout or outside the release, and whether the image is sealed.
@@ -407,8 +408,9 @@ self_test() {
 
     # A release whose core is not a core, otherwise complete. The launcher's own
     # check must refuse it at the boot probe.
-    local rel="$tmp/fake-release"
+    local rel="$tmp/fake-home/releases/fake"
     mkdir -p "$rel/core" "$rel/bin"
+    chmod -R go-w "$tmp/fake-home"
     printf 'not a core' > "$rel/core/dsmr.core"
     printf 'sbcl-version %s\n' "$(running_sbcl_version)" > "$rel/core/dsmr.core.manifest"
     printf 'commit 0000000\n' > "$rel/MANIFEST"
@@ -417,6 +419,36 @@ self_test() {
     if release_problem "$rel" >/dev/null; then
         printf '  FAIL  release check accepted a core that does not boot\n'; status=1
     else printf '  pass  release check fires on a core that does not boot\n'; fi
+
+    # A deploy home others can write is refused by the launcher, so the release
+    # check must block it too. The control is the same home with sound
+    # permissions passing, which needs a core that boots: a stub SBCL reports
+    # the version the manifest records and exits 0 for the probe and the guard.
+    local sbin="$tmp/sbcl-bin" dhome="$tmp/deploy-home" drel
+    drel="$dhome/releases/r"
+    mkdir -p "$sbin" "$drel/core" "$drel/bin" "$drel/scripts"
+    printf '#!/bin/sh\ncase " $* " in *" --version "*) echo "SBCL 9.9.9" ;; esac\nexit 0\n' \
+        > "$sbin/sbcl"
+    chmod +x "$sbin/sbcl"
+    printf 'core' > "$drel/core/dsmr.core"
+    printf 'sbcl-version 9.9.9\n' > "$drel/core/dsmr.core.manifest"
+    printf 'commit 0000000\n' > "$drel/MANIFEST"
+    printf '#!/bin/sh\n' > "$drel/bin/dsmr-mcp-launch"
+    chmod +x "$drel/bin/dsmr-mcp-launch"
+    cp "$REPO_ROOT/scripts/release-paths.sh" "$drel/scripts/release-paths.sh"
+    ln -s releases/r "$dhome/current"
+    chmod -R go-w "$dhome"
+    checks_release() {
+        SBCL="$sbin/sbcl" DSMR_HOME="$dhome" "$0" --check-release >/dev/null 2>&1
+    }
+    if checks_release; then
+        printf '  pass  release check passes a sound release\n'
+    else printf '  FAIL  release check refused a sound release\n'; status=1; fi
+    chmod g+w "$dhome"
+    if checks_release; then
+        printf '  FAIL  release check passed a deploy home others can write\n'; status=1
+    else printf '  pass  release check fires on a deploy home others can write\n'; fi
+    chmod g-w "$dhome"
 
     # A registration naming a launcher inside a checkout is flagged; one outside
     # every work tree is not, or the check is stuck on red.

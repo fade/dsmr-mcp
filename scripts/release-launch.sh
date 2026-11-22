@@ -16,11 +16,11 @@
 #   - HOME is unset or empty;
 #   - the launcher's physical path or the release root is inside a git work
 #     tree;
-#   - the deploy home, releases/, the root, scripts/, scripts/release-paths.sh,
-#     bin/ or the launcher is not owned by the running user or is group or
+#   - the deploy home, releases/, the root, scripts/ or
+#     scripts/release-paths.sh is not owned by the running user or is group or
 #     world writable (checked before anything from the release is sourced);
-#   - core/, the core or its manifest is not owned by the running user or is
-#     group or world writable;
+#   - bin/, the launcher, core/, the core or its manifest is not owned by the
+#     running user or is group or world writable;
 #   - the core, its manifest or MANIFEST is missing;
 #   - the core manifest's sbcl-version is not the running SBCL's;
 #   - the core does not boot.
@@ -135,17 +135,17 @@ worker_core_withheld() {
   return 1
 }
 
-# unsafe_paths ROOT LAUNCHER
-# Print `<reason>; <remedy>` and return 0 when a path the release's code can be
-# replaced through is owned by another user or is group or world writable:
-# the deploy home and releases/ above ROOT, ROOT, ROOT/scripts,
-# ROOT/scripts/release-paths.sh, ROOT/bin and LAUNCHER. Return 1 when all are
-# sound. Runs before anything from the release is sourced, so it uses nothing
-# from the release.
-unsafe_paths() {
+# source_chain_problem ROOT
+# Print `<reason>; <remedy>` and return 0 when a path that
+# ROOT/scripts/release-paths.sh could be replaced through is missing, owned by
+# another user, or group or world writable: the deploy home and releases/ above
+# ROOT, ROOT, ROOT/scripts and the file itself. Return 1 when all are sound.
+# Runs before release-paths.sh is sourced, so it uses nothing from the release;
+# the full list, shared with preflight, is release_path_problem in that file.
+source_chain_problem() {
   local root="$1" path
   for path in "$(dirname "$(dirname "$root")")" "$(dirname "$root")" "$root" \
-              "$root/scripts" "$root/scripts/release-paths.sh" "$root/bin" "$2"; do
+              "$root/scripts" "$root/scripts/release-paths.sh"; do
     if [ ! -O "$path" ]; then
       printf '%s is not owned by %s; restore ownership and permissions of %s\n' \
              "$path" "$(id -un)" "$path"
@@ -189,14 +189,14 @@ run_server() {
     return
   fi
   local problem
-  if problem="$(unsafe_paths "$root" "$launcher")"; then
+  if problem="$(source_chain_problem "$root")"; then
     refuse "$problem"
     return
   fi
   # shellcheck source=release-paths.sh
   . "$root/scripts/release-paths.sh"
 
-  if ! problem="$(release_problem "$root")"; then
+  if ! problem="$(release_problem "$root" "$launcher")"; then
     refuse "$problem"
     return
   fi
