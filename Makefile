@@ -747,14 +747,15 @@ TEST_LIMIT_STATUS = ; status=$$?; \
 ##   system resolved somewhere else.
 TEST_SOURCE_CHECK = --eval '(let ((found (namestring (truename (asdf:system-source-directory "dsmr-mcp")))) (here (namestring (truename "$(CURDIR)/")))) (if (string= found here) (format *error-output* "~&dsmr-mcp source: ~A~%" found) (uiop:die 2 "dsmr-mcp resolves to ~A, not this checkout ~A; put this checkout first in CL_SOURCE_REGISTRY" found here)))'
 
-## test-build: the shell suites for deploy, rollback, registration, the core
-##   install and the dependency pins.
+## test-build: the shell suites for deploy, rollback, registration, the launcher's
+##   refusals, the core install and the dependency pins.
 ##
 ##   Stubs stand in for SBCL, qlot, make and claude, and every run keeps HOME
 ##   and its destinations inside a temporary directory, so nothing reaches the
 ##   host's release, bin, skills, agents or Claude Code config. Runs every
 ##   suite and fails when any one fails. CI runs it in the unit-suite job.
 BUILD_SUITES = tests/build/deploy-test.sh tests/build/register-test.sh \
+               tests/build/release-guard-test.sh \
                tests/build/core-install-test.sh tests/build/qlfile-pin-test.sh
 test-build:
 	@status=0; \
@@ -1091,9 +1092,9 @@ rollback:
 ##   the entry's env settings and adds DSMR_READ_ROOTS when it is absent, then
 ##   prints the result. The leader runs it once per host, after the first
 ##   deploy; running sessions pick it up only when they restart. Refuses when no
-##   release is deployed, when a path the release's code or core is replaceable
-##   through is foreign-owned or group or world writable (the launcher's own
-##   check, release_path_problem), and when the deploy home is a scratch home (any home
+##   release is deployed, when the launcher would refuse the release (the
+##   launcher's own checks, release_refusal, which it boots through once, by
+##   the physical path `current` resolves to), and when the deploy home is a scratch home (any home
 ##   other than $HOME/.local/share/dsmr-mcp, or $XDG_DATA_HOME/dsmr-mcp with
 ##   XDG_DATA_HOME under $HOME) while CLAUDE_CONFIG is still the host's
 ##   config, by name or by file identity (a symlink or hard link to it). A
@@ -1106,14 +1107,12 @@ register:
 	if ! host_home_p "$$home" && host_config_p "$(CLAUDE_CONFIG)"; then \
 	  echo "register: deploy home $$home is a scratch home but CLAUDE_CONFIG is the host's config; pass CLAUDE_CONFIG=<scratch file>" >&2; exit 1; \
 	fi; \
-	core="$$home/current/core/dsmr.core"; \
-	if [ ! -f "$$core" ]; then \
-	  echo "register: no deployed release at $$home/current; run make deploy REF=<sha> first" >&2; exit 1; \
-	fi; \
-	root="$$(physical_dir "$$home/current")" || exit 1; \
-	if ! problem="$$(release_path_problem "$$root")"; then \
+	root="$$(physical_dir "$$home/current")" || { \
+	  echo "register: no deployed release at $$home/current; run make deploy REF=<sha> first" >&2; exit 1; }; \
+	if ! problem="$$(SBCL="$(SBCL)" release_refusal "$$root")"; then \
 	  echo "register: $$problem" >&2; exit 1; \
 	fi; \
+	core="$$root/core/dsmr.core"; \
 	DSMR_HOME="$$home" DSMR_REGISTER_CONFIG="$$config" "$(SBCL)" --core "$$core" \
 	   --noinform --non-interactive --no-sysinit --no-userinit \
 	   --eval '(format t "~&register: ~S~%" (dsmr-mcp/src/install/claude:install-into-claude :path (uiop:parse-native-namestring (uiop:getenv "DSMR_REGISTER_CONFIG"))))'

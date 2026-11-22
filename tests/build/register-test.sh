@@ -32,16 +32,31 @@ has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 FAKEHOME="$WORK/fakehome"
 mkdir -p "$WORK/bin" "$FAKEHOME"
 
+# The stub answers --version with 9.9.9 and exits 0 for the boot probe, which
+# the launcher's checks run before register boots; any other run is the
+# registration and is logged.
 cat > "$WORK/bin/sbcl" <<STUB
 #!/bin/sh
+case " \$* " in
+  *" --version "*) echo "SBCL 9.9.9"; exit 0 ;;
+  *"(sb-ext:exit)"*) exit 0 ;;
+esac
 printf '%s|%s\n' "\$DSMR_HOME" "\$DSMR_REGISTER_CONFIG" >> "$WORK/boot.log"
 STUB
 chmod +x "$WORK/bin/sbcl"
 
-# plant <home>: a release under <home>/current with a server core file.
+# plant <home>: a sound release under <home>/current. Modes are set outright,
+# so the result does not depend on the umask.
 plant() {
-    mkdir -p "$1/releases/r/core"
-    : > "$1/releases/r/core/dsmr.core"
+    local r="$1/releases/r"
+    mkdir -p "$r/core" "$r/bin" "$r/scripts"
+    printf 'planted core' > "$r/core/dsmr.core"
+    printf 'sbcl-version 9.9.9\n' > "$r/core/dsmr.core.manifest"
+    printf 'commit 0000000\n' > "$r/MANIFEST"
+    cp "$REPO_ROOT/scripts/release-paths.sh" "$r/scripts/release-paths.sh"
+    cp "$REPO_ROOT/scripts/release-launch.sh" "$r/bin/dsmr-mcp-launch"
+    chmod 755 "$1" "$1/releases" "$r" "$r/core" "$r/bin" "$r/scripts" "$r/bin/dsmr-mcp-launch"
+    chmod 644 "$r/core/dsmr.core" "$r/core/dsmr.core.manifest" "$r/MANIFEST" "$r/scripts/release-paths.sh"
     ln -sfn releases/r "$1/current"
 }
 
@@ -112,13 +127,8 @@ try "it boots with that home" "booted: $(boot_line)" \
 
 note "a release the launcher would refuse"
 # Each case plants a sound release first, so a refusal can only come from the
-# one path made unsafe. plant_sound sets umask-clean modes; the host's config
-# is the default, as for an account.
-plant_sound() {
-    plant "$1"
-    printf 'planted core' > "$1/releases/r/core/dsmr.core"
-    chmod -R go-w "$1"
-}
+# one path made unsafe; the host's config is the default, as for an account.
+# release-guard-test.sh holds the full table of shapes.
 refused_unsafe() {
     local label=$1; shift
     register "$@"
@@ -127,14 +137,14 @@ refused_unsafe() {
     try "that refusal names a path" "$OUT" has "$OUT" "writable"
 }
 rm -rf "$FAKEHOME/.local"
-plant_sound "$FAKEHOME/.local/share/dsmr-mcp"
+plant "$FAKEHOME/.local/share/dsmr-mcp"
 register
 try "a sound release registers (control)" "rc=$RC: $OUT" test "$RC" -eq 0
 chmod g+w "$FAKEHOME/.local/share/dsmr-mcp/releases/r/core"
 refused_unsafe "an account home whose core/ is group writable"
 rm -rf "$FAKEHOME/.local"
 
-plant_sound "$WORK/unsafe"
+plant "$WORK/unsafe"
 chmod o+w "$WORK/unsafe"
 refused_unsafe "a world writable deploy home" DSMR_HOME="$WORK/unsafe" CLAUDE_CONFIG="$WORK/unsafe.json"
 chmod o-w "$WORK/unsafe"
