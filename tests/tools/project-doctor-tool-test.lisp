@@ -486,6 +486,72 @@ exclude is the one thing a run writes that git status cannot see."
         (false (%apparatus-present-p root)
                "a dry run writes no apparatus")))))
 
+(define-test the-result-carries-the-server-release-report
+  "A run reports server_release, the release guard's report, with release_root,
+sealed, launcher, ties, residuals and status.
+
+Outside a release the report names no root, holds no tie and is red. With
+DSMR_RELEASE_ROOT naming a directory the unsealed test image is not part of,
+the same field names that root and lists ties, each with name, directory and
+reason, so an empty ties array on the first call is not a report that never
+looks."
+  (flet ((release-report ()
+           (with-fixture-template
+             (with-temp-git-repo (root :origin-url +third-party-origin-url+
+                                       :initial-file "seed" :initial-content "seed")
+               (%prepare root)
+               (let ((result (%call root (%args "policy" "repair" "dry_run" t
+                                                "disposition" "forked"))))
+                 (false (gethash "isError" result) "the dry run completes")
+                 (gethash "server_release" result))))))
+    (let ((saved (uiop:getenv "DSMR_RELEASE_ROOT"))
+          (release (%make-temp-directory)))
+      (unwind-protect
+           (progn
+             (sb-posix:unsetenv "DSMR_RELEASE_ROOT")
+             (let ((report (release-report)))
+               (true (hash-table-p report) "server_release is an object: ~S" report)
+               (when (hash-table-p report)
+                 (dolist (key '("release_root" "sealed" "launcher" "ties"
+                                "residuals" "status"))
+                   (true (nth-value 1 (gethash key report))
+                         "server_release has no ~A field" key))
+                 (is eq 'null (gethash "release_root" report)
+                     "outside a release release_root is not null")
+                 (true (vectorp (gethash "ties" report)) "ties is not an array")
+                 (is = 0 (length (gethash "ties" report))
+                     "outside a release the report lists ties")
+                 (true (vectorp (gethash "residuals" report)) "residuals is not an array")
+                 (is equal "red" (gethash "status" report)
+                     "outside a release the status is not red")))
+             (sb-posix:setenv "DSMR_RELEASE_ROOT" (uiop:native-namestring release) 1)
+             (let ((report (release-report)))
+               (true (hash-table-p report) "server_release is an object: ~S" report)
+               (when (hash-table-p report)
+                 (is equal (namestring (truename release)) (gethash "release_root" report)
+                     "release_root does not name DSMR_RELEASE_ROOT")
+                 (false (gethash "sealed" report) "the test image reports itself sealed")
+                 (is equal "red" (gethash "status" report)
+                     "an unsealed image outside its release root is not red")
+                 (let ((ties (gethash "ties" report)))
+                   (true (and (vectorp ties) (plusp (length ties)))
+                         "the test image outside the release root lists no tie: ~S" ties)
+                   (when (and (vectorp ties) (plusp (length ties)))
+                     (let ((tie (aref ties 0)))
+                       (true (stringp (gethash "name" tie)) "a tie has no name")
+                       (true (nth-value 1 (gethash "directory" tie)) "a tie has no directory")
+                       (true (member (gethash "reason" tie)
+                                     '("checkout" "outside-release" "no-source"
+                                       "launcher-in-work-tree" "launcher-outside-release")
+                                     :test #'equal)
+                             "a tie's reason is not a documented one: ~S"
+                             (gethash "reason" tie))))))))
+        (if saved
+            (sb-posix:setenv "DSMR_RELEASE_ROOT" saved 1)
+            (sb-posix:unsetenv "DSMR_RELEASE_ROOT"))
+        (ignore-errors (uiop:delete-directory-tree release :validate t
+                                                           :if-does-not-exist :ignore))))))
+
 (define-test a-supplied-upstream-is-recorded-and-decides-nothing
   "A supplied upstream is written down as the upstream remote, and answers no
 question: with a disposition it is proposed without a policy and added with
