@@ -238,6 +238,20 @@ release_guard() {
         --eval '(dsmr-mcp/src/release:guard-main)' </dev/null 2>/dev/null
 }
 
+# worker_core_remedy PROBLEM
+# Print the remedy for a worker_core_withheld reason. A path another user owns
+# or others can write is restored in place. Anything else needs a new worker
+# core, and the only build is a deploy of a commit with no release yet: a
+# deploy of the commit that is current runs the host steps and builds nothing.
+worker_core_remedy() {
+    case $1 in
+        *" is not owned by "*|*" is group or world writable")
+            printf 'restore ownership and permissions of %s' "${1%% is *}" ;;
+        *)
+            printf 'make deploy REF=<sha of a commit that has no release yet>; a commit that already has a release is reused, so its worker core is not rebuilt' ;;
+    esac
+}
+
 check_release() {
     head2 "Deployed release"
     local home root problem report commit
@@ -256,7 +270,7 @@ check_release() {
     fi
     if problem=$(worker_core_withheld "$root"); then
         bad "worker core withheld: $problem; every hermetic worker would refuse to spawn" \
-            "make deploy REF=<sha>"
+            "$(worker_core_remedy "$problem")"
         return
     fi
     if report=$(release_guard "$root"); then
@@ -464,15 +478,26 @@ self_test() {
 
     # A worker core the launcher withholds fails every hermetic spawn: o+w
     # manifest, then no worker core at all.
+    local remedy
     chmod o+w "$drel/core/dsmr.core.worker.manifest"
     if checks_release; then
         printf '  FAIL  release check passed a worker core the launcher withholds\n'; status=1
     else printf '  pass  release check fires on a worker core the launcher withholds\n'; fi
+    remedy=$(SBCL="$sbin/sbcl" DSMR_HOME="$dhome" "$0" --check-release 2>&1 | grep 'remedy:')
+    if [[ $remedy == *"restore ownership and permissions of $drel/core/dsmr.core.worker.manifest"* ]]; then
+        printf '  pass  a writable worker manifest names a permission repair\n'
+    else printf '  FAIL  a writable worker manifest names no repair: %s\n' "$remedy"; status=1; fi
     chmod o-w "$drel/core/dsmr.core.worker.manifest"
     mv "$drel/core/dsmr.core.worker" "$drel/core/dsmr.core.worker.away"
     if checks_release; then
         printf '  FAIL  release check passed a release with no worker core\n'; status=1
     else printf '  pass  release check fires on a release with no worker core\n'; fi
+    # The remedy must name a step that removes the cause: a repair for a mode,
+    # a deploy of a new commit for a missing core, never a redeploy of current.
+    remedy=$(SBCL="$sbin/sbcl" DSMR_HOME="$dhome" "$0" --check-release 2>&1 | grep 'remedy:')
+    if [[ $remedy == *"no release yet"* ]]; then
+        printf '  pass  a missing worker core names a deploy of a new commit\n'
+    else printf '  FAIL  a missing worker core names no rebuild: %s\n' "$remedy"; status=1; fi
     mv "$drel/core/dsmr.core.worker.away" "$drel/core/dsmr.core.worker"
 
     # A file the launcher requires cannot be missing. Each case moves one out
