@@ -141,11 +141,16 @@ variable. Returns the launcher's integer exit code."
       :environment env))))
 
 (defmacro with-temp-repo ((repo-var) &body body)
-  "Bind REPO-VAR to a fresh temp directory and remove the tree on exit."
-  `(let ((,repo-var (%make-temp-dir)))
-     (unwind-protect (progn ,@body)
-       (ignore-errors (uiop:delete-directory-tree
-                       ,repo-var :validate t :if-does-not-exist :ignore)))))
+  "Bind REPO-VAR to <tmp>/home/releases/r/ under a fresh temp directory, laid
+out as a deploy home so the launcher's checks of the home and releases/ pass,
+and remove the tree on exit."
+  (let ((tmp (gensym "TMP")))
+    `(let* ((,tmp (%make-temp-dir))
+            (,repo-var (merge-pathnames "home/releases/r/" ,tmp)))
+       (ensure-directories-exist ,repo-var)
+       (unwind-protect (progn ,@body)
+         (ignore-errors (uiop:delete-directory-tree
+                         ,tmp :validate t :if-does-not-exist :ignore))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Tests
