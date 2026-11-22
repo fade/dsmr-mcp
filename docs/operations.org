@@ -96,11 +96,14 @@ cold compile, clear the ASDF output cache first (typically
    loopback and =DSMR_ALLOW_REMOTE= is not set. This is the safety gate
    working as designed — see [[file:threat-model.org]] before changing
    it.
-4. *Hermetic mode wedged at startup.* When =*mode*= resolves to
-   =hermetic=, =run= initializes the worker pool, which pre-warms the
-   worker system's FASL cache once in the parent before any child spawns.
-   On a cold cache this adds a one-time compile to startup; on a warm
-   cache it returns immediately.
+4. *Hermetic workers refused.* A worker starts only from a worker image.
+   The release launcher passes the release's =core/dsmr.core.worker= to the
+   server as =DSMR_WORKER_CORE= when the running SBCL built it, and unsets
+   the variable otherwise; without it, every hermetic spawn is refused with
+   =no-worker-core=. Run =make check-release=, and deploy again when the
+   worker image is missing or was built by another SBCL.
+5. *The launcher exits 78.* The release or the deploy home is missing or
+   fails a check; see [[*Launcher refusals][Launcher refusals]].
 
 * Health checks
 
@@ -445,22 +448,12 @@ Three WARN codes say the service set something aside: =memory-threshold-ignored=
 it withdrew, passing that pool over for the next five minutes) and =worker-record-mismatch= (a worker record whose name and
 contents disagree, which it never acts on).
 
-** The core images
-
-=make core= builds two images: =dsmr.core= for the MCP server, then
-=dsmr.core.worker= for hermetic workers, each verified before it replaces the
-one installed, with the previous image kept beside it as =.prev=. Run
-=make core-worker= to rebuild the worker image alone and
-=make core-verify-worker= to check an installed one. The launcher judges the
-worker image by the same freshness rule as =dsmr.core=, rebuilds it in the
-background when it is stale, and passes it to the server only while it is
-fresh, so a server started meanwhile simply loads its workers from source.
-Running servers keep the image they started with until they restart.
+** Measuring worker cost
 
 To measure what idle workers cost on a host, run
 
 #+begin_src sh
-scripts/measure-worker-footprint.sh dsmr.core.worker 8
+scripts/measure-worker-footprint.sh ~/.local/share/dsmr-mcp/current/core/dsmr.core.worker 8
 #+end_src
 
 It starts that many workers from the image one after another, sums their
@@ -468,6 +461,168 @@ proportional set size, stops them all, and prints one line:
 =workers=8 total_pss_kb=... avg_pss_kb=... max_handshake_ms=... median_handshake_ms=...=.
 On the development box eight workers averaged about 39 MB each and reached
 their handshake in about 80 ms.
+
+* Releases
+
+A host runs dsmr-mcp from a /release/: one commit exported from git, built
+with its own pinned dependencies, and checked before any server uses it.
+=make deploy= is the only step that changes what a host runs. Editing a
+checkout, building in it, or running its test targets changes nothing that a
+server, a worker, the bus service or a watcher loads.
+
+** The deploy home
+
+Releases live under the deploy home, =DSMR_HOME=, which defaults to
+=${XDG_DATA_HOME:-~/.local/share}/dsmr-mcp=:
+
+| Path                         | Contents                                                                                    |
+|------------------------------+---------------------------------------------------------------------------------------------|
+| =releases/<sha>/=            | One release: the exported tree, its dependency bundle in =deps/=, its images and binaries  |
+| =releases/<sha>/core/=       | =dsmr.core= (the server image) and =dsmr.core.worker= (the worker image), each with a manifest |
+| =releases/<sha>/bin/=        | =dsmr-mcp-launch=, =dsmr-bus-watch= and =dsmr-bus-host=                                     |
+| =releases/<sha>/MANIFEST=    | The release record; a release directory without one is incomplete                          |
+| =current=                    | Link to the release servers start from                                                     |
+| =previous=                   | Link to the release =current= named before the last flip                                   |
+| =deploy.lock=, =deploy.holder= | The lock one deploy or rollback holds, and the process holding it                       |
+
+=MANIFEST= holds one =key value= pair per line:
+
+| Key                       | Value                                                                  |
+|---------------------------+------------------------------------------------------------------------|
+| =commit=                  | The full sha the release was built from                                |
+| =ref=                     | The =REF= the deploy was given                                         |
+| =dirty=                   | Always =false=; a deploy refuses a working tree with tracked changes   |
+| =sbcl-version=            | The SBCL that built the images; the launcher refuses any other         |
+| =build-host=, =build-time= | Where and when (UTC) the release was built                            |
+| =unpublished-ref-allowed= | =yes= when the deploy ran with =ALLOW_UNPUBLISHED=1=; absent otherwise |
+| =qlfile-lock-sha256=      | Hash of the =qlfile.lock= the dependencies came from                   |
+| =dependency=              | One line per locked dependency: its name and version or commit        |
+
+A finished release is read-only. Releases are never pruned automatically;
+remove an old =releases/<sha>/= by hand once no running process uses it.
+
+** Deploying a release
+
+Run the deploy from a clean checkout, naming a commit that is on a branch on
+=origin=:
+
+#+begin_src sh
+make deploy REF=<sha>
+#+end_src
+
+Before it creates anything, the deploy refuses:
+
+- a working tree with uncommitted changes to tracked files;
+- a =REF= reachable from no =origin= branch (=ALLOW_UNPUBLISHED=1= overrides
+  this, and the release records it);
+- a deploy home inside a git work tree;
+- a scratch =DSMR_HOME= whose host destinations are still the host's own (see
+  below).
+
+Before the export it also refuses a qlot checkout that is missing or not at
+the commit =QLOT_COMMIT= names. It then runs these stages, each logged on standard error as
+=deploy: <stage>: ...=:
+
+1. =export=: =git archive= of the commit into =releases/<sha>/=.
+2. =dependencies=: =qlot install= and =qlot bundle= from the committed
+   =qlfile= and =qlfile.lock= into =deps/=.
+3. =build-server=, =build-worker=, =build-bus=: the sealed server image, the
+   worker image and both bus binaries, built by plain SBCL against the bundle.
+4. =manifest=: writes =MANIFEST=.
+5. =verify-initialize=, =verify-worker=, =verify-bus=: the release's own
+   launcher answers =initialize= and =tools/list= with a =serverInfo.version=
+   that carries the commit, the worker image boots to a handshake, and each
+   bus binary answers =--help=.
+6. =check-copies=: refuses when a deployed skill, agent definition or harness
+   file was edited in place since the last deploy. =FORCE=1= replaces it.
+7. =flip=: =current= names the new release, in one rename; the release it
+   replaces becomes =previous=.
+8. =links=: =~/.local/bin/dsmr-bus-watch= and =dsmr-bus-host= become links
+   through =current/bin/=. A regular file found there is kept beside the link
+   as =<name>.pre-release-<UTC stamp>=.
+9. =copies=: the release's skills, agent definitions and harness files are
+   copied into =~/.claude/skills=, =~/.claude/agents= and =~/.claude=.
+
+A failure before the flip prints =deploy: <stage> failed: ...; current is
+unchanged= and exits 1. A failure after the flip names the release now current
+and the deploy that finishes the host steps. Deploying a commit whose release
+already exists verifies it again without rebuilding. One deploy runs at a time
+per deploy home.
+
+Run =make check-skills=, =make check-agents= and =make check-harness= before
+a deploy to see which deployed files differ from the tree. Port an edit you
+want to keep into the tree and commit it; pass =FORCE=1= only after reviewing
+the list.
+
+For a dry run that touches nothing on the host, give a scratch deploy home and
+skip the host steps:
+
+#+begin_src sh
+make deploy REF=HEAD DSMR_HOME=$(mktemp -d) ALLOW_UNPUBLISHED=1 HOST_LINKS=0
+#+end_src
+
+=HOST_LINKS=0= skips the =check-copies=, =links= and =copies= stages. To
+exercise them against scratch directories instead, set =BINDIR=,
+=SKILLDIR=, =AGENTDIR= and =SUBAGENTDIR= to scratch paths.
+
+** Rolling back
+
+#+begin_src sh
+make rollback
+#+end_src
+
+Swaps =current= and =previous= with two renames and prints the commit now
+current, then repairs the bus binary links and copies the restored release's
+skills, agent definitions and harness files, behind the same in-place-edit
+check as a deploy. It builds nothing and runs no git, qlot, SBCL or make. A
+second rollback swaps back.
+
+** Checking a release
+
+#+begin_src sh
+make check-release        # the release current names
+make check-preflight      # the whole host, changing nothing
+#+end_src
+
+=make check-release= applies the launcher's checks to =current=, boots its
+server image and prints the release guard's report: whether the image is
+sealed, each tie to a checkout or to a path outside the release, and
+=ties <n>=. It exits non-zero when the launcher would refuse the release or
+the report shows a tie.
+
+To read the commit a running server was built from:
+
+- =initialize= answers with =serverInfo.version= =0.1.0+<commit>=;
+- =backend-status= carries a =release= object with =root=, =commit=, =ties=
+  and =sealed=;
+- =project-doctor= reports the guard as =server_release=;
+- the launcher log, =~/.local/state/dsmr-mcp/launcher.log=, names the
+  release each boot used.
+
+** What a deploy reaches, and when
+
+A deploy or rollback changes what the next process starts from. Processes
+already running keep the release they started with:
+
+- an MCP server keeps its image until its session restarts it or runs =/mcp=;
+- the host bus service keeps its binary until
+  =systemctl --user restart dsmr-bus-host=;
+- a running =dsmr-bus-watch= keeps its binary until it is re-armed;
+- hermetic workers start from the worker image of the server that spawns them.
+
+** Launcher refusals
+
+The release launcher, =current/bin/dsmr-mcp-launch=, boots the release's
+server image and nothing else. It exits 78 with one line on standard error,
+naming the reason and the remedy, when the release is missing, incomplete,
+inside a git work tree, owned by another user, group- or world-writable, or
+built by another SBCL, or when its image does not boot. A release server also
+exits 78 when its image is not sealed or the guard finds a tie.
+
+The launcher in a checkout, =scripts/dsmr-mcp-launch.sh=, only forwards to
+=<DSMR_HOME>/current/bin/dsmr-mcp-launch= and logs that it did. With no
+deployed release it exits 78 and names =make deploy REF=<sha>=, then
+=make register=.
 
 * alive-lsp absence
 
