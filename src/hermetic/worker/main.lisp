@@ -262,14 +262,52 @@ is left for ASDF to redo at the worker's first system lookup, as a worker
 booted from the worker core does."
   (asdf:clear-source-registry))
 
+(defun %release-subject-systems (dir)
+  "Make every immutable system that a .asd file directly in DIR defines
+loadable from DIR again, and return the names released.
+
+A release worker core registers its dependencies immutable, and ASDF's
+find-system answers an immutable system from the image before any search
+function runs, so without this a worker rooted at a checkout of one of those
+dependencies loads the image's copy instead of the tree. A system counts as
+defined by DIR when its primary system name is the name of a .asd file
+directly in DIR, the files asdf:*central-registry* finds there. Each released
+system is removed from ASDF's immutable set and cleared, and logged as
+worker.subject-shadows-dependency. ASDF has no public call to undo
+register-immutable-system, so the set is reached by name and an image without
+one releases nothing."
+  (let* ((symbol (and dir (uiop:find-symbol* '#:*immutable-systems*
+                                             '#:asdf/system-registry nil)))
+         (table (and symbol (symbol-value symbol)))
+         (primaries (and (hash-table-p table)
+                         (mapcar #'pathname-name (uiop:directory-files dir "*.asd"))))
+         (released '()))
+    (when primaries
+      (maphash (lambda (name flag)
+                 (declare (ignore flag))
+                 (when (member (asdf:primary-system-name name) primaries
+                               :test #'string-equal)
+                   (push name released)))
+               table)
+      (dolist (name released)
+        (remhash name table)
+        (asdf:clear-system name)
+        (log-event :info "worker.subject-shadows-dependency"
+                   "system" name
+                   "path" (namestring dir))))
+    released))
+
 (defun %register-project-root (dir)
   "Put DIR first in asdf:*central-registry*, so the rooted project's .asd files
-are found before any same-named system elsewhere in the source registry. DIR
-is the project root from %setup-project-root, or NIL, in which case nothing
-changes. Logs worker.project-root.registered. Returns DIR."
+are found before any same-named system elsewhere in the source registry, and
+release any of those systems the image holds immutable (see
+%release-subject-systems). DIR is the project root from %setup-project-root,
+or NIL, in which case nothing changes. Logs worker.project-root.registered.
+Returns DIR."
   (when dir
     (setf asdf:*central-registry*
           (cons dir (remove dir asdf:*central-registry* :test #'equal)))
+    (%release-subject-systems dir)
     (log-event :info "worker.project-root.registered" "path" (namestring dir)))
   dir)
 

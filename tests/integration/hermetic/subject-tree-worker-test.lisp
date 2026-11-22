@@ -13,6 +13,10 @@
 ;;;; unrenamed dev worker core is clobbered by the subject, and the command line
 ;;;; workers were started with before the rename, which put this server's own
 ;;;; tree first in ASDF's lookup, never loads the subject at all.
+;;;;
+;;;; A last release case roots the worker at a copy of jzon, a dependency the
+;;;; release worker core itself loads and holds immutable, with one extra
+;;;; function, and checks that the copy is what loads.
 
 (defpackage #:dsmr-mcp/tests/integration/hermetic/subject-tree-worker-test
   (:use #:cl #:zebra)
@@ -199,6 +203,86 @@ release tree rather than the subject's, and the worker still answers a ping."
               "START is defined from ~A, outside the release ~A"
               start-from (namestring (%release-root core))))
       (true (getf seen :ping) "the worker did not answer a ping: ~S" seen))))
+
+(defparameter *dependency-system* "com.inuoe.jzon"
+  "A system the release worker core loads for itself, used as a subject.")
+
+(defvar *dependency-subjects* (make-hash-table :test 'equal)
+  "The dependency subject tree made for each release root, by DEPENDENCY-SUBJECT.")
+
+(defun dependency-subject (core)
+  "A writable copy of the jzon sources bundled in the release holding CORE,
+with SUBJECT-MARKER appended to src/jzon.lisp, as a directory namestring, or
+NIL when the release bundles no jzon. Made once per release and removed when
+the process exits."
+  (let ((release (namestring (%release-root core))))
+    (or (gethash release *dependency-subjects*)
+        (let ((asd (first (directory (merge-pathnames "deps/software/*/com.inuoe.jzon.asd"
+                                                      release)))))
+          (when asd
+            (let* ((dir (string-right-trim
+                         '(#\Newline)
+                         (uiop:run-program '("mktemp" "-d" "/tmp/dsmr-subject-dep.XXXXXX")
+                                           :output :string)))
+                   (dir (namestring (uiop:ensure-directory-pathname dir))))
+              (push (lambda () (ignore-errors (uiop:delete-directory-tree
+                                               (pathname dir) :validate t)))
+                    sb-ext:*exit-hooks*)
+              (uiop:run-program
+               (list "sh" "-c"
+                     (format nil "cp -R ~A/. ~A && chmod -R u+w ~A"
+                             (uiop:escape-sh-token
+                              (namestring (uiop:pathname-directory-pathname asd)))
+                             (uiop:escape-sh-token dir)
+                             (uiop:escape-sh-token dir)))
+               :error-output :string)
+              (with-open-file (out (merge-pathnames "src/jzon.lisp" dir)
+                                   :direction :output :if-exists :append)
+                (format out "~%(defun subject-marker () :subject-tree)~%"))
+              (setf (gethash release *dependency-subjects*) dir)))))))
+
+(defun observe-dependency-load (core subject)
+  "Spawn a worker from CORE rooted at SUBJECT, load *dependency-system* without
+force, and return a plist of :status, :source-directory and :marker, the value
+SUBJECT-MARKER returns in jzon's package, or NIL when it is absent."
+  (let ((*error-output* (make-string-output-stream))
+        (*worker-core-disabled* nil)
+        (worker nil))
+    (configure-log4cl-for-server :warn)
+    (unwind-protect
+         (let ((params (make-hash-table :test 'equal)))
+           (setf worker (spawn-worker :core core :root subject))
+           (setf (gethash "system" params) *dependency-system*
+                 (gethash "force" params) nil
+                 (gethash "timeout_seconds" params) *load-timeout-seconds*)
+           (let ((reply (worker-rpc worker "worker/load-system" params
+                                    :timeout (+ 60 *load-timeout-seconds*))))
+             (list :status (gethash "status" reply)
+                   :source-directory (gethash "source_directory" reply)
+                   :marker (%between
+                            (%eval-text worker
+                                        "(let* ((p (find-package \"COM.INUOE.JZON\"))
+                                                (s (and p (find-symbol \"SUBJECT-MARKER\" p))))
+                                           (format nil \"marker=~S\" (and s (fboundp s) (funcall s))))")
+                            "marker=" "\""))))
+      (when worker (ignore-errors (kill-worker worker))))))
+
+(define-test a-worker-rooted-at-a-dependency-loads-that-tree
+  "A release worker core rooted at a copy of jzon, which the core itself loads,
+loads com.inuoe.jzon from that copy: the reply names the copy as the source
+directory, and the copy's own function is there afterwards."
+  (with-release-worker-core-or-skip (core)
+    (let ((subject (dependency-subject core)))
+      (if (null subject)
+          (skip ("the release holding ~A bundles no jzon" core))
+          (let ((seen (observe-dependency-load core subject)))
+            (is equal "loaded" (getf seen :status) "~S" seen)
+            (true (and (getf seen :source-directory)
+                       (uiop:pathname-equal (truename (getf seen :source-directory))
+                                            (truename subject)))
+                  "source_directory ~S; expected the subject tree ~A"
+                  (getf seen :source-directory) subject)
+            (is equal ":SUBJECT-TREE" (getf seen :marker) "~S" seen))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Controls
