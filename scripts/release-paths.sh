@@ -156,13 +156,15 @@ release_path_problem() {
 # Check the release at ROOT before anything boots from it. Print
 # `<reason>; <remedy>` for the first problem found and return 1, or print
 # nothing and return 0. Checks in order: release_path_problem ROOT LAUNCHER;
-# the core, its manifest and MANIFEST present; the core's sbcl-version equal to
-# the running SBCL's; a boot of the core that exits 0, with stdin and stdout
-# closed and DSMR_BOOT_PROBE_TIMEOUT seconds (default 30) to do it.
+# the core, its manifest, MANIFEST, scripts/release-paths.sh and the launcher
+# present; the core's sbcl-version equal to the running SBCL's; a boot of the
+# core that exits 0, with stdin and stdout closed and DSMR_BOOT_PROBE_TIMEOUT
+# seconds (default 30) to do it.
 release_problem() {
   local root="$1" core="$1/core/dsmr.core" path recorded current status
   release_path_problem "$root" "${2:-}" || return 1
-  for path in "$core" "$core.manifest" "$root/MANIFEST"; do
+  for path in "$core" "$core.manifest" "$root/MANIFEST" \
+              "$root/scripts/release-paths.sh" "${2:-$root/bin/dsmr-mcp-launch}"; do
     if [ ! -f "$path" ]; then
       printf 'no %s; run make deploy REF=<sha>\n' "$path"
       return 1

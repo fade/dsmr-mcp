@@ -449,6 +449,17 @@ self_test() {
     else printf '  pass  release check fires on a deploy home others can write\n'; fi
     chmod g-w "$dhome"
 
+    # A file the launcher requires cannot be missing. Each case moves one out
+    # of the sound release above and restores it.
+    local gone
+    for gone in scripts/release-paths.sh bin/dsmr-mcp-launch; do
+        mv "$drel/$gone" "$drel/$gone.away"
+        if checks_release; then
+            printf '  FAIL  release check passed a release missing %s\n' "$gone"; status=1
+        else printf '  pass  release check fires on a release missing %s\n' "$gone"; fi
+        mv "$drel/$gone.away" "$drel/$gone"
+    done
+
     # A registration naming a launcher inside a checkout is flagged; one outside
     # every work tree is not, or the check is stuck on red.
     mkdir -p "$tmp/checkout/scripts" "$tmp/release/bin"
