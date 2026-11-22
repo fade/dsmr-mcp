@@ -146,7 +146,7 @@ run_server() {
   launcher="$(readlink -f "$INVOKED")"
   for path in "$(dirname "$launcher")" "$root"; do
     if [ "$(git -C "$path" rev-parse --is-inside-work-tree 2>/dev/null)" = "true" ]; then
-      refuse "$path is inside a git work tree; a release is never run from a checkout; run make deploy REF=<sha> and make register"
+      refuse "$path is inside a git work tree; run make deploy REF=<sha> and make register"
       return
     fi
   done

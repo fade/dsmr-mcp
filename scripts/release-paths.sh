@@ -240,7 +240,7 @@ release_refusal() {
   fi
   for path in "$(dirname "$launcher")" "$root"; do
     if inside_work_tree "$path"; then
-      printf '%s is inside a git work tree; a release is never run from a checkout; run make deploy REF=<sha> and make register\n' "$path"
+      printf '%s is inside a git work tree; run make deploy REF=<sha> and make register\n' "$path"
       return 1
     fi
   done

@@ -423,9 +423,9 @@ deploy() {
 
   if [ -n "$role" ] && [ ! -f "$rel/MANIFEST" ]; then
     if [ "$role" = current ]; then
-      fail export "$rel is the release current names but has no MANIFEST; it was left as it is, so run make rollback or deploy another commit"
+      fail export "$rel is the release current names but has no MANIFEST; run make rollback or deploy another commit"
     fi
-    fail export "$rel is the release previous names but has no MANIFEST; it was left as it is, so deploy another commit first, which moves previous off it"
+    fail export "$rel is the release previous names but has no MANIFEST; deploy another commit first, which moves previous off it"
   fi
 
   if [ "$role" = current ]; then
@@ -673,9 +673,9 @@ rollback() {
   mv -Tf "$home/previous.new" "$home/previous"
   printf 'current -> %s (commit %s)\n' "$prev" "$(manifest_commit "$home/$prev")"
   link_bus_binaries "$home" \
-    || rdie "links failed: $LINK_PROBLEM; current is $prev; fix the cause and run make deploy REF=$(manifest_commit "$home/$prev") to finish the host steps (it repeats only those, since that commit is current), not a second rollback, which swaps back"
+    || rdie "links failed: $LINK_PROBLEM; current is $prev; fix the cause and run make deploy REF=$(manifest_commit "$home/$prev") to finish the host steps, not a second rollback, which swaps back"
   copy_files "$home/$prev" \
-    || rdie "copies failed: $COPY_PROBLEM; current is $prev; fix the cause and run make deploy REF=$(manifest_commit "$home/$prev") to finish the host steps (it repeats only those, since that commit is current), not a second rollback, which swaps back"
+    || rdie "copies failed: $COPY_PROBLEM; current is $prev; fix the cause and run make deploy REF=$(manifest_commit "$home/$prev") to finish the host steps, not a second rollback, which swaps back"
 }
 
 # verify_initialize <release> <sbcl> <scratch> <commit>
