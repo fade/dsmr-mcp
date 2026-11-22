@@ -262,6 +262,111 @@ is left for ASDF to redo at the worker's first system lookup, as a worker
 booted from the worker core does."
   (asdf:clear-source-registry))
 
+(defparameter *subject-asd-depth* 2
+  "How many directories below the project root %subject-asd-files looks for
+.asd files. A subject whose .asd lies deeper still loads the image's copy.")
+
+(defparameter *subject-skipped-directories*
+  '("ocicl" "vendor" "vendored" "third_party" "third-party" "lib"
+    "quicklisp" "local-projects" "dists" "systems" "bundle" "deps"
+    "build" "_build" "target")
+  "Directory names %subject-asd-files never descends into, besides hidden ones
+such as .qlot and .bundle-libs. Each holds .asd files that are not the
+subject's own:
+
+- ocicl: ocicl's project-local systems, ocicl/<name>-<version>/.
+- vendor, vendored, third_party, third-party, lib: vendored checkouts and git
+  submodules.
+- quicklisp, local-projects, dists: a Quicklisp installation or its parts.
+- systems: an ASDF directory of .asd links.
+- bundle, deps: a ql:bundle-systems bundle and a release's dependencies.
+- build, _build, target: build output.")
+
+(defun %subject-asd-files (dir)
+  "Return the .asd files in DIR and in its subdirectories at most
+*subject-asd-depth* levels down, shallowest first and sorted by name within a
+level. Hidden directories, those named in *subject-skipped-directories*, and
+any whose truename lies outside DIR are not entered."
+  (let* ((root (truename dir))
+         (found '())
+         (level (list root)))
+    (flet ((sorted (paths)
+             (sort (copy-list paths) #'string< :key #'namestring))
+           (descend-p (sub)
+             (let ((name (car (last (pathname-directory sub)))))
+               (and (stringp name)
+                    (not (uiop:string-prefix-p "." name))
+                    (not (member name *subject-skipped-directories* :test #'string=))
+                    (let ((true (ignore-errors (truename sub))))
+                      (and true (uiop:subpathp true root)))))))
+      (loop repeat (1+ *subject-asd-depth*)
+            while level
+            do (dolist (d level)
+                 (dolist (file (sorted (uiop:directory-files d "*.asd")))
+                   (push file found)))
+               (setf level (loop for d in level
+                                 nconc (remove-if-not #'descend-p
+                                                      (sorted (uiop:subdirectories d)))))))
+    (nreverse found)))
+
+(defun %release-subject-systems (dir)
+  "Make every immutable system that a .asd file of the subject tree DIR defines
+loadable from that tree again, and return the names released.
+
+A release worker core registers its dependencies immutable, and ASDF's
+find-system answers an immutable system from the image before any search
+function runs, so without this a worker rooted at a checkout of one of those
+dependencies loads the image's copy instead of the tree. A system counts as
+defined by the tree when its primary system name is the name of a .asd file
+%subject-asd-files finds; the shallowest such file wins. Each released system
+is removed from ASDF's immutable set and cleared, the directory of its .asd is
+placed in asdf:*central-registry* right after DIR unless it is DIR, and the
+release is logged as worker.subject-shadows-dependency with that directory.
+ASDF has no public call to undo register-immutable-system, so the set is
+reached by name and an image without one releases nothing."
+  (let* ((symbol (and dir (uiop:find-symbol* '#:*immutable-systems*
+                                             '#:asdf/system-registry nil)))
+         (table (and symbol (symbol-value symbol)))
+         (asds (and (hash-table-p table) (%subject-asd-files dir)))
+         (released '()))
+    (when asds
+      (maphash (lambda (name flag)
+                 (declare (ignore flag))
+                 (let ((asd (find (asdf:primary-system-name name) asds
+                                  :key #'pathname-name :test #'string-equal)))
+                   (when asd
+                     (push (cons name (uiop:pathname-directory-pathname asd)) released))))
+               table)
+      (dolist (entry released)
+        (destructuring-bind (name . home) entry
+          (remhash name table)
+          (asdf:clear-system name)
+          (unless (uiop:pathname-equal home (truename dir))
+            (setf asdf:*central-registry*
+                  (if (and asdf:*central-registry*
+                           (equal (first asdf:*central-registry*) dir))
+                      (list* dir home (remove home (rest asdf:*central-registry*)
+                                              :test #'equal))
+                      (cons home (remove home asdf:*central-registry* :test #'equal)))))
+          (log-event :info "worker.subject-shadows-dependency"
+                     "system" name
+                     "path" (namestring home)))))
+    (mapcar #'car released)))
+
+(defun %register-project-root (dir)
+  "Put DIR first in asdf:*central-registry*, so the rooted project's .asd files
+are found before any same-named system elsewhere in the source registry, and
+release any of those systems the image holds immutable (see
+%release-subject-systems). DIR is the project root from %setup-project-root,
+or NIL, in which case nothing changes. Logs worker.project-root.registered.
+Returns DIR."
+  (when dir
+    (setf asdf:*central-registry*
+          (cons dir (remove dir asdf:*central-registry* :test #'equal)))
+    (%release-subject-systems dir)
+    (log-event :info "worker.project-root.registered" "path" (namestring dir)))
+  dir)
+
 (defun register-worker-methods (server registry)
   "Install every worker method on SERVER: the handler table over REGISTRY,
 plus the method that saves this worker's world to a core so a later process
@@ -290,7 +395,8 @@ Follows the mandatory startup order:
   3. configure-log4cl-for-server, second: any earlier log would corrupt stdout;
      then resolve-eval-timeout, so the eval timeout comes from this process's
      environment and not from the image it booted from
-  4. log worker.starting
+  4. log worker.starting; SIGTERM handler; the project root from
+     DSMR_PROJECT_ROOT, registered first in ASDF's lookup
   5. make-worker-server (ephemeral TCP), kept in *server*
   6. register-worker-methods with a new object registry, kept in *registry*
   7. %output-handshake (ONE line to stdout, then done)
@@ -322,7 +428,7 @@ worker saved itself to a core), the process exits cleanly."
   ;; Install SIGTERM handler for clean pool shutdown.
   (%install-signal-handlers)
   ;; Set project root when injected (fs verbs read this for path resolution).
-  (%setup-project-root)
+  (%register-project-root (%setup-project-root))
   ;; Step 5: open ephemeral TCP port.
   (handler-case
       (let* ((server   (setf *server* (make-worker-server)))
@@ -366,8 +472,9 @@ belongs to the process rather than the heap is redone, in the resume order:
   3. restore *standard-output*, configure-log4cl-for-server,
      resolve-eval-timeout, then the first log, which also reports the
      placeholders
-  4. SIGTERM handler and project root from this process's environment, and
-     the ASDF source registry scan dropped so it is redone on first lookup
+  4. SIGTERM handler and project root from this process's environment, the
+     ASDF source registry scan dropped so it is redone on first lookup, and
+     the project root registered first in ASDF's lookup
   5. reopen-worker-server: new listener, new port, not yet authenticated
   6. %output-handshake, %redirect-stdout-to-devnull
   7. start-parent-watchdog, which reads this process's DSMR_PARENT_PID
@@ -396,8 +503,9 @@ environment, so the process that resumes the core decides the secret."
     (when problem
       (log-event :error "worker.resume.placeholders-failed" "error" problem)))
   (%install-signal-handlers)
-  (%setup-project-root)
-  (%forget-source-registry-scan)
+  (let ((root (%setup-project-root)))
+    (%forget-source-registry-scan)
+    (%register-project-root root))
   (handler-case
       (let ((tcp-port (reopen-worker-server *server*)))
         (let ((swank-port (%maybe-start-swank)))

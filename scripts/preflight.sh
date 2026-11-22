@@ -21,19 +21,27 @@
 #   preflight.sh --check-only             report only, change nothing
 #   preflight.sh --fleet-dir D --repo N   also check repo N's direnv consent
 #   preflight.sh --self-test              prove every check can report red
+#   preflight.sh --check-release          run only the deployed-release check
 #
 # Exit status is the contract: 0 means a fleet may start, non-zero means it may
 # not. `sisters.sh` refuses to launch on a non-zero answer.
+#
+# DSMR_HOME, SBCL, QLOT and CLAUDE_CONFIG are read as the Makefile reads them.
 
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-CORE="$REPO_ROOT/dsmr.core"
-LAUNCHER="$REPO_ROOT/scripts/dsmr-mcp-launch.sh"
 CONSTELLATION="$REPO_ROOT/docs/CONSTELLATION.org"
+
+# dsmr_home, physical_dir, inside_work_tree and release_refusal: the checks the
+# release launcher and `make register` refuse with, so preflight cannot pass a
+# release either would refuse.
+# shellcheck source=release-paths.sh
+. "$REPO_ROOT/scripts/release-paths.sh"
 
 CHECK_ONLY=0
 SELF_TEST=0
+RELEASE_ONLY=0
 FLEET_DIR=""
 REPOS=()
 
@@ -55,20 +63,21 @@ while (($#)); do
     case $1 in
         --check-only) CHECK_ONLY=1 ;;
         --self-test)  SELF_TEST=1 ;;
+        --check-release) RELEASE_ONLY=1 ;;
         --fleet-dir)  FLEET_DIR=${2-}; shift ;;
         --repo)       REPOS+=("${2-}"); shift ;;
-        -h|--help)    sed -n '3,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)    sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) printf 'preflight.sh: unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
     shift
 done
 
 # ---------------------------------------------------------------------------
-# Binaries. Present is not the same as reachable, and the difference is not
-# cosmetic: roswell installs qlot into ~/.roswell/bin, so a correct `ros install
-# fukamachi/qlot` leaves a working qlot that no shell can find. That reads as
-# "not installed" to every caller and as "installed" to the person who installed
-# it, and nothing reports the disagreement until a suite fails with status 127.
+# Binaries. Present is not the same as reachable: a tool installed into a
+# directory that is not on PATH reads as "not installed" to every caller and as
+# "installed" to the person who installed it, so that case is reported with its
+# own remedy. qlot is the exception: a deploy runs it by path, never from PATH,
+# so the check is that the path the Makefile uses is executable.
 # ---------------------------------------------------------------------------
 check_binaries() {
     head2 "Binaries"
@@ -81,17 +90,15 @@ check_binaries() {
         "make:sudo pacman -S make" \
         "direnv:sudo pacman -S direnv" \
         "gh:sudo pacman -S github-cli" \
-        "qlot:sudo pacman -S roswell && ros install fukamachi/qlot"
+        "jq:sudo pacman -S jq"
     do
         name=${entry%%:*}; remedy=${entry#*:}
         if path=$(command -v "$name" 2>/dev/null); then
             ok "$name -> $path"
             continue
         fi
-        # Found on disk but not on PATH is a different failure with a different
-        # remedy, so say which one it is rather than reporting a bare absence.
         local found=""
-        for cand in "$HOME/.roswell/bin/$name" "$HOME/.local/bin/$name" "/usr/local/bin/$name"; do
+        for cand in "$HOME/.local/bin/$name" "/usr/local/bin/$name"; do
             [ -x "$cand" ] && { found=$cand; break; }
         done
         if [ -n "$found" ]; then
@@ -101,79 +108,184 @@ check_binaries() {
             bad "$name not found" "$remedy"
         fi
     done
+    local workspace=${LISP_WORKSPACE:-$HOME/SourceCode/lisp}
+    local qlot=${QLOT:-$workspace/qlot/bin/qlot}
+    if [ -x "$qlot" ]; then
+        ok "qlot -> $qlot"
+    else
+        bad "qlot not found at $qlot, so make deploy cannot take its dependencies" \
+            "clone fade/qlot into $workspace/qlot, then run LISP=sbcl scripts/setup.sh there"
+    fi
 }
 
 # ---------------------------------------------------------------------------
-# The MCP server. This check cannot ever become an MCP verb: if the answer is
-# no, the verb does not exist to be called. It stays shell permanently, and so
-# does the core check below it.
+# The MCP server. This check cannot become an MCP verb: when the answer is no,
+# the verb does not exist to be called.
+#
+# The registration names <DSMR_HOME>/current/bin/dsmr-mcp-launch, the release
+# launcher through current, so a deploy or rollback needs no new registration.
+# A registration that names a launcher inside a git work tree starts the server
+# from a checkout and is blocked.
 # ---------------------------------------------------------------------------
+
+# registered_command
+# Print the command of the user-scope dsmr-mcp entry in
+# ${CLAUDE_CONFIG:-$HOME/.claude.json}, or nothing when there is none or jq
+# cannot read the file.
+registered_command() {
+    jq -r '.mcpServers["dsmr-mcp"].command // empty' \
+       "${CLAUDE_CONFIG:-$HOME/.claude.json}" 2>/dev/null
+}
+
+# registration_problem COMMAND
+# Print a reason and return 1 when COMMAND's physical directory is inside a git
+# work tree; print nothing and return 0 otherwise.
+registration_problem() {
+    local command=$1 dir
+    dir=$(physical_dir "$(dirname "$(readlink -f "$command" 2>/dev/null || printf '%s' "$command")")") \
+        || return 0
+    if inside_work_tree "$dir"; then
+        printf 'dsmr-mcp is registered at %s, inside a checkout\n' "$command"
+        return 1
+    fi
+    return 0
+}
+
 check_mcp() {
     head2 "MCP server"
+    local home launcher command problem
+    home=$(dsmr_home) || { bad "no deploy home can be named" "set HOME, or DSMR_HOME to an absolute path"; return; }
+    launcher="$home/current/bin/dsmr-mcp-launch"
     if ! command -v claude >/dev/null 2>&1; then
         bad "claude CLI not found, so the server cannot be registered" \
             "install Claude Code, then re-run"
         return
     fi
     if claude mcp list 2>/dev/null | grep -q '^dsmr-mcp:'; then
-        ok "dsmr-mcp registered"
+        command=$(registered_command)
+        if [ -z "$command" ]; then
+            note "dsmr-mcp is registered, but no user-scope command was read from ${CLAUDE_CONFIG:-$HOME/.claude.json}"
+        elif problem=$(registration_problem "$command"); then
+            ok "dsmr-mcp registered at $command"
+        else
+            bad "${problem%$'\n'}" "make register"
+        fi
+        return
+    fi
+    if [ ! -x "$launcher" ]; then
+        bad "no deployed release; registering would name a missing launcher" \
+            "make deploy REF=<sha>, then make register"
         return
     fi
     if ((CHECK_ONLY)); then
         bad "dsmr-mcp is not registered, so no session gets bus, Lisp or test verbs" \
-            "make preflight (without --check-only), or claude mcp add dsmr-mcp --scope user ..."
+            "make register"
+        return
+    fi
+    # `claude mcp add` writes the CLI's own config, $HOME/.claude.json: only the
+    # account's own release goes there, and a CLAUDE_CONFIG naming any other
+    # file is left to make register, which writes the file it names.
+    if ! host_home_p "$home"; then
+        bad "deploy home $home is a scratch home; preflight registers only the account's own release" \
+            "make register DSMR_HOME=$home CLAUDE_CONFIG=<scratch file>"
+        return
+    fi
+    if [ -n "${CLAUDE_CONFIG:-}" ] && ! host_config_p "$CLAUDE_CONFIG"; then
+        bad "CLAUDE_CONFIG is $CLAUDE_CONFIG, which claude mcp add does not write" \
+            "make register CLAUDE_CONFIG=$CLAUDE_CONFIG"
         return
     fi
     # User scope on purpose: one entry serves every project and therefore every
-    # fleet on the host. Registering per project is the version of this that
-    # looks right and has to be redone for each repo anyone adds.
+    # fleet on the host.
     if claude mcp add dsmr-mcp --scope user \
            -e DSMR_MODE=auto -e DSMR_TRANSPORT=stdio \
-           -- "$LAUNCHER" >/dev/null 2>&1
+           -- "$launcher" >/dev/null 2>&1
     then
         fixed "registered dsmr-mcp at user scope (serves every fleet on this host)"
         note "already-running sessions do NOT pick this up; they need a restart"
     else
-        bad "could not register dsmr-mcp" \
-            "claude mcp add dsmr-mcp --scope user -e DSMR_MODE=auto -e DSMR_TRANSPORT=stdio -- $LAUNCHER"
+        bad "could not register dsmr-mcp" "make register"
     fi
 }
 
 # ---------------------------------------------------------------------------
-# The core. Verify that it BOOTS; never rebuild it here.
+# The deployed release. Checked in three steps, and never rebuilt here.
 #
-# The launcher decides staleness from the recorded sbcl-version, which cannot
-# tell one host's SBCL from another's of the same version. A core carried over
-# on a synced $HOME therefore grades FRESH, gets exec'd, and dies on SBCL's
-# runtime-identity check, with the source-load fallback and the background
-# rebuild both sitting in the branch that never runs. That is a permanent
-# hard-down that repeats identically on every start.
+# First release_refusal, the function the release launcher and `make register`
+# refuse with: HOME set, no git work tree around the release, ownership and
+# write permission of every path the release's code or cores can be replaced
+# through (release_path_problem), the core and its manifests present, the
+# core's recorded SBCL version equal to the running SBCL's, and a boot probe.
+# Then worker_core_withheld, the launcher's own test of the worker core, which a
+# deploy always builds, so a withheld one is a failure. Then the release guard,
+# booted from the release's own server core with the release root and launcher
+# the launcher would pass, which reports any loaded system or launcher tied to
+# a checkout or outside the release, and whether the image is sealed.
 #
-# Booting it is the only honest test, because a freshness check is a prediction
-# and the class of cores that pass one and then die is not empty: a truncated
-# image and an interrupted `make core` land in exactly the same place.
-#
-# Rebuilding is deliberately NOT done here. `make core` takes minutes and bakes
-# whatever is checked out into the deployed image, so a preflight that rebuilt
-# on every launch would silently ship a mid-work feature branch to the fleet.
+# Booting is the only reliable test. A recorded SBCL version cannot tell one
+# build from another of the same version, and a truncated or interrupted image
+# passes every file check; only SBCL loading the image catches those. A rebuild
+# takes minutes and is a deploy, which the operator runs.
 # ---------------------------------------------------------------------------
-check_core() {
-    head2 "Prebuilt core"
-    if [ ! -f "$CORE" ]; then
-        note "no core at $CORE; the launcher will source-load, which is slower but correct"
+
+# release_guard ROOT
+# Boot ROOT's server core and print the guard report (release-root, sealed, tie
+# and ties lines). Return the guard's status: 0 when green.
+release_guard() {
+    local root=$1
+    DSMR_RELEASE_ROOT="$root/" DSMR_LAUNCHER_PATH="$root/bin/dsmr-mcp-launch" \
+        timeout "${DSMR_GUARD_TIMEOUT:-120}" "${SBCL:-sbcl}" --core "$root/core/dsmr.core" \
+        --noinform --non-interactive --no-sysinit --no-userinit \
+        --eval '(dsmr-mcp/src/release:guard-main)' </dev/null 2>/dev/null
+}
+
+# worker_core_remedy PROBLEM
+# Print the remedy for a worker_core_withheld reason. A path another user owns
+# or others can write is restored in place. Anything else needs a new worker
+# core, and the only build is a deploy of a commit with no release yet: a
+# deploy of the commit that is current runs the host steps and builds nothing.
+worker_core_remedy() {
+    case $1 in
+        *" is not owned by "*)
+            printf 'restore ownership and permissions of %s' "${1% is not owned by *}" ;;
+        *" is group or world writable")
+            printf 'restore ownership and permissions of %s' "${1% is group or world writable}" ;;
+        *)
+            printf 'make deploy REF=<sha of a commit that has no release yet>; a commit that already has a release is reused, so its worker core is not rebuilt' ;;
+    esac
+}
+
+check_release() {
+    head2 "Deployed release"
+    local home root problem report commit
+    home=$(dsmr_home) || { bad "no deploy home can be named" "set HOME, or DSMR_HOME to an absolute path"; return; }
+    if [ ! -e "$home/current" ]; then
+        bad "no deployed release at $home/current" "make deploy REF=<sha>"
         return
     fi
-    local err
-    if err=$(sbcl --core "$CORE" --noinform --disable-debugger --no-userinit --eval '(quit)' 2>&1); then
-        ok "core boots on this host"
+    if ! root=$(physical_dir "$home/current"); then
+        bad "$home/current does not name a directory" "make deploy REF=<sha>"
         return
     fi
-    if grep -q 'core was built for runtime' <<<"$err"; then
-        bad "core at $CORE was built by a different SBCL than this host's" \
-            "make core"
-        say "  $(grep -o 'core was built for runtime.*' <<<"$err" | head -1)"
+    if ! problem=$(release_refusal "$root"); then
+        bad "${problem%%; *}" "${problem#*; }"
+        return
+    fi
+    if problem=$(worker_core_withheld "$root"); then
+        bad "worker core withheld: $problem; every hermetic worker would refuse to spawn" \
+            "$(worker_core_remedy "$problem")"
+        return
+    fi
+    if report=$(release_guard "$root"); then
+        commit=$(awk '/^commit /{print $2; exit}' "$root/MANIFEST" 2>/dev/null)
+        ok "release ${commit:-$root} boots and is untied"
+        say "$(grep -m1 '^ties ' <<<"$report")"
     else
-        bad "core at $CORE does not boot" "make core"
+        bad "deployed release $root is tied to a checkout or unsealed" \
+            "make deploy REF=<sha> from a clean, pushed commit"
+        while IFS= read -r line; do
+            case $line in sealed*|tie\ *|ties\ *) say "$line" ;; esac
+        done <<<"$report"
     fi
 }
 
@@ -311,12 +423,181 @@ self_test() {
         printf '  FAIL  binary check did not notice an empty PATH\n'; status=1
     else printf '  pass  binary check fires on a missing binary\n'; fi
 
-    # A core that is not a core.
-    printf 'not a core' > "$tmp/fake.core"
-    if sbcl --core "$tmp/fake.core" --noinform --disable-debugger --no-userinit \
-            --eval '(quit)' >/dev/null 2>&1; then
-        printf '  FAIL  core check accepted a file that is not a core\n'; status=1
-    else printf '  pass  core check fires on an unbootable image\n'; fi
+    # A deploy home with no release.
+    mkdir -p "$tmp/empty-home"
+    if DSMR_HOME="$tmp/empty-home" "$0" --check-release >/dev/null 2>&1; then
+        printf '  FAIL  release check passed a home with no release\n'; status=1
+    else printf '  pass  release check fires on a home with no release\n'; fi
+
+    # A release whose core is not a core, otherwise complete. The launcher's own
+    # check must refuse it at the boot probe.
+    local rel="$tmp/fake-home/releases/fake"
+    mkdir -p "$rel/core" "$rel/bin" "$rel/scripts"
+    chmod -R go-w "$tmp/fake-home"
+    printf 'not a core' > "$rel/core/dsmr.core"
+    printf 'sbcl-version %s\n' "$(running_sbcl_version)" > "$rel/core/dsmr.core.manifest"
+    printf 'commit 0000000\n' > "$rel/MANIFEST"
+    printf '#!/bin/sh\n' > "$rel/bin/dsmr-mcp-launch"
+    : > "$rel/scripts/release-paths.sh"
+    chmod -R go-w "$rel"
+    local boot_problem
+    if boot_problem=$(release_refusal "$rel"); then
+        printf '  FAIL  release check accepted a core that does not boot\n'; status=1
+    elif [[ $boot_problem != *"does not boot"* ]]; then
+        printf '  FAIL  release check refused the unbootable core for another reason: %s\n' "$boot_problem"; status=1
+    else printf '  pass  release check fires on a core that does not boot\n'; fi
+
+    # A deploy home others can write is refused by the launcher, so the release
+    # check must block it too. The control is the same home with sound
+    # permissions passing, which needs a core that boots: a stub SBCL reports
+    # the version the manifest records and exits 0 for the probe and the guard.
+    local sbin="$tmp/sbcl-bin" dhome="$tmp/deploy-home" drel
+    drel="$dhome/releases/r"
+    mkdir -p "$sbin" "$drel/core" "$drel/bin" "$drel/scripts"
+    printf '#!/bin/sh\ncase " $* " in *" --version "*) echo "SBCL 9.9.9" ;; esac\nexit 0\n' \
+        > "$sbin/sbcl"
+    chmod +x "$sbin/sbcl"
+    printf 'core' > "$drel/core/dsmr.core"
+    printf 'sbcl-version 9.9.9\n' > "$drel/core/dsmr.core.manifest"
+    printf 'commit 0000000\n' > "$drel/MANIFEST"
+    printf '#!/bin/sh\n' > "$drel/bin/dsmr-mcp-launch"
+    chmod +x "$drel/bin/dsmr-mcp-launch"
+    cp "$REPO_ROOT/scripts/release-paths.sh" "$drel/scripts/release-paths.sh"
+    printf 'worker core' > "$drel/core/dsmr.core.worker"
+    printf 'sbcl-version 9.9.9\n' > "$drel/core/dsmr.core.worker.manifest"
+    ln -s releases/r "$dhome/current"
+    chmod -R go-w "$dhome"
+    checks_release() {
+        SBCL="$sbin/sbcl" DSMR_HOME="$dhome" "$0" --check-release >/dev/null 2>&1
+    }
+    if checks_release; then
+        printf '  pass  release check passes a sound release\n'
+    else printf '  FAIL  release check refused a sound release\n'; status=1; fi
+    chmod g+w "$dhome"
+    if checks_release; then
+        printf '  FAIL  release check passed a deploy home others can write\n'; status=1
+    else printf '  pass  release check fires on a deploy home others can write\n'; fi
+    chmod g-w "$dhome"
+
+    # The launcher also refuses a release root inside a git work tree and an
+    # empty HOME, which release_problem alone does not check.
+    git init -q "$dhome" 2>/dev/null
+    if checks_release; then
+        printf '  FAIL  release check passed a release root inside a git work tree\n'; status=1
+    else printf '  pass  release check fires on a release root inside a git work tree\n'; fi
+    rm -rf "$dhome/.git"
+    if HOME='' checks_release; then
+        printf '  FAIL  release check passed with HOME empty\n'; status=1
+    else printf '  pass  release check fires with HOME empty\n'; fi
+
+    # A worker core the launcher withholds fails every hermetic spawn: o+w
+    # manifest, then no worker core at all.
+    local remedy
+    chmod o+w "$drel/core/dsmr.core.worker.manifest"
+    if checks_release; then
+        printf '  FAIL  release check passed a worker core the launcher withholds\n'; status=1
+    else printf '  pass  release check fires on a worker core the launcher withholds\n'; fi
+    remedy=$(SBCL="$sbin/sbcl" DSMR_HOME="$dhome" "$0" --check-release 2>&1 | grep 'remedy:')
+    if [[ $remedy == *"restore ownership and permissions of $drel/core/dsmr.core.worker.manifest"* ]]; then
+        printf '  pass  a writable worker manifest names a permission repair\n'
+    else printf '  FAIL  a writable worker manifest names no repair: %s\n' "$remedy"; status=1; fi
+    chmod o-w "$drel/core/dsmr.core.worker.manifest"
+    # A path holding " is " is named whole in the repair.
+    local spaced='/srv/this is home/releases/x/core/dsmr.core.worker'
+    remedy=$(worker_core_remedy "$spaced is group or world writable")
+    if [[ $remedy == "restore ownership and permissions of $spaced" ]]; then
+        printf '  pass  a repair names a writable path containing " is " whole\n'
+    else printf '  FAIL  repair for a writable path containing " is " reads: %s\n' "$remedy"; status=1; fi
+    remedy=$(worker_core_remedy "$spaced is not owned by uid 1000")
+    if [[ $remedy == "restore ownership and permissions of $spaced" ]]; then
+        printf '  pass  a repair names a foreign-owned path containing " is " whole\n'
+    else printf '  FAIL  repair for a foreign-owned path containing " is " reads: %s\n' "$remedy"; status=1; fi
+    mv "$drel/core/dsmr.core.worker" "$drel/core/dsmr.core.worker.away"
+    if checks_release; then
+        printf '  FAIL  release check passed a release with no worker core\n'; status=1
+    else printf '  pass  release check fires on a release with no worker core\n'; fi
+    # The remedy must name a step that removes the cause: a repair for a mode,
+    # a deploy of a new commit for a missing core, never a redeploy of current.
+    remedy=$(SBCL="$sbin/sbcl" DSMR_HOME="$dhome" "$0" --check-release 2>&1 | grep 'remedy:')
+    if [[ $remedy == *"no release yet"* ]]; then
+        printf '  pass  a missing worker core names a deploy of a new commit\n'
+    else printf '  FAIL  a missing worker core names no rebuild: %s\n' "$remedy"; status=1; fi
+    mv "$drel/core/dsmr.core.worker.away" "$drel/core/dsmr.core.worker"
+
+    # A file the launcher requires cannot be missing. Each case moves one out
+    # of the sound release above and restores it.
+    local gone
+    for gone in scripts/release-paths.sh bin/dsmr-mcp-launch; do
+        mv "$drel/$gone" "$drel/$gone.away"
+        if checks_release; then
+            printf '  FAIL  release check passed a release missing %s\n' "$gone"; status=1
+        else printf '  pass  release check fires on a release missing %s\n' "$gone"; fi
+        mv "$drel/$gone.away" "$drel/$gone"
+    done
+
+    # A registration naming a launcher inside a checkout is flagged; one outside
+    # every work tree is not, or the check is stuck on red.
+    mkdir -p "$tmp/checkout/scripts" "$tmp/release/bin"
+    git init -q "$tmp/checkout" 2>/dev/null
+    if registration_problem "$tmp/checkout/scripts/dsmr-mcp-launch.sh" >/dev/null; then
+        printf '  FAIL  registration check passed a launcher inside a checkout\n'; status=1
+    else printf '  pass  registration check fires on a launcher inside a checkout\n'; fi
+    if registration_problem "$tmp/release/bin/dsmr-mcp-launch" >/dev/null; then
+        printf '  pass  registration check passes a launcher outside every checkout\n'
+    else printf '  FAIL  registration check flagged a launcher outside every checkout\n'; status=1; fi
+
+    # Registering writes the CLI's own config, so it must happen only for the
+    # account's own deploy home and only when CLAUDE_CONFIG names that config.
+    # A stub `claude` on PATH reports no entry and records every call; the real
+    # CLI never runs.
+    local cbin="$tmp/claude-bin" clog="$tmp/claude.log" acct="$tmp/account"
+    mkdir -p "$cbin"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$clog" > "$cbin/claude"
+    chmod +x "$cbin/claude"
+    plant_launcher() {
+        mkdir -p "$1/current/bin"
+        printf '#!/bin/sh\n' > "$1/current/bin/dsmr-mcp-launch"
+        chmod +x "$1/current/bin/dsmr-mcp-launch"
+    }
+    plant_launcher "$tmp/scratch-home"
+    plant_launcher "$tmp/xdg/dsmr-mcp"
+    plant_launcher "$acct/.local/share/dsmr-mcp"
+    # registers VAR=value...: run check_mcp with HOME at $acct and the given
+    # variables; succeed when it called `claude mcp add`.
+    registers() {
+        rm -f "$clog"
+        (
+            unset DSMR_HOME XDG_DATA_HOME CLAUDE_CONFIG
+            export PATH="$cbin:$PATH" HOME="$acct"
+            local kv
+            for kv in "$@"; do export "${kv?}"; done
+            CHECK_ONLY=0
+            check_mcp
+        ) >/dev/null 2>&1
+        grep -q '^mcp add' "$clog" 2>/dev/null
+    }
+    if registers DSMR_HOME="$tmp/scratch-home"; then
+        printf '  FAIL  registration ran for a scratch DSMR_HOME\n'; status=1
+    else printf '  pass  registration refuses a scratch DSMR_HOME\n'; fi
+    if registers XDG_DATA_HOME="$tmp/xdg"; then
+        printf '  FAIL  registration ran for a scratch XDG_DATA_HOME\n'; status=1
+    else printf '  pass  registration refuses a scratch XDG_DATA_HOME\n'; fi
+    if registers CLAUDE_CONFIG="$tmp/other.json"; then
+        printf '  FAIL  registration ran while CLAUDE_CONFIG names another file\n'; status=1
+    else printf '  pass  registration refuses a CLAUDE_CONFIG that claude mcp add does not write\n'; fi
+    if registers && registers CLAUDE_CONFIG="$acct/.claude.json"; then
+        printf '  pass  registration runs for the account'"'"'s own home and config\n'
+    else printf '  FAIL  registration cannot run for the account'"'"'s own home\n'; status=1; fi
+    # A hard link is the account's config by identity, whatever its name.
+    : > "$acct/.claude.json"
+    ln "$acct/.claude.json" "$tmp/hard.json"
+    if registers CLAUDE_CONFIG="$tmp/hard.json"; then
+        printf '  pass  registration runs for a hard link to the account'"'"'s config\n'
+    else printf '  FAIL  registration refused a hard link to the account'"'"'s config\n'; status=1; fi
+    if registers DSMR_HOME="$tmp/scratch-home" CLAUDE_CONFIG="$tmp/hard.json"; then
+        printf '  FAIL  registration ran for a scratch home through a hard link\n'; status=1
+    else printf '  pass  registration refuses a scratch home through a hard link\n'; fi
+    rm -f "$tmp/hard.json" "$acct/.claude.json"
 
     # A directory whose .envrc has never been consented to.
     mkdir -p "$tmp/repo"; printf 'export PREFLIGHT_SELF_TEST=1\n' > "$tmp/repo/.envrc"
@@ -350,10 +631,15 @@ if ((SELF_TEST)); then
     self_test; exit $?
 fi
 
+if ((RELEASE_ONLY)); then
+    check_release
+    ((${#blocked[@]} == 0)); exit $?
+fi
+
 printf 'preflight: host %s\n' "$(hostname)"
 check_binaries
+check_release
 check_mcp
-check_core
 check_direnv_consent
 
 head2 "Summary"

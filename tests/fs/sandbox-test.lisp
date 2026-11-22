@@ -2,7 +2,7 @@
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
 ;;;; Tests for SAFETY-01, SAFETY-02, SAFETY-03:
-;;;; read allow-list (root + ASDF source dirs), write jail, 2 MB cap.
+;;;; read allow-list (root + read roots), write jail, 2 MB cap.
 
 ;; Package evolution guard
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -42,17 +42,21 @@
     ;; /etc/passwd is definitely outside root and outside ASDF source dirs
     (false (allowed-read-path "/etc/passwd" root))))
 
-;;; SAFETY-02: ASDF source dir is allowed for read ----------------------------
+;;; SAFETY-02: a read root is allowed for read --------------------------------
 
-(define-test read-allows-asdf-source-dir
-  "A path under a registered ASDF source dir is admitted for reading."
-  ;; dsmr-mcp itself is registered; its src/state.lisp should be readable
+(define-test read-allows-a-read-root
+  "A path under a directory named in DSMR_READ_ROOTS is admitted for reading
+from a session rooted elsewhere."
   (with-temp-project-root (session root)
     (let* ((dsmr-src (asdf:system-source-directory :dsmr-mcp))
-           (state-pn (merge-pathnames "src/state.lisp" dsmr-src)))
-      ;; Only run this check if the file exists (it should)
-      (when (probe-file state-pn)
-        (true (allowed-read-path (namestring state-pn) root))))))
+           (state-pn (merge-pathnames "src/state.lisp" dsmr-src))
+           (saved (uiop:getenv "DSMR_READ_ROOTS")))
+      (true (probe-file state-pn) "the fixture file exists")
+      (unwind-protect
+           (progn
+             (setf (uiop:getenv "DSMR_READ_ROOTS") (namestring dsmr-src))
+             (true (allowed-read-path (namestring state-pn) root)))
+        (setf (uiop:getenv "DSMR_READ_ROOTS") (or saved ""))))))
 
 ;;; D-13: ensure-write-path rejects ASDF source dirs -------------------------
 

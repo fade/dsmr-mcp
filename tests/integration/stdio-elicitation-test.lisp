@@ -52,7 +52,7 @@
 (defun %launch-args ()
   "Return the SBCL args list the installer would generate for dsmr-mcp.
 Reused verbatim so this test guards the SAME launch command operators run."
-  (coerce (gethash "args" (canonical-server-entry)) 'list))
+  (coerce (gethash "args" (canonical-server-entry "dsmr-mcp")) 'list))
 
 (defun %spawn-server (state-home &key project-root)
   "Spawn a child sbcl running dsmr-mcp :stdio with the generated launch args.

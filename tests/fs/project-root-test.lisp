@@ -19,6 +19,8 @@
                 #:get-tool-instance)
   (:import-from #:dsmr-mcp/src/project-root
                 #:allowed-read-path
+                #:ensure-write-path
+                #:%read-roots
                 #:broad-root-p)
   (:import-from #:dsmr-mcp/src/tools/base
                 #:tool-handle)
@@ -28,6 +30,7 @@
   (:import-from #:dsmr-mcp/src/tools/fs-set-project-root)
   (:import-from #:dsmr-mcp/tests/support/fs-fixture
                 #:with-temp-project-root
+                #:write-fixture-file
                 #:%make-temp-directory))
 
 (in-package #:dsmr-mcp/tests/fs/project-root-test)
@@ -451,3 +454,98 @@ as its launch project, and that one only."
                     "the first root established was not treated as home")))
       (uiop:delete-directory-tree first-root :validate t :if-does-not-exist :ignore)
       (uiop:delete-directory-tree sibling :validate t :if-does-not-exist :ignore))))
+
+;;; Read roots ---------------------------------------------------------------
+
+(defmacro %with-env-vars ((&rest bindings) &body body)
+  "Run BODY with each (NAME VALUE) of BINDINGS set in the environment, unsetting
+NAME when VALUE is NIL; restore every previous setting, including absence, on exit."
+  (let ((saved (gensym "SAVED-")) (pair (gensym "PAIR-")))
+    `(let ((,saved (list ,@(loop for (name) in bindings
+                                 collect `(cons ,name (uiop:getenv ,name))))))
+       (flet ((put (name value)
+                (if value
+                    (sb-posix:setenv name value 1)
+                    (sb-posix:unsetenv name))))
+         (unwind-protect
+              (progn
+                ,@(loop for (name value) in bindings collect `(put ,name ,value))
+                ,@body)
+           (dolist (,pair ,saved) (put (car ,pair) (cdr ,pair))))))))
+
+(defmacro %with-read-root-tree ((tmp) &body body)
+  "Bind TMP to the truename of a fresh temp tree holding proj/ (the session
+root), home/SourceCode/lisp/dep/dep.lisp, a/fa.lisp, b/fb.lisp and
+outside/secret.txt. HOME names TMP/home/ for BODY. Delete the tree on exit."
+  (let ((dir (gensym "DIR-")))
+    `(let ((,dir (%make-temp-directory)))
+       (unwind-protect
+            (let ((,tmp (truename ,dir)))
+              (ensure-directories-exist (merge-pathnames "proj/" ,tmp))
+              (dolist (file '("home/SourceCode/lisp/dep/dep.lisp" "a/fa.lisp"
+                              "b/fb.lisp" "outside/secret.txt"))
+                (write-fixture-file ,tmp file "x"))
+              (%with-env-vars (("HOME" (namestring (merge-pathnames "home/" ,tmp))))
+                ,@body))
+         (uiop:delete-directory-tree ,dir :validate t :if-does-not-exist :ignore)))))
+
+(define-test reads-default-to-the-lisp-source-tree
+  "With DSMR_READ_ROOTS unset, a file under ~/SourceCode/lisp/ outside the
+session root is readable and /etc/passwd is not."
+  (%with-read-root-tree (tmp)
+    (%with-env-vars (("DSMR_READ_ROOTS" nil))
+      (let ((root (merge-pathnames "proj/" tmp)))
+        (true (allowed-read-path
+               (namestring (merge-pathnames "home/SourceCode/lisp/dep/dep.lisp" tmp)) root))
+        (false (allowed-read-path "/etc/passwd" root))
+        (false (allowed-read-path (namestring (merge-pathnames "a/fa.lisp" tmp)) root)
+               "a directory outside the default root is not readable")))))
+
+(define-test configured-read-roots-replace-the-default
+  "DSMR_READ_ROOTS=A:B makes files under A and B readable and the default root
+no longer is."
+  (%with-read-root-tree (tmp)
+    (%with-env-vars (("DSMR_READ_ROOTS"
+                      (format nil "~A:~A"
+                              (namestring (merge-pathnames "a/" tmp))
+                              (namestring (merge-pathnames "b" tmp)))))
+      (let ((root (merge-pathnames "proj/" tmp)))
+        (true (allowed-read-path (namestring (merge-pathnames "a/fa.lisp" tmp)) root))
+        (true (allowed-read-path (namestring (merge-pathnames "b/fb.lisp" tmp)) root)
+              "a root named without a trailing slash still counts")
+        (false (allowed-read-path
+                (namestring (merge-pathnames "home/SourceCode/lisp/dep/dep.lisp" tmp)) root))))))
+
+(define-test missing-and-empty-read-roots
+  "A read root that does not exist is dropped, and an empty DSMR_READ_ROOTS
+means the default."
+  (%with-read-root-tree (tmp)
+    (let ((a (merge-pathnames "a/" tmp))
+          (default (merge-pathnames "home/SourceCode/lisp/" tmp)))
+      (%with-env-vars (("DSMR_READ_ROOTS"
+                        (format nil "~A:~A" (namestring (merge-pathnames "missing/" tmp))
+                                (namestring a))))
+        (is equal (list (namestring a)) (mapcar #'namestring (%read-roots))))
+      (%with-env-vars (("DSMR_READ_ROOTS" ""))
+        (is equal (list (namestring default)) (mapcar #'namestring (%read-roots))))
+      (%with-env-vars (("DSMR_READ_ROOTS" nil))
+        (is equal (list (namestring default)) (mapcar #'namestring (%read-roots)))))))
+
+(define-test a-symlink-out-of-a-read-root-is-refused
+  "A symlink under a read root whose target lies outside every root is not readable."
+  (%with-read-root-tree (tmp)
+    (let ((link (merge-pathnames "a/escape.txt" tmp)))
+      (sb-posix:symlink (namestring (merge-pathnames "outside/secret.txt" tmp))
+                        (namestring link))
+      (%with-env-vars (("DSMR_READ_ROOTS" (namestring (merge-pathnames "a/" tmp))))
+        (false (allowed-read-path (namestring link) (merge-pathnames "proj/" tmp)))))))
+
+(define-test a-read-root-is-not-writable
+  "A path under a read root but outside the session root is readable and not writable."
+  (%with-read-root-tree (tmp)
+    (%with-env-vars (("DSMR_READ_ROOTS" (namestring (merge-pathnames "a/" tmp))))
+      (let ((root (merge-pathnames "proj/" tmp))
+            (file (namestring (merge-pathnames "a/fa.lisp" tmp))))
+        (true (allowed-read-path file root))
+        (false (ensure-write-path file root))
+        (false (ensure-write-path (namestring (merge-pathnames "a/new.lisp" tmp)) root))))))

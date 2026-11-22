@@ -157,6 +157,14 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/src/bus-listener")
   :in-order-to ((test-op (test-op "dsmr-mcp/tests"))))
 
+(asdf:defsystem "dsmr-mcp/release"
+  :description "The closure a release server core loads: the server, its installer, and the HyperSpec lookup."
+  :author "Brian O'Reilly <fade@deepsky.com>"
+  :license "AGPL-3.0-or-later"
+  :depends-on ("dsmr-mcp"
+               "dsmr-mcp/src/install"
+               "clhs"))
+
 (asdf:defsystem "dsmr-mcp/tests"
   :class :package-inferred-system
   :description "Test suite for dsmr-mcp."
@@ -172,6 +180,8 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/support/env-fixture"
                "dsmr-mcp/tests/support/gated-load-fixture"
                "dsmr-mcp/tests/state/session-test"
+               "dsmr-mcp/tests/release/guard-test"
+               "dsmr-mcp/tests/release/support-package-test"
                "dsmr-mcp/tests/protocol/handshake-test"
                "dsmr-mcp/tests/protocol/version-negotiation-test"
                "dsmr-mcp/tests/protocol/strict-initialize-test"
@@ -196,6 +206,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/hermetic/pool-pressure-agent-test"
                "dsmr-mcp/tests/hermetic/hibernate-helpers-test"
                "dsmr-mcp/tests/hermetic/worker-client-test"
+               "dsmr-mcp/tests/hermetic/subject-asd-files-test"
                "dsmr-mcp/tests/attach/inspect-test"
                "dsmr-mcp/tests/attach/inspect-thread-test"
                "dsmr-mcp/tests/attach/inspect-restart-test"
@@ -385,6 +396,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/integration/hermetic/pool-resume-test"
                "dsmr-mcp/tests/integration/hermetic/pool-requests-test"
                "dsmr-mcp/tests/integration/hermetic/pressure-relief-test"
+               "dsmr-mcp/tests/integration/hermetic/subject-tree-worker-test"
                "dsmr-mcp/tests/integration/bus/failover-test"
                "dsmr-mcp/tests/integration/bus/broker-identity-test"
                "dsmr-mcp/tests/integration/bus/segmentation-test"
@@ -401,7 +413,9 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/integration/bus/host-ownership-test"
                "dsmr-mcp/tests/integration/bus/host-migration-test"
                "dsmr-mcp/tests/integration/scripts/launcher-supervise-test"
-               "dsmr-mcp/tests/integration/scripts/launcher-core-freshness-test")
+               "dsmr-mcp/tests/integration/scripts/launcher-release-test"
+               "dsmr-mcp/tests/integration/release/seal-test"
+               "dsmr-mcp/tests/integration/release/release-ties-test")
   :perform (test-op (o c)
                     (declare (ignore o))
                     (let* ((test-package-names

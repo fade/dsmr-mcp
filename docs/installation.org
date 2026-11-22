@@ -17,6 +17,7 @@ See also: [[file:index.org]], [[file:configuration.org]],
   do *not* pass =--no-userinit= for a normal launch, or Quicklisp will not be
   on the path.
 - *git* — to clone the source.
+- *qlot*, to deploy a release on a host. See [[*1. Provision qlot][Provision qlot]].
 
 The system =dsmr-mcp= is a package-inferred ASDF system. ASDF must be able to
 find the repository. Place the checkout where your ASDF source-registry looks,
@@ -149,11 +150,106 @@ back — for example evaluating =(+ 1 2)= should return =3=. A successful round
 trip means transport, protocol, and dispatch are all wired correctly. See
 [[file:operations.org]] for the health-check details.
 
+* First deploy on a host
+
+The sections above load and run the server from a checkout, for development.
+A host whose agents use dsmr-mcp runs it from a deployed release instead; see
+[[file:operations.org::*Releases][Releases]] for the release model. A first
+deploy on a new host takes four steps.
+
+** 1. Provision qlot
+
+A release takes its dependencies through qlot, run by path and only at build
+time. Install it without Roswell, from the fork the deploy requires:
+
+#+begin_src sh
+cd "$LISP_WORKSPACE"            # ~/SourceCode/lisp by default
+git clone <qlot fork url> qlot
+cd qlot
+git checkout <QLOT_COMMIT>      # the commit the Makefile's QLOT_COMMIT names
+LISP=sbcl scripts/setup.sh
+#+end_src
+
+The deploy uses =$LISP_WORKSPACE/qlot/bin/qlot= and refuses when that
+checkout is not at =QLOT_COMMIT= or has a tracked change. Set =QLOT= to use a
+qlot elsewhere.
+
+qlot writes a =.qlot= directory into the project it installs for. Add
+=.qlot= to the exclusions of the host's ASDF source registry, beside any
+others it carries, so a tree scan of the workspace never finds a second copy
+of a dependency:
+
+#+begin_src lisp
+;; ~/.config/common-lisp/source-registry.conf.d/source-registry.conf
+(:also-exclude ".qlot")
+#+end_src
+
+** 2. Deploy
+
+From a clean checkout, with the commit pushed to a branch on =origin=:
+
+#+begin_src sh
+make check-skills; make check-agents; make check-harness
+make deploy REF=<sha>
+#+end_src
+
+On a host whose =~/.claude/skills=, =~/.claude/agents= or harness files were
+installed some other way, there is no earlier release to compare them with,
+so every deployed file that differs from the release counts as edited in
+place and the deploy refuses. Review what the three checks list, port any
+edit worth keeping into the tree, and run the deploy again with =FORCE=1=.
+
+** 3. Register
+
+#+begin_src sh
+make register
+#+end_src
+
+Points the =dsmr-mcp= entry in =~/.claude.json= at
+=~/.local/share/dsmr-mcp/current/bin/dsmr-mcp-launch=, after backing the file
+up. It keeps the entry's =env= settings and adds =DSMR_READ_ROOTS= when the
+entry has none. Later deploys and rollbacks need no new registration, because
+the entry names the release through =current=. Running sessions pick up the
+new entry when they restart or run =/mcp=.
+
+** 4. Check the host
+
+#+begin_src sh
+make preflight
+#+end_src
+
+Preflight reports each missing step as =BLOCKED= with its remedy:
+
+| Report                                                       | Remedy                                    |
+|--------------------------------------------------------------+-------------------------------------------|
+| =qlot not found at ..., so make deploy cannot take its dependencies= | Step 1                            |
+| =no deployed release at .../current=                         | =make deploy REF=<sha>=                   |
+| =deployed release ... is tied to a checkout or unsealed=     | =make deploy REF=<sha>= from a clean, pushed commit |
+| =dsmr-mcp is registered at ..., inside a checkout=           | =make register=                           |
+| =dsmr-mcp is not registered, so no session gets bus, Lisp or test verbs= | =make register=               |
+
+When a release is deployed and no entry exists, =make preflight= registers
+the release launcher itself. Run =make check-preflight= to see the same
+report without changing anything.
+
+** A host registered to a checkout launcher
+
+On a host whose =~/.claude.json= still names =scripts/dsmr-mcp-launch.sh= in
+a checkout, take the steps in this order: deploy, register, then update the
+checkout. The checkout launcher forwards to the deployed release, and with no
+release it exits 78, so a checkout updated before the first deploy leaves new
+sessions without a server.
+
 * Wiring into an MCP client
 
-The bundled installer (=sbcl --script scripts/install.lisp=) is the
-recommended path for registering dsmr-mcp with MCP clients (e.g. adding it
-to your client's =mcpServers= configuration). Its flags and the full
-client-wiring walkthrough are documented in [[file:configuration.org]] — use
-that as the entry point for client setup rather than editing client config
-by hand.
+On a host that runs a release, =make register= writes the Claude Code entry
+(see [[*3. Register][Register]]). The bundled installer
+(=sbcl --script scripts/install.lisp=) writes the same entry, always into
+=~/.claude.json=, so it registers only the account's own release:
+=$HOME/.local/share/dsmr-mcp=, or =$XDG_DATA_HOME/dsmr-mcp= when
+=XDG_DATA_HOME= resolves under =$HOME=. It refuses when no release is deployed,
+and when the deploy home is any other (scratch) home. Register a scratch home
+with =make register DSMR_HOME=<scratch home> CLAUDE_CONFIG=<scratch file>=. The
+installer's flags, and the wiring for other clients, are documented in
+[[file:configuration.org]]. For the account's own release, use either rather
+than editing client configuration by hand.

@@ -41,6 +41,10 @@
                 #:start-bus-listener #:stop-bus-listener)
   (:import-from #:dsmr-mcp/src/tools/bus-helpers
                 #:session-bus)
+  (:import-from #:dsmr-mcp/src/release
+                #:release-root
+                #:release-ties
+                #:sealed-p)
   ;; process-json-line is re-exported from here so src/main.lisp's
   ;; existing :import-from dsmr-mcp/src/run #:process-json-line
   ;; continues to resolve. The canonical definition lives in
@@ -469,6 +473,33 @@ The dsmr-mcp:run nickname (re-exported by src/main.lisp) resolves to this functi
     ;; Slynk probe's :warn log line lands on stderr, never on the JSON-RPC
     ;; stdout channel.
     (configure-log4cl-for-server resolved-log-level)
+
+    ;; A server running from a release serves only from a sealed image, so no
+    ;; ASDF lookup can reach a development tree.
+    (let ((release (release-root)))
+      (when (and release (not (sealed-p)))
+        (log-event :error "run.release.unsealed"
+                   "release_root" (namestring release)
+                   "search_functions"
+                   (format nil "~{~A~^ ~}"
+                           (mapcar (lambda (f) (if (symbolp f)
+                                                   (let ((*package* (find-package '#:keyword)))
+                                                     (prin1-to-string f))
+                                                   (princ-to-string f)))
+                                   asdf:*system-definition-search-functions*)))
+        (uiop:quit 78))
+      ;; Nothing a release server runs may come from a checkout or from
+      ;; outside the release; only the SBCL contrib directory is allowed beside it.
+      (when release
+        (let ((ties (release-ties release)))
+          (when ties
+            (dolist (tie ties)
+              (log-event :error "run.release.tied"
+                         "release_root" (namestring release)
+                         "reason" (string-downcase (symbol-name (getf tie :reason)))
+                         "name" (getf tie :name)
+                         "directory" (or (getf tie :directory) "")))
+            (uiop:quit 78)))))
 
     ;; Apply attach-concurrency policy before any session accepts requests.
     (setf *attach-concurrency* resolved-attach-concurrency)

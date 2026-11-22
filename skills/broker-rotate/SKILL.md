@@ -23,11 +23,11 @@ Check the `ARG[...]` output before you trust it.
 
 ## Why you would
 
-The broker is a detached SBCL process that `quickload`s the broker subsystem
-from the project source directory at spawn time. It then runs until something
-kills it. A broker started weeks ago is serving the code that existed weeks ago,
-and no amount of rebuilding the core or the watcher binary reaches it. Restart
-is the only delivery mechanism.
+The broker is a detached SBCL process booted from the server image of the
+release that started it (`DSMR_BROKER_CORE`). It then runs until something
+kills it. A broker started weeks ago is serving the release that was current
+weeks ago, and no later deploy reaches it. Restart is the only delivery
+mechanism.
 
 The cheap tell: compare the broker's start time against the last commit that
 touched anything under `src/bus/`.
@@ -40,8 +40,9 @@ how you retire one. Ask the service first, with `--host-status` on the watcher
 binary, and read the line for your bus:
 
 - **`bus <name> owner=host`**: the service runs this broker. Retire it by
-  restarting the service, after installing the new binary with
-  `make install-bus-host` if the point is new code:
+  restarting the service. If the point is new code, the leader first deploys a
+  release that carries it (`make deploy REF=<sha>`), so the
+  `~/.local/bin/dsmr-bus-host` link reaches the new binary:
 
   ```
   systemctl --user restart dsmr-bus-host

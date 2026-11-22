@@ -2,17 +2,18 @@
 ;;;;
 ;;;; scripts/bus-binary-sources.lisp
 ;;;;
-;;;; Writes the make prerequisite list for one bus binary: one `TARGET: PATH`
-;;;; line per file the binary is built from, that is, every system definition
-;;;; file and every existing component file in the binary's ASDF dependency
-;;;; closure.
+;;;; Writes the make prerequisite list for a bus binary or a core image: one
+;;;; `TARGET: PATH` line per file the target is built from, that is, every
+;;;; system definition file and every existing component file in the ASDF
+;;;; dependency closure of the systems it is built from.
 ;;;;
-;;;; The Makefile loads this file into an SBCL that already holds the binary's
-;;;; build setup (the BUS_WATCH_SBCL or BUS_HOST_SBCL prefix), so the closure
-;;;; resolves exactly as the build resolves it. It is never loaded into a build
-;;;; image, so no binary carries it. It finds systems and never loads, compiles
-;;;; or operates on them; finding a third-party system may load that system's
-;;;; .asd file, as the build setup does.
+;;;; The caller loads this file into an SBCL that already holds the target's
+;;;; build setup (the BUS_WATCH_SBCL or BUS_HOST_SBCL prefix, or
+;;;; scripts/build-core.lisp in list mode), so the closure resolves exactly as
+;;;; the build resolves it. It is never loaded into a build image, so no binary
+;;;; or core carries it. It finds systems and never loads, compiles or operates
+;;;; on them; finding a third-party system may load that system's .asd file, as
+;;;; the build setup does.
 ;;;;
 ;;;; Every refusal signals an error with a message. Under --disable-debugger
 ;;;; SBCL prints it and exits non-zero, and nothing is written.
@@ -119,10 +120,16 @@ rule line."
 (defun write-prerequisites (system target output)
   "Write one `TARGET: PATH` line to file OUTPUT per file SYSTEM is built from,
 and return the number of lines written.
+SYSTEM is one system name, or a list of names whose closures are merged into
+one sorted, deduplicated list.
 Signal an error, before OUTPUT is opened, when TARGET or any path fails
-MAKE-SAFE-NAMESTRING-P, or when SYSTEM-SOURCE-FILES refuses SYSTEM."
+MAKE-SAFE-NAMESTRING-P, or when SYSTEM-SOURCE-FILES refuses a system."
   (check-make-safe target)
-  (let ((files (system-source-files system)))
+  (let ((files (if (listp system)
+                   (sort (remove-duplicates (mapcan #'system-source-files system)
+                                            :test #'string=)
+                         #'string<)
+                   (system-source-files system))))
     (mapc #'check-make-safe files)
     (with-open-file (stream output :direction :output
                                    :if-exists :supersede

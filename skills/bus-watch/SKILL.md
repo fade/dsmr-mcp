@@ -99,8 +99,8 @@ means whichever one is watching for you.
   one that does not know the service. You see it as `--detach` or `--check-live`
   naming a pid that is not the service's (`--host-status` prints the service's
   pid). The service adopts that watcher within about 5 seconds, so you stay
-  heard, but the next arm repeats it until the current binary is installed
-  (`make install-bus-watch`).
+  heard, but the next arm repeats it until the host's release carries the
+  current binary (the leader runs `make deploy REF=<sha>`).
 - **`--host-status` reports the service**, how the host's memory stands (its
   `memory` line), its buses and its registrations, and needs no identity. `service state=not-installed` means everything here about
   the detached watcher applies as written.
@@ -137,8 +137,8 @@ With an identity resolved:
 - It **ignores your own publishes** — arming and publishing happen in any order.
 
 **If `--agent` comes back as `unknown argument`**, your PATH binary predates
-identity support: `make install-bus-watch` from the dsmr-mcp checkout, then
-re-arm. `make bus-watch` alone only writes `bin/` and leaves PATH untouched.
+identity support: the leader runs `make deploy REF=<sha>`, then re-arm. `make bus-watch` alone only
+writes the checkout's `bin/` and leaves PATH untouched.
 
 ## Which bus? Name it, and check the answer names it back
 
@@ -174,10 +174,11 @@ heartbeat under its own bus root, so the liveness answers do not collide and eac
 one is about the bus it names.
 
 ⚠ **The watcher binary and the MCP core deploy SEPARATELY, and this has cost the
-fleet before.** `make install-bus-watch` publishes `~/.local/bin/dsmr-bus-watch`;
-`make core` plus an MCP restart or `/mcp` reconnect publishes the server. Neither
-carries the other. A running watcher also keeps the image it started with until it
-is re-armed. So a sister can be running a watcher that does not understand `--bus`
+fleet before.** `make deploy REF=<sha>` changes both at once:
+`~/.local/bin/dsmr-bus-watch` is a link through `~/.local/share/dsmr-mcp/current/bin/`,
+and the server comes from the same release. But each running process keeps what it
+started with: a running watcher until it is re-armed, a server until an MCP restart
+or `/mcp` reconnect. So a sister can be running a watcher that does not understand `--bus`
 while its own server already does: the watcher warns about an unknown flag, arms on
 the shared bus, and answers `--check-live` with **no `bus=` field at all**. Treat a
 missing `bus=` field as proof of a stale binary, not as an answer. A stale watcher
@@ -393,8 +394,7 @@ deaf with its watcher still live. ⛔ Do not bring it back.
 ### Last-resort fallback: a binary without `--wake` or `--detach`
 
 If `~/.local/bin/dsmr-bus-watch --help` lacks `--wake` or `--detach`, the PATH
-binary is old: `make install-bus-watch` from the dsmr-mcp checkout, then arm as
-above. Only if that is impossible, arm the old supervised stream directly in a
+binary is old: the leader runs `make deploy REF=<sha>`, then arm as above. Only if that is impossible, arm the old supervised stream directly in a
 Monitor, knowing it has both defects above:
 
 ```
@@ -535,7 +535,7 @@ down after 5 seconds.
 On **`error:…`**: the detached watcher hit a fault (it retries on its own and
 writes the same fault once): run `--check-live`, and if it answers
 `dead`/`stale` run `--detach` again; then re-arm the `--wake` either way. If the
-binary is missing or stale, `make install-bus-watch` first.
+binary is missing or stale, the leader runs `make deploy REF=<sha>` first.
 
 ## Is your watch actually alive, and can you hear it? — the liveness probe
 
@@ -581,9 +581,9 @@ clean exit, so "am I still listening?" is a cheap local check, not a `ps` grep:
   name; nothing was armed and nothing was created.
 - **no `bus=` field on a `live`/`dead`/`stale` line**: the binary predates named
   buses. It armed on the shared bus whatever you asked for.
-  `make install-bus-watch`, then re-arm.
+  The leader runs `make deploy REF=<sha>`; then re-arm.
 - **no `readers=` field**: the binary predates the reader count (and `--wake`).
-  `make install-bus-watch`, then re-arm.
+  The leader runs `make deploy REF=<sha>`; then re-arm.
 
 Run it **once per joined bus**, with that bus's tag. A single `live` says nothing
 about the other bus.
@@ -638,21 +638,21 @@ bus it uses an `ephemeral` identity, which never advances the main cursor.
 | Resumed after an interrupt (Esc) | nothing to do: your background `--wait-for-arm` wake outlives the interrupt and takes over once the hook's listener has fired. |
 | `--wake` exited with `bus:<SEQ>` | `bus-receive` every joined bus (stable id) → re-arm the same `--wake` line (with `--wait-for-arm` when the session hook is installed) → catch-up `bus-receive` → handle. |
 | `--wake` exited with `nowatcher bus=…` | `--detach` again (each bus on `bus=*`), then re-arm the `--wake`. With the host bus service installed it may be mid-restart; the same `--detach` covers that. |
-| `--detach` or `--check-live` names a pid that is not the host service's while the service is up | an old binary armed you with a watcher of its own. The service adopts it within seconds; `make install-bus-watch` so the next arm registers instead. |
+| `--detach` or `--check-live` names a pid that is not the host service's while the service is up | an old binary armed you with a watcher of its own. The service adopts it within seconds; the leader runs `make deploy REF=<sha>` so the next arm registers instead. |
 | `--wake` exited with `error:…` | the detached watcher hit a fault — `--check-live`; on `dead`/`stale` run `--detach` again; re-arm the `--wake`. |
 | Idle for hours | nothing. No timer, no re-arm; the `--wake` waits indefinitely. |
 | Parking | last drain, then `--park --all-buses --agent <name> --namespace <root>/`, then stop. **Do NOT reap**: the watcher stays up and `--detach` adopts it and clears the mark at bring-up. |
 | Leaving the fleet / retiring a host | last drain, then `--reap --all-buses --agent <name> --namespace <root>/`; exit 0, or say what survived. |
-| `--help` lacks `--wake` or `--detach` | stale PATH binary. `make install-bus-watch`; the bare `--stream` Monitor loop is the fallback only if that is impossible. |
+| `--help` lacks `--wake` or `--detach` | stale PATH binary. The leader runs `make deploy REF=<sha>`; the bare `--stream` Monitor loop is the fallback only if that is impossible. |
 | Am I still listening? | `~/.local/bin/dsmr-bus-watch --check-live --bus <tag> --agent <name> --namespace <absolute-project-root>/`, wanting `live`, the right `bus=`, **and `readers=1`+**. `deaf=`: drain, then arm a listener. `parked=1`: `--detach`. `dead`/`stale`: `--detach` again, then re-arm. |
 | Before going silent | run `--check-live` per joined bus; never go silent on `dead`/`stale`, on `deaf=` or `parked=1`, on a `bus=` that is not the one you armed, or on `readers=0` without the session hook. |
 | Joined to two buses | two `--detach` runs, two `--bus` tags, one `--wake --all-buses`, two `--check-live` runs. One `live` covers one bus. |
-| `--check-live` prints no `bus=` field | stale PATH binary that armed on the shared bus regardless of what you asked. `make install-bus-watch`, then re-arm. |
-| `--check-live` prints no `readers=` field | stale PATH binary without `--wake`. `make install-bus-watch`, then re-arm. |
+| `--check-live` prints no `bus=` field | stale PATH binary that armed on the shared bus regardless of what you asked. The leader runs `make deploy REF=<sha>`; then re-arm. |
+| `--check-live` prints no `readers=` field | stale PATH binary without `--wake`. The leader runs `make deploy REF=<sha>`; then re-arm. |
 | `--bus` exits 64 | the name is refused (over 32 chars, a character outside `A-Z a-z 0-9 - _ .`, a reserved name, or a socket path too long). Fix the name; never shorten it to fit. |
 | Large backlog | `bus-receive` with `limit` 5–10, page on `remaining_pending`. |
 | `bus-receive` rejects `limit` | MCP predates bounded delivery — `/mcp` reconnect (keeps context). |
-| `--check-live` says `unknown argument` | PATH binary predates liveness — `make install-bus-watch`, then re-arm. |
+| `--check-live` says `unknown argument` | PATH binary predates liveness — the leader runs `make deploy REF=<sha>`; then re-arm. |
 | Omitting `--agent`/`--namespace` | don't — it arms at the head, wakes on your own publishes, **replays on every restart**, and has no heartbeat to check. |
 | Tempted to `run_in_background` a `--stream` or `while true` watcher | that is the two-month deafness bug — it only notifies on exit, which never comes. Background only the one-shot `--wake`. |
 | Tempted to go back to a Monitor tail | don't: Monitor allow rules are dropped in auto mode, so every re-arm faces the classifier, and it expires every 30 minutes. That is how agents went deaf through 2026-09-30. |

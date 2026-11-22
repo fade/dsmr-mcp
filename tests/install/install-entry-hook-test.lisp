@@ -58,16 +58,28 @@ could leak into a later run's absence assertions."
 (defmacro with-temp-home ((var stem) &body body)
   "Point $HOME at a fresh temp dir VAR for the dynamic extent of BODY, restoring
 the previous value on exit. (user-homedir-pathname reads $HOME at call time, so
-this redirects every default install path — ~/.claude.json, ~/.claude/skills,
-~/.local/bin, ~/.local/lib — into temp space, keeping the real home untouched.)"
-  (let ((old (gensym "OLD-HOME")))
+this redirects every default install path (~/.claude.json, ~/.claude/skills,
+~/.local/bin, ~/.local/lib) into temp space, keeping the real home untouched.)
+DSMR_HOME and XDG_DATA_HOME are emptied for BODY, so the deploy home is
+VAR/.local/share/dsmr-mcp/, which holds a stub launcher under current/bin/."
+  (let ((old (gensym "OLD-HOME")) (saved (gensym "SAVED")) (pair (gensym "PAIR")))
     `(with-temp-dir (,var ,stem)
-       (let ((,old (uiop:getenv "HOME")))
+       (let ((,old (uiop:getenv "HOME"))
+             (,saved (mapcar (lambda (name) (cons name (uiop:getenv name)))
+                             '("DSMR_HOME" "XDG_DATA_HOME"))))
          (unwind-protect
               (progn
                 (sb-posix:setenv "HOME" (namestring ,var) 1)
+                (dolist (,pair ,saved) (setf (uiop:getenv (car ,pair)) ""))
+                (let ((launcher (merge-pathnames
+                                 ".local/share/dsmr-mcp/current/bin/dsmr-mcp-launch" ,var)))
+                  (ensure-directories-exist launcher)
+                  (with-open-file (s launcher :direction :output :if-exists :supersede)
+                    (write-line "#!/bin/sh" s)))
                 ,@body)
-           (when ,old (sb-posix:setenv "HOME" ,old 1)))))))
+           (when ,old (sb-posix:setenv "HOME" ,old 1))
+           (dolist (,pair ,saved)
+             (setf (uiop:getenv (car ,pair)) (or (cdr ,pair) ""))))))))
 
 ;;; tests ---------------------------------------------------------------------
 

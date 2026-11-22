@@ -1,0 +1,18 @@
+worker-handshake.json: provenance
+
+What it is: the first stdout line of a real release-worker core started the
+way the pool starts a worker, byte for byte as the deploy verify-worker stage
+kept it (<release>/verify-worker.json). The stub SBCL in
+tests/build/deploy-test.sh prints it when started with the worker entry.
+
+Recorded: 2026-11-21T19:30:39Z, host ghost, commit b31b0b562991cba98e79851243e5b004e841308b
+SBCL: SBCL 2.6.10 (sbcl --version)
+Command: make deploy REF=HEAD DSMR_HOME=<scratch dir>/home ALLOW_UNPUBLISHED=1
+         (from a clean checkout of that commit; then
+         cp <scratch dir>/home/releases/<sha>/verify-worker.json
+         tests/build/fixtures/worker-handshake.json)
+
+Re-record it whenever the worker handshake changes shape. Only the success
+state is recorded: the no-handshake case in deploy-test.sh is a worker that
+prints nothing, which tests the deploy script's reading of the line, not the
+worker's output.

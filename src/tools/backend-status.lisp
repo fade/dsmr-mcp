@@ -66,6 +66,8 @@
                 #:repl-eval-tool-liveness-basis
                 #:repl-eval-tool-last-probe-ms
                 #:repl-eval-tool-liveness-checked-at)
+  (:import-from #:dsmr-mcp/src/release
+                #:release-root #:release-commit #:release-ties #:sealed-p)
   (:import-from #:bordeaux-threads
                 #:with-lock-held)
   ;; closer-mop: the class is finalized explicitly after the defclass below.
@@ -161,6 +163,25 @@ The symbol the encoder writes as null, and hands back on a parse, is CL:NULL,
 which is what the rest of the server uses. An absent measurement is null: nobody has measured,
 which is a different statement from any value at all."
   (or value 'cl:null))
+
+(defun %release-payload ()
+  "The release this server runs from: root, commit, tie count and sealed.
+
+Every field is null outside a release, and the ties are not computed there.
+The tie count is a reported field because a count above zero is a failure;
+the root, the commit and the seal are plain facts."
+  (let ((root (release-root)))
+    (if (null root)
+        (make-ht "root" 'cl:null "commit" 'cl:null "ties" 'cl:null "sealed" 'cl:null)
+        (make-ht "root" (namestring root)
+                 "commit" (%or-null (release-commit))
+                 "ties"
+                 (reported-field (length (release-ties root))
+                                 :establishes "how many loaded systems and launchers resolve inside a git work tree or outside the release root and the SBCL contrib directory, counted on this call"
+                                 :does-not-establish "nothing about code loaded without an ASDF system, and nothing about tools that run in another process, such as the LSP bridge"
+                                 :basis "active-probe"
+                                 :red-condition "any count above zero: a loaded system or the launcher resolves inside a checkout or outside the release")
+                 "sealed" (and (sealed-p) t)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The hermetic branch
@@ -321,7 +342,8 @@ would be noise. Everything that is a judgement is a field."
                         :establishes "how many worker identifiers this server has issued since it started, one per worker process spawned"
                         :does-not-establish "nothing about why any worker was replaced and nothing about when. A number larger than the current worker count says a replacement happened at some point, and says nothing about what caused it."
                         :basis "passive-inference"))
-       "workers" (map 'vector #'%worker-payload workers)))))
+       "workers" (map 'vector #'%worker-payload workers)
+       "release" (%release-payload)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The attached branch
@@ -388,7 +410,8 @@ back clean. Those are opposite answers to a reader deciding whether to worry."
                       :establishes "that this mode has no such counter, so the field is answered rather than left out"
                       :does-not-establish "This is not a count of zero. The developer's image may well have crashed and been restarted; this server does not own it and did not count."
                       :basis "passive-inference"
-                      :red-condition "attached mode starts owning the image's lifecycle, at which point there would be something to count")))))
+                      :red-condition "attached mode starts owning the image's lifecycle, at which point there would be something to count"))
+     "release" (%release-payload))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The verb

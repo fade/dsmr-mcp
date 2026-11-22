@@ -1,0 +1,80 @@
+("quicklisp" .
+ (:class qlot/source/dist:source-dist
+  :initargs (:distribution "https://beta.quicklisp.org/dist/quicklisp.txt" :%version "2026-01-01")
+  :version "2026-01-01"))
+("slynk-client" .
+ (:class qlot/source/github:source-github
+  :initargs (:repos "fade/slynk-client" :ref "67b65da7210b4f9a6e373077373528a4c7bed4b5" :branch nil :tag nil)
+  :version "github-67b65da7210b4f9a6e373077373528a4c7bed4b5"))
+("zebra" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/fade/zebra.git" :ref "a36e393027746c65e41031f9c111f3fdf46877e7")
+  :version "git-a36e393027746c65e41031f9c111f3fdf46877e7"))
+("pzmq" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/fade/pzmq.git" :ref "6f7b2ca02c23ea53510a9b0e0f181d5364ce9d32")
+  :version "git-6f7b2ca02c23ea53510a9b0e0f181d5364ce9d32"))
+("jzon" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/fade/jzon.git" :ref "d5feb465244ac94630e8155f5bfbb45fc1d87b53")
+  :version "git-d5feb465244ac94630e8155f5bfbb45fc1d87b53"))
+("eclector" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/fade/Eclector.git" :ref "1088a7998f0d205da12ff48de7238b1008a31792")
+  :version "git-1088a7998f0d205da12ff48de7238b1008a31792"))
+("acclimation" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/fade/Acclimation.git" :ref "9339b92e16e6a6784488f8bac82c189ae4bab4aa")
+  :version "git-9339b92e16e6a6784488f8bac82c189ae4bab4aa"))
+("ubiquitous" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://codeberg.org/fade/ubiquitous.git" :ref "f6af0c2a2d7855942dd66467166ddf0dac3ab8d7")
+  :version "git-f6af0c2a2d7855942dd66467166ddf0dac3ab8d7"))
+("slynk" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/fade/sly.git" :ref "70350623eecd1f41837c9e57cbb6d5c06678a60d")
+  :version "git-70350623eecd1f41837c9e57cbb6d5c06678a60d"))
+("asdf" .
+ (:class qlot/source/asdf:source-asdf
+  :initargs (:version "3.3.7.4")
+  :version "3.3.7.4"))
+("log4cl" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/sharplispers/log4cl.git" :ref "fe3da517147d023029782ced7cd989ba24f1e62d")
+  :version "git-fe3da517147d023029782ced7cd989ba24f1e62d"))
+("bordeaux-threads" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/sionescu/bordeaux-threads.git" :ref "a44d59ee2452b360369750a675d673abb2175e0f")
+  :version "git-a44d59ee2452b360369750a675d673abb2175e0f"))
+("usocket" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/usocket/usocket.git" :ref "d492f746d33fed32283143394c7ead1cce59ba37")
+  :version "git-d492f746d33fed32283143394c7ead1cce59ba37"))
+("cl-ppcre" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/edicl/cl-ppcre.git" :ref "a2ea581c23fdc184168423adbd4b4c1f48d42743")
+  :version "git-a2ea581c23fdc184168423adbd4b4c1f48d42743"))
+("hunchentoot" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/edicl/hunchentoot.git" :ref "65a3a3cca7e6e91fb068efc2ef8069b5c78ee91f")
+  :version "git-65a3a3cca7e6e91fb068efc2ef8069b5c78ee91f"))
+("cffi" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/cffi/cffi.git" :ref "787d3cd94404f85c0324b0f8d6b9c535fc091720")
+  :version "git-787d3cd94404f85c0324b0f8d6b9c535fc091720"))
+("trivial-custom-debugger" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/phoe/trivial-custom-debugger.git" :ref "802473c75d9db625b8f37b05c95dde47b67c52fa")
+  :version "git-802473c75d9db625b8f37b05c95dde47b67c52fa"))
+("form-fiddle" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/Shinmera/form-fiddle.git" :ref "706c4fa07552d56b372f728a225021a14db3f62e")
+  :version "git-706c4fa07552d56b372f728a225021a14db3f62e"))
+("documentation-utils" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/Shinmera/documentation-utils.git" :ref "fcbd927dee7f311915a27ee557e3db1d4510403c")
+  :version "git-fcbd927dee7f311915a27ee557e3db1d4510403c"))
+("trivial-indent" .
+ (:class qlot/source/git:source-git
+  :initargs (:remote-url "https://github.com/Shinmera/trivial-indent.git" :ref "87b35ff9202b107230e35790e93c471cc7880900")
+  :version "git-87b35ff9202b107230e35790e93c471cc7880900"))

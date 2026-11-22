@@ -179,9 +179,9 @@ offer a core without touching the process environment.")
 (defvar *worker-core-disabled* nil
   "NIL, or a string saying why the worker core stopped being offered.
 
-spawn-worker sets it when a worker fails to boot from the core. From then on
-worker-core-path answers NIL, so this process loads every later worker from
-source instead of failing on the same image again.")
+spawn-worker sets it when the runtime refuses the core or the runtime it needs
+is gone, never for a failure that may pass. From then on worker-core-path
+answers NIL, so this process stops offering an image that cannot boot.")
 
 (defvar *worker-core-unavailable-logged* nil
   "True once this process has logged why it spawns workers from source, so the
@@ -192,6 +192,11 @@ reason is reported once rather than on every spawn.")
   (handler-case
       (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:stat path)))
     (error () nil)))
+
+(defun %source-workers-allowed-p ()
+  "True when DSMR_ALLOW_SOURCE_WORKERS is \"1\", which lets a worker load from
+source when no worker core boots it."
+  (equal (uiop:getenv "DSMR_ALLOW_SOURCE_WORKERS") "1"))
 
 (defun %offered-core (path)
   "Judge PATH as a worker core to boot from. Returns (values PATH NIL) when it
@@ -207,9 +212,11 @@ names an existing regular file, else (values NIL REASON) where REASON is
 load from source. Returns a second value, the reason, when the answer is NIL.
 
 *worker-core* wins when non-NIL, else DSMR_WORKER_CORE; either way the path is
-used only when it names an existing regular file. Once a worker has failed to
-boot from the core (*worker-core-disabled*) this answers NIL for the rest of
-the process. The launcher sets DSMR_WORKER_CORE only when the image is fresh."
+used only when it names an existing regular file. Once the runtime has refused
+the core (*worker-core-disabled*) this answers NIL for the rest of the process;
+a boot failure that may pass leaves the core offered. The launcher leaves
+DSMR_WORKER_CORE unset when worker_core_withheld in scripts/release-paths.sh
+reports a reason, or when that check is absent or fails."
   (if *worker-core-disabled*
       (values nil (format nil "disabled ~A" *worker-core-disabled*))
       (%offered-core (or *worker-core* (uiop:getenv "DSMR_WORKER_CORE")))))
@@ -349,16 +356,26 @@ can tell a failure worth retrying from one that will never succeed:
   :rejected      the runtime refused the core it was given;
   :runtime-gone  the runtime a saved core needs is no longer installed;
   :no-core       there is no saved core to start from;
+  :no-worker-core  there is no worker core, and source workers are not
+                 allowed (DSMR_ALLOW_SOURCE_WORKERS); not worth retrying;
   :connect, :auth, :other  the channel could not be set up."))
 
 (defun worker-spawn-failure-final-p (condition)
-  "True when CONDITION says a saved world can never be resumed as things stand:
-the runtime refused the core, the runtime that wrote it is gone, or there is
-no core. Every other failure, a timeout, a fork that failed for memory, a
-process killed while it loaded, may succeed when tried again."
+  "True when CONDITION says a worker can never be brought up as things stand:
+the runtime refused the core, the runtime that wrote it is gone, there is no
+saved core, or there is no worker core and source workers are not allowed.
+Every other failure, a timeout, a fork that failed for memory, a process
+killed while it loaded, may succeed when tried again."
   (and (typep condition 'worker-spawn-failed)
        (member (worker-spawn-failed-kind condition)
-               '(:rejected :runtime-gone :no-core))
+               '(:rejected :runtime-gone :no-core :no-worker-core))
+       t))
+
+(defun %core-unusable-p (condition)
+  "True when CONDITION, a failed boot from a worker core, says the core itself
+can never boot as things stand: the runtime refused it (:rejected) or the
+runtime it needs is gone (:runtime-gone)."
+  (and (member (worker-spawn-failed-kind condition) '(:rejected :runtime-gone))
        t))
 
 (define-condition worker-rpc-error (error)
@@ -470,9 +487,13 @@ read, a random state freshly seeded from the system is used instead."
 ;;; ---------------------------------------------------------------------------
 
 (defparameter *worker-env-denylist*
-  '("DSMR_WORKER_SECRET" "DSMR_WORKER_ID" "DSMR_PARENT_PID")
+  '("DSMR_WORKER_SECRET" "DSMR_WORKER_ID" "DSMR_PARENT_PID"
+    "DSMR_BROKER_CORE" "DSMR_WORKER_CORE" "DSMR_RELEASE_ROOT" "DSMR_HOME"
+    "DSMR_LAUNCHER_PATH")
   "Environment variables that must NOT be inherited from the parent.
-These are set explicitly per-worker to the correct per-worker values.")
+The per-worker variables are set explicitly to the correct per-worker values.
+The core and release paths are withheld so the brokers and child processes a
+worker starts follow the worker's own rules, not the server's release.")
 
 (defun %build-environment (secret id &key root)
   "Build the environment for worker processes.
@@ -607,14 +628,20 @@ resumes the worker, and CORE is ignored.
 
 With CORE, the path of a worker core image, the worker boots from that image,
 which already holds the worker system, so nothing is loaded before start. The
+worker starts through CL-USER::DSMR-WORKER-ENTRY, which every worker core
+defines, so the arguments name no package a release image may have renamed. The
 image carries the source registry as it stood when it was built; the arguments
-discard it, so the worker sees the workspace as it is now, and add this project
-directory to the central registry, so the project's systems are found even
-when it sits outside the configured registry. Discarding rather than
-re-scanning matters: a scan of a large workspace takes seconds, and ASDF
-repeats it lazily at the worker's first system lookup instead of before its
-handshake. Without CORE the worker loads its systems from source as described
-below.
+discard it, so the worker resolves systems against the workspace as it is
+now. No directory of this server is added to the worker's ASDF lookup: the worker registers the project
+it is rooted at itself. Discarding rather than re-scanning matters: a scan of a
+large workspace takes seconds, and ASDF repeats it lazily at the worker's first
+system lookup instead of before its handshake.
+
+With neither, the worker would load its support code from source, which pairs
+this server with whatever tree ASDF finds. That is refused with
+WORKER-SPAWN-FAILED of kind :no-worker-core unless DSMR_ALLOW_SOURCE_WORKERS is
+\"1\", which only the test targets set; with it the arguments load the worker
+system from source as described below.
 
 --no-userinit prevents the user's ~/.sbclrc from running in the child.
 Without this flag, .sbclrc (which quickloads bordeaux-threads and slynk)
@@ -634,16 +661,18 @@ handshake JSON line."
     ;; the image and the runtime's banner switch.
     (return-from %build-sbcl-args
       (list "--core" (namestring hibernated-core) "--noinform")))
+  (when core
+    (return-from %build-sbcl-args
+      (list "--core" (namestring core)
+            "--noinform" "--disable-debugger" "--no-sysinit" "--no-userinit"
+            "--eval" "(asdf:clear-source-registry)"
+            "--eval" "(cl-user::dsmr-worker-entry)")))
+  (unless (%source-workers-allowed-p)
+    (error 'worker-spawn-failed
+           :kind :no-worker-core
+           :message "no worker core: DSMR_WORKER_CORE is unset or names no file; set DSMR_ALLOW_SOURCE_WORKERS=1 to load the worker from source"))
   (let ((source-dir (namestring (asdf:system-source-directory :dsmr-mcp)))
         (ql-setup (%quicklisp-setup-path)))
-    (when core
-      (return-from %build-sbcl-args
-        (list "--core" (namestring core)
-              "--noinform" "--disable-debugger" "--no-userinit"
-              "--eval" (format nil
-                               "(progn (asdf:clear-source-registry) (pushnew (pathname ~S) asdf:*central-registry* :test (function equal)))"
-                               source-dir)
-              "--eval" "(dsmr-mcp/src/hermetic/worker/main:start)")))
     (append
      (list "--noinform" "--non-interactive" "--no-userinit")
      (when ql-setup
@@ -951,6 +980,7 @@ as :rejected when what it printed says the runtime refused the core."
                                         :hibernated-core hibernated-core
                                         :root root
                                         :runtime runtime))
+            (worker-spawn-failed (e) (error e))
             (error (e)
               (error 'worker-spawn-failed
                      :kind :launch
@@ -1061,11 +1091,20 @@ worker-core-path decides. A worker from the core starts in a fraction of a
 second, against tens of seconds to load its systems from source, which is why
 the pool can afford to spawn on demand and keep nothing warm.
 
-When no usable core is offered the worker loads from source, and the reason is
-logged once per process as worker.core.unavailable. When a core is offered but
-the worker fails to boot from it, the failure is logged as a warning,
-*worker-core-disabled* records it so this process does not try the core again,
-and the spawn is retried once from source.
+When no usable core is offered the reason is logged once per process as
+worker.core.unavailable, and the worker loads from source only when
+DSMR_ALLOW_SOURCE_WORKERS is \"1\"; otherwise WORKER-SPAWN-FAILED of kind
+:no-worker-core is signalled (see %build-sbcl-args). When a core is offered but
+the worker fails to boot from it, the failure is logged as a warning. Only a
+failure that says the core itself is unusable (kind :rejected or :runtime-gone)
+sets *worker-core-disabled*, so this process does not offer that core again; any
+other failure (a timeout, a fork refused for memory, a process killed while
+loading) leaves the core offered to the next spawn, since a release server has
+no source fallback and disabling the core on a passing failure would end every
+later spawn. The spawn is then retried once from source when
+DSMR_ALLOW_SOURCE_WORKERS is \"1\"; otherwise the boot failure is signalled
+again unchanged, so worker-spawn-failure-final-p and the caller's retry policy
+see its own kind.
 
 HIBERNATED-CORE is a core a worker saved of itself. Given one, the worker is
 resumed from it with everything its session had built, CORE is ignored, and
@@ -1095,12 +1134,17 @@ WORKER-SPAWN-FAILED when the worker cannot be brought up at all."
       (path
        (handler-case (%spawn-worker-once path :id id :root root)
          (worker-spawn-failed (e)
-           (let ((why (princ-to-string e)))
+           (let ((why (princ-to-string e))
+                 (unusable (%core-unusable-p e)))
              (log-event :warn "worker.core.boot-failed"
                         "core" path
-                        "error" why)
-             (setf *worker-core-disabled* why)
-             (%spawn-worker-once nil :id id :root root)))))
+                        "error" why
+                        "disabled" (if unusable "true" "false"))
+             (when unusable
+               (setf *worker-core-disabled* why))
+             (if (%source-workers-allowed-p)
+                 (%spawn-worker-once nil :id id :root root)
+                 (error e))))))
       (t
        (unless *worker-core-unavailable-logged*
          (setf *worker-core-unavailable-logged* t)

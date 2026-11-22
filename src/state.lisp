@@ -16,6 +16,8 @@
                 #:*tool-classes*)
   (:import-from #:bordeaux-threads
                 #:make-lock)
+  (:import-from #:dsmr-mcp/src/support-package
+                #:support-package)
   (:export #:session
            #:session-id
            #:initialized-p
@@ -210,13 +212,13 @@ The returned session has:
   (let ((result (make-instance 'session :id id :slynk-attach slynk-attach
                                         :project-root project-root)))
     ;; Install a null-channel as the default notify-channel.  Runtime class
-    ;; lookup via find-symbol / find-package avoids a compile-time import of
-    ;; dsmr-mcp/src/notify, which would create a circular load-order dependency
+    ;; lookup via find-symbol / support-package avoids a compile-time import of
+    ;; the notify package, which would create a circular load-order dependency
     ;; (notify.lisp loads after state.lisp in the package-inferred order).
     ;; When notify.lisp is not yet loaded the channel stays nil; tools call
     ;; emit only after full system load, so this is safe.
     (let ((null-channel-class
-            (let ((pkg (find-package :dsmr-mcp/src/notify)))
+            (let ((pkg (support-package "SRC/NOTIFY")))
               (when pkg
                 (let ((sym (find-symbol "NULL-CHANNEL" pkg)))
                   (when sym (find-class sym nil)))))))

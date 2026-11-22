@@ -24,12 +24,15 @@ tree, so tracking a definition here does nothing on its own.
 
 ```sh
 make check-agents      # report drift between this tree and the deployed copies
-make install-agents    # deploy this tree to $SUBAGENTDIR (default ~/.claude/agents)
+make deploy REF=<sha>  # copy a release's definitions to $SUBAGENTDIR (default ~/.claude/agents)
 ```
 
+Definitions reach a host only from a deployed release: `make deploy` and `make rollback` copy
+the release's `agents/` into `$SUBAGENTDIR`. `make install-agents` is retired and refuses.
+
 ⛔ **The migration direction is from the deployed copy into this tree.** A definition edited in
-place is the newer one, and `install-agents` overwrites without asking. Run `check-agents` first,
-and bring changes here before you deploy.
+place is the newer one. A deploy refuses to replace it unless `FORCE=1` is given. Run
+`check-agents` first, and commit changes here before you deploy.
 
 `check-agents` reports three kinds of drift: a tracked definition that was never deployed, a
 deployed copy that differs from this tree, and a backup left beside a deployed definition. It

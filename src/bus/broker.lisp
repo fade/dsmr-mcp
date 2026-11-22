@@ -711,28 +711,37 @@
     (uiop:quit 0)))
 
 (defun %prebuilt-image-path ()
-  "The prebuilt image beside this project's source, as a namestring, or NIL when
-   the checkout has none.
+  "The image DSMR_BROKER_CORE names, as a namestring, or NIL when the variable
+   is unset, empty, or names no existing file.
 
-   Probed at spawn time rather than remembered, because the image is rebuilt
-   under a running fleet and a path cached at load time would name a file that
-   has since been replaced or removed."
-  (ignore-errors
-    (let ((core (probe-file (merge-pathnames
-                             "dsmr.core"
-                             (asdf:system-source-directory "dsmr-mcp")))))
-      (and core (namestring core)))))
+   The release launcher sets DSMR_BROKER_CORE to its release's server core and
+   the test targets set it to the test core. Read at spawn time rather than remembered,
+   because an image can be replaced under a running fleet and a path cached at
+   load time would name a file that has since been replaced or removed."
+  (let ((named (uiop:getenv "DSMR_BROKER_CORE")))
+    (when (and named (plusp (length named)))
+      (ignore-errors
+        (let ((core (probe-file named)))
+          (and core (not (uiop:directory-pathname-p core))
+               (namestring core)))))))
 
 (defun %broker-spawn-args (root &key (block t))
   "The sbcl command line for a detached broker process.
 
-   A prebuilt image beside the source is used when there is one, because the
-   alternative is measured in tens of seconds: booting plain sbcl and building
-   the broker subsystem from source takes 22 to 33 seconds on this host against
-   0.03 for the image, and every one of those seconds is time the bus has no
-   broker and a caller asking after it learns nothing useful. Without the image
-   the source path is emitted exactly as before, so a checkout that was never
-   built still brings a bus up.
+   The broker boots the image DSMR_BROKER_CORE names when that file exists:
+   the release launcher sets it to its release's server core, the test targets
+   to the test core. An image is used because the alternative is measured in
+   tens of seconds: booting plain sbcl and building the broker subsystem from
+   source takes 22 to 33 seconds against 0.03 for the image, measured on the
+   development workspace, and
+   every one of those seconds is time the bus has no broker and a caller asking
+   after it learns nothing useful. Outside a release, without an image, the
+   broker is built from source, so a bus still comes up.
+
+   Inside a release (DSMR_RELEASE_ROOT set and non-empty) there is no source
+   fallback: with no image this signals an error naming DSMR_BROKER_CORE. A
+   source build would resolve dsmr-mcp through the host's source registry, not
+   the release.
 
    The image path carries fewer flags than the source path and each one earns
    its place. Errors are made fatal rather than interactive, since a broker that
@@ -749,6 +758,10 @@
          (core (%prebuilt-image-path))
          (start (format nil "(funcall (read-from-string \"dsmr-mcp/src/bus/broker:broker-main\") ~S :block ~:[nil~;t~])"
                         (namestring (uiop:ensure-directory-pathname root)) block)))
+    (when (and (not core)
+               (let ((release (uiop:getenv "DSMR_RELEASE_ROOT")))
+                 (and release (plusp (length release)))))
+      (error "no broker image: DSMR_BROKER_CORE is unset or names no file; a release server boots brokers only from its own core"))
     (if core
         (list sbcl "--core" core "--noinform" "--no-userinit" "--disable-debugger"
               "--eval" start)

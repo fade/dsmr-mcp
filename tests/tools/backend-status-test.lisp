@@ -340,3 +340,43 @@ can be improved without turning this red."
           "the liveness bound says it does not speak for another session")
     (true (search "calling session" (gethash "scope" payload))
           "and the answer as a whole says whose connection it covers")))
+
+(define-test backend-status-names-the-release-commit
+  "In both modes the answer carries a release object. Inside a release it names
+the root, the commit from the release MANIFEST, the tie count as a reported
+field and whether the image is sealed, and still conforms to the field
+contract; outside a release every one of those is null."
+  (let* ((dir (string-trim '(#\Newline)
+                           (uiop:run-program (list "mktemp" "-d") :output :string)))
+         (root (namestring (truename (uiop:ensure-directory-pathname dir))))
+         (sha "c9189ea76b7974ee9c11ca4151361dd63de8a7b3")
+         (saved (uiop:getenv "DSMR_RELEASE_ROOT")))
+    (with-open-file (out (merge-pathnames "MANIFEST" root) :direction :output)
+      (format out "commit ~A~%ref HEAD~%" sha))
+    (unwind-protect
+         (progn
+           (setf (uiop:getenv "DSMR_RELEASE_ROOT") root)
+           (dolist (mode '(:hermetic :attached))
+             (let* ((*mode* mode)
+                    (payload (with-populated-pool ()
+                               (%payload (%call "backend-status-release"))))
+                    (release (gethash "release" payload)))
+               (true (hash-table-p release)
+                     (format nil "the ~(~A~) answer carries a release object" mode))
+               (is equal root (gethash "root" release))
+               (is equal sha (gethash "commit" release))
+               (is eq nil (gethash "sealed" release)
+                   "the test image is not sealed")
+               (true (integerp (gethash "value" (gethash "ties" release)))
+                     "the tie count is a reported number")
+               (is equal '() (field-contract-violations payload)
+                   "the answer with a release object conforms")))
+           (setf (uiop:getenv "DSMR_RELEASE_ROOT") "")
+           (let* ((*mode* :hermetic)
+                  (release (gethash "release"
+                                    (with-populated-pool ()
+                                      (%payload (%call "backend-status-no-release"))))))
+             (dolist (key '("root" "commit" "ties" "sealed"))
+               (is eq 'null (gethash key release)
+                   (format nil "~A is null outside a release" key)))))
+      (setf (uiop:getenv "DSMR_RELEASE_ROOT") (or saved "")))))

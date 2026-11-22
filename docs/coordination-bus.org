@@ -232,8 +232,22 @@ dormant. The bus delivers reliably, but nothing connects /a message arrived/ to
 /wake the agent/, so a reply can sit unread until an operator nudges the other
 side. The =dsmr-bus-watch= binary is that missing connector: it watches the WAL
 and turns a new message into one of the two events a harness can wake a dormant
-agent on. Build it with =make bus-watch= and install it on =PATH= via the
-installer (=~/.local/bin/dsmr-bus-watch=).
+agent on. It comes from the deployed release: see
+[[*Where the bus binaries come from][Where the bus binaries come from]].
+
+** Where the bus binaries come from
+
+=dsmr-bus-watch= and the host bus service binary, =dsmr-bus-host=, are built
+inside each release by =make deploy=, from the same commit and dependency
+bundle as the server images. =~/.local/bin/dsmr-bus-watch= and
+=~/.local/bin/dsmr-bus-host= are links through
+=~/.local/share/dsmr-mcp/current/bin/=, so the paths agents, hooks and the
+service unit use never change, and a deploy or a rollback changes what they
+reach. A process already running keeps its binary: the host bus service until
+=systemctl --user restart dsmr-bus-host=, and each watcher until it is
+re-armed. =make install-bus-watch= and =make install-bus-host= are retired:
+they write nothing, exit 1 and name =make deploy=. =make bus-watch= and
+=make bus-host= build into the checkout's =bin/= for tests only.
 
 ** Two modes, and which one to stand on
 
@@ -342,15 +356,15 @@ as its original text, by a subscriber that has not yet picked it up.
 
 ** Rolling out a bus-internals change
 
-This publish behaviour lives in the bus internals compiled into the prebuilt core
-image (=dsmr.core=) that each agent's MCP server boots from. A running server keeps
-serving the *old* core — and thus the old publish behaviour — until it is rebuilt
-and restarted. To pick up the new behaviour, each live agent rebuilds the core and
-restarts its MCP server:
+This publish behaviour lives in the bus internals compiled into the release's
+server image that each agent's MCP server boots from. A running server keeps
+serving the release it started with, and thus the old publish behaviour, until it
+restarts. To roll out a bus-internals change, deploy a release that carries it,
+then restart each MCP server so it boots the new release:
 
 #+begin_example
-make core            # rebuild dsmr.core with the new bus internals
-# then restart the MCP server so it boots the freshly built core
+make deploy REF=<sha>   # build and verify the release, then make it current
+# then restart each MCP server (a session restart or /mcp)
 #+end_example
 
 Because the change is backward-compatible — the publish result gains a field
@@ -358,7 +372,7 @@ additively, an agent only filters its own messages on receive, and a message fro
 an agent on the new behaviour is still received correctly by an agent still on the
 old core — a *staggered* restart across agents is safe. An old-behaviour publisher
 and a new-behaviour publisher interoperate on the same bus, so the sisters need not
-restart in lockstep: each can rebuild and restart on its own schedule, and the
+restart in lockstep: each can restart on its own schedule, and the
 mixed window in between is harmless.
 
 ** CLI surface

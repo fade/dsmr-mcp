@@ -40,6 +40,8 @@
                 #:session-project-root)
   (:import-from #:dsmr-mcp/src/project-root
                 #:ensure-write-path)
+  (:import-from #:dsmr-mcp/src/release
+                #:guard-report)
   (:import-from #:dsmr-mcp/src/project-doctor
                 #:normalise-repository
                 #:report-root
@@ -337,6 +339,7 @@ carries the outcomes it admits. Call again with policy set to act on them.")))
                                           (report-remote-added report))
                                          'null)
                    "dry_run"         (and (report-dry-run report) t)
+                   "server_release"  (guard-report)
                    "content"         (text-content (%summary-text report policy)))))
 
 ;;; ---------------------------------------------------------------------------

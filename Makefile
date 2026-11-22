@@ -1,8 +1,8 @@
 # Makefile — dsmr-mcp build targets
 
 # Canonical SBCL. CI overrides this to the pinned upstream sbcl-bin (a fixed
-# GENCGC build) for reproducibility; a core-image run may instead add
-# `--core dsmr.core`.
+# GENCGC build) for reproducibility; `make test-warm` adds
+# `--core $(TEST_CORE)`.
 SBCL ?= sbcl
 
 # Isolate the fasl cache to a project-local dir so a test run never loads the
@@ -12,20 +12,42 @@ SBCL ?= sbcl
 # cache miss + recompile. Safe to override in the environment on a warm runner.
 export XDG_CACHE_HOME ?= $(CURDIR)/.ci-cache
 
-# Prebuilt core image (deps+system+test-deps via save-lisp-and-die). Override
-# CORE to point `test-warm` at an alternate path; rebuild with `make core`
-# whenever the dependencies, the SBCL build, or the project source change.
-CORE ?= dsmr.core
+## CL_SOURCE_REGISTRY: where ASDF looks for systems in every Lisp this Makefile starts.
+##
+##   Lists this checkout's own directory first and inherits the host
+##   configuration after it, so dsmr-mcp resolves to this checkout even from a
+##   worktree outside the scanned tree, while the dependencies still resolve
+##   from the host. A value already in the environment is kept (CI sets one).
+export CL_SOURCE_REGISTRY ?= $(CURDIR)/:
 
-# Prebuilt worker core image: only the hermetic worker system, its dependencies
-# and Quicklisp. Hermetic workers boot from it instead of loading the system on
-# every spawn. WORKER_CORE_IMAGE is the image `core-verify-worker` checks.
-WORKER_CORE ?= dsmr.core.worker
+## TEST_CORE_DIR, TEST_CORE: the core image test runs build and boot.
+##
+##   One per checkout, under the git-ignored .ci-cache, so a current core is
+##   reused across runs. `make test-core` rebuilds it when it is older than any
+##   file it is built from; test-integration hands it to brokers and test-warm
+##   boots it.
+TEST_CORE_DIR ?= $(CURDIR)/.ci-cache/test-core
+TEST_CORE = $(TEST_CORE_DIR)/dsmr.core
+
+## CORE: the server core image `make core` builds (deps, system and test systems).
+##
+##   Defaults to the test core, so `make core` alone builds into
+##   $(TEST_CORE_DIR) and never touches the image a server runs; `make deploy`
+##   builds that one inside a release.
+CORE ?= $(TEST_CORE)
+
+## WORKER_CORE: the hermetic worker core image `make core-worker` builds.
+##
+##   Holds only the hermetic worker system, its dependencies and Quicklisp.
+##   Hermetic workers boot from it instead of loading the system on every
+##   spawn. WORKER_CORE_IMAGE is the image `core-verify-worker` checks.
+WORKER_CORE ?= $(TEST_CORE_DIR)/dsmr.core.worker
 WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 
-.PHONY: bridge bus-watch bus-host bus-sources bus-binaries install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-verify core-worker core-verify-worker test-warm \
+.PHONY: bridge bus-watch bus-host bus-sources bus-binaries install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-server core-verify core-worker core-verify-worker core-sources test-core test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
-        preflight check-preflight self-test-preflight install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path \
+        preflight check-preflight self-test-preflight check-release install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path \
+        deploy rollback register test-leaf qlot-lock test-build \
         test-worktree-sister install-worktree-sister check-worktree-sister test-lisp-edit-guard
 
 PREFIX ?= $(HOME)/.local
@@ -36,6 +58,62 @@ LIBDIR ?= $(PREFIX)/lib/dsmr-mcp
 # repositories are resolved from. The environment wins so a clone elsewhere
 # needs no edit here.
 WORKSPACE ?= $(or $(LISP_WORKSPACE),$(HOME)/SourceCode/lisp)
+
+## DSMR_HOME: the deploy home `make deploy` builds releases in and flips.
+##
+##   Empty means the deploy script's default,
+##   ${XDG_DATA_HOME:-$HOME/.local/share}/dsmr-mcp. Point it at a scratch
+##   directory to deploy without touching the host's release.
+DSMR_HOME ?=
+
+## REF: the commit `make deploy` exports, builds and makes current.
+##
+##   Any form git rev-parse accepts; it is resolved once to a full sha and only
+##   the sha is used afterwards. Required by `make deploy`.
+REF ?=
+
+## ALLOW_UNPUBLISHED: set to 1 to let `make deploy` build a REF that is on no origin branch.
+##
+##   The override is recorded in the release MANIFEST as
+##   `unpublished-ref-allowed yes`. For CI and scratch dry runs; leave it empty
+##   for a deploy to the host's release.
+ALLOW_UNPUBLISHED ?=
+
+## HOST_LINKS: set to 0 to keep `make deploy` and `make rollback` off the host's own paths.
+##
+##   0 skips every host step: the bus binary links in BINDIR and the copies
+##   into SKILLDIR, AGENTDIR and SUBAGENTDIR. For CI and dry runs. A deploy
+##   with a scratch DSMR_HOME refuses unless this is 0 or those four
+##   directories are scratch directories too.
+HOST_LINKS ?=
+
+## FORCE: set to 1 to replace a deployed file that was edited in place.
+##
+##   `make deploy` and `make rollback` refuse, before they change anything, when
+##   a deployed skill, agent definition or harness file differs from both the
+##   release being installed and the release it replaces; FORCE=1 replaces it.
+##   install-host-unit reads it the same way for the systemd units.
+FORCE ?=
+
+## CLAUDE_CONFIG: the Claude Code config file `make register` writes.
+##
+##   Defaults to the host's own config. A run with a scratch DSMR_HOME must name
+##   a scratch file here too, or `make register` refuses.
+CLAUDE_CONFIG ?= $(HOME)/.claude.json
+
+## QLOT: the qlot executable a release build takes its dependencies through.
+##
+##   Provisioned by cloning qlot into the Lisp workspace and running its
+##   scripts/setup.sh. Used only at build time; a running server never calls it.
+QLOT ?= $(WORKSPACE)/qlot/bin/qlot
+
+## QLOT_COMMIT: the qlot commit that deploy and qlot-lock require.
+##
+##   The checkout holding QLOT must have this commit checked out with no
+##   tracked change. It is the commit on the fade/qlot fork that drops a git
+##   source's (:feature ...) dependency when the feature is false, which the
+##   bordeaux-threads pin needs. Empty skips the check.
+QLOT_COMMIT ?= 1dc76d184a2847d83b0596966abf30fb7648a29c
 
 # Where the harness skills are deployed for the agent that reads them. Claude is
 # the first target and deliberately not the only one; a second agent gets its own
@@ -75,20 +153,49 @@ bridge:
 	     --eval '(asdf:make :dsmr-mcp-bridge)' \
 	     --eval '(quit)'
 
+## BUS_DEPS_SETUP: a dependency bundle's setup.lisp the bus binaries are built against.
+##
+##   Empty builds them as a development checkout always has: the watcher with
+##   ASDF alone, the host service with the user's Quicklisp and the Lisp
+##   workspace. A path loads that file in place of both, limits the source
+##   registry to the current directory, loads the bundle's own
+##   local-projects/asdf/build/asdf.lisp as a file and empties the central
+##   registry, so the binaries resolve every dependency from the bundle and
+##   nothing from the host's Quicklisp, workspace or source registry
+##   configuration. The bundled ASDF is loaded as a file because the bundle's
+##   searcher resolves only primary system names: a build of asdf/defsystem
+##   through any registry still open regenerates another checkout's
+##   build/asdf.lisp. `make deploy` sets it to the release's own
+##   <release>/deps/setup.lisp and runs the build in the release, so the bus
+##   binaries come from the same export and bundle as the server cores.
+BUS_DEPS_SETUP ?=
+ifeq ($(strip $(BUS_DEPS_SETUP)),)
+BUS_WATCH_SETUP = --eval '(require :asdf)'
+BUS_HOST_SETUP = --eval '(require :asdf)' \
+	     --eval '(let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file ql) (load ql)))' \
+	     --eval '(pushnew (uiop:ensure-directory-pathname "$(WORKSPACE)") asdf:*central-registry* :test (function equal))' \
+	     --eval '(pushnew (uiop:ensure-directory-pathname "$(WORKSPACE)/pzmq") asdf:*central-registry* :test (function equal))'
+else
+BUS_ONLY_CWD = (asdf:initialize-source-registry (list :source-registry (list :directory (uiop:getcwd)) :ignore-inherited-configuration))
+BUS_WATCH_SETUP = --load "$(BUS_DEPS_SETUP)" \
+	     --eval '$(BUS_ONLY_CWD)' \
+	     --eval '(let ((*standard-output* *error-output*)) (load (merge-pathnames "local-projects/asdf/build/asdf.lisp" (uiop:pathname-directory-pathname "$(BUS_DEPS_SETUP)"))))' \
+	     --eval '$(BUS_ONLY_CWD)' \
+	     --eval '(setf asdf:*central-registry* nil)'
+BUS_HOST_SETUP = $(BUS_WATCH_SETUP)
+endif
+
 ## BUS_WATCH_SBCL, BUS_HOST_SBCL: the SBCL command and ASDF setup each bus binary is built under.
 ##
 ##   The bus-watch and bus-host recipes and the bus-sources listing start with
 ##   them, so the files listed for each binary resolve exactly as its build
-##   resolves them.
-BUS_WATCH_SBCL = sbcl --noinform --no-sysinit --no-userinit --disable-debugger \
-	     --eval '(require :asdf)' \
+##   resolves them. BUS_DEPS_SETUP selects the dependency setup.
+BUS_WATCH_SBCL = $(SBCL) --noinform --no-sysinit --no-userinit --disable-debugger \
+	     $(BUS_WATCH_SETUP) \
 	     --eval '(asdf:load-asd (truename "dsmr-mcp.asd"))' \
 	     --eval '(asdf:load-asd (truename "dsmr-bus-watch.asd"))'
-BUS_HOST_SBCL = sbcl --noinform --no-sysinit --no-userinit --disable-debugger \
-	     --eval '(require :asdf)' \
-	     --eval '(let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))) (when (probe-file ql) (load ql)))' \
-	     --eval '(pushnew (uiop:ensure-directory-pathname "$(WORKSPACE)") asdf:*central-registry* :test (function equal))' \
-	     --eval '(pushnew (uiop:ensure-directory-pathname "$(WORKSPACE)/pzmq") asdf:*central-registry* :test (function equal))' \
+BUS_HOST_SBCL = $(SBCL) --noinform --no-sysinit --no-userinit --disable-debugger \
+	     $(BUS_HOST_SETUP) \
 	     --eval '(asdf:load-asd (truename "dsmr-mcp.asd"))' \
 	     --eval '(asdf:load-asd (truename "dsmr-bus-watch.asd"))' \
 	     --eval '(asdf:load-asd (truename "dsmr-bus-host.asd"))'
@@ -96,9 +203,12 @@ BUS_HOST_SBCL = sbcl --noinform --no-sysinit --no-userinit --disable-debugger \
 ## bus-watch: build the standalone coordination-bus wakeup watcher binary.
 ##
 ##   Produces bin/dsmr-bus-watch via ASDF program-op (save-lisp-and-die).
-##   A sister repo arms it by bare command name; the machine needs no SBCL or
-##   Python of its own. Build artefact is .gitignored; rebuild with
-##   'make bus-watch' after any change to src/bus/watch.lisp.
+##   The machine that runs it needs no SBCL or Python of its own. The binary in
+##   this checkout's bin/ is for tests and is never what the host runs: the
+##   host runs <DSMR_HOME>/current/bin/dsmr-bus-watch, which `make deploy`
+##   builds from the release with this same target. Build artefact is
+##   .gitignored; rebuild with 'make bus-watch' after any change to
+##   src/bus/watch.lisp.
 ##
 ##   Built with --no-userinit/--no-sysinit so the saved image carries ONLY the
 ##   WAL leaf + watcher (no Quicklisp/slynk) — the watcher's closure needs
@@ -111,7 +221,10 @@ bus-watch:
 
 ## bus-host: build the host bus service binary.
 ##
-##   Produces bin/dsmr-bus-host via ASDF program-op (save-lisp-and-die). One
+##   Produces bin/dsmr-bus-host via ASDF program-op (save-lisp-and-die). The
+##   binary in this checkout's bin/ is for tests and is never what the host
+##   runs: the service runs <DSMR_HOME>/current/bin/dsmr-bus-host, which `make
+##   deploy` builds from the release with this same target. One
 ##   process per host runs every bus broker and the watch for every agent
 ##   registered with it. While it runs it takes over from the broker elected by
 ##   whichever client came first and the detached watcher process per agent per
@@ -204,36 +317,13 @@ bus-binaries:
 	$(MAKE) --no-print-directory -f Makefile -f "$$sources/dsmr-bus-watch.mk" bin/dsmr-bus-watch; \
 	$(MAKE) --no-print-directory -f Makefile -f "$$sources/dsmr-bus-host.mk" bin/dsmr-bus-host
 
-## install-bus-watch: publish the built watcher onto PATH.
+## install-bus-watch, install-bus-host: retired; refuse and name `make deploy`.
 ##
-##   Agents invoke 'dsmr-bus-watch' by name, so the copy under $(BINDIR) — not
-##   bin/ — is the one every session actually runs. Skipping this step leaves
-##   the operator docs describing flags the deployed binary rejects, and a
-##   watcher that exits on them is deaf to the bus rather than noisy about it.
-##   Install atomically: agents arm watchers continuously, and cp over a running
-##   binary's inode can hand a session a half-written image.
-install-bus-watch: bus-watch
-	@mkdir -p "$(BINDIR)"
-	@cp bin/dsmr-bus-watch "$(BINDIR)/.dsmr-bus-watch.tmp"
-	@chmod 755 "$(BINDIR)/.dsmr-bus-watch.tmp"
-	@mv -f "$(BINDIR)/.dsmr-bus-watch.tmp" "$(BINDIR)/dsmr-bus-watch"
-	@echo "installed $(BINDIR)/dsmr-bus-watch"
-	@echo "running watchers keep the previous image until each is re-armed"
-
-## install-bus-host: publish the built host bus service binary onto PATH.
-##
-##   The service's unit runs the copy under $(BINDIR), so this is the step that
-##   changes what the host runs. Installed atomically for the same reason as the
-##   watcher. The running service keeps the image it started with until it is
-##   restarted, and a restart is a deliberate act because every agent on the
-##   host hears the bus through it.
-install-bus-host: bus-host
-	@mkdir -p "$(BINDIR)"
-	@cp bin/dsmr-bus-host "$(BINDIR)/.dsmr-bus-host.tmp"
-	@chmod 755 "$(BINDIR)/.dsmr-bus-host.tmp"
-	@mv -f "$(BINDIR)/.dsmr-bus-host.tmp" "$(BINDIR)/dsmr-bus-host"
-	@echo "installed $(BINDIR)/dsmr-bus-host"
-	@echo "the running service keeps the previous image until 'systemctl --user restart dsmr-bus-host'"
+##   The host's ~/.local/bin/dsmr-bus-watch and dsmr-bus-host are links into
+##   the deployed release. A checkout build copied over a link would silently
+##   undo the release, so these targets build and write nothing and exit 1.
+install-bus-watch install-bus-host:
+	@echo "$@: bus binaries come from the deployed release; run make deploy REF=<sha>" >&2; exit 1
 
 ## install-host-unit: deploy the host bus service's systemd user units.
 ##
@@ -296,11 +386,14 @@ check-host-unit:
 
 ## preflight: check this host can run a fleet, establishing what is safe to.
 ##
-##   Registers the MCP server if it is absent, consents to the named repos'
-##   .envrc files, and verifies the prebuilt core actually boots here. Anything
-##   needing root, and anything that takes minutes, is reported with a remedy
-##   instead of being run: a check that rebuilt the core on every launch would
-##   ship whatever branch happens to be checked out to the whole fleet.
+##   Checks the deployed release under DSMR_HOME with the release launcher's
+##   own checks, boots its server core and runs the release guard against it,
+##   registers the MCP server at the release launcher if it is absent and a
+##   release exists, blocks a registration that names a launcher inside a
+##   checkout, and consents to the named repos' .envrc files. Anything needing
+##   root, and anything that takes minutes, is reported with a remedy instead
+##   of being run: deploying a release is `make deploy REF=<sha>`, which the
+##   operator runs after review.
 ##
 ##   `sisters.sh` runs this before it starts anything and refuses to launch on a
 ##   non-zero answer. Run it by hand to provision a new host, or to find out why
@@ -325,6 +418,17 @@ check-preflight:
 ##   suite.
 self-test-preflight:
 	@./scripts/preflight.sh --self-test
+
+## check-release: run the release guard against the deployed release.
+##
+##   Applies the release launcher's checks to <DSMR_HOME>/current, then boots
+##   its server core with that release's root and launcher and prints the guard
+##   report: whether the image is sealed, each tie to a checkout or to a path
+##   outside the release, and `ties <n>`. Exits non-zero when the release would
+##   be refused or the report is red. For CI and for the operator after a deploy:
+##   make check-release DSMR_HOME=<scratch home>
+check-release:
+	@DSMR_HOME="$(DSMR_HOME)" SBCL="$(SBCL)" ./scripts/preflight.sh --check-release
 
 ## install-hooks: install this tree's git hooks into a repository.
 ##
@@ -543,22 +647,17 @@ check-skills:
 	  fi; \
 	done; \
 	if [ $$status -eq 0 ]; then echo "skills in sync with $(SKILLDIR)"; \
-	else echo "run 'make install-skills' to deploy this tree, or port the other way first"; fi; \
+	else echo "run 'make deploy REF=<sha>' to deploy a commit of this tree, or port the other way first"; fi; \
 	exit $$status
 
-## install-skills: deploy this tree's harness skills to the agent that reads them.
+## install-skills: retired; refuses and names `make deploy`.
 ##
-##   ⛔ The migration direction is global -> repo. If a deployed skill has been
-##   edited in place, that edit is the newer one and this target would destroy
-##   it. Run check-skills first and port the other way before deploying.
-##   Deployment is per-file so an agent's unrelated skills are left alone.
+##   Skills, agent definitions and harness files are copied from the deployed
+##   release by `make deploy` and `make rollback`. A copy from this checkout
+##   would also make the next deploy's divergence check refuse, so this target
+##   writes nothing and exits 1.
 install-skills:
-	@for f in $$(cd skills && find . -mindepth 2 -type f ! -path '*__pycache__*' | sed 's|^\./||'); do \
-	  mkdir -p "$(SKILLDIR)/$$(dirname $$f)"; \
-	  cp -p "skills/$$f" "$(SKILLDIR)/$$f"; \
-	  echo "  deployed $$f"; \
-	done
-	@echo "installed into $(SKILLDIR)"
+	@echo "$@: skills, agents and harness files come from the deployed release; run make deploy REF=<sha>" >&2; exit 1
 
 ## check-agents: report where the deployed agent definitions differ from this tree.
 ##
@@ -585,29 +684,23 @@ check-agents:
 	  done; \
 	done; \
 	if [ $$status -eq 0 ]; then echo "agents in sync with $(SUBAGENTDIR)"; \
-	else echo "run 'make install-agents' to deploy this tree, or port the other way first"; fi; \
+	else echo "run 'make deploy REF=<sha>' to deploy a commit of this tree, or port the other way first"; fi; \
 	exit $$status
 
-## install-agents: deploy this tree's agent definitions to the agent that reads them.
+## install-agents: retired; refuses and names `make deploy`.
 ##
-##   ⛔ The migration direction is deployed -> repo. If a deployed definition
-##   has been edited in place, that edit is the newer one and this target would
-##   destroy it. Run check-agents first and port the other way before deploying.
-##   Deployment is per-file over the agents tracked here, so the gsd-* roster
-##   is left alone.
+##   Skills, agent definitions, and harness files are copied from the deployed
+##   release by `make deploy` and `make rollback`. A copy from this checkout
+##   would also make the next deploy's divergence check refuse, so this target
+##   writes nothing and exits 1.
 install-agents:
-	@for f in $$(cd agents && find . -maxdepth 1 -type f -name '*.md' ! -name README.md | sed 's|^\./||'); do \
-	  mkdir -p "$(SUBAGENTDIR)"; \
-	  cp -p "agents/$$f" "$(SUBAGENTDIR)/$$f"; \
-	  echo "  deployed $$f"; \
-	done
-	@echo "installed into $(SUBAGENTDIR)"
+	@echo "$@: skills, agents and harness files come from the deployed release; run make deploy REF=<sha>" >&2; exit 1
 
 ## check-harness: report drift between harness/ and the deployed agent root.
 ##
 ##   Same contract as check-skills, and the same hazard: a live correction is
 ##   usually made to the DEPLOYED copy, so the tracked tree is the stale one
-##   more often than not. Always run this before install-harness, and when it
+##   more often than not. Always run this before make deploy, and when it
 ##   reports DIFFERS, look before deciding which way to copy.
 check-harness:
 	@status=0; \
@@ -619,22 +712,17 @@ check-harness:
 	  fi; \
 	done; \
 	if [ $$status -eq 0 ]; then echo "harness in sync with $(AGENTDIR)"; \
-	else echo "run 'make install-harness' to deploy this tree, or port the other way first"; fi; \
+	else echo "run 'make deploy REF=<sha>' to deploy a commit of this tree, or port the other way first"; fi; \
 	exit $$status
 
-## install-harness: deploy harness/ into the agent configuration root.
+## install-harness: retired; refuses and names `make deploy`.
 ##
-##   Reaches every session on the host, not just this project's. The status
-##   line lands immediately for sessions started afterwards; a running session
-##   keeps the one it started with.
+##   Skills, agent definitions and harness files are copied from the deployed
+##   release by `make deploy` and `make rollback`. A copy from this checkout
+##   would also make the next deploy's divergence check refuse, so this target
+##   writes nothing and exits 1.
 install-harness:
-	@for f in $$(cd harness && find . -type f | sed 's|^\./||'); do \
-	  mkdir -p "$(AGENTDIR)/$$(dirname $$f)"; \
-	  cp -p "harness/$$f" "$(AGENTDIR)/$$f"; \
-	  chmod +x "$(AGENTDIR)/$$f"; \
-	  echo "  deployed $$f"; \
-	done
-	@echo "installed into $(AGENTDIR)"
+	@echo "$@: skills, agents and harness files come from the deployed release; run make deploy REF=<sha>" >&2; exit 1
 
 ## TEST_STATE_HOME: the shell prefix that gives a test run its own state.
 ##
@@ -692,6 +780,33 @@ TEST_LIMIT_STATUS = ; status=$$?; \
 	  printf '%s\n' "$@: killed by SIGKILL; if $(1)=$($(1)) had passed, the run ignored SIGTERM for TEST_KILL_GRACE=$(TEST_KILL_GRACE)" >&2; \
 	fi; exit $$status
 
+## TEST_SOURCE_CHECK: the --eval that proves a run loaded this checkout's dsmr-mcp.
+##
+##   Compares the truename of the directory dsmr-mcp resolves to with this
+##   checkout's. On a match it prints `dsmr-mcp source: <dir>` on stderr; on a
+##   mismatch the run dies with status 2 before any test runs. The suites place
+##   it after their load, because the registry can read correctly while the
+##   system resolved somewhere else.
+TEST_SOURCE_CHECK = --eval '(let ((found (namestring (truename (asdf:system-source-directory "dsmr-mcp")))) (here (namestring (truename "$(CURDIR)/")))) (if (string= found here) (format *error-output* "~&dsmr-mcp source: ~A~%" found) (uiop:die 2 "dsmr-mcp resolves to ~A, not this checkout ~A; put this checkout first in CL_SOURCE_REGISTRY" found here)))'
+
+## test-build: the shell suites for deploy, rollback, registration, the launcher's
+##   refusals, the core install and the dependency pins.
+##
+##   Stubs stand in for SBCL, qlot, make and claude, and every run keeps HOME
+##   and its destinations inside a temporary directory, so nothing reaches the
+##   host's release, bin, skills, agents or Claude Code config. Runs every
+##   suite and fails when any one fails. CI runs it in the unit-suite job.
+BUILD_SUITES = tests/build/deploy-test.sh tests/build/register-test.sh \
+               tests/build/release-guard-test.sh \
+               tests/build/core-install-test.sh tests/build/qlfile-pin-test.sh
+test-build:
+	@status=0; \
+	for suite in $(BUILD_SUITES); do \
+	  printf '\n== %s\n' "$$suite"; \
+	  bash "$$suite" || { echo "test-build: $$suite failed" >&2; status=1; }; \
+	done; \
+	exit $$status
+
 ## test: fast in-process unit suite (the push hot-path).
 ##
 ##   Runs the dsmr-mcp/tests umbrella — true in-process units, no child SBCLs.
@@ -710,6 +825,7 @@ test:
 	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(call TEST_LIMIT,TEST_TIMEOUT) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests")' \
+	     $(TEST_SOURCE_CHECK) \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))' $(call TEST_LIMIT_STATUS,TEST_TIMEOUT)
 
 ## test-integration: slow cross-process suite (gated, off the push hot-path).
@@ -719,14 +835,50 @@ test:
 ##   fail-fast contract, private state home, and DSMR_ removal as `test`,
 ##   because several leaves start a pool too. Run on a schedule / label, not every push.
 ##   TEST_INTEGRATION_TIMEOUT limits the run. It first runs bus-binaries, so
-##   no case runs a bus binary older than a file it is built from.
+##   no case runs a bus binary older than a file it is built from. It then runs
+##   test-core and passes $(TEST_CORE) to the suite as DSMR_BROKER_CORE, so
+##   every broker a case spawns boots the core built from this tree.
+## DSMR_ALLOW_SOURCE_WORKERS=1: the integration suite starts source-loaded
+##   workers deliberately; nothing else sets it, so a worker without a worker
+##   core is refused everywhere else.
 test-integration: bus-binaries
-	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(call TEST_LIMIT,TEST_INTEGRATION_TIMEOUT) $(SBCL) --noinform --disable-debugger --non-interactive \
+	+@$(MAKE) --no-print-directory test-core
+	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) DSMR_ALLOW_SOURCE_WORKERS=1 DSMR_BROKER_CORE="$(TEST_CORE)" $(call TEST_LIMIT,TEST_INTEGRATION_TIMEOUT) $(SBCL) --noinform --disable-debugger --non-interactive \
 	     --eval '(require :asdf)' \
 	     --eval '(asdf:load-system "dsmr-mcp/tests/integration")' \
+	     $(TEST_SOURCE_CHECK) \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests/integration") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))' $(call TEST_LIMIT_STATUS,TEST_INTEGRATION_TIMEOUT)
 
-## core: build the prebuilt deps+system+test-deps core image ($(CORE)).
+## test-leaf: run the tests of one test system, named by LEAF.
+##
+##   make test-leaf LEAF=dsmr-mcp/tests/install/config-test
+##
+##   Same private state home, DSMR_ removal and source check as `test`. Loads
+##   the test runner and LEAF, checks that dsmr-mcp resolved to this checkout,
+##   then runs LEAF's package under the per-test bound. Fails when a test
+##   fails and when the package holds no test, since a leaf that runs nothing
+##   is a wiring fault. TEST_TIMEOUT limits the run, or
+##   TEST_INTEGRATION_TIMEOUT when LEAF is under dsmr-mcp/tests/integration/.
+##   A leaf under dsmr-mcp/tests/integration/ runs test-core first and gets
+##   $(TEST_CORE) as DSMR_BROKER_CORE, as under test-integration.
+## DSMR_ALLOW_SOURCE_WORKERS=1 is set for an integration LEAF only, as under
+##   test-integration: those leaves start source-loaded workers deliberately.
+##   The command is not echoed, so a search of the log for the source check's
+##   refusal finds only a refusal the run printed.
+LEAF ?=
+LEAF_INTEGRATION = $(filter dsmr-mcp/tests/integration/%,$(LEAF))
+LEAF_LIMIT = $(if $(LEAF_INTEGRATION),TEST_INTEGRATION_TIMEOUT,TEST_TIMEOUT)
+test-leaf:
+	@$(if $(strip $(LEAF)),:,echo "test-leaf: LEAF is empty; name a test system, for example LEAF=dsmr-mcp/tests/install/config-test" >&2; exit 1)
+	$(if $(LEAF_INTEGRATION),+@$(MAKE) --no-print-directory test-core)
+	@$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(if $(LEAF_INTEGRATION),DSMR_ALLOW_SOURCE_WORKERS=1 DSMR_BROKER_CORE="$(TEST_CORE)") $(call TEST_LIMIT,$(LEAF_LIMIT)) $(SBCL) --noinform --disable-debugger --non-interactive \
+	     --eval '(require :asdf)' \
+	     --eval '(asdf:load-system "dsmr-mcp/tests/support/test-watchdog")' \
+	     --eval '(asdf:load-system "$(LEAF)")' \
+	     $(TEST_SOURCE_CHECK) \
+	     --eval '(handler-case (multiple-value-bind (failed reports) (uiop:symbol-call :dsmr-mcp/tests/support/test-watchdog :run-test-packages (list "$(LEAF)")) (let ((class (uiop:find-symbol* :test-result :zebra)) (ran 0)) (dolist (report reports) (incf ran (count-if (lambda (r) (typep r class)) (uiop:symbol-call :zebra :results report)))) (when (zerop ran) (uiop:die 1 "test-leaf: $(LEAF) ran no test; check that its package registers its tests")) (when failed (uiop:die 1 "test-leaf: a test in $(LEAF) failed")))) (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))' $(call TEST_LIMIT_STATUS,$(LEAF_LIMIT))
+
+## core-server: build the prebuilt deps+system+test-deps core image ($(CORE)).
 ##
 ##   Runs scripts/build-core.lisp (save-lisp-and-die) to amortize the Quicklisp
 ##   load and the system+test compile. The core is GC-safe (SBCL refuses a
@@ -750,31 +902,107 @@ test-integration: bus-binaries
 ##   replaces one complete file with another and there is no window where the
 ##   path is missing. Rollback is `mv $(CORE).prev $(CORE)`.
 ##
-##   Once $(CORE) is installed it builds the worker core too (core-worker), so a
-##   worker core that fails to build or verify does so after $(CORE) is already
-##   in place and cannot touch it.
+##   The whole build, check and install runs under `flock $(CORE).lock`, and
+##   the image is staged under a unique `$(CORE).tmp.XXXXXX` name removed on
+##   exit, so two builds of one image run one after the other and each installs
+##   only what it built. The staged image is checked in place, with the same
+##   check `make core-verify` runs. The installed core and manifest take the
+##   time the build started as their mtime, so a source edited during the build
+##   is newer than the core and the next test-core rebuilds it.
+core-server:
+	@mkdir -p "$(dir $(CORE))"
+	@set -e; exec 9>"$(CORE).lock"; flock 9; \
+	start=$$(date +%s); \
+	staged=$$(mktemp "$(CORE).tmp.XXXXXX"); \
+	trap 'rm -f "$$staged" "$$staged.manifest"' EXIT; trap 'exit 130' HUP INT TERM; \
+	echo "building $(CORE) (staged as $$staged)"; \
+	DSMR_CORE_OUTPUT="$$staged" $(SBCL) --noinform --disable-debugger \
+	     --load scripts/build-core.lisp; \
+	test -s "$$staged" || { echo "core build produced no image; $(CORE) left untouched" >&2; exit 1; }; \
+	test -s "$$staged.manifest" || { echo "core build produced no manifest; $(CORE) left untouched" >&2; exit 1; }; \
+	$(SBCL) --core "$$staged" --noinform --disable-debugger --non-interactive \
+	     --load scripts/verify-core.lisp; \
+	chmod go+r "$$staged" "$$staged.manifest"; \
+	rm -f "$(CORE).prev" "$(CORE).manifest.prev"; \
+	if [ -e "$(CORE)" ]; then ln "$(CORE)" "$(CORE).prev" 2>/dev/null || cp -p "$(CORE)" "$(CORE).prev"; fi; \
+	if [ -e "$(CORE).manifest" ]; then ln "$(CORE).manifest" "$(CORE).manifest.prev" 2>/dev/null || cp -p "$(CORE).manifest" "$(CORE).manifest.prev"; fi; \
+	mv -f "$$staged" "$(CORE)"; \
+	mv -f "$$staged.manifest" "$(CORE).manifest"; \
+	touch -d @$$start "$(CORE)" "$(CORE).manifest"; \
+	echo "installed $(CORE) (previous image kept as $(CORE).prev)"; \
+	echo "running servers keep the previous core until each restarts"
+
+## core: build the server core ($(CORE)), then the worker core ($(WORKER_CORE)).
+##
+##   Runs core-server, then core-worker with the same CORE and WORKER_CORE, so
+##   a worker core that fails to build or verify does so after $(CORE) is
+##   already in place and cannot touch it. With no arguments both land in
+##   $(TEST_CORE_DIR).
 core:
-	@rm -f "$(CORE).tmp" "$(CORE).tmp.manifest"
-	DSMR_CORE_OUTPUT=$(CORE).tmp $(SBCL) --noinform --disable-debugger \
-	     --load scripts/build-core.lisp
-	@test -s "$(CORE).tmp" || { echo "core build produced no image; $(CORE) left untouched" >&2; exit 1; }
-	@test -s "$(CORE).tmp.manifest" || { echo "core build produced no manifest; $(CORE) left untouched" >&2; exit 1; }
-	@$(MAKE) --no-print-directory core-verify CORE_IMAGE="$(CORE).tmp"
-	@rm -f "$(CORE).prev" "$(CORE).manifest.prev"
-	@if [ -e "$(CORE)" ]; then ln "$(CORE)" "$(CORE).prev" 2>/dev/null || cp -p "$(CORE)" "$(CORE).prev"; fi
-	@if [ -e "$(CORE).manifest" ]; then ln "$(CORE).manifest" "$(CORE).manifest.prev" 2>/dev/null || cp -p "$(CORE).manifest" "$(CORE).manifest.prev"; fi
-	@mv -f "$(CORE).tmp" "$(CORE)"
-	@mv -f "$(CORE).tmp.manifest" "$(CORE).manifest"
-	@echo "installed $(CORE) (previous image kept as $(CORE).prev)"
-	@echo "running servers keep the previous core until each restarts"
-	@$(MAKE) --no-print-directory core-worker
+	@$(MAKE) --no-print-directory core-server CORE="$(CORE)"
+	@$(MAKE) --no-print-directory core-worker WORKER_CORE="$(WORKER_CORE)"
+
+## core-sources: list the files the test core is built from.
+##
+##   Writes $(CORE_SOURCES_DIR)/test-core.mk, one `$(TEST_CORE): PATH` line per
+##   file in the ASDF dependency closure of the server core's systems, resolved
+##   by scripts/build-core.lisp in list mode under the core build's own setup.
+##   Systems are found, never loaded or built. CORE_SOURCES_DIR is required.
+##   Every line carries `+`, so `make -n` still writes the list a dry run of
+##   test-core reads.
+CORE_SOURCES_DIR ?=
+core-sources:
+	+@$(if $(strip $(CORE_SOURCES_DIR)),:,echo "core-sources: CORE_SOURCES_DIR is empty; set it to the directory for the source list" >&2; exit 1)
+	+@mkdir -p "$(CORE_SOURCES_DIR)"
+	+@DSMR_CORE_OUTPUT="$(TEST_CORE)" DSMR_CORE_SOURCES="$(CORE_SOURCES_DIR)/test-core.mk" \
+	  $(SBCL) --noinform --disable-debugger --non-interactive --load scripts/build-core.lisp
+
+## $(TEST_CORE): build the test core through `make core-server`.
+##
+##   Alone it builds an absent core, or one older than scripts/build-core.lisp:
+##   the other files it is built from come from the list test-core passes to
+##   it. Prints why it runs. The build always saves a new image, so nothing is
+##   removed first. core-server sets the installed core's mtime to the time the
+##   build started.
+$(TEST_CORE): $(CURDIR)/scripts/build-core.lisp
+	@if [ -e "$@" ]; then echo "$@: rebuilding: older than $(firstword $?)"; else echo "$@: building: absent"; fi
+	@mkdir -p "$(@D)"
+	$(MAKE) --no-print-directory core-server CORE="$@"
+
+## test-core: rebuild the test core when it is absent or older than its sources.
+##
+##   Lists the files $(TEST_CORE) is built from (core-sources) into a temporary
+##   directory, then lets make compare the core with every listed file and
+##   rebuild it through `make core-server` when it is absent or older than any
+##   of them. A current core is left alone. A core whose manifest records a
+##   different SBCL version than `$(SBCL) --version` reports is removed first,
+##   so it is rebuilt. Server kind only: integration cases that need a worker
+##   core build their own. Runs without the calling shell's DSMR_ settings
+##   (TEST_UNSET_DSMR). Writes only $(TEST_CORE_DIR); a dry run (make -n)
+##   removes nothing.
+DRY_RUN = $(findstring n,$(firstword -$(MAKEFLAGS)))
+test-core:
+	@$(TEST_UNSET_DSMR) set -e; \
+	if [ -e "$(TEST_CORE)" ]; then \
+	  recorded=$$(sed -n 's/^sbcl-version //p' "$(TEST_CORE).manifest" 2>/dev/null); \
+	  running=$$($(SBCL) --version | awk '{print $$2}'); \
+	  if [ "$$recorded" != "$$running" ]; then \
+	    echo "$(TEST_CORE): rebuilding: built by SBCL $${recorded:-unknown}, running $$running"; \
+	    if [ -z "$(DRY_RUN)" ]; then rm -f "$(TEST_CORE)" "$(TEST_CORE).manifest"; fi; \
+	  fi; \
+	fi; \
+	sources=$$(mktemp -d "$${TMPDIR:-/tmp}/dsmr-test-core.XXXXXX"); \
+	trap 'rm -rf "$$sources"' EXIT; trap 'exit 130' HUP INT TERM; \
+	$(MAKE) --no-print-directory core-sources CORE_SOURCES_DIR="$$sources"; \
+	$(MAKE) --no-print-directory -f Makefile -f "$$sources/test-core.mk" "$(TEST_CORE)"
 
 ## core-verify: boot a core image and assert it is a complete, working build.
 ##
-##   Run by `make core` against the staged image before it is installed, so the
-##   build refuses to replace a working core with a broken one. Also useful on
-##   its own to check the installed image (`make core-verify`) or any other
-##   (`make core-verify CORE_IMAGE=some.core`) without rebuilding anything.
+##   core-server runs the same check against its staged image before it is
+##   installed, so the build refuses to replace a working core with a broken one. Also
+##   useful on its own: `make core-verify` checks $(CORE), which is the test
+##   core unless CORE is set, and `make core-verify CORE_IMAGE=some.core`
+##   checks any other image, without rebuilding anything.
 ##
 ##   Two kinds of broken image fail here by two different routes, and only one
 ##   of them reaches the script. An image damaged badly enough not to boot kills
@@ -806,25 +1034,130 @@ core-verify:
 ##   personal init file is frozen into it, and core-verify-worker refuses an
 ##   image that holds a setting taken from the build host's environment.
 ##
-##   Same staged, verified, atomic install as `core`: build to .tmp, boot the
+##   Same locked, staged, verified, atomic install as core-server: under
+##   `flock $(WORKER_CORE).lock`, build to a unique .tmp.XXXXXX name, boot the
 ##   staged image and check it from the inside, keep the outgoing image as
 ##   .prev by hard link, then rename into place. A failed build or a rejected
 ##   image leaves the installed worker core untouched. `make core` runs this
 ##   after it has installed $(CORE); run on its own, this target never touches
 ##   $(CORE).
 core-worker:
-	@rm -f "$(WORKER_CORE).tmp" "$(WORKER_CORE).tmp.manifest"
-	DSMR_CORE_KIND=worker DSMR_CORE_OUTPUT=$(WORKER_CORE).tmp $(SBCL) --noinform --disable-debugger \
-	     --no-userinit --non-interactive --load scripts/build-core.lisp
-	@test -s "$(WORKER_CORE).tmp" || { echo "worker core build produced no image; $(WORKER_CORE) left untouched" >&2; exit 1; }
-	@test -s "$(WORKER_CORE).tmp.manifest" || { echo "worker core build produced no manifest; $(WORKER_CORE) left untouched" >&2; exit 1; }
-	@$(MAKE) --no-print-directory core-verify-worker WORKER_CORE_IMAGE="$(WORKER_CORE).tmp"
-	@rm -f "$(WORKER_CORE).prev" "$(WORKER_CORE).manifest.prev"
-	@if [ -e "$(WORKER_CORE)" ]; then ln "$(WORKER_CORE)" "$(WORKER_CORE).prev" 2>/dev/null || cp -p "$(WORKER_CORE)" "$(WORKER_CORE).prev"; fi
-	@if [ -e "$(WORKER_CORE).manifest" ]; then ln "$(WORKER_CORE).manifest" "$(WORKER_CORE).manifest.prev" 2>/dev/null || cp -p "$(WORKER_CORE).manifest" "$(WORKER_CORE).manifest.prev"; fi
-	@mv -f "$(WORKER_CORE).tmp" "$(WORKER_CORE)"
-	@mv -f "$(WORKER_CORE).tmp.manifest" "$(WORKER_CORE).manifest"
-	@echo "installed $(WORKER_CORE) (previous image kept as $(WORKER_CORE).prev)"
+	@mkdir -p "$(dir $(WORKER_CORE))"
+	@set -e; exec 9>"$(WORKER_CORE).lock"; flock 9; \
+	staged=$$(mktemp "$(WORKER_CORE).tmp.XXXXXX"); \
+	trap 'rm -f "$$staged" "$$staged.manifest"' EXIT; trap 'exit 130' HUP INT TERM; \
+	echo "building $(WORKER_CORE) (staged as $$staged)"; \
+	DSMR_CORE_KIND=worker DSMR_CORE_OUTPUT="$$staged" $(SBCL) --noinform --disable-debugger \
+	     --no-userinit --non-interactive --load scripts/build-core.lisp; \
+	test -s "$$staged" || { echo "worker core build produced no image; $(WORKER_CORE) left untouched" >&2; exit 1; }; \
+	test -s "$$staged.manifest" || { echo "worker core build produced no manifest; $(WORKER_CORE) left untouched" >&2; exit 1; }; \
+	$(SBCL) --core "$$staged" --noinform --disable-debugger --non-interactive \
+	     --no-userinit --load scripts/verify-core-worker.lisp; \
+	chmod go+r "$$staged" "$$staged.manifest"; \
+	rm -f "$(WORKER_CORE).prev" "$(WORKER_CORE).manifest.prev"; \
+	if [ -e "$(WORKER_CORE)" ]; then ln "$(WORKER_CORE)" "$(WORKER_CORE).prev" 2>/dev/null || cp -p "$(WORKER_CORE)" "$(WORKER_CORE).prev"; fi; \
+	if [ -e "$(WORKER_CORE).manifest" ]; then ln "$(WORKER_CORE).manifest" "$(WORKER_CORE).manifest.prev" 2>/dev/null || cp -p "$(WORKER_CORE).manifest" "$(WORKER_CORE).manifest.prev"; fi; \
+	mv -f "$$staged" "$(WORKER_CORE)"; \
+	mv -f "$$staged.manifest" "$(WORKER_CORE).manifest"; \
+	echo "installed $(WORKER_CORE) (previous image kept as $(WORKER_CORE).prev)"
+
+## qlot-lock: refresh qlfile.lock from the working qlfile.
+##
+##   Exports HEAD with git archive into a temporary directory, puts the working
+##   qlfile over the exported one, runs `qlot install` and then `qlot update`
+##   there (update needs an installed project), and copies the resulting
+##   qlfile.lock back. qlot writes its .qlot directory only in the temporary
+##   directory, never in this checkout. Needs the network.
+qlot-lock:
+	@set -e; \
+	QLOT="$(QLOT)" QLOT_COMMIT="$(QLOT_COMMIT)" scripts/deploy.sh check-qlot; \
+	scratch=$$(mktemp -d "$${TMPDIR:-/tmp}/dsmr-qlot-lock.XXXXXX"); \
+	trap 'rm -rf "$$scratch"' EXIT; trap 'exit 130' HUP INT TERM; \
+	git archive --format=tar HEAD | tar -x -C "$$scratch"; \
+	cp qlfile "$$scratch/qlfile"; \
+	(cd "$$scratch" && env -u CL_SOURCE_REGISTRY -u ASDF_OUTPUT_TRANSLATIONS -u XDG_CACHE_HOME LISP=sbcl "$(QLOT)" install \
+	   && env -u CL_SOURCE_REGISTRY -u ASDF_OUTPUT_TRANSLATIONS -u XDG_CACHE_HOME LISP=sbcl "$(QLOT)" update); \
+	cp "$$scratch/qlfile.lock" qlfile.lock; \
+	echo "qlot-lock: wrote qlfile.lock"
+
+## deploy: build a release of REF and make it the one servers run.
+##
+##   The only target that changes what a server runs. Exports the commit REF
+##   names with git archive into $(DSMR_HOME)/releases/<sha>/, takes its
+##   dependencies from the committed qlfile and qlfile.lock through qlot,
+##   builds a sealed server core, a worker core and the two bus binaries there
+##   with plain SBCL, and boots the release's own launcher to answer initialize
+##   and tools/list. Only then does $(DSMR_HOME)/current flip to the release,
+##   in one rename; the release it replaces becomes previous. After the flip,
+##   $(BINDIR)/dsmr-bus-watch and dsmr-bus-host are links through
+##   $(DSMR_HOME)/current/bin, so the paths agents and the bus service use never
+##   change, and the release's skills, agent definitions and harness files are
+##   copied into $(SKILLDIR), $(SUBAGENTDIR) and $(AGENTDIR). A deployed file
+##   edited in place since the last deploy stops the deploy before the flip
+##   unless FORCE=1. The verify requires serverInfo.version to carry the commit
+##   being deployed. A failure at any stage before the flip leaves current and
+##   previous as they were. Refuses, before it creates anything under
+##   DSMR_HOME, a working tree with uncommitted tracked changes and a REF that
+##   is on no origin branch (ALLOW_UNPUBLISHED=1 overrides the second). One
+##   deploy runs at a time per DSMR_HOME. REF is required. DSMR_HOME redirects
+##   the whole deploy to a scratch home, and then HOST_LINKS=0 or scratch
+##   BINDIR, SKILLDIR, AGENTDIR and SUBAGENTDIR are required too. Any deploy
+##   home other than $HOME/.local/share/dsmr-mcp is a scratch home, including
+##   one named through an XDG_DATA_HOME outside $HOME:
+##   make deploy REF=HEAD DSMR_HOME=$(mktemp -d) ALLOW_UNPUBLISHED=1 HOST_LINKS=0
+deploy:
+	@REPO="$(CURDIR)" REF="$(REF)" DSMR_HOME="$(DSMR_HOME)" QLOT="$(QLOT)" QLOT_COMMIT="$(QLOT_COMMIT)" SBCL="$(SBCL)" \
+	   ALLOW_UNPUBLISHED="$(ALLOW_UNPUBLISHED)" HOST_LINKS="$(HOST_LINKS)" FORCE="$(FORCE)" \
+	   BINDIR="$(BINDIR)" SKILLDIR="$(SKILLDIR)" AGENTDIR="$(AGENTDIR)" SUBAGENTDIR="$(SUBAGENTDIR)" \
+	   scripts/deploy.sh deploy
+
+## rollback: make the previous release current again.
+##
+##   Swaps $(DSMR_HOME)/current and previous with two renames and prints the
+##   commit now current, then repairs a missing bus binary link in $(BINDIR)
+##   and copies the restored release's skills, agent definitions and harness
+##   files, behind the same in-place-edit check as deploy.
+##   Builds nothing and runs no git, qlot, sbcl or make. Running servers and
+##   the running bus service keep their release until they restart. The same
+##   scratch-home rule as deploy applies.
+rollback:
+	@DSMR_HOME="$(DSMR_HOME)" HOST_LINKS="$(HOST_LINKS)" FORCE="$(FORCE)" \
+	   BINDIR="$(BINDIR)" SKILLDIR="$(SKILLDIR)" AGENTDIR="$(AGENTDIR)" SUBAGENTDIR="$(SUBAGENTDIR)" \
+	   scripts/deploy.sh rollback
+
+## register: point Claude Code's dsmr-mcp entry at the deployed release.
+##
+##   Boots the release's own server core, <DSMR_HOME>/current/core/dsmr.core,
+##   and runs its installer against CLAUDE_CONFIG. The entry names
+##   <DSMR_HOME>/current/bin/dsmr-mcp-launch, so later deploys and rollbacks
+##   need no new registration. The installer backs the config up first, keeps
+##   the entry's env settings and adds DSMR_READ_ROOTS when it is absent, then
+##   prints the result. The operator runs it once per host, after the first
+##   deploy; running sessions pick it up only when they restart. Refuses when no
+##   release is deployed, when the launcher would refuse the release (the
+##   launcher's own checks, release_refusal, which it boots through once, by
+##   the physical path `current` resolves to), and when the deploy home is a scratch home (any home
+##   other than $HOME/.local/share/dsmr-mcp, or $XDG_DATA_HOME/dsmr-mcp with
+##   XDG_DATA_HOME under $HOME) while CLAUDE_CONFIG is still the host's
+##   config, by name or by file identity (a symlink or hard link to it). A
+##   scratch run:
+##   make register DSMR_HOME=<scratch home> CLAUDE_CONFIG=<scratch file>
+register:
+	@. "$(CURDIR)/scripts/release-paths.sh"; \
+	home="$$(DSMR_HOME="$(DSMR_HOME)" dsmr_home)" || exit 1; home="$${home%/}"; \
+	config="$$(realpath -m -- "$(CLAUDE_CONFIG)")"; \
+	if ! host_home_p "$$home" && host_config_p "$(CLAUDE_CONFIG)"; then \
+	  echo "register: deploy home $$home is a scratch home but CLAUDE_CONFIG is the host's config; pass CLAUDE_CONFIG=<scratch file>" >&2; exit 1; \
+	fi; \
+	root="$$(physical_dir "$$home/current")" || { \
+	  echo "register: no deployed release at $$home/current; run make deploy REF=<sha> first" >&2; exit 1; }; \
+	if ! problem="$$(SBCL="$(SBCL)" release_refusal "$$root")"; then \
+	  echo "register: $$problem" >&2; exit 1; \
+	fi; \
+	core="$$root/core/dsmr.core"; \
+	DSMR_HOME="$$home" DSMR_REGISTER_CONFIG="$$config" "$(SBCL)" --core "$$core" \
+	   --noinform --non-interactive --no-sysinit --no-userinit \
+	   --eval '(format t "~&register: ~S~%" (dsmr-mcp/src/install/claude:install-into-claude :path (uiop:parse-native-namestring (uiop:getenv "DSMR_REGISTER_CONFIG"))))'
 
 ## core-verify-worker: boot a worker core image and assert it is fit for workers.
 ##
@@ -838,14 +1171,15 @@ core-verify-worker:
 	@$(SBCL) --core "$(WORKER_CORE_IMAGE)" --noinform --disable-debugger --non-interactive \
 	     --no-userinit --load scripts/verify-core-worker.lisp
 
-## test-warm: run the fast suite against the prebuilt core ($(CORE)).
+## test-warm: run the fast suite against the test core ($(TEST_CORE)).
 ##
-##   Skips the Quicklisp load and the recompile entirely — the core already
-##   holds dsmr-mcp + the test leaves — so only the assertions run. Build the
-##   core first with `make core`. `make test` remains the no-core load path and
-##   works whether or not a core is present. Like `test`, each run gets a fresh
-##   state home of its own (TEST_STATE_HOME) and none of the calling shell's
-##   DSMR_ settings (TEST_UNSET_DSMR). TEST_TIMEOUT limits the run.
-test-warm:
-	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(call TEST_LIMIT,TEST_TIMEOUT) $(SBCL) --core $(CORE) --noinform --disable-debugger --non-interactive \
+##   Runs test-core first, so the core is rebuilt when it is older than a file
+##   it is built from. The core already holds dsmr-mcp and the test leaves, so
+##   only the assertions run. `make test` boots no core. Like `test`, each run
+##   gets a fresh state home of its own (TEST_STATE_HOME) and none of the
+##   calling shell's DSMR_ settings (TEST_UNSET_DSMR). TEST_TIMEOUT limits the
+##   run.
+test-warm: test-core
+	$(TEST_STATE_HOME) $(TEST_UNSET_DSMR) $(call TEST_LIMIT,TEST_TIMEOUT) $(SBCL) --core "$(TEST_CORE)" --noinform --disable-debugger --non-interactive \
+	     $(TEST_SOURCE_CHECK) \
 	     --eval '(handler-case (asdf:test-system "dsmr-mcp/tests") (serious-condition (c) (uiop:die 1 "test failure: ~A" c)))' $(call TEST_LIMIT_STATUS,TEST_TIMEOUT)

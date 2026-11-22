@@ -3,7 +3,7 @@
 ;;;; scripts/build-core.lisp
 ;;;;
 ;;;; Builds a prebuilt SBCL core image and writes it via sb-ext:save-lisp-and-die.
-;;;; It builds two kinds of image, chosen by $DSMR_CORE_KIND:
+;;;; It builds four kinds of image, chosen by $DSMR_CORE_KIND:
 ;;;;
 ;;;;   server (the default)  dsmr-mcp, its dependencies, and the test systems.
 ;;;;                         The core amortizes the two dominant cold costs, the
@@ -20,15 +20,48 @@
 ;;;;                         worker image that carried them would carry them into
 ;;;;                         every image a worker later saves.
 ;;;;
-;;;; Any other value is an error naming the accepted ones.
+;;;;   release-server        the server a deployed release runs: the
+;;;;                         dsmr-mcp/release closure, built from an exported
+;;;;                         release tree and its bundled dependencies only, with
+;;;;                         no Quicklisp and no test systems. Requires
+;;;;                         $DSMR_RELEASE_ROOT (the release directory) and
+;;;;                         $DSMR_RELEASE_COMMIT (the commit it was exported
+;;;;                         from). The caller loads <root>/deps/setup.lisp first.
+;;;;                         Refuses an ASDF other than 3.3.7.4, seals the
+;;;;                         registry before saving, and refuses any loaded system
+;;;;                         whose source lies outside the release and the SBCL
+;;;;                         contrib directory.
+;;;;
+;;;;   release-worker        the worker a deployed release runs, with the same
+;;;;                         preconditions as release-server: the hermetic worker
+;;;;                         system loaded from the bundle, then the host
+;;;;                         Quicklisp. Its support packages are renamed from
+;;;;                         DSMR-MCP to DSMR-WORKER, its dsmr-mcp systems
+;;;;                         cleared and every other loaded system made
+;;;;                         immutable, so a worker rooted at a dsmr-mcp tree
+;;;;                         loads that tree without redefining its own code.
+;;;;                         ASDF's standard search functions replace the
+;;;;                         bundle's. The outside-release check also allows the
+;;;;                         Quicklisp client directory.
+;;;;
+;;;; Any other value is an error naming the accepted ones. Both worker kinds
+;;;; define CL-USER::DSMR-WORKER-ENTRY, the function a worker starts through.
+;;;;
+;;;; List mode: with $DSMR_CORE_SOURCES set, nothing is built. The script writes
+;;;; to that file one `TARGET: PATH` line per file the image of this kind is
+;;;; built from, with $DSMR_CORE_OUTPUT as TARGET, and exits 0. It finds the
+;;;; systems through scripts/bus-binary-sources.lisp and never loads them. The
+;;;; mode lives in this file so the list resolves under exactly the setup the
+;;;; build uses, for every kind.
 ;;;;
 ;;;; The server kind runs AFTER Quicklisp's setup.lisp (the `make core` target
 ;;;; and a dev box's ~/.sbclrc both arrange that). The worker kind is built with
 ;;;; --no-userinit, so nothing from a personal init file is frozen into it, and
 ;;;; loads ~/quicklisp/setup.lisp itself when Quicklisp is not already present.
 ;;;; Both kinds push $LISP_WORKSPACE onto the source registry the same way
-;;;; scripts/dev-boot.lisp does so the local checkouts resolve. All load output
-;;;; goes to stderr so a caller capturing stdout sees nothing structured.
+;;;; scripts/dev-boot.lisp does so the local checkouts resolve; the release
+;;;; kinds do neither. All load output goes to stderr so a caller capturing
+;;;; stdout sees nothing structured.
 ;;;;
 ;;;; Single-thread constraint: save-lisp-and-die requires exactly one running
 ;;;; thread, so this script only LOADS systems — it never calls dsmr-mcp:run or
@@ -42,7 +75,7 @@
 ;;;; Output path: $DSMR_CORE_OUTPUT if set, else dsmr.core in the current
 ;;;; directory (matches the .gitignore entry). The file is large and is never
 ;;;; committed; rebuild it whenever the dependencies, the SBCL build, or the
-;;;; project source change. Both kinds share the same staleness manifest rule.
+;;;; project source change. Every kind shares the same staleness manifest rule.
 
 (in-package #:cl-user)
 
@@ -52,16 +85,63 @@
   (let ((v (uiop:getenv name)))
     (if (and v (plusp (length v))) v default)))
 
+(defun build-core-die (control &rest args)
+  "Print one [build-core] line built from CONTROL and ARGS on stderr and exit 1."
+  (format *error-output* "~&[build-core] ~?~%" control args)
+  (finish-output *error-output*)
+  (uiop:quit 1))
+
 ;;; Which image to build. Checked before anything loads, so a mistyped kind
 ;;; fails in a second rather than after a full build of the wrong thing.
 (defparameter *build-core-kind* (build-core-getenv "DSMR_CORE_KIND" "server"))
 
-(unless (member *build-core-kind* '("server" "worker") :test #'string=)
-  (error "DSMR_CORE_KIND is ~S; the accepted values are \"server\" and \"worker\""
+(unless (member *build-core-kind* '("server" "worker" "release-server" "release-worker")
+                :test #'string=)
+  (error "DSMR_CORE_KIND is ~S; the accepted values are \"server\", \"worker\", \"release-server\" and \"release-worker\""
          *build-core-kind*))
 
 (defun build-core-worker-p ()
   (string= *build-core-kind* "worker"))
+
+(defun build-core-release-worker-p ()
+  (string= *build-core-kind* "release-worker"))
+
+(defun build-core-release-p ()
+  "True for both release kinds, which build from an exported release tree and
+its bundled dependencies."
+  (and (member *build-core-kind* '("release-server" "release-worker")
+               :test #'string=)
+       t))
+
+(defun build-core-systems ()
+  "The systems loaded into the image of this kind, in load order."
+  (cond ((or (build-core-worker-p) (build-core-release-worker-p))
+         '("dsmr-mcp/src/hermetic/worker/main"))
+        ((build-core-release-p)
+         '("dsmr-mcp/release"))
+        (t
+         '("dsmr-mcp" "dsmr-mcp/tests" "dsmr-mcp/tests/integration"))))
+
+;;; The ASDF version a release build accepts. SBCL's built-in ASDF is older and
+;;; fails on :local-nicknames; the qlfile's asdf line supplies this one.
+(defparameter *build-core-release-asdf-version* "3.3.7.4")
+
+;;; Release kind: the release directory as a truename, or NIL for other kinds.
+;;; Validated before anything loads.
+(defparameter *build-core-release-root*
+  (when (build-core-release-p)
+    (let* ((root (build-core-getenv "DSMR_RELEASE_ROOT" nil))
+           (dir (and root (uiop:ensure-directory-pathname root))))
+      (unless (and dir (uiop:absolute-pathname-p dir) (uiop:directory-exists-p dir))
+        (build-core-die "DSMR_RELEASE_ROOT is ~S; set it to the release's absolute directory"
+                        root))
+      (truename dir))))
+
+;;; Release kind: the commit the release tree was exported from.
+(defparameter *build-core-release-commit*
+  (when (build-core-release-p)
+    (or (build-core-getenv "DSMR_RELEASE_COMMIT" nil)
+        (build-core-die "DSMR_RELEASE_COMMIT is empty; set it to the commit the release was exported from"))))
 
 ;;; The worker kind is built without the user's init file, so it brings in
 ;;; Quicklisp itself. A worker asked to load a Quicklisp system needs it in the
@@ -82,35 +162,239 @@
                                    (user-homedir-pathname)))
       path))
 
-(let* ((workspace (build-core-expand-tilde
-                   (build-core-getenv "LISP_WORKSPACE"
-                                      (namestring
-                                       (merge-pathnames "SourceCode/lisp/"
-                                                        (user-homedir-pathname))))))
-       (workspace (uiop:ensure-directory-pathname workspace)))
-  (pushnew workspace asdf:*central-registry* :test #'equal)
-  (format *error-output* "~&[build-core] source-registry root: ~A~%" workspace))
+(unless (build-core-release-p)
+  (let* ((workspace (build-core-expand-tilde
+                     (build-core-getenv "LISP_WORKSPACE"
+                                        (namestring
+                                         (merge-pathnames "SourceCode/lisp/"
+                                                          (user-homedir-pathname))))))
+         (workspace (uiop:ensure-directory-pathname workspace)))
+    (pushnew workspace asdf:*central-registry* :test #'equal)
+    (format *error-output* "~&[build-core] source-registry root: ~A~%" workspace)))
+
+;;; Release kind: limit the source registry to the release, load the bundle's
+;;; asdf.lisp, and refuse any other ASDF version; then resolve dsmr-mcp from the
+;;; release directory alone. The bundle's searcher, installed by
+;;; deps/setup.lisp, resolves every dependency. The bundled asdf.lisp is loaded
+;;; as a file rather than through LOAD-SYSTEM: that searcher knows only primary
+;;; system names, so ASDF's build of asdf/defsystem would resolve through any
+;;; registry still open and regenerate another checkout's build/asdf.lisp.
+(when (build-core-release-p)
+  (asdf:initialize-source-registry
+   `(:source-registry (:directory ,*build-core-release-root*)
+                      :ignore-inherited-configuration))
+  (let ((asdf-source (merge-pathnames "deps/local-projects/asdf/build/asdf.lisp"
+                                      *build-core-release-root*))
+        (*standard-output* *error-output*))
+    (unless (probe-file asdf-source)
+      (build-core-die "no ASDF source at ~A; check the qlfile's asdf line"
+                      (namestring asdf-source)))
+    (load asdf-source))
+  (let ((found (asdf:asdf-version)))
+    (unless (string= found *build-core-release-asdf-version*)
+      (build-core-die "ASDF ~A is loaded; a release build needs ~A from ~Adeps/; check the qlfile's asdf line"
+                      found *build-core-release-asdf-version*
+                      (namestring *build-core-release-root*))))
+  (asdf:initialize-source-registry
+   `(:source-registry (:directory ,*build-core-release-root*)
+                      :ignore-inherited-configuration))
+  (setf asdf:*central-registry* nil)
+  (format *error-output* "~&[build-core] release root: ~A (ASDF ~A)~%"
+          (namestring *build-core-release-root*) (asdf:asdf-version)))
+
+;;; List mode: with DSMR_CORE_SOURCES set, write the make prerequisite list for
+;;; the image and quit before any system of this kind is loaded. It runs after
+;;; this kind's registry setup, so the list resolves as the build below would.
+(let ((sources (build-core-getenv "DSMR_CORE_SOURCES" nil)))
+  (when sources
+    (load (merge-pathnames "bus-binary-sources.lisp" *load-truename*))
+    (let ((count (uiop:symbol-call '#:bus-binary-sources '#:write-prerequisites
+                                   (build-core-systems)
+                                   (build-core-getenv "DSMR_CORE_OUTPUT" "dsmr.core")
+                                   sources)))
+      (format *error-output* "~&[build-core] listed ~D source files in ~A~%"
+              count sources))
+    (uiop:quit 0)))
 
 ;;; Load the systems for this kind, all compilation chatter on stderr.
 ;;; For the server kind, loading dsmr-mcp/tests and dsmr-mcp/tests/integration
 ;;; puts zebra and every test leaf in the image, so both `make test` and
 ;;; `make test-integration` can run against the core without any load-system
 ;;; step. The worker kind loads the worker entry point and what it depends on.
-(dolist (system (if (build-core-worker-p)
-                    '("dsmr-mcp/src/hermetic/worker/main")
-                    '("dsmr-mcp" "dsmr-mcp/tests" "dsmr-mcp/tests/integration")))
+;;; The release-server kind loads the release closure.
+(dolist (system (build-core-systems))
   (format *error-output* "~&[build-core] loading ~A …~%" system)
   (let ((*standard-output* *error-output*))
     (asdf:load-system system)))
+
+;;; The project's source directory, read once the systems are loaded and before
+;;; a release-worker build clears them: a lookup after the clear would search the
+;;; host and could register another checkout's dsmr-mcp in the image.
+(defparameter *build-core-project-dir*
+  (ignore-errors (namestring (asdf:system-source-directory :dsmr-mcp))))
+
+(defun build-core-seal ()
+  "Seal the registry with the server's own SEAL-SOURCE-REGISTRY, then exit 1
+unless SEALED-P confirms it. Only the package-inferred search function
+remains, so a system already loaded still resolves and any other system
+signals MISSING-COMPONENT instead of being found on the host."
+  (uiop:symbol-call '#:dsmr-mcp/src/release '#:seal-source-registry)
+  (unless (uiop:symbol-call '#:dsmr-mcp/src/release '#:sealed-p)
+    (build-core-die "the registry is not sealed after seal-source-registry; check dsmr-mcp/src/release"))
+  (format *error-output* "~&[build-core] sealed: ~D search function, no source registry~%"
+          (length asdf:*system-definition-search-functions*)))
+
+(defun build-core-under-p (dir root)
+  "True when directory DIR lies under directory ROOT, both compared as truenames."
+  (let ((dir (or (ignore-errors (truename dir)) dir))
+        (root (or (ignore-errors (truename root)) root)))
+    (uiop:subpathp dir root)))
+
+(defun build-core-quicklisp-client-directory ()
+  "The directory the loaded Quicklisp client's own source lives in, or NIL when
+Quicklisp is not loaded."
+  (let ((home (and (find-package "QL")
+                   (find-symbol "*QUICKLISP-HOME*" "QL"))))
+    (when (and home (boundp home))
+      (merge-pathnames "quicklisp/" (symbol-value home)))))
+
+(defun build-core-check-release-closure ()
+  "Exit 1 naming every loaded system whose source lies outside the release root,
+the SBCL contrib directory and, when Quicklisp is loaded, the Quicklisp client
+directory. Systems with no source directory are allowed."
+  (let ((allowed (remove nil
+                         (list *build-core-release-root*
+                               (merge-pathnames "contrib/" (sb-int:sbcl-homedir-pathname))
+                               (build-core-quicklisp-client-directory))))
+        (outside '()))
+    (dolist (name (asdf:already-loaded-systems))
+      (let* ((system (asdf:registered-system name))
+             (dir (and system (ignore-errors (asdf:system-source-directory system)))))
+        (when (and dir
+                   (notany (lambda (root) (build-core-under-p dir root)) allowed))
+          (push (cons name dir) outside))))
+    (when outside
+      (dolist (entry (nreverse outside))
+        (format *error-output* "~&[build-core] outside release: ~A ~A~%"
+                (car entry) (namestring (cdr entry))))
+      (build-core-die "~D loaded system~:P resolve outside ~A; check that the qlfile pins them"
+                      (length outside) (namestring *build-core-release-root*)))))
+
+;;; Release-worker kind: the support code moves out of a subject's way. A worker
+;;; rooted at a dsmr-mcp tree loads that tree under the DSMR-MCP names, so the
+;;; image keeps its own copy under DSMR-WORKER names, clears its dsmr-mcp
+;;; systems from ASDF so the subject's are found and loaded, and holds every
+;;; dependency immutable so the subject does not reload them from another
+;;; directory.
+
+(defun build-core-worker-name (name)
+  "NAME with its leading DSMR-MCP replaced by DSMR-WORKER when NAME is DSMR-MCP or
+starts with DSMR-MCP/, else NIL."
+  (when (or (string= name "DSMR-MCP") (uiop:string-prefix-p "DSMR-MCP/" name))
+    (concatenate 'string "DSMR-WORKER" (subseq name (length "DSMR-MCP")))))
+
+(defun build-core-rename-support-packages ()
+  "Rename every support package by BUILD-CORE-WORKER-NAME, rewriting its
+nicknames by the same rule and dropping the nickname DSMR. Returns the number
+of packages renamed."
+  (let ((count 0))
+    (dolist (package (list-all-packages))
+      (let ((new (build-core-worker-name (package-name package))))
+        (when new
+          (rename-package package new
+                          (loop for nickname in (package-nicknames package)
+                                unless (string= nickname "DSMR")
+                                  collect (or (build-core-worker-name nickname)
+                                              nickname)))
+          (incf count))))
+    count))
+
+(defun build-core-freeze-dependencies ()
+  "Register every loaded system whose name does not start with dsmr-mcp as
+immutable. Returns the number registered."
+  (let ((count 0))
+    (dolist (name (asdf:already-loaded-systems))
+      (unless (uiop:string-prefix-p "dsmr-mcp" name)
+        (asdf:register-immutable-system name)
+        (incf count)))
+    count))
+
+(defun build-core-isolate-release-worker ()
+  "Prepare a release-worker image to load a subject beside its own code.
+
+Renames the support packages and clears every dsmr-mcp system before any
+dependency is made immutable, since an immutable dsmr-mcp system would shadow
+the subject's. Then restores ASDF's standard search functions in place of the
+bundle's, so a worker finds a subject and the subject's dependencies through the
+host configuration, and loads the host Quicklisp when ~/quicklisp/setup.lisp
+exists. The freeze runs again afterwards to cover Quicklisp's own systems."
+  (format *error-output* "~&[build-core] renamed ~D support packages to DSMR-WORKER~%"
+          (build-core-rename-support-packages))
+  (let ((cleared 0))
+    (dolist (name (asdf:registered-systems))
+      (when (uiop:string-prefix-p "dsmr-mcp" name)
+        (asdf:clear-system name)
+        (incf cleared)))
+    (format *error-output* "~&[build-core] cleared ~D dsmr-mcp systems~%" cleared))
+  (format *error-output* "~&[build-core] ~D dependency systems immutable~%"
+          (build-core-freeze-dependencies))
+  (setf asdf:*system-definition-search-functions*
+        (list 'asdf/package-inferred-system:sysdef-package-inferred-system-search
+              'asdf/system-registry:sysdef-central-registry-search
+              'asdf/system-registry:sysdef-source-registry-search))
+  (setf asdf:*central-registry* nil)
+  (asdf:clear-source-registry)
+  (let ((setup (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
+    (if (probe-file setup)
+        (progn
+          (format *error-output* "~&[build-core] loading Quicklisp from ~A~%" setup)
+          (let ((*standard-output* *error-output*))
+            (load setup)))
+        (format *error-output* "~&[build-core] no Quicklisp at ~A; workers find systems through the host registry only~%"
+                setup)))
+  (build-core-freeze-dependencies))
+
+(when (build-core-release-p)
+  (if (build-core-release-worker-p)
+      (build-core-isolate-release-worker)
+      (build-core-seal))
+  (build-core-check-release-closure))
+
+;;; Both worker kinds: the one entry every worker core starts through. It lives
+;;; in CL-USER because the server's command line names it, and that line must
+;;; not name a package a release-worker image has renamed.
+(when (or (build-core-worker-p) (build-core-release-worker-p))
+  (defun dsmr-worker-entry ()
+    "Start the hermetic worker: call START in DSMR-WORKER/SRC/HERMETIC/WORKER/MAIN,
+or in DSMR-MCP/SRC/HERMETIC/WORKER/MAIN when the image holds the support code
+under its source names."
+    (let ((package (or (find-package "DSMR-WORKER/SRC/HERMETIC/WORKER/MAIN")
+                       (find-package "DSMR-MCP/SRC/HERMETIC/WORKER/MAIN"))))
+      (funcall (find-symbol "START" package)))))
+
+;;; Both worker kinds: UIOP's user cache directory and ASDF's output translations
+;;; are computed from the build's XDG_CACHE_HOME (inside a read-only release, for
+;;; a release-worker). An init hook recomputes both from the worker's own
+;;; environment each time the image starts, a resumed saved world included.
+
+(when (or (build-core-worker-p) (build-core-release-worker-p))
+  (defun dsmr-worker-restore-environment ()
+    "Recompute what UIOP and ASDF derived from the build's environment: run
+UIOP's image restore hooks, which recompute the user cache directory, and clear
+ASDF's output translations so they follow it."
+    (uiop:call-image-restore-hook)
+    (asdf:clear-output-translations))
+  (pushnew 'dsmr-worker-restore-environment sb-ext:*init-hooks*)
+  (asdf:clear-output-translations))
 
 ;;; Staleness manifest. A launch wrapper reads this (with plain shell tools, so
 ;;; an SBCL upgrade can't break the check) to decide whether the image is still
 ;;; current or must be regenerated. It records the SBCL identity plus the source
 ;;; root of every system the build loaded, so a patched workspace library or a
-;;; Quicklisp dist update is detected the same way a project edit is.
+;;; Quicklisp dist update is detected the same way a project edit is. A release
+;;; kind also records its kind and the commit it was built from.
 (defun build-core-write-manifest (output)
-  (let* ((project-dir (ignore-errors
-                       (namestring (asdf:system-source-directory :dsmr-mcp))))
+  (let* ((project-dir *build-core-project-dir*)
          (roots '()))
     (flet ((add (p) (when p (pushnew (namestring p) roots :test #'string=))))
       ;; Project: scan only src/ and the .asd, never the whole repo — the repo
@@ -122,8 +406,12 @@
       ;; Every other loaded system contributes its source directory. Test-only
       ;; systems resolve to the project root and are skipped here on purpose:
       ;; the server core does not change behavior when only tests change.
+      ;; REGISTERED-SYSTEM, not FIND-SYSTEM: finding a package-inferred
+      ;; subsystem again replaces it with an object that has no load stamps,
+      ;; and the saved image would then list none of the project's systems
+      ;; as loaded.
       (dolist (name (asdf:already-loaded-systems))
-        (let ((sys (asdf:find-system name nil)))
+        (let ((sys (asdf:registered-system name)))
           (when sys
             (let ((dir (ignore-errors (asdf:system-source-directory sys))))
               (when (and dir
@@ -134,6 +422,9 @@
       (with-open-file (out manifest :direction :output :if-exists :supersede
                                     :if-does-not-exist :create)
         (format out "sbcl-version ~A~%" (lisp-implementation-version))
+        (when (build-core-release-p)
+          (format out "kind ~A~%" *build-core-kind*)
+          (format out "commit ~A~%" *build-core-release-commit*))
         (dolist (r (nreverse roots))
           (format out "root ~A~%" r)))
       (format *error-output* "~&[build-core] wrote staleness manifest ~A~%"

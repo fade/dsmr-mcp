@@ -417,7 +417,7 @@ wrong bus is readable rather than invisible.
 | =live ... bus=default=            |    0 | On the shared host-wide bus                    |
 | =dead bus=valis=                  |    1 | Nothing listening. Re-arm                      |
 | =stale pid=N ...=                 |    1 | A watch existed and stopped refreshing         |
-| no =bus== field at all            |    - | Binary predates named buses. Reinstall it      |
+| no =bus== field at all            |    - | Binary predates named buses. Deploy a release and re-arm |
 | refusal message                   |   64 | The name was rejected. Nothing was armed       |
 
 =default= is unambiguous: it can only ever mean the shared bus, because the bus

@@ -14,6 +14,9 @@
 
 (defpackage #:dsmr-mcp/src/tools/base
   (:use #:cl)
+  ;; closer-mop: the metaclass methods below name C2MOP symbols, so a cold
+  ;; build of this file alone needs the package loaded first.
+  (:import-from #:closer-mop)
   (:export #:mcp-tool
            #:mcp-tool-class
            #:*tool-classes*

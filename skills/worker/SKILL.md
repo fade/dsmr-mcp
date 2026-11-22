@@ -293,7 +293,8 @@ while looking maintained. It has rotted that way twice.
 
 ⛔ **A running server keeps its startup environment.** A refusal there usually means a server
 predating the setting, so the fix is the operator's reconnect, not a retry. Confirm from
-`/proc/<pid>/environ` on your own `dsmr.core`, never from a fresh shell, which sees the value the
+`/proc/<pid>/environ` on your own server process (its core is
+`<DSMR_HOME>/current/core/dsmr.core`; the process title is unchanged), never from a fresh shell, which sees the value the
 server does not.
 
 ⚠ `lisp-scratch` is **outside** the ASDF registry deliberately. ⛔ Never move worktrees into the
@@ -535,7 +536,7 @@ you have.
   your identity, seen as `--detach` or `--check-live` naming a pid that is not
   the service's, means an older binary armed you. The service adopts it within
   about 5 seconds, so you are still heard, but say so in your report: the fix is
-  `make install-bus-watch` on this host.
+  the leader running `make deploy REF=<sha>` on this host.
 
 Then the standing listener: **one background Bash command** (`run_in_background:
 true`), NOT the Monitor tool. It exits on the next `bus:`/`error:` line from any of
@@ -604,9 +605,9 @@ which has gone silently deaf, so a bare `~/.local/bin/dsmr-bus-watch --stream`
 leaves you deaf at the first idle mark, believing you are armed. Under
 `run_in_background` a streaming watcher never exits per message, so it never wakes
 you at all. `--detach` carries the recycle itself; `--wake` is the only thing you
-background. If `--help` lacks `--wake` or `--detach`, run `make install-bus-watch`
-from the dsmr-mcp checkout first, and take the last-resort `--stream` fallback from
-the **bus-watch** skill only if that is impossible.
+background. If `--help` lacks `--wake` or `--detach`, report it to the leader, whose
+fix is `make deploy REF=<sha>`, and take the last-resort `--stream` fallback from
+the **bus-watch** skill until then.
 
 One watcher does not cover two buses. Two joined buses means two `--detach` runs;
 one `--wake --all-buses` waits on both.
@@ -648,8 +649,8 @@ the field was added.
   ambiguous.
 - **No `bus=` field at all**: your `~/.local/bin/dsmr-bus-watch` predates named
   buses and silently armed on the shared bus whatever you asked for.
-  `make install-bus-watch` from the dsmr-mcp checkout, then re-arm. The binary and
-  the MCP core deploy separately, so a current server is no evidence of a current
+  The leader runs `make deploy REF=<sha>`; then re-arm. A running watcher keeps
+  its binary until re-armed, so a current server is no evidence of a current
   watcher. **No `readers=` field** is the same defect one release later: the
   binary predates `--wake`.
 - `dead` / `stale`: nothing is listening. Run `--detach` again, then re-arm the

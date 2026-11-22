@@ -133,6 +133,83 @@ transport, and adding one would not be a transport swap but a different design,
 since the WAL as authority model exists in order to avoid consensus and
 replication entirely.
 
+* Releases: tool code and subject code
+
+Two kinds of Lisp code meet in one host. /Tool code/ is dsmr-mcp itself: the
+server, the bus binaries, and the support code inside each hermetic worker.
+/Subject code/ is the project a session works on, which workers load and
+reload as the work demands. dsmr-mcp is often its own subject, so the two can
+name the same systems.
+
+Tool code reaches a host only as a /release/. =make deploy= exports one commit
+with =git archive= into =<DSMR_HOME>/releases/<sha>/=, installs its
+dependencies there from the committed =qlfile.lock= with qlot, and builds the
+server image, the worker image and the bus binaries from that tree with plain
+SBCL. A release is never edited after it is verified, and =current= names the
+one new processes start from. Nothing a developer does in a checkout changes
+what a running server, worker, bus service or watcher loads.
+
+** The sealed server image
+
+The server image is /sealed/: its ASDF source registry names only the
+release's own tree and dependency bundle, and its central registry is empty,
+so a system lookup at run time cannot reach a checkout or the host's
+workspace. The release launcher starts the image with no init files and sets
+=DSMR_RELEASE_ROOT=, =DSMR_BROKER_CORE=, =DSMR_LAUNCHER_PATH= and
+=DSMR_WORKER_CORE= from the release itself, never from its caller. A server
+running as a release loads nothing from source: brokers boot from
+=DSMR_BROKER_CORE=, and the hermetic pool starts without loading a system.
+
+** The release guard
+
+The guard lists every loaded system and the launcher's path, and reports a
+/tie/ for each that resolves inside a git work tree or outside the release,
+along with whether the image is sealed. It runs in four places:
+
+- at server start, where a tie or an unsealed image ends the server with exit
+  78 and one =run.release.tied= log line per tie;
+- in =make preflight=, against the deployed release;
+- in =project-doctor=, as =server_release=;
+- in =make check-release=, for CI and after a deploy.
+
+=backend-status= carries the same facts in its =release= object, with the
+commit, which =initialize= also reports as =serverInfo.version=.
+
+** The worker image and a dsmr-mcp subject
+
+A worker's support code is tool code, and the subject it loads may be
+dsmr-mcp. In the release worker image the support code lives under renamed
+packages, =DSMR-WORKER/...= rather than =dsmr-mcp/...=, its own dsmr-mcp
+system definitions are cleared, and its dependencies are marked immutable. A
+worker registers the project it is rooted at ahead of anything else, so a
+subject that is a dsmr-mcp tree loads from that tree, beside the worker's own
+code, without redefining it.
+
+A subject may also be one of those dependencies. At start the worker looks for
+=.asd= files in the project root and up to two directories below it, skipping
+hidden directories (=.qlot/= among them), directories that hold vendored
+dependencies (=ocicl/=, =vendor/=, =vendored/=, =third_party/=,
+=third-party/=, =lib/=, =quicklisp/=, =local-projects/=, =dists/=,
+=systems/=, =bundle/= and =deps/=) and build output (=build/=, =_build/= and
+=target/=). Each
+immutable system one of them defines is released and loads from the subject's
+directory, and the worker logs =worker.subject-shadows-dependency= with the
+system and that directory. A subject whose =.asd= lies deeper loads the
+image's copy. Every run-time lookup of a support package goes
+through a helper that follows the image's prefix, so the same code serves
+under either name.
+
+A worker starts only from a worker image. Without one the spawn is refused
+(=no-worker-core=); only the integration test targets set
+=DSMR_ALLOW_SOURCE_WORKERS= to load workers from source.
+
+** The checkout launcher
+
+=scripts/dsmr-mcp-launch.sh= in a checkout only forwards to
+=<DSMR_HOME>/current/bin/dsmr-mcp-launch=, for a registration that still
+names it. It builds nothing and boots nothing from the checkout. =make
+register= names the release launcher directly.
+
 * Request lifecycle
 
 A single MCP request crosses several layers before it reaches the code that does
@@ -340,20 +417,20 @@ The hermetic pool manages worker processes with /strict exclusive session
 affinity/: one session is bound to exactly one worker, never shared. It spawns
 on demand up to a ceiling (=DSMR_MAX_POOL_SIZE=, default 16); exceeding the
 ceiling signals a typed capacity error rather than queueing. At hermetic startup
-the pool pre-warms the worker system's FASL cache once in the parent so
-concurrent child spawns never race to compile the same files, starts a
-background health monitor, and registers a shutdown hook.
+the pool loads nothing, starts a background health monitor, and registers a
+shutdown hook.
 
 ** Worker lifecycle
 
-A worker boots from the worker core, =dsmr.core.worker=, a prebuilt image of
-the worker system and its dependencies that the launcher keeps fresh beside
-=dsmr.core= and hands to the server. A worker from the core is serving in
-about a tenth of a second (135 ms measured on the development box), and every
-worker on the host shares the image's pages, so idle workers cost far less
-than workers loaded from source. When the worker core is unset, missing or
-stale, or fails to boot, the pool loads the worker system from source as it
-always did and logs that it did. A worker booted from the core reads your ASDF
+A worker boots from the worker core, the release's =core/dsmr.core.worker=, a
+prebuilt image of the worker system and its dependencies that the release
+launcher hands to the server as =DSMR_WORKER_CORE= when the image and its
+manifest are present, owned by the running user, not group or world writable,
+and built by the running SBCL. A worker from the core is serving in about a tenth of a second (135 ms
+measured on the development box), and every worker on the host shares the
+image's pages, so idle workers cost far less than workers loaded from source.
+When the worker core is unset or missing, the spawn is refused (see
+[[*The worker image and a dsmr-mcp subject][the worker image]]). A worker booted from the core reads your ASDF
 source registry configuration again at its first system lookup, rather than
 using the one saved in the image, so a project added since the image was built
 is still found.

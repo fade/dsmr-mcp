@@ -10,8 +10,13 @@
 # A real core is ~200 MB and takes minutes to build, which is too slow to test
 # every failure mode against and needs a machine nobody is depending on. The
 # build and the image check are stubbed instead, so the shell logic that does
-# the installing is what actually runs here. CORE points at a scratch path
-# throughout, so the installed image is never touched.
+# the installing is what actually runs here. CORE, WORKER_CORE and
+# TEST_CORE_DIR point at scratch paths throughout, so neither the test core
+# under .ci-cache nor a deployed release is ever touched.
+#
+# The later sections cover the test core: it is rebuilt when the SBCL changes
+# and when a source is edited while it is being built, two builds of one image
+# run one after the other, and no development target writes under DSMR_HOME.
 #
 # Usage: tests/build/core-install-test.sh
 
@@ -19,7 +24,7 @@ set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/core-install-test.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT
+trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 PASSED=0
 FAILED=0
@@ -38,18 +43,41 @@ try() {
     if "$@"; then ok "$label"; else bad "$label" "$detail"; fi
 }
 
-# A stand-in for SBCL covering both invocations the core target makes: the
-# build, which writes the staged image, and core-verify, which boots it. Its
-# behaviour is set per case through the environment so each failure mode can be
-# reached without a real build.
+# A stand-in for SBCL covering every invocation the core targets make: the
+# version query, the source listing (DSMR_CORE_SOURCES set), the build, which
+# writes the staged image, and the verification, which boots it. Its behaviour
+# is set per case through the environment so each failure mode can be reached
+# without a real build.
+#
+#   STUB_SBCL_VERSION    the version `--version` reports and a build records
+#   STUB_SOURCES         the files the listing names as the core's sources
+#   STUB_TOUCH           a file the build touches before it writes the image
+#   STUB_SLOW            seconds the build pauses between two image halves
 cat > "$WORK/stub-sbcl" <<'STUB'
 #!/bin/sh
 case "$*" in
+  --version)
+      echo "SBCL ${STUB_SBCL_VERSION:-0.0.stub}"
+      exit 0 ;;
   *build-core.lisp*)
+      if [ -n "${DSMR_CORE_SOURCES:-}" ]; then
+          : > "$DSMR_CORE_SOURCES"
+          for f in ${STUB_SOURCES:-}; do
+              echo "$DSMR_CORE_OUTPUT: $f" >> "$DSMR_CORE_SOURCES"
+          done
+          exit 0
+      fi
+      if [ -n "${STUB_TOUCH:-}" ]; then touch "$STUB_TOUCH"; fi
       case "${STUB_BUILD:-ok}" in
         none)       exit 0 ;;                       # build produces nothing
         empty)      : > "$DSMR_CORE_OUTPUT" ;;      # zero-byte image
         nomanifest) echo "${STUB_TAG:-new}" > "$DSMR_CORE_OUTPUT" ;;
+        split)      echo "${STUB_TAG:-new}-head" > "$DSMR_CORE_OUTPUT"
+                    sleep "${STUB_SLOW:-1}"
+                    echo "${STUB_TAG:-new}-tail" >> "$DSMR_CORE_OUTPUT"
+                    echo "manifest ${STUB_TAG:-new}" > "$DSMR_CORE_OUTPUT.manifest" ;;
+        versioned)  echo "${STUB_TAG:-new}" > "$DSMR_CORE_OUTPUT"
+                    echo "sbcl-version ${STUB_SBCL_VERSION:-0.0.stub}" > "$DSMR_CORE_OUTPUT.manifest" ;;
         *)          echo "${STUB_TAG:-new}" > "$DSMR_CORE_OUTPUT"
                     echo "manifest ${STUB_TAG:-new}" > "$DSMR_CORE_OUTPUT.manifest" ;;
       esac
@@ -61,12 +89,22 @@ exit 0
 STUB
 chmod +x "$WORK/stub-sbcl"
 
-# Run the real core target with the stub standing in for SBCL and CORE pointed
-# at a scratch path. Echoes make's exit status.
+# Run the real core target with the stub standing in for SBCL, and CORE and
+# WORKER_CORE pointed at scratch paths. Echoes make's exit status.
 run_core() {
     local core_path=$1; shift
     ( cd "$REPO_ROOT" && env "$@" make --no-print-directory core \
-        SBCL="$WORK/stub-sbcl" CORE="$core_path" >"$WORK/out" 2>&1 )
+        SBCL="$WORK/stub-sbcl" CORE="$core_path" WORKER_CORE="$core_path.worker" \
+        >"$WORK/out" 2>&1 )
+    echo $?
+}
+
+# Run one make target with the stub SBCL and the test core directory at
+# scratch directory DIR. Output goes to OUT. Echoes make's exit status.
+run_target() {
+    local target=$1 dir=$2 out=$3; shift 3
+    ( cd "$REPO_ROOT" && env "$@" make --no-print-directory "$target" \
+        SBCL="$WORK/stub-sbcl" TEST_CORE_DIR="$dir" >"$out" 2>&1 )
     echo $?
 }
 
@@ -169,6 +207,85 @@ for shape in old new; do
             "core missing or empty" test -s "$C"
     fi
 done
+
+core_is() { test "$(cat "$1" 2>/dev/null)" = "$2"; }
+
+note "the test core is rebuilt when the SBCL changes"
+
+DIR_A="$WORK/sbcl-change"
+SRC_A="$WORK/sbcl-change.lisp"
+touch -d '-1 hour' "$SRC_A"
+rc=$(run_target test-core "$DIR_A" "$WORK/a1.out" STUB_BUILD=versioned \
+     STUB_SBCL_VERSION=1.0 STUB_TAG=one STUB_SOURCES="$SRC_A")
+try "test-core builds an absent core" "exit=$rc, core $(cat "$DIR_A/dsmr.core" 2>/dev/null)" \
+    core_is "$DIR_A/dsmr.core" one
+rc=$(run_target test-core "$DIR_A" "$WORK/a2.out" STUB_BUILD=versioned \
+     STUB_SBCL_VERSION=2.0 STUB_TAG=two STUB_SOURCES="$SRC_A")
+try "a core built by another SBCL is rebuilt" "exit=$rc, core $(cat "$DIR_A/dsmr.core" 2>/dev/null)" \
+    core_is "$DIR_A/dsmr.core" two
+try "the rebuild names both SBCL versions" "$(cat "$WORK/a2.out")" \
+    grep -q "rebuilding: built by SBCL 1.0, running 2.0" "$WORK/a2.out"
+rc=$(run_target test-core "$DIR_A" "$WORK/a3.out" STUB_BUILD=versioned \
+     STUB_SBCL_VERSION=2.0 STUB_TAG=three STUB_SOURCES="$SRC_A")
+try "a core built by the running SBCL is left alone" "exit=$rc, core $(cat "$DIR_A/dsmr.core" 2>/dev/null)" \
+    core_is "$DIR_A/dsmr.core" two
+
+note "a source edited while the test core builds rebuilds it next time"
+
+DIR_B="$WORK/mid-edit"
+SRC_B="$WORK/mid-edit.lisp"
+touch -d '-1 hour' "$SRC_B"
+rc=$(run_target test-core "$DIR_B" "$WORK/b1.out" STUB_BUILD=versioned STUB_TAG=first \
+     STUB_SOURCES="$SRC_B" STUB_TOUCH="$SRC_B")
+try "the build that saw the edit succeeds" "exit=$rc" core_is "$DIR_B/dsmr.core" first
+rc=$(run_target test-core "$DIR_B" "$WORK/b2.out" STUB_BUILD=versioned STUB_TAG=second STUB_SOURCES="$SRC_B")
+try "the next test-core rebuilds the core" "exit=$rc, $(cat "$WORK/b2.out")" \
+    core_is "$DIR_B/dsmr.core" second
+try "and names the edited source" "$(cat "$WORK/b2.out")" \
+    grep -q "rebuilding: older than $SRC_B" "$WORK/b2.out"
+
+note "two builds of one image run one after the other"
+
+CORE_C="$WORK/concurrent.core"
+build_c() {
+    ( cd "$REPO_ROOT" && env STUB_BUILD=split STUB_SLOW=2 STUB_TAG="$1" \
+        make --no-print-directory core-server SBCL="$WORK/stub-sbcl" CORE="$CORE_C" \
+        >"$WORK/c-$1.out" 2>&1; echo $? >"$WORK/c-$1.rc" )
+}
+build_c a &
+sleep 0.5
+build_c b &
+wait
+try "the first concurrent build succeeds" "$(cat "$WORK/c-a.out")" test "$(cat "$WORK/c-a.rc")" = 0
+try "the second concurrent build succeeds" "$(cat "$WORK/c-b.out")" test "$(cat "$WORK/c-b.rc")" = 0
+installed=$(cat "$CORE_C" 2>/dev/null | tr '\n' ' ')
+one_whole_build() { [ "$installed" = "a-head a-tail " ] || [ "$installed" = "b-head b-tail " ]; }
+try "the installed image is one build's whole output" "got: $installed" one_whole_build
+tag=${installed%%-head*}
+try "the installed manifest is from the same build" "got $(cat "$CORE_C.manifest" 2>/dev/null)" \
+    core_is "$CORE_C.manifest" "manifest $tag"
+staged=$(find "$WORK" -maxdepth 1 -name 'concurrent.core.tmp*')
+try "no staged file is left behind" "$staged" test -z "$staged"
+
+note "no development target writes under DSMR_HOME"
+
+HOME_D="$WORK/deploy-home"
+mkdir -p "$HOME_D"
+touch "$WORK/home-marker"
+chmod a-w "$HOME_D"
+for target in core core-worker test-core; do
+    rc=$(run_target "$target" "$WORK/home-cores" "$WORK/d-$target.out" DSMR_HOME="$HOME_D")
+    try "make $target succeeds with DSMR_HOME read-only" "exit=$rc, $(tail -3 "$WORK/d-$target.out")" \
+        test "$rc" = 0
+done
+try "nothing under DSMR_HOME changed" "$(find "$HOME_D" -newer "$WORK/home-marker")" \
+    test -z "$(find "$HOME_D" -newer "$WORK/home-marker")"
+# Control: a build aimed into the read-only home fails, so the cases above
+# would have failed had any of them written there.
+rc=$( ( cd "$REPO_ROOT" && make --no-print-directory core-server SBCL="$WORK/stub-sbcl" \
+        CORE="$HOME_D/dsmr.core" >"$WORK/d-control.out" 2>&1 ); echo $? )
+try "control: a build into the read-only home fails" "exit=$rc" test "$rc" != 0
+chmod u+w "$HOME_D"
 
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

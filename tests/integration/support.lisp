@@ -55,6 +55,8 @@
            #:with-mcp-server-child-or-skip
            #:worker-core-for-tests
            #:with-worker-core-or-skip
+           #:release-worker-core-for-tests
+           #:with-release-worker-core-or-skip
            #:fresh-server-child-state-home
            #:server-child-environment
            #:launch-server-child
@@ -344,6 +346,13 @@ forgets it. PATH is NIL when no core could be had, and DETAIL then says why."
                 (values (cdr v) nil)
                 (values nil (cdr v))))))))
 
+(defun release-worker-core-for-tests ()
+  "The release worker core DSMR_TEST_RELEASE_WORKER_CORE names, when that file
+exists, else NIL. Nothing is built: a release worker core comes from a deploy."
+  (let ((given (uiop:getenv "DSMR_TEST_RELEASE_WORKER_CORE")))
+    (and given (plusp (length given)) (probe-file given)
+         given)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Guard macros — run BODY only on a buildable environment, else SKIP it
 ;;; ---------------------------------------------------------------------------
@@ -391,6 +400,15 @@ that builds but whose workers misbehave runs BODY and is free to fail."
        (if ,var
            (progn ,@body)
            (skip ("no worker core could be built here (make core-worker): ~A" ,detail))))))
+
+(defmacro with-release-worker-core-or-skip ((var) &body body)
+  "Evaluate BODY with VAR bound to the release worker core from
+release-worker-core-for-tests; when there is none, zebra:skip the enclosing test
+WITHOUT evaluating BODY."
+  `(let ((,var (release-worker-core-for-tests)))
+     (if ,var
+         (progn ,@body)
+         (skip ("set DSMR_TEST_RELEASE_WORKER_CORE to a release's core/dsmr.core.worker (make deploy into a scratch DSMR_HOME)")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Server children under a private state root

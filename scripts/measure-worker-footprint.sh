@@ -75,7 +75,7 @@ for ((i = 1; i <= count; i++)); do
   start_ns="$(date +%s%N)"
   DSMR_PARENT_PID=$$ DSMR_WORKER_ID="footprint-$i" DSMR_WORKER_SECRET="$secret" \
     "$SBCL" --core "$core" --noinform --disable-debugger --no-userinit \
-    --eval '(dsmr-mcp/src/hermetic/worker/main:start)' \
+    --eval '(cl-user::dsmr-worker-entry)' \
     >"$out" 2>"$err" </dev/null &
   pid=$!
   pids+=("$pid")

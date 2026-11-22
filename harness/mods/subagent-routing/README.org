@@ -169,13 +169,14 @@ that session.
 
 * Install
 
-Run these from the repository root. =make install-harness= copies every file
-under =harness/= into =~/.claude=, not only this mod, so read what
-=make check-harness= lists first.
+The mod reaches =~/.claude= from a deployed release: =make deploy= copies
+every file under the release's =harness/= into =~/.claude=, not only this mod,
+so read what =make check-harness= lists first. Run these from the repository
+root:
 
 #+begin_src sh
 make check-harness      # lists files NOT DEPLOYED, or that DIFFER from the installed copy
-make install-harness
+make deploy REF=<sha>
 cp -p ~/.claude/settings.json ~/.claude/settings.json.pre-subagent-routing-$(date +%F)
 #+end_src
 

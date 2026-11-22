@@ -30,6 +30,9 @@
                 #:log-event)
   (:import-from #:dsmr-mcp/src/wire-strings
                 #:coerce-wire-strings)
+  (:import-from #:dsmr-mcp/src/support-package
+                #:support-package
+                #:support-symbol-call)
   (:import-from #:usocket)
   (:export #:get-or-open-connection
            #:drop-connection
@@ -46,34 +49,35 @@
 ;;; are defined by the defclass in dsmr-mcp/src/attach/dispatch.  That package
 ;;; depends on this one, so importing from it would be circular.
 ;;;
-;;; Resolution: access the accessors by name at runtime via uiop:symbol-call
-;;; and fdefinition.  The two private helpers below isolate this indirection;
-;;; the rest of the file reads cleanly.  Once dispatch loads, the accessor
-;;; functions are interned in :dsmr-mcp/src/attach/dispatch and resolve here.
+;;; Resolution: access the accessors by name at runtime via support-symbol-call
+;;; and fdefinition of %dispatch-symbol, which find the dispatch package under
+;;; whatever prefix the support code carries.  The private helpers below
+;;; isolate this indirection; the rest of the file reads cleanly.
 
 (declaim (ftype function repl-eval-tool-slynk-conn repl-eval-tool-call-lock))
+
+(defun %dispatch-symbol (name)
+  "The symbol NAME in the attach dispatch package, or NIL when that package or
+symbol is absent."
+  (let ((package (support-package "SRC/ATTACH/DISPATCH")))
+    (and package (find-symbol name package))))
 
 (defun %conn (tool)
   "Read the slynk-conn slot on TOOL via the forward-referenced accessor.
 The accessor is defined in dsmr-mcp/src/attach/dispatch."
-  (uiop:symbol-call :dsmr-mcp/src/attach/dispatch
-                    :repl-eval-tool-slynk-conn
-                    tool))
+  (support-symbol-call "SRC/ATTACH/DISPATCH" "REPL-EVAL-TOOL-SLYNK-CONN" tool))
 
 (defun (setf %conn) (value tool)
   "Write the slynk-conn slot on TOOL via the forward-referenced (setf accessor).
 The accessor is defined in dsmr-mcp/src/attach/dispatch."
   (funcall (fdefinition (list 'setf
-                               (find-symbol "REPL-EVAL-TOOL-SLYNK-CONN"
-                                            :dsmr-mcp/src/attach/dispatch)))
+                               (%dispatch-symbol "REPL-EVAL-TOOL-SLYNK-CONN")))
            value tool))
 
 (defun %call-lock (tool)
   "Read the call-lock slot on TOOL via the forward-referenced accessor.
 The accessor is defined in dsmr-mcp/src/attach/dispatch."
-  (uiop:symbol-call :dsmr-mcp/src/attach/dispatch
-                    :repl-eval-tool-call-lock
-                    tool))
+  (support-symbol-call "SRC/ATTACH/DISPATCH" "REPL-EVAL-TOOL-CALL-LOCK" tool))
 
 ;;; Config parser -----------------------------------------------------------
 
@@ -212,17 +216,15 @@ Returns NIL."
           (usocket:socket-shutdown (slynk-client::usocket conn) :io)
         (error () nil))))
   ;; Bump epoch via the forward-referenced accessor.  Uses the same
-  ;; (fdefinition (list 'setf (find-symbol ...))) pattern as (setf %conn)
+  ;; (fdefinition (list 'setf (%dispatch-symbol ...))) pattern as (setf %conn)
   ;; above — dispatch.lisp depends on connection.lisp, so a direct import
   ;; would be circular.
   (ignore-errors
     (let* ((epoch-reader (fdefinition
-                          (find-symbol "REPL-EVAL-TOOL-CONNECTION-EPOCH"
-                                       :dsmr-mcp/src/attach/dispatch)))
+                          (%dispatch-symbol "REPL-EVAL-TOOL-CONNECTION-EPOCH")))
            (epoch-writer (fdefinition
                           (list 'setf
-                                (find-symbol "REPL-EVAL-TOOL-CONNECTION-EPOCH"
-                                             :dsmr-mcp/src/attach/dispatch)))))
+                                (%dispatch-symbol "REPL-EVAL-TOOL-CONNECTION-EPOCH")))))
       (when (and epoch-reader epoch-writer)
         (funcall epoch-writer (1+ (funcall epoch-reader tool)) tool))))
   (log-event :info "attach.connection.dropped" "reason" reason)

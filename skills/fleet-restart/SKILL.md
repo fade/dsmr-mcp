@@ -246,7 +246,7 @@ not summarise last session — it is in your files.
   `--stream` exits 0 on its idle window as a self-heal, so a bare watcher goes deaf at the first
   idle mark while still reporting armed. `--detach` carries that recycle itself; the `while true
   … --stream --recycle-seconds 1800` Monitor loop is a last-resort fallback only for a binary
-  without `--wake` (`make install-bus-watch` first). See the **bus-watch** skill for the full form.
+  without `--wake` (the leader runs `make deploy REF=<sha>` first). See the **bus-watch** skill for the full form.
   **Park marks, it does not reap**: `--park --all-buses` before you stop listening, and
   `--detach` clears the mark at bring-up; `--reap --all-buses` is for leaving the fleet or
   retiring a host.

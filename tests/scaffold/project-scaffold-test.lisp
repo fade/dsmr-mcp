@@ -469,3 +469,74 @@ all, nothing is recorded and the result says why."
         (is string= "not-recorded" (gethash "action_taken" recorded))
         (true (stringp (gethash "reason" recorded)) "the result says why"))
       (asdf:clear-system "verb-nogit-proj"))))
+
+(defun %plant-asd (directory name)
+  "Write a component-free definition of system NAME into DIRECTORY and return
+its pathname."
+  (let ((path (merge-pathnames (concatenate 'string name ".asd") directory)))
+    (with-open-file (out path :direction :output :if-exists :supersede)
+      (format out "(asdf:defsystem ~S)~%" name))
+    path))
+
+(defmacro with-cl-source-registry ((value) &body body)
+  "Evaluate BODY with the CL_SOURCE_REGISTRY environment variable set to
+VALUE, restoring the previous value afterwards."
+  (let ((old (gensym "OLD")))
+    `(let ((,old (uiop:getenv "CL_SOURCE_REGISTRY")))
+       (unwind-protect
+            (progn (sb-posix:setenv "CL_SOURCE_REGISTRY" ,value 1)
+                   ,@body)
+         (if ,old
+             (sb-posix:setenv "CL_SOURCE_REGISTRY" ,old 1)
+             (sb-posix:unsetenv "CL_SOURCE_REGISTRY"))))))
+
+(defun %call-register-keeping-state (name asd)
+  "Call %REGISTER-WITH-ASDF on NAME and ASD with the image's source registry
+initialized. Return (values ANSWER SAME-SEARCH-FUNCTIONS SAME-REGISTRY
+SAME-PARAMETER), each SAME- value true when that piece of ASDF state is the
+object it was before the call."
+  (asdf/source-registry:ensure-source-registry)
+  (let ((functions asdf:*system-definition-search-functions*)
+        (registry asdf/source-registry:*source-registry*)
+        (parameter asdf/source-registry:*source-registry-parameter*))
+    (let ((answer (dsmr-mcp/src/project-scaffold::%register-with-asdf
+                   name (namestring asd))))
+      (values answer
+              (eq functions asdf:*system-definition-search-functions*)
+              (eq registry asdf/source-registry:*source-registry*)
+              (eq parameter asdf/source-registry:*source-registry-parameter*)))))
+
+(define-test registering-a-scaffold-leaves-the-image-registry-alone
+  "A project inside a configured tree is reported as :SOURCE-REGISTRY, and the
+image's search functions, source registry and registry parameter are the same
+objects after the call."
+  (with-temp-project-root (session root)
+    (let* ((name "registry-probe-proj")
+           (asd (%plant-asd root name)))
+      (unwind-protect
+           (with-cl-source-registry ((format nil "~A:~@[~A~]"
+                                             (namestring root)
+                                             (uiop:getenv "CL_SOURCE_REGISTRY")))
+             (multiple-value-bind (answer same-functions same-registry same-parameter)
+                 (%call-register-keeping-state name asd)
+               (is eq :source-registry answer)
+               (true same-functions "the search functions were replaced")
+               (true same-registry "the image's source registry was cleared or re-read")
+               (true same-parameter "the image's source-registry parameter was replaced")))
+        (ignore-errors (asdf:clear-system name))))))
+
+(define-test a-scaffold-outside-every-tree-is-registered-by-hand
+  "A project outside every configured tree is reported as :LOAD-ASD, and the
+image's search functions, source registry and registry parameter are the same
+objects after the call."
+  (with-temp-project-root (session root)
+    (let* ((name "unregistered-probe-proj")
+           (asd (%plant-asd root name)))
+      (unwind-protect
+           (multiple-value-bind (answer same-functions same-registry same-parameter)
+               (%call-register-keeping-state name asd)
+             (is eq :load-asd answer)
+             (true same-functions "the search functions were replaced")
+             (true same-registry "the image's source registry was cleared or re-read")
+             (true same-parameter "the image's source-registry parameter was replaced"))
+        (ignore-errors (asdf:clear-system name))))))
