@@ -178,5 +178,16 @@ register_verdict "$d" >/dev/null
 try "register boots the resolved release core" "boot.log: $(cat "$WORK/boot.log" 2>/dev/null)" \
     grep -qF "core=$(cd -P "$d/home/releases/r" && pwd -P)/core/dsmr.core " "$WORK/boot.log"
 
+note "launcher withholds the worker core when the check is missing"
+d="$WORK/nofn"
+build "$d"
+printf '\nunset -f worker_core_withheld\n' >> "$(R "$d")/scripts/release-paths.sh"
+v=$(launcher_verdict "$d")
+try "a launcher beside a release-paths.sh with no worker check boots" "got $v" test "$v" = accepted
+try "it offers no worker core" "boot.log: $(cat "$WORK/boot.log" 2>/dev/null)" \
+    grep -qE 'worker=$' "$WORK/boot.log"
+try "it says the worker core is withheld" "$(tail -n 3 "$d/launcher.err")" \
+    grep -q 'worker core withheld' "$d/launcher.err"
+
 printf '\nrelease-guard-test: %d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

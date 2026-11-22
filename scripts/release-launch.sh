@@ -177,10 +177,17 @@ run_server() {
   export DSMR_BROKER_CORE="$core"
   export DSMR_LAUNCHER_PATH="$launcher"
   unset DSMR_ALLOW_SOURCE_WORKERS
-  local reason
-  if reason="$(worker_core_withheld "$root")"; then
+  # Offered only on status 1, the check's answer for "may be offered". Any
+  # other status, including 127 for a function the sourced file lacks, withholds.
+  local reason wstatus=0
+  if declare -F worker_core_withheld >/dev/null; then
+    reason="$(worker_core_withheld "$root")" || wstatus=$?
+  else
+    reason="$root/scripts/release-paths.sh does not define worker_core_withheld"
+  fi
+  if [ "$wstatus" -ne 1 ]; then
     unset DSMR_WORKER_CORE
-    log "worker core withheld: $reason; hermetic workers will refuse to spawn"
+    log "worker core withheld: ${reason:-the worker core check failed}; hermetic workers will refuse to spawn"
   else
     export DSMR_WORKER_CORE="$root/core/dsmr.core.worker"
   fi
