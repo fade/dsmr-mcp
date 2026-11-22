@@ -506,7 +506,7 @@ rest of the session. Do not remove it to make the watcher "keep running". The
 detached watcher re-arms itself in place at each recycle, so you no longer supply
 the loop or `--recycle-seconds`. The old `while true … --stream --recycle-seconds 1800`
 Monitor loop is valid only as a last-resort fallback when `--wake`/`--detach` are
-unavailable (`--help` lacks them: `make install-bus-watch` first), and in that form
+unavailable (`--help` lacks them: run `make deploy REF=<sha>` first), and in that form
 BOTH flags remain required.
 
 ⚠ **This has already cost a fleet an entire episode, and the leader is the one
@@ -537,7 +537,7 @@ a different bus means the same thing while looking healthy, which is worse.
 **`deaf=<epoch>` means mail sat unread for ten minutes: you are deaf, drain and arm
 a listener.** `readers=0` at bring-up, before the background `--wake` is up, means
 arm it; mid-turn under the session hook it is normal. No `bus=` field (or no `readers=` field) means the PATH binary
-predates named buses (or `--wake`): `make install-bus-watch`, then re-arm. A leader
+predates named buses (or `--wake`): run `make deploy REF=<sha>`, then re-arm. A leader
 that missed its own re-arm and lost inbound mail is exactly the failure this guards.
 On `dead`/`stale`, run `--detach` again and re-arm the `--wake`.
 

@@ -28,12 +28,15 @@ a skill here does nothing on its own.
 
 ```sh
 make check-skills      # report drift between this tree and the deployed copies
-make install-skills    # deploy this tree to $SKILLDIR (default ~/.claude/skills)
+make deploy REF=<sha>  # copy a release's skills to $SKILLDIR (default ~/.claude/skills)
 ```
 
+Skills reach a host only from a deployed release: `make deploy` and `make rollback` copy the
+release's `skills/` into `$SKILLDIR`. `make install-skills` is retired and refuses.
+
 ⛔ **The migration direction is from the deployed copy into this tree.** A skill edited in
-place while a fleet was running is the newer one, and `install-skills` overwrites without
-asking. Run `check-skills` first, and bring changes here before deploying.
+place while a fleet was running is the newer one. A deploy refuses to replace it unless
+`FORCE=1` is given. Run `check-skills` first, and commit changes here before deploying.
 
 ⚠ **A skill tracked here but never deployed is worse than one that was never tracked.** It
 reads as version controlled while an agent loads something else, and nothing reports the

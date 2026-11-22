@@ -179,7 +179,7 @@ across five sessions on 2026-09-29, cause established 2026-09-30). A sister
 handed a bare `~/.local/bin/dsmr-bus-watch --stream` still goes deaf at the
 first idle mark while believing it is armed. The old `while true` loop around
 `--stream` is a last-resort fallback only for a binary whose `--help` lacks
-`--wake`; the fix for that is `make install-bus-watch`. See the **bus-watch**
+`--wake`; the fix for that is `make deploy REF=<sha>`, which you run. See the **bus-watch**
 skill for the fallback form.
 
 Each sister arms that in **its own session**; a background command wakes only
@@ -214,7 +214,7 @@ returns. Her registration ends when a parked session ends (mail waits at her
 cursor, and `--check-live` reads `dead ... parked=1`), and `--reap` deregisters
 her. `nowatcher` can also mean the service is restarting: `--detach` again. A
 `--detached-child` watcher for her while the service is up means an old binary
-armed her; the service adopts it, and `make install-bus-watch` stops it
+armed her; the service adopts it, and `make deploy REF=<sha>` stops it
 recurring. The leader checks the service with `--host-status` (see **leader**).
 
 ## Step 5 - Close enrollment, and know what that means
@@ -270,7 +270,7 @@ findings to a project it is not a member of.
 | Remove one | the sister runs `bus-leave` and `--reap`s her watcher; the leader records it with `disenroll` |
 | "Is this sister connected?" | `--check-live --bus <tag> --agent <sister> --namespace <sister-root>/`, wanting `live` and `readers=1`+ (`deaf=` = deaf: the operator types in her terminal; `parked=1` = parked). **Not** the roster |
 | Enroll came back `enrolled: false` | the gate is shut. That agent still uses the bus; nothing failed |
-| Sister says `live` with no `bus=` field | its `dsmr-bus-watch` binary predates named buses and armed on the shared bus. `make install-bus-watch`, then re-arm |
+| Sister says `live` with no `bus=` field | its `dsmr-bus-watch` binary predates named buses and armed on the shared bus. You run `make deploy REF=<sha>`; she re-arms |
 | Two fleets on one machine | two tags, two declared leaders, two closed gates. There is no further guard and none is coming |
 
 Companion skills: **bus-watch** (how a watch is armed and proved), **worker** (how
