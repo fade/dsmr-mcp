@@ -179,9 +179,9 @@ offer a core without touching the process environment.")
 (defvar *worker-core-disabled* nil
   "NIL, or a string saying why the worker core stopped being offered.
 
-spawn-worker sets it when a worker fails to boot from the core. From then on
-worker-core-path answers NIL, so this process loads every later worker from
-source instead of failing on the same image again.")
+spawn-worker sets it when the runtime refuses the core or the runtime it needs
+is gone, never for a failure that may pass. From then on worker-core-path
+answers NIL, so this process stops offering an image that cannot boot.")
 
 (defvar *worker-core-unavailable-logged* nil
   "True once this process has logged why it spawns workers from source, so the
@@ -192,6 +192,11 @@ reason is reported once rather than on every spawn.")
   (handler-case
       (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:stat path)))
     (error () nil)))
+
+(defun %source-workers-allowed-p ()
+  "True when DSMR_ALLOW_SOURCE_WORKERS is \"1\", which lets a worker load from
+source when no worker core boots it."
+  (equal (uiop:getenv "DSMR_ALLOW_SOURCE_WORKERS") "1"))
 
 (defun %offered-core (path)
   "Judge PATH as a worker core to boot from. Returns (values PATH NIL) when it
@@ -207,9 +212,9 @@ names an existing regular file, else (values NIL REASON) where REASON is
 load from source. Returns a second value, the reason, when the answer is NIL.
 
 *worker-core* wins when non-NIL, else DSMR_WORKER_CORE; either way the path is
-used only when it names an existing regular file. Once a worker has failed to
-boot from the core (*worker-core-disabled*) this answers NIL for the rest of
-the process. The launcher sets DSMR_WORKER_CORE only when the image is fresh."
+used only when it names an existing regular file. Once the runtime has refused
+the core (*worker-core-disabled*) this answers NIL for the rest of the process;
+a boot failure that may pass leaves the core offered. The launcher sets DSMR_WORKER_CORE only when the image is fresh."
   (if *worker-core-disabled*
       (values nil (format nil "disabled ~A" *worker-core-disabled*))
       (%offered-core (or *worker-core* (uiop:getenv "DSMR_WORKER_CORE")))))
@@ -362,6 +367,13 @@ killed while it loaded, may succeed when tried again."
   (and (typep condition 'worker-spawn-failed)
        (member (worker-spawn-failed-kind condition)
                '(:rejected :runtime-gone :no-core :no-worker-core))
+       t))
+
+(defun %core-unusable-p (condition)
+  "True when CONDITION, a failed boot from a worker core, says the core itself
+can never boot as things stand: the runtime refused it (:rejected) or the
+runtime it needs is gone (:runtime-gone)."
+  (and (member (worker-spawn-failed-kind condition) '(:rejected :runtime-gone))
        t))
 
 (define-condition worker-rpc-error (error)
@@ -653,7 +665,7 @@ handshake JSON line."
             "--noinform" "--disable-debugger" "--no-sysinit" "--no-userinit"
             "--eval" "(asdf:clear-source-registry)"
             "--eval" "(cl-user::dsmr-worker-entry)")))
-  (unless (equal (uiop:getenv "DSMR_ALLOW_SOURCE_WORKERS") "1")
+  (unless (%source-workers-allowed-p)
     (error 'worker-spawn-failed
            :kind :no-worker-core
            :message "no worker core: DSMR_WORKER_CORE is unset or names no file; set DSMR_ALLOW_SOURCE_WORKERS=1 to load the worker from source"))
@@ -1081,9 +1093,16 @@ When no usable core is offered the reason is logged once per process as
 worker.core.unavailable, and the worker loads from source only when
 DSMR_ALLOW_SOURCE_WORKERS is \"1\"; otherwise WORKER-SPAWN-FAILED of kind
 :no-worker-core is signalled (see %build-sbcl-args). When a core is offered but
-the worker fails to boot from it, the failure is logged as a warning,
-*worker-core-disabled* records it so this process does not try the core again,
-and the spawn is retried once without it, under the same rule.
+the worker fails to boot from it, the failure is logged as a warning. Only a
+failure that says the core itself is unusable (kind :rejected or :runtime-gone)
+sets *worker-core-disabled*, so this process does not offer that core again; any
+other failure (a timeout, a fork refused for memory, a process killed while
+loading) leaves the core offered to the next spawn, since a release server has
+no source fallback and disabling the core on a passing failure would end every
+later spawn. The spawn is then retried once from source when
+DSMR_ALLOW_SOURCE_WORKERS is \"1\"; otherwise the boot failure is signalled
+again unchanged, so worker-spawn-failure-final-p and the caller's retry policy
+see its own kind.
 
 HIBERNATED-CORE is a core a worker saved of itself. Given one, the worker is
 resumed from it with everything its session had built, CORE is ignored, and
@@ -1113,12 +1132,17 @@ WORKER-SPAWN-FAILED when the worker cannot be brought up at all."
       (path
        (handler-case (%spawn-worker-once path :id id :root root)
          (worker-spawn-failed (e)
-           (let ((why (princ-to-string e)))
+           (let ((why (princ-to-string e))
+                 (unusable (%core-unusable-p e)))
              (log-event :warn "worker.core.boot-failed"
                         "core" path
-                        "error" why)
-             (setf *worker-core-disabled* why)
-             (%spawn-worker-once nil :id id :root root)))))
+                        "error" why
+                        "disabled" (if unusable "true" "false"))
+             (when unusable
+               (setf *worker-core-disabled* why))
+             (if (%source-workers-allowed-p)
+                 (%spawn-worker-once nil :id id :root root)
+                 (error e))))))
       (t
        (unless *worker-core-unavailable-logged*
          (setf *worker-core-unavailable-logged* t)

@@ -218,6 +218,82 @@ variable and the opt-in, and start nothing."
            (and condition (worker-spawn-failed-kind condition))
            "~A" condition)))))
 
+(defun %call-with-stubbed-boot (boot thunk)
+  "Call THUNK with wc::%spawn-worker-once replaced by a function that passes its
+core argument to BOOT and returns what BOOT returns; restore the real one after."
+  (let ((real (fdefinition 'wc::%spawn-worker-once)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'wc::%spawn-worker-once)
+                 (lambda (core &rest args)
+                   (declare (ignore args))
+                   (funcall boot core)))
+           (funcall thunk))
+      (setf (fdefinition 'wc::%spawn-worker-once) real))))
+
+(define-test a-core-boot-that-may-pass-is-tried-again-on-the-next-spawn
+  "With source workers not allowed, a core boot that times out fails that spawn
+with the kind timeout, which is not final, and leaves the core offered, so the
+next spawn boots from the core."
+  (let ((core (%temp-file 16))
+        (boots '()))
+    (unwind-protect
+         (let ((wc:*worker-core* core)
+               (wc:*worker-core-disabled* nil))
+           (%call-with-env
+            '(("DSMR_ALLOW_SOURCE_WORKERS" . nil))
+            (lambda ()
+              (%call-with-stubbed-boot
+               (lambda (c)
+                 (push c boots)
+                 (cond ((null c)
+                        (error 'worker-spawn-failed :kind :no-worker-core
+                                                    :message "no worker core"))
+                       ((= 1 (count-if #'identity boots))
+                        (error 'worker-spawn-failed :kind :timeout
+                                                    :message "no handshake"))
+                       (t :core-worker)))
+               (lambda ()
+                 (let ((first (handler-case (progn (spawn-worker) nil)
+                                (worker-spawn-failed (c) c))))
+                   (true first "the first spawn did not fail")
+                   (is eq :timeout (and first (worker-spawn-failed-kind first)) "~A" first)
+                   (false (worker-spawn-failure-final-p first)))
+                 (false wc:*worker-core-disabled*)
+                 (is equal core (wc:worker-core-path))
+                 (is eq :core-worker (handler-case (spawn-worker)
+                                       (worker-spawn-failed (c) c)))
+                 (is equal (list core core) boots))))))
+      (ignore-errors (delete-file core)))))
+
+(define-test a-core-the-runtime-refuses-is-not-offered-again
+  "With source workers not allowed, a core the runtime refuses fails the spawn
+with the kind rejected and stops the core being offered."
+  (let ((core (%temp-file 16))
+        (boots '()))
+    (unwind-protect
+         (let ((wc:*worker-core* core)
+               (wc:*worker-core-disabled* nil))
+           (%call-with-env
+            '(("DSMR_ALLOW_SOURCE_WORKERS" . nil))
+            (lambda ()
+              (%call-with-stubbed-boot
+               (lambda (c)
+                 (push c boots)
+                 (if c
+                     (error 'worker-spawn-failed :kind :rejected
+                                                 :message "invalid magic number in core")
+                     (error 'worker-spawn-failed :kind :no-worker-core
+                                                 :message "no worker core")))
+               (lambda ()
+                 (let ((first (handler-case (progn (spawn-worker) nil)
+                                (worker-spawn-failed (c) c))))
+                   (is eq :rejected (and first (worker-spawn-failed-kind first)) "~A" first))
+                 (true wc:*worker-core-disabled*)
+                 (false (wc:worker-core-path))
+                 (is equal (list core) boots))))))
+      (ignore-errors (delete-file core)))))
+
 (define-test the-source-worker-opt-in-allows-a-source-command-line
   "With DSMR_ALLOW_SOURCE_WORKERS=1 and no core, the command line loads the
 worker system from source and starts it."
