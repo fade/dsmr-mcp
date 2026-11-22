@@ -74,6 +74,13 @@
 # that stopped and is removed. A failed verify removes the MANIFEST and leaves
 # current and previous untouched. A verified release is made read-only.
 #
+# The releases current and previous name are never removed or changed. A deploy
+# of the commit current names runs no build, verify or flip: only check-copies,
+# links and copies, with the release previous names as the base, so it is the
+# redeploy that finishes the host steps after a failure. A deploy of the commit
+# previous names verifies it again and, on a failure, keeps its MANIFEST. A
+# current or previous release with no MANIFEST is refused, not removed.
+#
 # rollback runs check-copies with the release it leaves as the base, swaps
 # current and previous with two renames, then runs the links and copies
 # stages. It runs no git, qlot, sbcl or make.
@@ -386,8 +393,30 @@ deploy() {
   mkdir -p "$home/releases"
 
   local rel="$home/releases/$sha"
-  local t0
+  local t0 role
   say "deploy $sha into $home"
+  role="$(live_role "$rel" "$home")"
+
+  if [ -n "$role" ] && [ ! -f "$rel/MANIFEST" ]; then
+    if [ "$role" = current ]; then
+      fail export "$rel is the release current names but has no MANIFEST; it was left as it is, so run make rollback or deploy another commit"
+    fi
+    fail export "$rel is the release previous names but has no MANIFEST; it was left as it is, so deploy another commit first, which moves previous off it"
+  fi
+
+  if [ "$role" = current ]; then
+    say "export: $rel is current; only the host steps run"
+    local prev_rel=""
+    if [ -L "$home/previous" ]; then
+      prev_rel="$home/$(readlink "$home/previous")"
+    fi
+    check_copies "$rel" "$prev_rel" || fail check-copies "$COPY_PROBLEM"
+    say "flip: current already names releases/$sha"
+    FAIL_NOTE="; current is releases/$sha; fix the cause and run make deploy REF=$sha again, which repeats only the host steps"
+    link_bus_binaries "$home" || fail links "$LINK_PROBLEM"
+    copy_files "$rel" || fail copies "$COPY_PROBLEM"
+    return 0
+  fi
 
   if [ -d "$rel" ] && [ ! -f "$rel/MANIFEST" ]; then
     say "export: removing incomplete earlier attempt $rel"
@@ -509,19 +538,13 @@ deploy() {
   local vscratch
   vscratch="$(mktemp -d "${TMPDIR:-/tmp}/dsmr-deploy-verify.XXXXXX")"
   if ! verify_initialize "$rel" "$sbcl" "$vscratch" "$sha"; then
-    chmod -R u+w "$rel"
-    rm -f "$rel/MANIFEST"
-    fail verify-initialize "$VERIFY_PROBLEM (output kept in $vscratch)"
+    reject_release verify-initialize "$VERIFY_PROBLEM (output kept in $vscratch)" "$rel" "$role"
   fi
   if ! verify_worker "$rel" "$sbcl" "$vscratch"; then
-    chmod -R u+w "$rel"
-    rm -f "$rel/MANIFEST"
-    fail verify-worker "$VERIFY_PROBLEM (output kept in $vscratch)"
+    reject_release verify-worker "$VERIFY_PROBLEM (output kept in $vscratch)" "$rel" "$role"
   fi
   if ! verify_bus "$rel" "$vscratch"; then
-    chmod -R u+w "$rel"
-    rm -f "$rel/MANIFEST"
-    fail verify-bus "$VERIFY_PROBLEM (output kept in $vscratch)"
+    reject_release verify-bus "$VERIFY_PROBLEM (output kept in $vscratch)" "$rel" "$role"
   fi
   if [ ! -f "$rel/verify-initialize.jsonl" ]; then
     cp "$vscratch/verify-initialize.jsonl" "$vscratch/verify-initialize.log" "$rel/"
@@ -550,10 +573,38 @@ deploy() {
   ln -sfn "releases/$sha" "$home/current.new"
   mv -Tf "$home/current.new" "$current"
   say "flip: current -> releases/$sha"
-  FAIL_NOTE="; current is releases/$sha; fix the cause and run make deploy REF=$sha again to finish the host steps"
+  FAIL_NOTE="; current is releases/$sha; fix the cause and run make deploy REF=$sha again, which repeats only the host steps"
 
   link_bus_binaries "$home" || fail links "$LINK_PROBLEM"
   copy_files "$rel" || fail copies "$COPY_PROBLEM"
+}
+
+# live_role <release dir> <home>
+# Print current or previous when that link under <home> names <release dir>,
+# current first; print nothing otherwise.
+live_role() {
+  local rel="$1" home="$2" l
+  [ -e "$rel" ] || return 0
+  for l in current previous; do
+    if [ -L "$home/$l" ] && [ "$home/$l" -ef "$rel" ]; then
+      printf '%s\n' "$l"
+      return 0
+    fi
+  done
+}
+
+# reject_release <stage> <problem> <release dir> <role>
+# Exit 1 naming the failed verify stage. A release no link names loses its
+# MANIFEST, so the next deploy of its commit rebuilds it; one that <role>
+# (current or previous) names is left as it is.
+reject_release() {
+  local stage="$1" problem="$2" rel="$3" role="$4"
+  if [ -n "$role" ]; then
+    fail "$stage" "$problem; $rel is the release $role names, so it was left as it is"
+  fi
+  chmod -R u+w "$rel"
+  rm -f "$rel/MANIFEST"
+  fail "$stage" "$problem"
 }
 
 # manifest_commit <release dir>
@@ -598,9 +649,9 @@ rollback() {
   mv -Tf "$home/previous.new" "$home/previous"
   printf 'current -> %s (commit %s)\n' "$prev" "$(manifest_commit "$home/$prev")"
   link_bus_binaries "$home" \
-    || rdie "links failed: $LINK_PROBLEM; current is $prev; fix the cause and run make deploy REF=$(manifest_commit "$home/$prev") to finish the host steps, since a second rollback swaps back"
+    || rdie "links failed: $LINK_PROBLEM; current is $prev; fix the cause and run make deploy REF=$(manifest_commit "$home/$prev") to finish the host steps (it repeats only those, since that commit is current), not a second rollback, which swaps back"
   copy_files "$home/$prev" \
-    || rdie "copies failed: $COPY_PROBLEM; current is $prev; fix the cause and run make deploy REF=$(manifest_commit "$home/$prev") to finish the host steps, since a second rollback swaps back"
+    || rdie "copies failed: $COPY_PROBLEM; current is $prev; fix the cause and run make deploy REF=$(manifest_commit "$home/$prev") to finish the host steps (it repeats only those, since that commit is current), not a second rollback, which swaps back"
 }
 
 # verify_initialize <release> <sbcl> <scratch> <commit>

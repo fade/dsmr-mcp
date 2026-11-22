@@ -363,7 +363,8 @@ echo ok > "$WORK/stub-mode"
 
 note "reuse"
 HR="$WORK/home-reuse"
-deploy "$HR" "$C1"
+# Neither current nor previous names the first release after the third deploy.
+deploy "$HR" "$C1"; deploy "$HR" "$C2"; deploy "$HR" "$C3"
 q0=$(count_lines "$WORK/qlot.log")
 b0=$(grep -c 'build-core.lisp' "$WORK/sbcl.log")
 v0=$(grep -c -e '--core' "$WORK/sbcl.log")
@@ -372,12 +373,12 @@ try "redeploy of a complete release succeeds" "rc=$RC: $OUT" test "$RC" -eq 0
 try "redeploy runs no qlot" "qlot lines $q0 -> $(count_lines "$WORK/qlot.log")" test "$(count_lines "$WORK/qlot.log")" -eq "$q0"
 try "redeploy runs no build" "builds $b0 -> $(grep -c 'build-core.lisp' "$WORK/sbcl.log")" test "$(grep -c 'build-core.lisp' "$WORK/sbcl.log")" -eq "$b0"
 try "redeploy verifies again" "boots $v0 -> $(grep -c -e '--core' "$WORK/sbcl.log")" test "$(grep -c -e '--core' "$WORK/sbcl.log")" -gt "$v0"
-chmod -R u+w "$HR/releases/$C1"
-rm -f "$HR/releases/$C1/MANIFEST"
-deploy "$HR" "$C1"
+chmod -R u+w "$HR/releases/$C2"
+rm -f "$HR/releases/$C2/MANIFEST"
+deploy "$HR" "$C2"
 try "release without a MANIFEST is rebuilt" "rc=$RC: $OUT" test "$RC" -eq 0
 try "rebuild ran qlot again" "qlot lines stayed $q0" test "$(count_lines "$WORK/qlot.log")" -gt "$q0"
-try "rebuild wrote a MANIFEST" "no MANIFEST" test -f "$HR/releases/$C1/MANIFEST"
+try "rebuild wrote a MANIFEST" "no MANIFEST" test -f "$HR/releases/$C2/MANIFEST"
 
 # ---- rollback -----------------------------------------------------------
 
@@ -407,6 +408,80 @@ rollback "$HN"
 try "rollback with no previous is refused" "rc=$RC: $OUT" test "$RC" -eq 1
 try "refusal says there is nothing to roll back to" "$OUT" has "$OUT" "no previous release at"
 try "refused rollback leaves current" "current=$(link "$HN/current")" test "$(link "$HN/current")" = "releases/$C1"
+
+# ---- redeploy the current release ---------------------------------------
+
+note "redeploy the current release"
+HX="$WORK/home-live"
+deploy "$HX" "$C1"; deploy "$HX" "$C2"
+echo crash > "$WORK/stub-mode"
+v0=$(grep -c -e '--core' "$WORK/sbcl.log")
+q0=$(count_lines "$WORK/qlot.log")
+deploy "$HX" "$C2"
+try "redeploying current succeeds while a boot would crash" "rc=$RC: $OUT" test "$RC" -eq 0
+try "it boots nothing" "boots $v0 -> $(grep -c -e '--core' "$WORK/sbcl.log")" \
+    test "$(grep -c -e '--core' "$WORK/sbcl.log")" -eq "$v0"
+try "the current release keeps its MANIFEST" "MANIFEST gone" test -f "$HX/releases/$C2/MANIFEST"
+try "current still names it" "current=$(link "$HX/current")" test "$(link "$HX/current")" = "releases/$C2"
+try "previous is unchanged" "previous=$(link "$HX/previous")" test "$(link "$HX/previous")" = "releases/$C1"
+try "it says only the host steps run" "$OUT" has "$OUT" "export: $HX/releases/$C2 is current; only the host steps run"
+deploy "$HX" "$C2"
+try "a second redeploy of current succeeds" "rc=$RC: $OUT" test "$RC" -eq 0
+try "it removes nothing" "$OUT" lacks "$OUT" "removing incomplete earlier attempt"
+try "it rebuilds nothing" "qlot lines $q0 -> $(count_lines "$WORK/qlot.log")" test "$(count_lines "$WORK/qlot.log")" -eq "$q0"
+try "the current release is still read-only" "writable: $(find "$HX/releases/$C2" ! -type l -perm -u+w | head -3)" \
+    test -z "$(find "$HX/releases/$C2" ! -type l -perm -u+w | head -3)"
+
+deploy "$HX" "$C1"
+try "a failed verify of the previous release fails the deploy" "rc=$RC: $OUT" test "$RC" -eq 1
+try "the failure says the previous release was left as it is" "$OUT" \
+    has "$OUT" "$HX/releases/$C1 is the release previous names, so it was left as it is"
+try "the previous release keeps its MANIFEST" "MANIFEST gone" test -f "$HX/releases/$C1/MANIFEST"
+try "current is unchanged by it" "current=$(link "$HX/current")" test "$(link "$HX/current")" = "releases/$C2"
+try "previous is unchanged by it" "previous=$(link "$HX/previous")" test "$(link "$HX/previous")" = "releases/$C1"
+
+HY="$WORK/home-live-broken"
+echo ok > "$WORK/stub-mode"
+deploy "$HY" "$C1"
+chmod -R u+w "$HY/releases/$C1"
+rm -f "$HY/releases/$C1/MANIFEST"
+deploy "$HY" "$C1"
+try "current without a MANIFEST is refused" "rc=$RC: $OUT" test "$RC" -eq 1
+try "the refusal names current" "$OUT" has "$OUT" "$HY/releases/$C1 is the release current names but has no MANIFEST"
+try "the directory current names is kept" "marker gone" test -f "$HY/releases/$C1/marker"
+
+note "follow the remedy a failed host step prints"
+HZ="$WORK/home-remedy"
+D="$WORK/dest-remedy"
+DESTS=(HOST_LINKS= BINDIR="$D/bin" SKILLDIR="$D/claude/skills" AGENTDIR="$D/claude" SUBAGENTDIR="$D/claude/agents")
+deploy "$HZ" "$C1" "${DESTS[@]}"
+# A regular file where BINDIR should be stops the links stage after the flip.
+rm -rf "${D:?}/bin"
+: > "$D/bin"
+deploy "$HZ" "$C2" "${DESTS[@]}"
+try "a links failure after the flip fails the deploy" "rc=$RC: $OUT" test "$RC" -eq 1
+try "it names the redeploy that finishes the host steps" "$OUT" has "$OUT" "run make deploy REF=$C2 again"
+rm -f "$D/bin"
+echo crash > "$WORK/stub-mode"
+deploy "$HZ" "$C2" "${DESTS[@]}"
+try "the named redeploy succeeds while a boot would crash" "rc=$RC: $OUT" test "$RC" -eq 0
+try "it links the bus binaries" "link=$(link "$D/bin/dsmr-bus-watch")" \
+    test "$(link "$D/bin/dsmr-bus-watch")" = "$HZ/current/bin/dsmr-bus-watch"
+try "the current release keeps its MANIFEST" "MANIFEST gone" test -f "$HZ/releases/$C2/MANIFEST"
+rm -f "$D/bin/dsmr-bus-watch" "$D/bin/dsmr-bus-host"
+rmdir "$D/bin"
+: > "$D/bin"
+rollback "$HZ" "${DESTS[@]}"
+try "a links failure after a rollback stops it" "rc=$RC: $OUT" test "$RC" -eq 1
+try "it names the redeploy of the restored commit" "$OUT" has "$OUT" "run make deploy REF=$C1 to finish the host steps"
+rm -f "$D/bin"
+deploy "$HZ" "$C1" "${DESTS[@]}"
+try "that redeploy succeeds while a boot would crash" "rc=$RC: $OUT" test "$RC" -eq 0
+try "it links the bus binaries to the restored release" "resolves to $(readlink -f "$D/bin/dsmr-bus-watch")" \
+    test "$(readlink -f "$D/bin/dsmr-bus-watch")" = "$HZ/releases/$C1/bin/dsmr-bus-watch"
+try "the restored release keeps its MANIFEST" "MANIFEST gone" test -f "$HZ/releases/$C1/MANIFEST"
+try "the release left keeps its MANIFEST" "MANIFEST gone" test -f "$HZ/releases/$C2/MANIFEST"
+echo ok > "$WORK/stub-mode"
 
 # ---- host destinations -------------------------------------------------
 
