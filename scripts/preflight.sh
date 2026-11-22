@@ -182,6 +182,20 @@ check_mcp() {
             "make register"
         return
     fi
+    # `claude mcp add` writes the CLI's own config, $HOME/.claude.json: only the
+    # account's own release goes there, and a CLAUDE_CONFIG naming any other
+    # file is left to make register, which writes the file it names.
+    if ! host_home_p "$home"; then
+        bad "deploy home $home is a scratch home; preflight registers only the account's own release" \
+            "make register DSMR_HOME=$home CLAUDE_CONFIG=<scratch file>"
+        return
+    fi
+    if [ -n "${CLAUDE_CONFIG:-}" ] \
+       && [ "$(realpath -m -- "$CLAUDE_CONFIG")" != "$(realpath -m -- "$HOME/.claude.json")" ]; then
+        bad "CLAUDE_CONFIG is $CLAUDE_CONFIG, which claude mcp add does not write" \
+            "make register CLAUDE_CONFIG=$CLAUDE_CONFIG"
+        return
+    fi
     # User scope on purpose: one entry serves every project and therefore every
     # fleet on the host.
     if claude mcp add dsmr-mcp --scope user \
@@ -414,6 +428,49 @@ self_test() {
     if registration_problem "$tmp/release/bin/dsmr-mcp-launch" >/dev/null; then
         printf '  pass  registration check passes a launcher outside every checkout\n'
     else printf '  FAIL  registration check flagged a launcher outside every checkout\n'; status=1; fi
+
+    # Registering writes the CLI's own config, so it must happen only for the
+    # account's own deploy home and only when CLAUDE_CONFIG names that config.
+    # A stub `claude` on PATH reports no entry and records every call; the real
+    # CLI never runs.
+    local cbin="$tmp/claude-bin" clog="$tmp/claude.log" acct="$tmp/account"
+    mkdir -p "$cbin"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$clog" > "$cbin/claude"
+    chmod +x "$cbin/claude"
+    plant_launcher() {
+        mkdir -p "$1/current/bin"
+        printf '#!/bin/sh\n' > "$1/current/bin/dsmr-mcp-launch"
+        chmod +x "$1/current/bin/dsmr-mcp-launch"
+    }
+    plant_launcher "$tmp/scratch-home"
+    plant_launcher "$tmp/xdg/dsmr-mcp"
+    plant_launcher "$acct/.local/share/dsmr-mcp"
+    # registers VAR=value...: run check_mcp with HOME at $acct and the given
+    # variables; succeed when it called `claude mcp add`.
+    registers() {
+        rm -f "$clog"
+        (
+            unset DSMR_HOME XDG_DATA_HOME CLAUDE_CONFIG
+            export PATH="$cbin:$PATH" HOME="$acct"
+            local kv
+            for kv in "$@"; do export "${kv?}"; done
+            CHECK_ONLY=0
+            check_mcp
+        ) >/dev/null 2>&1
+        grep -q '^mcp add' "$clog" 2>/dev/null
+    }
+    if registers DSMR_HOME="$tmp/scratch-home"; then
+        printf '  FAIL  registration ran for a scratch DSMR_HOME\n'; status=1
+    else printf '  pass  registration refuses a scratch DSMR_HOME\n'; fi
+    if registers XDG_DATA_HOME="$tmp/xdg"; then
+        printf '  FAIL  registration ran for a scratch XDG_DATA_HOME\n'; status=1
+    else printf '  pass  registration refuses a scratch XDG_DATA_HOME\n'; fi
+    if registers CLAUDE_CONFIG="$tmp/other.json"; then
+        printf '  FAIL  registration ran while CLAUDE_CONFIG names another file\n'; status=1
+    else printf '  pass  registration refuses a CLAUDE_CONFIG it cannot write\n'; fi
+    if registers && registers CLAUDE_CONFIG="$acct/.claude.json"; then
+        printf '  pass  registration runs for the account'"'"'s own home and config\n'
+    else printf '  FAIL  registration cannot run for the account'"'"'s own home\n'; status=1; fi
 
     # A directory whose .envrc has never been consented to.
     mkdir -p "$tmp/repo"; printf 'export PREFLIGHT_SELF_TEST=1\n' > "$tmp/repo/.envrc"
