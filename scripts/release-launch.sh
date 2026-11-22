@@ -19,7 +19,8 @@
 #   - the deploy home, releases/, the root, scripts/, scripts/release-paths.sh,
 #     bin/ or the launcher is not owned by the running user or is group or
 #     world writable (checked before anything from the release is sourced);
-#   - the core is not owned by the running user or is group or world writable;
+#   - core/, the core or its manifest is not owned by the running user or is
+#     group or world writable;
 #   - the core, its manifest or MANIFEST is missing;
 #   - the core manifest's sbcl-version is not the running SBCL's;
 #   - the core does not boot.
@@ -31,7 +32,9 @@
 #   DSMR_BROKER_CORE    the server core
 #   DSMR_LAUNCHER_PATH  this launcher's physical path
 #   DSMR_WORKER_CORE    <root>/core/dsmr.core.worker when it and its manifest
-#                       exist and the running SBCL built it; unset otherwise,
+#                       exist, are owned by the running user and are not group
+#                       or world writable, and the running SBCL built it; unset
+#                       otherwise,
 #                       and hermetic workers then refuse to spawn
 # DSMR_ALLOW_SOURCE_WORKERS is always unset.
 #
@@ -99,10 +102,12 @@ SETSID="$(command -v setsid || true)"
 
 # worker_core_withheld ROOT
 # Print why the release's worker core must not be offered and return 0, or
-# print nothing and return 1 when it may be. SBCL refuses a core another build
-# saved, so the manifest's sbcl-version must equal the running SBCL's.
+# print nothing and return 1 when it may be. The core and its manifest must be
+# owned by the running user and not group or world writable, as every worker
+# boots the core. SBCL refuses a core another build saved, so the manifest's
+# sbcl-version must equal the running SBCL's.
 worker_core_withheld() {
-  local wcore="$1/core/dsmr.core.worker" recorded current
+  local wcore="$1/core/dsmr.core.worker" recorded current path
   if [ ! -f "$wcore" ]; then
     printf 'no worker core at %s' "$wcore"
     return 0
@@ -111,6 +116,16 @@ worker_core_withheld() {
     printf 'no manifest at %s.manifest' "$wcore"
     return 0
   fi
+  for path in "$wcore" "$wcore.manifest"; do
+    if foreign_owned "$path"; then
+      printf '%s is not owned by %s' "$path" "$(id -un)"
+      return 0
+    fi
+    if others_can_write "$path"; then
+      printf '%s is group or world writable' "$path"
+      return 0
+    fi
+  done
   recorded="$(manifest_sbcl_version "$wcore.manifest")"
   current="$(running_sbcl_version)"
   if [ -z "$recorded" ] || [ "$recorded" != "$current" ]; then

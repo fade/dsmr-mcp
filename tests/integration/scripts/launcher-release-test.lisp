@@ -400,6 +400,28 @@ versions."
     (multiple-value-bind (rc out err) (%launch tmp (%entry home))
       (%refused-p rc out err tmp "restore ownership and permissions"))))
 
+(define-test a-group-writable-core-directory-is-refused-before-any-boot
+  "A core/ directory others can write is refused before the boot probe or the
+server runs: a core planted through it is never started."
+  (with-fake-release (tmp home)
+    (let ((core-dir (merge-pathnames "releases/r1/core/" home)))
+      (%run "chmod" "u+w" (%path core-dir))
+      (uiop:delete-file-if-exists (merge-pathnames "dsmr.core" core-dir))
+      (%write-file (merge-pathnames "dsmr.core" core-dir) "planted")
+      (%run "chmod" "go-w" (%path (merge-pathnames "dsmr.core" core-dir)))
+      (%run "chmod" "g+w" (%path core-dir)))
+    (multiple-value-bind (rc out err) (%launch tmp (%entry home))
+      (%refused-p rc out err tmp "restore ownership and permissions")
+      (false (probe-file (merge-pathnames "probes" tmp)) "the planted core was never probed"))))
+
+(define-test a-world-writable-core-manifest-refuses-with-78
+  "A server core manifest anyone can write is refused before any boot."
+  (with-fake-release (tmp home)
+    (%run "chmod" "o+w" (%path (merge-pathnames "releases/r1/core/dsmr.core.manifest" home)))
+    (multiple-value-bind (rc out err) (%launch tmp (%entry home))
+      (%refused-p rc out err tmp "restore ownership and permissions")
+      (false (probe-file (merge-pathnames "probes" tmp)) "the core was never probed"))))
+
 (defun %plant-release-paths (home tmp)
   "Replace release r1's scripts/release-paths.sh under HOME with one that
 creates <TMP>/planted-ran when sourced."
@@ -491,6 +513,20 @@ and the server core still boots."
       (is string= "" out "the launcher wrote nothing to stdout")
       (is string= "<unset>" (%boot tmp 1 "DSMR_WORKER_CORE")
           "the worker core was withheld"))))
+
+(define-test a-writable-worker-core-is-withheld
+  "A worker core, or its manifest, that others can write is withheld, the
+caller's value removed, and the server core still boots."
+  (dolist (file '("core/dsmr.core.worker" "core/dsmr.core.worker.manifest"))
+    (with-fake-release (tmp home :worker t)
+      (%run "chmod" "o+w" (%path (merge-pathnames (format nil "releases/r1/~A" file) home)))
+      (multiple-value-bind (rc out err)
+          (%launch tmp (%entry home) :extra-env '("DSMR_WORKER_CORE=/elsewhere/w"))
+        (is = 0 rc "the launcher exited with the server's status")
+        (is string= "" out "the launcher wrote nothing to stdout")
+        (is string= "<unset>" (%boot tmp 1 "DSMR_WORKER_CORE")
+            "the worker core was withheld with a writable ~A" file)
+        (true (search "worker core withheld" err) "stderr says the worker core was withheld")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Relaunch

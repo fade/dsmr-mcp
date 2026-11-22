@@ -112,21 +112,22 @@ others_can_write() {
 # release_problem ROOT
 # Check the release at ROOT before anything boots from it. Print
 # `<reason>; <remedy>` for the first problem found and return 1, or print
-# nothing and return 0. Checks in order: ownership of the root, the server core
-# and bin/dsmr-mcp-launch; group or world write on the root and the core; the
-# core, its manifest and MANIFEST present; the core's sbcl-version equal to the
+# nothing and return 0. Checks in order: ownership of the root, core/, the
+# server core, its manifest and bin/dsmr-mcp-launch; group or world write on the
+# root, core/, the core and its manifest; the core, its manifest and MANIFEST
+# present; the core's sbcl-version equal to the
 # running SBCL's; a boot of the core that exits 0, with stdin and stdout closed
 # and DSMR_BOOT_PROBE_TIMEOUT seconds (default 30) to do it.
 release_problem() {
   local root="$1" core="$1/core/dsmr.core" path recorded current status
-  for path in "$root" "$core" "$root/bin/dsmr-mcp-launch"; do
+  for path in "$root" "$root/core" "$core" "$core.manifest" "$root/bin/dsmr-mcp-launch"; do
     if foreign_owned "$path"; then
       printf '%s is not owned by %s; restore ownership and permissions of %s\n' \
              "$path" "$(id -un)" "$path"
       return 1
     fi
   done
-  for path in "$root" "$core"; do
+  for path in "$root" "$root/core" "$core" "$core.manifest"; do
     if others_can_write "$path"; then
       printf '%s is group or world writable; restore ownership and permissions of %s\n' \
              "$path" "$path"
