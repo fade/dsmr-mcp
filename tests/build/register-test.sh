@@ -110,5 +110,36 @@ try "an XDG_DATA_HOME under HOME registers" "rc=$RC: $OUT" test "$RC" -eq 0
 try "it boots with that home" "booted: $(boot_line)" \
     test "$(boot_line)" = "$FAKEHOME/data/dsmr-mcp|$FAKEHOME/.claude.json"
 
+note "a release the launcher would refuse"
+# Each case plants a sound release first, so a refusal can only come from the
+# one path made unsafe. plant_sound sets umask-clean modes; the host's config
+# is the default, as for an account.
+plant_sound() {
+    plant "$1"
+    printf 'planted core' > "$1/releases/r/core/dsmr.core"
+    chmod -R go-w "$1"
+}
+refused_unsafe() {
+    local label=$1; shift
+    register "$@"
+    try "$label is refused" "rc=$RC: $OUT" test "$RC" -ne 0
+    try "that refusal boots nothing" "booted: $(boot_line)" test ! -e "$WORK/boot.log"
+    try "that refusal names a path" "$OUT" has "$OUT" "writable"
+}
+rm -rf "$FAKEHOME/.local"
+plant_sound "$FAKEHOME/.local/share/dsmr-mcp"
+register
+try "a sound release registers (control)" "rc=$RC: $OUT" test "$RC" -eq 0
+chmod g+w "$FAKEHOME/.local/share/dsmr-mcp/releases/r/core"
+refused_unsafe "an account home whose core/ is group writable"
+rm -rf "$FAKEHOME/.local"
+
+plant_sound "$WORK/unsafe"
+chmod o+w "$WORK/unsafe"
+refused_unsafe "a world writable deploy home" DSMR_HOME="$WORK/unsafe" CLAUDE_CONFIG="$WORK/unsafe.json"
+chmod o-w "$WORK/unsafe"
+chmod o+w "$WORK/unsafe/releases/r/core/dsmr.core"
+refused_unsafe "a world writable server core" DSMR_HOME="$WORK/unsafe" CLAUDE_CONFIG="$WORK/unsafe.json"
+
 printf '\nregister-test: %d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

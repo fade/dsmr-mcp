@@ -1091,7 +1091,9 @@ rollback:
 ##   the entry's env settings and adds DSMR_READ_ROOTS when it is absent, then
 ##   prints the result. The leader runs it once per host, after the first
 ##   deploy; running sessions pick it up only when they restart. Refuses when no
-##   release is deployed, and when the deploy home is a scratch home (any home
+##   release is deployed, when a path the release's code or core is replaceable
+##   through is foreign-owned or group or world writable (the launcher's own
+##   check, release_path_problem), and when the deploy home is a scratch home (any home
 ##   other than $HOME/.local/share/dsmr-mcp, or $XDG_DATA_HOME/dsmr-mcp with
 ##   XDG_DATA_HOME under $HOME) while CLAUDE_CONFIG is still the host's
 ##   config, by name or by file identity (a symlink or hard link to it). A
@@ -1107,6 +1109,10 @@ register:
 	core="$$home/current/core/dsmr.core"; \
 	if [ ! -f "$$core" ]; then \
 	  echo "register: no deployed release at $$home/current; run make deploy REF=<sha> first" >&2; exit 1; \
+	fi; \
+	root="$$(physical_dir "$$home/current")" || exit 1; \
+	if ! problem="$$(release_path_problem "$$root")"; then \
+	  echo "register: $$problem" >&2; exit 1; \
 	fi; \
 	DSMR_HOME="$$home" DSMR_REGISTER_CONFIG="$$config" "$(SBCL)" --core "$$core" \
 	   --noinform --non-interactive --no-sysinit --no-userinit \
