@@ -79,6 +79,13 @@ register DSMR_HOME="$WORK/scratch" CLAUDE_CONFIG="$WORK/config-link.json"
 try "a link to the host's config is refused too" "rc=$RC: $OUT" test "$RC" -ne 0
 try "that refusal boots nothing" "booted: $(boot_line)" test ! -e "$WORK/boot.log"
 
+: > "$FAKEHOME/.claude.json"
+ln "$FAKEHOME/.claude.json" "$WORK/config-hard.json"
+register DSMR_HOME="$WORK/scratch" CLAUDE_CONFIG="$WORK/config-hard.json"
+try "a hard link to the host's config is refused" "rc=$RC: $OUT" test "$RC" -ne 0
+try "that refusal boots nothing" "booted: $(boot_line)" test ! -e "$WORK/boot.log"
+rm -f "$WORK/config-hard.json" "$FAKEHOME/.claude.json"
+
 ln -s "$WORK/xdg" "$FAKEHOME/xdg-link"
 register XDG_DATA_HOME="$FAKEHOME/xdg-link"
 try "an XDG_DATA_HOME under HOME that resolves outside it is refused" "rc=$RC: $OUT" test "$RC" -ne 0

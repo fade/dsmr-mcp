@@ -51,6 +51,21 @@ host_home_p() {
   esac
 }
 
+# host_config_p FILE
+# Return 0 when FILE is the account's Claude Code config, $HOME/.claude.json:
+# the same file, a symlink or hard link to it included, or, when either file is
+# absent, the same resolved path. Else return 1.
+host_config_p() {
+  local account
+  [ -n "${HOME:-}" ] || return 1
+  account="$HOME/.claude.json"
+  if [ -e "$1" ] && [ -e "$account" ]; then
+    [ "$1" -ef "$account" ]
+    return
+  fi
+  [ "$(realpath -m -- "$1")" = "$(realpath -m -- "$account")" ]
+}
+
 # dsmr_state_dir
 # Print ${XDG_STATE_HOME:-$HOME/.local/state}/dsmr-mcp under the same rules as
 # dsmr_home.

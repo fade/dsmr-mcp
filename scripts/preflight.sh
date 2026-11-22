@@ -190,8 +190,7 @@ check_mcp() {
             "make register DSMR_HOME=$home CLAUDE_CONFIG=<scratch file>"
         return
     fi
-    if [ -n "${CLAUDE_CONFIG:-}" ] \
-       && [ "$(realpath -m -- "$CLAUDE_CONFIG")" != "$(realpath -m -- "$HOME/.claude.json")" ]; then
+    if [ -n "${CLAUDE_CONFIG:-}" ] && ! host_config_p "$CLAUDE_CONFIG"; then
         bad "CLAUDE_CONFIG is $CLAUDE_CONFIG, which claude mcp add does not write" \
             "make register CLAUDE_CONFIG=$CLAUDE_CONFIG"
         return
@@ -503,6 +502,16 @@ self_test() {
     if registers && registers CLAUDE_CONFIG="$acct/.claude.json"; then
         printf '  pass  registration runs for the account'"'"'s own home and config\n'
     else printf '  FAIL  registration cannot run for the account'"'"'s own home\n'; status=1; fi
+    # A hard link is the account's config by identity, whatever its name.
+    : > "$acct/.claude.json"
+    ln "$acct/.claude.json" "$tmp/hard.json"
+    if registers CLAUDE_CONFIG="$tmp/hard.json"; then
+        printf '  pass  registration runs for a hard link to the account'"'"'s config\n'
+    else printf '  FAIL  registration refused a hard link to the account'"'"'s config\n'; status=1; fi
+    if registers DSMR_HOME="$tmp/scratch-home" CLAUDE_CONFIG="$tmp/hard.json"; then
+        printf '  FAIL  registration ran for a scratch home through a hard link\n'; status=1
+    else printf '  pass  registration refuses a scratch home through a hard link\n'; fi
+    rm -f "$tmp/hard.json" "$acct/.claude.json"
 
     # A directory whose .envrc has never been consented to.
     mkdir -p "$tmp/repo"; printf 'export PREFLIGHT_SELF_TEST=1\n' > "$tmp/repo/.envrc"
