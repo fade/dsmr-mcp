@@ -100,41 +100,6 @@ RESTART_EXIT_CODE="${DSMR_RESTART_EXIT_CODE:-75}"
 # reaches stdout after the client closes stdin.
 SETSID="$(command -v setsid || true)"
 
-# worker_core_withheld ROOT
-# Print why the release's worker core must not be offered and return 0, or
-# print nothing and return 1 when it may be. The core and its manifest must be
-# owned by the running user and not group or world writable, as every worker
-# boots the core. SBCL refuses a core another build saved, so the manifest's
-# sbcl-version must equal the running SBCL's.
-worker_core_withheld() {
-  local wcore="$1/core/dsmr.core.worker" recorded current path
-  if [ ! -f "$wcore" ]; then
-    printf 'no worker core at %s' "$wcore"
-    return 0
-  fi
-  if [ ! -f "$wcore.manifest" ]; then
-    printf 'no manifest at %s.manifest' "$wcore"
-    return 0
-  fi
-  for path in "$wcore" "$wcore.manifest"; do
-    if foreign_owned "$path"; then
-      printf '%s is not owned by %s' "$path" "$(id -un)"
-      return 0
-    fi
-    if others_can_write "$path"; then
-      printf '%s is group or world writable' "$path"
-      return 0
-    fi
-  done
-  recorded="$(manifest_sbcl_version "$wcore.manifest")"
-  current="$(running_sbcl_version)"
-  if [ -z "$recorded" ] || [ "$recorded" != "$current" ]; then
-    printf 'built by SBCL %s, running SBCL is %s' "${recorded:-unknown}" "${current:-unknown}"
-    return 0
-  fi
-  return 1
-}
-
 # source_chain_problem ROOT
 # Print `<reason>; <remedy>` and return 0 when a path that
 # ROOT/scripts/release-paths.sh could be replaced through is missing, owned by

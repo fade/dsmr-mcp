@@ -214,10 +214,12 @@ check_mcp() {
 # First release_problem, the function the release launcher refuses with:
 # ownership and write permission of every path the release's code or cores can
 # be replaced through (release_path_problem), the core and its manifests
-# present, the core built by this host's SBCL, and a boot probe. Then the release guard, booted
-# from the release's own server core with the release root and launcher the
-# launcher would pass, which reports any loaded system or launcher tied to a
-# checkout or outside the release, and whether the image is sealed.
+# present, the core built by this host's SBCL, and a boot probe. Then
+# worker_core_withheld, the launcher's own test of the worker core, which a
+# deploy always builds, so a withheld one is a failure. Then the release guard,
+# booted from the release's own server core with the release root and launcher
+# the launcher would pass, which reports any loaded system or launcher tied to
+# a checkout or outside the release, and whether the image is sealed.
 #
 # Booting is the only reliable test. A recorded SBCL version cannot tell one
 # host's build from another's of the same version, and a truncated or
@@ -250,6 +252,11 @@ check_release() {
     fi
     if ! problem=$(release_problem "$root"); then
         bad "${problem%%; *}" "${problem#*; }"
+        return
+    fi
+    if problem=$(worker_core_withheld "$root"); then
+        bad "worker core withheld: $problem; every hermetic worker would refuse to spawn" \
+            "make deploy REF=<sha>"
         return
     fi
     if report=$(release_guard "$root"); then
@@ -435,6 +442,8 @@ self_test() {
     printf '#!/bin/sh\n' > "$drel/bin/dsmr-mcp-launch"
     chmod +x "$drel/bin/dsmr-mcp-launch"
     cp "$REPO_ROOT/scripts/release-paths.sh" "$drel/scripts/release-paths.sh"
+    printf 'worker core' > "$drel/core/dsmr.core.worker"
+    printf 'sbcl-version 9.9.9\n' > "$drel/core/dsmr.core.worker.manifest"
     ln -s releases/r "$dhome/current"
     chmod -R go-w "$dhome"
     checks_release() {
@@ -448,6 +457,19 @@ self_test() {
         printf '  FAIL  release check passed a deploy home others can write\n'; status=1
     else printf '  pass  release check fires on a deploy home others can write\n'; fi
     chmod g-w "$dhome"
+
+    # A worker core the launcher withholds fails every hermetic spawn: o+w
+    # manifest, then no worker core at all.
+    chmod o+w "$drel/core/dsmr.core.worker.manifest"
+    if checks_release; then
+        printf '  FAIL  release check passed a worker core the launcher withholds\n'; status=1
+    else printf '  pass  release check fires on a worker core the launcher withholds\n'; fi
+    chmod o-w "$drel/core/dsmr.core.worker.manifest"
+    mv "$drel/core/dsmr.core.worker" "$drel/core/dsmr.core.worker.away"
+    if checks_release; then
+        printf '  FAIL  release check passed a release with no worker core\n'; status=1
+    else printf '  pass  release check fires on a release with no worker core\n'; fi
+    mv "$drel/core/dsmr.core.worker.away" "$drel/core/dsmr.core.worker"
 
     # A file the launcher requires cannot be missing. Each case moves one out
     # of the sound release above and restores it.
