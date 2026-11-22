@@ -244,7 +244,12 @@ sessions without a server.
 
 On a host that runs a release, =make register= writes the Claude Code entry
 (see [[*3. Register][Register]]). The bundled installer
-(=sbcl --script scripts/install.lisp=) writes the same entry and refuses when
-no release is deployed; its flags, and the wiring for other clients, are
-documented in [[file:configuration.org]]. Use either rather than editing
-client configuration by hand.
+(=sbcl --script scripts/install.lisp=) writes the same entry, always into
+=~/.claude.json=, so it registers only the account's own release:
+=$HOME/.local/share/dsmr-mcp=, or =$XDG_DATA_HOME/dsmr-mcp= when
+=XDG_DATA_HOME= resolves under =$HOME=. It refuses when no release is deployed,
+and when the deploy home is any other (scratch) home. Register a scratch home
+with =make register DSMR_HOME=<scratch home> CLAUDE_CONFIG=<scratch file>=. The
+installer's flags, and the wiring for other clients, are documented in
+[[file:configuration.org]]. For the account's own release, use either rather
+than editing client configuration by hand.

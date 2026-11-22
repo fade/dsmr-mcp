@@ -240,6 +240,60 @@ backup beside it, and creates no config where none existed."
           (fail (install-into-claude :path absent) error)
           (false (probe-file absent) "no config created"))))))
 
+(define-test a-scratch-home-never-registers-into-the-account-config
+  "With HOME at a scratch account, a deploy home outside the account (from
+XDG_DATA_HOME outside HOME, or DSMR_HOME) is refused while the target is the
+account's ~/.claude.json, reached by its own path, a symlink or a hard link:
+the call signals and the config is unchanged with no backup. The same scratch
+home registers into a scratch config, and the account's own homes register
+into ~/.claude.json."
+  (with-temp-dir (tmp "dsmr-install-scratch-home")
+    (let* ((account (merge-pathnames "account/" tmp))
+           (config (merge-pathnames ".claude.json" account))
+           (xdg (merge-pathnames "xdg/" tmp))
+           (soft (merge-pathnames "soft.json" tmp))
+           (hard (merge-pathnames "hard.json" tmp))
+           (scratch-config (merge-pathnames "scratch.json" tmp)))
+      (ensure-directories-exist account)
+      (%make-release (merge-pathnames "dsmr-mcp/" xdg))
+      (%make-release (merge-pathnames "scratch-home/" tmp))
+      (with-env (("HOME" (namestring account)) ("DSMR_HOME" "")
+                 ("XDG_DATA_HOME" (namestring xdg)))
+        (fail (install-into-claude) error
+              "an XDG_DATA_HOME outside HOME registers into the account config")
+        (false (probe-file config) "no account config was created")
+        (%write-json config (ht "mcpServers" (ht "other" (ht "type" "stdio"))))
+        (uiop:run-program (list "ln" "-s" (namestring config) (namestring soft)))
+        (uiop:run-program (list "ln" (namestring config) (namestring hard)))
+        (let ((before (uiop:read-file-string config)))
+          (fail (install-into-claude) error "the existing account config is refused")
+          (fail (install-into-claude :path soft) error "a symlink to it is refused")
+          (fail (install-into-claude :path hard) error "a hard link to it is refused")
+          (is string= before (uiop:read-file-string config) "the account config is unchanged")
+          (is = 0 (length (uiop:directory-files account "*.bak-*")) "no backup was written")
+          (let ((result (install-into-claude :path scratch-config)))
+            (true (probe-file scratch-config) "a scratch config registers: ~S" result)))
+        (with-env (("XDG_DATA_HOME" "")
+                   ("DSMR_HOME" (namestring (merge-pathnames "scratch-home/" tmp))))
+          (let ((before (uiop:read-file-string config)))
+            (fail (install-into-claude :path hard) error "a scratch DSMR_HOME is refused")
+            (is string= before (uiop:read-file-string config) "still unchanged"))))
+      (%make-release (merge-pathnames ".local/share/dsmr-mcp/" account))
+      (with-env (("HOME" (namestring account)) ("DSMR_HOME" "") ("XDG_DATA_HOME" ""))
+        (install-into-claude)
+        (true (search ".local/share/dsmr-mcp/current/bin/dsmr-mcp-launch"
+                      (gethash "command" (gethash +dsmr-server-name+
+                                                  (servers (jzon:parse (uiop:read-file-string config))))))
+              "the account's default home registers into the account config"))
+      (%make-release (merge-pathnames "data/dsmr-mcp/" account))
+      (with-env (("HOME" (namestring account)) ("DSMR_HOME" "")
+                 ("XDG_DATA_HOME" (namestring (merge-pathnames "data/" account))))
+        (install-into-claude)
+        (true (search "data/dsmr-mcp/current/bin/dsmr-mcp-launch"
+                      (gethash "command" (gethash +dsmr-server-name+
+                                                  (servers (jzon:parse (uiop:read-file-string config))))))
+              "an XDG_DATA_HOME under HOME registers into the account config")))))
+
 (define-test re-registering-keeps-the-entry-environment
   "Registering over an existing dsmr-mcp entry points it at the release launcher
 and keeps its env keys and values, adding DSMR_READ_ROOTS; other servers stay."

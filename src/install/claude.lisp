@@ -12,8 +12,11 @@
   (:use #:cl)
   (:local-nicknames (#:jzon #:com.inuoe.jzon)
                     (#:config #:dsmr-mcp/src/install/config))
+  (:import-from #:sb-posix)
   (:export #:claude-config-path
            #:dsmr-home
+           #:host-home-p
+           #:account-config-p
            #:wrapper-launcher-path
            #:launcher-if-present
            #:install-into-claude))
@@ -44,6 +47,44 @@ Signal an error when the variable used is not an absolute path."
       (let ((data (%env-directory "XDG_DATA_HOME")))
         (and data (merge-pathnames "dsmr-mcp/" data)))
       (merge-pathnames ".local/share/dsmr-mcp/" (user-homedir-pathname))))
+
+(defun %resolved (path)
+  "Return PATH as a namestring with every symlink, `.' and `..' resolved and no
+trailing slash, as `realpath -m' prints it; components that do not exist are
+kept as written."
+  (uiop:run-program (list "realpath" "-m" "--" (uiop:native-namestring path))
+                    :output '(:string :stripped t)))
+
+(defun host-home-p (home)
+  "Return true when HOME is the account's own deploy home: $HOME/.local/share/dsmr-mcp/,
+or $XDG_DATA_HOME/dsmr-mcp/ when XDG_DATA_HOME resolves to a directory under
+$HOME. Paths are compared resolved. Every other home is a scratch home. The
+rule matches host_home_p in scripts/release-paths.sh."
+  (let* ((user (%resolved (user-homedir-pathname)))
+         (home (%resolved home))
+         (data (%env-directory "XDG_DATA_HOME")))
+    (or (string= home (format nil "~A/.local/share/dsmr-mcp" user))
+        (and data
+             (let ((data (%resolved data)))
+               (and (uiop:string-prefix-p (format nil "~A/" user) (format nil "~A/" data))
+                    (string= home (format nil "~A/dsmr-mcp" data))))))))
+
+(defun %file-identity (path)
+  "Return (device . inode) of the file PATH names, following symlinks, or NIL
+when there is none."
+  (let ((stat (ignore-errors (sb-posix:stat (uiop:native-namestring path)))))
+    (and stat (cons (sb-posix:stat-dev stat) (sb-posix:stat-ino stat)))))
+
+(defun account-config-p (path)
+  "Return true when PATH is the account's Claude Code config, ~/.claude.json:
+the same file, a symlink or hard link to it included, or, when either file is
+absent, the same resolved path."
+  (let* ((account (claude-config-path))
+         (a (%file-identity path))
+         (b (%file-identity account)))
+    (if (and a b)
+        (equal a b)
+        (string= (%resolved path) (%resolved account)))))
 
 (defun wrapper-launcher-path ()
   "Return the namestring of <dsmr-home>current/bin/dsmr-mcp-launch, whether or
@@ -91,8 +132,9 @@ overwritten."
 to any cl-mcp entry. An existing dsmr-mcp entry keeps its env; see
 dsmr-mcp/src/install/config:ensure-server.
 
-Signal an error, before PATH is read or backed up, when the launcher does not
-exist. Create PATH when absent. Otherwise copy it to
+Signal an error, before PATH is read or backed up, when the deploy home is a
+scratch home (see host-home-p) and PATH is the account's config (see
+account-config-p), or when the launcher does not exist. Create PATH when absent. Otherwise copy it to
 <path>.bak-YYYYMMDDHHMMSS first and abort, leaving PATH untouched, when the
 backup is missing. Signal an error, leaving PATH untouched, when the rendered
 JSON does not re-parse.
@@ -104,6 +146,11 @@ Return a plist:
   :action-taken        one of :created, :updated-kept-cl-mcp,
                        :updated-removed-cl-mcp, :updated-no-cl-mcp"
   (check-type on-existing-cl-mcp (member :keep :remove :replace))
+  (let ((home (dsmr-home)))
+    (when (and (not (host-home-p home)) (account-config-p path))
+      (error "deploy home ~A is a scratch home but ~A is the account's Claude Code config; ~
+              register a scratch home with make register DSMR_HOME=<scratch home> CLAUDE_CONFIG=<scratch file>"
+             (namestring home) (namestring path))))
   (let ((launcher (launcher-if-present)))
     (unless launcher
       (error "no deployed release at ~Acurrent; run make deploy REF=<sha> before registering"

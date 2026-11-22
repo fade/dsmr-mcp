@@ -439,7 +439,8 @@ socket, run a =tcp= (or =http=) transport instance and point the client at
 On a host that runs a deployed release, =make register= writes this entry,
 naming the release launcher (see [[file:installation.org][Installation]]).
 The bundled installer writes the same entry and refuses when no release is
-deployed. It automates this wiring end to end: it writes the
+deployed, or when the deploy home is not the account's own (see
+[[file:installation.org][Installation]]). It automates this wiring end to end: it writes the
 =mcpServers= block into =~/.claude.json= (backing the file up and
 re-parsing the result before committing the write), copies the
 =scaffold-project= skill into =~/.claude/skills/=, and handles an existing
