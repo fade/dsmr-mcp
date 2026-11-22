@@ -12,13 +12,21 @@
 ;;;;   a release with no worker core       the worker client refuses a source worker
 ;;;;   a deployed release                  GUARD-MAIN in its core exits 0 with no tie
 ;;;;
+;;;; Two more cases boot a deployed release's server core directly and expect
+;;;; it to log run.release.tied and exit 78 before serving:
+;;;;
+;;;;   a dependency in a checkout          a .git directory overlaid on one
+;;;;                                       dependency in a private mount namespace
+;;;;   a launcher in a work tree           DSMR_LAUNCHER_PATH inside a git work tree
+;;;;
 ;;;; The launcher cases reuse the fake releases and stub programs of
 ;;;; launcher-release-test. The image cases boot DSMR_BROKER_CORE, the test
 ;;;; core make test-integration passes, in a child whose environment holds no
 ;;;; inherited DSMR_ variable. The old launcher is read from commit 16d1e20 with
-;;;; git show; a clone without that commit skips the case. The release case
-;;;; reads DSMR_TEST_RELEASE_HOME, a deploy home holding a release made by
-;;;; make deploy, and skips without it.
+;;;; git show; a clone without that commit skips the case. The release cases
+;;;; read DSMR_TEST_RELEASE_HOME, a deploy home holding a release made by
+;;;; make deploy, and skip without it. The dependency case also skips when
+;;;; unshare -rm cannot mount an overlay.
 
 (defpackage #:dsmr-mcp/tests/integration/release/release-ties-test
   (:use #:cl #:zebra)
@@ -228,3 +236,166 @@ reports green with no tie."
                                     0)))
                     "the guard examined no dsmr-mcp system, so its green proves nothing; output:~%~A"
                     (%tail output))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; A tied release server refuses to start
+;;; ---------------------------------------------------------------------------
+
+(defun %deployed-release-root ()
+  "The physical root namestring of the release DSMR_TEST_RELEASE_HOME's current
+names, ending in /, or NIL when the variable is unset or current holds no
+server core."
+  (let* ((home (uiop:getenv "DSMR_TEST_RELEASE_HOME"))
+         (current (and home (plusp (length home))
+                       (probe-file (uiop:ensure-directory-pathname
+                                    (merge-pathnames "current/"
+                                                     (uiop:ensure-directory-pathname home)))))))
+    (and current
+         (probe-file (merge-pathnames "core/dsmr.core" current))
+         (uiop:native-namestring current))))
+
+(defparameter +serve-form+ "(dsmr-mcp:run :transport :stdio)"
+  "The form the release launcher evaluates to serve on stdio.")
+
+(defun %serve-command (core)
+  "The command that boots CORE as a stdio server under timeout(1)."
+  (list "timeout" (princ-to-string *child-timeout*)
+        (sbcl-path) "--core" core "--noinform" "--disable-debugger"
+        "--no-sysinit" "--no-userinit" "--non-interactive"
+        "--eval" +serve-form+))
+
+(defun %run-server (command root launcher)
+  "Run COMMAND with stdin at end of file, DSMR_RELEASE_ROOT at ROOT and
+DSMR_LAUNCHER_PATH at LAUNCHER, in an environment holding no inherited DSMR_
+variable. Return the exit code and stderr."
+  (let ((state (fresh-server-child-state-home)))
+    (unwind-protect
+         (multiple-value-bind (out err rc)
+             (uiop:run-program command
+                               :input nil :output :string :error-output :string
+                               :ignore-error-status t
+                               :environment
+                               (server-child-environment
+                                state
+                                :assignments
+                                (list (concatenate 'string "DSMR_RELEASE_ROOT=" root)
+                                      (concatenate 'string "DSMR_LAUNCHER_PATH=" launcher))))
+           (declare (ignore out))
+           (values rc err))
+      (ignore-errors (uiop:delete-directory-tree state :validate t
+                                                       :if-does-not-exist :ignore)))))
+
+(defparameter +overlay-script+
+  "if [ \"$1\" = plant ]; then
+     mount -t overlay overlay -o \"lowerdir=$2,upperdir=$3,workdir=$4\" \"$2\" || exit 97
+   fi
+   shift 4
+   exec \"$@\""
+  "A sh script run under unshare -rm. With first argument plant it mounts an
+overlay of upper directory $3 over $2, in the private mount namespace only, then
+it executes the remaining arguments. Exit 97 means the mount failed.")
+
+(defun %overlay-command (plantp lower upper work command)
+  "COMMAND run in a private user and mount namespace, with UPPER overlaid on
+LOWER (WORK as the overlay work directory) when PLANTP is true."
+  (append (list "unshare" "-rm" "sh" "-c" +overlay-script+ "sh"
+                (if plantp "plant" "none") lower upper work)
+          command))
+
+(defun %overlay-available-p ()
+  "True when an unprivileged process can mount an overlay in a private user
+and mount namespace on this host."
+  (let ((tmp (uiop:ensure-directory-pathname (fresh-server-child-state-home))))
+    (unwind-protect
+         (let ((dirs (mapcar (lambda (name)
+                               (uiop:native-namestring
+                                (ensure-directories-exist
+                                 (merge-pathnames (format nil "~A/" name) tmp))))
+                             '("lower" "upper" "work"))))
+           (eql 0 (nth-value 2 (uiop:run-program
+                                (apply #'%overlay-command t
+                                       (append dirs (list (list "true"))))
+                                :input nil :output nil :error-output nil
+                                :ignore-error-status t))))
+      (ignore-errors (uiop:delete-directory-tree tmp :validate t
+                                                     :if-does-not-exist :ignore)))))
+
+(defun %dependency-directory (root)
+  "The physical namestring of the alexandria directory under ROOT's
+deps/software/, or NIL."
+  (let ((dir (first (directory (merge-pathnames "deps/software/alexandria-*/" root)))))
+    (and dir (uiop:native-namestring dir))))
+
+(define-test a-release-server-with-a-dependency-in-a-checkout-exits-78
+  "The server core of a deployed release, booted with that release's root and
+launcher, exits 78 and logs run.release.tied naming the dependency when a .git
+directory appears in one dependency's directory. The .git directory is planted
+through an overlay in a private mount namespace, so the release on disk is
+never written. The same boot without the plant serves and exits 0."
+  (let* ((root (%deployed-release-root))
+         (dependency (and root (%dependency-directory root))))
+    (cond
+      ((null root)
+       (skip "set DSMR_TEST_RELEASE_HOME to a deploy home whose current holds a release (make deploy into a scratch DSMR_HOME)"))
+      ((null dependency)
+       (skip ("~Adeps/software/ holds no alexandria directory" root)))
+      ((not (%overlay-available-p))
+       (skip "unshare -rm cannot mount an overlay on this host"))
+      (t
+       (let ((tmp (uiop:ensure-directory-pathname (fresh-server-child-state-home)))
+             (command (%serve-command (concatenate 'string root "core/dsmr.core")))
+             (launcher (concatenate 'string root "bin/dsmr-mcp-launch")))
+         (unwind-protect
+              (let ((upper (uiop:native-namestring
+                            (ensure-directories-exist (merge-pathnames "upper/" tmp))))
+                    (work (uiop:native-namestring
+                           (ensure-directories-exist (merge-pathnames "work/" tmp)))))
+                (ensure-directories-exist (merge-pathnames "upper/.git/" tmp))
+                (multiple-value-bind (rc err)
+                    (%run-server (%overlay-command nil dependency upper work command)
+                                 root launcher)
+                  (is eql 0 rc "the unplanted release server exited ~S, not 0; stderr:~%~A"
+                      rc (%tail err))
+                  (false (search "run.release.tied" err)
+                         "the unplanted release server logged a tie; stderr:~%~A" (%tail err)))
+                (multiple-value-bind (rc err)
+                    (%run-server (%overlay-command t dependency upper work command)
+                                 root launcher)
+                  (is eql 78 rc "the release server with a planted .git exited ~S, not 78; stderr:~%~A"
+                      rc (%tail err))
+                  (true (search "run.release.tied" err)
+                        "stderr does not name run.release.tied; stderr:~%~A" (%tail err))
+                  (true (search "reason=\\\"checkout\\\" name=\\\"alexandria\\\"" err)
+                        "no tie names alexandria as a checkout; stderr:~%~A" (%tail err)))
+                (false (probe-file (merge-pathnames ".git" dependency))
+                       "the planted .git reached the release on disk at ~A" dependency))
+           (ignore-errors (uiop:delete-directory-tree tmp :validate t
+                                                          :if-does-not-exist :ignore))))))))
+
+(define-test a-release-server-with-its-launcher-in-a-work-tree-exits-78
+  "The server core of a deployed release, booted with that release's root and a
+DSMR_LAUNCHER_PATH inside a git work tree, exits 78 and logs run.release.tied
+with reason launcher-in-work-tree."
+  (let ((root (%deployed-release-root)))
+    (cond
+      ((null root)
+       (skip "set DSMR_TEST_RELEASE_HOME to a deploy home whose current holds a release (make deploy into a scratch DSMR_HOME)"))
+      ((not (%git-available-p))
+       (skip "git is unavailable in this environment"))
+      (t
+       (let ((tmp (uiop:ensure-directory-pathname (fresh-server-child-state-home))))
+         (unwind-protect
+              (let ((launcher (merge-pathnames "bin/dsmr-mcp-launch" tmp)))
+                (%run "git" "init" "-q" (%path tmp))
+                (%write-file launcher "#!/bin/sh" :executable t)
+                (multiple-value-bind (rc err)
+                    (%run-server (%serve-command (concatenate 'string root "core/dsmr.core"))
+                                 root (uiop:native-namestring launcher))
+                  (is eql 78 rc "the release server exited ~S, not 78; stderr:~%~A"
+                      rc (%tail err))
+                  (true (search "run.release.tied" err)
+                        "stderr does not name run.release.tied; stderr:~%~A" (%tail err))
+                  (true (search "reason=\\\"launcher-in-work-tree\\\"" err)
+                        "no tie names the launcher in a work tree; stderr:~%~A" (%tail err))))
+           (ignore-errors (uiop:delete-directory-tree tmp :validate t
+                                                          :if-does-not-exist :ignore))))))))
