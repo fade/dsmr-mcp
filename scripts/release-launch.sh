@@ -24,8 +24,10 @@
 #   - the core, its manifest or MANIFEST is missing;
 #   - the core manifest's sbcl-version is not the running SBCL's;
 #   - the core does not boot.
-# The release checks are release_problem in <root>/scripts/release-paths.sh,
-# which preflight shares.
+# The checks after the source are release_refusal in
+# <root>/scripts/release-paths.sh, which `make register` shares; the launcher
+# alone runs the ones before it, since nothing from the release can be sourced
+# until they pass.
 #
 # Exports, always from the release and never from the caller:
 #   DSMR_RELEASE_ROOT   the release root
@@ -161,7 +163,11 @@ run_server() {
   # shellcheck source=release-paths.sh
   . "$root/scripts/release-paths.sh"
 
-  if ! problem="$(release_problem "$root" "$launcher")"; then
+  if ! declare -F release_refusal >/dev/null; then
+    refuse "$root/scripts/release-paths.sh does not define release_refusal; run make deploy REF=<sha>"
+    return
+  fi
+  if ! problem="$(release_refusal "$root" "$launcher")"; then
     refuse "$problem"
     return
   fi

@@ -4,8 +4,8 @@
 # scripts/release-paths.sh: path helpers for the deploy home and its state
 # directory, and the checks a release must pass before it boots. Sourced, never
 # executed. dsmr_home and dsmr_state_dir report a refusal on stderr and return
-# 1; release_problem and worker_core_withheld print their reason on stdout.
-# None creates anything.
+# 1; release_refusal, release_problem and worker_core_withheld print their
+# reason on stdout. None creates anything.
 
 # dsmr_home
 # Print the deploy home: DSMR_HOME when set and not empty, else
@@ -223,4 +223,26 @@ release_problem() {
     return 1
   fi
   return 0
+}
+
+# release_refusal ROOT [LAUNCHER]
+# The launcher's complete refusal sequence after release-paths.sh is sourced,
+# for the launcher, `make register` and any other caller that must agree with
+# it. Print `<reason>; <remedy>` for the first problem found and return 1, or
+# print nothing and return 0. Checks in order: HOME set and not empty; neither
+# LAUNCHER's directory (default ROOT/bin) nor ROOT inside a git work tree;
+# release_problem ROOT LAUNCHER.
+release_refusal() {
+  local root="$1" launcher="${2:-$1/bin/dsmr-mcp-launch}" path
+  if [ -z "${HOME:-}" ]; then
+    printf 'HOME is unset or empty; start the server with HOME set\n'
+    return 1
+  fi
+  for path in "$(dirname "$launcher")" "$root"; do
+    if inside_work_tree "$path"; then
+      printf '%s is inside a git work tree; a release is never run from a checkout; run make deploy REF=<sha> and make register\n' "$path"
+      return 1
+    fi
+  done
+  release_problem "$root" "$launcher"
 }
