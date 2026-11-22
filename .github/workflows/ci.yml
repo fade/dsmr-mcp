@@ -158,6 +158,14 @@ jobs:
           /usr/bin/time -v make test 2> warm.time || { cat warm.time; exit 1; }
           grep -E 'Elapsed \(wall' warm.time || true
 
+      - name: Build and deploy scripts
+        # Deploy, rollback, registration, the core install and the dependency
+        # pins, with stubs for SBCL, qlot and claude and every destination in a
+        # temporary directory. Shell only, so a failing Lisp suite above does
+        # not hide a broken deploy guard: this step runs either way.
+        if: ${{ !cancelled() }}
+        run: make test-build
+
   integration:
     name: Cross-process integration suite (gated)
     # Off the push hot-path: nightly, manual dispatch, or a PR carrying the
@@ -292,5 +300,14 @@ jobs:
 
       - name: Integration suite
         # sbcl is on PATH (installed above), so the gated leaves actually spawn
-        # their child SBCLs and run — they do not all-skip.
-        run: make test-integration
+        # their child SBCLs and run; they do not all skip. The release built
+        # by Release smoke is handed to the release-tie and release-worker
+        # cases, which skip without it.
+        env:
+          DSMR_TEST_RELEASE_HOME: ${{ runner.temp }}/dsmr
+          DSMR_TEST_RELEASE_WORKER_CORE: ${{ runner.temp }}/dsmr/current/core/dsmr.core.worker
+        run: |
+          set -euo pipefail
+          test -s "$DSMR_TEST_RELEASE_WORKER_CORE" \
+            || { echo "no release worker core at $DSMR_TEST_RELEASE_WORKER_CORE; Release smoke did not deploy one" >&2; exit 1; }
+          make test-integration

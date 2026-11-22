@@ -47,7 +47,7 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
 .PHONY: bridge bus-watch bus-host bus-sources bus-binaries install-bus-watch install-bus-host install-host-unit check-host-unit test test-integration core core-server core-verify core-worker core-verify-worker core-sources test-core test-warm \
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
         preflight check-preflight self-test-preflight check-release install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path \
-        deploy rollback register test-leaf qlot-lock
+        deploy rollback register test-leaf qlot-lock test-build
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -746,6 +746,23 @@ TEST_LIMIT_STATUS = ; status=$$?; \
 ##   it after their load, because the registry can read correctly while the
 ##   system resolved somewhere else.
 TEST_SOURCE_CHECK = --eval '(let ((found (namestring (truename (asdf:system-source-directory "dsmr-mcp")))) (here (namestring (truename "$(CURDIR)/")))) (if (string= found here) (format *error-output* "~&dsmr-mcp source: ~A~%" found) (uiop:die 2 "dsmr-mcp resolves to ~A, not this checkout ~A; put this checkout first in CL_SOURCE_REGISTRY" found here)))'
+
+## test-build: the shell suites for deploy, rollback, registration, the core
+##   install and the dependency pins.
+##
+##   Stubs stand in for SBCL, qlot, make and claude, and every run keeps HOME
+##   and its destinations inside a temporary directory, so nothing reaches the
+##   host's release, bin, skills, agents or Claude Code config. Runs every
+##   suite and fails when any one fails. CI runs it in the unit-suite job.
+BUILD_SUITES = tests/build/deploy-test.sh tests/build/register-test.sh \
+               tests/build/core-install-test.sh tests/build/qlfile-pin-test.sh
+test-build:
+	@status=0; \
+	for suite in $(BUILD_SUITES); do \
+	  printf '\n== %s\n' "$$suite"; \
+	  bash "$$suite" || { echo "test-build: $$suite failed" >&2; status=1; }; \
+	done; \
+	exit $$status
 
 ## test: fast in-process unit suite (the push hot-path).
 ##
