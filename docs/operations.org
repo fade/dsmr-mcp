@@ -98,10 +98,12 @@ cold compile, clear the ASDF output cache first (typically
    it.
 4. *Hermetic workers refused.* A worker starts only from a worker image.
    The release launcher passes the release's =core/dsmr.core.worker= to the
-   server as =DSMR_WORKER_CORE= when the running SBCL built it, and unsets
-   the variable otherwise; without it, every hermetic spawn is refused with
-   =no-worker-core=. Run =make check-release=, and deploy again when the
-   worker image is missing or was built by another SBCL.
+   server as =DSMR_WORKER_CORE= when the image and its manifest are present,
+   owned by the running user, not group or world writable, and built by the
+   running SBCL, and unsets the variable otherwise; without it, every hermetic
+   spawn is refused with =no-worker-core=. Run =make check-release=. It
+   prints the repair: restore ownership and permissions of the named path, or
+   deploy a commit that has no release yet.
 5. *The launcher exits 78.* The release or the deploy home is missing or
    fails a check; see [[*Launcher refusals][Launcher refusals]].
 
@@ -533,23 +535,24 @@ the commit =QLOT_COMMIT= names. It then runs these stages, each logged on standa
    launcher answers =initialize= and =tools/list= with a =serverInfo.version=
    that carries the commit, the worker image boots to a handshake, and each
    bus binary answers =--help=.
-6. =check-copies=: refuses when a deployed skill, agent definition or harness
+6. =check-copies=: refuses when a deployed skill, agent definition, or harness
    file was edited in place since the last deploy. =FORCE=1= replaces it.
 7. =flip=: =current= names the new release, in one rename; the release it
    replaces becomes =previous=.
 8. =links=: =~/.local/bin/dsmr-bus-watch= and =dsmr-bus-host= become links
    through =current/bin/=. A regular file found there is kept beside the link
    as =<name>.pre-release-<UTC stamp>=.
-9. =copies=: the release's skills, agent definitions and harness files are
-   copied into =~/.claude/skills=, =~/.claude/agents= and =~/.claude=.
+9. =copies=: the release's skills, agent definitions, and harness files are
+   copied into =~/.claude/skills=, =~/.claude/agents=, and =~/.claude=.
 
 A failure before the flip prints =deploy: <stage> failed: ...; current is
 unchanged= and exits 1. A failure after the flip names the release now current
-and the deploy that finishes the host steps. Deploying a commit whose release
-already exists verifies it again without rebuilding. One deploy runs at a time
-per deploy home.
+and the deploy that finishes the host steps. Deploying the commit that
+=current= names runs only the host steps. Deploying any other commit that
+already has a release verifies it again without rebuilding. One deploy runs at
+a time per deploy home.
 
-Run =make check-skills=, =make check-agents= and =make check-harness= before
+Run =make check-skills=, =make check-agents=, and =make check-harness= before
 a deploy to see which deployed files differ from the tree. Port an edit you
 want to keep into the tree and commit it; pass =FORCE=1= only after reviewing
 the list.

@@ -252,12 +252,15 @@ env -i HOME="$HOME" PATH="$PATH" \
 
 ** Release tests
 
-Two shell suites test the release scripts with stubs, in seconds, and build
-nothing real:
+=make test-build= runs five shell suites over the release scripts with stubs,
+in seconds, and builds nothing real. Run one alone with =bash=:
 
 #+begin_src sh
-bash tests/build/deploy-test.sh        # scripts/deploy.sh: gates, lock, stages, reuse, rollback
-bash tests/build/core-install-test.sh  # core install sequence and the test core
+bash tests/build/deploy-test.sh         # scripts/deploy.sh: gates, lock, stages, reuse, rollback
+bash tests/build/register-test.sh       # registration of the release launcher
+bash tests/build/release-guard-test.sh  # release shapes the launcher and make register treat alike
+bash tests/build/core-install-test.sh   # core install sequence and the test core
+bash tests/build/qlfile-pin-test.sh     # qlfile and qlfile.lock pins
 #+end_src
 
 =deploy-test.sh= drives the deploy against a temporary origin and clone with

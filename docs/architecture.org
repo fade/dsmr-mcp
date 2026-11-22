@@ -136,7 +136,7 @@ replication entirely.
 * Releases: tool code and subject code
 
 Two kinds of Lisp code meet in one host. /Tool code/ is dsmr-mcp itself: the
-server, the bus binaries and the support code inside each hermetic worker.
+server, the bus binaries, and the support code inside each hermetic worker.
 /Subject code/ is the project a session works on, which workers load and
 reload as the work demands. dsmr-mcp is often its own subject, so the two can
 name the same systems.
@@ -424,8 +424,9 @@ shutdown hook.
 
 A worker boots from the worker core, the release's =core/dsmr.core.worker=, a
 prebuilt image of the worker system and its dependencies that the release
-launcher hands to the server as =DSMR_WORKER_CORE= when the running SBCL built
-it. A worker from the core is serving in about a tenth of a second (135 ms
+launcher hands to the server as =DSMR_WORKER_CORE= when the image and its
+manifest are present, owned by the running user, not group or world writable,
+and built by the running SBCL. A worker from the core is serving in about a tenth of a second (135 ms
 measured on the development box), and every worker on the host shares the
 image's pages, so idle workers cost far less than workers loaded from source.
 When the worker core is unset or missing, the spawn is refused (see
