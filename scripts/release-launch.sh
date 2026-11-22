@@ -16,8 +16,10 @@
 #   - HOME is unset or empty;
 #   - the launcher's physical path or the release root is inside a git work
 #     tree;
-#   - the root, the core or the launcher is not owned by the running user, or
-#     the root or the core is group or world writable;
+#   - the deploy home, releases/, the root, scripts/, scripts/release-paths.sh,
+#     bin/ or the launcher is not owned by the running user or is group or
+#     world writable (checked before anything from the release is sourced);
+#   - the core is not owned by the running user or is group or world writable;
 #   - the core, its manifest or MANIFEST is missing;
 #   - the core manifest's sbcl-version is not the running SBCL's;
 #   - the core does not boot.
@@ -118,6 +120,31 @@ worker_core_withheld() {
   return 1
 }
 
+# unsafe_paths ROOT LAUNCHER
+# Print `<reason>; <remedy>` and return 0 when a path the release's code can be
+# replaced through is owned by another user or is group or world writable:
+# the deploy home and releases/ above ROOT, ROOT, ROOT/scripts,
+# ROOT/scripts/release-paths.sh, ROOT/bin and LAUNCHER. Return 1 when all are
+# sound. Runs before anything from the release is sourced, so it uses nothing
+# from the release.
+unsafe_paths() {
+  local root="$1" path
+  for path in "$(dirname "$(dirname "$root")")" "$(dirname "$root")" "$root" \
+              "$root/scripts" "$root/scripts/release-paths.sh" "$root/bin" "$2"; do
+    if [ ! -O "$path" ]; then
+      printf '%s is not owned by %s; restore ownership and permissions of %s\n' \
+             "$path" "$(id -un)" "$path"
+      return 0
+    fi
+    if [ -n "$(find "$path" -maxdepth 0 -perm /022 2>/dev/null)" ]; then
+      printf '%s is group or world writable; restore ownership and permissions of %s\n' \
+             "$path" "$path"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # run_server
 # Check the release `current` names now, export its paths and boot its server
 # core. Return 78 on a refusal, else the server's exit status.
@@ -146,10 +173,14 @@ run_server() {
     refuse "no $root/scripts/release-paths.sh; run make deploy REF=<sha>"
     return
   fi
+  local problem
+  if problem="$(unsafe_paths "$root" "$launcher")"; then
+    refuse "$problem"
+    return
+  fi
   # shellcheck source=release-paths.sh
   . "$root/scripts/release-paths.sh"
 
-  local problem
   if ! problem="$(release_problem "$root")"; then
     refuse "$problem"
     return

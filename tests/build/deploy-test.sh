@@ -316,6 +316,32 @@ try "home inside a checkout is refused" "rc=$RC: $OUT" test "$RC" -eq 1
 try "refusal names the work tree" "$OUT" has "$OUT" "inside a git work tree"
 try "refusal creates no home" "home exists" test ! -e "$HW"
 
+note "deploy home permissions"
+HP="$WORK/home-perms"
+saved_umask=$(umask)
+umask 0002
+deploy "$HP" "$C1"
+umask "$saved_umask"
+try "a deploy under umask 0002 succeeds" "rc=$RC: $OUT" test "$RC" -eq 0
+try "it creates the home as 0755" "mode $(stat -c %a "$HP" 2>/dev/null)" test "$(stat -c %a "$HP" 2>/dev/null)" = 755
+try "it creates releases/ as 0755" "mode $(stat -c %a "$HP/releases" 2>/dev/null)" \
+    test "$(stat -c %a "$HP/releases" 2>/dev/null)" = 755
+HQ="$WORK/home-perms-open"
+mkdir -p "$HQ"
+chmod 0775 "$HQ"
+deploy "$HQ" "$C1"
+try "a group-writable home is refused" "rc=$RC: $OUT" test "$RC" -eq 1
+try "refusal names the home and the remedy" "$OUT" has "$OUT" "deploy home $HQ is group or world writable; restore ownership and permissions of $HQ"
+try "refusal creates nothing in it" "found: $(ls -A "$HQ")" test -z "$(ls -A "$HQ")"
+chmod 0755 "$HQ"
+mkdir -p "$HQ/releases"
+chmod 0777 "$HQ/releases"
+deploy "$HQ" "$C1"
+try "a world-writable releases/ is refused" "rc=$RC: $OUT" test "$RC" -eq 1
+try "refusal names releases/" "$OUT" has "$OUT" "$HQ/releases is group or world writable"
+try "that refusal builds no release" "found: $(ls -A "$HQ/releases")" test -z "$(ls -A "$HQ/releases")"
+chmod 0755 "$HQ/releases"
+
 # ---- lock ---------------------------------------------------------------
 
 note "lock"

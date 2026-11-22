@@ -86,6 +86,10 @@
 # stages. It runs no git, qlot, sbcl or make.
 set -euo pipefail
 
+# Directories this script creates are 0755 and files 0644 or 0755 whatever the
+# caller's umask, so the release launcher's ownership and mode checks pass.
+umask 022
+
 # shellcheck source=release-paths.sh
 . "$(dirname "${BASH_SOURCE[0]}")/release-paths.sh"
 
@@ -186,6 +190,26 @@ lock_dependencies() {
       name = ""
     }
   ' "$1"
+}
+
+# home_dirs_problem <home>
+# Print a refusal and return 1 when <home> or <home>/releases exists and is
+# owned by another user or is group or world writable; the release launcher
+# refuses a release under either.
+home_dirs_problem() {
+  local home="$1" path label
+  for path in "$home" "$home/releases"; do
+    label="$path"
+    [ "$path" = "$home" ] && label="deploy home $home"
+    if foreign_owned "$path"; then
+      printf '%s is not owned by %s; restore ownership and permissions of %s\n' "$label" "$(id -un)" "$path"
+      return 1
+    fi
+    if others_can_write "$path"; then
+      printf '%s is group or world writable; restore ownership and permissions of %s\n' "$label" "$path"
+      return 1
+    fi
+  done
 }
 
 # host_default <VAR>
@@ -372,6 +396,9 @@ deploy() {
   fi
   if home_in_work_tree "$home"; then
     die "DSMR_HOME $home is inside a git work tree; point DSMR_HOME at a directory outside every checkout"
+  fi
+  if ! problem="$(home_dirs_problem "$home")"; then
+    die "$problem"
   fi
   if [ -n "$(git -C "$repo" status --porcelain --untracked-files=no)" ]; then
     die "the working tree has uncommitted changes to tracked files; commit or stash them, then re-run"

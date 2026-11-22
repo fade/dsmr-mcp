@@ -400,6 +400,68 @@ versions."
     (multiple-value-bind (rc out err) (%launch tmp (%entry home))
       (%refused-p rc out err tmp "restore ownership and permissions"))))
 
+(defun %plant-release-paths (home tmp)
+  "Replace release r1's scripts/release-paths.sh under HOME with one that
+creates <TMP>/planted-ran when sourced."
+  (let ((file (merge-pathnames "releases/r1/scripts/release-paths.sh" home)))
+    (%run "chmod" "u+w" (%path (merge-pathnames "releases/r1/scripts/" home)))
+    (uiop:delete-file-if-exists file)
+    (%write-file file (format nil ": > '~A'~%"
+                              (%path (merge-pathnames "planted-ran" tmp))))
+    (%run "chmod" "go-w" (%path file))
+    (%run "chmod" "u-w" (%path (merge-pathnames "releases/r1/scripts/" home)))))
+
+(defun %planted-ran-p (tmp)
+  "True when the planted release-paths.sh ran."
+  (probe-file (merge-pathnames "planted-ran" tmp)))
+
+(define-test a-world-writable-release-root-is-refused-before-its-scripts-run
+  "In a release root anyone can write, scripts/release-paths.sh never runs:
+the refusal comes first."
+  (with-fake-release (tmp home)
+    (%plant-release-paths home tmp)
+    (%run "chmod" "o+w" (%release-dir home "r1"))
+    (multiple-value-bind (rc out err) (%launch tmp (%entry home))
+      (%refused-p rc out err tmp "restore ownership and permissions")
+      (false (%planted-ran-p tmp) "the planted release-paths.sh did not run"))))
+
+(define-test a-group-writable-scripts-directory-is-refused-before-it-runs
+  "A scripts/ directory others can write is refused before anything in it runs."
+  (with-fake-release (tmp home)
+    (%plant-release-paths home tmp)
+    (%run "chmod" "g+w" (%path (merge-pathnames "releases/r1/scripts/" home)))
+    (multiple-value-bind (rc out err) (%launch tmp (%entry home))
+      (%refused-p rc out err tmp "restore ownership and permissions")
+      (false (%planted-ran-p tmp) "the planted release-paths.sh did not run"))))
+
+(define-test a-world-writable-releases-directory-is-refused-before-scripts-run
+  "A releases/ directory anyone can write is refused before anything from the
+release runs: a release can be replaced through it."
+  (with-fake-release (tmp home)
+    (%plant-release-paths home tmp)
+    (%run "chmod" "o+w" (%path (merge-pathnames "releases/" home)))
+    (multiple-value-bind (rc out err) (%launch tmp (%entry home))
+      (%refused-p rc out err tmp "restore ownership and permissions")
+      (false (%planted-ran-p tmp) "the planted release-paths.sh did not run"))))
+
+(define-test a-group-writable-deploy-home-is-refused-before-scripts-run
+  "A deploy home others can write is refused before anything from the release
+runs."
+  (with-fake-release (tmp home)
+    (%plant-release-paths home tmp)
+    (%run "chmod" "g+w" (%path home))
+    (multiple-value-bind (rc out err) (%launch tmp (%entry home))
+      (%refused-p rc out err tmp "restore ownership and permissions")
+      (false (%planted-ran-p tmp) "the planted release-paths.sh did not run"))))
+
+(define-test an-intact-release-runs-its-release-paths
+  "The control: in a release with sound permissions the launcher sources
+scripts/release-paths.sh, so the planted file runs."
+  (with-fake-release (tmp home)
+    (%plant-release-paths home tmp)
+    (%launch tmp (%entry home))
+    (true (%planted-ran-p tmp) "the planted release-paths.sh ran")))
+
 (define-test an-unset-home-refuses-with-78
   "With HOME unset the launcher refuses and asks for HOME."
   (with-fake-release (tmp home)
