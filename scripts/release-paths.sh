@@ -31,6 +31,26 @@ dsmr_home() {
   esac
 }
 
+# host_home_p HOME
+# Return 0 when HOME is the account's own deploy home, else 1. The account's
+# home is $HOME/.local/share/dsmr-mcp, or $XDG_DATA_HOME/dsmr-mcp when
+# XDG_DATA_HOME resolves to a directory under $HOME. Paths are compared
+# resolved. Every other deploy home is a scratch home, so an XDG_DATA_HOME
+# outside $HOME never names the host's own release.
+host_home_p() {
+  local home user data
+  [ -n "${HOME:-}" ] || return 1
+  home="$(realpath -m -- "$1")"
+  user="$(realpath -m -- "$HOME")"
+  [ "$home" = "$user/.local/share/dsmr-mcp" ] && return 0
+  [ -n "${XDG_DATA_HOME:-}" ] || return 1
+  data="$(realpath -m -- "$XDG_DATA_HOME")"
+  case "$data/" in
+    "$user"/*) [ "$home" = "$data/dsmr-mcp" ] ;;
+    *) return 1 ;;
+  esac
+}
+
 # dsmr_state_dir
 # Print ${XDG_STATE_HOME:-$HOME/.local/state}/dsmr-mcp under the same rules as
 # dsmr_home.

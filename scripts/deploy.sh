@@ -206,20 +206,17 @@ AGENTDIR="${AGENTDIR:-$(host_default AGENTDIR)}"
 SUBAGENTDIR="${SUBAGENTDIR:-$AGENTDIR/agents}"
 
 # host_problem <home>
-# Print a refusal and return 1 when <home> is not the default deploy home,
+# Print a refusal and return 1 when <home> is a scratch home (host_home_p),
 # HOST_LINKS is not 0, and one of BINDIR, SKILLDIR, AGENTDIR or SUBAGENTDIR
 # still names the host's own directory. Paths are compared resolved, so another
 # spelling of a host directory is caught too.
 host_problem() {
-  local home="$1" default var
+  local home="$1" var
   [ "${HOST_LINKS:-}" = "0" ] && return 0
-  default="$(DSMR_HOME='' dsmr_home 2>/dev/null)" || default=""
-  if [ -n "$default" ] && [ "$(realpath -m -- "$home")" = "$(realpath -m -- "$default")" ]; then
-    return 0
-  fi
+  host_home_p "$home" && return 0
   for var in BINDIR SKILLDIR AGENTDIR SUBAGENTDIR; do
     if [ "$(realpath -m -- "${!var}")" = "$(realpath -m -- "$(host_default "$var")")" ]; then
-      printf 'DSMR_HOME %s is a scratch home but %s is the host'"'"'s %s; set HOST_LINKS=0 or point BINDIR, SKILLDIR, AGENTDIR and SUBAGENTDIR at scratch directories\n' \
+      printf 'deploy home %s is a scratch home but %s is the host'"'"'s %s; set HOST_LINKS=0 or point BINDIR, SKILLDIR, AGENTDIR and SUBAGENTDIR at scratch directories\n' \
         "$home" "$var" "${!var}"
       return 1
     fi

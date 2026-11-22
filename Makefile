@@ -1041,7 +1041,9 @@ qlot-lock:
 ##   is on no origin branch (ALLOW_UNPUBLISHED=1 overrides the second). One
 ##   deploy runs at a time per DSMR_HOME. REF is required. DSMR_HOME redirects
 ##   the whole deploy to a scratch home, and then HOST_LINKS=0 or scratch
-##   BINDIR, SKILLDIR, AGENTDIR and SUBAGENTDIR are required too:
+##   BINDIR, SKILLDIR, AGENTDIR and SUBAGENTDIR are required too. Any deploy
+##   home other than $HOME/.local/share/dsmr-mcp is a scratch home, including
+##   one named through an XDG_DATA_HOME outside $HOME:
 ##   make deploy REF=HEAD DSMR_HOME=$(mktemp -d) ALLOW_UNPUBLISHED=1 HOST_LINKS=0
 deploy:
 	@REPO="$(CURDIR)" REF="$(REF)" DSMR_HOME="$(DSMR_HOME)" QLOT="$(QLOT)" QLOT_COMMIT="$(QLOT_COMMIT)" SBCL="$(SBCL)" \

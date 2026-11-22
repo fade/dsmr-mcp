@@ -219,7 +219,7 @@ OUT=""; RC=0
 deploy() {
     local home=$1 ref=$2
     shift 2
-    OUT=$(env -u ALLOW_UNPUBLISHED -u BINDIR -u SKILLDIR -u AGENTDIR -u SUBAGENTDIR \
+    OUT=$(env -u ALLOW_UNPUBLISHED -u BINDIR -u SKILLDIR -u AGENTDIR -u SUBAGENTDIR -u XDG_DATA_HOME \
               HOME="$WORK/fakehome" PATH="$WORK/bin:$PATH" HOST_LINKS=0 \
               REPO="$REPO" REF="$ref" DSMR_HOME="$home" \
               QLOT="$WORK/bin/qlot" SBCL="$WORK/bin/sbcl" DEPLOY_VERIFY_TIMEOUT=5 \
@@ -389,7 +389,7 @@ rm -f "$WORK/guard.hit"
 rollback() {
     local home=$1
     shift
-    OUT=$(env -u BINDIR -u SKILLDIR -u AGENTDIR -u SUBAGENTDIR \
+    OUT=$(env -u BINDIR -u SKILLDIR -u AGENTDIR -u SUBAGENTDIR -u XDG_DATA_HOME \
               HOME="$WORK/fakehome" PATH="$WORK/guard:$PATH" HOST_LINKS=0 DSMR_HOME="$home" \
               "$@" bash "$DEPLOY" rollback 2>&1)
     RC=$?
@@ -490,7 +490,7 @@ HG="$WORK/home-guard"
 touch "$WORK/marker-guard"; sleep 1
 deploy "$HG" "$C1" HOST_LINKS=
 try "scratch home with host destinations is refused" "rc=$RC: $OUT" test "$RC" -eq 1
-try "refusal names the scratch home and the variable" "$OUT" has "$OUT" "DSMR_HOME $HG is a scratch home but BINDIR is the host's"
+try "refusal names the scratch home and the variable" "$OUT" has "$OUT" "deploy home $HG is a scratch home but BINDIR is the host's"
 try "refusal names the remedy" "$OUT" has "$OUT" "set HOST_LINKS=0 or point BINDIR, SKILLDIR, AGENTDIR and SUBAGENTDIR at scratch directories"
 try "refusal creates no home" "home exists" test ! -e "$HG"
 written=$(find "$WORK/fakehome" -newer "$WORK/marker-guard" 2>/dev/null | head -3)
@@ -503,6 +503,36 @@ try "refusal names SUBAGENTDIR" "$OUT" has "$OUT" "but SUBAGENTDIR is the host's
 rollback "$HG" HOST_LINKS=
 try "rollback with a scratch home and host destinations is refused" "rc=$RC: $OUT" test "$RC" -eq 1
 try "rollback refusal names the scratch home" "$OUT" has "$OUT" "is a scratch home but BINDIR is the host's"
+
+note "host-destination guard, deploy home named by XDG_DATA_HOME"
+# DSMR_HOME is empty, so the deploy home is $XDG_DATA_HOME/dsmr-mcp. Only a
+# home under HOME is the host's own; any other one is a scratch home.
+HXD="$WORK/xdg-scratch"
+touch "$WORK/marker-xdg"; sleep 1
+deploy "" "$C1" HOST_LINKS= XDG_DATA_HOME="$HXD"
+try "a scratch XDG_DATA_HOME with host destinations is refused" "rc=$RC: $OUT" test "$RC" -eq 1
+try "refusal names the deploy home and the variable" "$OUT" has "$OUT" "deploy home $HXD/dsmr-mcp is a scratch home but BINDIR is the host's"
+try "refusal creates no home under XDG_DATA_HOME" "home exists" test ! -e "$HXD/dsmr-mcp"
+written=$(find "$WORK/fakehome" -newer "$WORK/marker-xdg" 2>/dev/null | head -3)
+try "refusal writes nothing under the host directories" "written: $written" test -z "$written"
+deploy "$HXD/dsmr-mcp" "$C1"; deploy "$HXD/dsmr-mcp" "$C2"
+touch "$WORK/marker-xdg"; sleep 1
+rollback "" HOST_LINKS= XDG_DATA_HOME="$HXD"
+try "rollback in a scratch XDG_DATA_HOME with host destinations is refused" "rc=$RC: $OUT" test "$RC" -eq 1
+try "rollback refusal names the deploy home" "$OUT" has "$OUT" "deploy home $HXD/dsmr-mcp is a scratch home but BINDIR is the host's"
+try "refused rollback leaves current" "current=$(link "$HXD/dsmr-mcp/current")" \
+    test "$(link "$HXD/dsmr-mcp/current")" = "releases/$C2"
+written=$(find "$WORK/fakehome" -newer "$WORK/marker-xdg" 2>/dev/null | head -3)
+try "refused rollback writes nothing under the host directories" "written: $written" test -z "$written"
+ln -s "$HXD" "$WORK/fakehome/xdg-link"
+deploy "" "$C1" HOST_LINKS= XDG_DATA_HOME="$WORK/fakehome/xdg-link"
+try "an XDG_DATA_HOME under HOME that resolves outside it is refused" "rc=$RC: $OUT" test "$RC" -eq 1
+rm -f "$WORK/fakehome/xdg-link"
+deploy "" "$C1" HOST_LINKS= XDG_DATA_HOME="$WORK/fakehome/.xdg-data"
+try "an XDG_DATA_HOME under HOME is the host's own home" "rc=$RC: $OUT" test "$RC" -eq 0
+try "that deploy links the host's bus binaries" "link=$(link "$WORK/fakehome/.local/bin/dsmr-bus-watch")" \
+    test "$(link "$WORK/fakehome/.local/bin/dsmr-bus-watch")" = "$WORK/fakehome/.xdg-data/dsmr-mcp/current/bin/dsmr-bus-watch"
+rm -rf "${WORK:?}/fakehome/.local/bin" "${WORK:?}/fakehome/.claude"
 
 note "bus binary links"
 HK="$WORK/home-links"
