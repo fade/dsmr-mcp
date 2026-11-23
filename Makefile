@@ -102,7 +102,7 @@ FORCE ?=
 ##   a scratch file here too, or `make register` refuses.
 CLAUDE_CONFIG ?= $(HOME)/.claude.json
 
-## CLAUDE_SETTINGS: the Claude Code user settings file the worktree permission targets read.
+## CLAUDE_SETTINGS: the Claude Code user settings file the worktree permission targets read and write.
 ##
 ##   Defaults to $CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json.
 ##   Point it at a scratch file to run either target without touching the
@@ -1177,7 +1177,8 @@ register:
 ##   <workspace> is WORKSPACE and each <root> an absolute directory from the
 ##   colon-separated DSMR_WORKTREE_ROOTS. An existing file is backed up to
 ##   <file>.bak-<stamp> first; a file holding every rule is not written, and one
-##   that is not valid JSON is refused. A scratch run:
+##   that cannot be read, is not valid JSON, or has the wrong shape is refused.
+##   A scratch run:
 ##   make install-worktree-permissions CLAUDE_SETTINGS=<scratch file>
 install-worktree-permissions:
 	@DSMR_PERMISSIONS_SETTINGS="$(CLAUDE_SETTINGS)" DSMR_PERMISSIONS_WORKSPACE="$(WORKSPACE)" \
