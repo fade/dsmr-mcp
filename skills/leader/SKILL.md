@@ -600,7 +600,10 @@ degradation that you put right. Check it at every bring-up, after your own ears:
 - `service state=alive pid=<p> beat-age=<n> status-age=<n>`: the service is up.
   Read each `bus <name> owner=...` line; `owner=host` is in order.
 - `memory state=<s> hibernated=<n> resident=<n> since=<t> some=<x> available=<y> last-action=<t>`:
-  how the host's memory stands. `state=ok` is in order. `state=pressure` means
+  how the host's memory stands. `state=ok` is in order. `state=reclaim` is in
+  order too; memory is stalling while at least a quarter of it is available
+  (page-cache reclaim, usually heavy file I/O), nothing is relieved, and it stays
+  out of the footer. `state=pressure` means
   the service is asking session pools to stop fresh idle hermetic workers and
   hibernate stateful idle ones; put it in your footer with `since` and
   `available`. A hibernated worker resumes with its world on its session's next

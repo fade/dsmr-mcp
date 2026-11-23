@@ -38,6 +38,85 @@
                SwapFree:        8000000 kB~%")
   "The lines of /proc/meminfo the service reads, with some it ignores.")
 
+(defparameter *calm-pressure-memory*
+  "some avg10=0.00 avg60=0.01 avg300=0.00 total=8936605
+full avg10=0.00 avg60=0.01 avg300=0.00 total=8862540
+"
+  "/proc/pressure/memory captured verbatim on the 64 GB development host at
+   2026-11-23T02:01:10Z, with the host calm.")
+
+(defparameter *calm-pressure-io*
+  "some avg10=0.14 avg60=0.18 avg300=0.29 total=1576273004
+full avg10=0.14 avg60=0.15 avg300=0.26 total=1502569673
+"
+  "/proc/pressure/io captured verbatim on the 64 GB development host at
+   2026-11-23T02:01:10Z, with the host calm.")
+
+(defparameter *calm-meminfo*
+  "MemTotal:       65886884 kB
+MemFree:        20711552 kB
+MemAvailable:   42854576 kB
+Buffers:            1124 kB
+Cached:         20366272 kB
+SwapCached:          292 kB
+Active:         14710932 kB
+Inactive:       23721932 kB
+Active(anon):   13782000 kB
+Inactive(anon):  4963564 kB
+Active(file):     928932 kB
+Inactive(file): 18758368 kB
+Unevictable:       82108 kB
+Mlocked:           82104 kB
+SwapTotal:      65886204 kB
+SwapFree:       58786504 kB
+Zswap:                 0 kB
+Zswapped:              0 kB
+Dirty:              2568 kB
+Writeback:             0 kB
+AnonPages:      17657920 kB
+Mapped:          1831704 kB
+Shmem:           1218172 kB
+KReclaimable:    3123000 kB
+Slab:            3965764 kB
+SReclaimable:    3123000 kB
+SUnreclaim:       842764 kB
+KernelStack:       47168 kB
+PageTables:       159656 kB
+SecPageTables:         0 kB
+NFS_Unstable:          0 kB
+Bounce:                0 kB
+WritebackTmp:          0 kB
+CommitLimit:    98829644 kB
+Committed_AS:   49649524 kB
+VmallocTotal:   34359738367 kB
+VmallocUsed:      621940 kB
+VmallocChunk:          0 kB
+Percpu:            38912 kB
+HardwareCorrupted:     0 kB
+AnonHugePages:   2400256 kB
+ShmemHugePages:        0 kB
+ShmemPmdMapped:        0 kB
+FileHugePages:         0 kB
+FilePmdMapped:         0 kB
+CmaTotal:              0 kB
+CmaFree:               0 kB
+Unaccepted:            0 kB
+Balloon:               0 kB
+GPUActive:             0 kB
+GPUReclaim:            0 kB
+HugePages_Total:       0
+HugePages_Free:        0
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+Hugepagesize:       2048 kB
+Hugetlb:               0 kB
+DirectMap4k:     3145864 kB
+DirectMap2M:    61822976 kB
+DirectMap1G:     3145728 kB
+"
+  "/proc/meminfo captured verbatim on the 64 GB development host at
+   2026-11-23T02:01:10Z, with the host calm.")
+
 (defun readings (&key some full (total 1000) (available 500))
   "Readings with SOME and FULL as the PSI avg10 values and AVAILABLE out of
    TOTAL kilobytes free."
@@ -147,15 +226,55 @@
     (is eql 8388608 (getf plist :swap-total-kb))
     (is eql 8000000 (getf plist :swap-free-kb))))
 
+(define-test the-captured-calm-io-pressure-file-parses
+  "*CALM-PRESSURE-IO*, captured on the development host at
+   2026-11-23T02:01:10Z, gives some and full avg10 0.14."
+  (multiple-value-bind (some full) (memory:parse-psi-text *calm-pressure-io*)
+    (is = 0.14 some)
+    (is = 0.14 full)))
+
 (define-test a-host-without-pressure-files-still-reads-its-memory
-  "With no PSI file the pressure fields are empty and meminfo is still read,
-   so the available-memory rule keeps working."
-  (let ((r (memory:read-memory-readings :psi-path "/nonexistent/pressure")))
+  "With no PSI files the memory and I/O pressure fields are empty and meminfo
+   is still read, so the available-memory rule keeps working."
+  (let ((r (memory:read-memory-readings :psi-path "/nonexistent/pressure"
+                                        :io-psi-path "/nonexistent/pressure-io")))
     (is eq nil (memory:memory-readings-some-avg10 r))
     (is eq nil (memory:memory-readings-full-avg10 r))
+    (is eq nil (memory:memory-readings-io-some-avg10 r))
+    (is eq nil (memory:memory-readings-io-full-avg10 r))
     (true (typep (memory:memory-readings-mem-total-kb r) '(integer 1)))
     (true (integerp (memory:memory-readings-mem-available-kb r)))
     (true (realp (memory:available-fraction r)))))
+
+(define-test the-captured-calm-host-reads-ok-and-not-io-driven
+  "The three /proc files captured calm on the development host at
+   2026-11-23T02:01:10Z, read from files, give memory some and full 0.0, I/O
+   some and full 0.14 and the captured sizes; they classify ok and are not
+   I/O-driven."
+  (let ((dir (uiop:ensure-directory-pathname
+              (format nil "~Ahost-memory-test-~D-~D/"
+                      (uiop:native-namestring (uiop:temporary-directory))
+                      (sb-posix:getpid) (random 1000000 (make-random-state t))))))
+    (unwind-protect
+         (flet ((place (name text)
+                  (let ((path (merge-pathnames name dir)))
+                    (with-open-file (out path :direction :output :if-exists :supersede)
+                      (write-string text out))
+                    (uiop:native-namestring path))))
+           (ensure-directories-exist dir)
+           (let ((r (memory:read-memory-readings
+                     :psi-path (place "pressure-memory" *calm-pressure-memory*)
+                     :io-psi-path (place "pressure-io" *calm-pressure-io*)
+                     :meminfo-path (place "meminfo" *calm-meminfo*))))
+             (is = 0.0 (memory:memory-readings-some-avg10 r))
+             (is = 0.0 (memory:memory-readings-full-avg10 r))
+             (is = 0.14 (memory:memory-readings-io-some-avg10 r))
+             (is = 0.14 (memory:memory-readings-io-full-avg10 r))
+             (is eql 65886884 (memory:memory-readings-mem-total-kb r))
+             (is eql 42854576 (memory:memory-readings-mem-available-kb r))
+             (is eq :ok (values (memory:classify-memory r (memory:make-memory-state) 0)))
+             (false (memory:io-driven-p r))))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
 
 (define-test the-available-fraction-needs-both-sizes
   "Available over total, or nothing when either is missing or the total is 0."
@@ -235,6 +354,20 @@
     (is equal '(:ok :pressure)
         (run-classifier (memory:make-memory-state) (recorded-stall-steps :to 1) th))))
 
+(define-test reclaim-is-io-driven-at-the-recorded-incident-s-io-figure
+  "I/O full avg10 15, recorded during the 2026-11-22 16:39Z incident on the
+   development host, is I/O-driven; 0.14, captured calm on the same host at
+   2026-11-23T02:01:10Z, and an absent figure are not. With
+   DSMR_PRESSURE_IO_FULL=20, 15 is not."
+  (flet ((io (full) (memory:make-memory-readings :io-full-avg10 full)))
+    (true (memory:io-driven-p (io 15.0)))
+    (false (memory:io-driven-p (io 0.14)))
+    (false (memory:io-driven-p (io nil)))
+    (false (memory:io-driven-p
+            (io 15.0)
+            (memory:thresholds-from-environment
+             :getenv (getenv-from '(("DSMR_PRESSURE_IO_FULL" . "20"))))))))
+
 (define-test pressure-clears-only-after-thirty-seconds-of-calm
   "Calm from 10 still reads pressure at 39 and clears at 40."
   (let ((steps (loop for now from 10 to 38 collect (list now (calm)))))
@@ -298,6 +431,7 @@
     (is = 3.0 (memory:memory-thresholds-leave-some th))
     (is = 0.20 (memory:memory-thresholds-leave-available th))
     (is = 0.25 (memory:memory-thresholds-stall-available th))
+    (is = 5.0 (memory:memory-thresholds-io-full th))
     (is = 30 (memory:memory-thresholds-hold-seconds th))
     (is = 10 (memory:memory-thresholds-min-kill-age-seconds th))
     (is eq nil warnings)))
@@ -330,6 +464,16 @@
     (is = 0.25 (memory:memory-thresholds-stall-available th))
     (is = 1 (length warnings))
     (true (search "DSMR_PRESSURE_STALL_AVAILABLE_PERCENT" (first warnings)))))
+
+(define-test an-unreadable-io-threshold-keeps-its-default
+  "DSMR_PRESSURE_IO_FULL=x keeps 5.0 and yields one warning naming the
+   variable."
+  (multiple-value-bind (th warnings)
+      (memory:thresholds-from-environment
+       :getenv (getenv-from '(("DSMR_PRESSURE_IO_FULL" . "x"))))
+    (is = 5.0 (memory:memory-thresholds-io-full th))
+    (is = 1 (length warnings))
+    (true (search "DSMR_PRESSURE_IO_FULL" (first warnings)))))
 
 (define-test the-minimum-kill-age-is-read-from-the-process-environment
   "DSMR_PRESSURE_MIN_KILL_AGE_SECONDS=3 in the real environment reads as 3."

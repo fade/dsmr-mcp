@@ -589,7 +589,8 @@ not start, 75 when its supervisor loop stalled.
    Entering pressure is reported at WARN with the readings that showed it, and
    leaving it writes the recovered line that closes the episode. Entering
    reclaim from :OK is reported at INFO under memory-reclaim, which reaches
-   the service log only; reclaim relieves nothing. The first check also
+   the service log only, naming I/O when the I/O full figure reaches its
+   threshold; reclaim relieves nothing. The first check also
    reports any threshold the environment set to something unusable. Run
    under the healing protocol, as the supervisor runs it, since relief is
    asked for by raising a fault."
@@ -620,12 +621,15 @@ not start, 75 when its supervisor loop stalled.
                                           available=~:[-~;~:*~D%~] ~:[and no memory ~
                                           total~;~:*at or above the ~D% stall ceiling~]; ~
                                           some avg10=~:[-~;~:*~,1F~] ~
-                                          full avg10=~:[-~;~:*~,1F~]"
+                                          full avg10=~:[-~;~:*~,1F~]~
+                                          ~@[; I/O-driven: io full avg10=~,1F~]"
                                      percent
                                      (and percent
                                           (round (* 100 (memory:memory-thresholds-stall-available
                                                          thresholds))))
-                                     some full)))
+                                     some full
+                                     (and (memory:io-driven-p readings thresholds)
+                                          (memory:memory-readings-io-full-avg10 readings)))))
               ((and (eq before :pressure) (not (eq verdict :pressure)))
                (fleetlog:fleet-recovered "memory-pressure" :subject "host")
                (when (service-unrelieved-reported-p svc)

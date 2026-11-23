@@ -297,6 +297,15 @@
   (destructuring-bind (some percent) (nth (mod i 4) *recorded-stalls*)
     (readings percent :some some :full 2.0)))
 
+(defparameter *incident-reading*
+  '(:some-avg10 2.7 :full-avg10 2.0 :mem-total-kb 1000000 :mem-available-kb 710000
+    :io-full-avg10 15.0)
+  "The FLEET WARN reading of the 2026-11-22 16:39Z incident on the development
+   host, an md5sum pass over the source tree: some avg10 2.7, 71% available,
+   I/O full avg10 15 during the episode. Memory full is unrecorded and taken
+   as 2.0, the default enter-full and the least value that entered pressure.
+   I/O some is unrecorded and left out.")
+
 (defvar *reading* nil
   "What the current memory case's service reads as the host's memory.")
 
@@ -574,7 +583,8 @@
       (let ((reclaim (reported "memory-reclaim" :info)))
         (is = 1 (length reclaim))
         (true (search "not a shortage" (fourth (first reclaim))))
-        (true (search "available=59%" (fourth (first reclaim))))))))
+        (true (search "available=59%" (fourth (first reclaim))))
+        (false (search "I/O" (fourth (first reclaim))))))))
 
 (define-test recorded-stalls-with-most-memory-available-never-become-unrelieved
   "The recorded FLEET WARN readings of 2026-11-22/23 (*RECORDED-STALLS*),
@@ -590,6 +600,26 @@
       (is = 0 (length (fleet-lines-with "code=memory-pressure-unrelieved")))
       (is = 0 (length (fleet-lines-with "WARN code=memory-pressure")))
       (is eq :reclaim (memory:memory-state-verdict (service::service-memory-state svc))))))
+
+(define-test the-recorded-incident-is-reported-as-io-driven-reclaim
+  "The WARN reading of the 2026-11-22 16:39Z incident (*INCIDENT-READING*),
+   given twice because the reading before it is unrecorded but was also a
+   stall, asks nothing of an idle stateful worker and is reported once as
+   reclaim driven by I/O, with the I/O full figure."
+  (with-memory-case (state)
+    (let ((svc (memory-service))
+          (now (%unix-time)))
+      (publish (list (worker 1 :stateful t :spawned-at (- now 100)
+                               :last-activity (- now 50))))
+      (setf *reading* (apply #'memory:make-memory-readings *incident-reading*))
+      (check svc now)
+      (check svc (+ now 1))
+      (is equal '() (requests))
+      (is equal '() (reported "memory-pressure"))
+      (let ((reclaim (reported "memory-reclaim" :info)))
+        (is = 1 (length reclaim))
+        (true (search "I/O-driven" (fourth (first reclaim))))
+        (true (search "io full avg10=15.0" (fourth (first reclaim))))))))
 
 (define-test a-failing-memory-reader-never-stops-the-supervisor
   "A memory reader that signals is reported as a failed duty about the host,

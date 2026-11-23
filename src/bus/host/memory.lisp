@@ -54,6 +54,8 @@
    #:memory-readings-mem-available-kb
    #:memory-readings-swap-total-kb
    #:memory-readings-swap-free-kb
+   #:memory-readings-io-some-avg10
+   #:memory-readings-io-full-avg10
    #:parse-psi-text
    #:parse-meminfo-text
    #:read-memory-readings
@@ -67,6 +69,7 @@
    #:memory-thresholds-leave-some
    #:memory-thresholds-leave-available
    #:memory-thresholds-stall-available
+   #:memory-thresholds-io-full
    #:memory-thresholds-hold-seconds
    #:memory-thresholds-min-kill-age-seconds
    #:thresholds-from-environment
@@ -78,6 +81,7 @@
    #:memory-state-since
    #:memory-state-clear-since
    #:classify-memory
+   #:io-driven-p
    ;; ranking
    #:rank-candidates))
 
@@ -88,14 +92,17 @@
 (defstruct (memory-readings (:copier nil))
   "One reading of the host's memory. SOME-AVG10 and FULL-AVG10 are the
    percentages of the last ten seconds in which some or all tasks stalled on
-   memory, or NIL without a pressure file; the sizes are in kilobytes, or NIL
-   when /proc/meminfo did not give them."
+   memory, or NIL without a pressure file; IO-SOME-AVG10 and IO-FULL-AVG10
+   are the same figures for I/O, or NIL without /proc/pressure/io. The sizes
+   are in kilobytes, or NIL when /proc/meminfo did not give them."
   (some-avg10 nil)
   (full-avg10 nil)
   (mem-total-kb nil)
   (mem-available-kb nil)
   (swap-total-kb nil)
-  (swap-free-kb nil))
+  (swap-free-kb nil)
+  (io-some-avg10 nil)
+  (io-full-avg10 nil))
 
 (defun %parse-decimal (text)
   "The non-negative number TEXT spells as digits with at most one decimal
@@ -122,8 +129,8 @@
 
 (defun parse-psi-text (text)
   "The avg10 figures of the some and full lines of TEXT, as the kernel writes
-   /proc/pressure/memory, as two values. Either is NIL when its line is
-   missing or unreadable."
+   any file under /proc/pressure, as two values. Either is NIL when its line
+   is missing or unreadable."
   (let ((some nil) (full nil))
     (dolist (line (%lines text))
       (let* ((fields (remove "" (uiop:split-string line :separator " ")
@@ -158,20 +165,24 @@
           append (list key (getf found key)))))
 
 (defun read-memory-readings (&key (psi-path "/proc/pressure/memory")
-                                  (meminfo-path "/proc/meminfo"))
-  "Read the host's memory now, from PSI-PATH and MEMINFO-PATH. A file that
-   cannot be read leaves its fields NIL, so a kernel without pressure figures
-   still yields the sizes."
+                                  (meminfo-path "/proc/meminfo")
+                                  (io-psi-path "/proc/pressure/io"))
+  "Read the host's memory now, from PSI-PATH, MEMINFO-PATH and IO-PSI-PATH. A
+   file that cannot be read leaves its fields NIL, so a kernel without
+   pressure figures still yields the sizes."
   (flet ((text (path)
            (or (ignore-errors (uiop:read-file-string path)) "")))
     (multiple-value-bind (some full) (parse-psi-text (text psi-path))
-      (let ((sizes (parse-meminfo-text (text meminfo-path))))
-        (make-memory-readings :some-avg10 some
-                              :full-avg10 full
-                              :mem-total-kb (getf sizes :mem-total-kb)
-                              :mem-available-kb (getf sizes :mem-available-kb)
-                              :swap-total-kb (getf sizes :swap-total-kb)
-                              :swap-free-kb (getf sizes :swap-free-kb))))))
+      (multiple-value-bind (io-some io-full) (parse-psi-text (text io-psi-path))
+        (let ((sizes (parse-meminfo-text (text meminfo-path))))
+          (make-memory-readings :some-avg10 some
+                                :full-avg10 full
+                                :mem-total-kb (getf sizes :mem-total-kb)
+                                :mem-available-kb (getf sizes :mem-available-kb)
+                                :swap-total-kb (getf sizes :swap-total-kb)
+                                :swap-free-kb (getf sizes :swap-free-kb)
+                                :io-some-avg10 io-some
+                                :io-full-avg10 io-full))))))
 
 (defun available-fraction (readings)
   "The share of memory still available, between 0 and 1, or NIL when READINGS
@@ -192,14 +203,17 @@
    enters pressure at once. Pressure clears once the some figure has stayed
    below LEAVE-SOME and the available share above LEAVE-AVAILABLE for
    HOLD-SECONDS. A fresh worker
-   younger than MIN-KILL-AGE-SECONDS is never offered for stopping. The
-   defaults are unmeasured starting points: STALL-AVAILABLE 0.25."
+   younger than MIN-KILL-AGE-SECONDS is never offered for stopping. Reclaim
+   is reported as I/O-driven when the I/O full figure reaches IO-FULL; it
+   changes no verdict. The defaults are unmeasured starting points:
+   STALL-AVAILABLE 0.25, IO-FULL 5.0."
   (enter-some 10.0)
   (enter-full 2.0)
   (enter-available 0.12)
   (leave-some 3.0)
   (leave-available 0.20)
   (stall-available 0.25)
+  (io-full 5.0)
   (hold-seconds 30)
   (min-kill-age-seconds 10))
 
@@ -210,6 +224,7 @@
     ("DSMR_PRESSURE_LEAVE_SOME" :leave-some :stall)
     ("DSMR_PRESSURE_LEAVE_AVAILABLE_PERCENT" :leave-available :percent)
     ("DSMR_PRESSURE_STALL_AVAILABLE_PERCENT" :stall-available :percent)
+    ("DSMR_PRESSURE_IO_FULL" :io-full :stall)
     ("DSMR_PRESSURE_HOLD_SECONDS" :hold-seconds :hold)
     ("DSMR_PRESSURE_MIN_KILL_AGE_SECONDS" :min-kill-age-seconds :age))
   "Each environment variable that sets a threshold, the threshold it sets, and
@@ -321,6 +336,12 @@
                    (values :pressure (make-memory-state :verdict :pressure :since since
                                                         :clear-since clear-since))))
              (values :pressure (make-memory-state :verdict :pressure :since since))))))))
+
+(defun io-driven-p (readings &optional (thresholds (make-memory-thresholds)))
+  "True when READINGS carry an I/O full figure at or above the IO-FULL
+   threshold of THRESHOLDS. Pure."
+  (let ((io-full (memory-readings-io-full-avg10 readings)))
+    (and io-full (>= io-full (memory-thresholds-io-full thresholds)) t)))
 
 ;;; ------------------------------------------------------------------- ranking
 
