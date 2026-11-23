@@ -147,7 +147,10 @@ THUNK are ignored: other tests check each path's result."
           +feature-probe+))
 
 (defun path-thunks (text content)
-  "Return (name . thunk) for each path that reads TEXT as a file or CONTENT as edit text."
+  "Return (name . thunk) for each path that reads TEXT as a file or CONTENT as edit text.
+CONTENT is a (defun target ...) form.  The :PATCH-TEXT path patches a probe-free
+file with the text of CONTENT after its name, so the probe reaches patch-form's
+own reader only through the patch text."
   (flet ((in-project (function)
            (lambda ()
              (with-temp-project-root (session root)
@@ -163,6 +166,13 @@ THUNK are ignored: other tests check each path's result."
            (in-project (lambda (root pn)
                          (patch-form (namestring root) (namestring pn) "defun" "target"
                                      "() 1)" "() 2)"))))
+     (cons :patch-text
+           (lambda ()
+             (with-temp-project-root (session root)
+               (let ((pn (write-fixture-file root "src/edge.lisp"
+                                             (format nil "(defun target () 1)~%"))))
+                 (patch-form (namestring root) (namestring pn) "defun" "target"
+                             "() 1)" (subseq content (length "(defun target ")))))))
      (cons :read-file (lambda () (read-file-collapsed text :source-path #p"edge.lisp")))
      (cons :check-parens (lambda () (try-reader-check text)))
      (cons :package (lambda () (extract-in-package-name-from-text text)))
@@ -175,12 +185,12 @@ THUNK are ignored: other tests check each path's result."
         collect (cons name (evaluated-p thunk :control control))))
 
 (defparameter +all-false+
-  '((:parse) (:edit-form) (:patch-form) (:read-file) (:check-parens) (:package)
-    (:custom-readtable) (:replacement))
+  '((:parse) (:edit-form) (:patch-form) (:patch-text) (:read-file) (:check-parens)
+    (:package) (:custom-readtable) (:replacement))
   "PATH-RESULTS when no path evaluated the probe.")
 
 (defparameter +all-true+
-  '((:parse . t) (:edit-form . t) (:patch-form . t) (:read-file . t)
+  '((:parse . t) (:edit-form . t) (:patch-form . t) (:patch-text . t) (:read-file . t)
     (:check-parens . t) (:package . t) (:custom-readtable . t) (:replacement . t))
   "PATH-RESULTS when every path evaluated the probe.")
 
