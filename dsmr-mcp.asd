@@ -4,6 +4,7 @@
 (asdf:register-system-packages "eclector"
                                '(:eclector.parse-result
                                  :eclector.reader
+                                 :eclector.readtable
                                  :eclector.base))
 
 (asdf:defsystem "dsmr-mcp"
@@ -227,6 +228,7 @@ file-based ICP as a fallback for crash isolation and parallel workers."
                "dsmr-mcp/tests/lisp-patch-form-test"
                "dsmr-mcp/tests/lisp-edit-comment-test"
                "dsmr-mcp/tests/validate-test"
+               "dsmr-mcp/tests/read-time-eval-test"
                "dsmr-mcp/tests/clgrep-test"
                "dsmr-mcp/tests/code-intelligence/code-core-test"
                "dsmr-mcp/tests/code-intelligence/code-find-test"
