@@ -3,8 +3,10 @@
 ;;;;
 ;;;; Zebra tests for the worktree .envrc edit rules: rule derivation, the
 ;;;; append-only merge into a Claude Code settings file, idempotency, refusal of
-;;;; unreadable files, and extra roots from the environment. Every test passes an
-;;;; explicit settings path inside a fresh temp dir and an explicit workspace, so
+;;;; unreadable or wrongly shaped files, file mode and symlink handling, backup
+;;;; naming, default path resolution, and the consent gate. Every test passes a
+;;;; settings path inside a fresh temp dir, and every test that resolves a
+;;;; default path first points HOME and CLAUDE_CONFIG_DIR into a temp dir, so
 ;;;; the real user settings are never read or written.
 
 ;; Package evolution guard
@@ -20,7 +22,11 @@
                 #:worktree-envrc-rules
                 #:ensure-allow-rules
                 #:env-worktree-roots
-                #:install-worktree-permissions))
+                #:install-worktree-permissions
+                #:user-settings-path
+                #:default-workspace
+                #:offer-worktree-permissions
+                #:%backup-path))
 
 (in-package #:dsmr-mcp/tests/install/worktree-permissions-test)
 
@@ -59,6 +65,18 @@ restore the previous values on exit. An unset variable is restored as empty."
               ,@body)
          (dolist (,pair ,saved)
            (setf (uiop:getenv (car ,pair)) (or (cdr ,pair) "")))))))
+
+(defmacro with-scratch-home ((var stem) &body body)
+  "Run BODY with HOME at a fresh temp dir VAR, CLAUDE_CONFIG_DIR at VAR/.claude/,
+and LISP_WORKSPACE and DSMR_WORKTREE_ROOTS empty, restoring all four on exit.
+Every default path then resolves inside VAR."
+  `(with-temp-dir (,var ,stem)
+     (with-env (("HOME" (uiop:native-namestring ,var))
+                ("CLAUDE_CONFIG_DIR"
+                 (uiop:native-namestring (merge-pathnames ".claude/" ,var)))
+                ("LISP_WORKSPACE" "")
+                ("DSMR_WORKTREE_ROOTS" ""))
+       ,@body)))
 
 (defun %write-text (path text)
   "Write TEXT to PATH as UTF-8 and return PATH."
@@ -304,3 +322,87 @@ overridable through ARGS."
       (is equal +expected-rules+ (getf result :missing))
       (is string= +fixture+ (%read-text path))
       (is equal (list "settings.json") (%listing dir)))))
+
+(define-test wrong-shapes-are-refused
+  (%assert-refused (format nil "[]~%"))
+  (%assert-refused (format nil "{~%  \"permissions\": \"x\"~%}~%"))
+  (%assert-refused (format nil "{~%  \"permissions\": null~%}~%"))
+  (%assert-refused (format nil "{~%  \"permissions\": {~%    \"allow\": \"Edit(x)\"~%  }~%}~%")))
+
+(defun %mode (path)
+  "Return the permission bits of PATH."
+  (logand #o777 (sb-posix:stat-mode (sb-posix:stat (uiop:native-namestring path)))))
+
+(define-test updating-run-keeps-file-mode
+  (with-temp-dir (dir "worktree-perms")
+    (let ((path (%write-text (merge-pathnames "settings.json" dir) +fixture+)))
+      (sb-posix:chmod (uiop:native-namestring path) #o600)
+      (let ((result (%run path)))
+        (is eq :updated (getf result :action-taken))
+        (is = #o600 (%mode path))
+        (is = #o600 (%mode (getf result :backup-path))
+            "the backup keeps the original mode too")))))
+
+(define-test symlinked-settings-are-written-through-the-link
+  (with-temp-dir (dir "worktree-perms")
+    (let* ((target (%write-text (merge-pathnames "managed/settings.json" dir) +fixture+))
+           (link (merge-pathnames "settings.json" dir)))
+      (sb-posix:symlink (uiop:native-namestring target) (uiop:native-namestring link))
+      (let ((result (%run link)))
+        (is eq :updated (getf result :action-taken))
+        (true (sb-posix:s-islnk
+               (sb-posix:stat-mode (sb-posix:lstat (uiop:native-namestring link))))
+              "the settings path is still a symlink")
+        (is string= +fixture-merged+ (%read-text target))
+        (is equal (truename target) (getf result :path))
+        (is equal (pathname-directory (truename target))
+            (pathname-directory (getf result :backup-path))
+            "the backup sits beside the link target")))))
+
+(define-test backup-name-never-overwrites
+  (with-temp-dir (dir "worktree-perms")
+    (let* ((path (merge-pathnames "settings.json" dir))
+           (base (concatenate 'string (uiop:native-namestring path)
+                              ".bak-20260101000000")))
+      (is string= base (uiop:native-namestring (%backup-path path "20260101000000")))
+      (%write-text (uiop:parse-native-namestring base) "x")
+      (is string= (concatenate 'string base "-1")
+          (uiop:native-namestring (%backup-path path "20260101000000")))
+      (%write-text (uiop:parse-native-namestring (concatenate 'string base "-1")) "x")
+      (is string= (concatenate 'string base "-2")
+          (uiop:native-namestring (%backup-path path "20260101000000"))))))
+
+(define-test user-settings-path-resolution
+  (with-scratch-home (home "worktree-perms-home")
+    (let ((cfg (merge-pathnames "cfg/" home)))
+      (with-env (("CLAUDE_CONFIG_DIR" (uiop:native-namestring cfg)))
+        (is string= (uiop:native-namestring (merge-pathnames "settings.json" cfg))
+            (uiop:native-namestring (user-settings-path)))))
+    (with-env (("CLAUDE_CONFIG_DIR" ""))
+      (is string= (uiop:native-namestring (merge-pathnames ".claude/settings.json" home))
+          (uiop:native-namestring (user-settings-path))))
+    (with-env (("CLAUDE_CONFIG_DIR" "relative/dir"))
+      (fail (user-settings-path)))))
+
+(define-test default-workspace-resolution
+  (with-scratch-home (home "worktree-perms-home")
+    (let ((home-text (uiop:native-namestring home)))
+      (with-env (("LISP_WORKSPACE" "~/ws/"))
+        (is string= (concatenate 'string home-text "ws/") (default-workspace)))
+      (is string= (concatenate 'string home-text "SourceCode/lisp/") (default-workspace))
+      (is equal (format nil "Edit(/~Ascratch/**/.envrc)" home-text)
+          (third (worktree-envrc-rules +workspace+ (list "~/scratch")))
+          "a home-relative extra root expands under the home directory"))))
+
+(define-test offer-respects-consent-mode
+  (with-scratch-home (home "worktree-perms-home")
+    (let ((path (merge-pathnames "settings.json" home)))
+      (false (offer-worktree-permissions :mode :skip :settings-path path))
+      (false (probe-file path))
+      (let ((*standard-input* (make-string-input-stream (format nil "y~%"))))
+        (false (offer-worktree-permissions :mode :interactive :settings-path path)
+               "a non-interactive stream is never read"))
+      (false (probe-file path))
+      (let ((result (offer-worktree-permissions :mode :force :settings-path path)))
+        (is eq :created (getf result :action-taken))
+        (is equal (worktree-envrc-rules (default-workspace) nil) (%allow path))))))

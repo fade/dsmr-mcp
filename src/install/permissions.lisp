@@ -217,6 +217,28 @@ refused."
                 (format nil "~A is not valid JSON: ~A; fix the file, then run again"
                         name e))))))
 
+(defun %shape-problem (settings path)
+  "Return a refusal reason when SETTINGS, parsed from PATH, does not have the
+shape of a Claude Code settings file, else NIL. The top level is an object,
+permissions is absent or an object, and permissions.allow is absent or an
+array."
+  (let ((name (uiop:native-namestring path)))
+    (flet ((problem (what)
+             (format nil "~A: ~A; fix the file, then run again" name what)))
+      (cond
+        ((not (hash-table-p settings))
+         (problem "the top level is not a JSON object"))
+        (t
+         (multiple-value-bind (perms perms-p) (gethash "permissions" settings)
+           (cond
+             ((not perms-p) nil)
+             ((not (hash-table-p perms))
+              (problem "\"permissions\" is not a JSON object"))
+             (t
+              (multiple-value-bind (allow allow-p) (gethash "allow" perms)
+                (when (and allow-p (not (%json-array-p allow)))
+                  (problem "\"permissions.allow\" is not a JSON array")))))))))))
+
 (defun install-worktree-permissions (&key (settings-path (user-settings-path))
                                           (workspace (default-workspace))
                                           (extra-roots (env-worktree-roots))
@@ -233,7 +255,8 @@ Claude Code settings file SETTINGS-PATH. Returns a plist:
   :reason         why the file was refused (only with :refused)
 
 An existing file is resolved to its truename, so a symlink is written through.
-A file that is empty or not valid JSON is refused and left unchanged. When no
+A file that is empty, is not valid JSON, or does not have the shape of a
+settings file is refused and left unchanged. When no
 rule is missing nothing is written. DRY-RUN true reports :checked and writes
 nothing. Otherwise the file is backed up to <path>.bak-<stamp> and replaced
 atomically with its mode kept. Signals an error when WORKSPACE is not usable."
@@ -251,9 +274,11 @@ atomically with its mode kept. Signals an error when WORKSPACE is not usable."
                       (when reason (list :reason reason)))))
         (multiple-value-bind (settings text reason)
             (if existing (%read-settings path) (values nil nil nil))
-          (when reason
-            (return-from install-worktree-permissions
-              (result :refused :reason reason)))
+          (let ((reason (or reason
+                            (and existing (%shape-problem settings path)))))
+            (when reason
+              (return-from install-worktree-permissions
+                (result :refused :reason reason))))
           (multiple-value-bind (updated missing) (ensure-allow-rules settings rules)
             (cond
               (dry-run (result :checked :missing missing))
