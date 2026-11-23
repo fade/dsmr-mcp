@@ -89,6 +89,66 @@ const PROJECT_ROOT_SET = /^[ \t]*PROJECT_ROOT=['"]?(\/[^'"\s]*)['"]?[ \t]*$/m
 const AUDIT_FIX_OPENING = 'Fix finding '
 const QUICK_BATCH_OPENING = 'Execute quick-batch item'
 
+/** Effort level the Agent tool takes. */
+export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+
+/** Effort levels in rising order. */
+const EFFORT_LEVELS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
+
+/**
+ * Least effort set on an Agent call that names none, by agent type. Changing
+ * the agent types here needs the same change to the matcher of the Agent
+ * tool.call hook in register.ts; a test pins the two together.
+ */
+const CALL_EFFORT: Readonly<Record<string, Effort>> = { 'gsd-plan-checker': 'high' }
+
+/** The agent types CALL_EFFORT names, in table order. */
+export function callEffortTypes(): string[] {
+  return Object.keys(CALL_EFFORT)
+}
+
+/**
+ * Effort to set on an Agent call, or undefined to leave the call as written.
+ * `subagentType` and `effort` are the call's `subagent_type` and `effort`
+ * arguments. `definitionEffort` is the `effort` of the agent definition the
+ * call resolves to; null when that is absent or unreadable.
+ *
+ * CALL_EFFORT's level is a floor, never a cap. The call is left as written when:
+ * - it names an effort;
+ * - its type is absent from CALL_EFFORT;
+ * - the definition sets that level or a higher one.
+ * A definition effort that is no level (an integer budget) does not count.
+ */
+export function callEffort(
+  subagentType: string | undefined,
+  effort: string | undefined,
+  definitionEffort: string | null,
+): Effort | undefined {
+  if (effort !== undefined || subagentType === undefined) return undefined
+  if (!Object.hasOwn(CALL_EFFORT, subagentType)) return undefined
+  const floor = CALL_EFFORT[subagentType] as Effort
+  const defined = EFFORT_LEVELS.indexOf(definitionEffort as Effort)
+  return defined >= EFFORT_LEVELS.indexOf(floor) ? undefined : floor
+}
+
+/**
+ * The `effort` frontmatter value of the definition of agent type `name` that
+ * Claude Code resolves: the project's `.claude/agents/<name>.md` when it is
+ * readable, else `<configDir>/agents/<name>.md`. Null when neither is
+ * readable, when the file read sets no effort, or when `name` is no agent name.
+ */
+export async function definitionEffort(
+  name: string,
+  io: Pick<RouteIo, 'read' | 'configDir' | 'projectDir'>,
+): Promise<string | null> {
+  if (!AGENT_NAME.test(name)) return null
+  for (const definition of [`${io.projectDir}/.claude/agents/${name}.md`, `${io.configDir}/agents/${name}.md`]) {
+    const text = await io.read(definition)
+    if (text !== null) return frontmatterValue(text, 'effort')
+  }
+  return null
+}
+
 /**
  * Directories the decision needs, from the environment and the session.
  * Configuration falls back to `$HOME/.claude` when CLAUDE_CONFIG_DIR is unset.

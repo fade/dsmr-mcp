@@ -19,11 +19,15 @@
 // refuses runs once more as requested (action `fallback`); when that is
 // refused too, no agent starts (action `refused`). The log line says why, and
 // the first such spawn of each kind in a session raises a toast.
+//
+// The Agent tool hook raises one agent type's effort on its Agent call to a
+// floor before the spawn (callEffort), and matches no other Agent call; the
+// spawn's log line records the effort it set.
 
 import type { AgentSpawnInput, AgentSpawnResult, EngineInterface, HookFailure, Register } from 'claude-code'
-import { decide, ioDirs, permissionRuleAgainst, type Action, type Decision, type RouteIo } from './route'
+import { callEffort, decide, definitionEffort, ioDirs, permissionRuleAgainst, type Action, type Decision, type Effort, type RouteIo } from './route'
 
-const VERSION = '0.5.0'
+const VERSION = '0.6.0'
 const LOG_DIR = 'logs/subagent-routing'
 const SAFE_NAME = /^[A-Za-z0-9_-]+$/
 const ERROR_TEXT_LIMIT = 200
@@ -79,6 +83,8 @@ export type SpawnLogLine = {
   agentId: string | null
   action: LogAction
   reason: string
+  /** Effort the mod set on the spawn's Agent call; null when it set none. */
+  effort: Effort | null
   version: string
   error?: { name: string; message: string }
 }
@@ -86,6 +92,43 @@ export type SpawnLogLine = {
 // $.fs has no append: every log write is a read and a whole-file write,
 // serialized through this chain so concurrent spawns do not drop lines.
 let logChain: Promise<void> = Promise.resolve()
+
+/**
+ * Matcher of the Agent tool.call hook: Agent calls for the agent types
+ * callEffortTypes() names, and no others. Claude Code cannot move a call to
+ * the background while a hook that may match it is registered. A literal kept
+ * inside the module: `claude plugin validate` reads neither a computed nor an
+ * exported matcher. call-effort.test.ts pins it to CALL_EFFORT.
+ */
+const AGENT_CALL_MATCHER = { tool: 'Agent', subagent_type: ['gsd-plan-checker'] } as const
+
+/**
+ * The `effort` of the definition of agent type `type`, or null when it cannot
+ * be read. Never rejects.
+ */
+async function definitionEffortOf($: EngineInterface, type: string): Promise<string | null> {
+  try {
+    const { config, home } = await configDirOf($, [])
+    const dirs = ioDirs(config, home, await $.session.root())
+    return await definitionEffort(type, tapedIo($, dirs, []))
+  } catch {
+    return null
+  }
+}
+
+// Effort set on each in-flight Agent call, keyed by tool_use_id. The Agent
+// tool raises agent.spawn on the same tool_use_id inside the call's next.
+const callEfforts = new Map<string, Effort>()
+
+/** Effort set on the Agent call `toolUseId`, or null. */
+function effortOf(toolUseId: string): Effort | null {
+  return callEfforts.get(toolUseId) ?? null
+}
+
+/** `reason` with the effort clause appended when `effort` is set. */
+function withEffort(reason: string, effort: Effort | null): string {
+  return effort === null ? reason : `${reason}; the Agent call was set to effort ${effort}`
+}
 
 // What each in-flight spawn was passed down as, for the failure handler.
 const passedDown = new Map<string, Agent>()
@@ -331,7 +374,11 @@ async function recordFailedRefusal(
         resolvedModel: null,
         agentId: null,
         action: 'refused',
-        reason: `${decision.reason}; the routing hook then failed (${name}${message === '' ? '' : `: ${message}`})`,
+        reason: withEffort(
+          `${decision.reason}; the routing hook then failed (${name}${message === '' ? '' : `: ${message}`})`,
+          effortOf(e.tool_use_id),
+        ),
+        effort: effortOf(e.tool_use_id),
         version: VERSION,
         error: { name, message },
       },
@@ -377,6 +424,22 @@ export const register: Register = on => {
         )
       : ''
     return { text: statusText(path, text) }
+  })
+
+  // No .catch: a hook that fails before next is skipped and the call runs as
+  // written; one that fails after next keeps what next settled to, and the
+  // call does not run again.
+  on('tool.call', AGENT_CALL_MATCHER, async ($, e, next) => {
+    if (e.tool !== 'Agent' || e.effort !== undefined || e.subagent_type === undefined) return next(e)
+    // Read for whatever type the matcher let through; callEffort then applies CALL_EFFORT.
+    const effort = callEffort(e.subagent_type, e.effort, await definitionEffortOf($, e.subagent_type))
+    if (effort === undefined) return next(e)
+    callEfforts.set(e.tool_use_id, effort)
+    try {
+      return await next({ ...e, effort })
+    } finally {
+      callEfforts.delete(e.tool_use_id)
+    }
   })
 
   on('agent.offer', async ($, e, next) => {
@@ -464,6 +527,7 @@ export const register: Register = on => {
 
     const session = await $.session.id()
     tape.push({ op: 'session.id', arg: '', result: session })
+    const effort = effortOf(e.tool_use_id)
     const line: SpawnLogLine = {
       ts: new Date().toISOString(),
       session,
@@ -483,13 +547,16 @@ export const register: Register = on => {
             : result.deny === undefined
               ? 'fallback'
               : 'refused',
-      reason:
+      reason: withEffort(
         refused === undefined
           ? decision.reason
           : result.deny === undefined
             ? `${decision.reason}; ${decision.subagentType} was refused (${clip(refused)}), so it ran as requested`
             : `${decision.reason}; ${decision.subagentType} was refused (${clip(refused)}) and running it as requested ` +
               `was refused too (${clip(result.deny)}), so no agent started`,
+        effort,
+      ),
+      effort,
       version: VERSION,
       ...(failure === undefined ? {} : { error: failure }),
     }
@@ -550,7 +617,8 @@ export const register: Register = on => {
         resolvedModel: result.deny === undefined ? result.model : null,
         agentId: result.deny === undefined ? (result.agentId ?? null) : null,
         action: 'error',
-        reason: `the routing hook failed (${name}${message === '' ? '' : `: ${message}`})`,
+        reason: withEffort(`the routing hook failed (${name}${message === '' ? '' : `: ${message}`})`, effortOf(e.tool_use_id)),
+        effort: effortOf(e.tool_use_id),
         version: VERSION,
         error: { name, message },
       })
