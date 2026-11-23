@@ -31,7 +31,11 @@
                 #:read-time-eval-expression
                 #:inert-readtable)
   (:import-from #:dsmr-mcp/src/lisp-edit-form
-                #:edit-form)
+                #:edit-form
+                #:validate-and-repair-content)
+  (:import-from #:dsmr-mcp/src/lisp-patch-form
+                #:patch-form
+                #:patch-operation-error)
   (:import-from #:dsmr-mcp/tests/support/fs-fixture
                 #:with-temp-project-root
                 #:write-fixture-file))
@@ -223,3 +227,132 @@
     (is = 1 (length nodes))
     (true (read-time-eval-p (third (cst-node-value (first nodes)))))
     (is eq entry (get-dispatch-macro-character #\# #\. custom))))
+
+;;;; -------------------------------------------------------------------------
+;;;; Replacement and patch text holding #. forms
+;;;; -------------------------------------------------------------------------
+
+(define-test replace-a-read-time-eval-form-with-text-holding-read-time-evals
+  "Replacing a form that holds #. writes the replacement text exactly as sent."
+  (with-temp-project-root (session root)
+    (let* ((original (fixture-text))
+           (pn (write-conditions root original))
+           (node (form-node original "defun" "known-alert-description-p"))
+           (replacement (replace-once (form-text original node)
+                                      "Return T if CODE is a known TLS alert description, NIL otherwise."
+                                      "Return T when CODE is a known TLS alert description."))
+           (written (replace-form root pn "defun" "known-alert-description-p"
+                                  replacement)))
+      (check-splice original written node replacement)
+      (is = 54 (count-read-time-evals written)))))
+
+(define-test dry-run-preview-of-a-read-time-eval-form
+  "A dry run of the same replacement previews the file the apply writes, and writes nothing."
+  (with-temp-project-root (session root)
+    (let* ((original (fixture-text))
+           (pn (write-conditions root original))
+           (node (form-node original "defun" "known-alert-description-p"))
+           (replacement (replace-once (form-text original node)
+                                      "Return T if CODE is a known TLS alert description, NIL otherwise."
+                                      "Return T when CODE is a known TLS alert description."))
+           (result (edit-form (namestring root) (namestring pn)
+                              "defun" "known-alert-description-p"
+                              "replace" replacement :dry-run t)))
+      (true (string= original (uiop:read-file-string pn)))
+      (let ((written (replace-form root pn "defun" "known-alert-description-p"
+                                   replacement)))
+        (is string= written (gethash "preview" result))))))
+
+(define-test patch-inside-a-read-time-eval-form
+  "Patching one string inside a form that holds #. changes only that string."
+  (with-temp-project-root (session root)
+    (let* ((original (fixture-text))
+           (pn (write-conditions root original)))
+      (patch-form (namestring root) (namestring pn)
+                  "defun" "alert-description-name"
+                  "\"unknown_ca\"" "\"unknown_certificate_authority\"")
+      (let ((written (uiop:read-file-string pn)))
+        (is string= (replace-once original "\"unknown_ca\""
+                                  "\"unknown_certificate_authority\"")
+            written)
+        (is = 54 (count-read-time-evals written))))))
+
+(define-test patch-text-may-add-a-read-time-eval
+  "Patch text that adds a #. clause is accepted and written verbatim."
+  (with-temp-project-root (session root)
+    (let* ((original (fixture-text))
+           (pn (write-conditions root original))
+           (old "    (otherwise (format nil \"unknown(~D)\" code))")
+           (new (format nil "    (#.+alert-ech-required+ \"ech_required\")~%~A" old)))
+      (patch-form (namestring root) (namestring pn)
+                  "defun" "alert-description-name" old new)
+      (let ((written (uiop:read-file-string pn)))
+        (is string= (replace-once original old new) written)
+        (is = 55 (count-read-time-evals written))))))
+
+(define-test replacement-text-is-never-evaluated
+  "Replacement text holding the probe is validated and written without evaluating it."
+  (let ((*read-time-evaluated* nil))
+    (with-temp-project-root (session root)
+      (let* ((original (fixture-text))
+             (pn (write-conditions root original))
+             (node (form-node original "define-condition" "tls-alert-error"))
+             (replacement (replace-once (form-text original node)
+                                        "\"TLS alert received from peer\""
+                                        +probe+)))
+        (multiple-value-bind (content error)
+            (ignore-errors (validate-and-repair-content replacement))
+          (false error)
+          (is equal replacement content))
+        (false *read-time-evaluated*)
+        (multiple-value-bind (written error)
+            (ignore-errors (replace-form root pn "define-condition" "tls-alert-error"
+                                         replacement))
+          (false error)
+          (false *read-time-evaluated*)
+          (when written
+            (check-splice original written node replacement)))))))
+
+(define-test patch-text-is-never-evaluated
+  "Patch text holding the probe is checked and written without evaluating it."
+  (let ((*read-time-evaluated* nil))
+    (with-temp-project-root (session root)
+      (let* ((original (fixture-text))
+             (pn (write-conditions root original)))
+        (let ((error (handler-case
+                         (progn
+                           (patch-form (namestring root) (namestring pn)
+                                       "defun" "alert-description-name"
+                                       "\"unknown_ca\"" +probe+)
+                           nil)
+                       (error (e) e))))
+          (false error)
+          (false *read-time-evaluated*)
+          (true (search +probe+ (uiop:read-file-string pn))))))))
+
+(define-test one-form-rule-still-holds-with-read-time-evals
+  "Replacement text holding two forms, one with #., is refused as more than one form."
+  (with-temp-project-root (session root)
+    (let* ((original (fixture-text))
+           (pn (write-conditions root original))
+           (content (format nil "(defun a () #.+k+)~%(defun b () 1)"))
+           (error (nth-value 1 (ignore-errors
+                                (edit-form (namestring root) (namestring pn)
+                                           "defun" "known-alert-description-p"
+                                           "replace" content)))))
+      (true error)
+      (true (and error
+                 (search "exactly one top-level form" (princ-to-string error))))
+      (is string= original (uiop:read-file-string pn)))))
+
+(define-test broken-patch-still-refused-beside-read-time-evals
+  "A patch that unbalances a form holding #. is refused and the file is unchanged."
+  (with-temp-project-root (session root)
+    (let* ((original (fixture-text))
+           (pn (write-conditions root original)))
+      (fail (patch-form (namestring root) (namestring pn)
+                        "defun" "alert-description-name"
+                        "(#.+alert-unknown-ca+ \"unknown_ca\")"
+                        "(#.+alert-unknown-ca+ \"unknown_ca\"")
+          'patch-operation-error)
+      (is string= original (uiop:read-file-string pn)))))
