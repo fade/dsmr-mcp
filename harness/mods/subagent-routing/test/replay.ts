@@ -4,9 +4,10 @@
 // (`source.kind` "hook") or what routing-probe.sh record-history builds from a
 // session transcript (`source.kind` "transcript"): the spawn input, a tape of
 // engine answers looked up by call and argument, and an `expected` block added
-// by hand. Recordings hold real dispatch prompts, so they stay outside the
-// repository; a test file written beside a temporary copy of the mod passes
-// them in.
+// by hand. `expected.effort` is the effort the mod sets on the Agent call
+// rebuilt from the recording; absent or null means none. Recordings hold real dispatch prompts, so
+// they stay outside the repository; a test file written beside a temporary
+// copy of the mod passes them in.
 
 import { expect, test, type Engine } from 'claude-code/testing'
 import type { AgentSpawnInput, AgentSpawnResult, On } from 'claude-code'
@@ -21,7 +22,7 @@ export type Recording = {
   input: RecordedInput
   tape: TapeEntry[]
   decision?: unknown
-  expected: { subagentType: string; model: string | null; action: string; why: string }
+  expected: { subagentType: string; model: string | null; action: string; why: string; effort?: string | null }
   source: { kind: string; capturedAt: string }
 }
 
@@ -178,6 +179,25 @@ async function dispatch($: Engine, input: AgentSpawnInput, types: readonly strin
   return $.agent.spawn(input)
 }
 
+/**
+ * Agent call arguments rebuilt from the recorded spawn input, which holds no
+ * call effort:
+ * - `subagent_type`, `prompt`, `description`, and `model` from the input;
+ * - `run_in_background` true when the input ran in the background.
+ * A hook recording's type is the one the engine resolved, `general-purpose`
+ * for a call that named none.
+ */
+function agentArgs(rec: Recording): Record<string, unknown> {
+  const input = rec.input as Record<string, unknown>
+  return {
+    subagent_type: rec.input.subagentType,
+    prompt: rec.input.prompt,
+    description: typeof input.description === 'string' ? input.description : '',
+    ...(typeof rec.input.model === 'string' ? { model: rec.input.model } : {}),
+    ...(input.background === true ? { run_in_background: true } : {}),
+  }
+}
+
 function tapeIo(rec: Recording, tape: Tape): RouteIo {
   const projectDir = rec.input.cwd ?? rootOf(tape)
   return {
@@ -208,6 +228,24 @@ export function replay(recordings: readonly Recording[]): void {
       expect(d.action).toBe(rec.expected.action)
     })
 
+    test(`${label}: the rebuilt Agent call reaches the tool with the expected effort and otherwise as written`, async ($, on) => {
+      const received: Record<string, unknown>[] = []
+      // No agent definition is readable, so a type CALL_EFFORT names gets its level.
+      on('fs.read', (_$, e) => {
+        throw new Error(`ENOENT: ${e.path}`)
+      })
+      on('tool.call', { tool: 'Agent' }, (_$, e) => {
+        const { tool: _tool, tool_use_id: _id, agentId: _agent, requestMeta: _meta, consent: _consent, ...args } =
+          e as unknown as Record<string, unknown>
+        received.push(args)
+        return { result: { status: 'completed', agentId: 'replay', content: [{ type: 'text', text: 'done' }] } }
+      })
+      const args = agentArgs(rec)
+      await $.tool.call({ tool: 'Agent', ...args } as Parameters<Engine['tool']['call']>[0])
+      const effort = rec.expected.effort ?? null
+      expect(received).toEqual([effort === null ? args : { ...args, effort }])
+    })
+
     test(`${label}: the hooks module passes the expected spawn down and logs it once`, async ($, on) => {
       const tape = new Tape(rec.tape, label)
       const log: LogFile = { text: '' }
@@ -221,6 +259,8 @@ export function replay(recordings: readonly Recording[]): void {
       expect(mine.length).toBe(1)
       expect(mine[0]?.action).toBe(rec.expected.action)
       expect(mine[0]?.error).toBe(undefined)
+      // A spawn raised without an Agent call carries no effort the mod set.
+      expect(mine[0]?.effort).toBe(null)
       if (rec.expected.action === 'refused') {
         // A refused spawn starts nothing and reaches the spawner as the Agent tool error.
         expect(String(result.deny).startsWith('subagent-routing refused')).toBe(true)
