@@ -316,16 +316,33 @@ reader does; the Eclector parse accepts it, as Eclector's own #. entry does."
       (is equal '("m") (expr-names nodes))
       (false unparsed-from))))
 
-(define-test numeric-argument-to-read-time-eval-is-reported
-  "#1. signals as each standard reader does: an error from Eclector, a warning from SBCL."
-  (is eql 0 (nth-value 1 (handler-bind ((warning #'muffle-warning))
-                           (parse "(defparameter *x* #1.(+ 1 2))"))))
-  (is eq :warned
-      (handler-case (let ((*read-eval* nil)
-                          (*readtable* (inert-readtable nil)))
-                      (read-from-string "#1.(+ 1 2)")
-                      :quiet)
-        (warning () :warned))))
+(define-test numeric-argument-to-read-time-eval-is-ignored
+  "#1. reads as #. does, as SBCL loads it: every form after it is found, no
+reader path signals a warning, and the readers write nothing to *ERROR-OUTPUT*."
+  (let ((text (format nil "(defun a () 1)~%(defparameter *x* #1.(+ 1 2))~%(defun c () 3)~%"))
+        (warnings '())
+        (stderr (make-string-output-stream)))
+    (handler-bind ((warning (lambda (w) (push w warnings) (muffle-warning w))))
+      (let ((*error-output* stderr))
+        (multiple-value-bind (nodes unparsed-from) (parse text)
+          (is equal '("a" "*x*" "c") (expr-names nodes))
+          (false unparsed-from)
+          (is equal '(+ 1 2)
+              (read-time-eval-expression (third (cst-node-value (second nodes))))))
+        (multiple-value-bind (nodes unparsed-from) (custom-read text)
+          (is equal '("a" "*x*" "c") (expr-names nodes))
+          (false unparsed-from))
+        (is = 3 (gethash "total_forms"
+                         (nth-value 2 (read-file-collapsed text :source-path #p"edge.lisp"))))
+        (false (try-reader-check text)))
+      (with-temp-project-root (session root)
+        (let ((pn (write-fixture-file root "src/edge.lisp" text)))
+          (edit-form (namestring root) (namestring pn) "defun" "c" "replace"
+                     "(defun c () 30)" :normalize-blank-lines nil)
+          (is string= (replace-text text "(defun c () 3)" "(defun c () 30)")
+              (uiop:read-file-string pn)))))
+    (is equal '() warnings)
+    (is string= "" (get-output-stream-string stderr))))
 
 ;;;; -------------------------------------------------------------------------
 ;;;; #. nested inside other syntax

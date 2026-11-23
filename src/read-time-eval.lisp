@@ -80,10 +80,10 @@ locatable and editable, and its text is left as written."
 (defun %inert-sharpsign-dot (stream sub-char parameter)
   "CL reader #. entry: read the next object and return it unevaluated.
 Return a READ-TIME-EVAL holding the object, or NIL when *READ-SUPPRESS* is true.
-As in SBCL's own entry, a numeric argument warns, and a comma in the object
-signals unless a backquote inside the object encloses it."
-  (when parameter
-    (warn "A numeric argument was ignored in #~W~A." parameter sub-char))
+A numeric argument is ignored without a warning.  On SBCL, any comma in the
+object that no backquote inside the object encloses signals a reader error,
+as in SBCL's own entry."
+  (declare (ignore sub-char parameter))
   (let ((expression (let (#+sbcl (sb-impl::*backquote-depth* 0))
                       (read stream t nil t))))
     (if *read-suppress*
@@ -117,15 +117,12 @@ reader errors.  Uses Eclector internals, matching its sharpsign-dot."
 (defun %inert-eclector-sharpsign-dot (stream sub-char parameter)
   "Eclector #. entry: read the next object and return it unevaluated.
 Return a READ-TIME-EVAL holding the object, or NIL when the client state
-reports *READ-SUPPRESS* as true.  Signal the reader errors Eclector's own #.
-entry signals for a numeric argument, end of input, a closing parenthesis in
-place of the object, and a comma that unquotes out of the object."
-  (declare (ignore sub-char))
+reports *READ-SUPPRESS* as true.  A numeric argument is ignored and the
+parse continues, as when SBCL loads the file.  End of input, or a closing
+parenthesis in place of the object, signals a reader error."
+  (declare (ignore sub-char parameter))
   (let* ((client eclector.reader:*client*)
          (suppress (eclector.reader:state-value client '*read-suppress*)))
-    (unless (null parameter)
-      (eclector.reader::numeric-parameter-ignored
-       stream 'eclector.reader::sharpsign-dot parameter suppress))
     (if suppress
         (progn (eclector.reader:read stream t nil t) nil)
         (make-read-time-eval (%read-eclector-sharpsign-dot-object client stream)))))
