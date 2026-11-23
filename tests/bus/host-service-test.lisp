@@ -621,6 +621,42 @@
         (false (member :pressure (nthcdr 30 verdicts))))
       (is = 0 (length (fleet-lines-with "code=memory-pressure-unrelieved"))))))
 
+(define-test ample-memory-during-the-hold-asks-no-worker-to-give-memory-back
+  "Pressure entered 50 s earlier on a shortage, then the recorded FLEET WARN
+   readings of 2026-11-22/23 (*RECORDED-STALLS*), 59-64% available, through
+   the 30 s hold: the idle stateful worker is left alone and the episode
+   ends. The entry is constructed: no recorded shortage exists."
+  (with-memory-case (state)
+    (let ((svc (memory-service))
+          (now (%unix-time)))
+      (publish (list (worker 1 :stateful t :spawned-at (- now 100)
+                               :last-activity (- now 50))))
+      (setf (service::service-memory-state svc)
+            (memory:make-memory-state :verdict :pressure :since (- now 50)))
+      (loop for i from 0 to 30
+            do (setf *reading* (recorded-stall i))
+               (check svc (+ now i)))
+      (is equal '() (requests))
+      (is eq :ok (memory:memory-state-verdict (service::service-memory-state svc))))))
+
+(define-test ample-memory-during-the-hold-is-never-reported-unrelieved
+  "Pressure entered 50 s earlier on a shortage with no worker to relieve,
+   then the recorded FLEET WARN readings of 2026-11-22/23
+   (*RECORDED-STALLS*), 59-64% available, through the 30 s hold: the episode
+   passes 60 s and ends without an unrelieved line. The entry is
+   constructed: no recorded shortage exists."
+  (with-memory-case (state)
+    (let ((svc (memory-service))
+          (now (%unix-time)))
+      (publish '())
+      (setf (service::service-memory-state svc)
+            (memory:make-memory-state :verdict :pressure :since (- now 50)))
+      (loop for i from 0 to 30
+            do (setf *reading* (recorded-stall i))
+               (check svc (+ now i)))
+      (is = 0 (length (fleet-lines-with "code=memory-pressure-unrelieved")))
+      (is eq :ok (memory:memory-state-verdict (service::service-memory-state svc))))))
+
 (define-test the-recorded-incident-is-reported-as-io-driven-reclaim
   "The WARN reading of the 2026-11-22 16:39Z incident (*INCIDENT-READING*),
    given twice because the reading before it is unrecorded but was also a

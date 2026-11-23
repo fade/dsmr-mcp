@@ -590,7 +590,9 @@ not start, 75 when its supervisor loop stalled.
    leaving it writes the recovered line that closes the episode. Entering
    reclaim from :OK is reported at INFO under memory-reclaim, which reaches
    the service log only, naming I/O when the I/O full figure reaches its
-   threshold; reclaim relieves nothing. The first check also
+   threshold; reclaim relieves nothing. Under pressure, a reading with ample
+   memory (MEMORY:AMPLE-MEMORY-P) asks for no relief and reports nothing
+   unrelieved while the clearing hold runs. The first check also
    reports any threshold the environment set to something unusable. Run
    under the healing protocol, as the supervisor runs it, since relief is
    asked for by raising a fault."
@@ -635,7 +637,8 @@ not start, 75 when its supervisor loop stalled.
                (when (service-unrelieved-reported-p svc)
                  (fleetlog:fleet-recovered "memory-pressure-unrelieved" :subject "host"))
                (setf (service-unrelieved-reported-p svc) nil)))
-        (when (eq verdict :pressure)
+        (when (and (eq verdict :pressure)
+                   (not (memory:ample-memory-p readings thresholds)))
           (%relieve-pressure svc now))
         verdict))))
 

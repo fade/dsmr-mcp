@@ -82,6 +82,7 @@
    #:memory-state-clear-since
    #:classify-memory
    #:io-driven-p
+   #:ample-memory-p
    ;; ranking
    #:rank-candidates))
 
@@ -338,6 +339,16 @@
                    (values :pressure (make-memory-state :verdict :pressure :since since
                                                         :clear-since clear-since))))
              (values :pressure (make-memory-state :verdict :pressure :since since))))))))
+
+(defun ample-memory-p (readings &optional (thresholds (make-memory-thresholds)))
+  "True when the available share of READINGS is above LEAVE-AVAILABLE and at
+   or above STALL-AVAILABLE of THRESHOLDS, the share at which a reading under
+   pressure counts as calm whatever its stall figures. Pure."
+  (let ((available (available-fraction readings)))
+    (and available
+         (> available (memory-thresholds-leave-available thresholds))
+         (>= available (memory-thresholds-stall-available thresholds))
+         t)))
 
 (defun io-driven-p (readings &optional (thresholds (make-memory-thresholds)))
   "True when READINGS carry an I/O full figure at or above the IO-FULL
