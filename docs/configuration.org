@@ -53,6 +53,7 @@ variable.
 | =DSMR_LAUNCHER_PATH=           | Physical path of the launcher that started the server. Set by the release launcher; the release guard checks it | set by the launcher | =src/release.lisp= |
 | =DSMR_ALLOW_SOURCE_WORKERS=    | =1= lets a hermetic worker load from source when no worker image is offered. Set only by the integration test targets; the release launcher always unsets it | unset (refuse) | =src/hermetic/worker-client.lisp= |
 | =DSMR_READ_ROOTS=              | Colon-separated absolute directories whose files the read verbs may read, read-only, outside the session root. Entries that are relative or name no directory are dropped. =make register= adds it to the Claude Code entry when absent | =~/SourceCode/lisp/= | =src/project-root.lisp= |
+| =DSMR_WORKTREE_ROOTS=          | Colon-separated absolute directories under which Claude Code may edit any =.envrc=; each adds an =Edit(/<root>/**/.envrc)= rule when the worktree permission step runs. Entries that are empty, relative, or =/= add no rule | unset, read at install time | =src/install/permissions.lisp= |
 | =DSMR_MAX_POOL_SIZE=           | Max total hermetic workers (bound + standby)                       | =16= (min 1)     | =src/hermetic/pool.lisp=           |
 | =DSMR_MAX_HIBERNATED_WORKERS=  | The most hermetic workers one server keeps hibernated at once. A hibernated worker holds no memory and no place in the pool, so this is what bounds the disk its saved worlds take; at the limit a request to hibernate is refused and the host service turns to another worker. =0= turns hibernation off | =8= (min 0), read at server start | =src/hermetic/pool.lisp= |
 | =DSMR_MAX_RESUME_ATTEMPTS=     | How many resumes of one hibernated worker in a row may fail in a way that may pass (a timeout, a process that ended before its handshake) before its world is given up: the core is kept under =hibernate/failed/= and the session gets a fresh worker with a notice saying why | =3= (min 1), read at server start | =src/hermetic/pool.lisp= |
@@ -149,6 +150,7 @@ values take the default shown.
 | =BINDIR=            | Directory of the =dsmr-bus-watch= and =dsmr-bus-host= links                                              | =~/.local/bin=                  | =deploy=, =rollback= |
 | =SKILLDIR=, =SUBAGENTDIR=, =AGENTDIR= | Where a deploy copies skills, agent definitions and harness files                      | =~/.claude/skills=, =~/.claude/agents=, =~/.claude= | =deploy=, =rollback=, =check-skills=, =check-agents=, =check-harness= |
 | =CLAUDE_CONFIG=     | Claude Code config file =make register= writes; with a scratch =DSMR_HOME= it must name a scratch file   | =~/.claude.json=                | =register= |
+| =CLAUDE_SETTINGS=   | Claude Code user settings file the worktree permission targets read and write                            | =$CLAUDE_CONFIG_DIR/settings.json=, else =~/.claude/settings.json= | =install-worktree-permissions=, =check-worktree-permissions= |
 | =LEAF=              | Test system =make test-leaf= runs, for example =dsmr-mcp/tests/install/config-test=                      | none (required)                 | =test-leaf= |
 | =TEST_CORE_DIR=     | Directory of the test core the integration suite and =test-warm= boot                                    | =.ci-cache/test-core=           | =test-core=, =core=, =test-integration=, =test-warm= |
 | =BUS_DEPS_SETUP=    | A dependency bundle's =setup.lisp= the bus binaries are built against; =make deploy= sets it to the release's own | empty (build from the host's Quicklisp and workspace) | =bus-watch=, =bus-host= |
@@ -450,6 +452,9 @@ cl-mcp entry so the two can coexist or dsmr-mcp can take over — no
 hand-editing JSON. Prefer it over manual edits: it keeps the env defaults
 and command path consistent with the installed build.
 
+The installer also offers to let Claude Code edit =.envrc= files in git
+worktrees; see [[file:installation.org::*Allowing edits to worktree .envrc files][Allowing edits to worktree .envrc files]].
+
 Run it from the checkout:
 
 #+begin_src sh
@@ -464,6 +469,7 @@ sbcl --script scripts/install.lisp [FLAGS]
 | =--print=             | Print the canonical JSON snippet to stdout instead of writing =~/.claude.json= (for non-Claude agents) |
 | =--no-skill=          | Do not copy the scaffold skill into =~/.claude/skills/=             |
 | =--no-envrc-defaults= | Skip the interactive site-wide =.envrc= defaults step (otherwise offered after the install when stdin is a tty) |
+| =--no-worktree-permissions= | Skip the step that adds the worktree =.envrc= edit rules to the Claude Code user settings (otherwise offered after the hook step when stdin is a tty) |
 
 =--keep= / =--migrate= / =--replace= are mutually exclusive; the last one
 wins. The manual =~/.claude.json= block above remains a supported

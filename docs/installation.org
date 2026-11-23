@@ -232,6 +232,65 @@ When a release is deployed and no entry exists, =make preflight= registers
 the release launcher itself. Run =make check-preflight= to see the same
 report without changing anything.
 
+** Allowing edits to worktree .envrc files
+
+Claude Code asks before it edits a =.envrc= file. Run this target to let it
+edit the =.envrc= of any git worktree under the Lisp workspace without asking:
+
+#+begin_src sh
+make install-worktree-permissions
+#+end_src
+
+The target adds these rules to =permissions.allow= in the Claude Code user
+settings file:
+
+#+begin_example
+Edit(/<workspace>/*/.worktrees/**/.envrc)
+Edit(/<workspace>/**/.claude/worktrees/**/.envrc)
+Edit(/<root>/**/.envrc)
+#+end_example
+
+The first two cover a repository's =.worktrees/= and =.claude/worktrees/=
+directories. =<workspace>= is =LISP_WORKSPACE= (the Makefile's =WORKSPACE=),
+by default =~/SourceCode/lisp=. Because the path is absolute, each rule reads
+=Edit(//...)=. The third rule appears once for each extra root you list in
+=DSMR_WORKTREE_ROOTS=, a colon-separated list of absolute directories; every
+=.envrc= under such a root becomes editable. An entry that is empty, relative,
+or =/= adds no rule, and the report names it:
+
+#+begin_src sh
+make install-worktree-permissions DSMR_WORKTREE_ROOTS=<root>
+#+end_src
+
+The settings file is =$CLAUDE_CONFIG_DIR/settings.json=, or
+=~/.claude/settings.json= when =CLAUDE_CONFIG_DIR= is unset. Set
+=CLAUDE_SETTINGS= to use another file, for example a scratch copy:
+
+#+begin_src sh
+make install-worktree-permissions CLAUDE_SETTINGS=<scratch file>
+#+end_src
+
+The run appends only the rules that are missing and keeps every other rule
+and key in place. It backs an existing file up to =<file>.bak-<stamp>= before
+writing, and keeps the file's mode and any symlink to it. When every rule is
+already present, it writes nothing. A file that is not valid JSON, is empty,
+or has the wrong shape (a top level that is not an object, a =permissions=
+that is not an object, or a =permissions.allow= that is not an array) is
+refused and left unchanged.
+
+To see which rules are missing without writing anything, run:
+
+#+begin_src sh
+make check-worktree-permissions
+#+end_src
+
+It takes the same variables and exits non-zero when a rule is missing or the
+file is refused.
+
+The bundled installer (=sbcl --script scripts/install.lisp=) offers the same
+step on a terminal, after the hook step; =--no-worktree-permissions= skips it.
+Sessions started after the run get the rules.
+
 ** A host registered to a checkout launcher
 
 On a host whose =~/.claude.json= still names =scripts/dsmr-mcp-launch.sh= in
