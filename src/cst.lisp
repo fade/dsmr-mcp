@@ -24,6 +24,7 @@
                 #:call-with-lenient-packages
                 #:call-with-file-package-context)
   (:import-from #:dsmr-mcp/src/read-time-eval
+                #:inert-feature-client
                 #:inert-readtable
                 #:inert-eclector-readtable)
   (:export #:cst-node
@@ -287,6 +288,10 @@ it and the Eclector loop learns nothing more about that text."
                 (values rt-nodes t unparsed-from))))))))
   (values nil nil nil))
 
+(defclass source-client (inert-feature-client parse-result-client)
+  ()
+  (:documentation "Eclector client for source parsing: CST nodes, inert #. features."))
+
 (defun %eclector-parse-loop (text)
   "Inner Eclector parse loop.  *LINE-TABLE* and *PACKAGE* must be bound.
 
@@ -301,12 +306,13 @@ so it is uncovered as surely as the text below it.  Reporting the reader's own
 position would licence a claim about a span nothing ever examined.
 
 A #. form reads as a READ-TIME-EVAL object through the Eclector readtable bound
-here; nothing is evaluated, and *READ-EVAL* stays NIL."
+here; nothing is evaluated, and *READ-EVAL* stays NIL.  A form guarded by a
+feature expression holding #. reads as present."
   (let ((*readtable* (copy-readtable))
         (eclector.reader:*readtable* (inert-eclector-readtable))
         (*read-eval* nil)
         (nodes '())
-        (client (make-instance 'parse-result-client)))
+        (client (make-instance 'source-client)))
     (with-input-from-string (stream text)
       (handler-case
           (call-with-lenient-packages
