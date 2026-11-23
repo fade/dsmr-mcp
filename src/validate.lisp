@@ -10,8 +10,10 @@
 ;;;;
 ;;;; Pass 2 — try-reader-check: reads the text with the standard CL reader
 ;;;; (*read-eval* nil) to detect reader errors (malformed dispatch characters,
-;;;; etc.) that the paren scanner misses. Skips files using in-readtable to
-;;;; avoid false positives on custom syntax. Paren errors take priority.
+;;;; etc.) that the paren scanner misses. A #. form is valid syntax: it reads
+;;;; as an inert READ-TIME-EVAL object and is never evaluated. Skips files
+;;;; using in-readtable to avoid false positives on custom syntax. Paren
+;;;; errors take priority.
 ;;;;
 ;;;; Re-implemented from cl-mcp/src/validate.lisp (MIT) under AGPL. The
 ;;;; algorithm is adapted to use plain t/nil for the ok field (jzon encodes
@@ -22,6 +24,8 @@
   (:use #:cl)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
+  (:import-from #:dsmr-mcp/src/read-time-eval
+                #:inert-readtable)
   (:export #:scan-parens
            #:try-reader-check
            #:*check-parens-max-bytes*
@@ -293,14 +297,16 @@ Skips the check (returns nil) when:
   would give false positives on valid custom syntax).
 - A package-error surfaces (missing package is not a file syntax error).
 
-*read-eval* is bound to nil to prevent #. evaluation during the pass."
+A #. form reads as an inert READ-TIME-EVAL object through a copy of the
+current readtable; nothing is evaluated, and *read-eval* stays nil."
   (declare (type string text))
   ;; Skip for files using custom readtables
   (when (%custom-readtable-p text)
     (return-from try-reader-check nil))
   (with-input-from-string (stream text)
     (handler-case
-        (let ((*read-eval* nil))
+        (let ((*read-eval* nil)
+              (*readtable* (inert-readtable *readtable*)))
           (loop (when (eq :eof (read stream nil :eof)) (return nil))))
       (reader-error (e)
         ;; SB-INT:SIMPLE-READER-PACKAGE-ERROR is a subtype of both

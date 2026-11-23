@@ -36,6 +36,12 @@
   (:import-from #:dsmr-mcp/src/lisp-patch-form
                 #:patch-form
                 #:patch-operation-error)
+  (:import-from #:dsmr-mcp/src/validate
+                #:try-reader-check)
+  (:import-from #:dsmr-mcp/src/package-context
+                #:extract-in-package-name-from-text)
+  (:import-from #:dsmr-mcp/src/lisp-read-file
+                #:read-file-collapsed)
   (:import-from #:dsmr-mcp/tests/support/fs-fixture
                 #:with-temp-project-root
                 #:write-fixture-file))
@@ -356,3 +362,46 @@
                         "(#.+alert-unknown-ca+ \"unknown_ca\"")
           'patch-operation-error)
       (is string= original (uiop:read-file-string pn)))))
+
+;;;; -------------------------------------------------------------------------
+;;;; Check-parens, package detection and the read-file view
+;;;; -------------------------------------------------------------------------
+
+(define-test check-parens-accepts-read-time-evals
+  "The reader pass of check-parens reports the recorded file clean."
+  (false (try-reader-check (fixture-text))))
+
+(define-test check-parens-still-reports-reader-errors-beside-read-time-evals
+  "An unterminated form or a #. with no object after it is still a reader error."
+  (true (try-reader-check (format nil "~A~%(defun broken (x)~%" (fixture-text))))
+  (let ((report (try-reader-check (format nil "~A~%(list #.)~%" (fixture-text)))))
+    (true report)
+    (is equal "reader-error" (getf report :kind))))
+
+(define-test check-parens-never-evaluates-read-time-forms
+  "The reader pass of check-parens accepts the probe without evaluating it."
+  (let ((*read-time-evaluated* nil))
+    (false (try-reader-check (format nil "~A~%~A~%" (fixture-text) (probe-form-text))))
+    (false *read-time-evaluated*)))
+
+(define-test in-package-after-a-read-time-eval-is-found
+  "Synthetic text: an IN-PACKAGE that follows a #. form is found, and the probe is not evaluated."
+  (is equal "READ-TIME-EVAL-PROBE"
+      (extract-in-package-name-from-text
+       (format nil "(defconstant +k+ #.(+ 1 2))~%(in-package #:read-time-eval-probe)~%")))
+  (let ((*read-time-evaluated* nil))
+    (is equal "READ-TIME-EVAL-PROBE"
+        (extract-in-package-name-from-text
+         (format nil "(defconstant +k+ ~A)~%(in-package #:read-time-eval-probe)~%"
+                 +probe+)))
+    (false *read-time-evaluated*)))
+
+(define-test read-file-view-shows-read-time-evals-as-written
+  "The read-file view of a form holding #. shows each key as written in the source."
+  (multiple-value-bind (display mode meta)
+      (read-file-collapsed (fixture-text)
+                           :name-pattern "known-alert-description-p"
+                           :source-path #p"conditions.lisp")
+    (declare (ignore mode))
+    (true (search "#.+alert-close-notify+" (string-downcase display)))
+    (is = 5 (gethash "total_forms" meta))))
