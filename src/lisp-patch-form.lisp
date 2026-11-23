@@ -33,6 +33,8 @@
                 #:%whitespace-char-p)
   (:import-from #:dsmr-mcp/src/package-context
                 #:call-with-lenient-packages)
+  (:import-from #:dsmr-mcp/src/read-time-eval
+                #:inert-readtable)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
   (:import-from #:dsmr-mcp/src/lsp/client
@@ -124,9 +126,10 @@ provide more surrounding context to match exactly once"
 (defun %validate-form-parseable (form-text)
   "Validate that FORM-TEXT parses as a single complete Lisp form.
 Does NOT attempt parinfer repair (D-08: fail hard, write nothing).
-Signals PATCH-OPERATION-ERROR when the text does not parse correctly."
+Signals PATCH-OPERATION-ERROR when the text does not parse correctly.
+A #. form reads as an inert READ-TIME-EVAL object and is never evaluated."
   (let ((*read-eval* nil)
-        (*readtable* (copy-readtable nil)))
+        (*readtable* (inert-readtable nil)))
     (handler-case
         (call-with-lenient-packages
          (lambda ()

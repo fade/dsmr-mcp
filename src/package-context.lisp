@@ -25,6 +25,8 @@
                 #:package-does-not-exist
                 #:symbol-does-not-exist
                 #:symbol-is-not-external)
+  (:import-from #:dsmr-mcp/src/read-time-eval
+                #:inert-readtable)
   (:export #:call-with-lenient-packages
            #:call-with-file-package-context
            #:*homeless-due-to-teardown*
@@ -219,9 +221,11 @@ Returns the values returned by THUNK."
 
 (defun %extract-in-package-name (text)
   "Return the first IN-PACKAGE name from TEXT as an uppercase string, or NIL.
-Uses the CL reader with *read-eval* nil so no code is evaluated."
+Reads with the CL reader, *read-eval* nil, and a copy of the current readtable
+in which a #. form reads as an inert READ-TIME-EVAL object; nothing is evaluated."
   (handler-case
-      (let ((*read-eval* nil))
+      (let ((*read-eval* nil)
+            (*readtable* (inert-readtable *readtable*)))
         (with-input-from-string (stream text)
           (loop for form = (read stream nil :eof)
                 until (eq form :eof)

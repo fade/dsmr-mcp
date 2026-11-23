@@ -1,0 +1,102 @@
+;;; conditions.lisp --- Error conditions for boomer
+;;;
+;;; SPDX-License-Identifier: MIT
+;;;
+;;; Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+
+(in-package #:boomer)
+
+;;;; Alert Errors
+
+(define-condition tls-alert-error (tls-error)
+  ((level :initarg :level
+          :reader tls-alert-error-level)
+   (description :initarg :description
+                :reader tls-alert-error-description))
+  (:report (lambda (condition stream)
+             (format stream "TLS alert received: ~A (~A)"
+                     (alert-description-name (tls-alert-error-description condition))
+                     (if (= (tls-alert-error-level condition) +alert-level-fatal+)
+                         "fatal"
+                         "warning"))))
+  (:documentation "TLS alert received from peer"))
+
+(defun known-alert-description-p (code)
+  "Return T if CODE is a known TLS alert description, NIL otherwise."
+  (case code
+    ((#.+alert-close-notify+
+      #.+alert-unexpected-message+
+      #.+alert-bad-record-mac+
+      #.+alert-record-overflow+
+      #.+alert-handshake-failure+
+      #.+alert-bad-certificate+
+      #.+alert-unsupported-certificate+
+      #.+alert-certificate-revoked+
+      #.+alert-certificate-expired+
+      #.+alert-certificate-unknown+
+      #.+alert-illegal-parameter+
+      #.+alert-unknown-ca+
+      #.+alert-access-denied+
+      #.+alert-decode-error+
+      #.+alert-decrypt-error+
+      #.+alert-protocol-version+
+      #.+alert-insufficient-security+
+      #.+alert-internal-error+
+      #.+alert-inappropriate-fallback+
+      #.+alert-user-canceled+
+      #.+alert-missing-extension+
+      #.+alert-unsupported-extension+
+      #.+alert-unrecognized-name+
+      #.+alert-bad-certificate-status-response+
+      #.+alert-unknown-psk-identity+
+      #.+alert-certificate-required+
+      #.+alert-no-application-protocol+)
+     t)
+    (otherwise nil)))
+
+(defun alert-description-name (code)
+  "Return a human-readable name for an alert description code."
+  (case code
+    (#.+alert-close-notify+ "close_notify")
+    (#.+alert-unexpected-message+ "unexpected_message")
+    (#.+alert-bad-record-mac+ "bad_record_mac")
+    (#.+alert-record-overflow+ ":TLSV1_ALERT_RECORD_OVERFLOW: record_overflow")
+    (#.+alert-handshake-failure+ ":HANDSHAKE_FAILURE_ON_CLIENT_HELLO: handshake_failure")
+    (#.+alert-bad-certificate+ "bad_certificate")
+    (#.+alert-unsupported-certificate+ "unsupported_certificate")
+    (#.+alert-certificate-revoked+ "certificate_revoked")
+    (#.+alert-certificate-expired+ "certificate_expired")
+    (#.+alert-certificate-unknown+ "certificate_unknown")
+    (#.+alert-illegal-parameter+ "illegal_parameter")
+    (#.+alert-unknown-ca+ "unknown_ca")
+    (#.+alert-access-denied+ "access_denied")
+    (#.+alert-decode-error+ "decode_error")
+    (#.+alert-decrypt-error+ "decrypt_error")
+    (#.+alert-protocol-version+ "protocol_version")
+    (#.+alert-insufficient-security+ "insufficient_security")
+    (#.+alert-internal-error+ "internal_error")
+    (#.+alert-inappropriate-fallback+ "inappropriate_fallback")
+    (#.+alert-user-canceled+ "user_canceled")
+    (#.+alert-missing-extension+ "missing_extension")
+    (#.+alert-unsupported-extension+ "unsupported_extension")
+    (#.+alert-unrecognized-name+ "unrecognized_name")
+    (#.+alert-bad-certificate-status-response+ "bad_certificate_status_response")
+    (#.+alert-unknown-psk-identity+ "unknown_psk_identity")
+    (#.+alert-certificate-required+ "certificate_required")
+    (#.+alert-no-application-protocol+ "no_application_protocol")
+    (otherwise (format nil "unknown(~D)" code))))
+
+;;;; Decode Errors
+
+(define-condition tls-decode-error (tls-error)
+  ((data :initarg :data
+         :initform nil
+         :reader tls-decode-error-data)
+   (position :initarg :position
+             :initform nil
+             :reader tls-decode-error-position))
+  (:report (lambda (condition stream)
+             (format stream "TLS decode error~@[ at position ~D~]~@[: ~A~]"
+                     (tls-decode-error-position condition)
+                     (tls-error-message condition))))
+  (:documentation "Error decoding TLS data"))

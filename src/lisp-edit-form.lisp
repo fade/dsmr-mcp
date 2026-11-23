@@ -33,6 +33,8 @@
                 #:%whitespace-char-p)
   (:import-from #:dsmr-mcp/src/package-context
                 #:call-with-lenient-packages)
+  (:import-from #:dsmr-mcp/src/read-time-eval
+                #:inert-readtable)
   (:import-from #:dsmr-mcp/src/log
                 #:log-event)
   (:import-from #:dsmr-mcp/src/lsp/client
@@ -99,14 +101,17 @@ Keeps existing whitespace and adds only the minimal needed newlines."
 
 (defun %comment-only-p (text)
   "Return T when TEXT contains only comments/whitespace and no readable forms.
-Allows replace to delete a form by replacing it with a '; removed' comment."
+Allows replace to delete a form by replacing it with a '; removed' comment.
+A #. form reads as an inert READ-TIME-EVAL object and is never evaluated."
   (and (stringp text)
        (some (lambda (ch) (not (%whitespace-char-p ch))) text)
        (handler-case
-           (multiple-value-bind (form pos)
-               (read-from-string text nil :eof)
-             (declare (ignore pos))
-             (eq form :eof))
+           (let ((*read-eval* nil)
+                 (*readtable* (inert-readtable nil)))
+             (multiple-value-bind (form pos)
+                 (read-from-string text nil :eof)
+               (declare (ignore pos))
+               (eq form :eof)))
          (error () nil))
        (or (find #\; text)
            (search "#|" text))))
@@ -118,9 +123,11 @@ Returns TEXT on success, or (values nil error kind) on failure.
 KIND is :multiple-forms when TEXT holds more than one top-level form, and
 :unreadable for every other failure. It lets the caller tell a missing
 delimiter, which a parinfer repair can fix, from a payload that is simply not
-one form, which it cannot."
+one form, which it cannot.
+
+A #. form reads as an inert READ-TIME-EVAL object and is never evaluated."
   (let ((*read-eval* nil)
-        (*readtable* (copy-readtable nil))
+        (*readtable* (inert-readtable nil))
         (kind :unreadable))
     (handler-case
         (call-with-lenient-packages

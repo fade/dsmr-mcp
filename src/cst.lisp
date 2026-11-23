@@ -6,6 +6,9 @@
 ;;;; numbers, and the read value so that downstream tools can locate, render,
 ;;;; and patch top-level forms without losing comment positions.
 ;;;;
+;;;; A #. form reads as a READ-TIME-EVAL object holding its unevaluated
+;;;; expression.  Nothing is evaluated at read time, and *READ-EVAL* stays NIL.
+;;;;
 ;;;; Shared across lisp-read-file (collapsed view), lisp-edit-form (structural
 ;;;; editor), and clgrep (structural search).
 ;;;;
@@ -20,6 +23,10 @@
   (:import-from #:dsmr-mcp/src/package-context
                 #:call-with-lenient-packages
                 #:call-with-file-package-context)
+  (:import-from #:dsmr-mcp/src/read-time-eval
+                #:inert-feature-client
+                #:inert-readtable
+                #:inert-eclector-readtable)
   (:export #:cst-node
            #:cst-node-kind
            #:cst-node-value
@@ -213,8 +220,12 @@ reached end of stream, and otherwise the offset past which the returned nodes
 describe nothing: the read stopped there and everything below it is unaccounted
 for.  The standard reader says nothing about what it choked on, so without that
 second value a caller cannot tell a file it read whole from a file it read the
-first half of."
-  (let ((*readtable* custom-readtable)
+first half of.
+
+The read uses a copy of CUSTOM-READTABLE in which a #. form reads as a
+READ-TIME-EVAL object; nothing is evaluated and CUSTOM-READTABLE is not
+modified."
+  (let ((*readtable* (inert-readtable custom-readtable))
         (*read-eval* nil))
     (loop
       (let ((start-pos (file-position stream)))
@@ -277,6 +288,10 @@ it and the Eclector loop learns nothing more about that text."
                 (values rt-nodes t unparsed-from))))))))
   (values nil nil nil))
 
+(defclass source-client (inert-feature-client parse-result-client)
+  ()
+  (:documentation "Eclector client for source parsing: CST nodes, inert #. features."))
+
 (defun %eclector-parse-loop (text)
   "Inner Eclector parse loop.  *LINE-TABLE* and *PACKAGE* must be bound.
 
@@ -288,11 +303,16 @@ That offset is the end of the text the nodes cover, not the position the reader
 had consumed to when it gave up.  The two are not the same: the reader may have
 eaten part of the input it then failed on, and that stretch produced no node,
 so it is uncovered as surely as the text below it.  Reporting the reader's own
-position would licence a claim about a span nothing ever examined."
+position would licence a claim about a span nothing ever examined.
+
+A #. form reads as a READ-TIME-EVAL object through the Eclector readtable bound
+here; nothing is evaluated, and *READ-EVAL* stays NIL.  A form guarded by a
+feature expression holding #. reads as present."
   (let ((*readtable* (copy-readtable))
+        (eclector.reader:*readtable* (inert-eclector-readtable))
         (*read-eval* nil)
         (nodes '())
-        (client (make-instance 'parse-result-client)))
+        (client (make-instance 'source-client)))
     (with-input-from-string (stream text)
       (handler-case
           (call-with-lenient-packages
@@ -310,16 +330,10 @@ position would licence a claim about a span nothing ever examined."
                      (%check-in-readtable result stream nodes)
                    (when switched
                      (return (values rt-nodes rt-unparsed))))))))
-        (reader-error (e)
-          (let ((msg (format nil "~A" e)))
-            (if (search "READ-EVAL" msg)
-                (error
-                 "Reader error: ~A~%~%Read-time evaluation (#.) is disabled for ~
-security. If you need to parse files containing #., consider removing or ~
-replacing the #. forms, or use a separate evaluation step." e)
-                ;; Computed before the NREVERSE, which consumes NODES.
-                (let ((covered (%coverage-end nodes)))
-                  (values (nreverse nodes) covered)))))))))
+        (reader-error ()
+          ;; Computed before the NREVERSE, which consumes NODES.
+          (let ((covered (%coverage-end nodes)))
+            (values (nreverse nodes) covered)))))))
 
 (defun %parse-core (text readtable)
   "Run the Eclector or CL-reader parse loop over TEXT.
@@ -363,6 +377,10 @@ likely to be expected, because the file is otherwise perfectly well formed.
 The reader signals on it, so the parse ends there, and it also discards the
 skipped input already accumulated for the failing read: text between the last
 completed form and the datum comment is dropped along with everything below it.
+
+A #. form reads as a READ-TIME-EVAL object holding the unevaluated expression
+that follows it, on both the Eclector and the custom-readtable path.  Nothing in
+TEXT is evaluated, and a readtable named by READTABLE is copied, not modified.
 
 Keyword arguments:
   READTABLE       -- a named-readtable designator string; when supplied, the
