@@ -405,6 +405,16 @@ DirectMap1G:     3145728 kB
                         (list (list 10 no-total) (list 40 no-total)
                               (list 100 no-total))))))
 
+(define-test recorded-stalls-with-ample-memory-do-not-hold-pressure-open
+  "Under pressure since 0, the recorded FLEET WARN readings of 2026-11-22/23
+   (*RECORDED-STALLS*) cycled once a second from 10 count as calm, with
+   59-64% available: still pressure at 39, ok at 40. No recorded pressure
+   entry exists, so the state is constructed."
+  (let ((verdicts (run-classifier (under-pressure 0)
+                                  (recorded-stall-steps :from 10 :to 40))))
+    (is eq :pressure (nth 29 verdicts))
+    (is eq :ok (nth 30 verdicts))))
+
 (define-test the-classifier-leaves-its-state-argument-alone
   "Every slot of the state handed in reads the same after the call."
   (let ((state (memory:make-memory-state :verdict :ok :psi-hits 1)))

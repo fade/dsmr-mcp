@@ -200,9 +200,9 @@
    reaches ENTER-SOME or the full figure reaches ENTER-FULL. Two stalls in a
    row enter pressure while the available share is below STALL-AVAILABLE,
    and read as reclaim otherwise. An available share below ENTER-AVAILABLE
-   enters pressure at once. Pressure clears once the some figure has stayed
-   below LEAVE-SOME and the available share above LEAVE-AVAILABLE for
-   HOLD-SECONDS. A fresh worker
+   enters pressure at once. Pressure clears once the available share has
+   stayed above LEAVE-AVAILABLE, with the some figure below LEAVE-SOME or the
+   share at or above STALL-AVAILABLE, for HOLD-SECONDS. A fresh worker
    younger than MIN-KILL-AGE-SECONDS is never offered for stopping. Reclaim
    is reported as I/O-driven when the I/O full figure reaches IO-FULL; it
    changes no verdict. The defaults are unmeasured starting points:
@@ -298,8 +298,9 @@
    when it is at or above that ceiling or unknown: stalls with memory to
    spare are page-cache reclaim, not a shortage. Anything else gives :OK.
 
-   Under pressure, a reading whose some figure is below its leave threshold,
-   or absent, and whose available share is above its own counts as calm;
+   Under pressure, a reading whose available share is above LEAVE-AVAILABLE
+   counts as calm when its some figure is below LEAVE-SOME or absent, or its
+   share is at or above STALL-AVAILABLE, so reclaim never holds an episode open;
    pressure clears to :OK once calm has held for the hold time, and any
    reading that is not calm starts the hold again. Without a memory total
    there is no available share, so the available rules can neither enter
@@ -327,7 +328,8 @@
        (let ((calm (and available
                         (> available (memory-thresholds-leave-available thresholds))
                         (or (null some)
-                            (< some (memory-thresholds-leave-some thresholds)))))
+                            (< some (memory-thresholds-leave-some thresholds))
+                            (>= available (memory-thresholds-stall-available thresholds)))))
              (since (memory-state-since state)))
          (if calm
              (let ((clear-since (or (memory-state-clear-since state) now)))

@@ -601,6 +601,26 @@
       (is = 0 (length (fleet-lines-with "WARN code=memory-pressure")))
       (is eq :reclaim (memory:memory-state-verdict (service::service-memory-state svc))))))
 
+(define-test pressure-held-open-only-by-recorded-stalls-ends
+  "A pressure episode fed only the recorded FLEET WARN readings of
+   2026-11-22/23 (*RECORDED-STALLS*), 59-64% available, ends after the 30 s
+   hold and is never reported unrelieved. No recorded pressure entry exists
+   to replay, so the service's state is constructed."
+  (with-memory-case (state)
+    (let ((svc (memory-service))
+          (now (%unix-time)))
+      (publish '())
+      (setf (service::service-memory-state svc)
+            (memory:make-memory-state :verdict :pressure :since now))
+      (let ((verdicts (loop for i from 0 to 61
+                            collect (progn (setf *reading* (recorded-stall i))
+                                           (check svc (+ now i))
+                                           (memory:memory-state-verdict
+                                            (service::service-memory-state svc))))))
+        (is eq :pressure (nth 29 verdicts))
+        (false (member :pressure (nthcdr 30 verdicts))))
+      (is = 0 (length (fleet-lines-with "code=memory-pressure-unrelieved"))))))
+
 (define-test the-recorded-incident-is-reported-as-io-driven-reclaim
   "The WARN reading of the 2026-11-22 16:39Z incident (*INCIDENT-READING*),
    given twice because the reading before it is unrecorded but was also a
