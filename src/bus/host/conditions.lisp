@@ -189,9 +189,10 @@
 (define-condition memory-pressure (host-fault)
   ()
   (:default-initargs :code "memory-pressure")
-  (:documentation "The host is short of memory: stalls on memory are high or
-   little memory is left available. The heal asks a session pool to stop or
-   hibernate one idle worker."))
+  (:documentation "The host is short of memory: little memory is left
+   available, or stalls on memory are high while available memory is below
+   the stall ceiling. Stalls at or above that ceiling are reclaim and never raise
+   this. The heal asks a session pool to stop or hibernate one idle worker."))
 
 (define-condition memory-pressure-unrelieved (host-fault)
   ()

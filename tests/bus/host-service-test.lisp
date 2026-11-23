@@ -278,11 +278,24 @@
                         (or (null level) (eq level (first r)))))
                  *reports*))
 
-(defun readings (available-percent &key (some 0.0))
+(defun readings (available-percent &key (some 0.0) (full 0.0))
   "A memory reading with AVAILABLE-PERCENT of a 1 GB host available."
-  (memory:make-memory-readings :some-avg10 some :full-avg10 0.0
+  (memory:make-memory-readings :some-avg10 some :full-avg10 full
                                :mem-total-kb 1000000
                                :mem-available-kb (* 10000 available-percent)))
+
+(defparameter *recorded-stalls*
+  '((3.2 62) (4.2 59) (2.2 64) (2.1 64))
+  "The four FLEET WARN memory-pressure lines of 2026-11-22/23 in the fleet log
+   of the development host, as (some-avg10 available-percent). A WARN line
+   records no full figure. At these shares pressure was entered only through
+   full >= enter-full, so full is taken as 2.0, the default enter-full and
+   the least value the record implies.")
+
+(defun recorded-stall (i)
+  "A reading of the Ith entry of *RECORDED-STALLS*, cycling, with full 2.0."
+  (destructuring-bind (some percent) (nth (mod i 4) *recorded-stalls*)
+    (readings percent :some some :full 2.0)))
 
 (defvar *reading* nil
   "What the current memory case's service reads as the host's memory.")
@@ -540,6 +553,43 @@
       (check svc (+ now 151))
       (is eq :ok (memory:memory-state-verdict (service::service-memory-state svc)))
       (is = 1 (length (fleet-lines-with "INFO code=memory-pressure " "recovered"))))))
+
+(define-test recorded-stalls-with-most-memory-available-ask-no-worker-to-give-memory-back
+  "The first two recorded FLEET WARN readings of 2026-11-22/23
+   (*RECORDED-STALLS*), 62% and 59% available, leave an idle stateful worker
+   alone and write no memory-pressure line. Reclaim is reported once, at
+   INFO, with the share of the reading that entered it."
+  (with-memory-case (state)
+    (let ((svc (memory-service))
+          (now (%unix-time)))
+      (publish (list (worker 1 :stateful t :spawned-at (- now 100)
+                               :last-activity (- now 50))))
+      (setf *reading* (recorded-stall 0))
+      (check svc now)
+      (setf *reading* (recorded-stall 1))
+      (check svc (+ now 1))
+      (is equal '() (requests))
+      (is = 0 (length (fleet-lines-with "code=memory-pressure")))
+      (is equal '() (reported "memory-pressure"))
+      (let ((reclaim (reported "memory-reclaim" :info)))
+        (is = 1 (length reclaim))
+        (true (search "not a shortage" (fourth (first reclaim))))
+        (true (search "available=59%" (fourth (first reclaim))))))))
+
+(define-test recorded-stalls-with-most-memory-available-never-become-unrelieved
+  "The recorded FLEET WARN readings of 2026-11-22/23 (*RECORDED-STALLS*),
+   cycled once a second for 62 s with no worker published, write neither a
+   WARN memory-pressure line nor an unrelieved line, and end in reclaim."
+  (with-memory-case (state)
+    (let ((svc (memory-service))
+          (now (%unix-time)))
+      (publish '())
+      (loop for i from 0 to 62
+            do (setf *reading* (recorded-stall i))
+               (check svc (+ now i)))
+      (is = 0 (length (fleet-lines-with "code=memory-pressure-unrelieved")))
+      (is = 0 (length (fleet-lines-with "WARN code=memory-pressure")))
+      (is eq :reclaim (memory:memory-state-verdict (service::service-memory-state svc))))))
 
 (define-test a-failing-memory-reader-never-stops-the-supervisor
   "A memory reader that signals is reported as a failed duty about the host,

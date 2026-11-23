@@ -49,13 +49,34 @@
   "Readings well inside the clearing thresholds: some 1, 25% available."
   (readings :some 1.0 :full 0.0 :available 250))
 
-(defun run-classifier (state steps)
-  "Feed STEPS, a list of (now readings), to the classifier from STATE and
-   return the list of verdicts and the last state."
+(defparameter *recorded-stalls*
+  '((3.2 62) (4.2 59) (2.2 64) (2.1 64))
+  "The four FLEET WARN memory-pressure lines of 2026-11-22/23 in the fleet log
+   of the development host, as (some-avg10 available-percent). A WARN line
+   records no full figure. At these shares pressure was entered only through
+   full >= enter-full (some is below 10, available above 12%), so full is
+   taken as 2.0, the default enter-full and the least value the record
+   implies.")
+
+(defun recorded-stall (entry &key (total 100))
+  "Readings for ENTRY of *RECORDED-STALLS*, full at 2.0, out of TOTAL."
+  (destructuring-bind (some percent) entry
+    (readings :some some :full 2.0 :total total :available percent)))
+
+(defun recorded-stall-steps (&key (from 0) (to 3) (total 100))
+  "Steps from FROM to TO, one a second, cycling through *RECORDED-STALLS*."
+  (loop for now from from to to
+        for i from 0
+        collect (list now (recorded-stall (nth (mod i 4) *recorded-stalls*)
+                                          :total total))))
+
+(defun run-classifier (state steps &optional (thresholds (memory:make-memory-thresholds)))
+  "Feed STEPS, a list of (now readings), to the classifier from STATE under
+   THRESHOLDS and return the list of verdicts and the last state."
   (let ((verdicts '()))
     (loop for (now reading) in steps
           do (multiple-value-bind (verdict next)
-                 (memory:classify-memory reading state now)
+                 (memory:classify-memory reading state now thresholds)
                (push verdict verdicts)
                (setf state next)))
     (values (nreverse verdicts) state)))
@@ -147,32 +168,72 @@
 
 (define-test one-stall-reading-is-not-pressure-two-in-a-row-are
   "Some at 15 once leaves the verdict ok; a second reading in a row enters
-   pressure."
+   pressure. Available is 20%, between enter-available and the stall
+   ceiling; no capture of a stall with that little memory available exists."
   (is equal '(:ok :pressure)
       (run-classifier (memory:make-memory-state)
-                      (list (list 0 (readings :some 15.0))
-                            (list 1 (readings :some 15.0))))))
+                      (list (list 0 (readings :some 15.0 :available 200))
+                            (list 1 (readings :some 15.0 :available 200))))))
 
 (define-test a-calm-reading-between-two-stalls-resets-the-count
-  "Stall, calm, stall is three ok verdicts: the hits must be consecutive."
+  "Stall, calm, stall is three ok verdicts: the hits must be consecutive.
+   Available is 20%, below the stall ceiling; no capture of that state
+   exists."
   (is equal '(:ok :ok :ok)
       (run-classifier (memory:make-memory-state)
-                      (list (list 0 (readings :some 15.0))
-                            (list 1 (readings :some 1.0))
-                            (list 2 (readings :some 15.0))))))
+                      (list (list 0 (readings :some 15.0 :available 200))
+                            (list 1 (readings :some 1.0 :available 200))
+                            (list 2 (readings :some 15.0 :available 200))))))
 
 (define-test a-full-stall-twice-enters-pressure
-  "Full at 2.5 on two readings in a row is pressure."
+  "Full at 2.5 on two readings in a row is pressure while 20% is available,
+   below the stall ceiling; no capture of that state exists."
   (is equal '(:ok :pressure)
       (run-classifier (memory:make-memory-state)
-                      (list (list 0 (readings :some 0.0 :full 2.5))
-                            (list 1 (readings :some 0.0 :full 2.5))))))
+                      (list (list 0 (readings :some 0.0 :full 2.5 :available 200))
+                            (list 1 (readings :some 0.0 :full 2.5 :available 200))))))
 
 (define-test low-available-memory-enters-pressure-at-once
   "Available below 12% of total is pressure on the first reading."
   (is equal '(:pressure)
       (run-classifier (memory:make-memory-state)
                       (list (list 0 (readings :some 0.0 :available 110))))))
+
+(define-test recorded-stalls-with-most-memory-available-read-as-reclaim
+  "The four recorded FLEET WARN readings of 2026-11-22/23 (*RECORDED-STALLS*),
+   in order, are ok and then reclaim, never pressure: 59-64% of memory was
+   available."
+  (is equal '(:ok :reclaim :reclaim :reclaim)
+      (run-classifier (memory:make-memory-state) (recorded-stall-steps))))
+
+(define-test stalls-with-no-memory-total-read-as-reclaim
+  "The stall figures of the recorded FLEET WARN readings of 2026-11-22/23
+   (*RECORDED-STALLS*) with no memory total are ok, then reclaim: without a
+   share there is no evidence of a shortage."
+  (is equal '(:ok :reclaim)
+      (run-classifier (memory:make-memory-state)
+                      (recorded-stall-steps :to 1 :total nil))))
+
+(define-test low-available-memory-enters-pressure-from-reclaim
+  "The first two recorded FLEET WARN readings of 2026-11-22/23
+   (*RECORDED-STALLS*) reach reclaim; an 11%-available reading then enters
+   pressure at once. No capture of a host short of memory exists, so the
+   last reading is the synthetic one of
+   low-available-memory-enters-pressure-at-once."
+  (is equal '(:ok :reclaim :pressure)
+      (run-classifier (memory:make-memory-state)
+                      (append (recorded-stall-steps :to 1)
+                              (list (list 2 (readings :some 0.0 :available 110)))))))
+
+(define-test a-raised-stall-ceiling-makes-the-recorded-stalls-pressure
+  "With DSMR_PRESSURE_STALL_AVAILABLE_PERCENT=65, the first two recorded FLEET
+   WARN readings of 2026-11-22/23 (*RECORDED-STALLS*), 62% and 59% available,
+   enter pressure."
+  (let ((th (memory:thresholds-from-environment
+             :getenv (getenv-from '(("DSMR_PRESSURE_STALL_AVAILABLE_PERCENT" . "65"))))))
+    (is = 0.65 (memory:memory-thresholds-stall-available th))
+    (is equal '(:ok :pressure)
+        (run-classifier (memory:make-memory-state) (recorded-stall-steps :to 1) th))))
 
 (define-test pressure-clears-only-after-thirty-seconds-of-calm
   "Calm from 10 still reads pressure at 39 and clears at 40."
@@ -236,6 +297,7 @@
     (is = 0.12 (memory:memory-thresholds-enter-available th))
     (is = 3.0 (memory:memory-thresholds-leave-some th))
     (is = 0.20 (memory:memory-thresholds-leave-available th))
+    (is = 0.25 (memory:memory-thresholds-stall-available th))
     (is = 30 (memory:memory-thresholds-hold-seconds th))
     (is = 10 (memory:memory-thresholds-min-kill-age-seconds th))
     (is eq nil warnings)))
@@ -258,6 +320,16 @@
     (is = 1 (length warnings))
     (true (stringp (first warnings)))
     (true (search "DSMR_PRESSURE_ENTER_SOME" (first warnings)))))
+
+(define-test a-stall-ceiling-above-100-percent-keeps-its-default
+  "DSMR_PRESSURE_STALL_AVAILABLE_PERCENT=150 keeps 0.25 and yields one
+   warning naming the variable."
+  (multiple-value-bind (th warnings)
+      (memory:thresholds-from-environment
+       :getenv (getenv-from '(("DSMR_PRESSURE_STALL_AVAILABLE_PERCENT" . "150"))))
+    (is = 0.25 (memory:memory-thresholds-stall-available th))
+    (is = 1 (length warnings))
+    (true (search "DSMR_PRESSURE_STALL_AVAILABLE_PERCENT" (first warnings)))))
 
 (define-test the-minimum-kill-age-is-read-from-the-process-environment
   "DSMR_PRESSURE_MIN_KILL_AGE_SECONDS=3 in the real environment reads as 3."
