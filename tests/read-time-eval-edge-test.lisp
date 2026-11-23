@@ -307,7 +307,7 @@ replacement that keeps the guard carries it."
           "tail ~S" tail)
       (true (try-reader-check text) "check-parens on tail ~S" tail))))
 
-(define-test comma-after-read-time-eval-in-backquote-is-an-error
+(define-test comma-after-read-time-eval-in-backquote-fails-check-and-parses
   "A comma straight after #. inside backquote: check-parens refuses it, as SBCL's
 reader does; the Eclector parse accepts it, as Eclector's own #. entry does."
   (let ((text "(defmacro m (x) `(list #.,x))"))
@@ -415,7 +415,7 @@ reader path signals a warning, and the readers write nothing to *ERROR-OUTPUT*."
 (define-test named-readtable-is-unchanged-by-a-parse
   "A readtable found by name for :READTABLE keeps its entries after a parse."
   (if (find-package :named-readtables)
-      (true t "named-readtables is loaded; the stub is not installed")
+      (skip "named-readtables is loaded, so the FIND-READTABLE stub cannot be installed")
       (let* ((custom (copy-readtable nil))
              (before (dispatch-entries custom))
              (package (make-package :named-readtables :use '())))

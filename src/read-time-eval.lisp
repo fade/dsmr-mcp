@@ -92,10 +92,11 @@ as in SBCL's own entry."
 
 (defun %read-eclector-sharpsign-dot-object (client stream)
   "Read the object after #. from STREAM for CLIENT, as Eclector's #. entry reads it.
-Quasiquotation is forbidden inside the object, and the enclosing list reader
-is hidden from it.  End of input signals END-OF-INPUT-AFTER-SHARPSIGN-DOT, and
-a closing parenthesis signals OBJECT-MUST-FOLLOW-SHARPSIGN-DOT; both are
-reader errors.  Uses Eclector internals, matching its sharpsign-dot."
+The object is read with a fresh quasiquotation state, which forbids neither
+backquote nor comma, and with the enclosing list reader hidden from it.
+End of input signals END-OF-INPUT-AFTER-SHARPSIGN-DOT, and a closing
+parenthesis signals OBJECT-MUST-FOLLOW-SHARPSIGN-DOT; both are reader errors.
+Uses Eclector internals, matching its sharpsign-dot."
   (eclector.reader::with-quasiquotation-state (client nil nil nil)
     (let ((eclector.reader::*list-reader* nil))
       (handler-case (eclector.reader:read stream t nil t)
