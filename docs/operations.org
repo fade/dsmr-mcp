@@ -309,6 +309,12 @@ nothing is ever stopped or hibernated, and a worker lives until its session
 ends. =pool-status= reports =pressure_relief= as =active= when its pool is
 answering a live service.
 
+Pressure means =MemAvailable= is below 12% of memory, or memory stalls on two
+readings in a row and the second shows it below 25%. Stalls at or above 25% are
+page-cache reclaim, usually from heavy file I/O. The service records them as
+reclaim, naming I/O when =/proc/pressure/io= shows it, and relieves nothing.
+Both shares are settings (see [[file:configuration.org][Configuration]]).
+
 ** Where hibernated cores live, and who removes them
 
 Each MCP server keeps its workers' saved worlds at
@@ -408,7 +414,7 @@ service line once the service watches memory:
 memory state=ok hibernated=0 resident=3 since=1760584000 some=0.0 available=61 last-action=-
 #+end_example
 
-=state= is =ok=, =pressure=, or =unknown= before the first reading.
+=state= is =ok=, =reclaim=, =pressure=, or =unknown= before the first reading.
 =hibernated= and =resident= count the workers of live servers. =since= is
 when the state last changed and =last-action= when a pool was last asked to
 give memory back, both in Unix seconds (=-= for never). =some= is the
@@ -449,6 +455,10 @@ Three WARN codes say the service set something aside: =memory-threshold-ignored=
 =memory-request-stale= (a request no pool answered within five minutes, which
 it withdrew, passing that pool over for the next five minutes) and =worker-record-mismatch= (a worker record whose name and
 contents disagree, which it never acts on).
+
+=memory-reclaim= (INFO) goes to the service's own log and never to the fleet
+log: memory is stalling while at least a quarter of it is available, so
+nothing needs relieving and no leader needs to know.
 
 ** Measuring worker cost
 

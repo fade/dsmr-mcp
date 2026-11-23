@@ -28,12 +28,16 @@
 ;;;; Every one of them can be changed from the service's environment, read when
 ;;;; the service starts.
 ;;;;
-;;;; Entering pressure takes two stall readings in a row, or one reading of low
-;;;; available memory, and leaving it takes a calm that has held for a while,
-;;;; so a single spike neither starts nor stops relief. The classifier and the
-;;;; ranking are pure functions of the readings, the records and a time the
-;;;; caller passes in, in the manner of the breaker in conditions.lisp, so they
-;;;; are tested by handing them numbers rather than by starving a host.
+;;;; Pressure is entered on one reading of low available memory, or on the
+;;;; second of two stall readings in a row when that reading shows available
+;;;; memory below the stall ceiling. Stalls at or above the ceiling are
+;;;; page-cache reclaim, usually from heavy file I/O: they give the verdict
+;;;; :RECLAIM, which relieves nothing. Leaving pressure takes a calm that has
+;;;; held for a while, so a single spike neither starts nor stops relief. The
+;;;; classifier and the ranking are pure functions of the readings, the records
+;;;; and a time the caller passes in, in the manner of the breaker in
+;;;; conditions.lisp, so they are tested by handing them numbers rather than by
+;;;; starving a host.
 
 (defpackage #:dsmr-bus-host/src/bus/host/memory
   (:use #:cl)
@@ -50,6 +54,8 @@
    #:memory-readings-mem-available-kb
    #:memory-readings-swap-total-kb
    #:memory-readings-swap-free-kb
+   #:memory-readings-io-some-avg10
+   #:memory-readings-io-full-avg10
    #:parse-psi-text
    #:parse-meminfo-text
    #:read-memory-readings
@@ -62,6 +68,8 @@
    #:memory-thresholds-enter-available
    #:memory-thresholds-leave-some
    #:memory-thresholds-leave-available
+   #:memory-thresholds-stall-available
+   #:memory-thresholds-io-full
    #:memory-thresholds-hold-seconds
    #:memory-thresholds-min-kill-age-seconds
    #:thresholds-from-environment
@@ -73,6 +81,8 @@
    #:memory-state-since
    #:memory-state-clear-since
    #:classify-memory
+   #:io-driven-p
+   #:ample-memory-p
    ;; ranking
    #:rank-candidates))
 
@@ -83,14 +93,17 @@
 (defstruct (memory-readings (:copier nil))
   "One reading of the host's memory. SOME-AVG10 and FULL-AVG10 are the
    percentages of the last ten seconds in which some or all tasks stalled on
-   memory, or NIL without a pressure file; the sizes are in kilobytes, or NIL
-   when /proc/meminfo did not give them."
+   memory, or NIL without a pressure file; IO-SOME-AVG10 and IO-FULL-AVG10
+   are the same figures for I/O, or NIL without /proc/pressure/io. The sizes
+   are in kilobytes, or NIL when /proc/meminfo did not give them."
   (some-avg10 nil)
   (full-avg10 nil)
   (mem-total-kb nil)
   (mem-available-kb nil)
   (swap-total-kb nil)
-  (swap-free-kb nil))
+  (swap-free-kb nil)
+  (io-some-avg10 nil)
+  (io-full-avg10 nil))
 
 (defun %parse-decimal (text)
   "The non-negative number TEXT spells as digits with at most one decimal
@@ -117,8 +130,8 @@
 
 (defun parse-psi-text (text)
   "The avg10 figures of the some and full lines of TEXT, as the kernel writes
-   /proc/pressure/memory, as two values. Either is NIL when its line is
-   missing or unreadable."
+   any file under /proc/pressure, as two values. Either is NIL when its line
+   is missing or unreadable."
   (let ((some nil) (full nil))
     (dolist (line (%lines text))
       (let* ((fields (remove "" (uiop:split-string line :separator " ")
@@ -153,20 +166,24 @@
           append (list key (getf found key)))))
 
 (defun read-memory-readings (&key (psi-path "/proc/pressure/memory")
-                                  (meminfo-path "/proc/meminfo"))
-  "Read the host's memory now, from PSI-PATH and MEMINFO-PATH. A file that
-   cannot be read leaves its fields NIL, so a kernel without pressure figures
-   still yields the sizes."
+                                  (meminfo-path "/proc/meminfo")
+                                  (io-psi-path "/proc/pressure/io"))
+  "Read the host's memory now, from PSI-PATH, MEMINFO-PATH and IO-PSI-PATH. A
+   file that cannot be read leaves its fields NIL, so a kernel without
+   pressure figures still yields the sizes."
   (flet ((text (path)
            (or (ignore-errors (uiop:read-file-string path)) "")))
     (multiple-value-bind (some full) (parse-psi-text (text psi-path))
-      (let ((sizes (parse-meminfo-text (text meminfo-path))))
-        (make-memory-readings :some-avg10 some
-                              :full-avg10 full
-                              :mem-total-kb (getf sizes :mem-total-kb)
-                              :mem-available-kb (getf sizes :mem-available-kb)
-                              :swap-total-kb (getf sizes :swap-total-kb)
-                              :swap-free-kb (getf sizes :swap-free-kb))))))
+      (multiple-value-bind (io-some io-full) (parse-psi-text (text io-psi-path))
+        (let ((sizes (parse-meminfo-text (text meminfo-path))))
+          (make-memory-readings :some-avg10 some
+                                :full-avg10 full
+                                :mem-total-kb (getf sizes :mem-total-kb)
+                                :mem-available-kb (getf sizes :mem-available-kb)
+                                :swap-total-kb (getf sizes :swap-total-kb)
+                                :swap-free-kb (getf sizes :swap-free-kb)
+                                :io-some-avg10 io-some
+                                :io-full-avg10 io-full))))))
 
 (defun available-fraction (readings)
   "The share of memory still available, between 0 and 1, or NIL when READINGS
@@ -180,18 +197,24 @@
 ;;; ---------------------------------------------------------------- thresholds
 
 (defstruct (memory-thresholds (:copier nil))
-  "Where pressure starts and stops. Pressure is entered when the some figure
-   reaches ENTER-SOME or the full figure reaches ENTER-FULL on two readings in
-   a row, or at once when the available share falls below ENTER-AVAILABLE. It
-   clears once the some figure has stayed below LEAVE-SOME and the available
-   share above LEAVE-AVAILABLE for HOLD-SECONDS. A fresh worker younger than
-   MIN-KILL-AGE-SECONDS is never offered for stopping. The defaults are
-   unmeasured starting points."
+  "Where pressure starts and stops. A reading is a stall when the some figure
+   reaches ENTER-SOME or the full figure reaches ENTER-FULL. Two stalls in a
+   row enter pressure while the available share is below STALL-AVAILABLE,
+   and read as reclaim otherwise. An available share below ENTER-AVAILABLE
+   enters pressure at once. Pressure clears once the available share has
+   stayed above LEAVE-AVAILABLE, with the some figure below LEAVE-SOME or the
+   share at or above STALL-AVAILABLE, for HOLD-SECONDS. A fresh worker
+   younger than MIN-KILL-AGE-SECONDS is never offered for stopping. Reclaim
+   is reported as I/O-driven when the I/O full figure reaches IO-FULL; it
+   changes no verdict. The defaults are unmeasured starting points:
+   STALL-AVAILABLE 0.25, IO-FULL 5.0."
   (enter-some 10.0)
   (enter-full 2.0)
   (enter-available 0.12)
   (leave-some 3.0)
   (leave-available 0.20)
+  (stall-available 0.25)
+  (io-full 5.0)
   (hold-seconds 30)
   (min-kill-age-seconds 10))
 
@@ -201,6 +224,8 @@
     ("DSMR_PRESSURE_ENTER_AVAILABLE_PERCENT" :enter-available :percent)
     ("DSMR_PRESSURE_LEAVE_SOME" :leave-some :stall)
     ("DSMR_PRESSURE_LEAVE_AVAILABLE_PERCENT" :leave-available :percent)
+    ("DSMR_PRESSURE_STALL_AVAILABLE_PERCENT" :stall-available :percent)
+    ("DSMR_PRESSURE_IO_FULL" :io-full :stall)
     ("DSMR_PRESSURE_HOLD_SECONDS" :hold-seconds :hold)
     ("DSMR_PRESSURE_MIN_KILL_AGE_SECONDS" :min-kill-age-seconds :age))
   "Each environment variable that sets a threshold, the threshold it sets, and
@@ -252,9 +277,10 @@
 ;;; ---------------------------------------------------------------- classifier
 
 (defstruct (memory-state (:copier nil))
-  "Where the classifier stands. VERDICT is :OK or :PRESSURE; PSI-HITS counts
-   stall readings in a row while the verdict is :OK; SINCE is when pressure
-   was entered; CLEAR-SINCE is when the calm that may end it began."
+  "Where the classifier stands. VERDICT is :OK, :RECLAIM or :PRESSURE;
+   PSI-HITS counts stall readings in a row while the verdict is :OK or
+   :RECLAIM; SINCE is when pressure was entered; CLEAR-SINCE is when the calm
+   that may end it began."
   (verdict :ok)
   (psi-hits 0)
   (since nil)
@@ -263,36 +289,48 @@
 (defun classify-memory (readings state now &optional (thresholds (make-memory-thresholds)))
   "Decide from READINGS taken at NOW, in seconds, whether the host is under
    memory pressure, given the classifier STATE. Returns (values verdict
-   new-state), the verdict :OK or :PRESSURE. Pure: STATE is not modified and
-   nothing is read but the arguments.
+   new-state), the verdict :OK, :RECLAIM or :PRESSURE. Pure: STATE is not
+   modified and nothing is read but the arguments.
 
-   From :OK, a stall reading at or above a threshold counts a hit and any
-   other reading clears the count; two hits in a row, or an available share
-   below its threshold, enter pressure. Under pressure, a reading whose some
-   figure is below its leave threshold, or absent, and whose available share
-   is above its own counts as calm; pressure clears once calm has held for the
-   hold time, and any reading that is not calm starts the hold again. Without
-   a memory total there is no available share, so that rule can neither enter
+   From :OK or :RECLAIM, a stall reading at or above a threshold counts a hit
+   and any other reading clears the count. An available share below
+   ENTER-AVAILABLE enters pressure at once. Two hits in a row enter pressure
+   while the available share is below STALL-AVAILABLE, and give :RECLAIM
+   when it is at or above that ceiling or unknown: stalls with memory to
+   spare are page-cache reclaim, not a shortage. Anything else gives :OK.
+
+   Under pressure, a reading whose available share is above LEAVE-AVAILABLE
+   counts as calm when its some figure is below LEAVE-SOME or absent, or its
+   share is at or above STALL-AVAILABLE, so reclaim never holds an episode open;
+   pressure clears to :OK once calm has held for the hold time, and any
+   reading that is not calm starts the hold again. Without a memory total
+   there is no available share, so the available rules can neither enter
    pressure nor clear it."
   (let ((some (memory-readings-some-avg10 readings))
         (full (memory-readings-full-avg10 readings))
         (available (available-fraction readings)))
     (ecase (memory-state-verdict state)
-      (:ok
+      ((:ok :reclaim)
        (let* ((stalled (or (and some (>= some (memory-thresholds-enter-some thresholds)))
                            (and full (>= full (memory-thresholds-enter-full thresholds)))))
               (hits (if stalled (1+ (memory-state-psi-hits state)) 0)))
-         (if (or (>= hits 2)
-                 (and available
-                      (< available (memory-thresholds-enter-available thresholds))))
-             (values :pressure (make-memory-state :verdict :pressure :psi-hits hits
-                                                  :since now))
-             (values :ok (make-memory-state :verdict :ok :psi-hits hits)))))
+         (cond ((or (and available
+                         (< available (memory-thresholds-enter-available thresholds)))
+                    (and (>= hits 2)
+                         available
+                         (< available (memory-thresholds-stall-available thresholds))))
+                (values :pressure (make-memory-state :verdict :pressure :psi-hits hits
+                                                     :since now)))
+               ((>= hits 2)
+                (values :reclaim (make-memory-state :verdict :reclaim :psi-hits hits)))
+               (t
+                (values :ok (make-memory-state :verdict :ok :psi-hits hits))))))
       (:pressure
        (let ((calm (and available
                         (> available (memory-thresholds-leave-available thresholds))
                         (or (null some)
-                            (< some (memory-thresholds-leave-some thresholds)))))
+                            (< some (memory-thresholds-leave-some thresholds))
+                            (>= available (memory-thresholds-stall-available thresholds)))))
              (since (memory-state-since state)))
          (if calm
              (let ((clear-since (or (memory-state-clear-since state) now)))
@@ -301,6 +339,22 @@
                    (values :pressure (make-memory-state :verdict :pressure :since since
                                                         :clear-since clear-since))))
              (values :pressure (make-memory-state :verdict :pressure :since since))))))))
+
+(defun ample-memory-p (readings &optional (thresholds (make-memory-thresholds)))
+  "True when the available share of READINGS is above LEAVE-AVAILABLE and at
+   or above STALL-AVAILABLE of THRESHOLDS, the share at which a reading under
+   pressure counts as calm whatever its stall figures. Pure."
+  (let ((available (available-fraction readings)))
+    (and available
+         (> available (memory-thresholds-leave-available thresholds))
+         (>= available (memory-thresholds-stall-available thresholds))
+         t)))
+
+(defun io-driven-p (readings &optional (thresholds (make-memory-thresholds)))
+  "True when READINGS carry an I/O full figure at or above the IO-FULL
+   threshold of THRESHOLDS. Pure."
+  (let ((io-full (memory-readings-io-full-avg10 readings)))
+    (and io-full (>= io-full (memory-thresholds-io-full thresholds)) t)))
 
 ;;; ------------------------------------------------------------------- ranking
 

@@ -584,20 +584,26 @@ not start, 75 when its supervisor loop stalled.
 (defun %check-memory (svc now)
   "Read the host's memory at NOW, in Unix seconds, decide whether it is under
    pressure, and while it is, ask one pool at a time to give memory back.
-   Returns the verdict, :OK or :PRESSURE.
+   Returns the verdict, :OK, :RECLAIM or :PRESSURE.
 
    Entering pressure is reported at WARN with the readings that showed it, and
-   leaving it writes the recovered line that closes the episode. The first
-   check also reports any threshold the environment set to something
-   unusable. Run under the healing protocol, as the supervisor runs it, since
-   relief is asked for by raising a fault."
+   leaving it writes the recovered line that closes the episode. Entering
+   reclaim from :OK is reported at INFO under memory-reclaim, which reaches
+   the service log only, naming I/O when the I/O full figure reaches its
+   threshold; reclaim relieves nothing. Under pressure, a reading with ample
+   memory (MEMORY:AMPLE-MEMORY-P) asks for no relief and reports nothing
+   unrelieved while the clearing hold runs. The first check also
+   reports any threshold the environment set to something unusable. Run
+   under the healing protocol, as the supervisor runs it, since relief is
+   asked for by raising a fault."
   (%report-threshold-warnings svc)
   (let ((readings (funcall (service-memory-reader svc)))
-        (before (memory:memory-state-verdict (service-memory-state svc))))
+        (before (memory:memory-state-verdict (service-memory-state svc)))
+        (thresholds (service-memory-thresholds svc)))
     (multiple-value-bind (verdict state)
-        (memory:classify-memory readings (service-memory-state svc) now
-                                (service-memory-thresholds svc))
+        (memory:classify-memory readings (service-memory-state svc) now thresholds)
       (let* ((some (memory:memory-readings-some-avg10 readings))
+             (full (memory:memory-readings-full-avg10 readings))
              (available (memory:available-fraction readings))
              (percent (and available (round (* 100 available)))))
         (setf (service-memory-state svc) state
@@ -606,17 +612,33 @@ not start, 75 when its supervisor loop stalled.
                                                       :available-percent percent))
         (when (or (null (service-memory-since svc)) (not (eq verdict before)))
           (setf (service-memory-since svc) now))
-        (cond ((and (eq verdict :pressure) (eq before :ok))
+        (cond ((and (eq verdict :pressure) (not (eq before :pressure)))
                (funcall (service-report-fn svc) :warn "memory-pressure" :subject "host"
                         :msg (format nil "the host is short of memory: some avg10=~
                                           ~:[-~;~:*~,1F~] available=~:[-~;~:*~D%~]"
                                      some percent)))
-              ((and (eq verdict :ok) (eq before :pressure))
+              ((and (eq verdict :reclaim) (eq before :ok))
+               (funcall (service-report-fn svc) :info "memory-reclaim" :subject "host"
+                        :msg (format nil "reclaim, not a shortage: memory stalls with ~
+                                          available=~:[-~;~:*~D%~] ~:[and no memory ~
+                                          total~;~:*at or above the ~D% stall ceiling~]; ~
+                                          some avg10=~:[-~;~:*~,1F~] ~
+                                          full avg10=~:[-~;~:*~,1F~]~
+                                          ~@[; I/O-driven: io full avg10=~,1F~]"
+                                     percent
+                                     (and percent
+                                          (round (* 100 (memory:memory-thresholds-stall-available
+                                                         thresholds))))
+                                     some full
+                                     (and (memory:io-driven-p readings thresholds)
+                                          (memory:memory-readings-io-full-avg10 readings)))))
+              ((and (eq before :pressure) (not (eq verdict :pressure)))
                (fleetlog:fleet-recovered "memory-pressure" :subject "host")
                (when (service-unrelieved-reported-p svc)
                  (fleetlog:fleet-recovered "memory-pressure-unrelieved" :subject "host"))
                (setf (service-unrelieved-reported-p svc) nil)))
-        (when (eq verdict :pressure)
+        (when (and (eq verdict :pressure)
+                   (not (memory:ample-memory-p readings thresholds)))
           (%relieve-pressure svc now))
         verdict))))
 
