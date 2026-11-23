@@ -232,6 +232,84 @@ When a release is deployed and no entry exists, =make preflight= registers
 the release launcher itself. Run =make check-preflight= to see the same
 report without changing anything.
 
+** Allowing edits to worktree .envrc files
+
+Run this target to let Claude Code edit, without a permission prompt, the
+=.envrc= of a git worktree in a repository's =.worktrees/= or
+=.claude/worktrees/= directory:
+
+#+begin_src sh
+make install-worktree-permissions
+#+end_src
+
+The target adds these rules to =permissions.allow= in the Claude Code user
+settings file:
+
+#+begin_example
+Edit(/<workspace>/*/.worktrees/**/.envrc)
+Edit(/<workspace>/**/.claude/worktrees/**/.envrc)
+Edit(/<root>/**/.envrc)
+#+end_example
+
+The first rule covers =.worktrees/= in each repository directly under the
+workspace, one level deep. The second covers =.claude/worktrees/= at any depth
+under the workspace. A worktree kept in a directory with another name, or in a
+=.worktrees/= nested deeper, needs an extra root. =<workspace>= is
+=LISP_WORKSPACE= (the Makefile's =WORKSPACE=), by default =~/SourceCode/lisp=.
+Because the path is absolute, each rule reads =Edit(//...)=. The third rule
+appears once for each extra root you list in =DSMR_WORKTREE_ROOTS=, a
+colon-separated list of absolute directories; every =.envrc= under such a
+root becomes editable:
+
+#+begin_src sh
+make install-worktree-permissions DSMR_WORKTREE_ROOTS=<root>
+#+end_src
+
+The workspace and each root are written in canonical form: repeated slashes
+collapse, =.= and =..= resolve, and a trailing slash is dropped, so two
+spellings of one directory give one rule. A root that is empty, relative, the
+filesystem root, or holds a glob character (=* ? [ ] { }=) adds no rule, and
+the report names it with the reason. A workspace of that kind stops the run.
+
+The settings file is =$CLAUDE_CONFIG_DIR/settings.json=, or
+=~/.claude/settings.json= when =CLAUDE_CONFIG_DIR= is unset. Set
+=CLAUDE_SETTINGS= to use another file, for example a scratch copy:
+
+#+begin_src sh
+make install-worktree-permissions CLAUDE_SETTINGS=<scratch file>
+#+end_src
+
+The target appends only the rules that are missing and keeps every other rule
+and key in place. When the file does not exist, the target creates it. An
+existing file is backed up to =<file>.bak-<stamp>= before it is replaced, and
+keeps its mode and any symlink to it. When every rule is already present, the
+target writes nothing. Rewriting the file keeps every value but writes numbers
+in the JSON library's spelling, so =1e3= becomes =1000.0=.
+
+The target refuses the file, and leaves it unchanged, when it:
+
+- is a directory, a symlink to a missing file, or not a regular file;
+- cannot be read, or is not UTF-8;
+- is empty or is not valid JSON;
+- has the wrong shape: a top level that is not an object, a =permissions=
+  that is not an object, or a =permissions.allow= that is not an array;
+- changes while the target is updating it. Run the target again.
+
+To see which rules are missing without writing anything, run:
+
+#+begin_src sh
+make check-worktree-permissions
+#+end_src
+
+=check-worktree-permissions= takes the same variables and exits non-zero
+when a rule is missing or the file is refused.
+
+The bundled installer (=sbcl --script scripts/install.lisp=) offers the same
+step on a terminal, after the hook step. =--no-worktree-permissions= skips it,
+and so does =--no-envrc-defaults=, which sets the consent for the defaults,
+hook and worktree permission steps together. A session started after the run
+reads the new rules.
+
 ** A host registered to a checkout launcher
 
 On a host whose =~/.claude.json= still names =scripts/dsmr-mcp-launch.sh= in

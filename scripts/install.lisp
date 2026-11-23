@@ -16,9 +16,14 @@
 ;;;;                writing ~/.claude.json (for non-Claude agents)
 ;;;;   --no-skill   do not copy the scaffold skill into ~/.claude/skills/
 ;;;;   --no-envrc-defaults  skip the interactive site-wide .envrc defaults step
-;;;;                (otherwise it runs after the install when stdin is a tty)
+;;;;                (otherwise it runs after the install when stdin is a tty);
+;;;;                the hook and worktree permission steps share its consent
+;;;;                setting, so this flag skips them too
 ;;;;   --no-hook    skip the SessionStart auto-arm hook step (otherwise it
 ;;;;                runs after the install when stdin is a tty)
+;;;;   --no-worktree-permissions  skip the step that adds the worktree .envrc
+;;;;                edit rules to the Claude Code user settings (otherwise it
+;;;;                runs after the hook step when stdin is a tty)
 ;;;;   --project DIR  the project whose .claude/settings.json receives the
 ;;;;                SessionStart hook (defaults to the installer's CWD, which is
 ;;;;                rarely the project to instrument — pass this to be explicit)
@@ -71,6 +76,7 @@ an unexpanded ~/, so this is a real input, not a hypothetical."
       (agent :claude-code)
       (install-skill t)
       (install-hook t)
+      (install-worktree-permissions t)
       (project-root nil)
       (site-defaults :interactive)
       (args (uiop:command-line-arguments)))
@@ -83,6 +89,8 @@ an unexpanded ~/, so this is a real input, not a hypothetical."
                  ((string= arg "--no-skill") (setf install-skill nil))
                  ((string= arg "--no-envrc-defaults") (setf site-defaults :skip))
                  ((string= arg "--no-hook") (setf install-hook nil))
+                 ((string= arg "--no-worktree-permissions")
+                  (setf install-worktree-permissions nil))
                  ((string= arg "--project")
                   ;; The directory whose .claude/settings.json receives the
                   ;; SessionStart hook. Without this, the installer defaults the
@@ -98,7 +106,7 @@ an unexpanded ~/, so this is a real input, not a hypothetical."
                  ((or (string= arg "-h") (string= arg "--help"))
                   (format t "~&Usage: sbcl --script scripts/install.lisp ~
 [--keep|--migrate|--replace] [--print] [--no-skill] [--no-envrc-defaults] ~
-[--no-hook] [--project DIR]~%")
+[--no-hook] [--no-worktree-permissions] [--project DIR]~%")
                   (uiop:quit 0))
                  (t
                   (format *error-output* "~&[install] unknown flag: ~A~%" arg)
@@ -114,6 +122,7 @@ an unexpanded ~/, so this is a real input, not a hypothetical."
          :on-existing-cl-mcp on-existing
          :install-skill install-skill
          :install-hook install-hook
+         :install-worktree-permissions install-worktree-permissions
          :site-defaults site-defaults
          ;; Only forward an explicit --project; otherwise let install default it
          ;; (to getcwd) at its own boundary.

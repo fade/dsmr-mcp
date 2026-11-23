@@ -12,7 +12,8 @@
                     (#:config #:dsmr-mcp/src/install/config)
                     (#:claude #:dsmr-mcp/src/install/claude)
                     (#:defaults #:dsmr-mcp/src/install/defaults)
-                    (#:hooks #:dsmr-mcp/src/install/hooks))
+                    (#:hooks #:dsmr-mcp/src/install/hooks)
+                    (#:perms #:dsmr-mcp/src/install/permissions))
   (:export #:install))
 
 (in-package #:dsmr-mcp/src/install)
@@ -117,6 +118,9 @@ keyed by \"dsmr-mcp\"."
                      (project-root nil)
                      (lib-dir nil)
                      (hook-mode nil)
+                     (install-worktree-permissions t)
+                     (permissions-mode nil)
+                     (settings-path nil)
                      (site-defaults :interactive))
   "Install dsmr-mcp as an MCP server for the requested AGENT and report
 what was done.
@@ -163,6 +167,17 @@ SITE-DEFAULTS (which it otherwise inherits). :force installs the hook without
 prompting — for a non-interactive opt-in given out of band, and for tests that
 drive the positive write end-to-end.
 
+INSTALL-WORKTREE-PERMISSIONS (default T) governs the step run after the hook
+step that merges the worktree .envrc edit rules into the Claude Code user
+settings file (see dsmr-mcp/src/install/permissions); NIL skips it (wired to
+--no-worktree-permissions). PERMISSIONS-MODE, when non-NIL, overrides the
+step's consent mode, which otherwise is the SITE-DEFAULTS value. SETTINGS-PATH,
+when non-NIL, names the settings file in place of
+$CLAUDE_CONFIG_DIR/settings.json or ~/.claude/settings.json. The step's result
+is carried as :permissions-result; a declined answer gives :action-taken
+:declined, and an error in the step gives :failed with a :reason, so the
+summary still prints. It never runs under the :print agent.
+
 To extend this installer to a new agent, add a new AGENT keyword here and
 a corresponding IO function (mirroring dsmr-mcp/src/install/claude) that
 reads, transforms via the config core, and writes that agent's config
@@ -201,11 +216,16 @@ augmented with :skill-dir), or NIL for :print."
                             :project-root hook-target
                             :lib-dir (or lib-dir (hooks:default-lib-dir))
                             :mode (or hook-mode site-defaults))))
+            (permissions-result (when install-worktree-permissions
+                                  (perms:offer-worktree-permissions
+                                   :mode (or permissions-mode site-defaults)
+                                   :settings-path settings-path)))
             (full (append result (list :skill-dir skill-dest
                                        :bus-watch-path bus-watch-dest
                                        :envrc-template-dir envrc-template
                                        :hook-project-root hook-target
-                                       :hook-result hook-result))))
+                                       :hook-result hook-result
+                                       :permissions-result permissions-result))))
        (%print-claude-summary full)
        full))))
 
@@ -242,5 +262,15 @@ augmented with :skill-dir), or NIL for :print."
   (let ((b (getf (getf (getf result :hook-result) :hook) :backup-path)))
     (when b
       (format t "  hook backup:  ~A~%" (namestring b))))
+  ;; Name the user settings file the worktree .envrc rules went into, and what
+  ;; the step did with it. A declined or failed step carries no path.
+  (let ((p (getf result :permissions-result)))
+    (if p
+        (format t "  permissions:  ~@[~A ~](~(~A~))~@[: ~A~]~%"
+                (let ((path (getf p :path)))
+                  (and path (uiop:native-namestring path)))
+                (getf p :action-taken)
+                (getf p :reason))
+        (format t "  permissions:  (not offered)~%")))
   (format t "~%Restart Claude Code (or reconnect MCP servers) to pick up ~
 the dsmr-mcp entry.~%"))

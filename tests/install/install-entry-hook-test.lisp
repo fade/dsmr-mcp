@@ -21,7 +21,8 @@
 
 (defpackage #:dsmr-mcp/tests/install/install-entry-hook-test
   (:use #:cl #:zebra)
-  (:local-nicknames (#:jzon #:com.inuoe.jzon))
+  (:local-nicknames (#:jzon #:com.inuoe.jzon)
+                    (#:perms #:dsmr-mcp/src/install/permissions))
   (:import-from #:dsmr-mcp/src/install
                 #:install)
   (:import-from #:dsmr-mcp/src/install/hooks
@@ -59,14 +60,17 @@ could leak into a later run's absence assertions."
   "Point $HOME at a fresh temp dir VAR for the dynamic extent of BODY, restoring
 the previous value on exit. (user-homedir-pathname reads $HOME at call time, so
 this redirects every default install path (~/.claude.json, ~/.claude/skills,
-~/.local/bin, ~/.local/lib) into temp space, keeping the real home untouched.)
-DSMR_HOME and XDG_DATA_HOME are emptied for BODY, so the deploy home is
-VAR/.local/share/dsmr-mcp/, which holds a stub launcher under current/bin/."
+~/.claude/settings.json, ~/.local/bin, ~/.local/lib) into temp space, keeping
+the real home untouched.) DSMR_HOME, XDG_DATA_HOME, CLAUDE_CONFIG_DIR,
+LISP_WORKSPACE and DSMR_WORKTREE_ROOTS are emptied for BODY, so the deploy
+home is VAR/.local/share/dsmr-mcp/, which holds a stub launcher under
+current/bin/, and the Claude Code user settings resolve under VAR/.claude/."
   (let ((old (gensym "OLD-HOME")) (saved (gensym "SAVED")) (pair (gensym "PAIR")))
     `(with-temp-dir (,var ,stem)
        (let ((,old (uiop:getenv "HOME"))
              (,saved (mapcar (lambda (name) (cons name (uiop:getenv name)))
-                             '("DSMR_HOME" "XDG_DATA_HOME"))))
+                             '("DSMR_HOME" "XDG_DATA_HOME" "CLAUDE_CONFIG_DIR"
+                               "LISP_WORKSPACE" "DSMR_WORKTREE_ROOTS"))))
          (unwind-protect
               (progn
                 (sb-posix:setenv "HOME" (namestring ,var) 1)
@@ -154,3 +158,57 @@ VAR/.local/share/dsmr-mcp/, which holds a stub launcher under current/bin/."
         (false (getf result :hook-result))
         ;; The plist still carries the rest of the install result.
         (true (getf result :path))))))
+
+(define-test worktree-permissions-land-in-the-temp-home-settings
+  ;; :permissions-mode :force runs the step without a tty. The settings path
+  ;; resolves under the temp home because with-temp-home empties
+  ;; CLAUDE_CONFIG_DIR, and the rules derive from the temp home's default
+  ;; workspace.
+  (with-temp-home (home "install-entry-perms-home")
+    (let* ((settings (merge-pathnames ".claude/settings.json" home))
+           (result (install :agent :claude-code
+                            :install-hook nil
+                            :permissions-mode :force
+                            :site-defaults :skip
+                            :install-skill nil
+                            :install-bus-watch nil))
+           (perms-result (getf result :permissions-result)))
+      (is eq :created (getf perms-result :action-taken))
+      (true (probe-file settings))
+      (is equal (perms:worktree-envrc-rules (perms:default-workspace) nil)
+          (coerce (gethash "allow" (gethash "permissions"
+                                            (jzon:parse (uiop:read-file-string settings))))
+                  'list)))))
+
+(define-test no-worktree-permissions-writes-no-settings
+  (with-temp-home (home "install-entry-perms-home")
+    (let* ((settings (merge-pathnames ".claude/settings.json" home))
+           (result (install :agent :claude-code
+                            :install-hook nil
+                            :install-worktree-permissions nil
+                            :permissions-mode :force
+                            :site-defaults :skip
+                            :install-skill nil
+                            :install-bus-watch nil)))
+      (false (getf result :permissions-result))
+      (false (probe-file settings)))))
+
+(define-test failed-worktree-permissions-step-still-prints-the-summary
+  ;; A relative LISP_WORKSPACE makes the step fail; install must return and
+  ;; report that failure in its summary instead of signalling.
+  (with-temp-home (home "install-entry-perms-home")
+    (setf (uiop:getenv "LISP_WORKSPACE") "relative/ws")
+    (let* ((settings (merge-pathnames ".claude/settings.json" home))
+           (out (make-string-output-stream))
+           (result (let ((*standard-output* out))
+                     (install :agent :claude-code
+                              :install-hook nil
+                              :permissions-mode :force
+                              :site-defaults :skip
+                              :install-skill nil
+                              :install-bus-watch nil)))
+           (summary (get-output-stream-string out)))
+      (is eq :failed (getf (getf result :permissions-result) :action-taken))
+      (true (search "permissions:  (failed): workspace" summary))
+      (true (search "dsmr-mcp installed for Claude Code." summary))
+      (false (probe-file settings)))))

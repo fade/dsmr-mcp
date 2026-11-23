@@ -48,7 +48,8 @@ WORKER_CORE_IMAGE ?= $(WORKER_CORE)
         install-skills check-skills install-agents check-agents install-harness check-harness install-sisters check-sisters \
         preflight check-preflight self-test-preflight check-release install-hooks check-hooks test-hooks test-restart-session install-restart-session check-restart-session test-routing-probe test-memory-store-path \
         deploy rollback register test-leaf qlot-lock test-build \
-        test-worktree-sister install-worktree-sister check-worktree-sister test-lisp-edit-guard
+        test-worktree-sister install-worktree-sister check-worktree-sister test-lisp-edit-guard \
+        install-worktree-permissions check-worktree-permissions
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -100,6 +101,13 @@ FORCE ?=
 ##   Defaults to the host's own config. A run with a scratch DSMR_HOME must name
 ##   a scratch file here too, or `make register` refuses.
 CLAUDE_CONFIG ?= $(HOME)/.claude.json
+
+## CLAUDE_SETTINGS: the Claude Code user settings file the worktree permission targets read and write.
+##
+##   Defaults to $CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json.
+##   Point it at a scratch file to run either target without touching the
+##   host's settings.
+CLAUDE_SETTINGS ?= $(or $(CLAUDE_CONFIG_DIR),$(HOME)/.claude)/settings.json
 
 ## QLOT: the qlot executable a release build takes its dependencies through.
 ##
@@ -1158,6 +1166,39 @@ register:
 	DSMR_HOME="$$home" DSMR_REGISTER_CONFIG="$$config" "$(SBCL)" --core "$$core" \
 	   --noinform --non-interactive --no-sysinit --no-userinit \
 	   --eval '(format t "~&register: ~S~%" (dsmr-mcp/src/install/claude:install-into-claude :path (uiop:parse-native-namestring (uiop:getenv "DSMR_REGISTER_CONFIG"))))'
+
+## install-worktree-permissions: let Claude Code edit .envrc files in git worktrees.
+##
+##   Appends the missing rules of these shapes to permissions.allow in
+##   CLAUDE_SETTINGS, keeping every other rule and key in place:
+##     Edit(/<workspace>/*/.worktrees/**/.envrc)
+##     Edit(/<workspace>/**/.claude/worktrees/**/.envrc)
+##     Edit(/<root>/**/.envrc)   one per entry of DSMR_WORKTREE_ROOTS
+##   <workspace> is WORKSPACE and each <root> an absolute directory from the
+##   colon-separated DSMR_WORKTREE_ROOTS. An existing file is backed up to
+##   <file>.bak-<stamp> first; a file holding every rule is not written, and one
+##   that cannot be read, is not valid JSON, or has the wrong shape is refused.
+##   A scratch run:
+##   make install-worktree-permissions CLAUDE_SETTINGS=<scratch file>
+install-worktree-permissions:
+	@DSMR_PERMISSIONS_SETTINGS="$(CLAUDE_SETTINGS)" DSMR_PERMISSIONS_WORKSPACE="$(WORKSPACE)" \
+	 DSMR_WORKTREE_ROOTS="$(DSMR_WORKTREE_ROOTS)" $(SBCL) --noinform --disable-debugger --non-interactive \
+	     --eval '(require :asdf)' \
+	     --eval '(let ((*standard-output* *error-output*)) (asdf:load-system "dsmr-mcp/src/install/permissions"))' \
+	     $(TEST_SOURCE_CHECK) \
+	     --eval '(uiop:quit (uiop:symbol-call :dsmr-mcp/src/install/permissions :run-worktree-permissions :settings-path (uiop:getenv "DSMR_PERMISSIONS_SETTINGS") :workspace (uiop:getenv "DSMR_PERMISSIONS_WORKSPACE")))'
+
+## check-worktree-permissions: report whether CLAUDE_SETTINGS holds every worktree .envrc rule.
+##
+##   Same inputs as install-worktree-permissions. Writes nothing. Exits
+##   non-zero when a rule is missing or the file is refused.
+check-worktree-permissions:
+	@DSMR_PERMISSIONS_SETTINGS="$(CLAUDE_SETTINGS)" DSMR_PERMISSIONS_WORKSPACE="$(WORKSPACE)" \
+	 DSMR_WORKTREE_ROOTS="$(DSMR_WORKTREE_ROOTS)" $(SBCL) --noinform --disable-debugger --non-interactive \
+	     --eval '(require :asdf)' \
+	     --eval '(let ((*standard-output* *error-output*)) (asdf:load-system "dsmr-mcp/src/install/permissions"))' \
+	     $(TEST_SOURCE_CHECK) \
+	     --eval '(uiop:quit (uiop:symbol-call :dsmr-mcp/src/install/permissions :run-worktree-permissions :settings-path (uiop:getenv "DSMR_PERMISSIONS_SETTINGS") :workspace (uiop:getenv "DSMR_PERMISSIONS_WORKSPACE") :dry-run t))'
 
 ## core-verify-worker: boot a worker core image and assert it is fit for workers.
 ##
