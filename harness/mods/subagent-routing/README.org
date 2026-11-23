@@ -1,5 +1,5 @@
 #+TITLE: subagent-routing
-#+SUBTITLE: A Claude Code mod that sets a subagent's agent type and model by role
+#+SUBTITLE: A Claude Code mod that sets a subagent's agent type, model, and effort by role
 
 =subagent-routing= sets the agent type and model of GSD executor and
 specialist subagents, according to the role the work needs, and writes one log
@@ -7,6 +7,8 @@ line for every spawn. I wrote it so that GSD plans reach the right executor
 without patches to gsd-core's workflows: shell work goes to =shell-developer=,
 Lisp work goes to the project's own executor, and each specialist runs on the
 model its agent definition names.
+The mod also sets the effort of one agent type, =gsd-plan-checker=, on the
+Agent call that spawns it (see Effort).
 
 In a project whose GSD configuration sets =planning.agents.specialized= to true,
 the mod refuses a =gsd-executor= spawn it cannot place. I made it refuse there
@@ -112,6 +114,36 @@ refused spawn stays refused, and its =refused= line carries the =error=.
 The mod raises a toast for the first =cannot-decide=, =fallback=, =refused=,
 or =error= line of each kind in a session, and for a log it cannot write.
 
+* Effort
+
+The mod sets effort =high= on an Agent call for =gsd-plan-checker= that names
+no effort, unless the =gsd-plan-checker= definition sets =high= or a higher
+level. =high= is a floor: the mod never sets an effort below the one the
+definition sets, and it sets =high= when the definition cannot be read. The
+definition read is the one Claude Code resolves: the project's
+=.claude/agents/gsd-plan-checker.md= when it can be read, else the one under
+=<config>/agents=. A call that names an effort keeps it.
+
+The mod adds no effort to an Agent call for any other agent type,
+=gsd-executor= included. Each of those calls reaches the Agent tool with the
+effort it names, or with none. When the mod passes a =gsd-executor= spawn on
+as =lisp-developer= or =shell-developer=, an effort the =gsd-executor= call
+names carries through to the specialist, since the mod neither adds nor
+removes one. GSD's workflows name no effort on a =gsd-executor= call.
+
+Effort is an argument of the Agent call, and the mod sets it on the call
+before the spawn starts. The agent definitions stay as installed, so the
+setting survives a gsd-core upgrade that rewrites the GSD agents' frontmatter.
+Claude Code's documentation does not say whether the effort on the call
+outranks the effort in the definition. After an install, check the first
+=gsd-plan-checker= transcript: its requests carry the effort the subagent ran
+at.
+
+The mod's Agent call hook matches only =gsd-plan-checker= calls. Claude Code
+cannot move a call to the background while a mod's hook matches it, so a
+running =gsd-plan-checker= call cannot be sent to the background. Every other
+Agent call can.
+
 * The spawn log
 
 The mod writes each session's log to
@@ -136,6 +168,10 @@ fields:
 - =agentId= :: the id of the agent that started, or null
 - =action= :: one of the seven actions below
 - =reason= :: one sentence saying why
+- =effort= :: the effort the mod set on the spawn's Agent call, or null when it
+  set none. When it set one, =reason= ends with =the Agent call was set to
+  effort <level>=, and =action= can still read =unchanged=, since the type and
+  model pass on as requested
 - =version= :: the mod's version
 - =error= :: the error's =name= and =message=, on an =error= line, or on a
   =refused= line when the mod failed after refusing
@@ -161,7 +197,7 @@ loaded, the path of the session's log, and this session's spawns counted by
 action.
 
 #+begin_example
-subagent-routing 0.5.0 loaded <time>; log <path>; this session: <n> spawns, <n> rewrote, <n> cleared-model, <n> unchanged, <n> cannot-decide, <n> fallback, <n> refused, <n> error
+subagent-routing 0.6.0 loaded <time>; log <path>; this session: <n> spawns, <n> rewrote, <n> cleared-model, <n> unchanged, <n> cannot-decide, <n> fallback, <n> refused, <n> error
 #+end_example
 
 A reply of =Unknown command: /subagent-routing= means the mod is not loaded in
