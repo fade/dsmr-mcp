@@ -16,7 +16,9 @@
 ;;;;                writing ~/.claude.json (for non-Claude agents)
 ;;;;   --no-skill   do not copy the scaffold skill into ~/.claude/skills/
 ;;;;   --no-envrc-defaults  skip the interactive site-wide .envrc defaults step
-;;;;                (otherwise it runs after the install when stdin is a tty)
+;;;;                (otherwise it runs after the install when stdin is a tty);
+;;;;                the hook and worktree permission steps share its consent
+;;;;                setting, so this flag skips them too
 ;;;;   --no-hook    skip the SessionStart auto-arm hook step (otherwise it
 ;;;;                runs after the install when stdin is a tty)
 ;;;;   --no-worktree-permissions  skip the step that adds the worktree .envrc

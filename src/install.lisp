@@ -174,7 +174,9 @@ settings file (see dsmr-mcp/src/install/permissions); NIL skips it (wired to
 step's consent mode, which otherwise is the SITE-DEFAULTS value. SETTINGS-PATH,
 when non-NIL, names the settings file in place of
 $CLAUDE_CONFIG_DIR/settings.json or ~/.claude/settings.json. The step's result
-is carried as :permissions-result. It never runs under the :print agent.
+is carried as :permissions-result; a declined answer gives :action-taken
+:declined, and an error in the step gives :failed with a :reason, so the
+summary still prints. It never runs under the :print agent.
 
 To extend this installer to a new agent, add a new AGENT keyword here and
 a corresponding IO function (mirroring dsmr-mcp/src/install/claude) that
@@ -261,11 +263,12 @@ augmented with :skill-dir), or NIL for :print."
     (when b
       (format t "  hook backup:  ~A~%" (namestring b))))
   ;; Name the user settings file the worktree .envrc rules went into, and what
-  ;; the step did with it.
+  ;; the step did with it. A declined or failed step carries no path.
   (let ((p (getf result :permissions-result)))
     (if p
-        (format t "  permissions:  ~A (~(~A~))~@[: ~A~]~%"
-                (uiop:native-namestring (getf p :path))
+        (format t "  permissions:  ~@[~A ~](~(~A~))~@[: ~A~]~%"
+                (let ((path (getf p :path)))
+                  (and path (uiop:native-namestring path)))
                 (getf p :action-taken)
                 (getf p :reason))
         (format t "  permissions:  (not offered)~%")))

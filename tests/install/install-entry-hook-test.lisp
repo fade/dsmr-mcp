@@ -192,3 +192,23 @@ current/bin/, and the Claude Code user settings resolve under VAR/.claude/."
                             :install-bus-watch nil)))
       (false (getf result :permissions-result))
       (false (probe-file settings)))))
+
+(define-test failed-worktree-permissions-step-still-prints-the-summary
+  ;; A relative LISP_WORKSPACE makes the step fail; install must return and
+  ;; report that failure in its summary instead of signalling.
+  (with-temp-home (home "install-entry-perms-home")
+    (setf (uiop:getenv "LISP_WORKSPACE") "relative/ws")
+    (let* ((settings (merge-pathnames ".claude/settings.json" home))
+           (out (make-string-output-stream))
+           (result (let ((*standard-output* out))
+                     (install :agent :claude-code
+                              :install-hook nil
+                              :permissions-mode :force
+                              :site-defaults :skip
+                              :install-skill nil
+                              :install-bus-watch nil)))
+           (summary (get-output-stream-string out)))
+      (is eq :failed (getf (getf result :permissions-result) :action-taken))
+      (true (search "permissions:  (failed): workspace" summary))
+      (true (search "dsmr-mcp installed for Claude Code." summary))
+      (false (probe-file settings)))))
