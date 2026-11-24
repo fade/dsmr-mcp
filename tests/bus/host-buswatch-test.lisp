@@ -415,6 +415,25 @@
       (is = 1 (length (log-lines "alpha")) "the agent heard the new records")
       (is = 1 (buswatch:bus-watch-generation bw) "the last known generation stands"))))
 
+(define-test a-watch-opened-on-an-unknown-generation-sees-the-next-rotation
+  "The watch opens on an empty log with a refused generation file. Records 1 to
+   4 land, the log is sealed, which writes a readable generation, and records 1
+   and 2 land in the new log, all before the first step. That step raises
+   WAL-ROTATED once."
+  (with-host ()
+    (write-text (wal:generation-path (wal-path)) "#S(foo)")
+    (let ((bw (open-watch :feed nil)))
+      (false (buswatch:bus-watch-generation bw) "the generation is unknown at open")
+      (loop for seq from 1 to 4 do (append-from seq *other*))
+      (archive:archive-wal (wal-path) (broker:bus-paths-root
+                                       (broker:make-bus-paths
+                                        (broker:default-state-root *bus*))))
+      (true (integerp (wal:generation (wal-path))) "the seal wrote a generation")
+      (append-from 1 *other*)
+      (append-from 2 *other*)
+      (step-watch bw '())
+      (is = 1 (length (reports :info "wal-rotated")) "the rotation was raised once"))))
+
 (define-test an-agent-without-a-cursor-hears-the-new-log-after-a-rotation
   "An agent with no cursor of its own was armed at the head of the old log.
    Everything in the new log arrived after the rotation, so it is all owed to

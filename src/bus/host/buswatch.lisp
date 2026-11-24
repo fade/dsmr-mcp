@@ -232,7 +232,7 @@
         (conditions:raise-fault 'conditions:wal-rotated
                                 :bus (bus-watch-name bw)
                                 :subject (%subject bw)
-                                :detail (format nil "the log restarted at generation ~D"
+                                :detail (format nil "the log restarted at generation ~:[unknown~;~:*~D~]"
                                                 (bus-watch-generation bw)))
         (sb-thread:with-recursive-lock ((bus-watch-lock bw))
           (%arm-again bw identities report-fn)))
@@ -318,10 +318,12 @@
              (generation (wal:generation (bus-watch-wal-path bw)))
              (seen (bus-watch-generation bw))
              (rotated (or restarted
-                          (and generation seen (/= generation seen))))
+                          (and generation (not (eql generation seen)))))
              (grew (and (not rotated) (> last (bus-watch-last-seq bw)))))
         ;; An unknown generation (NIL) neither counts as a rotation nor
-        ;; replaces the last one known.
+        ;; replaces the last one known. A known generation after an unknown one
+        ;; counts as a rotation: only a seal writes the generation, and a watch
+        ;; that opened on an empty log has no read position to show the restart.
         (setf (bus-watch-generation bw) (or generation seen)
               (bus-watch-last-seq bw) last)
         (when rotated

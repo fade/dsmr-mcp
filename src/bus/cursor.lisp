@@ -109,9 +109,13 @@
   ;; log it belongs to and a rotation makes that the difference between a reader
   ;; that is behind and one that is reading a log that no longer exists. The
   ;; sequence number stays first, so anything reading only the leading value
-  ;; still reads the position correctly. An unknown log generation (NIL) is
-  ;; left out, so the cursor names none rather than a guessed one.
+  ;; still reads the position correctly. While the log generation is unknown
+  ;; (NIL), the generation the cursor already records is written again: dropping
+  ;; it would leave the cursor unable to read as stranded after the next
+  ;; rotation, so it would skip the start of the new log.
   (let* ((target (subscriber-cursor-path subscriber))
+         (generation (or (wal:generation (subscriber-wal subscriber))
+                         (%recorded-generation target)))
          (temp (make-pathname :name (format nil "~A.tmp~D"
                                             (or (pathname-name target) "cursor")
                                             (random 100000000))
@@ -122,7 +126,7 @@
            (with-open-file (out temp :direction :output
                                      :if-exists :supersede
                                      :if-does-not-exist :create)
-             (format out "~D~@[ ~D~]" seq (wal:generation (subscriber-wal subscriber)))
+             (format out "~D~@[ ~D~]" seq generation)
              (finish-output out))
            (rename-file temp target)
            (setf temp nil))

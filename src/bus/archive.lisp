@@ -52,6 +52,9 @@
   (when (%wal-empty-p wal-path)
     (return-from archive-wal nil))
   (wal:recover wal-path)                 ; truncate any torn tail before sealing
+  ;; Before anything destructive: a generation path that cannot take the new
+  ;; value must be cleared or refused while the live log is still intact.
+  (wal:ensure-generation-writable wal-path)
   (let* ((stamp (if now-supplied-p now (wal:now-ms)))
          (archive (merge-pathnames
                    (format nil "~A.archive-~D" (file-namestring wal-path) stamp)

@@ -661,6 +661,9 @@
    the new log wake the agent, so it is done here, and only when the cursor is
    provably stranded. It moves to 0 when the log it named is gone (the new log
    is wholly owed), or to the head when the same log was shortened under it.
+   With the log generation unknown, a cursor above the head moves to 0: which
+   of the two happened cannot be told, and redelivery duplicates records where
+   a move to the head could lose them.
    With REBASE-P false, or when the rewrite fails, the baseline clamps to the
    head instead: never silence, at worst a missed backlog that the report
    names.

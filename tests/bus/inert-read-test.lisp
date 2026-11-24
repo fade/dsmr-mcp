@@ -24,7 +24,8 @@
                     (#:roster #:dsmr-mcp/src/bus/roster)
                     (#:envelope #:dsmr-mcp/src/bus/envelope)
                     (#:broker #:dsmr-mcp/src/bus/broker)
-                    (#:status #:dsmr-mcp/src/bus/status)))
+                    (#:status #:dsmr-mcp/src/bus/status)
+                    (#:archive #:dsmr-mcp/src/bus/archive)))
 
 (in-package #:dsmr-mcp/tests/bus/inert-read-test)
 
@@ -730,3 +731,65 @@
       (let ((new (wal:bump-generation wal-path)))
         (true (and (integerp new) (> new 6)) "the rotation wrote a higher generation")
         (is eql new (wal:generation wal-path) "and it reads back")))))
+
+(define-test a-cursor-keeps-its-generation-while-the-logs-is-unknown
+  "A cursor at 3 recorded against generation 5 is written again while the
+   generation file is refused, and keeps 5. After a rotation and a new log
+   grown past 3, the cursor reads as a generation mismatch, so records 1 to 3
+   of the new log are not skipped."
+  (with-temp-dir (dir)
+    (let* ((sub (probe-subscriber dir))
+           (wal-path (cursor:subscriber-wal sub))
+           (cursor-path (cursor:subscriber-cursor-path sub)))
+      (loop for seq from 1 to 4
+            do (wal:append-record wal-path seq (format nil "old ~D" seq)))
+      (wal::%write-generation wal-path 5)
+      (setf (cursor:cursor-value sub) 3)
+      (plant (wal:generation-path wal-path) "#S(foo)")
+      (setf (cursor:cursor-value sub) 3)
+      (is eql 5 (cursor::%recorded-generation cursor-path) "the write kept generation 5")
+      (true (archive:archive-wal wal-path dir) "the log was sealed")
+      (loop for seq from 1 to 6
+            do (wal:append-record wal-path seq (format nil "new ~D" seq)))
+      (is eq :generation-mismatch (cursor:stranded-reason sub)))))
+
+(define-test a-directory-at-the-generation-path-does-not-stop-a-rotation
+  "With a directory where the generation file belongs, ARCHIVE-WAL seals the log,
+   moves the directory aside, and leaves a readable generation."
+  (with-temp-dir (dir)
+    (let* ((wal-path (merge-pathnames "bus.wal" dir))
+           (generation-dir (uiop:ensure-directory-pathname
+                            (wal:generation-path wal-path))))
+      (loop for seq from 1 to 3
+            do (wal:append-record wal-path seq (format nil "old ~D" seq)))
+      (plant (merge-pathnames "inside" generation-dir) "x")
+      (is eq :returned (refusal (archive:archive-wal wal-path dir)) "the rotation completed")
+      (true (integerp (wal:generation wal-path)) "a readable generation was written")
+      (is = 0 (wal:scan wal-path) "the live log was emptied")
+      (true (find-if (lambda (p)
+                       (search "bus.wal.generation.bad-"
+                               (namestring p)))
+                     (uiop:subdirectories dir))
+            "the directory was moved aside"))))
+
+(define-test status-and-the-strand-check-agree-under-an-unknown-generation
+  "With a refused generation file and a cursor above the head, the status
+   inventory reports the same stranded reason the strand check gives, which is
+   what bus-receive reports."
+  (with-temp-dir (dir)
+    (let* ((paths (broker:make-bus-paths dir))
+           (wal-path (plant (broker:bus-paths-wal paths) ""))
+           (cursor-path (plant (merge-pathnames "probe"
+                                                (broker:bus-paths-cursors-dir paths))
+                               "9 5"))
+           (sub (cursor:make-subscriber "probe" wal-path cursor-path)))
+      (loop for seq from 1 to 2
+            do (wal:append-record wal-path seq (format nil "r ~D" seq)))
+      (plant (wal:generation-path wal-path) "#S(foo)")
+      (let* ((expected (cursor:stranded-reason sub :head (wal:scan wal-path)
+                                                   :log-generation (wal:generation wal-path)))
+             (inventory (status:cursor-inventory paths))
+             (rows (getf (getf inventory :cursors) :value)))
+        (is eq :cursor-above-head expected)
+        (is eq expected (getf (first rows) :stranded-reason))
+        (is eql 1 (getf (getf inventory :stranded-count) :value))))))

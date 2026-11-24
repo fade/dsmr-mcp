@@ -39,6 +39,7 @@
            #:append-record
            #:scan
            #:generation #:generation-path #:bump-generation
+           #:ensure-generation-writable
            #:read-records
            #:reader #:make-reader #:reset-reader
            #:reader-offset #:reader-anchor #:reader-last-seq
@@ -281,12 +282,14 @@
 
    A generation file that is present but unreadable, refused, or not a
    non-negative integer reads NIL, and nothing is signalled, so a planted file
-   cannot stop cursor writes or rotation. NIL is deliberately not 0: cursors
+   cannot stop cursor writes. NIL is deliberately not 0: every sound cursor
    recorded against the real generation would read as stranded against 0, and
-   healing them would redeliver the whole log. Callers compare nothing against
-   NIL. A cursor write records no generation, the strand check reports no
-   mismatch, and BUMP-GENERATION writes a fresh generation at the next
-   rotation."
+   healing them all would redeliver the whole log to everyone. Callers compare
+   nothing against NIL:
+   - a cursor write keeps the generation the cursor already records;
+   - the strand check reports no generation mismatch, only a cursor above the
+     head;
+   - BUMP-GENERATION writes a fresh generation at the next rotation."
   (handler-case
       (multiple-value-bind (data present-p)
           (inert-read:read-state-file (generation-path wal-path))
@@ -295,6 +298,23 @@
                 ((and (integerp value) (>= value 0)) value)
                 (t nil))))
     (error () nil)))
+
+(defun ensure-generation-writable (wal-path)
+  "Make WAL-PATH's generation path one a file can be renamed over, and return
+   that path. A directory there, which no writer creates, is renamed to
+   <name>.bad-<ms> beside it and kept for inspection. Signals an ERROR when the
+   directory cannot be moved."
+  (let* ((target (generation-path wal-path))
+         (found (probe-file target)))
+    (when (and found (uiop:directory-pathname-p found))
+      (let ((from (sb-ext:native-namestring target))
+            (to (format nil "~A.bad-~D" (sb-ext:native-namestring target) (now-ms))))
+        (multiple-value-bind (ok errno) (sb-unix:unix-rename from to)
+          (unless ok
+            (error "The log generation path ~A is a directory that cannot be moved ~
+                    aside (errno ~D). Check the permissions of its parent directory."
+                   from errno)))))
+    target))
 
 (defun %write-generation (wal-path value)
   "Replace WAL-PATH's generation file with VALUE, atomically.
@@ -305,7 +325,7 @@
    either the old value or the new one. A torn generation file would be worse
    than none at all, because a reader comparing against garbage reports every
    cursor on the bus stranded."
-  (let* ((target (generation-path wal-path))
+  (let* ((target (ensure-generation-writable wal-path))
          (temp (make-pathname :name (format nil "~A.tmp~D"
                                             (or (pathname-name target) "generation")
                                             (random 100000000))
@@ -333,8 +353,13 @@
 
    When the current generation is unknown (GENERATION returns NIL), writes the
    current time in Unix milliseconds instead. That value exceeds any counter a
-   cursor can have recorded, so the generation never moves backwards and every
-   cursor from before the rotation reads as stranded, as after any rotation."
+   cursor can have recorded, so the generation never moves backwards, and every
+   cursor that records a generation reads as stranded after the rotation. A
+   cursor that records none, written before generations were recorded, reads
+   as stranded only when it is above the head of the new log.
+
+   A directory at the generation path is moved aside first (see
+   ENSURE-GENERATION-WRITABLE)."
   (let ((current (generation wal-path)))
     (%write-generation wal-path (if current (1+ current) (now-ms)))))
 
