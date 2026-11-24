@@ -37,7 +37,8 @@
 
 (defpackage #:dsmr-mcp/src/bus/cursor
   (:use #:cl)
-  (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal))
+  (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal)
+                    (#:inert-read #:dsmr-mcp/src/bus/inert-read))
   (:export #:subscriber #:make-subscriber
            #:subscriber-id #:subscriber-wal #:subscriber-cursor-path
            #:cursor-value
@@ -81,8 +82,8 @@
   (when (probe-file path)
     (with-open-file (in path :if-does-not-exist nil)
       (when in
-        (read in nil nil)                  ; the sequence number, read elsewhere
-        (let ((generation (read in nil nil)))
+        (inert-read:read-datum in)         ; the sequence number, read elsewhere
+        (let ((generation (inert-read:read-datum in)))
           (and (integerp generation) (>= generation 0) generation))))))
 
 (defun cursor-value (subscriber)
@@ -91,7 +92,7 @@
   (let ((path (subscriber-cursor-path subscriber)))
     (if (probe-file path)
         (with-open-file (in path :if-does-not-exist nil)
-          (or (and in (let ((v (read in nil nil)))
+          (or (and in (let ((v (inert-read:read-datum in)))
                         (and (integerp v) (>= v 0) v)))
               0))
         0)))
