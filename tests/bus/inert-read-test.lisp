@@ -342,8 +342,8 @@
 
 (define-test read-datum-refuses-package-qualified-symbols
   "A token with a package marker after its first character signals
-   REFUSED-SYNTAX and interns nothing. Keywords, uninterned symbols, and colons
-   inside strings, comments, characters and escapes still read."
+   REFUSED-SYNTAX and interns nothing. Keywords, and colons inside strings,
+   comments, characters and backslash escapes, still read."
   (let ((name (format nil "ZZ-INERT-READ-PLANTED-~D" (random 1000000000)))
         (target (find-package "DSMR-MCP/SRC/BUS/BROKER")))
     (is eq :refused (refusal (read-text (format nil "dsmr-mcp/src/bus/broker::~A" name))))
@@ -356,10 +356,38 @@
   (is equal "a::b" (read-text "\"a::b\""))
   (is eql #\: (read-text "#\\:"))
   (is = 7 (read-text (format nil "; a::b~%7")))
-  (is = 7 (read-text "#| a::b |# 7"))
-  (is equal "a:b" (symbol-name (read-text "|a:b|")))
-  (is eq nil (symbol-package (read-text "#:foo")))
+  (is equal "A:B" (symbol-name (read-text "a\\:b")))
   (is equal '(:k "x:y" #\: 3) (read-text "(:k \"x:y\" #\\: 3)")))
+
+(define-test read-datum-refuses-syntax-the-scan-does-not-model
+  "Backquote, comma, vertical bar, #| comments and #: uninterned symbols signal
+   REFUSED-SYNTAX, so the scan and the reader never parse a text differently.
+   The two shapes that once hid a package-qualified symbol from the scan intern
+   nothing."
+  (let ((victim (or (find-package "INERT-READ-VICTIM")
+                    (make-package "INERT-READ-VICTIM" :use '()))))
+    (is eq :refused (refusal (read-text "(#:#|| inert-read-victim::evil-b |#|)")))
+    (is eq :refused (refusal (read-text "`(,@#|\\|#inert-read-victim::evil-c)")))
+    (false (find-symbol "EVIL-B" victim) "EVIL-B was not interned")
+    (false (find-symbol "EVIL-C" victim) "EVIL-C was not interned"))
+  (dolist (text '("`(1)" ",x" "(1 ,@x)" "#| c |# 1" "#:foo" "|a|" "a|b|c" "(:a |x|)"))
+    (is eq :refused (refusal (read-text text)) text))
+  (is eql #\| (read-text "#\\|"))
+  (is equal "a|b`c,d" (read-text "\"a|b`c,d\""))
+  (is = 3 (read-text (format nil "; `,|#|~%3"))))
+
+(define-test a-timeout-during-a-read-is-not-turned-into-a-refusal
+  "An SB-EXT:TIMEOUT raised while READ-DATUM is reading escapes as itself, never
+   as REFUSED-SYNTAX. The input is a slow number of 8190 characters, so each
+   timeout lands inside the reader."
+  (let ((slow (concatenate 'string "0." (make-string 8187 :initial-element #\0) "1")))
+    (dotimes (trial 5)
+      (is eq :timeout
+          (handler-case (sb-ext:with-timeout 0.01
+                          (loop (read-text slow)))
+            (sb-ext:timeout () :timeout)
+            (inert-read:refused-syntax () :converted))
+          (format nil "trial ~D" trial)))))
 
 (define-test read-state-file-reads-up-to-count-data
   "READ-STATE-FILE returns the first COUNT data and T; fewer when the file

@@ -5,11 +5,11 @@
 ;;;; heartbeats, roster entries, host records and broker identities sit under a
 ;;;; state root that every bus participant of the same user can write, so their
 ;;;; content is untrusted. READ-STATE-FILE opens a state file without blocking,
-;;;; refuses anything but a small regular file, and reads its data with
-;;;; READ-DATUM. READ-DATUM reads with fixed reader variables and read-time
-;;;; evaluation off, bounds size, nesting and prefixes, refuses
-;;;; package-qualified symbols, and refuses the dispatch syntax no bus writer
-;;;; emits: #S, #=, ##, #A, #n( and #n*.
+;;;; refuses anything but a regular file within its byte limit, and reads its
+;;;; data with READ-DATUM. READ-DATUM reads with fixed reader variables and
+;;;; read-time evaluation off, bounds size, nesting and prefixes, refuses
+;;;; package-qualified symbols, and refuses the syntax no bus writer emits:
+;;;; backquote, comma, vertical bar, #S, #=, ##, #A, #|, #:, #n( and #n*.
 ;;;;
 ;;;; CL only, apart from the descriptor checks in %READ-FILE-TEXT, which use
 ;;;; sb-posix: the watcher binary loads this leaf and must not pull in a parser
@@ -53,9 +53,11 @@
     refuse. #S runs an image-defined constructor and its slot initforms. #A
     runs an image-defined type expander. #n( , #n* and #A allocate from a count
     in the text. #= and ## build circular structure that makes a plist walk
-    loop forever. A file that is not a regular file can block the opener or
-    never end. Any other condition the reader signals, storage exhaustion
-    included, arrives as this condition with SUB-CHAR NIL."))
+    loop forever. Backquote, comma, vertical bar, #| and #: are refused so
+    the pre-read scan and the reader always parse a text the same way. A file
+    that is not a regular file can block the opener or never end. Any other
+    ERROR or STORAGE-CONDITION the reader signals arrives as this condition
+    with SUB-CHAR NIL."))
 
 (defconstant +byte-limit+ 8192
   "Default for the most bytes READ-STATE-FILE reads from a file, and the most
@@ -70,8 +72,8 @@
   "Deepest list nesting the text may hold. Bus writers nest two levels at most.")
 
 (defconstant +prefix-limit+ 64
-  "Most quote, backquote, comma and # dispatch prefixes the text may hold. Each
-   makes the reader recurse; bus writers emit none of them.")
+  "Most quote and # dispatch prefixes the text may hold. Each makes the reader
+   recurse; bus writers emit none of them.")
 
 (defun %refuse-input (path control &rest arguments)
   "Signal REFUSED-SYNTAX naming no character, for PATH or NIL, with the reason
@@ -91,32 +93,20 @@
                      (t (incf i))))
           finally (return n))))
 
-(defun %skip-block-comment (text start)
-  "Index just past the |# closing a #| comment whose body starts at START in
-   TEXT, counting nested #| |# pairs, or the length of TEXT."
-  (let ((n (length text))
-        (depth 1)
-        (i start))
-    (flet ((pair-p (first second)
-             (and (char= (char text i) first) (char= (char text (1+ i)) second))))
-      (loop while (< i (1- n))
-            do (cond ((pair-p #\| #\#)
-                      (incf i 2)
-                      (when (zerop (decf depth))
-                        (return-from %skip-block-comment i)))
-                     ((pair-p #\# #\|) (incf depth) (incf i 2))
-                     (t (incf i)))))
-    n))
-
 (defun %check-text (text path limit)
-  "Signal REFUSED-SYNTAX, naming PATH, when TEXT is longer than LIMIT characters,
-   nests lists deeper than +NESTING-LIMIT+, holds more than +PREFIX-LIMIT+
-   quote, backquote, comma or # dispatch prefixes, or holds a token with a
-   package marker after its first character. Strings, comments, character
-   names and escaped characters are skipped as the reader skips them.
+  "Signal REFUSED-SYNTAX, naming PATH, when TEXT:
+   - is longer than LIMIT characters;
+   - nests lists deeper than +NESTING-LIMIT+;
+   - holds more than +PREFIX-LIMIT+ quote or # dispatch prefixes;
+   - holds backquote, comma, vertical bar, #| or #:;
+   - holds a token with a package marker after its first character.
+   Strings, ; comments, character names and backslash escapes are skipped as
+   the reader skips them.
 
    The scan runs before READ, so a package-qualified symbol is never interned
-   and the reader never recurses past the limits. A single leading colon, a
+   and the reader never recurses past the limits. Every construct whose extent
+   the scan does not follow is refused here and by the readtable, so the scan
+   and the reader cannot parse a text differently. A single leading colon, a
    keyword, still reads."
   (let ((n (length text))
         (i 0)
@@ -132,6 +122,8 @@
              (when (> (incf prefixes) +prefix-limit+)
                (%refuse-input path "it holds more than ~D quote or dispatch prefixes"
                               +prefix-limit+)))
+           (unmodelled (what)
+             (%refuse-input path "it holds ~A, which no bus writer emits" what))
            (constituent (next)
              (setf token-length (1+ (or token-length 0))
                    i next)))
@@ -151,10 +143,14 @@
                         (setf token-length nil
                               depth (max 0 (1- depth)))
                         (incf i))
-                       ((member c '(#\' #\` #\,))
+                       ((char= c #\')
                         (setf token-length nil)
                         (incf i)
                         (prefix))
+                       ((member c '(#\` #\,))
+                        (unmodelled "backquote or comma syntax"))
+                       ((char= c #\|)
+                        (unmodelled "a vertical bar"))
                        ((member c '(#\Space #\Tab #\Newline #\Return #\Page #\Linefeed))
                         (setf token-length nil)
                         (incf i))
@@ -164,15 +160,15 @@
                                 do (incf j))
                           (cond ((>= j n) (setf i n))
                                 ((char= (char text j) #\|)
-                                 (setf i (%skip-block-comment text (1+ j))))
+                                 (unmodelled "a #| comment"))
+                                ((char= (char text j) #\:)
+                                 (unmodelled "an uninterned symbol"))
                                 ((char= (char text j) #\\)
                                  (constituent (min n (+ j 2))))
                                 (t
                                  (prefix)
                                  (setf i (1+ j))
                                  (when (char= (char text j) #\() (open-list))))))
-                       ((char= c #\|)
-                        (constituent (%skip-delimited text (1+ i) #\|)))
                        ((char= c #\\)
                         (constituent (min n (+ i 2))))
                        ((char= c #\:)
@@ -196,13 +192,21 @@
       (%refuse stream sub-char arg)
       (funcall (get-dispatch-macro-character #\# sub-char nil) stream sub-char arg)))
 
+(defun %refuse-macro (stream char)
+  "Macro character function: signal REFUSED-SYNTAX for CHAR on STREAM."
+  (error 'refused-syntax
+         :stream stream
+         :reason (format nil "~A syntax, which no bus writer emits" char)))
+
 (defun %make-refusing-readtable ()
-  "A copy of the standard readtable that refuses #S, #=, ##, #A, #n( and #n*.
-   The entries hold function names, not function objects, so a redefinition of
-   %REFUSE or %REFUSE-COUNTED reaches the table. The standard readtable itself
-   is never modified."
+  "A copy of the standard readtable that refuses backquote, comma, vertical
+   bar, #S, #=, ##, #A, #|, #:, #n( and #n*. The entries hold function names,
+   not function objects, so a redefinition of a refusing function reaches the
+   table. The standard readtable itself is never modified."
   (let ((table (copy-readtable nil)))
-    (dolist (sub-char '(#\S #\= #\# #\A))
+    (dolist (char '(#\` #\, #\|))
+      (set-macro-character char '%refuse-macro nil table))
+    (dolist (sub-char '(#\S #\= #\# #\A #\| #\:))
       (set-dispatch-macro-character #\# sub-char '%refuse table))
     (dolist (sub-char '(#\( #\*) table)
       (set-dispatch-macro-character #\# sub-char '%refuse-counted table))))
@@ -234,7 +238,9 @@
                 for datum = (read in nil eof)
                 until (eq datum eof)
                 collect datum)
-        (serious-condition (c)
+        ;; Only what the reader itself can cause. A timeout, deadline or
+        ;; interrupt is neither, and must reach the caller as itself.
+        ((or storage-condition error) (c)
           (if (typep c '(or reader-error end-of-file))
               (error c)
               (error 'refused-syntax
@@ -268,14 +274,16 @@
    +BYTE-LIMIT+ characters of names per read. A package-qualified symbol is
    refused before anything is interned.
 
-   Signals only these conditions, each an ERROR:
+   Signals these conditions, each an ERROR:
    - READER-ERROR for malformed syntax and for #.;
-   - REFUSED-SYNTAX, a READER-ERROR, for #S, #=, ##, #A, #n( and #n*, for a
+   - REFUSED-SYNTAX, a READER-ERROR, for the refused syntax (backquote, comma,
+     vertical bar, #S, #=, ##, #A, #|, #:, #n( and #n*), for a
      package-qualified symbol, for text over +BYTE-LIMIT+ characters, nested
      deeper than +NESTING-LIMIT+ or holding more than +PREFIX-LIMIT+ prefixes,
-     and for any other condition the reader signals, storage exhaustion
-     included;
-   - END-OF-FILE for a form cut off by end of file."
+     and for any other ERROR or STORAGE-CONDITION the reader signals;
+   - END-OF-FILE for a form cut off by end of file.
+   Any other serious condition raised during the read, such as a timeout or an
+   interrupt, passes through unchanged."
   (let ((data (%read-data (if (stringp source) source (%read-stream-text source))
                           1 nil +byte-limit+)))
     (if data (first data) eof-value)))
@@ -311,15 +319,17 @@
   "The text of the regular file at PATH, decoded as UTF-8, and T; or NIL and NIL
    when no file exists there.
 
-   Opens without blocking and checks the open descriptor, so a FIFO cannot
-   block the open and a rename after the check cannot substitute another file.
+   Opens without blocking and without taking a controlling terminal, and checks
+   the open descriptor, so a FIFO cannot block the open, a terminal cannot
+   become the process's controlling terminal, and a rename after the check
+   cannot substitute another file.
    Signals REFUSED-SYNTAX when the file cannot be opened, is not a regular file
    after symlinks are followed, is not owned by uid OWNER (when OWNER is
    non-NIL), holds more than BYTE-LIMIT bytes, or is not UTF-8."
   (let ((fd (handler-case
                 (sb-posix:open (sb-ext:native-namestring
                                 (translate-logical-pathname (merge-pathnames path)))
-                               (logior sb-posix:o-rdonly sb-posix:o-nonblock))
+                               (logior sb-posix:o-rdonly sb-posix:o-nonblock sb-posix:o-noctty))
               (sb-posix:syscall-error (e)
                 (let ((errno (sb-posix:syscall-errno e)))
                   (if (member errno (list sb-posix:enoent sb-posix:enotdir))
