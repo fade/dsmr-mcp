@@ -410,6 +410,20 @@
         (write-sequence (coerce #(49 255 50) '(vector (unsigned-byte 8))) out))
       (is eq :refused (refusal (inert-read:read-state-file path))))))
 
+(define-test read-state-file-honours-the-callers-byte-limit
+  "A 20 KB file reads under :BYTE-LIMIT 65536 and is refused under the default
+   8192. A limit above 1 MiB is capped at 1 MiB."
+  (with-temp-dir (dir)
+    (let ((path (merge-pathnames "state" dir))
+          (big (concatenate 'string "1" (make-string 20000 :initial-element #\Space))))
+      (plant path big)
+      (is equal '(1) (inert-read:read-state-file path :byte-limit 65536))
+      (is eq :refused (refusal (inert-read:read-state-file path)))
+      (plant path (concatenate 'string "1" (make-string (* 1536 1024)
+                                                        :initial-element #\Space)))
+      (is eq :refused (refusal (inert-read:read-state-file
+                                path :byte-limit (* 4 1024 1024)))))))
+
 (define-test read-datum-signals-end-of-file-on-a-truncated-form
   "A form cut off by end of file signals END-OF-FILE, as CL:READ does."
   (fail (read-text "(:pid 1") end-of-file))
@@ -521,6 +535,30 @@
           (plist (list :name "host" :pid 4242 :parked nil :live t)))
       (hostfiles:write-plist-file path plist)
       (multiple-value-bind (read status) (hostfiles:read-plist-file path)
+        (is eq :ok status)
+        (is equal plist read)))))
+
+(define-test a-service-status-over-8-kb-reads-through-the-host-status-reader
+  "A service status plist of more than 8192 bytes, 80 registrations, written by
+   WRITE-PLIST-FILE, reads back as :OK through READ-PLIST-FILE with the 1 MiB
+   limit --host-status passes."
+  (with-temp-dir (dir)
+    (let* ((path (merge-pathnames "service.status" dir))
+           (registrations
+             (loop for i from 1 to 80
+                   collect (list :id (format nil "/home/operator/SourceCode/project-~2,'0D/agent" i)
+                                 :bus "default" :pid (+ 40000 i) :state :armed
+                                 :since 1795507912)))
+           (plist (list :written-at 1795507912 :pid 4242
+                        :buses (list (list :bus "default" :owner :service))
+                        :registrations registrations)))
+      (hostfiles:write-plist-file path plist)
+      (true (> (with-open-file (in path :element-type '(unsigned-byte 8))
+                 (file-length in))
+               8192)
+            "the record is larger than 8192 bytes")
+      (multiple-value-bind (read status)
+          (hostfiles:read-plist-file path :max-bytes (* 1024 1024))
         (is eq :ok status)
         (is equal plist read)))))
 

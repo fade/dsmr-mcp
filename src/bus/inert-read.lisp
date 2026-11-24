@@ -58,8 +58,13 @@
     included, arrives as this condition with SUB-CHAR NIL."))
 
 (defconstant +byte-limit+ 8192
-  "Most bytes READ-STATE-FILE reads from a file, and most characters READ-DATUM
-   reads from its source. Every bus state file a writer produces is far smaller.")
+  "Default for the most bytes READ-STATE-FILE reads from a file, and the most
+   characters READ-DATUM reads from its source. Cursors, generations, beats,
+   roster entries and broker identities are far smaller.")
+
+(defconstant +byte-ceiling+ (* 1024 1024)
+  "The largest byte limit a READ-STATE-FILE caller may ask for. The host service
+   status summary grows with the number of registrations and asks for this.")
 
 (defconstant +nesting-limit+ 32
   "Deepest list nesting the text may hold. Bus writers nest two levels at most.")
@@ -103,8 +108,8 @@
                      (t (incf i)))))
     n))
 
-(defun %check-text (text path)
-  "Signal REFUSED-SYNTAX, naming PATH, when TEXT is longer than +BYTE-LIMIT+,
+(defun %check-text (text path limit)
+  "Signal REFUSED-SYNTAX, naming PATH, when TEXT is longer than LIMIT characters,
    nests lists deeper than +NESTING-LIMIT+, holds more than +PREFIX-LIMIT+
    quote, backquote, comma or # dispatch prefixes, or holds a token with a
    package marker after its first character. Strings, comments, character
@@ -118,8 +123,8 @@
         (depth 0)
         (prefixes 0)
         (token-length nil))
-    (when (> n +byte-limit+)
-      (%refuse-input path "it is longer than ~D characters" +byte-limit+))
+    (when (> n limit)
+      (%refuse-input path "it is longer than ~D characters" limit))
     (flet ((open-list ()
              (when (> (incf depth) +nesting-limit+)
                (%refuse-input path "it nests lists deeper than ~D" +nesting-limit+)))
@@ -206,15 +211,16 @@
   "Readtable READ-DATUM reads under. Rebuilt on every load, so reloading this
    file applies a changed refused set; never mutated otherwise.")
 
-(defun %read-data (text count path)
+(defun %read-data (text count path limit)
   "A list of up to COUNT data read from TEXT, shorter when TEXT ends first.
-   PATH, or NIL, names the source in a refusal.
+   PATH, or NIL, names the source in a refusal. TEXT longer than LIMIT
+   characters is refused.
 
    Binds the reader variables to fixed values, independent of the caller:
    *READ-EVAL* NIL, *READ-BASE* 10, *READ-DEFAULT-FLOAT-FORMAT* SINGLE-FLOAT,
    *READ-SUPPRESS* NIL, *PACKAGE* CL-USER, and *READTABLE* the refusing copy of
    the standard readtable. Printer variables are left as the caller has them."
-  (%check-text text path)
+  (%check-text text path limit)
   (let ((*readtable* *refusing-readtable*)
         (*read-eval* nil)
         (*read-base* 10)
@@ -271,7 +277,7 @@
      included;
    - END-OF-FILE for a form cut off by end of file."
   (let ((data (%read-data (if (stringp source) source (%read-stream-text source))
-                          1 nil)))
+                          1 nil +byte-limit+)))
     (if data (first data) eof-value)))
 
 (defun read-state-file (path &key (count 1) owner (byte-limit +byte-limit+))
@@ -279,7 +285,8 @@
    list of the data in file order, shorter than COUNT when the file ends
    first, and T; or NIL and NIL when no file exists at PATH.
 
-   Reads at most BYTE-LIMIT bytes, capped at +BYTE-LIMIT+, then reads the data
+   Reads at most BYTE-LIMIT bytes (default +BYTE-LIMIT+, capped at
+   +BYTE-CEILING+), then reads the data
    from that text as READ-DATUM does. With OWNER, a uid, refuses a file owned
    by any other uid.
 
@@ -293,11 +300,11 @@
    - is not UTF-8.
    The type and owner checks run on the open descriptor, and a FIFO is opened
    without blocking."
-  (multiple-value-bind (text present-p)
-      (%read-file-text path (min byte-limit +byte-limit+) owner)
-    (if present-p
-        (values (%read-data text count path) t)
-        (values nil nil))))
+  (let ((limit (min byte-limit +byte-ceiling+)))
+    (multiple-value-bind (text present-p) (%read-file-text path limit owner)
+      (if present-p
+          (values (%read-data text count path limit) t)
+          (values nil nil)))))
 
 #+sbcl
 (defun %read-file-text (path byte-limit owner)
