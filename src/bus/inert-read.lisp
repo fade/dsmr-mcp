@@ -7,9 +7,9 @@
 ;;;; content is untrusted. READ-STATE-FILE opens a state file without blocking,
 ;;;; refuses anything but a regular file within its byte limit, and reads its
 ;;;; data with READ-DATUM. READ-DATUM reads with fixed reader variables and
-;;;; read-time evaluation off, bounds size, nesting and prefixes, refuses
-;;;; package-qualified symbols, and refuses the syntax no bus writer emits:
-;;;; backquote, comma, vertical bar, #S, #=, ##, #A, #|, #:, #n( and #n*.
+;;;; read-time evaluation off, bounds size, nesting, prefixes, and token length,
+;;;; refuses package-qualified symbols, and refuses the syntax no bus writer
+;;;; emits: backquote, comma, vertical bar, #S, #=, ##, #A, #|, #:, #n( and #n*.
 ;;;;
 ;;;; CL only, apart from the descriptor checks in %READ-FILE-TEXT, which use
 ;;;; sb-posix: the watcher binary loads this leaf and must not pull in a parser
@@ -36,7 +36,9 @@
    (reason :initarg :reason :initform nil :reader refused-syntax-reason
            :documentation "Why the input was refused, as text, when SUB-CHAR is NIL.")
    (path :initarg :path :initform nil :reader refused-syntax-path
-         :documentation "The file refused, when the refusal came from READ-STATE-FILE."))
+         :documentation "The file refused, or NIL. Set when READ-STATE-FILE's opener or pre-read
+    scan refused the file, or when it wraps another error the reader
+    signalled; NIL for syntax the readtable refuses."))
   (:report
    (lambda (condition stream)
      (let ((source (stream-error-stream condition))
@@ -56,8 +58,8 @@
     loop forever. Backquote, comma, vertical bar, #| and #: are refused so
     the pre-read scan and the reader always parse a text the same way. A file
     that is not a regular file can block the opener or never end. Any other
-    ERROR or STORAGE-CONDITION the reader signals arrives as this condition
-    with SUB-CHAR NIL."))
+    ERROR or STORAGE-CONDITION the reader signals, apart from READER-ERROR and
+    END-OF-FILE, arrives as this condition with SUB-CHAR NIL."))
 
 (defconstant +byte-limit+ 8192
   "Default for the most bytes READ-STATE-FILE reads from a file, and the most
