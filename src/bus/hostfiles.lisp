@@ -26,7 +26,8 @@
   (:local-nicknames (#:selector #:dsmr-mcp/src/bus/selector)
                     (#:cursor #:dsmr-mcp/src/bus/cursor)
                     (#:wal #:dsmr-mcp/src/bus/wal)
-                    (#:envelope #:dsmr-mcp/src/bus/envelope))
+                    (#:envelope #:dsmr-mcp/src/bus/envelope)
+                    (#:inert-read #:dsmr-mcp/src/bus/inert-read))
   (:export
    ;; paths
    #:state-home
@@ -280,9 +281,9 @@
 
    Unreadable covers a file over MAX-BYTES, a file owned by another user,
    anything that does not read as a plist with keyword keys, and an empty file.
-   The read runs under standard io syntax with *READ-EVAL* off, because these
-   files sit under a state root other processes can write, and looking at one
-   must never run code planted in it."
+   The read goes through the inert reader, which refuses read-time evaluation
+   and structure syntax, because these files sit under a state root other
+   processes can write, and looking at one must never run code planted in it."
   (handler-case
       (if (not (probe-file path))
           (values nil :absent)
@@ -291,10 +292,8 @@
                     (not (%owned-by-me-p path)))
                 (values nil :unreadable)
                 (let* ((eof '#:eof)
-                       (form (with-standard-io-syntax
-                               (let ((*read-eval* nil))
-                                 (with-open-file (in path :if-does-not-exist nil)
-                                   (if in (read in nil eof) eof))))))
+                       (form (with-open-file (in path :if-does-not-exist nil)
+                               (if in (inert-read:read-datum in eof) eof))))
                   (if (and (not (eq form eof)) (%proper-plist-p form))
                       (values form :ok)
                       (values nil :unreadable))))))
@@ -626,8 +625,7 @@
   (and (probe-file path)
        (ignore-errors
         (with-open-file (in path :if-does-not-exist nil)
-          (let ((value (and in (with-standard-io-syntax
-                                 (let ((*read-eval* nil)) (read in nil nil))))))
+          (let ((value (and in (inert-read:read-datum in))))
             (and (integerp value) (>= value 0) t))))))
 
 (defun %newest-archive (wal-path)

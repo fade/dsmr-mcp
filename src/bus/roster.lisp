@@ -43,7 +43,8 @@
 
 (defpackage #:dsmr-mcp/src/bus/roster
   (:use #:cl)
-  (:local-nicknames (#:envelope #:dsmr-mcp/src/bus/envelope))
+  (:local-nicknames (#:envelope #:dsmr-mcp/src/bus/envelope)
+                    (#:inert-read #:dsmr-mcp/src/bus/inert-read))
   (:export #:entry
            #:enroll
            #:disenroll
@@ -154,17 +155,15 @@
    different handling, and conflating them would report a departed agent as one
    that never left.
 
-   *READ-EVAL* is bound off for the read. The roster sits under a state root that
-   other processes can write, so a crafted entry file must not be able to run
-   code just by being looked at. Standard io syntax also pins the read base and
-   the readtable, keeping the parse independent of whatever the calling image has
-   configured."
+   The read goes through the inert reader, which refuses read-time evaluation
+   and structure syntax. The roster sits under a state root that other processes
+   can write, so a crafted entry file must not be able to run code just by being
+   looked at. The inert reader also pins the read base and the readtable, keeping
+   the parse independent of whatever the calling image has configured."
   (if (probe-file path)
       (let ((form (handler-case
-                      (with-standard-io-syntax
-                        (let ((*read-eval* nil))
-                          (with-open-file (in path :if-does-not-exist nil)
-                            (and in (read in nil nil)))))
+                      (with-open-file (in path :if-does-not-exist nil)
+                        (and in (inert-read:read-datum in)))
                     (error () :unreadable))))
         (if (and (not (eq form :unreadable))
                  (%readable-plist-p form))

@@ -19,7 +19,11 @@
                     (#:cursor #:dsmr-mcp/src/bus/cursor)
                     (#:inert-read #:dsmr-mcp/src/bus/inert-read)
                     (#:heartbeat #:dsmr-mcp/src/bus/heartbeat)
-                    (#:watch #:dsmr-bus-watch/src/bus/watch)))
+                    (#:watch #:dsmr-bus-watch/src/bus/watch)
+                    (#:hostfiles #:dsmr-mcp/src/bus/hostfiles)
+                    (#:roster #:dsmr-mcp/src/bus/roster)
+                    (#:envelope #:dsmr-mcp/src/bus/envelope)
+                    (#:broker #:dsmr-mcp/src/bus/broker)))
 
 (in-package #:dsmr-mcp/tests/bus/inert-read-test)
 
@@ -288,3 +292,124 @@
     (let ((sub (probe-subscriber dir)))
       (setf (cursor:cursor-value sub) 3)
       (true (watch::%cursor-holds-seq-p (cursor:subscriber-cursor-path sub))))))
+
+(define-test read-plist-file-refuses-read-time-evaluation
+  "A host record holding a #. form reads as unreadable and runs nothing."
+  (with-probe (dir marker)
+    (let ((path (plant (merge-pathnames "r.plist" dir)
+                       (format nil "(:a ~A)" (eval-probe marker 1)))))
+      (is eq :unreadable (nth-value 1 (hostfiles:read-plist-file path)))
+      (false (probe-file marker) "the planted form did not run"))))
+
+(define-test read-plist-file-refuses-structure-syntax
+  "A host record holding #S reads as unreadable and constructs nothing."
+  (with-probe (dir marker)
+    (let ((path (plant (merge-pathnames "r.plist" dir)
+                       (format nil "(:a ~A)" (struct-probe)))))
+      (is eq :unreadable (nth-value 1 (hostfiles:read-plist-file path)))
+      (false (probe-file marker) "the planted structure was not built"))))
+
+(define-test read-plist-file-reads-what-its-writer-wrote
+  "A host record written by the module's own writer reads back as :OK."
+  (with-temp-dir (dir)
+    (let ((path (merge-pathnames "r.plist" dir))
+          (plist (list :name "host" :pid 4242 :parked nil :live t)))
+      (hostfiles:write-plist-file path plist)
+      (multiple-value-bind (read status) (hostfiles:read-plist-file path)
+        (is eq :ok status)
+        (is equal plist read)))))
+
+(define-test host-cursor-check-refuses-read-time-evaluation
+  "The host service's cursor check answers NIL for a #. form and runs nothing."
+  (with-probe (dir marker)
+    (let ((path (plant (merge-pathnames "probe.cursor" dir)
+                       (eval-probe marker 7))))
+      (false (hostfiles::%cursor-holds-seq-p path))
+      (false (probe-file marker) "the planted form did not run"))))
+
+(define-test host-cursor-check-refuses-structure-syntax
+  "The host service's cursor check answers NIL for #S and constructs nothing."
+  (with-probe (dir marker)
+    (let ((path (plant (merge-pathnames "probe.cursor" dir) (struct-probe))))
+      (false (hostfiles::%cursor-holds-seq-p path))
+      (false (probe-file marker) "the planted structure was not built"))))
+
+(define-test host-cursor-check-accepts-a-written-cursor
+  "The host service's cursor check answers T for a cursor the cursor writer wrote."
+  (with-temp-dir (dir)
+    (let ((sub (probe-subscriber dir)))
+      (setf (cursor:cursor-value sub) 3)
+      (true (hostfiles::%cursor-holds-seq-p (cursor:subscriber-cursor-path sub))))))
+
+(defun probe-roster (dir)
+  "The roster directory and bus state path of a bus rooted at DIR."
+  (let ((paths (broker:make-bus-paths dir)))
+    (values (broker:bus-paths-roster-dir paths)
+            (broker:bus-paths-roster-state paths))))
+
+(defun probe-agent-id ()
+  "A bus id for a probe agent."
+  (envelope:agent-id "/tmp/inert-read-probe-project" :name "probe"))
+
+(define-test roster-entry-refuses-read-time-evaluation
+  "A roster entry holding a #. form reads as present but unreadable and runs
+   nothing."
+  (with-probe (dir marker)
+    (let ((roster-dir (probe-roster dir))
+          (id (probe-agent-id)))
+      (plant (roster:roster-entry-path id roster-dir)
+             (format nil "(:id ~A)" (eval-probe marker 1)))
+      (multiple-value-bind (entry present-p) (roster:entry id roster-dir)
+        (false entry)
+        (true present-p))
+      (false (probe-file marker) "the planted form did not run"))))
+
+(define-test roster-entry-refuses-structure-syntax
+  "A roster entry holding #S reads as present but unreadable and constructs
+   nothing."
+  (with-probe (dir marker)
+    (let ((roster-dir (probe-roster dir))
+          (id (probe-agent-id)))
+      (plant (roster:roster-entry-path id roster-dir)
+             (format nil "(:id ~A)" (struct-probe)))
+      (multiple-value-bind (entry present-p) (roster:entry id roster-dir)
+        (false entry)
+        (true present-p))
+      (false (probe-file marker) "the planted structure was not built"))))
+
+(define-test roster-entry-reads-what-enroll-wrote
+  "An entry written by ENROLL reads back as a plist, present."
+  (with-temp-dir (dir)
+    (multiple-value-bind (roster-dir state-path) (probe-roster dir)
+      (let ((id (probe-agent-id)))
+        (roster:enroll id roster-dir state-path)
+        (multiple-value-bind (entry present-p) (roster:entry id roster-dir)
+          (true (consp entry))
+          (true present-p))))))
+
+(define-test broker-identity-refuses-read-time-evaluation
+  "A broker identity record holding a #. form reads as NIL and runs nothing."
+  (with-probe (dir marker)
+    (let ((paths (broker:make-bus-paths dir)))
+      (plant (broker:broker-identity-path paths)
+             (format nil "(:pid ~A)" (eval-probe marker 1)))
+      (false (broker:read-broker-identity paths))
+      (false (probe-file marker) "the planted form did not run"))))
+
+(define-test broker-identity-refuses-structure-syntax
+  "A broker identity record holding #S reads as NIL and constructs nothing."
+  (with-probe (dir marker)
+    (let ((paths (broker:make-bus-paths dir)))
+      (plant (broker:broker-identity-path paths)
+             (format nil "(:pid ~A)" (struct-probe)))
+      (false (broker:read-broker-identity paths))
+      (false (probe-file marker) "the planted structure was not built"))))
+
+(define-test broker-identity-reads-what-its-writer-wrote
+  "An identity written by the module's own writer reads back with this
+   process's pid."
+  (with-temp-dir (dir)
+    (let ((paths (broker:make-bus-paths dir)))
+      (true (broker:write-broker-identity paths) "the record was written")
+      (is eql (sb-posix:getpid)
+          (getf (broker:read-broker-identity paths) :pid)))))
