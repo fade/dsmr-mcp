@@ -302,8 +302,11 @@
 (defun ensure-generation-writable (wal-path)
   "Make WAL-PATH's generation path one a file can be renamed over, and return
    that path. A directory there, which no writer creates, is renamed to
-   <name>.bad-<ms> beside it and kept for inspection. Signals an ERROR when the
-   directory cannot be moved."
+   <name>.bad-<ms> beside it and kept for inspection, and the generation path
+   then holds the keyword :UNKNOWN. GENERATION still reads NIL, so the
+   generation stays unknown and the next BUMP-GENERATION writes a fresh one
+   above every recorded generation rather than counting on from 0. Signals an
+   ERROR when the directory cannot be moved or the marker cannot be written."
   (let* ((target (generation-path wal-path))
          (found (probe-file target)))
     (when (and found (uiop:directory-pathname-p found))
@@ -313,7 +316,12 @@
           (unless ok
             (error "The log generation path ~A is a directory that cannot be moved ~
                     aside (errno ~D). Check the permissions of its parent directory."
-                   from errno)))))
+                   from errno)))
+        (with-open-file (out target :direction :output
+                                    :if-exists :supersede
+                                    :if-does-not-exist :create)
+          (prin1 :unknown out)
+          (finish-output out))))
     target))
 
 (defun %write-generation (wal-path value)

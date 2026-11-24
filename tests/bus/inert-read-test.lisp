@@ -838,6 +838,59 @@
                      (uiop:subdirectories dir))
             "the directory was moved aside"))))
 
+(define-test a-rotation-over-a-generation-directory-strands-the-old-cursors
+  "Generation 1, a cursor at \"3 1\", and a directory planted at the generation
+   path. The cursor is written again and keeps generation 1; the log is sealed
+   and the new log grows to 6 records. The new generation is above 1 and the
+   cursor reads as a generation mismatch, so records 1 to 3 are not skipped."
+  (with-temp-dir (dir)
+    (let* ((sub (probe-subscriber dir))
+           (wal-path (cursor:subscriber-wal sub))
+           (cursor-path (cursor:subscriber-cursor-path sub)))
+      (loop for seq from 1 to 4
+            do (wal:append-record wal-path seq (format nil "old ~D" seq)))
+      (wal::%write-generation wal-path 1)
+      (setf (cursor:cursor-value sub) 3)
+      (delete-file (wal:generation-path wal-path))
+      (plant (merge-pathnames "inside" (uiop:ensure-directory-pathname
+                                        (wal:generation-path wal-path)))
+             "x")
+      (setf (cursor:cursor-value sub) 3)
+      (is eql 1 (cursor::%recorded-generation cursor-path) "the cursor kept generation 1")
+      (true (archive:archive-wal wal-path dir) "the log was sealed")
+      (loop for seq from 1 to 6
+            do (wal:append-record wal-path seq (format nil "new ~D" seq)))
+      (let ((generation (wal:generation wal-path)))
+        (true (and (integerp generation) (> generation 1))
+              "the new generation is above every one recorded"))
+      (is eq :generation-mismatch (cursor:stranded-reason sub)))))
+
+(define-test the-heal-after-a-rotation-over-a-generation-directory-rebases-to-zero
+  "The same rotation with only 2 records in the new log. The heal finds the
+   cursor stranded and rebases it to 0, never to the head, so records 1 and 2
+   are delivered."
+  (with-temp-dir (dir)
+    (let* ((sub (probe-subscriber dir))
+           (wal-path (cursor:subscriber-wal sub))
+           (cursor-path (cursor:subscriber-cursor-path sub)))
+      (loop for seq from 1 to 4
+            do (wal:append-record wal-path seq (format nil "old ~D" seq)))
+      (wal::%write-generation wal-path 1)
+      (setf (cursor:cursor-value sub) 3)
+      (delete-file (wal:generation-path wal-path))
+      (plant (merge-pathnames "inside" (uiop:ensure-directory-pathname
+                                        (wal:generation-path wal-path)))
+             "x")
+      (setf (cursor:cursor-value sub) 3)
+      (true (archive:archive-wal wal-path dir) "the log was sealed")
+      (loop for seq from 1 to 2
+            do (wal:append-record wal-path seq (format nil "new ~D" seq)))
+      (multiple-value-bind (baseline action)
+          (hostfiles:heal-stranded-baseline "probe" wal-path cursor-path)
+        (is eq :rebased action)
+        (is eql 0 baseline "rebased to 0, not to the head")
+        (is eql 0 (cursor:cursor-value sub))))))
+
 (define-test status-and-the-strand-check-agree-under-an-unknown-generation
   "With a refused generation file and a cursor above the head, the status
    inventory reports the same stranded reason the strand check gives, which is
