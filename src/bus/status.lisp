@@ -600,8 +600,10 @@
              (sub (cursor:make-subscriber name log file))
              (written (ignore-errors (file-write-date file))))
         (multiple-value-bind (position log-head recorded current)
-            (if (and head generation)
-                (cursor:cursor-and-head sub :head head :log-generation generation)
+            (if head
+                (handler-case
+                    (cursor:cursor-and-head sub :head head :log-generation generation)
+                  (error () (values nil head nil generation)))
                 (values (ignore-errors (cursor:cursor-value sub)) head nil generation))
           (push (list :name name
                       :ephemeral (broker:ephemeral-cursor-name-p name)
@@ -610,7 +612,7 @@
                       :recorded-generation recorded
                       :log-generation current
                       :stranded-reason
-                      (when (and head generation)
+                      (when head
                         (ignore-errors
                          (cursor:stranded-reason sub :head head
                                                      :log-generation generation)))

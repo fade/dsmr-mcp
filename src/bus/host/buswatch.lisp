@@ -82,7 +82,8 @@
    READER is the one position in the log every agent on the bus is fed from.
    FEED is the subscription to the broker's publications, or NIL when the watch
    reads on the backstop alone; FEED-WANTED says whether it should have one.
-   GENERATION is the log generation the reader last saw, LAST-SEQ the highest
+   GENERATION is the log generation the reader last saw, NIL until one could
+   be read, LAST-SEQ the highest
    seq it has read. PROGRESS counts steps, NUDGES-SEEN the nudges that ended a
    wait, and GROWTH-WITHOUT-NUDGE the steps in a row in which the log grew while
    the feed said nothing. LOCK is held while agents are handed records or armed
@@ -231,7 +232,7 @@
         (conditions:raise-fault 'conditions:wal-rotated
                                 :bus (bus-watch-name bw)
                                 :subject (%subject bw)
-                                :detail (format nil "the log restarted at generation ~D"
+                                :detail (format nil "the log restarted at generation ~:[unknown~;~:*~D~]"
                                                 (bus-watch-generation bw)))
         (sb-thread:with-recursive-lock ((bus-watch-lock bw))
           (%arm-again bw identities report-fn)))
@@ -315,9 +316,15 @@
         (%poll-forward (bus-watch-wal-path bw) (bus-watch-reader bw) 0)
       (let* ((before (bus-watch-last-seq bw))
              (generation (wal:generation (bus-watch-wal-path bw)))
-             (rotated (or restarted (/= generation (bus-watch-generation bw))))
+             (seen (bus-watch-generation bw))
+             (rotated (or restarted
+                          (and generation (not (eql generation seen)))))
              (grew (and (not rotated) (> last (bus-watch-last-seq bw)))))
-        (setf (bus-watch-generation bw) generation
+        ;; An unknown generation (NIL) neither counts as a rotation nor
+        ;; replaces the last one known. A known generation after an unknown one
+        ;; counts as a rotation: only a seal writes the generation, and a watch
+        ;; that opened on an empty log has no read position to show the restart.
+        (setf (bus-watch-generation bw) (or generation seen)
               (bus-watch-last-seq bw) last)
         (when rotated
           (%rotated bw identities report-fn))

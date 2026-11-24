@@ -30,7 +30,8 @@
 (defpackage #:dsmr-mcp/src/bus/heartbeat
   (:use #:cl)
   (:local-nicknames (#:envelope #:dsmr-mcp/src/bus/envelope)
-                    (#:selector #:dsmr-mcp/src/bus/selector))
+                    (#:selector #:dsmr-mcp/src/bus/selector)
+                    (#:inert-read #:dsmr-mcp/src/bus/inert-read))
   (:export #:default-watch-dir
            #:beat-path
            #:write-beat
@@ -118,6 +119,5 @@
         (values :dead nil nil)
         (let ((age (- (get-universal-time) mtime))
               (pid (ignore-errors
-                    (with-open-file (in path :if-does-not-exist nil)
-                      (getf (and in (read in nil nil)) :pid)))))
+                    (getf (first (inert-read:read-state-file path)) :pid))))
           (values (beat-status age window-seconds) age pid)))))

@@ -33,7 +33,8 @@
                     (#:archive #:dsmr-mcp/src/bus/archive)
                     (#:tz #:dsmr-mcp/src/bus/zmq)
                     (#:selector #:dsmr-mcp/src/bus/selector)
-                    (#:roster #:dsmr-mcp/src/bus/roster))
+                    (#:roster #:dsmr-mcp/src/bus/roster)
+                    (#:inert-read #:dsmr-mcp/src/bus/inert-read))
   (:export #:bus-paths #:make-bus-paths #:default-state-root
            #:bus-paths-root #:bus-paths-wal #:bus-paths-lock #:bus-paths-members
            #:bus-paths-cursors-dir
@@ -261,21 +262,16 @@
    The caller cross-checks: running comes from the lock, and the recorded pid is
    worth repeating only when a process with that pid still exists.
 
-   *READ-EVAL* is bound off and the read runs in standard syntax. The record
-   sits under a state root other processes can write, so looking at it must not
-   be able to run code, and the parse must not depend on what the calling image
-   has configured its reader to do."
+   The read goes through the inert reader, which refuses read-time evaluation
+   and structure syntax. The record sits under a state root other processes can
+   write, so looking at it must not be able to run code, and the parse must not
+   depend on what the calling image has configured its reader to do."
   (ignore-errors
-   (let ((path (broker-identity-path paths)))
-     (when (probe-file path)
-       (let ((form (with-standard-io-syntax
-                     (let ((*read-eval* nil))
-                       (with-open-file (in path :if-does-not-exist nil)
-                         (and in (read in nil nil)))))))
-         (when (and (listp form)
-                    (let ((len (ignore-errors (list-length form))))
-                      (and len (evenp len))))
-           form))))))
+   (let ((form (first (inert-read:read-state-file (broker-identity-path paths)))))
+     (when (and (listp form)
+                (let ((len (ignore-errors (list-length form))))
+                  (and len (evenp len))))
+       form))))
 
 (defun broker-identity-pid (record)
   "The pid the broker recorded for itself, or NIL when RECORD names none."

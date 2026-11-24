@@ -37,7 +37,8 @@
 
 (defpackage #:dsmr-mcp/src/bus/cursor
   (:use #:cl)
-  (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal))
+  (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal)
+                    (#:inert-read #:dsmr-mcp/src/bus/inert-read))
   (:export #:subscriber #:make-subscriber
            #:subscriber-id #:subscriber-wal #:subscriber-cursor-path
            #:cursor-value
@@ -77,24 +78,22 @@
 
    The generation is the second value in the file, written after the sequence
    number, so a reader that knows nothing of generations still reads the
-   sequence number it came for and reads it correctly."
-  (when (probe-file path)
-    (with-open-file (in path :if-does-not-exist nil)
-      (when in
-        (read in nil nil)                  ; the sequence number, read elsewhere
-        (let ((generation (read in nil nil)))
-          (and (integerp generation) (>= generation 0) generation))))))
+   sequence number it came for and reads it correctly.
+
+   Also NIL when the file cannot be read, or its second value is malformed or
+   refused: the cursor then names no generation, and one bad file in a shared
+   cursor directory cannot abort a caller walking all of them."
+  (let ((generation (ignore-errors
+                     (second (inert-read:read-state-file path :count 2)))))
+    (and (integerp generation) (>= generation 0) generation)))
 
 (defun cursor-value (subscriber)
   "The last sequence number SUBSCRIBER has acknowledged (0 if it has never
-   delivered)."
-  (let ((path (subscriber-cursor-path subscriber)))
-    (if (probe-file path)
-        (with-open-file (in path :if-does-not-exist nil)
-          (or (and in (let ((v (read in nil nil)))
-                        (and (integerp v) (>= v 0) v)))
-              0))
-        0)))
+   delivered, or if the file's first value is not a non-negative integer).
+   Signals a READER-ERROR, REFUSED-SYNTAX included, when the cursor file is
+   malformed or refused anywhere in its text, not only in its first value."
+  (let ((v (first (inert-read:read-state-file (subscriber-cursor-path subscriber)))))
+    (if (and (integerp v) (>= v 0)) v 0)))
 
 (defun (setf cursor-value) (seq subscriber)
   ;; The replacement must be atomic. A cursor file is read by processes other
@@ -112,8 +111,13 @@
   ;; log it belongs to and a rotation makes that the difference between a reader
   ;; that is behind and one that is reading a log that no longer exists. The
   ;; sequence number stays first, so anything reading only the leading value
-  ;; still reads the position correctly.
+  ;; still reads the position correctly. While the log generation is unknown
+  ;; (NIL), the generation the cursor already records is written again: dropping
+  ;; it would leave the cursor unable to read as stranded after the next
+  ;; rotation, so it would skip the start of the new log.
   (let* ((target (subscriber-cursor-path subscriber))
+         (generation (or (wal:generation (subscriber-wal subscriber))
+                         (%recorded-generation target)))
          (temp (make-pathname :name (format nil "~A.tmp~D"
                                             (or (pathname-name target) "cursor")
                                             (random 100000000))
@@ -124,7 +128,7 @@
            (with-open-file (out temp :direction :output
                                      :if-exists :supersede
                                      :if-does-not-exist :create)
-             (format out "~D ~D" seq (wal:generation (subscriber-wal subscriber)))
+             (format out "~D~@[ ~D~]" seq generation)
              (finish-output out))
            (rename-file temp target)
            (setf temp nil))
@@ -251,7 +255,8 @@
    a value above the head rather than as a zero. RECORDED-GENERATION is the
    generation the cursor was written against, NIL for a cursor written before
    generations were recorded. LOG-GENERATION is the log's own, 0 for a log that
-   has never been rotated since the counter existed.
+   has never been rotated since the counter existed, NIL when its counter file
+   is unreadable.
 
    A caller handed these four can ask any question it needs to. A caller handed
    a clamped count cannot recover the fact the clamp discarded.
@@ -291,12 +296,13 @@
    A cursor that names no generation is not a mismatch. It predates the
    generation being recorded, so nothing is known about which log it belongs to,
    and calling an unknown a disagreement would report every cursor written
-   before this existed as stranded."
+   before this existed as stranded. For the same reason no cursor is a
+   mismatch against a log generation that is unknown, NIL."
   (multiple-value-bind (cursor head recorded current)
       (apply #'cursor-and-head subscriber
              (append (when head-supplied-p (list :head head))
                      (when generation-supplied-p
                        (list :log-generation log-generation))))
     (cond ((> cursor head) :cursor-above-head)
-          ((and recorded (/= recorded current)) :generation-mismatch)
+          ((and recorded current (/= recorded current)) :generation-mismatch)
           (t nil))))

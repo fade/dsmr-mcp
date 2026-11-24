@@ -651,6 +651,23 @@ from the alarm being wrong."
       (is eq 'null (%field payload "recorded_generation")
           "the generation is unknown rather than different"))))
 
+(define-test an-unreadable-own-cursor-is-reported-rather-than-raised
+  "A cursor file holding a position followed by refused text makes the verb
+answer with an error result of type cursor-unreadable that names the tool,
+rather than signal."
+  (with-bus-session (session)
+    (with-publisher (pub session)
+      (%publish-backlog pub 2))
+    (%call session)
+    (let ((path (cursor:subscriber-cursor-path
+                 (%reader-position (session-agent session)))))
+      (with-open-file (out path :direction :output :if-exists :supersede)
+        (write-string "5 foo::bar" out)))
+    (let ((payload (%call session)))
+      (is string= "cursor-unreadable" (%error-type payload))
+      (true (search "bus-receive" (%content-text payload))
+            "the answer names the tool"))))
+
 (define-test a-delivered-read-still-carries-everything-it-always-did
   "The change must not alter delivery. A read that hands messages over comes back
 with every field it came back with before, correct, and with the position beside
