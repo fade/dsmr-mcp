@@ -164,6 +164,35 @@
   (with-input-from-string (in text)
     (inert-read:read-datum in eof-value)))
 
+(defun refusal-of (thunk)
+  "What calling THUNK signals:
+   - the upcased character of a REFUSED-SYNTAX, or :REFUSED when it names none;
+   - the type of any other ERROR;
+   - :ESCAPED for a STORAGE-CONDITION, which no ERROR handler catches;
+   - :RETURNED when THUNK returns."
+  (handler-case (progn (funcall thunk) :returned)
+    (inert-read:refused-syntax (c)
+      (or (inert-read:refused-syntax-character c) :refused))
+    (error (c) (type-of c))
+    (storage-condition () :escaped)))
+
+(defmacro refusal (form)
+  "REFUSAL-OF a thunk evaluating FORM."
+  `(refusal-of (lambda () ,form)))
+
+(defmacro contained (form)
+  "The value of FORM, or :ESCAPED when FORM signals a STORAGE-CONDITION."
+  `(handler-case ,form
+     (storage-condition () :escaped)))
+
+(defvar *expander-ran* nil
+  "The arguments the INERT-READ-PROBE-TYPE expander last ran with, or NIL.")
+
+(deftype cl-user::inert-read-probe-type (&rest args)
+  "Element type whose expander records ARGS in *EXPANDER-RAN*."
+  (setf *expander-ran* (or args t))
+  'bit)
+
 (define-test read-datum-reads-integers
   "Integers read as CL:READ reads them, one datum per call."
   (is = 42 (read-text "42"))
@@ -199,15 +228,61 @@
     (false (probe-file marker) "the #S form was not built under a standard readtable")))
 
 (define-test read-datum-refuses-structure-and-circular-syntax
-  "#S and #s signal REFUSED-SYNTAX and construct nothing; #= and ## signal
-   READER-ERROR, also inside a skipped #- branch."
+  "#S, #s, #= and ## each signal REFUSED-SYNTAX naming the sub-character, and
+   #S builds nothing. #S and #= are refused inside a skipped #- branch too."
   (with-probe (dir marker)
-    (fail (read-text (struct-probe "S")) inert-read:refused-syntax)
-    (fail (read-text (struct-probe "s")) inert-read:refused-syntax)
+    (is eql #\S (refusal (read-text (struct-probe "S"))))
+    (is eql #\S (refusal (read-text (struct-probe "s"))))
     (false (probe-file marker) "the #S form was not built"))
-  (fail (read-text "#1=(:a . #1#)") reader-error)
-  (fail (read-text "(#1#)") reader-error)
-  (fail (read-text "#-(and) #S(foo :a 1) 1") reader-error))
+  (is eql #\= (refusal (read-text "#1=(:a . #1#)")))
+  (is eql #\# (refusal (read-text "(1 #1#)")))
+  (is eql #\S (refusal (read-text "#-(and) #S(foo :a 1) 1")))
+  (is eql #\= (refusal (read-text "#-(and) #1=(1) 1"))))
+
+(define-test read-datum-refuses-counted-vector-syntax
+  "#n( and #n* signal REFUSED-SYNTAX before allocating, the 14-byte
+   #40000000000*1 included. #( and #* with no count still read."
+  (is = 14 (length "#40000000000*1"))
+  (is eql #\* (refusal (read-text "#40000000000*1")))
+  (is eql #\( (refusal (read-text "#4000000000(1)")))
+  (is eql #\( (refusal (read-text "#3(1)")))
+  (is eql #\* (refusal (read-text "#3*1")))
+  (is equalp #(1 2) (read-text "#(1 2)"))
+  (is equal #*101 (read-text "#*101")))
+
+(define-test read-datum-refuses-array-syntax
+  "#A and #nA signal REFUSED-SYNTAX, and no type expander named in the text
+   runs."
+  (setf *expander-ran* nil)
+  (is eql #\A (refusal (read-text "#A((2) (inert-read-probe-type :planted) . (1 0))")))
+  (false *expander-ran* "the planted type expander did not run")
+  (is eql #\A (refusal (read-text "#A((4000000000) t . nil)")))
+  (is eql #\A (refusal (read-text "#2A((1 2) (3 4))"))))
+
+(define-test read-datum-turns-other-reader-faults-into-refusals
+  "A condition the reader signals that is neither a READER-ERROR nor an
+   END-OF-FILE arrives as REFUSED-SYNTAX naming no character: here the
+   TYPE-ERROR of a malformed feature expression."
+  (is eq :refused (refusal (read-text "#+(:not . 1) 1 2"))))
+
+(define-test read-datum-reads-nil-as-cl-nil-in-any-caller-package
+  "NIL and T read as CL:NIL and CL:T while the caller's *PACKAGE* uses no
+   package."
+  (let ((bare (make-package (symbol-name (gensym "INERT-READ-BARE-")) :use '())))
+    (unwind-protect
+         (let ((plist (let ((*package* bare)) (read-text "(:a nil :b t)"))))
+           (true (eq 'cl:nil (getf plist :a :absent)) "NIL is CL:NIL")
+           (true (eq 'cl:t (getf plist :b)) "T is CL:T"))
+      (delete-package bare))))
+
+(define-test reloading-the-reader-source-replaces-its-readtable
+  "Loading inert-read.lisp again installs a new refusing readtable, and that
+   table still refuses #S."
+  (let ((before inert-read::*refusing-readtable*))
+    (load (asdf:system-relative-pathname "dsmr-mcp" "src/bus/inert-read.lisp"))
+    (false (eq before inert-read::*refusing-readtable*)
+           "the reload rebuilt the table")
+    (is eql #\S (refusal (read-text "#S(foo :a 1)")))))
 
 (define-test read-datum-signals-end-of-file-on-a-truncated-form
   "A form cut off by end of file signals END-OF-FILE, as CL:READ does."
@@ -413,3 +488,33 @@
       (true (broker:write-broker-identity paths) "the record was written")
       (is eql (sb-posix:getpid)
           (getf (broker:read-broker-identity paths) :pid)))))
+
+(define-test every-reader-contains-the-counted-bit-vector-probe
+  "Each bus state reader given the 14-byte #40000000000*1 ends in its usual
+   unreadable answer or an ERROR, never a STORAGE-CONDITION."
+  (with-temp-dir (dir)
+    (let* ((probe "#40000000000*1")
+           (sub (probe-subscriber dir))
+           (cursor-path (plant (cursor:subscriber-cursor-path sub) probe))
+           (wal-path (cursor:subscriber-wal sub))
+           (beat (plant (merge-pathnames "probe.beat" dir) probe))
+           (record (plant (merge-pathnames "r.plist" dir) probe))
+           (paths (broker:make-bus-paths dir))
+           (id (probe-agent-id))
+           (roster-dir (probe-roster dir)))
+      (plant (wal:generation-path wal-path) probe)
+      (plant (broker:broker-identity-path paths) probe)
+      (plant (roster:roster-entry-path id roster-dir) probe)
+      (is eql #\* (refusal (cursor:cursor-value sub)) "cursor value")
+      (isnt eq :escaped (refusal (cursor::%recorded-generation
+                                  (plant (merge-pathnames "second.cursor" dir)
+                                         (format nil "5 ~A" probe))))
+            "recorded generation")
+      (isnt eq :escaped (refusal (wal:generation wal-path)) "log generation")
+      (is eq :live (contained (heartbeat:beat-liveness beat 60)) "beat")
+      (false (contained (watch::%cursor-holds-seq-p cursor-path)) "watcher check")
+      (false (contained (hostfiles::%cursor-holds-seq-p cursor-path)) "host check")
+      (is eq :unreadable (contained (nth-value 1 (hostfiles:read-plist-file record)))
+          "host record")
+      (is eq t (contained (nth-value 1 (roster:entry id roster-dir))) "roster entry")
+      (false (contained (broker:read-broker-identity paths)) "broker identity"))))
