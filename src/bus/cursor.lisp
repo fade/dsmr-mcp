@@ -89,7 +89,9 @@
 
 (defun cursor-value (subscriber)
   "The last sequence number SUBSCRIBER has acknowledged (0 if it has never
-   delivered)."
+   delivered, or if the file's first value is not a non-negative integer).
+   Signals a READER-ERROR, REFUSED-SYNTAX included, when the cursor file is
+   malformed or refused anywhere in its text, not only in its first value."
   (let ((v (first (inert-read:read-state-file (subscriber-cursor-path subscriber)))))
     (if (and (integerp v) (>= v 0)) v 0)))
 

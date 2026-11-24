@@ -407,6 +407,17 @@ delivered.~%~%~A"
       ;; backlog in place of the one it named.
       (invalid-bus-name (e)
         (%invalid-argument id (format nil "bus-receive: ~A" e)))
+      ;; The cursor position is the one state read on this path that signals;
+      ;; the log generation and the cursor's recorded generation read as
+      ;; unknown instead. A reader error here is therefore this identity's own
+      ;; cursor file.
+      (reader-error (e)
+        (result id (make-ht "isError" t
+                            "error_type" "cursor-unreadable"
+                            "content" (text-content
+                                       (format nil "bus-receive: this identity's ~
+                                                    cursor file is unreadable. ~A"
+                                               e)))))
       (no-project-root ()
         (result id (make-ht "isError" t
                             "error_type" "project-root-not-set"
