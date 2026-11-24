@@ -31,6 +31,7 @@
 
 (defpackage #:dsmr-mcp/src/bus/wal
   (:use #:cl)
+  (:local-nicknames (#:inert-read #:dsmr-mcp/src/bus/inert-read))
   (:export #:crc32
            #:now-ms
            #:record #:record-seq #:record-ts #:record-body #:record-body-string
@@ -279,7 +280,7 @@
   (let ((path (generation-path wal-path)))
     (if (probe-file path)
         (with-open-file (in path :if-does-not-exist nil)
-          (or (and in (let ((v (read in nil nil)))
+          (or (and in (let ((v (inert-read:read-datum in)))
                         (and (integerp v) (>= v 0) v)))
               0))
         0)))

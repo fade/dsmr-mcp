@@ -17,7 +17,9 @@
   (:use #:cl #:zebra)
   (:local-nicknames (#:wal #:dsmr-mcp/src/bus/wal)
                     (#:cursor #:dsmr-mcp/src/bus/cursor)
-                    (#:inert-read #:dsmr-mcp/src/bus/inert-read)))
+                    (#:inert-read #:dsmr-mcp/src/bus/inert-read)
+                    (#:heartbeat #:dsmr-mcp/src/bus/heartbeat)
+                    (#:watch #:dsmr-bus-watch/src/bus/watch)))
 
 (in-package #:dsmr-mcp/tests/bus/inert-read-test)
 
@@ -206,3 +208,83 @@
 (define-test read-datum-signals-end-of-file-on-a-truncated-form
   "A form cut off by end of file signals END-OF-FILE, as CL:READ does."
   (fail (read-text "(:pid 1") end-of-file))
+
+(define-test generation-refuses-read-time-evaluation
+  "A log generation file holding a #. form signals and runs nothing."
+  (with-probe (dir marker)
+    (let ((wal-path (merge-pathnames "bus.wal" dir)))
+      (plant (wal:generation-path wal-path) (eval-probe marker 5))
+      (fail (wal:generation wal-path) reader-error)
+      (false (probe-file marker) "the planted form did not run"))))
+
+(define-test generation-refuses-structure-syntax
+  "A log generation file holding #S signals and constructs nothing."
+  (with-probe (dir marker)
+    (let ((wal-path (merge-pathnames "bus.wal" dir)))
+      (plant (wal:generation-path wal-path) (struct-probe))
+      (fail (wal:generation wal-path) reader-error)
+      (false (probe-file marker) "the planted structure was not built"))))
+
+(define-test generation-reads-what-its-writer-wrote
+  "A generation written by the module's own writer reads back."
+  (with-temp-dir (dir)
+    (let ((wal-path (merge-pathnames "bus.wal" dir)))
+      (wal::%write-generation wal-path 5)
+      (is = 5 (wal:generation wal-path)))))
+
+(define-test beat-liveness-ignores-read-time-evaluation
+  "A heartbeat whose pid is a #. form reads live by age, with no pid, and runs
+   nothing."
+  (with-probe (dir marker)
+    (let ((path (plant (merge-pathnames "probe.beat" dir)
+                       (format nil "(:pid ~A)" (eval-probe marker 4242)))))
+      (multiple-value-bind (status age pid) (heartbeat:beat-liveness path 60)
+        (declare (ignore age))
+        (is eq :live status)
+        (false pid "no pid is read from the planted beat"))
+      (false (probe-file marker) "the planted form did not run"))))
+
+(define-test beat-liveness-ignores-structure-syntax
+  "A heartbeat whose pid is #S reads live by age, with no pid, and constructs
+   nothing."
+  (with-probe (dir marker)
+    (let ((path (plant (merge-pathnames "probe.beat" dir)
+                       (format nil "(:pid ~A)" (struct-probe)))))
+      (multiple-value-bind (status age pid) (heartbeat:beat-liveness path 60)
+        (declare (ignore age))
+        (is eq :live status)
+        (false pid "no pid is read from the planted beat"))
+      (false (probe-file marker) "the planted structure was not built"))))
+
+(define-test beat-liveness-reads-what-its-writer-wrote
+  "A heartbeat written by the module's own writer reads live with this
+   process's pid."
+  (with-temp-dir (dir)
+    (let ((path (merge-pathnames "probe.beat" dir)))
+      (heartbeat:write-beat path :mode :foreign :baseline 0 :poll-ms 250)
+      (multiple-value-bind (status age pid) (heartbeat:beat-liveness path 60)
+        (declare (ignore age))
+        (is eq :live status)
+        (is eql (sb-posix:getpid) pid)))))
+
+(define-test watcher-cursor-check-refuses-read-time-evaluation
+  "The watcher's cursor check answers NIL for a #. form and runs nothing."
+  (with-probe (dir marker)
+    (let ((path (plant (merge-pathnames "probe.cursor" dir)
+                       (eval-probe marker 7))))
+      (false (watch::%cursor-holds-seq-p path))
+      (false (probe-file marker) "the planted form did not run"))))
+
+(define-test watcher-cursor-check-refuses-structure-syntax
+  "The watcher's cursor check answers NIL for #S and constructs nothing."
+  (with-probe (dir marker)
+    (let ((path (plant (merge-pathnames "probe.cursor" dir) (struct-probe))))
+      (false (watch::%cursor-holds-seq-p path))
+      (false (probe-file marker) "the planted structure was not built"))))
+
+(define-test watcher-cursor-check-accepts-a-written-cursor
+  "The watcher's cursor check answers T for a cursor the cursor writer wrote."
+  (with-temp-dir (dir)
+    (let ((sub (probe-subscriber dir)))
+      (setf (cursor:cursor-value sub) 3)
+      (true (watch::%cursor-holds-seq-p (cursor:subscriber-cursor-path sub))))))

@@ -58,7 +58,8 @@
                     (#:heartbeat #:dsmr-mcp/src/bus/heartbeat)
                     (#:wal #:dsmr-mcp/src/bus/wal)
                     (#:selector #:dsmr-mcp/src/bus/selector)
-                    (#:hostfiles #:dsmr-mcp/src/bus/hostfiles))
+                    (#:hostfiles #:dsmr-mcp/src/bus/hostfiles)
+                    (#:inert-read #:dsmr-mcp/src/bus/inert-read))
   (:import-from #:dsmr-mcp/src/bus/wal
                 #:scan
                 #:now-ms
@@ -1160,7 +1161,7 @@ detached watcher, its pid file.
   (and (probe-file path)
        (ignore-errors
         (with-open-file (in path :if-does-not-exist nil)
-          (let ((value (and in (read in nil nil))))
+          (let ((value (and in (inert-read:read-datum in))))
             (and (integerp value) (>= value 0) t))))))
 
 (defun %stranded-fleet-message (report)
