@@ -378,9 +378,13 @@
 
 (define-test a-timeout-during-a-read-is-not-turned-into-a-refusal
   "An SB-EXT:TIMEOUT raised while READ-DATUM is reading escapes as itself, never
-   as REFUSED-SYNTAX. The input is a slow number of 8190 characters, so each
-   timeout lands inside the reader."
-  (let ((slow (concatenate 'string "0." (make-string 8187 :initial-element #\0) "1")))
+   as REFUSED-SYNTAX. The input is a list of 60 floats of 120 digits, most of
+   whose read time is spent inside the reader."
+  (let ((slow (format nil "(~{~A~^ ~})"
+                      (make-list 60 :initial-element
+                                 (concatenate 'string "0."
+                                              (make-string 117 :initial-element #\0)
+                                              "1")))))
     (dotimes (trial 5)
       (is eq :timeout
           (handler-case (sb-ext:with-timeout 0.01
@@ -589,6 +593,23 @@
           (hostfiles:read-plist-file path :max-bytes (* 1024 1024))
         (is eq :ok status)
         (is equal plist read)))))
+
+(define-test a-1-mib-status-holding-one-long-number-is-refused-quickly
+  "A 1 MiB service status whose :WRITTEN-AT is a float of about a million
+   digits reads as :UNREADABLE through the --host-status reader in under a
+   second. A token of 128 characters reads; 129 is refused."
+  (with-temp-dir (dir)
+    (let ((path (merge-pathnames "service.status" dir))
+          (start (get-internal-real-time)))
+      (plant path (concatenate 'string "(:pid 1 :written-at 1."
+                               (make-string (- (* 1024 1024) 40) :initial-element #\3)
+                               ")"))
+      (is eq :unreadable (nth-value 1 (hostfiles:read-plist-file
+                                       path :max-bytes (* 1024 1024))))
+      (true (< (- (get-internal-real-time) start) internal-time-units-per-second)
+            "the refusal took under a second")))
+  (is = 128 (length (princ-to-string (read-text (make-string 128 :initial-element #\7)))))
+  (is eq :refused (refusal (read-text (make-string 129 :initial-element #\7)))))
 
 (define-test host-cursor-check-refuses-read-time-evaluation
   "The host service's cursor check answers NIL for a #. form and runs nothing."

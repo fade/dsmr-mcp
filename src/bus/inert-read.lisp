@@ -75,6 +75,11 @@
   "Most quote and # dispatch prefixes the text may hold. Each makes the reader
    recurse; bus writers emit none of them.")
 
+(defconstant +token-limit+ 128
+  "Longest token, in characters, the text may hold; strings are exempt. The
+   reader's cost for a number grows faster than its length, and bus writers
+   emit no token near this long.")
+
 (defun %refuse-input (path control &rest arguments)
   "Signal REFUSED-SYNTAX naming no character, for PATH or NIL, with the reason
    CONTROL formatted with ARGUMENTS."
@@ -99,6 +104,7 @@
    - nests lists deeper than +NESTING-LIMIT+;
    - holds more than +PREFIX-LIMIT+ quote or # dispatch prefixes;
    - holds backquote, comma, vertical bar, #| or #:;
+   - holds a token longer than +TOKEN-LIMIT+ characters;
    - holds a token with a package marker after its first character.
    Strings, ; comments, character names and backslash escapes are skipped as
    the reader skips them.
@@ -126,7 +132,10 @@
              (%refuse-input path "it holds ~A, which no bus writer emits" what))
            (constituent (next)
              (setf token-length (1+ (or token-length 0))
-                   i next)))
+                   i next)
+             (when (> token-length +token-limit+)
+               (%refuse-input path "it holds a token longer than ~D characters"
+                              +token-limit+))))
       (loop while (< i n)
             do (let ((c (char text i)))
                  (cond ((char= c #\")
@@ -278,7 +287,8 @@
    - READER-ERROR for malformed syntax and for #.;
    - REFUSED-SYNTAX, a READER-ERROR, for the refused syntax (backquote, comma,
      vertical bar, #S, #=, ##, #A, #|, #:, #n( and #n*), for a
-     package-qualified symbol, for text over +BYTE-LIMIT+ characters, nested
+     package-qualified symbol, for a token over +TOKEN-LIMIT+ characters,
+     for text over +BYTE-LIMIT+ characters, nested
      deeper than +NESTING-LIMIT+ or holding more than +PREFIX-LIMIT+ prefixes,
      and for any other ERROR or STORAGE-CONDITION the reader signals;
    - END-OF-FILE for a form cut off by end of file.
