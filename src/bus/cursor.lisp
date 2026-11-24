@@ -79,23 +79,14 @@
    The generation is the second value in the file, written after the sequence
    number, so a reader that knows nothing of generations still reads the
    sequence number it came for and reads it correctly."
-  (when (probe-file path)
-    (with-open-file (in path :if-does-not-exist nil)
-      (when in
-        (inert-read:read-datum in)         ; the sequence number, read elsewhere
-        (let ((generation (inert-read:read-datum in)))
-          (and (integerp generation) (>= generation 0) generation))))))
+  (let ((generation (second (inert-read:read-state-file path :count 2))))
+    (and (integerp generation) (>= generation 0) generation)))
 
 (defun cursor-value (subscriber)
   "The last sequence number SUBSCRIBER has acknowledged (0 if it has never
    delivered)."
-  (let ((path (subscriber-cursor-path subscriber)))
-    (if (probe-file path)
-        (with-open-file (in path :if-does-not-exist nil)
-          (or (and in (let ((v (inert-read:read-datum in)))
-                        (and (integerp v) (>= v 0) v)))
-              0))
-        0)))
+  (let ((v (first (inert-read:read-state-file (subscriber-cursor-path subscriber)))))
+    (if (and (integerp v) (>= v 0)) v 0)))
 
 (defun (setf cursor-value) (seq subscriber)
   ;; The replacement must be atomic. A cursor file is read by processes other

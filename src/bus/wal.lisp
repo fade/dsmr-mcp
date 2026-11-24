@@ -277,13 +277,8 @@
    disk predates this file, and a missing counter means only that the log has
    not been rotated since the counter existed, and that is a fact worth
    reporting rather than a failure worth raising in a reader."
-  (let ((path (generation-path wal-path)))
-    (if (probe-file path)
-        (with-open-file (in path :if-does-not-exist nil)
-          (or (and in (let ((v (inert-read:read-datum in)))
-                        (and (integerp v) (>= v 0) v)))
-              0))
-        0)))
+  (let ((v (first (inert-read:read-state-file (generation-path wal-path)))))
+    (if (and (integerp v) (>= v 0)) v 0)))
 
 (defun %write-generation (wal-path value)
   "Replace WAL-PATH's generation file with VALUE, atomically.

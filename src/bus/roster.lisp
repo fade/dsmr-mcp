@@ -160,16 +160,12 @@
    can write, so a crafted entry file must not be able to run code just by being
    looked at. The inert reader also pins the read base and the readtable, keeping
    the parse independent of whatever the calling image has configured."
-  (if (probe-file path)
-      (let ((form (handler-case
-                      (with-open-file (in path :if-does-not-exist nil)
-                        (and in (inert-read:read-datum in)))
-                    (error () :unreadable))))
-        (if (and (not (eq form :unreadable))
-                 (%readable-plist-p form))
-            (values form t)
-            (values nil t)))
-      (values nil nil)))
+  (multiple-value-bind (data present-p)
+      (handler-case (inert-read:read-state-file path)
+        (error () (values :unreadable t)))
+    (cond ((not present-p) (values nil nil))
+          ((and (consp data) (%readable-plist-p (first data))) (values (first data) t))
+          (t (values nil t)))))
 
 (defun %plain-text (value)
   "VALUE with every string inside it held as a full CHARACTER string.

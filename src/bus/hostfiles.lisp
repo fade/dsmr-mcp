@@ -266,11 +266,6 @@
          (and length (evenp length)))
        (loop for key in form by #'cddr always (keywordp key))))
 
-(defun %owned-by-me-p (path)
-  "True when PATH is owned by the uid this process runs as."
-  (= (sb-posix:stat-uid (sb-posix:stat (uiop:native-namestring path)))
-     (sb-posix:getuid)))
-
 (defun read-plist-file (path &key (max-bytes 8192))
   "The plist stored at PATH, and a status saying how the read went: :OK with the
    plist, :ABSENT when there is no file, or :UNREADABLE with NIL.
@@ -279,24 +274,22 @@
    a missing registration means nobody registered, a damaged one means someone
    did and the record cannot be trusted.
 
-   Unreadable covers a file over MAX-BYTES, a file owned by another user,
-   anything that does not read as a plist with keyword keys, and an empty file.
+   Unreadable covers:
+   - a file over MAX-BYTES, or owned by another user, both checked on the open
+     file;
+   - anything that is not a regular file, such as a FIFO or a device;
+   - anything that does not read as a plist with keyword keys, and an empty
+     file.
    The read goes through the inert reader, which refuses read-time evaluation
    and structure syntax, because these files sit under a state root other
    processes can write, and looking at one must never run code planted in it."
   (handler-case
-      (if (not (probe-file path))
-          (values nil :absent)
-          (let ((stat (sb-posix:stat (uiop:native-namestring path))))
-            (if (or (> (sb-posix:stat-size stat) max-bytes)
-                    (not (%owned-by-me-p path)))
-                (values nil :unreadable)
-                (let* ((eof '#:eof)
-                       (form (with-open-file (in path :if-does-not-exist nil)
-                               (if in (inert-read:read-datum in eof) eof))))
-                  (if (and (not (eq form eof)) (%proper-plist-p form))
-                      (values form :ok)
-                      (values nil :unreadable))))))
+      (multiple-value-bind (data present-p)
+          (inert-read:read-state-file path :owner (sb-posix:getuid)
+                                           :byte-limit max-bytes)
+        (cond ((not present-p) (values nil :absent))
+              ((and data (%proper-plist-p (first data))) (values (first data) :ok))
+              (t (values nil :unreadable))))
     (error () (values nil :unreadable))))
 
 (defun write-plist-file (path plist)
@@ -622,11 +615,9 @@
   "True only when PATH exists and holds a readable non-negative integer. The
    canonical reader answers 0 for a missing file, and 0 here would read as a
    whole log's worth of pending records."
-  (and (probe-file path)
-       (ignore-errors
-        (with-open-file (in path :if-does-not-exist nil)
-          (let ((value (and in (inert-read:read-datum in))))
-            (and (integerp value) (>= value 0) t))))))
+  (ignore-errors
+   (let ((value (first (inert-read:read-state-file path))))
+     (and (integerp value) (>= value 0) t))))
 
 (defun %newest-archive (wal-path)
   "The newest archive of WAL-PATH beside it (<log>.archive-<ms>), or NIL."

@@ -55,7 +55,7 @@
   path)
 
 (defvar *struct-marker* nil
-  "Pathname the READ-PROBE slot initform creates, or NIL to create nothing.")
+  "Pathname the INERT-READ-PROBE slot initform creates, or NIL to create nothing.")
 
 (defun touch-struct-marker ()
   "Create the file named by *STRUCT-MARKER* when it is non-NIL. Returns T."
@@ -65,9 +65,10 @@
                                  :if-does-not-exist :create)))
   t)
 
-(defstruct read-probe
+(defstruct (cl-user::inert-read-probe (:predicate read-probe-p))
   "A structure whose second slot initform creates a marker file, so a #S read
-   that constructs it leaves visible evidence."
+   that constructs it leaves visible evidence. Named in CL-USER, the package
+   the inert reader reads in, so the probe text needs no package prefix."
   (a nil)
   (b (touch-struct-marker)))
 
@@ -78,10 +79,10 @@
           (namestring marker) value))
 
 (defun struct-probe (&optional (dispatch "S"))
-  "Text of a #S form naming READ-PROBE fully qualified and supplying only slot A.
+  "Text of a #S form naming INERT-READ-PROBE, unqualified, and supplying only slot A.
    DISPATCH is the sub-character, \"S\" or \"s\"."
   (let ((*package* (find-package "CL-USER")))
-    (format nil "#~A(~S :A 1)" dispatch 'read-probe)))
+    (format nil "#~A(~S :A 1)" dispatch 'cl-user::inert-read-probe)))
 
 (defmacro with-probe ((dir marker) &body body)
   "Bind DIR to a fresh temporary directory and MARKER to a marker path inside
@@ -185,6 +186,34 @@
   `(handler-case ,form
      (storage-condition () :escaped)))
 
+(defun plant-fifo (path)
+  "Create a FIFO at PATH. Returns PATH."
+  (ensure-directories-exist path)
+  (sb-posix:mkfifo (namestring path) #o600)
+  path)
+
+(defun call-with-deadline (fifo thunk &optional (seconds 5))
+  "Call THUNK in a thread and return its value, or :HUNG when it is still
+   running after SECONDS. A serious condition from THUNK returns as
+   (:SIGNALLED type). On :HUNG, open FIFO for writing and close it, so a reader
+   blocked opening FIFO returns and its thread ends."
+  (let* ((thread (sb-thread:make-thread
+                  (lambda ()
+                    (handler-case (funcall thunk)
+                      (serious-condition (c) (list :signalled (type-of c)))))
+                  :name "inert-read deadline probe"))
+         (value (sb-thread:join-thread thread :timeout seconds :default :hung)))
+    (when (eq value :hung)
+      (ignore-errors
+       (sb-posix:close (sb-posix:open (namestring fifo)
+                                      (logior sb-posix:o-wronly sb-posix:o-nonblock))))
+      (sb-thread:join-thread thread :timeout seconds :default nil))
+    value))
+
+(defmacro with-deadline ((fifo &optional (seconds 5)) &body body)
+  "CALL-WITH-DEADLINE over a thunk running BODY."
+  `(call-with-deadline ,fifo (lambda () ,@body) ,seconds))
+
 (defvar *expander-ran* nil
   "The arguments the INERT-READ-PROBE-TYPE expander last ran with, or NIL.")
 
@@ -194,11 +223,9 @@
   'bit)
 
 (define-test read-datum-reads-integers
-  "Integers read as CL:READ reads them, one datum per call."
+  "Integers read as CL:READ reads them."
   (is = 42 (read-text "42"))
-  (with-input-from-string (in "42 3")
-    (is = 42 (inert-read:read-datum in))
-    (is = 3 (inert-read:read-datum in))))
+  (is = -7 (read-text " -7 3")))
 
 (define-test read-datum-reads-keyword-plists
   "A keyword plist of strings, integers, NIL and T reads EQUAL to CL:READ."
@@ -283,6 +310,99 @@
     (false (eq before inert-read::*refusing-readtable*)
            "the reload rebuilt the table")
     (is eql #\S (refusal (read-text "#S(foo :a 1)")))))
+
+(define-test read-datum-refuses-deep-nesting
+  "Lists nested deeper than 32, and runs of quote or dispatch prefixes, signal
+   REFUSED-SYNTAX before the reader recurses into them. 32 levels read."
+  (flet ((nested (depth)
+           (concatenate 'string (make-string depth :initial-element #\()
+                        (make-string depth :initial-element #\)))))
+    (true (consp (read-text (nested 32))))
+    (is eq :refused (refusal (read-text (nested 33))))
+    (is eq :refused (refusal (read-text (make-string 100000 :initial-element #\())))
+    (is eq :refused (refusal (read-text (concatenate
+                                         'string
+                                         (make-string 100 :initial-element #\')
+                                         "x"))))
+    (is eq :refused (refusal (read-text (apply #'concatenate 'string
+                                                (append (make-list 100 :initial-element "#+sbcl ")
+                                                        (list "1"))))))))
+
+(define-test read-datum-refuses-input-over-the-byte-limit
+  "Text longer than 8192 characters signals REFUSED-SYNTAX; 8192 reads."
+  (is eq :refused (refusal (read-text (make-string 8193 :initial-element #\Space))))
+  (is = 1 (read-text (concatenate 'string "1" (make-string 8191 :initial-element #\Space))))
+  (is eq :refused (refusal (read-text (make-string 100000 :initial-element #\7)))))
+
+(define-test read-datum-refuses-package-qualified-symbols
+  "A token with a package marker after its first character signals
+   REFUSED-SYNTAX and interns nothing. Keywords, uninterned symbols, and colons
+   inside strings, comments, characters and escapes still read."
+  (let ((name (format nil "ZZ-INERT-READ-PLANTED-~D" (random 1000000000)))
+        (target (find-package "DSMR-MCP/SRC/BUS/BROKER")))
+    (is eq :refused (refusal (read-text (format nil "dsmr-mcp/src/bus/broker::~A" name))))
+    (false (find-symbol name target) "nothing was interned in the named package"))
+  (is eq :refused (refusal (read-text "cl::car")))
+  (is eq :refused (refusal (read-text "keyword:pid")))
+  (is eq :refused (refusal (read-text "::pid")))
+  (is eq :refused (refusal (read-text "#+sb-impl::zz-feature 1 2")))
+  (is eq :pid (read-text ":pid"))
+  (is equal "a::b" (read-text "\"a::b\""))
+  (is eql #\: (read-text "#\\:"))
+  (is = 7 (read-text (format nil "; a::b~%7")))
+  (is = 7 (read-text "#| a::b |# 7"))
+  (is equal "a:b" (symbol-name (read-text "|a:b|")))
+  (is eq nil (symbol-package (read-text "#:foo")))
+  (is equal '(:k "x:y" #\: 3) (read-text "(:k \"x:y\" #\\: 3)")))
+
+(define-test read-state-file-reads-up-to-count-data
+  "READ-STATE-FILE returns the first COUNT data and T; fewer when the file
+   ends first; NIL and NIL for a missing file."
+  (with-temp-dir (dir)
+    (let ((path (plant (merge-pathnames "state" dir) "5 7 9")))
+      (is equal '(5 7) (inert-read:read-state-file path :count 2))
+      (is equal '(5) (inert-read:read-state-file path))
+      (true (nth-value 1 (inert-read:read-state-file path)))
+      (plant path "")
+      (is equal '(nil t) (multiple-value-list (inert-read:read-state-file path :count 2)))
+      (is equal '(nil nil) (multiple-value-list
+                            (inert-read:read-state-file (merge-pathnames "absent" dir))))
+      (is equal '(nil nil) (multiple-value-list
+                            (inert-read:read-state-file (merge-pathnames "no-dir/absent" dir)))))))
+
+(define-test read-state-file-refuses-what-is-not-a-regular-file
+  "A FIFO, a symlink to a character device, and a directory each signal
+   REFUSED-SYNTAX without blocking. A symlink to a regular file reads."
+  (with-temp-dir (dir)
+    (let ((fifo (plant-fifo (merge-pathnames "fifo" dir)))
+          (zero (merge-pathnames "zero" dir))
+          (target (plant (merge-pathnames "target" dir) "11"))
+          (link (merge-pathnames "link" dir)))
+      (sb-posix:symlink "/dev/zero" (namestring zero))
+      (sb-posix:symlink (namestring target) (namestring link))
+      (is eq :refused (with-deadline (fifo 3) (refusal (inert-read:read-state-file fifo))))
+      (is eq :refused (with-deadline (fifo 3) (refusal (inert-read:read-state-file zero))))
+      (is eq :refused (refusal (inert-read:read-state-file dir)))
+      (is equal '(11) (inert-read:read-state-file link)))))
+
+(define-test read-state-file-refuses-oversized-foreign-and-undecodable-files
+  "A file over the byte limit, a file not owned by OWNER, and a file that is
+   not UTF-8 each signal REFUSED-SYNTAX."
+  (with-temp-dir (dir)
+    (let ((path (merge-pathnames "state" dir)))
+      (plant path (make-string 8193 :initial-element #\Space))
+      (is eq :refused (refusal (inert-read:read-state-file path)))
+      (plant path (concatenate 'string "1" (make-string 8191 :initial-element #\Space)))
+      (is equal '(1) (inert-read:read-state-file path))
+      (plant path "12345")
+      (is eq :refused (refusal (inert-read:read-state-file path :byte-limit 4)))
+      (is eq :refused (refusal (inert-read:read-state-file
+                                path :owner (1+ (sb-posix:getuid)))))
+      (is equal '(12345) (inert-read:read-state-file path :owner (sb-posix:getuid)))
+      (with-open-file (out path :direction :output :if-exists :supersede
+                                :element-type '(unsigned-byte 8))
+        (write-sequence (coerce #(49 255 50) '(vector (unsigned-byte 8))) out))
+      (is eq :refused (refusal (inert-read:read-state-file path))))))
 
 (define-test read-datum-signals-end-of-file-on-a-truncated-form
   "A form cut off by end of file signals END-OF-FILE, as CL:READ does."
@@ -518,3 +638,38 @@
           "host record")
       (is eq t (contained (nth-value 1 (roster:entry id roster-dir))) "roster entry")
       (false (contained (broker:read-broker-identity paths)) "broker identity"))))
+
+(define-test every-reader-returns-promptly-from-a-fifo
+  "Each bus state reader given a FIFO in place of its file returns its usual
+   unreadable answer, or signals an ERROR, within three seconds."
+  (with-temp-dir (dir)
+    (let* ((sub (probe-subscriber dir))
+           (cursor-path (plant-fifo (cursor:subscriber-cursor-path sub)))
+           (wal-path (cursor:subscriber-wal sub))
+           (generation (plant-fifo (wal:generation-path wal-path)))
+           (beat (plant-fifo (merge-pathnames "probe.beat" dir)))
+           (record (plant-fifo (merge-pathnames "r.plist" dir)))
+           (paths (broker:make-bus-paths dir))
+           (identity (plant-fifo (broker:broker-identity-path paths)))
+           (id (probe-agent-id))
+           (roster-dir (probe-roster dir))
+           (entry (plant-fifo (roster:roster-entry-path id roster-dir))))
+      (is eq :refused (with-deadline (cursor-path 3) (refusal (cursor:cursor-value sub)))
+          "cursor value")
+      (isnt eq :hung (with-deadline (cursor-path 3)
+                       (refusal (cursor::%recorded-generation cursor-path)))
+            "recorded generation")
+      (isnt eq :hung (with-deadline (generation 3) (refusal (wal:generation wal-path)))
+            "log generation")
+      (is eq :live (with-deadline (beat 3) (heartbeat:beat-liveness beat 60)) "beat")
+      (false (with-deadline (cursor-path 3) (watch::%cursor-holds-seq-p cursor-path))
+             "watcher check")
+      (false (with-deadline (cursor-path 3) (hostfiles::%cursor-holds-seq-p cursor-path))
+             "host check")
+      (is eq :unreadable (with-deadline (record 3)
+                           (nth-value 1 (hostfiles:read-plist-file record)))
+          "host record")
+      (is eq t (with-deadline (entry 3) (nth-value 1 (roster:entry id roster-dir)))
+          "roster entry")
+      (false (with-deadline (identity 3) (broker:read-broker-identity paths))
+             "broker identity"))))

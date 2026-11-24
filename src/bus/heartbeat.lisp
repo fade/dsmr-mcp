@@ -119,6 +119,5 @@
         (values :dead nil nil)
         (let ((age (- (get-universal-time) mtime))
               (pid (ignore-errors
-                    (with-open-file (in path :if-does-not-exist nil)
-                      (getf (and in (inert-read:read-datum in)) :pid)))))
+                    (getf (first (inert-read:read-state-file path)) :pid))))
           (values (beat-status age window-seconds) age pid)))))

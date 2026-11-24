@@ -267,14 +267,11 @@
    write, so looking at it must not be able to run code, and the parse must not
    depend on what the calling image has configured its reader to do."
   (ignore-errors
-   (let ((path (broker-identity-path paths)))
-     (when (probe-file path)
-       (let ((form (with-open-file (in path :if-does-not-exist nil)
-                     (and in (inert-read:read-datum in)))))
-         (when (and (listp form)
-                    (let ((len (ignore-errors (list-length form))))
-                      (and len (evenp len))))
-           form))))))
+   (let ((form (first (inert-read:read-state-file (broker-identity-path paths)))))
+     (when (and (listp form)
+                (let ((len (ignore-errors (list-length form))))
+                  (and len (evenp len))))
+       form))))
 
 (defun broker-identity-pid (record)
   "The pid the broker recorded for itself, or NIL when RECORD names none."
