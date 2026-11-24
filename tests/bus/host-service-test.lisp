@@ -6,7 +6,10 @@
 ;;;; --host-status reads, an orderly stop lets everything go without rotating a
 ;;;; log or removing an agent's files, and the watchdog's progress rule. The
 ;;;; memory cases hand the service readings and pool records of their choosing
-;;;; and check which worker it asks for, when, and what it reports.
+;;;; and check which worker it asks for, when, and what it reports. The I/O
+;;;; thread cases start the service's I/O thread, hold one pass inside the
+;;;; memory reader, and read the messages the duty loop sends to a
+;;;; notification socket the case binds.
 ;;;;
 ;;;; The state home is a fresh short directory under /tmp (a bus socket path has
 ;;;; to fit in 107 bytes), the fleet and service logs are installed there before
@@ -761,3 +764,208 @@
         (if previous
             (sb-posix:setenv "DSMR_PRESSURE_ENTER_SOME" previous 1)
             (ignore-errors (sb-posix:unsetenv "DSMR_PRESSURE_ENTER_SOME")))))))
+
+;;; ------------------------------------------------- the duty loop and the I/O thread
+
+(defvar *stall-armed* nil
+  "True when the next call of STALLING-MEMORY-READER is to stall.")
+
+(defvar *stall-entered* nil
+  "True once STALLING-MEMORY-READER has entered its stall.")
+
+(defvar *stall-release* (sb-thread:make-semaphore :name "stall")
+  "Signalled to end the stall. These four are global, not bound per case,
+   because the I/O thread sees no case's dynamic bindings.")
+
+(defvar *stall-left* nil
+  "True once STALLING-MEMORY-READER has left its stall.")
+
+(defun stalling-memory-reader ()
+  "A memory reader with 50% of memory available. Once armed, the next call
+   blocks the pass that made it until *STALL-RELEASE* is signalled, or for at
+   most 60 s."
+  (when *stall-armed*
+    (setf *stall-armed* nil
+          *stall-entered* t)
+    (sb-thread:wait-on-semaphore *stall-release* :timeout 60)
+    (setf *stall-left* t))
+  (readings 50))
+
+(defun drain (sock)
+  "Every datagram waiting on SOCK, oldest first, without blocking."
+  (let ((buffer (make-array 64 :element-type '(unsigned-byte 8)))
+        (got '()))
+    (loop
+      (multiple-value-bind (received length)
+          (handler-case (sb-bsd-sockets:socket-receive sock buffer nil)
+            (error () nil))
+        (if (and received length (plusp length))
+            (push (map 'string #'code-char (subseq buffer 0 length)) got)
+            (return))))
+    (nreverse got)))
+
+(defun tick (svc sock now)
+  "Run one supervisor tick of SVC at NOW and return the messages it sent to
+   SOCK."
+  (service:supervisor-tick svc now)
+  (drain sock))
+
+(defun beats (messages)
+  "How many of MESSAGES are WATCHDOG=1."
+  (count "WATCHDOG=1" messages :test #'string=))
+
+(defun call-with-io-service (state thunk &key (diagnostic (make-broadcast-stream)))
+  "Call THUNK with a service whose I/O thread is started, whose memory reader
+   is STALLING-MEMORY-READER and whose backtraces go to DIAGNOSTIC, and with a
+   bound, non-blocking datagram socket under STATE that NOTIFY_SOCKET names.
+   Afterwards the stall is released, the service stopped, its I/O thread
+   joined, NOTIFY_SOCKET restored and the socket closed."
+  (let ((path (uiop:native-namestring (merge-pathnames "notify.sock" state)))
+        (sock (make-instance 'sb-bsd-sockets:local-socket :type :datagram))
+        (previous (uiop:getenv "NOTIFY_SOCKET"))
+        (svc nil))
+    (setf *stall-armed* nil
+          *stall-entered* nil
+          *stall-left* nil
+          *stall-release* (sb-thread:make-semaphore :name "stall"))
+    (unwind-protect
+         (progn
+           (sb-bsd-sockets:socket-bind sock path)
+           (setf (sb-bsd-sockets:non-blocking-mode sock) t)
+           (sb-posix:setenv "NOTIFY_SOCKET" path 1)
+           (setf svc (service:make-service :feed-p nil
+                                           :memory-reader #'stalling-memory-reader
+                                           :diagnostic-stream diagnostic))
+           (push svc *services*)
+           (service:start-io-thread svc)
+           (funcall thunk svc sock))
+      (setf *stall-armed* nil)
+      (sb-thread:signal-semaphore *stall-release* 10)
+      (when svc
+        (ignore-errors (service:stop-service svc :mark-clean nil))
+        (let ((thread (service::service-io-thread svc)))
+          (when thread
+            (sb-thread:join-thread thread :default nil :timeout 10))))
+      (if previous
+          (sb-posix:setenv "NOTIFY_SOCKET" previous 1)
+          (ignore-errors (sb-posix:unsetenv "NOTIFY_SOCKET")))
+      (ignore-errors (sb-bsd-sockets:socket-close sock)))))
+
+(defmacro with-io-service ((svc sock state &rest options) &body body)
+  "Run BODY inside CALL-WITH-IO-SERVICE with SVC and SOCK bound."
+  `(call-with-io-service ,state (lambda (,svc ,sock) ,@body) ,@options))
+
+(defun await-ready (svc sock)
+  "Tick SVC on the wall clock until READY=1 reaches SOCK, for at most 15 s.
+   True when it did."
+  (loop repeat 60
+        thereis (member "READY=1" (tick svc sock (%unix-time)) :test #'string=)
+        do (sleep 0.25)))
+
+(defun enter-stall (svc sock)
+  "Arm the stalling reader and tick SVC on the wall clock until a pass enters
+   the stall, for at most 10 s. Returns the clock of the tick that saw it
+   entered and the sequence number of the stalled pass, or NIL when no pass
+   entered it."
+  (setf *stall-armed* t)
+  (loop repeat 40
+        for now = (%unix-time)
+        do (tick svc sock now)
+           (sleep 0.25)
+           (when *stall-entered*
+             (return (values now (service::service-io-posted svc))))))
+
+(defun await-completion (svc sock sequence clock)
+  "Tick SVC from CLOCK on, 2 s of its clock per tick, until the duty loop has
+   consumed the completion of pass SEQUENCE, for at most 10 s. True when it
+   did."
+  (loop repeat 20
+        for now from (+ clock 2) by 2
+        do (sleep 0.5)
+           (tick svc sock now)
+        thereis (>= (service::service-io-consumed svc) sequence)))
+
+(define-test the-beat-goes-on-while-a-pass-is-stalled
+  "With a pass held inside the memory reader for 16 s of the duty loop's
+   clock, every once-a-second tick still sends WATCHDOG=1, and the pass
+   completes once released."
+  (with-memory-case (state)
+    (with-io-service (svc sock state)
+      (true (await-ready svc sock) "READY=1 did not arrive within 15 s")
+      (multiple-value-bind (start sequence) (enter-stall svc sock)
+        (true start "no pass entered the stalling reader within 10 s")
+        (when start
+          (loop for offset from 2 to 16 by 2
+                do (sleep 0.5)
+                   (is = 1 (beats (tick svc sock (+ start offset)))
+                       "WATCHDOG=1 count at stall start + ~D s" offset))
+          (true *stall-entered*)
+          (false *stall-left* "the stall ended before its release")
+          (sb-thread:signal-semaphore *stall-release*)
+          (true (await-completion svc sock sequence (+ start 16))
+                "the released pass was not consumed within 10 s"))))))
+
+(define-test a-wedged-io-thread-stops-the-beat
+  "With a pass held past the I/O progress window, no WATCHDOG=1 is sent from
+   stall start + 22 s, the I/O thread's backtrace naming the stalled reader is
+   written once to the diagnostic stream, and the beat returns within three
+   ticks of the release."
+  (with-memory-case (state)
+    (let ((diagnostic (make-string-output-stream)))
+      (with-io-service (svc sock state :diagnostic diagnostic)
+        (true (await-ready svc sock) "READY=1 did not arrive within 15 s")
+        (let ((start (enter-stall svc sock)))
+          (true start "no pass entered the stalling reader within 10 s")
+          (when start
+            (loop for offset from 2 to 26 by 2
+                  do (sleep 0.5)
+                     (let ((count (beats (tick svc sock (+ start offset)))))
+                       (cond ((<= offset 18)
+                              (is = 1 count "WATCHDOG=1 count at stall start + ~D s" offset))
+                             ((>= offset 22)
+                              (is = 0 count "WATCHDOG=1 count at stall start + ~D s" offset)))))
+            (sleep 1)
+            (let ((text (get-output-stream-string diagnostic)))
+              (is = 1 (loop for at = (search "completed no pass for" text)
+                              then (search "completed no pass for" text :start2 (1+ at))
+                            while at
+                            count t)
+                  "backtrace headers written: ~A" text)
+              (true (search "\"host service io\"" text) "the header does not name the I/O thread")
+              (true (search "STALLING-MEMORY-READER" text)
+                    "the backtrace does not show the stalled reader: ~A" text))
+            (sb-thread:signal-semaphore *stall-release*)
+            (true (loop for offset from 28 to 32 by 2
+                        do (sleep 0.5)
+                        thereis (plusp (beats (tick svc sock (+ start offset)))))
+                  "WATCHDOG=1 did not return within three ticks of the release")))))))
+
+(define-test a-stop-does-not-wait-on-a-wedged-pass
+  "With a pass held, an orderly stop returns within 6 s and writes no
+   clean-stop marker, so the next start records an unclean restart."
+  (with-memory-case (state)
+    (with-io-service (svc sock state)
+      (true (await-ready svc sock) "READY=1 did not arrive within 15 s")
+      (let ((start (enter-stall svc sock)))
+        (true start "no pass entered the stalling reader within 10 s")
+        (when start
+          (let ((began (get-internal-real-time)))
+            (service:stop-service svc :mark-clean t)
+            (let ((seconds (/ (- (get-internal-real-time) began)
+                              internal-time-units-per-second)))
+              (true (< seconds 6) "the stop took ~,1F s" seconds)))
+          (false (probe-file (hostfiles:clean-stop-path))
+                 "a clean-stop marker was written with a pass wedged"))))))
+
+(define-test io-progress-stall-rule
+  "The stall watchdog's rule: the service has stalled when its loop has not
+   come round for more than the window, or when a pass has been outstanding
+   for more than the window; a pass done in time, or none outstanding, is
+   no stall."
+  (false (service:stall-p 100 nil nil 100))
+  (false (service:stall-p 100 nil 0 100) "no pass outstanding")
+  (false (service:stall-p 100 t 40 100) "outstanding for exactly the window")
+  (true (service:stall-p 100 t 39 100) "outstanding past the window")
+  (false (service:stall-p 100 t 39 100 :window 61))
+  (true (service:stall-p 39 nil nil 100) "the loop has not come round")
+  (false (service:stall-p 40 t 95 100)))
