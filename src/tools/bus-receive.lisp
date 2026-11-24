@@ -189,7 +189,7 @@ bus that was named."))
    "cursor" cursor
    "head" head
    "recorded_generation" (or recorded 'null)
-   "log_generation" current
+   "log_generation" (or current 'null)
    "stranded_reason" (%cursor-word reason)
    "cursor_state"
    (reported-field (cond (reason "stranded")

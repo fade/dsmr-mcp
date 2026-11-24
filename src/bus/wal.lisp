@@ -271,14 +271,30 @@
                    (uiop:pathname-directory-pathname wal-path)))
 
 (defun generation (wal-path)
-  "Which generation of the log WAL-PATH currently is.
+  "Which generation of the log WAL-PATH currently is: a non-negative integer,
+   or NIL when the generation is unknown.
 
    A log with no generation file reads 0 rather than signalling. Every bus on
    disk predates this file, and a missing counter means only that the log has
    not been rotated since the counter existed, and that is a fact worth
-   reporting rather than a failure worth raising in a reader."
-  (let ((v (first (inert-read:read-state-file (generation-path wal-path)))))
-    (if (and (integerp v) (>= v 0)) v 0)))
+   reporting rather than a failure worth raising in a reader.
+
+   A generation file that is present but unreadable, refused, or not a
+   non-negative integer reads NIL, and nothing is signalled, so a planted file
+   cannot stop cursor writes or rotation. NIL is deliberately not 0: cursors
+   recorded against the real generation would read as stranded against 0, and
+   healing them would redeliver the whole log. Callers compare nothing against
+   NIL. A cursor write records no generation, the strand check reports no
+   mismatch, and BUMP-GENERATION writes a fresh generation at the next
+   rotation."
+  (handler-case
+      (multiple-value-bind (data present-p)
+          (inert-read:read-state-file (generation-path wal-path))
+        (let ((value (first data)))
+          (cond ((not present-p) 0)
+                ((and (integerp value) (>= value 0)) value)
+                (t nil))))
+    (error () nil)))
 
 (defun %write-generation (wal-path value)
   "Replace WAL-PATH's generation file with VALUE, atomically.
@@ -313,8 +329,14 @@
    Belongs to the act that seals the log and to nothing else. A generation that
    moved without a rotation would make every cursor recorded against the
    previous value look stranded; one that failed to move on a rotation leaves
-   the failure this identity exists to catch invisible again."
-  (%write-generation wal-path (1+ (generation wal-path))))
+   the failure this identity exists to catch invisible again.
+
+   When the current generation is unknown (GENERATION returns NIL), writes the
+   current time in Unix milliseconds instead. That value exceeds any counter a
+   cursor can have recorded, so the generation never moves backwards and every
+   cursor from before the rotation reads as stranded, as after any rotation."
+  (let ((current (generation wal-path)))
+    (%write-generation wal-path (if current (1+ current) (now-ms)))))
 
 ;;; ------------------------------------------------- incremental tail reads
 ;;;

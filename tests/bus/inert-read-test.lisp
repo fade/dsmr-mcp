@@ -23,7 +23,8 @@
                     (#:hostfiles #:dsmr-mcp/src/bus/hostfiles)
                     (#:roster #:dsmr-mcp/src/bus/roster)
                     (#:envelope #:dsmr-mcp/src/bus/envelope)
-                    (#:broker #:dsmr-mcp/src/bus/broker)))
+                    (#:broker #:dsmr-mcp/src/bus/broker)
+                    (#:status #:dsmr-mcp/src/bus/status)))
 
 (in-package #:dsmr-mcp/tests/bus/inert-read-test)
 
@@ -135,19 +136,23 @@
       (false (probe-file marker) "the planted structure was not built"))))
 
 (define-test recorded-generation-refuses-read-time-evaluation
-  "A cursor file whose generation is a #. form signals and runs nothing."
+  "A cursor file whose generation is a #. form names no generation and runs
+   nothing."
   (with-probe (dir marker)
     (let ((path (plant (merge-pathnames "probe.cursor" dir)
                        (format nil "7 ~A" (eval-probe marker 3)))))
-      (fail (cursor::%recorded-generation path) reader-error)
+      (is eq :returned (refusal-of (lambda () (cursor::%recorded-generation path))))
+      (false (cursor::%recorded-generation path))
       (false (probe-file marker) "the planted form did not run"))))
 
 (define-test recorded-generation-refuses-structure-syntax
-  "A cursor file whose generation is #S signals and constructs nothing."
+  "A cursor file whose generation is #S names no generation and constructs
+   nothing."
   (with-probe (dir marker)
     (let ((path (plant (merge-pathnames "probe.cursor" dir)
                        (format nil "7 ~A" (struct-probe)))))
-      (fail (cursor::%recorded-generation path) reader-error)
+      (is eq :returned (refusal-of (lambda () (cursor::%recorded-generation path))))
+      (false (cursor::%recorded-generation path))
       (false (probe-file marker) "the planted structure was not built"))))
 
 (define-test cursor-reads-what-its-writer-wrote
@@ -409,19 +414,23 @@
   (fail (read-text "(:pid 1") end-of-file))
 
 (define-test generation-refuses-read-time-evaluation
-  "A log generation file holding a #. form signals and runs nothing."
+  "A log generation file holding a #. form reads as an unknown generation, NIL,
+   and runs nothing."
   (with-probe (dir marker)
     (let ((wal-path (merge-pathnames "bus.wal" dir)))
       (plant (wal:generation-path wal-path) (eval-probe marker 5))
-      (fail (wal:generation wal-path) reader-error)
+      (is eq :returned (refusal (wal:generation wal-path)))
+      (false (wal:generation wal-path))
       (false (probe-file marker) "the planted form did not run"))))
 
 (define-test generation-refuses-structure-syntax
-  "A log generation file holding #S signals and constructs nothing."
+  "A log generation file holding #S reads as an unknown generation, NIL, and
+   constructs nothing."
   (with-probe (dir marker)
     (let ((wal-path (merge-pathnames "bus.wal" dir)))
       (plant (wal:generation-path wal-path) (struct-probe))
-      (fail (wal:generation wal-path) reader-error)
+      (is eq :returned (refusal (wal:generation wal-path)))
+      (false (wal:generation wal-path))
       (false (probe-file marker) "the planted structure was not built"))))
 
 (define-test generation-reads-what-its-writer-wrote
@@ -673,3 +682,51 @@
           "roster entry")
       (false (with-deadline (identity 3) (broker:read-broker-identity paths))
              "broker identity"))))
+
+(define-test a-bad-second-value-in-a-cursor-names-no-generation
+  "A cursor file holding a sound position followed by a malformed or refused
+   value names no generation. The strand check, the host service's heal and the
+   status inventory each answer without signalling."
+  (dolist (text '("5 )" "5 #1=(1)" "5 #S(foo)" "5 #40000000000*1"))
+    (with-temp-dir (dir)
+      (let* ((paths (broker:make-bus-paths dir))
+             (wal-path (plant (broker:bus-paths-wal paths) ""))
+             (cursor-path (plant (merge-pathnames "probe"
+                                                  (broker:bus-paths-cursors-dir paths))
+                                 text))
+             (sub (cursor:make-subscriber "probe" wal-path cursor-path)))
+        (is eq :returned (refusal (cursor::%recorded-generation cursor-path)) text)
+        (false (cursor::%recorded-generation cursor-path) text)
+        (is eq :returned (refusal (cursor:stranded-reason sub :head 10 :log-generation 0))
+            text)
+        (is eq :returned (refusal (hostfiles:heal-stranded-baseline
+                                   "probe" wal-path cursor-path :rebase-p nil))
+            text)
+        (is eql 1 (getf (getf (contained (ignore-errors (status:cursor-inventory paths)))
+                              :count)
+                        :value)
+            text)))))
+
+(define-test an-unknown-log-generation-keeps-the-bus-serving
+  "With a refused log generation file, the generation reads NIL, cursor writes
+   continue and record no generation, no cursor reads as stranded by
+   generation, and the next rotation writes a readable generation above the
+   last one any cursor recorded."
+  (with-temp-dir (dir)
+    (let* ((sub (probe-subscriber dir))
+           (wal-path (cursor:subscriber-wal sub))
+           (cursor-path (cursor:subscriber-cursor-path sub)))
+      (wal::%write-generation wal-path 5)
+      (is = 6 (wal:bump-generation wal-path) "a readable generation advances by one")
+      (plant (wal:generation-path wal-path) "#S(foo)")
+      (false (wal:generation wal-path))
+      (is eq :returned (refusal (setf (cursor:cursor-value sub) 9)))
+      (is = 9 (cursor:cursor-value sub))
+      (false (cursor::%recorded-generation cursor-path)
+             "the write recorded no generation")
+      (plant cursor-path "4 6")
+      (false (cursor:stranded-reason sub :head 10 :log-generation (wal:generation wal-path))
+             "a cursor recorded against generation 6 is not stranded by an unknown one")
+      (let ((new (wal:bump-generation wal-path)))
+        (true (and (integerp new) (> new 6)) "the rotation wrote a higher generation")
+        (is eql new (wal:generation wal-path) "and it reads back")))))

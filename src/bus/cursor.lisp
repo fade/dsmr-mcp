@@ -78,8 +78,13 @@
 
    The generation is the second value in the file, written after the sequence
    number, so a reader that knows nothing of generations still reads the
-   sequence number it came for and reads it correctly."
-  (let ((generation (second (inert-read:read-state-file path :count 2))))
+   sequence number it came for and reads it correctly.
+
+   Also NIL when the file cannot be read, or its second value is malformed or
+   refused: the cursor then names no generation, and one bad file in a shared
+   cursor directory cannot abort a caller walking all of them."
+  (let ((generation (ignore-errors
+                     (second (inert-read:read-state-file path :count 2)))))
     (and (integerp generation) (>= generation 0) generation)))
 
 (defun cursor-value (subscriber)
@@ -104,7 +109,8 @@
   ;; log it belongs to and a rotation makes that the difference between a reader
   ;; that is behind and one that is reading a log that no longer exists. The
   ;; sequence number stays first, so anything reading only the leading value
-  ;; still reads the position correctly.
+  ;; still reads the position correctly. An unknown log generation (NIL) is
+  ;; left out, so the cursor names none rather than a guessed one.
   (let* ((target (subscriber-cursor-path subscriber))
          (temp (make-pathname :name (format nil "~A.tmp~D"
                                             (or (pathname-name target) "cursor")
@@ -116,7 +122,7 @@
            (with-open-file (out temp :direction :output
                                      :if-exists :supersede
                                      :if-does-not-exist :create)
-             (format out "~D ~D" seq (wal:generation (subscriber-wal subscriber)))
+             (format out "~D~@[ ~D~]" seq (wal:generation (subscriber-wal subscriber)))
              (finish-output out))
            (rename-file temp target)
            (setf temp nil))
@@ -243,7 +249,8 @@
    a value above the head rather than as a zero. RECORDED-GENERATION is the
    generation the cursor was written against, NIL for a cursor written before
    generations were recorded. LOG-GENERATION is the log's own, 0 for a log that
-   has never been rotated since the counter existed.
+   has never been rotated since the counter existed, NIL when its counter file
+   is unreadable.
 
    A caller handed these four can ask any question it needs to. A caller handed
    a clamped count cannot recover the fact the clamp discarded.
@@ -283,12 +290,13 @@
    A cursor that names no generation is not a mismatch. It predates the
    generation being recorded, so nothing is known about which log it belongs to,
    and calling an unknown a disagreement would report every cursor written
-   before this existed as stranded."
+   before this existed as stranded. For the same reason no cursor is a
+   mismatch against a log generation that is unknown, NIL."
   (multiple-value-bind (cursor head recorded current)
       (apply #'cursor-and-head subscriber
              (append (when head-supplied-p (list :head head))
                      (when generation-supplied-p
                        (list :log-generation log-generation))))
     (cond ((> cursor head) :cursor-above-head)
-          ((and recorded (/= recorded current)) :generation-mismatch)
+          ((and recorded current (/= recorded current)) :generation-mismatch)
           (t nil))))

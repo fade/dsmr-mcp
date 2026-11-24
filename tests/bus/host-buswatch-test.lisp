@@ -393,6 +393,28 @@
       (true (uiop:string-prefix-p "bus:2 " (first (log-lines "alpha"))))
       (is = 2 (ident:identity-floor alpha)))))
 
+(define-test an-unreadable-generation-file-neither-rotates-nor-stops-the-watch
+  "Records 1 to 4 at generation 1 and a cursor at 4. The generation file is
+   replaced with refused syntax and records 5 and 6 land. The steps raise no
+   WAL-ROTATED, rebase no cursor, and the agent hears both records in one
+   line."
+  (with-host ()
+    (loop for seq from 1 to 4 do (append-from seq *other*))
+    (write-text (wal:generation-path (wal-path)) "1")
+    (write-text (cursor-file "alpha") "4 1")
+    (let* ((alpha (claim "alpha"))
+           (bw (open-watch :feed nil)))
+      (step-watch bw (list alpha))
+      (write-text (wal:generation-path (wal-path)) "#S(foo)")
+      (append-from 5 *other*)
+      (append-from 6 *other*)
+      (step-watch bw (list alpha))
+      (step-watch bw (list alpha))
+      (is = 0 (length (reports :info "wal-rotated")) "no rotation was raised")
+      (is = 0 (length (reports :warn "stranded-cursor")) "no cursor was rebased")
+      (is = 1 (length (log-lines "alpha")) "the agent heard the new records")
+      (is = 1 (buswatch:bus-watch-generation bw) "the last known generation stands"))))
+
 (define-test an-agent-without-a-cursor-hears-the-new-log-after-a-rotation
   "An agent with no cursor of its own was armed at the head of the old log.
    Everything in the new log arrived after the rotation, so it is all owed to

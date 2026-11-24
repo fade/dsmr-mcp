@@ -691,7 +691,7 @@
             (return-from heal-stranded-baseline (values value :sound report)))
           (setf (getf report :unread-in-archive) (%unread-in-archive wal-path value))
           (let ((target (if (and (eq reason :cursor-above-head)
-                                 recorded (= recorded generation))
+                                 recorded generation (= recorded generation))
                             head
                             0)))
             (if (not rebase-p)
