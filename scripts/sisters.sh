@@ -89,13 +89,15 @@ case $leader in
         FLEET_DIR=~/SourceCode/lisp
         # Full fleet, set aside while the work is rhizome only:
         # args=(--no-scan --extra "dsmr-mcp,mallet,boomer,zebra,stumpwm-contrib,fade-stumpwm-init,stumpwm,rhizome,fade-rhizome-init,$HOME/system_scripts,clink" --stagger 3-10)
-        args=(--no-scan --extra "dsmr-mcp,rhizome,fade-rhizome-init,fade-stumpwm-init,$HOME/system_scripts,$HOME/SourceCode/lisp-scratch/dsmr-mcp-release,clink" --stagger 3-10)
+        args=(--no-scan --extra "dsmr-mcp,rhizome,fade-rhizome-init,fade-stumpwm-init,$HOME/system_scripts,$HOME/SourceCode/lisp-scratch/dsmr-mcp-release,clink,boomer" --stagger 3-10)
         # Membership is declared, never found, for the same reason --no-scan is
         # set: this directory holds a dozen non-members that carry .git and
         # .planning too. Consenting to their .envrc files would be exactly the
         # blanket trust the host check is written to avoid.
         # MEMBERS=(dsmr-mcp mallet boomer zebra stumpwm-contrib fade-stumpwm-init stumpwm rhizome fade-rhizome-init "$HOME/system_scripts")
-        MEMBERS=(dsmr-mcp rhizome fade-rhizome-init fade-stumpwm-init "$HOME/system_scripts")
+        # Name every --extra entry above. The host check consents to the .envrc of
+        # each one listed; a sister left off stops the launcher until direnv allow.
+        MEMBERS=(dsmr-mcp rhizome fade-rhizome-init fade-stumpwm-init "$HOME/system_scripts" "$HOME/SourceCode/lisp-scratch/dsmr-mcp-release" clink boomer)
         SCAN_MEMBERS=0
         EXCLUDE_MEMBER=
         ;;
