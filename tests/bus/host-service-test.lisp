@@ -1022,3 +1022,53 @@
             (sb-thread:signal-semaphore *stall-release*)
             (true (await-completion svc sock sequence start)
                   "the released pass was not consumed within 10 s")))))))
+
+(defvar *failed-surveys* '()
+  "Whether each survey FAILING-SURVEY was handed was forced, newest first.")
+
+(defun failing-survey (survey)
+  "A survey function that notes whether SURVEY is forced, then signals."
+  (push (and (ident::survey-forced survey) t) *failed-surveys*)
+  (error "stand-in survey failure"))
+
+(defun served-identity (svc agent)
+  "The identity SVC serves for AGENT on the unnamed bus, or NIL."
+  (sb-thread:with-recursive-lock ((service::service-mutex svc))
+    (loop for identity being the hash-values
+            of (dsmr-bus-host/src/bus/host/registry:registry-identities
+                (service:service-registry svc))
+          when (equal (id agent) (ident:identity-id identity))
+            return identity)))
+
+(define-test a-survey-that-keeps-failing-still-samples-deafness
+  "With every survey signalling, a forced one still starts the next recycle
+   window, so later ticks inside it are not forced, and the deafness rule is
+   still sampled: mail unheard past the threshold raises the marker."
+  (with-memory-case (state)
+    (register "alpha")
+    (setf *failed-surveys* '())
+    (let ((svc (service:make-service :feed-p nil :report-fn #'recording-report
+                                     :memory-reader (lambda () *reading*)
+                                     :survey-fn #'failing-survey))
+          (start (%unix-time))
+          (marker (hostfiles:watch-state-file (hostfiles:detach-stem nil (id "alpha"))
+                                              "deaf")))
+      (push svc *services*)
+      (service:run-duties svc start)
+      (let* ((identity (served-identity svc "alpha"))
+             (wal-path (broker:bus-paths-wal (default-bus-paths)))
+             (head (values (wal:scan wal-path))))
+        (true identity "alpha is not served")
+        (wal:append-record wal-path (1+ head)
+                           (envelope:wrap-envelope "c1" "/ns/other" "x" :to (id "alpha")))
+        (sb-thread:with-recursive-lock ((service::service-mutex svc))
+          (ident:identity-deliver identity
+                                  (values (dsmr-bus-watch/src/bus/watch::%poll-forward
+                                           wal-path (wal:make-reader) head))
+                                  start :readers 0))
+        (setf *failed-surveys* '())
+        (loop for offset from 700 to 703
+              do (service:run-duties svc (+ start offset)))
+        (is = 4 (length *failed-surveys*) "surveys asked: ~S" *failed-surveys*)
+        (is = 1 (count t *failed-surveys*) "forced surveys: ~S" *failed-surveys*)
+        (true (probe-file marker) "no deaf marker after 700 s of unheard mail")))))

@@ -550,8 +550,9 @@ not start, 75 when its supervisor loop stalled.
    is answered by SVC's survey function: those are the reads of the logs and
    of /proc, and the bus readers take the mutex to deliver. Under the mutex
    again, each identity's tick applies its survey and is settled. A survey
-   that signals is reported like any identity duty, and that identity's
-   questions wait for the next pass.
+   that signals is reported like any identity duty and applied with the
+   answers it holds, so the deafness rule is still sampled and a forced
+   survey still starts the next recycle window.
 
    A heal of a stranded cursor and a claim still read the log under the
    mutex; they run only for a cursor found stranded and for a new
@@ -585,6 +586,7 @@ not start, 75 when its supervisor loop stalled.
                                                     :bus (ident:identity-bus identity)
                                                     :id (ident:identity-id identity)
                                                     :subject (ident:identity-stem identity)))
+                                        request
                                         :unanswered))))
         (incf (service-pass-surveys svc)
               (count-if (lambda (survey)

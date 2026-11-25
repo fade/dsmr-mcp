@@ -834,7 +834,7 @@
    SURVEY carries the answers to the tick's questions of the log, taken by
    REQUEST-SURVEY and RUN-SURVEY; left out, both run here. A survey whose
    epoch or state IDENTITY no longer has is discarded, as is :UNANSWERED, for
-   a survey that could not be taken: the tick then only refreshes the
+   a survey that could not be requested: the tick then only refreshes the
    heartbeat and checks the pid file, leaving the recorded cursor write date
    and the last activity as they were, so the next pass asks again.
 
