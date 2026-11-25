@@ -183,7 +183,8 @@
   "Set the floor of every agent on BW's bus from its cursor over the log as it
    now is. An agent with no cursor of its own gets a floor of 0: it was armed at
    the head of the old log, and everything in the new one arrived after the
-   rotation, so all of it is owed."
+   rotation, so all of it is owed. Either way the agent's epoch moves, so a
+   survey taken against the old log is discarded."
   (dolist (identity identities)
     (when (%on-bus-p bw identity)
       (let ((path (merge-pathnames (envelope:encode-id (ident:identity-id identity))
@@ -193,7 +194,7 @@
             (ident:identity-baseline identity (bus-watch-wal-path bw)
                                      (bus-watch-cursors-dir bw)
                                      :report-fn report-fn)
-            (setf (ident:identity-floor identity) 0))))))
+            (ident:rearm-at-floor identity 0))))))
 
 (defun rebase-bus-cursors (bw identities &key (report-fn #'ident:report-to-logs))
   "Rebase every stranded stable cursor on BW's bus, once, then arm every agent

@@ -32,6 +32,7 @@
                     (#:hostfiles #:dsmr-mcp/src/bus/hostfiles)
                     (#:broker #:dsmr-mcp/src/bus/broker)
                     (#:wal #:dsmr-mcp/src/bus/wal)
+                    (#:envelope #:dsmr-mcp/src/bus/envelope)
                     (#:conditions #:dsmr-bus-host/src/bus/host/conditions)
                     (#:ident #:dsmr-bus-host/src/bus/host/identity)
                     (#:memory #:dsmr-bus-host/src/bus/host/memory)
@@ -768,7 +769,8 @@
 ;;; ------------------------------------------------- the duty loop and the I/O thread
 
 (defvar *stall-armed* nil
-  "True when the next call of STALLING-MEMORY-READER is to stall.")
+  "Which stand-in stalls on its next call: :MEMORY for
+   STALLING-MEMORY-READER, :SURVEY for STALLING-SURVEY, NIL for neither.")
 
 (defvar *stall-entered* nil
   "True once STALLING-MEMORY-READER has entered its stall.")
@@ -781,15 +783,26 @@
   "True once STALLING-MEMORY-READER has left its stall.")
 
 (defun stalling-memory-reader ()
-  "A memory reader with 50% of memory available. Once armed, the next call
-   blocks the pass that made it until *STALL-RELEASE* is signalled, or for at
-   most 60 s."
-  (when *stall-armed*
+  "A memory reader with 50% of memory available. Once armed with :MEMORY,
+   the next call blocks the pass that made it until *STALL-RELEASE* is
+   signalled, or for at most 60 s."
+  (when (eq *stall-armed* :memory)
     (setf *stall-armed* nil
           *stall-entered* t)
     (sb-thread:wait-on-semaphore *stall-release* :timeout 60)
     (setf *stall-left* t))
   (readings 50))
+
+(defun stalling-survey (survey)
+  "A survey function that answers SURVEY as the service's own does. Once
+   armed with :SURVEY, the next call blocks the pass that made it until
+   *STALL-RELEASE* is signalled, or for at most 60 s, before it answers."
+  (when (eq *stall-armed* :survey)
+    (setf *stall-armed* nil
+          *stall-entered* t)
+    (sb-thread:wait-on-semaphore *stall-release* :timeout 60)
+    (setf *stall-left* t))
+  (ident:run-survey survey))
 
 (defun drain (sock)
   "Every datagram waiting on SOCK, oldest first, without blocking."
@@ -814,12 +827,14 @@
   "How many of MESSAGES are WATCHDOG=1."
   (count "WATCHDOG=1" messages :test #'string=))
 
-(defun call-with-io-service (state thunk &key (diagnostic (make-broadcast-stream)))
+(defun call-with-io-service (state thunk &key (diagnostic (make-broadcast-stream))
+                                             (survey-fn #'ident:run-survey))
   "Call THUNK with a service whose I/O thread is started, whose memory reader
-   is STALLING-MEMORY-READER and whose backtraces go to DIAGNOSTIC, and with a
-   bound, non-blocking datagram socket under STATE that NOTIFY_SOCKET names.
-   Afterwards the stall is released, the service stopped, its I/O thread
-   joined, NOTIFY_SOCKET restored and the socket closed."
+   is STALLING-MEMORY-READER, whose survey function is SURVEY-FN and whose
+   backtraces go to DIAGNOSTIC, and with a bound, non-blocking datagram
+   socket under STATE that NOTIFY_SOCKET names. Afterwards the stall is
+   released, the service stopped, its I/O thread joined, NOTIFY_SOCKET
+   restored and the socket closed."
   (let ((path (uiop:native-namestring (merge-pathnames "notify.sock" state)))
         (sock (make-instance 'sb-bsd-sockets:local-socket :type :datagram))
         (previous (uiop:getenv "NOTIFY_SOCKET"))
@@ -835,6 +850,7 @@
            (sb-posix:setenv "NOTIFY_SOCKET" path 1)
            (setf svc (service:make-service :feed-p nil
                                            :memory-reader #'stalling-memory-reader
+                                           :survey-fn survey-fn
                                            :diagnostic-stream diagnostic))
            (push svc *services*)
            (service:start-io-thread svc)
@@ -862,12 +878,12 @@
         thereis (member "READY=1" (tick svc sock (%unix-time)) :test #'string=)
         do (sleep 0.25)))
 
-(defun enter-stall (svc sock)
-  "Arm the stalling reader and tick SVC on the wall clock until a pass enters
-   the stall, for at most 10 s. Returns the clock of the tick that saw it
-   entered and the sequence number of the stalled pass, or NIL when no pass
-   entered it."
-  (setf *stall-armed* t)
+(defun enter-stall (svc sock &optional (kind :memory))
+  "Arm the stand-in KIND names (*STALL-ARMED*) and tick SVC on the wall clock
+   until a pass enters the stall, for at most 10 s. Returns the clock of the
+   tick that saw it entered and the sequence number of the stalled pass, or
+   NIL when no pass entered it."
+  (setf *stall-armed* kind)
   (loop repeat 40
         for now = (%unix-time)
         do (tick svc sock now)
@@ -969,3 +985,40 @@
   (false (service:stall-p 100 t 39 100 :window 61))
   (true (service:stall-p 39 nil nil 100) "the loop has not come round")
   (false (service:stall-p 40 t 95 100)))
+
+(define-test mail-is-announced-while-a-cursor-survey-is-stalled
+  "With the I/O thread held inside one agent's cursor survey, mail published
+   to that agent reaches its wake log within 5 s while the survey is still
+   held: the survey takes no service mutex, so the bus reader delivers."
+  (with-memory-case (state)
+    (register "alpha")
+    (with-io-service (svc sock state :survey-fn #'stalling-survey)
+      (true (await-ready svc sock) "READY=1 did not arrive within 15 s")
+      (let* ((paths (default-bus-paths))
+             (wal-path (broker:bus-paths-wal paths))
+             (cursor (merge-pathnames (envelope:encode-id (id "alpha"))
+                                      (uiop:ensure-directory-pathname
+                                       (broker:bus-paths-cursors-dir paths))))
+             (log (hostfiles:watch-state-file (hostfiles:detach-stem nil (id "alpha")) "log"))
+             (head (values (wal:scan wal-path))))
+        ;; A cursor at the head with a write date the identity has not
+        ;; recorded, so the held survey goes on to read the log.
+        (write-text cursor (format nil "~D" head))
+        (sb-posix:utimes (uiop:native-namestring cursor) (- (%unix-time) 100)
+                         (- (%unix-time) 100))
+        (multiple-value-bind (start sequence) (enter-stall svc sock :survey)
+          (true start "no pass entered the stalling survey within 10 s")
+          (when start
+            (let ((before (if (probe-file log) (length (uiop:read-file-lines log)) 0)))
+              (wal:append-record wal-path (1+ head)
+                                 (envelope:wrap-envelope "c1" "/ns/other" "x"
+                                                         :to (id "alpha")))
+              (true (loop repeat 100
+                          thereis (and (probe-file log)
+                                       (> (length (uiop:read-file-lines log)) before))
+                          do (sleep 0.05))
+                    "no wake line within 5 s while the survey was held")
+              (false *stall-left* "the survey was released before the mail was announced"))
+            (sb-thread:signal-semaphore *stall-release*)
+            (true (await-completion svc sock sequence start)
+                  "the released pass was not consumed within 10 s")))))))

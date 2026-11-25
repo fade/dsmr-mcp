@@ -186,7 +186,7 @@ not start, 75 when its supervisor loop stalled.
 
 (defstruct (service (:constructor %make-service
                         (&key pid report-fn feed-p memory-reader memory-thresholds
-                              memory-threshold-warnings diagnostic-stream
+                              memory-threshold-warnings diagnostic-stream survey-fn
                          &aux (registry (registry:make-registry :service-pid pid)))))
   "One running host service. Made by MAKE-SERVICE.
 
@@ -220,6 +220,10 @@ not start, 75 when its supervisor loop stalled.
    of the completed count, IO-WEDGED-P, true while a withheld beat has already
    had the I/O thread's backtrace written, and LAST-BEAT, when it last told
    systemd anything. DIAGNOSTIC-STREAM takes that backtrace.
+
+   SURVEY-FN answers one identity's survey of the bus's log, without the
+   service mutex (IDENT:RUN-SURVEY). PASS-SURVEYS counts the surveys of the
+   current pass that read the log.
 
    MEMORY-READER returns the host's memory readings when called with no
    arguments. MEMORY-THRESHOLDS say where pressure starts and stops, and
@@ -266,6 +270,8 @@ not start, 75 when its supervisor loop stalled.
   (io-wedged-p nil)
   (last-beat nil)
   diagnostic-stream
+  survey-fn
+  (pass-surveys 0)
   memory-reader
   memory-thresholds
   memory-threshold-warnings
@@ -282,7 +288,8 @@ not start, 75 when its supervisor loop stalled.
                           (feed-p t)
                           (memory-reader #'memory:read-memory-readings)
                           memory-thresholds
-                          (diagnostic-stream sb-sys:*stderr*))
+                          (diagnostic-stream sb-sys:*stderr*)
+                          (survey-fn #'ident:run-survey))
   "A host service for the process PID that reports through REPORT-FN, its bus
    readers subscribing to the brokers' publications when FEED-P is true.
 
@@ -292,7 +299,8 @@ not start, 75 when its supervisor loop stalled.
    check, through REPORT-FN like every other finding. DIAGNOSTIC-STREAM takes
    the I/O thread's backtrace when its pass is wedged; it defaults to the
    process's standard error, never a dynamic binding, because the I/O thread
-   sees none of its maker's bindings."
+   sees none of its maker's bindings. SURVEY-FN answers each identity's
+   survey of the bus's log, once a second, without the service mutex."
   (multiple-value-bind (thresholds warnings)
       (if memory-thresholds
           (values memory-thresholds '())
@@ -301,7 +309,8 @@ not start, 75 when its supervisor loop stalled.
                    :memory-reader memory-reader
                    :memory-thresholds thresholds
                    :memory-threshold-warnings warnings
-                   :diagnostic-stream diagnostic-stream)))
+                   :diagnostic-stream diagnostic-stream
+                   :survey-fn survey-fn)))
 
 (defmacro with-service-lock ((svc) &body body)
   "Run BODY holding SVC's mutex, the one the bus readers hold while they hand
@@ -534,28 +543,72 @@ not start, 75 when its supervisor loop stalled.
 
 (defun %tick-identities (svc now)
   "Look at every agent's session, then do every agent's duties for this tick,
-   with one count of the readers of every agent's log."
+   with one count of the readers of every agent's log, in three steps.
+
+   Under the service mutex, the sessions are checked and every identity's
+   survey is requested. Without it, the readers are counted and each survey
+   is answered by SVC's survey function: those are the reads of the logs and
+   of /proc, and the bus readers take the mutex to deliver. Under the mutex
+   again, each identity's tick applies its survey and is settled. A survey
+   that signals is reported like any identity duty, and that identity's
+   questions wait for the next pass.
+
+   A heal of a stranded cursor and a claim still read the log under the
+   mutex; they run only for a cursor found stranded and for a new
+   registration."
   (let ((reg (service-registry svc))
-        (report-fn (service-report-fn svc)))
-    (with-service-lock (svc)
-      (%duty svc "sessions"
-             (lambda () (registry:check-sessions reg now :report-fn report-fn)))
-      (let* ((identities (%identities svc))
-             (counts (ident:log-reader-counts
-                      (mapcar #'ident:identity-log-path identities))))
-        (dolist (identity identities)
-          (%duty svc "identity"
-                 (lambda ()
-                   (let ((result (ident:identity-tick
-                                  identity now
-                                  :readers (gethash (uiop:native-namestring
-                                                     (ident:identity-log-path identity))
-                                                    counts)
-                                  :report-fn report-fn)))
-                     (registry:settle-tick reg identity result :report-fn report-fn)))
-                 :bus (ident:identity-bus identity)
-                 :id (ident:identity-id identity)
-                 :subject (ident:identity-stem identity)))))))
+        (report-fn (service-report-fn svc))
+        (survey-fn (service-survey-fn svc)))
+    (multiple-value-bind (identities requests)
+        (with-service-lock (svc)
+          (%duty svc "sessions"
+                 (lambda () (registry:check-sessions reg now :report-fn report-fn)))
+          (let ((identities (%identities svc)))
+            (values identities
+                    (mapcar (lambda (identity)
+                              (%duty svc "identity"
+                                     (lambda () (ident:request-survey identity now))
+                                     :bus (ident:identity-bus identity)
+                                     :id (ident:identity-id identity)
+                                     :subject (ident:identity-stem identity)))
+                            identities))))
+      (let* ((counts (%duty svc "readers"
+                            (lambda ()
+                              (ident:log-reader-counts
+                               (mapcar #'ident:identity-log-path identities)))
+                            :subject "host"))
+             (surveys (loop for identity in identities
+                            for request in requests
+                            collect (or (and request
+                                             (%duty svc "identity"
+                                                    (lambda () (funcall survey-fn request))
+                                                    :bus (ident:identity-bus identity)
+                                                    :id (ident:identity-id identity)
+                                                    :subject (ident:identity-stem identity)))
+                                        :unanswered))))
+        (incf (service-pass-surveys svc)
+              (count-if (lambda (survey)
+                          (and (ident:survey-p survey) (ident:survey-read-log-p survey)))
+                        surveys))
+        (with-service-lock (svc)
+          (loop for identity in identities
+                for survey in surveys
+                do (let ((identity identity)
+                         (survey survey))
+                     (%duty svc "identity"
+                            (lambda ()
+                              (let ((result (ident:identity-tick
+                                             identity now
+                                             :readers (and (hash-table-p counts)
+                                                           (gethash (uiop:native-namestring
+                                                                     (ident:identity-log-path identity))
+                                                                    counts))
+                                             :report-fn report-fn
+                                             :survey survey)))
+                                (registry:settle-tick reg identity result :report-fn report-fn)))
+                            :bus (ident:identity-bus identity)
+                            :id (ident:identity-id identity)
+                            :subject (ident:identity-stem identity)))))))))
 
 (defun %check-brokers (svc now)
   "Look at every bus's broker. NOW is Unix seconds; the brokers keep universal
@@ -967,11 +1020,13 @@ not start, 75 when its supervisor loop stalled.
    on the first pass after the service became ready, so the summary never
    says a bus is unserved for five seconds after it is served. The first pass
    does all of it. A pass longer than the progress window writes one line to
-   the service log with its length."
+   the service log with its length and the number of identity surveys that
+   read a log."
   (let ((started (get-internal-real-time))
         (five (%due-p (service-last-five svc) now 5))
         (second (%due-p (service-last-second svc) now 1))
         (newly-ready (and (service-ready-p svc) (not (service-ready-noted-p svc)))))
+    (setf (service-pass-surveys svc) 0)
     (%write-deferred-reports svc)
     (when newly-ready
       (setf (service-ready-noted-p svc) t)
@@ -995,7 +1050,8 @@ not start, 75 when its supervisor loop stalled.
     (let ((seconds (/ (- (get-internal-real-time) started)
                       internal-time-units-per-second)))
       (when (> seconds +progress-window+)
-        (fleetlog:service-log :info "slow pass seconds=~,1F" seconds))))
+        (fleetlog:service-log :info "slow pass seconds=~,1F surveys=~D"
+                              seconds (service-pass-surveys svc)))))
   svc)
 
 (defun %io-loop (svc)
