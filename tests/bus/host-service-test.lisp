@@ -776,21 +776,39 @@
   "True once STALLING-MEMORY-READER has entered its stall.")
 
 (defvar *stall-release* (sb-thread:make-semaphore :name "stall")
-  "Signalled to end the stall. These four are global, not bound per case,
+  "Signalled to end the stall. These *STALL-* variables are global, not bound per case,
    because the I/O thread sees no case's dynamic bindings.")
 
 (defvar *stall-left* nil
   "True once STALLING-MEMORY-READER has left its stall.")
 
+(defvar *stall-service* nil
+  "The service whose mutex STALLING-MEMORY-READER holds when armed with
+   :MEMORY-LOCKED.")
+
 (defun stalling-memory-reader ()
   "A memory reader with 50% of memory available. Once armed with :MEMORY,
    the next call blocks the pass that made it until *STALL-RELEASE* is
-   signalled, or for at most 60 s."
-  (when (eq *stall-armed* :memory)
-    (setf *stall-armed* nil
-          *stall-entered* t)
-    (sb-thread:wait-on-semaphore *stall-release* :timeout 60)
-    (setf *stall-left* t))
+   signalled, or for at most 60 s; armed with :MEMORY-LOCKED, it blocks the
+   same way holding *STALL-SERVICE*'s mutex; armed with :MEMORY-SLOW, it
+   takes 5 s."
+  (case *stall-armed*
+    (:memory
+     (setf *stall-armed* nil
+           *stall-entered* t)
+     (sb-thread:wait-on-semaphore *stall-release* :timeout 60)
+     (setf *stall-left* t))
+    (:memory-locked
+     (setf *stall-armed* nil)
+     (sb-thread:with-recursive-lock ((service::service-mutex *stall-service*))
+       (setf *stall-entered* t)
+       (sb-thread:wait-on-semaphore *stall-release* :timeout 60))
+     (setf *stall-left* t))
+    (:memory-slow
+     (setf *stall-armed* nil
+           *stall-entered* t)
+     (sleep 5)
+     (setf *stall-left* t)))
   (readings 50))
 
 (defun stalling-survey (survey)
@@ -959,21 +977,45 @@
                   "WATCHDOG=1 did not return within three ticks of the release")))))))
 
 (define-test a-stop-does-not-wait-on-a-wedged-pass
-  "With a pass held, an orderly stop returns within 6 s and writes no
-   clean-stop marker, so the next start records an unclean restart."
+  "With a pass held while it holds the service mutex, an orderly stop
+   returns within its bound (the quiet window, a second each to join the
+   broker and the reader, and 4 s of margin), says it was not orderly, and
+   writes no clean-stop marker, so the next start records an unclean
+   restart."
   (with-memory-case (state)
     (with-io-service (svc sock state)
+      (setf *stall-service* svc)
       (true (await-ready svc sock) "READY=1 did not arrive within 15 s")
-      (let ((start (enter-stall svc sock)))
+      (let ((start (enter-stall svc sock :memory-locked))
+            (bound (+ service::+io-stop-quiet-seconds+ 2 4)))
         (true start "no pass entered the stalling reader within 10 s")
         (when start
+          (true (sb-thread:mutex-owner (service::service-mutex svc))
+                "the stalled pass does not hold the service mutex")
           (let ((began (get-internal-real-time)))
             (service:stop-service svc :mark-clean t)
             (let ((seconds (/ (- (get-internal-real-time) began)
                               internal-time-units-per-second)))
-              (true (< seconds 6) "the stop took ~,1F s" seconds)))
+              (true (< seconds bound) "the stop took ~,1F s, bound ~D s" seconds bound)))
+          (false (service::service-stop-orderly-p svc) "the stop says it was orderly")
           (false (probe-file (hostfiles:clean-stop-path))
                  "a clean-stop marker was written with a pass wedged"))))))
+
+(define-test a-stop-waits-for-a-pass-that-is-still-running
+  "With a pass inside a memory read that takes 5 s, an orderly stop waits
+   for the pass to end, says it was orderly, and writes the clean-stop
+   marker."
+  (with-memory-case (state)
+    (with-io-service (svc sock state)
+      (true (await-ready svc sock) "READY=1 did not arrive within 15 s")
+      (let ((start (enter-stall svc sock :memory-slow)))
+        (true start "no pass entered the slow reader within 10 s")
+        (when start
+          (false *stall-left* "the slow read ended before the stop")
+          (service:stop-service svc :mark-clean t)
+          (true (probe-file (hostfiles:clean-stop-path))
+                "no clean-stop marker after a pass that was only running")
+          (true (service::service-stop-orderly-p svc) "the stop says it was not orderly"))))))
 
 (define-test io-progress-stall-rule
   "The stall watchdog's rule: the service has stalled when its loop has not

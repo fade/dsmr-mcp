@@ -92,6 +92,7 @@
    #:run-duties
    #:supervisor-tick
    #:stop-service
+   #:service-stop-orderly-p
    ;; systemd
    #:sd-notify
    ;; watchdog rule
@@ -120,9 +121,14 @@
    it keeps finishing duties, and bus delivery goes on throughout, since the
    bus readers run on their own threads.")
 
-(defconstant +io-join-seconds+ 3
-  "Seconds an orderly stop waits for the I/O thread to end before it treats
-   the pass in flight as wedged.")
+(defconstant +io-stop-quiet-seconds+ +io-progress-window+
+  "Seconds an orderly stop waits for the I/O thread to finish a duty before
+   it treats the pass in flight as wedged: the window the beat allows.")
+
+(defconstant +io-stop-limit+ 60
+  "Seconds an orderly stop waits at most for the I/O thread to end, however
+   it progresses, so the stop ends well inside systemd's default stop
+   timeout of 90 s.")
 
 (defconstant +stall-seconds+ 60
   "Seconds the supervisor loop may go without coming round, or a pass on the
@@ -207,7 +213,9 @@ not start, 75 when its supervisor loop stalled.
    SCANNED says the registrations have been read once, READY-P that systemd
    has been told the service is ready, READY-NOTED-P that a pass has logged
    the readiness and written the status for it. STOPPING asks every thread to
-   end; STOPPED says the stop has run. LOCK-FD holds the service lock.
+   end; STOPPED says the stop has run, and STOP-ORDERLY-P that it found the
+   I/O thread ended, which is when the clean-stop marker may be written.
+   LOCK-FD holds the service lock.
 
    IO-THREAD is the thread that runs the duty passes, or NIL when the passes
    run inline in SUPERVISOR-TICK. IO-MUTEX guards the queue: IO-POSTED is the
@@ -259,6 +267,7 @@ not start, 75 when its supervisor loop stalled.
   (ready-noted-p nil)
   (stopping nil)
   (stopped nil)
+  (stop-orderly-p nil)
   lock-fd
   (io-thread nil)
   (io-mutex (sb-thread:make-mutex :name "host service io queue"))
@@ -1216,32 +1225,48 @@ not start, 75 when its supervisor loop stalled.
   svc)
 
 (defun %stop-io-thread (svc)
-  "Ask every thread of SVC to end, wake the I/O thread, and wait up to
-   +IO-JOIN-SECONDS+ for it. True when it has ended or was never started."
+  "Ask every thread of SVC to end, wake the I/O thread, and wait for it to
+   end while its pass keeps finishing duties: until it has finished none for
+   +IO-STOP-QUIET-SECONDS+, and for +IO-STOP-LIMIT+ at most. True when it
+   has ended or was never started."
   (sb-thread:with-mutex ((service-io-mutex svc))
     (setf (service-stopping svc) t)
     (sb-thread:condition-broadcast (service-io-queue svc)))
   (let ((thread (service-io-thread svc)))
     (or (null thread)
-        (progn
-          (sb-thread:join-thread thread :default nil :timeout +io-join-seconds+)
-          (not (sb-thread:thread-alive-p thread))))))
+        (let* ((units internal-time-units-per-second)
+               (began (get-internal-real-time))
+               (moved began)
+               (seen (service-io-progress svc)))
+          (loop
+            (sb-thread:join-thread thread :default nil :timeout 0.25)
+            (unless (sb-thread:thread-alive-p thread)
+              (return t))
+            (let ((now (get-internal-real-time))
+                  (progress (service-io-progress svc)))
+              (unless (eql progress seen)
+                (setf seen progress
+                      moved now))
+              (when (or (> (- now moved) (* +io-stop-quiet-seconds+ units))
+                        (> (- now began) (* +io-stop-limit+ units)))
+                (return nil))))))))
 
 (defun stop-service (svc &key (mark-clean t))
   "Stop SVC in order, and return it. Safe to call more than once.
 
-   Every thread is asked to end, and the I/O thread is given a few seconds to
-   finish its pass. Each broker then lets its role go without archiving, then
-   each reader closes, then every agent's descriptors are closed with its pid
-   file, heartbeat and registration left in place for the service that
-   follows. With MARK-CLEAN, the clean-stop marker is written last, so the
-   next start knows this was not a crash.
+   Every thread is asked to end, and a pass still running on the I/O thread
+   is waited for while it keeps finishing duties (%STOP-IO-THREAD). Each
+   broker then lets its role go without archiving, then each reader closes,
+   then every agent's descriptors are closed with its pid file, heartbeat
+   and registration left in place for the service that follows. With
+   MARK-CLEAN, the clean-stop marker is written last, so the next start knows
+   this was not a crash. SERVICE-STOP-ORDERLY-P then says whether the I/O
+   thread had ended.
 
-   When the I/O thread does not end in time, its pass may hold the service
-   mutex, so the stop never waits on it: the brokers and readers are stopped
-   as usual, the agents' descriptors are left to the process's exit, and no
-   clean-stop marker is written, so the next start records an unclean
-   restart."
+   When the I/O thread does not end, its pass may hold the service mutex, so
+   the stop never waits on it: the brokers and readers are stopped as usual,
+   the agents' descriptors are left to the process's exit, and no clean-stop
+   marker is written, so the next start records an unclean restart."
   (unless (service-stopped svc)
     (let ((orderly (%stop-io-thread svc)))
       (dolist (entry (%served-brokers svc))
@@ -1251,7 +1276,8 @@ not start, 75 when its supervisor loop stalled.
       (when orderly
         (dolist (identity (%identities svc))
           (ignore-errors (ident:release-identity identity :remove-files nil))))
-      (setf (service-stopped svc) t)
+      (setf (service-stop-orderly-p svc) orderly
+            (service-stopped svc) t)
       (when (and orderly mark-clean)
         (with-open-file (out (hostfiles:clean-stop-path) :direction :output
                                                          :if-exists :supersede
@@ -1352,11 +1378,11 @@ not start, 75 when its supervisor loop stalled.
       (%note-loop)
       (%notify svc "STOPPING=1")
       (stop-service svc :mark-clean t)
-      (if (sb-thread:thread-alive-p (service-io-thread svc))
+      (if (service-stop-orderly-p svc)
+          (fleetlog:service-log :info "stopped in order pid=~D" (service-pid svc))
           (fleetlog:service-log :info "stopped with a pass still running pid=~D; ~
                                        the next start records an unclean restart"
-                                (service-pid svc))
-          (fleetlog:service-log :info "stopped in order pid=~D" (service-pid svc)))
+                                (service-pid svc)))
       (sb-ext:exit :code 0 :abort t))))
 
 (defun main ()
