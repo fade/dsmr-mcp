@@ -674,18 +674,22 @@
   "The questions one identity tick asks of the bus's log, and their answers.
 
    REQUEST-SURVEY fills the request from the identity as it then is, under the
-   service mutex: EPOCH, STATE, ID, CURSOR-PATH and WAL-PATH; RECORDED-MTIME,
-   the cursor's write date when it was last looked at; FLOOR and
-   LAST-ACTIVITY; PENDING-KEY, the cached answer of the lapsed check; FORCED,
-   true for a served identity whose recycle window is exceeded, so the cursor
-   is checked and the unread mail read whatever the cursor's write date; and
-   LAPSED-P.
+   service mutex:
+     EPOCH, STATE, ID, CURSOR-PATH, WAL-PATH, FLOOR, LAST-ACTIVITY, LAPSED-P
+     RECORDED-MTIME  the cursor's write date when it was last looked at
+     PENDING-KEY     the cached answer of the lapsed check
+     FORCED          true for a served identity past its recycle window; the
+                     cursor is checked and the unread mail read whatever the
+                     cursor's write date
 
-   RUN-SURVEY fills the answers without the mutex: MTIME, the cursor's write
-   date it saw; STRANDED, whether the cursor is stranded; UNREAD, the mail
-   between the cursor and FLOOR for a forced survey; CURSOR-SEQ and PENDING,
-   the cursor's seq and whether mail waits, for a lapsed one. An answer not
-   asked for is :UNASKED. READ-LOG-P is true when a question reached the log."
+   RUN-SURVEY fills the answers without the mutex:
+     MTIME           the cursor's write date RUN-SURVEY read
+     STRANDED        whether the cursor is stranded
+     UNREAD          the mail between the cursor and FLOOR, for a forced survey
+     CURSOR-SEQ      the cursor's seq, for a lapsed survey
+     PENDING         whether mail waits, for a lapsed survey
+   An answer not asked for is :UNASKED. READ-LOG-P is true when a question
+   reached the log."
   epoch state id cursor-path wal-path recorded-mtime floor last-activity
   pending-key forced lapsed-p
   (mtime :unasked)
@@ -826,10 +830,12 @@
    :HEARD when a lapsed identity's agent has read past its pending mail.
 
    Every tick refreshes the heartbeat, checks the pid file is still the one
-   held, and heals the cursor when it was rewritten and found stranded; a
-   heal on a forced survey starts the next recycle window. A served identity then announces unread mail again once a recycle window has
-   passed quietly, and samples the deafness rule; a lapsed one only watches
-   for unread mail. Faults are raised for the supervisor to heal.
+   held, and heals the cursor when it was rewritten, or the survey is
+   forced, and found stranded; a heal on a forced survey starts the next
+   recycle window. A served identity then announces unread mail again once a
+   recycle window has passed quietly, and samples the deafness rule; a
+   lapsed one only watches for unread mail. Faults are raised for the
+   supervisor to heal.
 
    SURVEY carries the answers to the tick's questions of the log, taken by
    REQUEST-SURVEY and RUN-SURVEY; left out, both run here. A survey whose

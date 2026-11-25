@@ -1385,7 +1385,7 @@
                    (is = 1 (beats (tick svc sock (+ start offset)))
                        "WATCHDOG=1 count at slow pass start + ~D s" offset))
           (true (< (service::service-io-completed svc) sequence)
-                "the pass ended inside the window, so it proves nothing")
+                "the slow pass ended inside the I/O progress window")
           (setf *stall-armed* nil)
           (true (await-completion svc sock sequence (+ start 28))
                 "the slow pass was not consumed within 10 s"))))))

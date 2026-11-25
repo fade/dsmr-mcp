@@ -190,7 +190,7 @@ records and the fleet error log, bus/ the buses, watch/ the agents' files.
 
 Exit status: 0 after an orderly stop on SIGTERM, 1 when another copy already
 holds the service lock, 64 on an argument it does not take, 70 when it could
-not start, 75 when its supervisor loop stalled.
+not start, 75 when its supervisor loop or its I/O thread stalled.
 "
   "The --help text, a format control taking the state home.")
 
@@ -509,7 +509,7 @@ not start, 75 when its supervisor loop stalled.
    its backtrace, into IO-BACKTRACE as text. The episode ends when the I/O
    thread is fresh again.
 
-   SIGABRT's own backtrace shows only the main thread, which now sits in the
+   SIGABRT's own backtrace shows only the main thread, which sits in the
    duty loop, so this is the one record of where the pass is stuck. The
    interrupt may land while the I/O thread holds a mutex, so it writes to no
    stream and calls no logger: it formats into a string and returns to the
@@ -1074,15 +1074,15 @@ not start, 75 when its supervisor loop stalled.
    left running, looks for buses to serve, starting a broker and a reader for
    each new one, and, when a minute has passed since it last did, removes
    what servers that have gone left behind. Once a second it refreshes its
-   beat, looks at every agent's session and does every agent's duties, checks
-   every broker, and reads the host's memory, relieving pressure one worker
-   at a time. Last, it writes its status summary, every five seconds and also
-   on the first pass after the service became ready, so the summary never
-   says a bus is unserved for five seconds after it is served. The first pass
-   does all of it. Once SVC is asked to stop, the pass skips every step
-   still to come, so it ends at its next duty. A pass longer than the progress window writes one line to
-   the service log with its length and the number of identity surveys that
-   read a log."
+   beat file, looks at every agent's session and does every agent's duties,
+   checks every broker, and reads the host's memory, relieving pressure one
+   worker at a time. Last, it writes its status summary, every five seconds
+   and also on the first pass after the service became ready, so the summary
+   never says a bus is unserved for five seconds after it is served. The
+   first pass does all of it. Once SVC is asked to stop, the pass skips every
+   step still to come, so it ends at its next duty. A pass longer than
+   +PROGRESS-WINDOW+ writes one line to the service log with its length and
+   the number of identity surveys that read a log."
   (let ((started (get-internal-real-time))
         (five (%due-p (service-last-five svc) now 5))
         (second (%due-p (service-last-second svc) now 1))
