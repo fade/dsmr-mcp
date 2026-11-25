@@ -340,6 +340,10 @@
             (true (await-true (lambda () (search "bus b owner=host " (host-status state))) 7)
                   "--host-status does not show the service owning the bus: ~S"
                   (host-status state))
+            ;; Sample on past the hand-over for 1.2 s, so the samples also
+            ;; cover the service holding the role once it has it, however
+            ;; soon the status reports the new owner.
+            (sleep 1.2)
             (multiple-value-bind (free tries) (stop-lock-sampler sampler)
               (format *trace-output* "~&broker lock free in ~D of ~D samples across the hand-over~%"
                       free tries)

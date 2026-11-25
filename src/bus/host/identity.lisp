@@ -94,7 +94,14 @@
    ;; serving
    #:identity-deliver
    #:identity-tick
+   #:identity-epoch
+   #:request-survey
+   #:run-survey
+   #:survey
+   #:survey-p
+   #:survey-read-log-p
    #:identity-baseline
+   #:rearm-at-floor
    #:clamp-baseline
    #:lapse-identity
    #:unlapse-identity
@@ -121,8 +128,14 @@
    under it. DEAF-WATCH and DEAF-STATE are the deafness alarm's, exactly as the
    detached watcher keeps them. CURSOR-MTIME is the agent's cursor file's write
    date when it was last looked at, and PENDING-P whether mail the agent would be
-   handed sits above its cursor. SERVICE-PID is the pid the pid file records."
+   handed sits above its cursor. SERVICE-PID is the pid the pid file records.
+
+   EPOCH counts the re-arms of the identity: every new baseline or floor set
+   from outside a delivery, every lapse, unlapse and release moves it, always
+   under the service mutex. A survey taken at one epoch is discarded when the
+   identity has moved on by the time it is applied."
   id bus stem token session-pid session-start
+  (epoch 0)
   (state :serving)
   pid-stream log-stream log-path pid-path beat-path
   (floor 0)
@@ -316,7 +329,7 @@
       (ignore-errors (sb-posix:unlink path)))))
 
 (defun release-identity (identity &key (remove-files t))
-  "Stop serving IDENTITY and return it.
+  "Stop serving IDENTITY, move its epoch, and return it.
 
    With REMOVE-FILES, the agent is deregistered: the pid file is removed while
    its lock is still held, so nobody sees it unlocked first, then the lock is let
@@ -324,6 +337,7 @@
    marker and the listener's offset are the agent's and stay. Without it, which
    is how an orderly stop of the service leaves things, only the descriptors are
    closed and every file stays for the service that follows."
+  (incf (identity-epoch identity))
   (%close-quietly (identity-log-stream identity))
   (setf (identity-log-stream identity) nil)
   (when (and remove-files (identity-pid-stream identity))
@@ -399,9 +413,10 @@
    rewrite discards the only record of it. CLAMP-BASELINE leaves the cursor
    alone and arms at the head of the log, reported as an error. A fault the
    supervisor skips clamps too, so the identity never filters on a stranded
-   value."
+   value. Moves IDENTITY's epoch."
   (let* ((id (identity-id identity))
          (path (%cursor-path id cursors-dir)))
+    (incf (identity-epoch identity))
     (setf (identity-cursor-path identity) path)
     (setf (identity-floor identity)
           (if (not (%cursor-holds-seq-p path))
@@ -419,6 +434,12 @@
                 (if reason
                     (%stranded-baseline identity wal-path path reason head report-fn)
                     (cursor:cursor-value subscriber)))))))
+
+(defun rearm-at-floor (identity floor)
+  "Set IDENTITY's floor to FLOOR outside a delivery, move its epoch, and
+   return FLOOR. Call it with the service mutex held."
+  (incf (identity-epoch identity))
+  (setf (identity-floor identity) floor))
 
 ;;; ------------------------------------------------------------------- readers
 
@@ -606,70 +627,129 @@
           :report "Create the pid file again, lock it and record this process."
           (%reclaim-pid-file identity))))))
 
-(defun %cursor-seq (identity wal-path)
-  "The seq IDENTITY's agent has consumed to, or NIL when its cursor holds
-   nothing readable. NIL is not 0: an unreadable cursor says nothing about what
-   the agent has read."
-  (let ((path (identity-cursor-path identity)))
-    (and path (%cursor-holds-seq-p path)
-         (cursor:cursor-value (cursor:make-subscriber (identity-id identity)
-                                                      wal-path path)))))
+(defun %cursor-seq-at (id cursor-path wal-path)
+  "The seq agent ID has consumed to, by its cursor at CURSOR-PATH over the log
+   at WAL-PATH, or NIL when the cursor holds nothing readable. NIL is not 0:
+   an unreadable cursor says nothing about what the agent has read."
+  (and cursor-path (%cursor-holds-seq-p cursor-path)
+       (cursor:cursor-value (cursor:make-subscriber id wal-path cursor-path))))
 
-(defun %stranded-p (identity wal-path)
-  "True when IDENTITY's cursor is stranded against the log at WAL-PATH. The
-   cheap question, asked before any fault is raised."
-  (let ((path (identity-cursor-path identity)))
-    (and path (%cursor-holds-seq-p path)
-         (ignore-errors
-          (cursor:stranded-reason
-           (cursor:make-subscriber (identity-id identity) wal-path path)))
-         t)))
+(defun %stranded-at-p (id cursor-path wal-path)
+  "True when agent ID's cursor at CURSOR-PATH is stranded against the log at
+   WAL-PATH. The cheap question, asked before any fault is raised. The cursor
+   is read before the log's head and generation (CURSOR:CURSOR-AND-HEAD)."
+  (and cursor-path (%cursor-holds-seq-p cursor-path)
+       (ignore-errors
+        (cursor:stranded-reason (cursor:make-subscriber id wal-path cursor-path)))
+       t))
 
-(defun %recheck-cursor (identity now readers wal-path cursors-dir report-fn
-                        &key force)
-  "Look at IDENTITY's cursor again when its write date has changed since the
-   last look, or when FORCE. A cursor found stranded is healed through
-   IDENTITY-BASELINE, and when the heal lowers the floor the mail between the
-   new floor and the old one is announced at once, since the bus's reader has
-   already moved past it.
+(defun %heal-stranded (identity now readers wal-path cursors-dir report-fn)
+  "Heal IDENTITY's stranded cursor through IDENTITY-BASELINE, and when the heal
+   lowers the floor, announce at once the mail between the new floor and the
+   old one, since the bus's reader has already moved past it.
 
    A heal never raises the floor: records above the old floor have not been
-   handed over yet, and skipping them would lose mail."
-  (let ((mtime (%mtime (identity-cursor-path identity))))
-    (when (or force (not (eql mtime (identity-cursor-mtime identity))))
-      (setf (identity-cursor-mtime identity) mtime)
-      (when (%stranded-p identity wal-path)
-        (let* ((old-floor (identity-floor identity))
-               (baseline (identity-baseline identity wal-path cursors-dir
-                                            :report-fn report-fn)))
-          (setf (identity-cursor-mtime identity) (%mtime (identity-cursor-path identity)))
-          (if (< baseline old-floor)
-              (identity-deliver identity
-                                (values (%poll-forward wal-path (wal:make-reader) baseline))
-                                now :readers readers)
-              (setf (identity-floor identity) old-floor)))))))
+   handed over yet, and skipping them would lose mail. The baseline reads the
+   cursor again under the caller's lock, so a cursor rewritten since it was
+   found stranded is taken as it now is."
+  (let* ((old-floor (identity-floor identity))
+         (baseline (identity-baseline identity wal-path cursors-dir
+                                      :report-fn report-fn)))
+    (setf (identity-cursor-mtime identity) (%mtime (identity-cursor-path identity)))
+    (if (< baseline old-floor)
+        (identity-deliver identity
+                          (values (%poll-forward wal-path (wal:make-reader) baseline))
+                          now :readers readers)
+        (setf (identity-floor identity) old-floor))))
 
-(defun %unread-mail (identity wal-path)
-  "The records between IDENTITY's cursor and its floor that its agent would be
-   handed, oldest first; NIL when the cursor holds nothing readable or has
-   reached the floor. Records above the floor are left to the next delivery."
-  (let ((cursor (%cursor-seq identity wal-path))
-        (floor (identity-floor identity)))
-    (when (and cursor (< cursor floor))
-      (remove-if (lambda (record) (> (wal:record-seq record) floor))
-                 (values (poll-new-records wal-path cursor (identity-id identity)))))))
+(defun %unread-mail-at (id cursor-seq floor wal-path)
+  "The records of the log at WAL-PATH above CURSOR-SEQ and at or below FLOOR
+   that agent ID would be handed, oldest first; NIL when CURSOR-SEQ is NIL or
+   has reached FLOOR. Records above the floor are left to the next delivery."
+  (when (and cursor-seq (< cursor-seq floor))
+    (remove-if (lambda (record) (> (wal:record-seq record) floor))
+               (values (poll-new-records wal-path cursor-seq id)))))
 
-(defun %pending-p (identity wal-path)
-  "True when mail IDENTITY's agent would be handed sits above its cursor. The
-   log is read only when the cursor or the floor has moved since the last
-   answer, so a lapsed identity costs a stat and a small file read per tick."
-  (let* ((key (list (%cursor-seq identity wal-path) (identity-floor identity)))
-         (cached (identity-pending-key identity)))
-    (if (and cached (equal (car cached) key))
-        (cdr cached)
-        (let ((pending (and (%unread-mail identity wal-path) t)))
-          (setf (identity-pending-key identity) (cons key pending))
-          pending))))
+(defstruct (survey (:constructor %make-survey))
+  "The questions one identity tick asks of the bus's log, and their answers.
+
+   REQUEST-SURVEY fills the request from the identity as it then is, under the
+   service mutex:
+     EPOCH, STATE, ID, CURSOR-PATH, WAL-PATH, FLOOR, LAST-ACTIVITY, LAPSED-P
+     RECORDED-MTIME  the cursor's write date when it was last looked at
+     PENDING-KEY     the cached answer of the lapsed check
+     FORCED          true for a served identity past its recycle window; the
+                     cursor is checked and the unread mail read whatever the
+                     cursor's write date
+
+   RUN-SURVEY fills the answers without the mutex:
+     MTIME           the cursor's write date RUN-SURVEY read
+     STRANDED        whether the cursor is stranded
+     UNREAD          the mail between the cursor and FLOOR, for a forced survey
+     CURSOR-SEQ      the cursor's seq, for a lapsed survey
+     PENDING         whether mail waits, for a lapsed survey
+   An answer not asked for is :UNASKED. READ-LOG-P is true when a question
+   reached the log."
+  epoch state id cursor-path wal-path recorded-mtime floor last-activity
+  pending-key forced lapsed-p
+  (mtime :unasked)
+  (stranded :unasked)
+  (unread :unasked)
+  (cursor-seq :unasked)
+  (pending :unasked)
+  (read-log-p nil))
+
+(defun request-survey (identity now &key wal-path)
+  "The unanswered survey IDENTITY's tick at NOW (Unix seconds) needs, or NIL
+   for a released identity. WAL-PATH defaults to the bus's own. Reads memory
+   only; call it with the service mutex held."
+  (unless (eq (identity-state identity) :released)
+    (let ((last (identity-last-activity identity))
+          (lapsed (eq (identity-state identity) :lapsed)))
+      (%make-survey :epoch (identity-epoch identity)
+                    :state (identity-state identity)
+                    :id (identity-id identity)
+                    :cursor-path (identity-cursor-path identity)
+                    :wal-path (or wal-path (default-wal-path (identity-bus identity)))
+                    :recorded-mtime (identity-cursor-mtime identity)
+                    :floor (identity-floor identity)
+                    :last-activity last
+                    :pending-key (identity-pending-key identity)
+                    :forced (and (not lapsed) last
+                                 (> (- now last) (identity-recycle-seconds identity))
+                                 t)
+                    :lapsed-p lapsed))))
+
+(defun run-survey (survey)
+  "Answer SURVEY's questions from the agent's cursor and the bus's log, and
+   return SURVEY. Takes no lock and touches no identity, so call it without
+   the service mutex: the bus readers take that mutex to deliver.
+
+   The cursor's write date is read first. When it differs from the recorded
+   one, or the survey is forced, the stranded question is asked, the cursor
+   read before the log's head. A forced survey then reads the unread mail. A
+   lapsed one reads the cursor's seq and, only when the seq or the floor has
+   moved since the cached answer, the unread mail."
+  (let* ((id (survey-id survey))
+         (path (survey-cursor-path survey))
+         (wal-path (survey-wal-path survey))
+         (floor (survey-floor survey))
+         (mtime (and path (%mtime path))))
+    (setf (survey-mtime survey) mtime)
+    (when (or (survey-forced survey) (not (eql mtime (survey-recorded-mtime survey))))
+      (setf (survey-stranded survey) (%stranded-at-p id path wal-path)
+            (survey-read-log-p survey) t))
+    (when (survey-forced survey)
+      (setf (survey-unread survey)
+            (%unread-mail-at id (%cursor-seq-at id path wal-path) floor wal-path)))
+    (when (survey-lapsed-p survey)
+      (let* ((seq (%cursor-seq-at id path wal-path))
+             (cached (survey-pending-key survey)))
+        (setf (survey-cursor-seq survey) seq)
+        (unless (and cached (equal (car cached) (list seq floor)))
+          (setf (survey-pending survey) (and (%unread-mail-at id seq floor wal-path) t)
+                (survey-read-log-p survey) t))))
+    survey))
 
 (defun %offset-time (identity)
   "When a listener last saved its read offset for IDENTITY's log, in Unix
@@ -677,33 +757,58 @@
   (let ((date (%mtime (%watch-file identity "offset"))))
     (and date (%unix-time date))))
 
-(defun %reannounce (identity now readers wal-path cursors-dir report-fn)
+(defun %reannounce (identity survey epoch now readers)
   "Once a recycle window has passed with the log quiet under IDENTITY, announce
-   again the mail still above the agent's cursor, and start the next window.
+   again the mail SURVEY found above the agent's cursor, and start the next
+   window.
 
    This is the detached watcher's re-arm on the same clock: a wake line that
-   nobody heard is not the agent's only chance to learn of its mail. The cursor
-   is checked for stranding first, as a re-arm would.
+   nobody heard is not the agent's only chance to learn of its mail. A forced
+   survey has already asked whether the cursor is stranded, as a re-arm would.
 
    The window has to be exceeded, not just reached. The clock is in whole
    seconds, so the log may have moved up to a second after the LAST it records,
-   and a window that was only reached could end almost a second early."
+   and a window that was only reached could end almost a second early.
+
+   Nothing is announced, and the window stays open for the next pass, when
+   the floor or the last activity has moved since the survey was requested (a
+   delivery announced what came since) or IDENTITY's epoch has moved from
+   EPOCH in this tick (a heal announced what it owed)."
   (let ((last (identity-last-activity identity)))
-    (when (and last (> (- now last) (identity-recycle-seconds identity)))
+    (when (and (survey-forced survey)
+               last
+               (> (- now last) (identity-recycle-seconds identity))
+               (eql last (survey-last-activity survey))
+               (eql (identity-floor identity) (survey-floor survey))
+               (eql epoch (identity-epoch identity)))
       (setf (identity-last-activity identity) now)
-      (%recheck-cursor identity now readers wal-path cursors-dir report-fn :force t)
-      (let ((mail (%unread-mail identity wal-path)))
-        (when mail
+      (let ((mail (survey-unread survey)))
+        (when (and (listp mail) mail)
           (%announce identity mail now readers))))))
 
-(defun %lapsed-tick (identity now readers wal-path)
+(defun %surveyed-pending (identity survey)
+  "Whether mail waits above a lapsed IDENTITY's cursor, as SURVEY found it.
+   The answer is cached under its key, the cursor's seq and the floor, so the
+   log is read only when either has moved. A survey taken against a floor
+   IDENTITY no longer has answers nothing, and the last answer stands."
+  (cond ((not (eql (survey-floor survey) (identity-floor identity)))
+         (identity-pending-p identity))
+        ((eq (survey-pending survey) :unasked)
+         (cdr (identity-pending-key identity)))
+        (t
+         (setf (identity-pending-key identity)
+               (cons (list (survey-cursor-seq survey) (survey-floor survey))
+                     (survey-pending survey)))
+         (survey-pending survey))))
+
+(defun %lapsed-tick (identity survey now readers)
   "One tick of a lapsed IDENTITY: no lines, only the question of whether mail
-   is waiting unread. Mail that waits counts as a line nobody heard, so the
-   deafness rule raises the alarm after the threshold exactly as it would for a
-   served agent. Returns :HEARD once the cursor has moved past mail that was
-   pending, which ends the lapse, and :OK otherwise."
+   is waiting unread, answered from SURVEY. Mail that waits counts as a line
+   nobody heard, so the deafness rule raises the alarm after the threshold
+   exactly as it would for a served agent. Returns :HEARD once the cursor has
+   moved past mail that was pending, which ends the lapse, and :OK otherwise."
   (let ((was (identity-pending-p identity))
-        (pending (%pending-p identity wal-path)))
+        (pending (%surveyed-pending identity survey)))
     (setf (identity-pending-p identity) pending)
     (if (and was (not pending))
         (let ((marker (%watch-file identity "deaf")))
@@ -719,52 +824,78 @@
           :ok))))
 
 (defun identity-tick (identity now &key readers wal-path cursors-dir
-                                        (report-fn #'report-to-logs))
+                                        (report-fn #'report-to-logs)
+                                        survey)
   "Do IDENTITY's duties for one tick at NOW (Unix seconds) and return :OK, or
    :HEARD when a lapsed identity's agent has read past its pending mail.
 
    Every tick refreshes the heartbeat, checks the pid file is still the one
-   held, and looks at the cursor again if it has been rewritten. A served
-   identity then announces unread mail again once a recycle window has passed
-   quietly, and samples the deafness rule; a lapsed one only watches for unread
-   mail. Faults are raised for the supervisor to heal.
+   held, and heals the cursor when it was rewritten, or the survey is
+   forced, and found stranded; a heal on a forced survey starts the next
+   recycle window. A served identity then announces unread mail again once a
+   recycle window has passed quietly, and samples the deafness rule; a
+   lapsed one only watches for unread mail. Faults are raised for the
+   supervisor to heal.
+
+   SURVEY carries the answers to the tick's questions of the log, taken by
+   REQUEST-SURVEY and RUN-SURVEY; left out, both run here. A survey whose
+   epoch or state IDENTITY no longer has is discarded, as is :UNANSWERED, for
+   a survey that could not be requested: the tick then only refreshes the
+   heartbeat and checks the pid file, leaving the recorded cursor write date
+   and the last activity as they were, so the next pass asks again.
 
    READERS is the count of processes following the log from the supervisor's
    one census of every log; left out, it is measured here. WAL-PATH and
    CURSORS-DIR default to the bus's own."
   (when (eq (identity-state identity) :released)
     (return-from identity-tick :ok))
-  (let ((wal-path (or wal-path (default-wal-path (identity-bus identity))))
-        (cursors-dir (or cursors-dir (default-cursors-dir (identity-bus identity)))))
+  (let* ((wal-path (or wal-path (default-wal-path (identity-bus identity))))
+         (cursors-dir (or cursors-dir (default-cursors-dir (identity-bus identity))))
+         (survey (or survey (run-survey (request-survey identity now :wal-path wal-path)))))
     (%reap-notifiers)
     (%refresh-beat identity now)
     (%check-pid-claim identity)
-    (%recheck-cursor identity now readers wal-path cursors-dir report-fn)
-    (if (eq (identity-state identity) :lapsed)
-        (%lapsed-tick identity now readers wal-path)
-        (progn
-          (%reannounce identity now readers wal-path cursors-dir report-fn)
-          (%observe-deaf identity now
-                         :readers (%readers identity readers)
-                         :parked-p (%parked-p identity)
-                         :offset-time (%offset-time identity))
-          :ok))))
+    (if (not (and (survey-p survey)
+                  (eql (survey-epoch survey) (identity-epoch identity))
+                  (eq (survey-state survey) (identity-state identity))))
+        :ok
+        (let ((epoch (identity-epoch identity)))
+          (unless (eq (survey-stranded survey) :unasked)
+            (setf (identity-cursor-mtime identity) (survey-mtime survey))
+            (when (survey-stranded survey)
+              (%heal-stranded identity now readers wal-path cursors-dir report-fn)
+              ;; The heal answers for this window, as a re-arm does; left
+              ;; open, a cursor the heal cannot rewrite is healed every pass.
+              (when (survey-forced survey)
+                (setf (identity-last-activity identity) now))))
+          (if (eq (identity-state identity) :lapsed)
+              (%lapsed-tick identity survey now readers)
+              (progn
+                (%reannounce identity survey epoch now readers)
+                (%observe-deaf identity now
+                               :readers (%readers identity readers)
+                               :parked-p (%parked-p identity)
+                               :offset-time (%offset-time identity))
+                :ok))))))
 
 ;;; -------------------------------------------------------------------- lapses
 
 (defun lapse-identity (identity)
   "Mark IDENTITY lapsed: its session ended without parking, so no wake lines
    are written for it, but its files stay held and unread mail still raises
-   the alarm. Returns IDENTITY."
+   the alarm. Moves its epoch and returns IDENTITY."
+  (incf (identity-epoch identity))
   (setf (identity-state identity) :lapsed
         (identity-pending-key identity) nil)
   identity)
 
 (defun unlapse-identity (identity registration)
   "Serve IDENTITY again for the session REGISTRATION names, taking that
-   registration's token, session and settings. Returns IDENTITY."
+   registration's token, session and settings. Moves its epoch and returns
+   IDENTITY."
   (let ((deaf-seconds (or (getf registration :deaf-seconds)
                           (identity-deaf-seconds identity))))
+    (incf (identity-epoch identity))
     (setf (identity-state identity) :serving
           (identity-token identity) (getf registration :token)
           (identity-session-pid identity) (getf registration :session-pid)

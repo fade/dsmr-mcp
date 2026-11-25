@@ -704,6 +704,118 @@
       (ident:identity-tick identity (+ start 1200) :readers 1)
       (is = 2 (length (log-lines)) "mail the agent has read is not announced again"))))
 
+;;; -------------------------------------------------------- stale surveys
+
+(define-test a-survey-overtaken-by-a-re-arm-is-discarded
+  "A survey that found the cursor stranded, applied after a re-arm moved the
+   identity's epoch, heals nothing, reports nothing, and leaves the recorded
+   cursor write date as it was; the next tick asks again and heals."
+  (with-host ()
+    (append-from 1 *other*)
+    (append-from 2 *other*)
+    (write-text (cursor-file) "2")
+    (let ((identity (claim :recycle-seconds 100000))
+          (start (%unix-time))
+          (*reports* '()))
+      (write-text (cursor-file) "99")
+      (set-mtime (cursor-file) (- start 100))
+      (let ((recorded (ident:identity-cursor-mtime identity))
+            (survey (ident:run-survey (ident:request-survey identity start))))
+        (true (ident::survey-stranded survey) "the survey did not find the cursor stranded")
+        (ident:rearm-at-floor identity (ident:identity-floor identity))
+        (healing (lambda () (ident:identity-tick identity start
+                                                 :readers 1 :report-fn #'collect-report
+                                                 :survey survey))
+                 :report-fn #'collect-report)
+        (false (find "stranded-cursor" *reports* :key #'second :test #'string=)
+               "~S" *reports*)
+        (is string= "99" (file-text (cursor-file)) "the cursor was healed")
+        (is eql recorded (ident:identity-cursor-mtime identity))
+        (is = 0 (length (log-lines))))
+      (healing (lambda () (ident:identity-tick identity (1+ start)
+                                               :readers 1 :report-fn #'collect-report))
+               :report-fn #'collect-report)
+      (true (find "stranded-cursor" *reports* :key #'second :test #'string=)
+            "the next tick did not heal: ~S" *reports*)
+      (is string= "0 0" (file-text (cursor-file)))
+      (let ((lines (log-lines)))
+        (is = 1 (length lines))
+        (true (uiop:string-prefix-p "bus:2 " (first lines)) "~S" lines)))))
+
+(define-test a-reannounce-overtaken-by-a-delivery-announces-nothing
+  "A survey taken past the recycle window found unread mail; a delivery since
+   wrote its own line, so applying the survey writes none. The next window
+   announces again."
+  (with-host ()
+    (write-text (cursor-file) "0")
+    (append-from 1 *other*)
+    (let ((start (%unix-time))
+          (identity (claim :recycle-seconds 600 :deaf-seconds 0)))
+      (ident:identity-deliver identity (records-above 0) start :readers 1)
+      (is = 1 (length (log-lines)))
+      (let ((survey (ident:run-survey (ident:request-survey identity (+ start 601)))))
+        (true (consp (ident::survey-unread survey)) "the survey found no unread mail")
+        (append-from 2 *other*)
+        (true (ident:identity-deliver identity (records-above 1) (+ start 601) :readers 1))
+        (is = 2 (length (log-lines)))
+        (ident:identity-tick identity (+ start 601) :readers 1 :survey survey)
+        (is = 2 (length (log-lines)) "the overtaken survey announced again"))
+      (ident:identity-tick identity (+ start 1202) :readers 1)
+      (is = 3 (length (log-lines)) "the next window did not announce"))))
+
+(define-test a-survey-for-a-released-identity-is-discarded
+  "A survey requested before the identity was released is applied to
+   nothing: the tick returns :OK and writes no line to the closed log."
+  (with-host ()
+    (write-text (cursor-file) "0")
+    (append-from 1 *other*)
+    (let ((start (%unix-time))
+          (identity (claim :recycle-seconds 600 :deaf-seconds 0)))
+      (ident:identity-deliver identity (records-above 0) start :readers 1)
+      (let ((survey (ident:run-survey (ident:request-survey identity (+ start 601)))))
+        (true (consp (ident::survey-unread survey)) "the survey found no unread mail")
+        (ident:release-identity identity :remove-files nil)
+        (is eq :ok (ident:identity-tick identity (+ start 601) :readers 1 :survey survey))
+        (is = 1 (length (log-lines)))))))
+
+(define-test a-cursor-that-cannot-be-rewritten-is-healed-once-per-window
+  "A stranded cursor in a read-only cursors directory clamps. A forced survey
+   that heals it restarts the recycle window, so later ticks inside that
+   window heal nothing, and the next window heals once more."
+  (with-host ()
+    (append-from 1 *other*)
+    (append-from 2 *other*)
+    (write-text (cursor-file) "2")
+    (let* ((identity (claim :recycle-seconds 600 :deaf-seconds 0))
+           (start (%unix-time))
+           (cursors (uiop:native-namestring (default-cursors-dir *bus*)))
+           (breakers (make-hash-table :test 'equal))
+           (*reports* '()))
+      (write-text (cursor-file) "99")
+      (set-mtime (cursor-file) (- start 100))
+      (flet ((tick-at (offset)
+               (conditions:call-with-healing
+                (lambda ()
+                  (ident:identity-tick identity (+ start offset)
+                                       :readers 1 :report-fn #'collect-report))
+                :report-fn #'collect-report :breakers breakers))
+             (heals ()
+               (count-if (lambda (report)
+                           (uiop:string-prefix-p "stranded-cursor" (second report)))
+                         *reports*)))
+        (unwind-protect
+             (progn
+               (sb-posix:chmod cursors #o500)
+               (tick-at 601)
+               (let ((once (heals)))
+                 (true (plusp once) "the forced survey did not heal: ~S" *reports*)
+                 (loop for offset from 602 to 605 do (tick-at offset))
+                 (is = once (heals) "heal reports inside one window: ~S" *reports*)
+                 (is string= "99" (file-text (cursor-file)))
+                 (tick-at 1202)
+                 (is = (* 2 once) (heals) "the next window did not heal: ~S" *reports*)))
+          (sb-posix:chmod cursors #o700))))))
+
 ;;; ------------------------------------------------------------------- readers
 
 (define-test reader-census-counts-only-processes-reading-each-log

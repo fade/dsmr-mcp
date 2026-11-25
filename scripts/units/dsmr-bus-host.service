@@ -22,8 +22,8 @@ TimeoutStartSec=60
 Restart=always
 RestartSec=1
 # The supervisor sends WATCHDOG=1 every second while its broker and watch
-# threads are moving; a service that stops making progress is killed and
-# restarted.
+# threads are moving and its I/O thread finishes duties or has no pass
+# outstanding; a service that stops making progress is killed and restarted.
 WatchdogSec=30
 TimeoutStopSec=10
 # KillMode is left at its default on purpose: everything in the service's

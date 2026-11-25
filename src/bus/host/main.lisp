@@ -1,7 +1,7 @@
 ;;;; src/bus/host/main.lisp
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
-;;;; The host bus service itself: its entry point, the supervisor loop that
+;;;; The host bus service itself: its entry point, the supervisor that
 ;;;; schedules every duty the other host leaves define, the readiness and
 ;;;; watchdog messages it sends systemd, and the orderly stop.
 ;;;;
@@ -9,10 +9,23 @@
 ;;;; elects for each bus and the watcher process each agent keeps per bus; those
 ;;;; remain the fallback whenever the service is down. Each bus has a broker
 ;;;; thread and one reader thread; every agent registered with the service is an
-;;;; identity the supervisor ticks. The supervisor runs each duty under the
-;;;; healing protocol, so a fault in one agent's files or one bus never stops the
-;;;; others, and what cannot be healed reaches the fleet error log a leader
-;;;; watches.
+;;;; identity the supervisor ticks. Each duty runs under the healing protocol,
+;;;; so a fault in one agent's files or one bus never stops the others, and what
+;;;; cannot be healed reaches the fleet error log a leader watches.
+;;;;
+;;;; The supervisor is two threads. The main thread runs the duty loop, which
+;;;; opens no file and never takes the service mutex: it posts one pass of
+;;;; duties at a time to the I/O thread, consumes each completion, and once a
+;;;; second tells systemd it is ready and alive. The I/O thread runs every duty
+;;;; that touches a file, in a fixed order. WATCHDOG=1 is sent only when every
+;;;; broker and bus reader thread has progressed within the progress window and
+;;;; the I/O thread has finished a duty within its own window or has no pass
+;;;; outstanding, so a wedged pass still stops the beat and a long one that
+;;;; keeps finishing duties does not. The I/O thread's backtrace is then taken
+;;;; once and written to the service log, whose warnings reach the journal,
+;;;; since SIGABRT's shows only the main thread. A service whose I/O thread was
+;;;; never started runs each pass inline in the tick, as the in-process tests
+;;;; do.
 ;;;;
 ;;;; The service also decides when the host gives memory back. It already comes
 ;;;; round once a second for every agent, so it reads the host's memory on the
@@ -35,7 +48,7 @@
 ;;;; brokers let their roles go without archiving, the readers close, every
 ;;;; agent's descriptors are closed without removing its pid file or its
 ;;;; registration, and a clean-stop marker tells the next start that this was
-;;;; not a crash.
+;;;; not a crash. A stop that finds a pass wedged writes no marker.
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :sb-posix)
@@ -73,15 +86,19 @@
    #:service-brokers
    #:service-watches
    #:service-ready-p
-   #:service-stopping
+   #:request-stop
    #:start-service
+   #:start-io-thread
+   #:run-duties
    #:supervisor-tick
    #:stop-service
+   #:service-stop-orderly-p
    ;; systemd
    #:sd-notify
    ;; watchdog rule
    #:progress-step
-   #:progress-fresh-p))
+   #:progress-fresh-p
+   #:stall-p))
 
 (in-package #:dsmr-bus-host/src/bus/host/main)
 
@@ -94,9 +111,36 @@
   "Seconds a broker or bus reader thread may go without progress before the
    service stops telling systemd it is alive.")
 
+(defconstant +io-progress-window+ 20
+  "Seconds a pass on the I/O thread may stay outstanding with no duty finished
+   before the service stops telling systemd it is alive.
+
+   With WatchdogSec=30 a wedged I/O thread loses the beat at 20 s and systemd
+   ends the process at most 30 s later; the stall watchdog ends it at 60 s
+   when no service manager is watching. A pass of any length survives while
+   it keeps finishing duties, and bus delivery goes on throughout, since the
+   bus readers run on their own threads.")
+
+(defconstant +stop-budget-seconds+ 7
+  "Seconds an orderly stop takes at most, from the request to the last join
+   of a broker or bus reader. The unit file sets TimeoutStopSec=10, and
+   systemd ends a stop that outlasts it with SIGKILL and reports the service
+   failed; the 3 s left over cover the release of the agents' descriptors,
+   the clean-stop marker and the exit.")
+
+(defconstant +stop-join-seconds+ 2
+  "Seconds of the stop budget kept for joining the brokers and bus readers.
+   The rest is the most the stop waits for the I/O thread to end. A pass
+   asked to stop ends at its next duty, so a duty that ends inside that share
+   still gives an orderly stop.")
+
 (defconstant +stall-seconds+ 60
-  "Seconds the supervisor loop may go without coming round before the service
+  "Seconds the supervisor loop may go without coming round, or a pass on the
+   I/O thread may stay outstanding with no duty finished, before the service
    ends itself so that it is restarted.")
+
+(defconstant +backtrace-frames+ 60
+  "Frames of the I/O thread's backtrace written when its pass is wedged.")
 
 (defconstant +memory-action-spacing+ 2
   "Seconds that must pass after a pool was asked to give memory back before
@@ -146,7 +190,7 @@ records and the fleet error log, bus/ the buses, watch/ the agents' files.
 
 Exit status: 0 after an orderly stop on SIGTERM, 1 when another copy already
 holds the service lock, 64 on an argument it does not take, 70 when it could
-not start, 75 when its supervisor loop stalled.
+not start, 75 when its supervisor loop or its I/O thread stalled.
 "
   "The --help text, a format control taking the state home.")
 
@@ -154,21 +198,52 @@ not start, 75 when its supervisor loop stalled.
 
 (defstruct (service (:constructor %make-service
                         (&key pid report-fn feed-p memory-reader memory-thresholds
-                              memory-threshold-warnings
+                              memory-threshold-warnings diagnostic-stream survey-fn
                          &aux (registry (registry:make-registry :service-pid pid)))))
   "One running host service. Made by MAKE-SERVICE.
 
    PID is the pid its records name and REGISTRY the agents it serves. MUTEX is
-   held whenever those agents are changed or handed records, by the supervisor
+   held whenever those agents are changed or handed records, by the I/O thread
    and by every bus reader alike. BROKERS and WATCHES map each served bus (NIL
-   for the unnamed bus) to its broker and its reader; PROGRESS keeps, for each
-   of those threads, its progress count and when the count last moved.
+   for the unnamed bus) to its broker and its reader; only the thread that
+   runs the duties touches them. SERVED-BROKERS and SERVED-WATCHES are alist
+   snapshots of the two tables, (bus . object), replaced under IO-MUTEX
+   whenever a bus is added, for the duty loop and the stop to read. PROGRESS
+   keeps, for each broker and reader thread, its progress count and when the
+   count last moved; only the duty loop touches it.
    REPORT-FN takes every report. FEED-P says whether the readers subscribe to
    the brokers' publications. LAST-SECOND and LAST-FIVE are when the once a
    second and once every five seconds duties last ran, in Unix seconds.
    SCANNED says the registrations have been read once, READY-P that systemd
-   has been told the service is ready. STOPPING asks every thread to end;
-   STOPPED says the orderly stop has run. LOCK-FD holds the service lock.
+   has been told the service is ready, READY-NOTED-P that a pass has logged
+   the readiness and written the status for it. STOPPING asks the I/O thread and
+   its pass to end, and is set only by REQUEST-STOP. CLOSING asks the brokers
+   and bus readers to end; the stop sets it once the I/O thread has ended or
+   its share of the stop budget is spent, so the bus is served until then.
+   STOPPED says the stop has run, and STOP-ORDERLY-P that it found the I/O
+   thread ended, which is when the clean-stop marker may be written.
+   LOCK-FD holds the service lock.
+
+   IO-THREAD is the thread that runs the duty passes, or NIL when the passes
+   run inline in SUPERVISOR-TICK. IO-MUTEX guards the queue: IO-POSTED is the
+   sequence number of the last pass posted, with IO-POSTED-NOW the time handed
+   to it and IO-POSTED-AT the internal real time it was posted; IO-COMPLETED
+   is the sequence number of the last pass completed, IO-FINISHED-AT the
+   internal real time it ended and IO-LAST-DURATION its length in seconds.
+   IO-PROGRESS counts the duties and passes the I/O thread has finished; it
+   is moved atomically, outside every mutex. IO-QUEUE is the waitqueue the
+   I/O thread waits on. DEFERRED holds the reports the duty loop could not
+   write itself, as argument lists for REPORT-FN, until the next pass writes
+   them. The duty loop alone keeps IO-CONSUMED, the last completion it
+   consumed, IO-STAMP, the progress stamp of IO-PROGRESS, IO-WEDGED-P, true
+   while a withheld beat has already had the I/O thread's backtrace taken,
+   and LAST-BEAT, when it last told systemd anything. IO-BACKTRACE is that
+   backtrace as text, set by the I/O thread and taken by the duty loop.
+   DIAGNOSTIC-STREAM takes it, or the service log when NIL.
+
+   SURVEY-FN answers one identity's survey of the bus's log, without the
+   service mutex (IDENT:RUN-SURVEY). PASS-SURVEYS counts the surveys of the
+   current pass that read the log.
 
    MEMORY-READER returns the host's memory readings when called with no
    arguments. MEMORY-THRESHOLDS say where pressure starts and stops, and
@@ -181,12 +256,14 @@ not start, 75 when its supervisor loop stalled.
    unanswered to when that happened, so the pool is passed over for a while,
    UNRELIEVED-REPORTED-P says this episode of pressure has been reported as
    unrelieved, and LAST-OWNER-SWEEP is when gone servers' files were last
-   swept. All times are Unix seconds."
+   swept. All times are Unix seconds unless named otherwise."
   pid
   registry
   (mutex (sb-thread:make-mutex :name "host service"))
   (brokers (make-hash-table :test 'equal))
   (watches (make-hash-table :test 'equal))
+  (served-brokers '())
+  (served-watches '())
   (progress (make-hash-table :test 'equal))
   report-fn
   (feed-p t)
@@ -194,9 +271,31 @@ not start, 75 when its supervisor loop stalled.
   last-five
   (scanned nil)
   (ready-p nil)
+  (ready-noted-p nil)
   (stopping nil)
+  (closing nil)
   (stopped nil)
+  (stop-orderly-p nil)
   lock-fd
+  (io-thread nil)
+  (io-mutex (sb-thread:make-mutex :name "host service io queue"))
+  (io-queue (sb-thread:make-waitqueue :name "host service io queue"))
+  (io-posted 0)
+  (io-posted-now nil)
+  (io-posted-at nil)
+  (io-completed 0)
+  (io-finished-at nil)
+  (io-last-duration nil)
+  (io-progress 0 :type sb-ext:word)
+  (deferred '())
+  (io-consumed 0)
+  (io-stamp nil)
+  (io-wedged-p nil)
+  (io-backtrace nil)
+  (last-beat nil)
+  diagnostic-stream
+  survey-fn
+  (pass-surveys 0)
   memory-reader
   memory-thresholds
   memory-threshold-warnings
@@ -212,14 +311,20 @@ not start, 75 when its supervisor loop stalled.
                           (report-fn #'ident:report-to-logs)
                           (feed-p t)
                           (memory-reader #'memory:read-memory-readings)
-                          memory-thresholds)
+                          memory-thresholds
+                          diagnostic-stream
+                          (survey-fn #'ident:run-survey))
   "A host service for the process PID that reports through REPORT-FN, its bus
    readers subscribing to the brokers' publications when FEED-P is true.
 
    MEMORY-READER is called once a second for the host's memory. The pressure
    thresholds are MEMORY-THRESHOLDS when given, else read from the environment
    here, once; what the environment got wrong is reported on the first memory
-   check, through REPORT-FN like every other finding."
+   check, through REPORT-FN like every other finding. DIAGNOSTIC-STREAM takes
+   the I/O thread's backtrace when its pass is wedged; left NIL, the
+   backtrace goes to the service log, whose warnings are copied to standard
+   error under the logger's own lock. SURVEY-FN answers each identity's
+   survey of the bus's log, once a second, without the service mutex."
   (multiple-value-bind (thresholds warnings)
       (if memory-thresholds
           (values memory-thresholds '())
@@ -227,7 +332,9 @@ not start, 75 when its supervisor loop stalled.
     (%make-service :pid pid :report-fn report-fn :feed-p feed-p
                    :memory-reader memory-reader
                    :memory-thresholds thresholds
-                   :memory-threshold-warnings warnings)))
+                   :memory-threshold-warnings warnings
+                   :diagnostic-stream diagnostic-stream
+                   :survey-fn survey-fn)))
 
 (defmacro with-service-lock ((svc) &body body)
   "Run BODY holding SVC's mutex, the one the bus readers hold while they hand
@@ -256,15 +363,17 @@ not start, 75 when its supervisor loop stalled.
   "Run THUNK, one of SVC's duties, under the healing protocol with SVC's report
    function, and return what it returns. An error that is not a fault is
    reported under duty-failed and NIL is returned, so one failing duty never
-   stops the loop."
+   stops the loop. Either way the duty counts as progress (IO-PROGRESS)."
   (let ((report-fn (service-report-fn svc)))
-    (handler-case
-        (conditions:call-with-healing thunk :report-fn report-fn)
-      (error (e)
-        (ignore-errors
-         (funcall report-fn :error "duty-failed" :bus bus :id id :subject subject
-                  :msg (format nil "~A: ~A" name e)))
-        nil))))
+    (unwind-protect
+         (handler-case
+             (conditions:call-with-healing thunk :report-fn report-fn)
+           (error (e)
+             (ignore-errors
+              (funcall report-fn :error "duty-failed" :bus bus :id id :subject subject
+                       :msg (format nil "~A: ~A" name e)))
+             nil))
+      (sb-ext:atomic-incf (service-io-progress svc)))))
 
 ;;; ------------------------------------------------------------------- systemd
 
@@ -291,14 +400,26 @@ not start, 75 when its supervisor loop stalled.
       t)))
 
 (defun %notify (svc message)
-  "Send MESSAGE to systemd, reporting a failure rather than letting it end the
-   tick."
+  "Send MESSAGE to systemd. A failure ends neither the tick nor the loop: it is
+   kept as a deferred report, which the next pass writes, because the duty
+   loop writes no file."
   (handler-case (sd-notify message)
     (error (e)
       (ignore-errors
-       (funcall (service-report-fn svc) :warn "notify-failed" :subject "systemd"
-                :msg (format nil "~A could not be sent: ~A" message e)))
+       (let ((report (list :warn "notify-failed" :subject "systemd"
+                           :msg (format nil "~A could not be sent: ~A; check NOTIFY_SOCKET"
+                                        message e))))
+         (sb-thread:with-mutex ((service-io-mutex svc))
+           (push report (service-deferred svc)))))
       nil)))
+
+(defun %write-deferred-reports (svc)
+  "Write, through SVC's report function, every report the duty loop deferred,
+   oldest first."
+  (let ((reports (sb-thread:with-mutex ((service-io-mutex svc))
+                   (shiftf (service-deferred svc) '()))))
+    (dolist (report (reverse reports))
+      (ignore-errors (apply (service-report-fn svc) report)))))
 
 ;;; -------------------------------------------------------------- the watchdog
 
@@ -313,6 +434,43 @@ not start, 75 when its supervisor loop stalled.
   "True when the count in STAMP moved within WINDOW seconds of NOW."
   (and stamp (<= (- now (cdr stamp)) window) t))
 
+(defun stall-p (loop-at outstanding-p posted-at now &key (window +stall-seconds+))
+  "True when the service has stalled at NOW: the supervisor loop last came
+   round at LOOP-AT, more than WINDOW seconds before, or a pass is
+   OUTSTANDING-P and the later of its posting and the I/O thread's last
+   finished duty, POSTED-AT, is more than WINDOW seconds before.
+   All times are in seconds on one clock. Pure."
+  (and (or (> (- now loop-at) window)
+           (and outstanding-p posted-at (> (- now posted-at) window)))
+       t))
+
+(defun %served-brokers (svc)
+  "SVC's brokers as an alist (bus . broker), from the snapshot the duties
+   publish."
+  (sb-thread:with-mutex ((service-io-mutex svc))
+    (service-served-brokers svc)))
+
+(defun %served-watches (svc)
+  "SVC's bus readers as an alist (bus . reader), from the snapshot the duties
+   publish."
+  (sb-thread:with-mutex ((service-io-mutex svc))
+    (service-served-watches svc)))
+
+(defun %publish-served (svc)
+  "Replace the snapshots of SVC's broker and reader tables. Called by the
+   thread that fills the tables, after each change. The duty loop reads the
+   snapshots, never the tables: a hash table is not safe to read while
+   another thread writes it."
+  (let ((brokers (loop for bus being the hash-keys of (service-brokers svc)
+                         using (hash-value bb)
+                       collect (cons bus bb)))
+        (watches (loop for bus being the hash-keys of (service-watches svc)
+                         using (hash-value bw)
+                       collect (cons bus bw))))
+    (sb-thread:with-mutex ((service-io-mutex svc))
+      (setf (service-served-brokers svc) brokers
+            (service-served-watches svc) watches))))
+
 (defun %threads-progressing-p (svc now)
   "Note how far every serving broker thread and every bus reader thread has got
    at NOW, and answer true when each has moved within the progress window. A
@@ -324,15 +482,76 @@ not start, 75 when its supervisor loop stalled.
                (setf (gethash key table) stamp)
                (unless (progress-fresh-p stamp now)
                  (setf all nil)))))
-      (maphash (lambda (bus bb)
-                 (if (eq (brokers:bus-broker-state bb) :serving)
-                     (note (cons :broker bus) (brokers:bus-broker-progress bb))
-                     (remhash (cons :broker bus) table)))
-               (service-brokers svc))
-      (maphash (lambda (bus bw)
-                 (note (cons :watch bus) (buswatch:bus-watch-progress bw)))
-               (service-watches svc)))
+      (loop for (bus . bb) in (%served-brokers svc)
+            do (if (eq (brokers:bus-broker-state bb) :serving)
+                   (note (cons :broker bus) (brokers:bus-broker-progress bb))
+                   (remhash (cons :broker bus) table)))
+      (loop for (bus . bw) in (%served-watches svc)
+            do (note (cons :watch bus) (buswatch:bus-watch-progress bw))))
     all))
+
+(defun %io-fresh-p (svc now)
+  "True when SVC's I/O thread has no pass outstanding, or has finished a duty
+   within the I/O progress window of NOW, or was never started. A long pass
+   that keeps finishing duties is fresh; one call held for the window is not.
+   Reads the queue under its own mutex only."
+  (or (null (service-io-thread svc))
+      (let ((outstanding (sb-thread:with-mutex ((service-io-mutex svc))
+                           (> (service-io-posted svc) (service-io-completed svc))))
+            (stamp (progress-step (service-io-stamp svc) (service-io-progress svc) now)))
+        (setf (service-io-stamp svc) stamp)
+        (or (not outstanding)
+            (progress-fresh-p stamp now :window +io-progress-window+)))))
+
+(defun %take-io-backtrace (svc now)
+  "Once per episode of a withheld beat, interrupt SVC's I/O thread so that it
+   puts a header naming itself and its seconds without progress at NOW, then
+   its backtrace, into IO-BACKTRACE as text. The episode ends when the I/O
+   thread is fresh again.
+
+   SIGABRT's own backtrace shows only the main thread, which sits in the
+   duty loop, so this is the one record of where the pass is stuck. The
+   interrupt may land while the I/O thread holds a mutex, so it writes to no
+   stream and calls no logger: it formats into a string and returns to the
+   interrupted pass. %EMIT-IO-BACKTRACE writes the text."
+  (unless (service-io-wedged-p svc)
+    (setf (service-io-wedged-p svc) t)
+    (let ((thread (service-io-thread svc))
+          (seconds (let ((stamp (service-io-stamp svc)))
+                     (if stamp (- now (cdr stamp)) 0))))
+      (when (and thread (sb-thread:thread-alive-p thread))
+        (ignore-errors
+         (sb-thread:interrupt-thread
+          thread
+          (lambda ()
+            (ignore-errors
+             (setf (service-io-backtrace svc)
+                   (with-output-to-string (out)
+                     (format out "dsmr-bus-host: thread ~S made no progress for ~D s; ~
+                                  its backtrace follows~%"
+                             (sb-thread:thread-name sb-thread:*current-thread*) seconds)
+                     (sb-debug:print-backtrace :stream out
+                                               :count +backtrace-frames+)))))))))))
+
+(defun %emit-io-backtrace (svc)
+  "When the I/O thread has put its backtrace in IO-BACKTRACE, take it and
+   start a thread that writes it to SVC's diagnostic stream, or line by line
+   to the service log when there is none. Returns at once: a write that
+   blocks holds up only that thread, never the duty loop or the I/O thread."
+  (let ((text (shiftf (service-io-backtrace svc) nil))
+        (stream (service-diagnostic-stream svc)))
+    (when text
+      (ignore-errors
+       (sb-thread:make-thread
+        (lambda ()
+          (ignore-errors
+           (if stream
+               (progn (write-string text stream)
+                      (finish-output stream))
+               (dolist (line (uiop:split-string (string-right-trim '(#\Newline) text)
+                                                :separator '(#\Newline)))
+                 (fleetlog:service-log :warn "~A" line)))))
+        :name "host service diagnostic")))))
 
 ;;; ----------------------------------------------------------------- the duties
 
@@ -373,28 +592,78 @@ not start, 75 when its supervisor loop stalled.
 
 (defun %tick-identities (svc now)
   "Look at every agent's session, then do every agent's duties for this tick,
-   with one count of the readers of every agent's log."
+   with one count of the readers of every agent's log, in three steps.
+
+   Under the service mutex, the sessions are checked and every identity's
+   survey is requested. Without it, the readers are counted and each survey
+   is answered by SVC's survey function: those are the reads of the logs and
+   of /proc, and the bus readers take the mutex to deliver. Under the mutex
+   again, each identity's tick applies its survey and is settled. A survey
+   that signals is reported like any identity duty and applied with the
+   answers it holds, so the deafness rule is still sampled and a forced
+   survey still starts the next recycle window. Once SVC is asked to stop,
+   the reader count, the surveys and the ticks still to come are skipped.
+
+   A heal of a stranded cursor and a claim still read the log under the
+   mutex; they run only for a cursor found stranded and for a new
+   registration."
   (let ((reg (service-registry svc))
-        (report-fn (service-report-fn svc)))
-    (with-service-lock (svc)
-      (%duty svc "sessions"
-             (lambda () (registry:check-sessions reg now :report-fn report-fn)))
-      (let* ((identities (%identities svc))
-             (counts (ident:log-reader-counts
-                      (mapcar #'ident:identity-log-path identities))))
-        (dolist (identity identities)
-          (%duty svc "identity"
-                 (lambda ()
-                   (let ((result (ident:identity-tick
-                                  identity now
-                                  :readers (gethash (uiop:native-namestring
-                                                     (ident:identity-log-path identity))
-                                                    counts)
-                                  :report-fn report-fn)))
-                     (registry:settle-tick reg identity result :report-fn report-fn)))
-                 :bus (ident:identity-bus identity)
-                 :id (ident:identity-id identity)
-                 :subject (ident:identity-stem identity)))))))
+        (report-fn (service-report-fn svc))
+        (survey-fn (service-survey-fn svc)))
+    (multiple-value-bind (identities requests)
+        (with-service-lock (svc)
+          (%duty svc "sessions"
+                 (lambda () (registry:check-sessions reg now :report-fn report-fn)))
+          (let ((identities (%identities svc)))
+            (values identities
+                    (mapcar (lambda (identity)
+                              (%duty svc "identity"
+                                     (lambda () (ident:request-survey identity now))
+                                     :bus (ident:identity-bus identity)
+                                     :id (ident:identity-id identity)
+                                     :subject (ident:identity-stem identity)))
+                            identities))))
+      (let* ((counts (unless (service-stopping svc)
+                       (%duty svc "readers"
+                              (lambda ()
+                                (ident:log-reader-counts
+                                 (mapcar #'ident:identity-log-path identities)))
+                              :subject "host")))
+             (surveys (loop for identity in identities
+                            for request in requests
+                            until (service-stopping svc)
+                            collect (or (and request
+                                             (%duty svc "identity"
+                                                    (lambda () (funcall survey-fn request))
+                                                    :bus (ident:identity-bus identity)
+                                                    :id (ident:identity-id identity)
+                                                    :subject (ident:identity-stem identity)))
+                                        request
+                                        :unanswered))))
+        (incf (service-pass-surveys svc)
+              (count-if (lambda (survey)
+                          (and (ident:survey-p survey) (ident:survey-read-log-p survey)))
+                        surveys))
+        (with-service-lock (svc)
+          (loop for identity in identities
+                for survey in surveys
+                until (service-stopping svc)
+                do (let ((identity identity)
+                         (survey survey))
+                     (%duty svc "identity"
+                            (lambda ()
+                              (let ((result (ident:identity-tick
+                                             identity now
+                                             :readers (and (hash-table-p counts)
+                                                           (gethash (uiop:native-namestring
+                                                                     (ident:identity-log-path identity))
+                                                                    counts))
+                                             :report-fn report-fn
+                                             :survey survey)))
+                                (registry:settle-tick reg identity result :report-fn report-fn)))
+                            :bus (ident:identity-bus identity)
+                            :id (ident:identity-id identity)
+                            :subject (ident:identity-stem identity)))))))))
 
 (defun %check-brokers (svc now)
   "Look at every bus's broker. NOW is Unix seconds; the brokers keep universal
@@ -672,30 +941,41 @@ not start, 75 when its supervisor loop stalled.
 
 (defun %ready-now-p (svc)
   "True once the registrations have been read and every bus's broker serves
-   its bus or has recorded that a broker a client elected holds it."
-  (and (service-scanned svc)
-       (plusp (hash-table-count (service-brokers svc)))
-       (loop for bb being the hash-values of (service-brokers svc)
-             always (or (eq (brokers:bus-broker-state bb) :serving)
-                        (brokers:bus-broker-degraded-since bb)))))
+   its bus or has recorded that a broker a client elected holds it. Reads the
+   brokers' snapshot, never the table."
+  (let ((brokers (%served-brokers svc)))
+    (and (service-scanned svc)
+         brokers
+         (loop for (nil . bb) in brokers
+               always (or (eq (brokers:bus-broker-state bb) :serving)
+                          (brokers:bus-broker-degraded-since bb))))))
 
 (defun %tell-systemd (svc now)
-  "Say READY=1 once the service is ready, and from then on WATCHDOG=1 on every
-   tick of this once a second duty in which every thread has progressed."
+  "Say READY=1 once the service is ready, and from then on WATCHDOG=1 each
+   time this runs, once a second, when every broker and bus reader thread has
+   progressed and the I/O thread is fresh (%IO-FRESH-P). When the I/O thread
+   is not, the beat is withheld and the thread's backtrace is taken once for
+   the episode, then written by a thread of its own. Takes no service mutex
+   and writes no log itself: the readiness line is written by the next pass."
   (unless (service-ready-p svc)
     (when (%ready-now-p svc)
       (setf (service-ready-p svc) t)
-      (%notify svc "READY=1")
-      (fleetlog:service-log :info "ready buses=~D"
-                            (hash-table-count (service-brokers svc)))))
-  (let ((progressing (%threads-progressing-p svc now)))
-    (when (and (service-ready-p svc) progressing)
-      (%notify svc "WATCHDOG=1"))))
+      (%notify svc "READY=1")))
+  (let ((progressing (%threads-progressing-p svc now))
+        (io-fresh (%io-fresh-p svc now)))
+    (when (and (service-ready-p svc) progressing io-fresh)
+      (%notify svc "WATCHDOG=1"))
+    (cond (io-fresh
+           (setf (service-io-wedged-p svc) nil))
+          ((service-ready-p svc)
+           (%take-io-backtrace svc now)))
+    (%emit-io-backtrace svc)))
 
 (defun %serve-bus (svc bus)
-  "Start BUS's broker and its reader when SVC has neither yet."
+  "Start BUS's broker and its reader when SVC has neither yet, and publish
+   the tables' snapshots."
   (let ((report-fn (service-report-fn svc))
-        (stop-fn (lambda () (service-stopping svc))))
+        (stop-fn (lambda () (service-closing svc))))
     (unless (gethash bus (service-brokers svc))
       (let ((bb (%duty svc "broker-start"
                        (lambda ()
@@ -714,11 +994,13 @@ not start, 75 when its supervisor loop stalled.
           (buswatch:start-bus-watch-thread bw stop-fn
                                            (lambda () (%identities svc))
                                            :report-fn report-fn)
-          (setf (gethash bus (service-watches svc)) bw))))))
+          (setf (gethash bus (service-watches svc)) bw))))
+    (%publish-served svc)))
 
 (defun %discover (svc)
   "Find the buses SVC should serve, start a broker and a reader for each new
-   one, and return the list."
+   one, and return the list. Once SVC is asked to stop, no further bus is
+   served."
   (let* ((registered (remove-duplicates
                       (mapcar (lambda (identity) (%bus-key (ident:identity-bus identity)))
                               (%identities svc))
@@ -727,7 +1009,8 @@ not start, 75 when its supervisor loop stalled.
                            (lambda () (brokers:discover-buses :registered-buses registered)))
                     (list nil))))
     (dolist (bus buses)
-      (%serve-bus svc bus))
+      (unless (service-stopping svc)
+        (%serve-bus svc bus)))
     buses))
 
 (defun %adopt (svc now)
@@ -780,38 +1063,142 @@ not start, 75 when its supervisor loop stalled.
   "True when a duty last run at LAST is due again at NOW."
   (or (null last) (>= (- now last) interval)))
 
-(defun supervisor-tick (svc now)
-  "Do SVC's duties for one tick at NOW, in Unix seconds, and return SVC.
+(defun run-duties (svc now)
+  "Run one pass of SVC's file-bound duties at NOW, in Unix seconds, and return
+   SVC. Runs on the I/O thread once it is started, else inline in
+   SUPERVISOR-TICK.
 
-   Every tick reads the registrations. Once every five seconds the service
-   takes over any detached watcher left running, looks for buses to serve,
-   starting a broker and a reader for each new one, and, when a minute has
-   passed since it last did, removes what servers that have gone left behind.
-   Once a second it refreshes its beat, looks at every agent's session and
-   does every agent's duties, checks every broker, reads the host's memory and
-   relieves pressure one worker at a time, and tells systemd it is ready and
-   alive. Last, it writes its status summary, every five seconds and also on
-   the tick it becomes ready, so the summary never says a bus is unserved for
-   five seconds after it is served. The first tick does all of it."
-  (let ((five (%due-p (service-last-five svc) now 5))
+   The pass first writes the reports the duty loop deferred, and the readiness
+   line on the first pass after the service became ready. Every pass reads the
+   registrations. Once every five seconds it takes over any detached watcher
+   left running, looks for buses to serve, starting a broker and a reader for
+   each new one, and, when a minute has passed since it last did, removes
+   what servers that have gone left behind. Once a second it refreshes its
+   beat file, looks at every agent's session and does every agent's duties,
+   checks every broker, and reads the host's memory, relieving pressure one
+   worker at a time. Last, it writes its status summary, every five seconds
+   and also on the first pass after the service became ready, so the summary
+   never says a bus is unserved for five seconds after it is served. The
+   first pass does all of it. Once SVC is asked to stop, the pass skips every
+   step still to come, so it ends at its next duty. A pass longer than
+   +PROGRESS-WINDOW+ writes one line to the service log with its length and
+   the number of identity surveys that read a log."
+  (let ((started (get-internal-real-time))
+        (five (%due-p (service-last-five svc) now 5))
         (second (%due-p (service-last-second svc) now 1))
-        (was-ready (service-ready-p svc)))
-    (%scan-registrations svc now)
-    (when five
-      (%adopt svc now)
-      (%discover svc)
-      (%sweep-owners svc now))
-    (when second
-      (setf (service-last-second svc) now)
-      (%duty svc "beat" (lambda () (%write-beat now)))
-      (%tick-identities svc now)
-      (%check-brokers svc now)
-      (%duty svc "memory" (lambda () (%check-memory svc now)) :subject "host")
-      (%tell-systemd svc now))
-    (when five
-      (setf (service-last-five svc) now))
-    (when (or five (and (not was-ready) (service-ready-p svc)))
-      (%write-status svc now)))
+        (newly-ready (and (service-ready-p svc) (not (service-ready-noted-p svc)))))
+    (setf (service-pass-surveys svc) 0)
+    (%write-deferred-reports svc)
+    (when newly-ready
+      (setf (service-ready-noted-p svc) t)
+      (%duty svc "ready-line"
+             (lambda ()
+               (fleetlog:service-log :info "ready buses=~D"
+                                     (hash-table-count (service-brokers svc))))
+             :subject "service"))
+    (macrolet ((unless-stopping (&body body)
+                 `(unless (service-stopping svc) ,@body)))
+      (unless-stopping (%scan-registrations svc now))
+      (when five
+        (unless-stopping (%adopt svc now))
+        (unless-stopping (%discover svc))
+        (unless-stopping (%sweep-owners svc now)))
+      (when second
+        (setf (service-last-second svc) now)
+        (unless-stopping (%duty svc "beat" (lambda () (%write-beat now))))
+        (unless-stopping (%tick-identities svc now))
+        (unless-stopping (%check-brokers svc now))
+        (unless-stopping
+          (%duty svc "memory" (lambda () (%check-memory svc now)) :subject "host")))
+      (when five
+        (setf (service-last-five svc) now))
+      (when (or five newly-ready)
+        (unless-stopping (%write-status svc now))))
+    (let ((seconds (/ (- (get-internal-real-time) started)
+                      internal-time-units-per-second)))
+      (when (> seconds +progress-window+)
+        (fleetlog:service-log :info "slow pass seconds=~,1F surveys=~D"
+                              seconds (service-pass-surveys svc)))))
+  svc)
+
+(defun %io-loop (svc)
+  "The I/O thread's body: wait for a posted pass, run it with the time it was
+   posted with, record its completion, and end once SVC is stopping. An error
+   that escapes a pass is reported under duty-failed and the loop goes on.
+   The queue mutex is never held across a pass."
+  (let ((mutex (service-io-mutex svc))
+        (queue (service-io-queue svc)))
+    (loop
+      (multiple-value-bind (sequence now)
+          (sb-thread:with-mutex (mutex)
+            (loop until (or (service-stopping svc)
+                            (> (service-io-posted svc) (service-io-completed svc)))
+                  do (sb-thread:condition-wait queue mutex))
+            (values (service-io-posted svc) (service-io-posted-now svc)))
+        (when (service-stopping svc)
+          (return))
+        (let ((started (get-internal-real-time)))
+          (handler-case (run-duties svc now)
+            (error (e)
+              (ignore-errors
+               (funcall (service-report-fn svc) :error "duty-failed" :subject "io"
+                        :msg (format nil "pass: ~A" e)))))
+          (let ((finished (get-internal-real-time)))
+            (sb-ext:atomic-incf (service-io-progress svc))
+            (sb-thread:with-mutex (mutex)
+              (setf (service-io-completed svc) sequence
+                    (service-io-finished-at svc) finished
+                    (service-io-last-duration svc)
+                    (/ (- finished started) internal-time-units-per-second)))))))))
+
+(defun start-io-thread (svc)
+  "Start SVC's I/O thread, named `host service io`, which runs every duty
+   pass from then on, and return it. Returns the running thread when one was
+   already started."
+  (or (service-io-thread svc)
+      (setf (service-io-thread svc)
+            (sb-thread:make-thread (lambda () (%io-loop svc))
+                                   :name "host service io"))))
+
+(defun %consume-and-post (svc now)
+  "Consume the latest completion of SVC's I/O thread and, when no pass is
+   outstanding, post the next one with NOW. At most one pass is ever
+   outstanding, so a pass always runs with the time it was posted with and
+   nothing queues behind a slow one."
+  (sb-thread:with-mutex ((service-io-mutex svc))
+    (let ((completed (service-io-completed svc)))
+      (setf (service-io-stamp svc)
+            (progress-step (service-io-stamp svc) (service-io-progress svc) now))
+      (when (> completed (service-io-consumed svc))
+        (setf (service-io-consumed svc) completed
+              (service-io-wedged-p svc) nil))
+      (when (and (= (service-io-posted svc) completed)
+                 (not (service-stopping svc)))
+        (setf (service-io-posted svc) (1+ completed)
+              (service-io-posted-now svc) now
+              (service-io-posted-at svc) (get-internal-real-time))
+        (sb-thread:condition-broadcast (service-io-queue svc))))))
+
+(defun supervisor-tick (svc now)
+  "Run one tick of SVC's supervisor at NOW, in Unix seconds, and return SVC.
+
+   With the I/O thread started (START-IO-THREAD), this is the duty loop's
+   tick, which touches no file and takes no service mutex: it consumes the
+   last completed pass, posts the next when none is outstanding, and once a
+   second tells systemd it is ready and alive (%TELL-SYSTEMD). Without one,
+   it runs the pass inline (RUN-DUTIES) and then, when a second has passed,
+   tells systemd."
+  (if (service-io-thread svc)
+      (progn
+        (%consume-and-post svc now)
+        (when (%due-p (service-last-beat svc) now 1)
+          (setf (service-last-beat svc) now)
+          (%tell-systemd svc now)))
+      (let ((second (%due-p (service-last-second svc) now 1)))
+        (run-duties svc now)
+        (when second
+          (setf (service-last-beat svc) now)
+          (%tell-systemd svc now))))
   svc)
 
 ;;; ------------------------------------------------------------ start and stop
@@ -858,32 +1245,75 @@ not start, 75 when its supervisor loop stalled.
                             previous-pid count))))
   svc)
 
-(defun stop-service (svc &key (mark-clean t))
-  "Stop SVC in order, and return it. Safe to call more than once.
-
-   Every thread is asked to end; each broker lets its role go without
-   archiving, then each reader closes, then every agent's descriptors are
-   closed with its pid file, heartbeat and registration left in place for the
-   service that follows. With MARK-CLEAN, the clean-stop marker is written last,
-   so the next start knows this was not a crash."
-  (unless (service-stopped svc)
+(defun request-stop (svc)
+  "Ask the I/O thread of SVC and its pass to end, wake the thread so that it
+   sees the request, and return SVC. The brokers and readers go on serving
+   until STOP-SERVICE closes them. Set STOPPING only through this: the I/O
+   thread waits with no timeout, so a request without the wake-up is never
+   seen."
+  (sb-thread:with-mutex ((service-io-mutex svc))
     (setf (service-stopping svc) t)
-    (maphash (lambda (bus bb)
-               (declare (ignore bus))
-               (ignore-errors (brokers:stop-bus-broker bb :join-seconds 1)))
-             (service-brokers svc))
-    (maphash (lambda (bus bw)
-               (declare (ignore bus))
-               (ignore-errors (buswatch:close-bus-watch bw :join-seconds 1)))
-             (service-watches svc))
-    (dolist (identity (%identities svc))
-      (ignore-errors (ident:release-identity identity :remove-files nil)))
-    (setf (service-stopped svc) t)
-    (when mark-clean
-      (with-open-file (out (hostfiles:clean-stop-path) :direction :output
-                                                       :if-exists :supersede
-                                                       :if-does-not-exist :create)
-        (format out "~D~%" (%unix-time)))))
+    (sb-thread:condition-broadcast (service-io-queue svc)))
+  svc)
+
+(defun %stop-io-thread (svc deadline)
+  "Ask the I/O thread of SVC to end, wake it, and wait for it to end until
+   DEADLINE, an internal real time, at most. Each turn of the wait notes the
+   supervisor loop, so the stall watchdog reads the stop as the loop coming
+   round. True when the thread has ended or was never started."
+  (request-stop svc)
+  (let ((thread (service-io-thread svc)))
+    (or (null thread)
+        (loop
+          (%note-loop)
+          (sb-thread:join-thread thread :default nil :timeout 0.25)
+          (unless (sb-thread:thread-alive-p thread)
+            (return t))
+          (when (>= (get-internal-real-time) deadline)
+            (return nil))))))
+
+(defun stop-service (svc &key (mark-clean t))
+  "Stop SVC in order within +STOP-BUDGET-SECONDS+, and return it. Safe to
+   call more than once.
+
+   The I/O thread is asked to end, and a pass still running on it is waited
+   for (%STOP-IO-THREAD), for the budget less +STOP-JOIN-SECONDS+ at most. The brokers and readers serve the bus until
+   that wait ends. Each broker then lets its role go without archiving, then
+   each reader closes, each joined within what is left of the budget and
+   each noting the supervisor loop for the stall watchdog, then
+   every agent's descriptors are closed with its pid file, heartbeat and
+   registration left in place for the service that follows. With
+   MARK-CLEAN, the clean-stop marker is written last, so the next start knows
+   this was not a crash. SERVICE-STOP-ORDERLY-P then says whether the I/O
+   thread had ended.
+
+   When the I/O thread does not end, its pass may hold the service mutex, so
+   the stop never waits on it: the brokers and readers are stopped as usual,
+   the agents' descriptors are left to the process's exit, and no clean-stop
+   marker is written, so the next start records an unclean restart."
+  (unless (service-stopped svc)
+    (let* ((units internal-time-units-per-second)
+           (deadline (+ (get-internal-real-time) (* +stop-budget-seconds+ units)))
+           (orderly (%stop-io-thread svc (- deadline (* +stop-join-seconds+ units)))))
+      (setf (service-closing svc) t)
+      (flet ((join-seconds ()
+               (%note-loop)
+               ;; A broker still waiting for its role is joined twice.
+               (max 1/20 (min 1 (/ (- deadline (get-internal-real-time)) units 2)))))
+        (dolist (entry (%served-brokers svc))
+          (ignore-errors (brokers:stop-bus-broker (cdr entry) :join-seconds (join-seconds))))
+        (dolist (entry (%served-watches svc))
+          (ignore-errors (buswatch:close-bus-watch (cdr entry) :join-seconds (join-seconds)))))
+      (when orderly
+        (dolist (identity (%identities svc))
+          (ignore-errors (ident:release-identity identity :remove-files nil))))
+      (setf (service-stop-orderly-p svc) orderly
+            (service-stopped svc) t)
+      (when (and orderly mark-clean)
+        (with-open-file (out (hostfiles:clean-stop-path) :direction :output
+                                                         :if-exists :supersede
+                                                         :if-does-not-exist :create)
+          (format out "~D~%" (%unix-time))))))
   svc)
 
 ;;; ---------------------------------------------------------------- the process
@@ -897,24 +1327,41 @@ not start, 75 when its supervisor loop stalled.
 (defun %note-loop ()
   (setf *last-loop* (get-internal-real-time)))
 
-(defun %start-stall-watchdog (stall-seconds)
+(defun %start-stall-watchdog (stall-seconds &optional svc)
   "Start a thread that ends the process with status 75 once the supervisor
-   loop has not come round for STALL-SECONDS.
+   loop has not come round for STALL-SECONDS, or a pass of SVC's I/O thread
+   has been outstanding that long with no duty finished (STALL-P).
 
    A wedged service is worse than a dead one: it holds the service lock and
    every agent's pid file, so nothing can take its place, and its agents stop
    hearing the bus. Ending it lets systemd start it again. Under systemd's own
    watchdog this is a second line of defence; without one it is the only one.
    Nothing is written on the way out, since the stream the loop wedged on may
-   be the one that would carry it."
+   be the one that would carry it. The queue is read without its mutex, so a
+   thread holding that mutex cannot hold up this one."
   (%note-loop)
   (sb-thread:make-thread
    (lambda ()
-     (loop
-       (sleep (max 0.2 (min 5 (/ stall-seconds 4))))
-       (when (> (- (get-internal-real-time) *last-loop*)
-                (* stall-seconds internal-time-units-per-second))
-         (sb-ext:exit :code 75 :abort t))))
+     (let ((seen nil)
+           (moved-at (get-internal-real-time)))
+       (loop
+         (sleep (max 0.2 (min 5 (/ stall-seconds 4))))
+         (let ((units internal-time-units-per-second)
+               (now (get-internal-real-time)))
+           (multiple-value-bind (outstanding since)
+               (if svc
+                   (let ((progress (service-io-progress svc))
+                         (posted-at (service-io-posted-at svc)))
+                     (unless (eql progress seen)
+                       (setf seen progress
+                             moved-at now))
+                     (values (> (service-io-posted svc) (service-io-completed svc))
+                             (and posted-at (max posted-at moved-at))))
+                   (values nil nil))
+             (when (stall-p (/ *last-loop* units) outstanding
+                            (and since (/ since units)) (/ now units)
+                            :window stall-seconds)
+               (sb-ext:exit :code 75 :abort t)))))))
    :name "host service stall watchdog"))
 
 (defun %take-service-lock ()
@@ -953,7 +1400,8 @@ not start, 75 when its supervisor loop stalled.
       (start-service svc)
       (fleetlog:service-log :info "started pid=~D state=~A" (service-pid svc)
                             (uiop:native-namestring (hostfiles:state-home)))
-      (%start-stall-watchdog +stall-seconds+)
+      (start-io-thread svc)
+      (%start-stall-watchdog +stall-seconds+ svc)
       (loop until *stop-requested*
             do (%note-loop)
                (supervisor-tick svc (%unix-time))
@@ -961,7 +1409,11 @@ not start, 75 when its supervisor loop stalled.
       (%note-loop)
       (%notify svc "STOPPING=1")
       (stop-service svc :mark-clean t)
-      (fleetlog:service-log :info "stopped in order pid=~D" (service-pid svc))
+      (if (service-stop-orderly-p svc)
+          (fleetlog:service-log :info "stopped in order pid=~D" (service-pid svc))
+          (fleetlog:service-log :info "stopped with a pass still running pid=~D; ~
+                                       the next start records an unclean restart"
+                                (service-pid svc)))
       (sb-ext:exit :code 0 :abort t))))
 
 (defun main ()
