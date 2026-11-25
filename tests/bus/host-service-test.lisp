@@ -923,7 +923,7 @@
 
 (define-test a-wedged-io-thread-stops-the-beat
   "With a pass held past the I/O progress window, no WATCHDOG=1 is sent from
-   stall start + 22 s, the I/O thread's backtrace naming the stalled reader is
+   stall start + 24 s, the I/O thread's backtrace naming the stalled reader is
    written once to the diagnostic stream, and the beat returns within three
    ticks of the release."
   (with-memory-case (state)
@@ -933,17 +933,19 @@
         (let ((start (enter-stall svc sock)))
           (true start "no pass entered the stalling reader within 10 s")
           (when start
-            (loop for offset from 2 to 26 by 2
+            ;; The last duty before the stall can finish up to one tick
+            ;; after START, so the window is counted from START + 2 s.
+            (loop for offset from 2 to 28 by 2
                   do (sleep 0.5)
                      (let ((count (beats (tick svc sock (+ start offset)))))
                        (cond ((<= offset 18)
                               (is = 1 count "WATCHDOG=1 count at stall start + ~D s" offset))
-                             ((>= offset 22)
+                             ((>= offset 24)
                               (is = 0 count "WATCHDOG=1 count at stall start + ~D s" offset)))))
             (sleep 1)
             (let ((text (get-output-stream-string diagnostic)))
-              (is = 1 (loop for at = (search "completed no pass for" text)
-                              then (search "completed no pass for" text :start2 (1+ at))
+              (is = 1 (loop for at = (search "made no progress for" text)
+                              then (search "made no progress for" text :start2 (1+ at))
                             while at
                             count t)
                   "backtrace headers written: ~A" text)
@@ -951,7 +953,7 @@
               (true (search "STALLING-MEMORY-READER" text)
                     "the backtrace does not show the stalled reader: ~A" text))
             (sb-thread:signal-semaphore *stall-release*)
-            (true (loop for offset from 28 to 32 by 2
+            (true (loop for offset from 30 to 34 by 2
                         do (sleep 0.5)
                         thereis (plusp (beats (tick svc sock (+ start offset)))))
                   "WATCHDOG=1 did not return within three ticks of the release")))))))
@@ -1072,3 +1074,33 @@
         (is = 4 (length *failed-surveys*) "surveys asked: ~S" *failed-surveys*)
         (is = 1 (count t *failed-surveys*) "forced surveys: ~S" *failed-surveys*)
         (true (probe-file marker) "no deaf marker after 700 s of unheard mail")))))
+
+(defun slow-survey (survey)
+  "A survey function that answers SURVEY as the service's own does. While
+   *STALL-ARMED* is :SLOW, each call first sets *STALL-ENTERED* and takes
+   1 s."
+  (when (eq *stall-armed* :slow)
+    (setf *stall-entered* t)
+    (sleep 1))
+  (ident:run-survey survey))
+
+(define-test a-slow-pass-that-keeps-progressing-keeps-the-beat
+  "With ten agents whose surveys take 1 s each, one pass outlasts the I/O
+   progress window on the duty loop's clock, yet every once-a-second tick
+   still sends WATCHDOG=1: each finished survey counts as progress."
+  (with-memory-case (state)
+    (dotimes (i 10) (register (format nil "agent~D" i)))
+    (with-io-service (svc sock state :survey-fn #'slow-survey)
+      (true (await-ready svc sock) "READY=1 did not arrive within 15 s")
+      (multiple-value-bind (start sequence) (enter-stall svc sock :slow)
+        (true start "no pass entered the slow survey within 10 s")
+        (when start
+          (loop for offset from 2 to 28 by 2
+                do (sleep 0.5)
+                   (is = 1 (beats (tick svc sock (+ start offset)))
+                       "WATCHDOG=1 count at slow pass start + ~D s" offset))
+          (true (< (service::service-io-completed svc) sequence)
+                "the pass ended inside the window, so it proves nothing")
+          (setf *stall-armed* nil)
+          (true (await-completion svc sock sequence (+ start 28))
+                "the slow pass was not consumed within 10 s"))))))

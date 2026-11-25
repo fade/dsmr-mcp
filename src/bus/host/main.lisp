@@ -19,11 +19,12 @@
 ;;;; second tells systemd it is ready and alive. The I/O thread runs every duty
 ;;;; that touches a file, in a fixed order. WATCHDOG=1 is sent only when every
 ;;;; broker and bus reader thread has progressed within the progress window and
-;;;; the I/O thread has completed a pass within its own window or has none
-;;;; outstanding, so a wedged pass still stops the beat; the I/O thread's
-;;;; backtrace is then written to standard error once, since SIGABRT's shows
-;;;; only the main thread. A service whose I/O thread was never started runs
-;;;; each pass inline in the tick, as the in-process tests do.
+;;;; the I/O thread has finished a duty within its own window or has no pass
+;;;; outstanding, so a wedged pass still stops the beat and a long one that
+;;;; keeps finishing duties does not; the I/O thread's backtrace is then
+;;;; written to standard error once, since SIGABRT's shows only the main
+;;;; thread. A service whose I/O thread was never started runs each pass
+;;;; inline in the tick, as the in-process tests do.
 ;;;;
 ;;;; The service also decides when the host gives memory back. It already comes
 ;;;; round once a second for every agent, so it reads the host's memory on the
@@ -109,14 +110,14 @@
    service stops telling systemd it is alive.")
 
 (defconstant +io-progress-window+ 20
-  "Seconds a pass on the I/O thread may stay outstanding with no completion
+  "Seconds a pass on the I/O thread may stay outstanding with no duty finished
    before the service stops telling systemd it is alive.
 
    With WatchdogSec=30 a wedged I/O thread loses the beat at 20 s and systemd
    ends the process at most 30 s later; the stall watchdog ends it at 60 s
-   when no service manager is watching. A pass of up to about 50 s survives
-   without a restart, and bus delivery goes on throughout, since the bus
-   readers run on their own threads.")
+   when no service manager is watching. A pass of any length survives while
+   it keeps finishing duties, and bus delivery goes on throughout, since the
+   bus readers run on their own threads.")
 
 (defconstant +io-join-seconds+ 3
   "Seconds an orderly stop waits for the I/O thread to end before it treats
@@ -124,8 +125,8 @@
 
 (defconstant +stall-seconds+ 60
   "Seconds the supervisor loop may go without coming round, or a pass on the
-   I/O thread may stay outstanding, before the service ends itself so that it
-   is restarted.")
+   I/O thread may stay outstanding with no duty finished, before the service
+   ends itself so that it is restarted.")
 
 (defconstant +backtrace-frames+ 60
   "Frames of the I/O thread's backtrace written when its pass is wedged.")
@@ -213,11 +214,12 @@ not start, 75 when its supervisor loop stalled.
    to it and IO-POSTED-AT the internal real time it was posted; IO-COMPLETED
    is the sequence number of the last pass completed, IO-FINISHED-AT the
    internal real time it ended and IO-LAST-DURATION its length in seconds.
-   IO-QUEUE is the waitqueue the I/O thread waits on. DEFERRED holds the
+   IO-PROGRESS counts the duties and passes the I/O thread has finished; it
+   is moved atomically, outside every mutex. IO-QUEUE is the waitqueue the I/O thread waits on. DEFERRED holds the
    reports the duty loop could not write itself, as argument lists for
    REPORT-FN, until the next pass writes them. The duty loop alone keeps
    IO-CONSUMED, the last completion it consumed, IO-STAMP, the progress stamp
-   of the completed count, IO-WEDGED-P, true while a withheld beat has already
+   of IO-PROGRESS, IO-WEDGED-P, true while a withheld beat has already
    had the I/O thread's backtrace written, and LAST-BEAT, when it last told
    systemd anything. DIAGNOSTIC-STREAM takes that backtrace.
 
@@ -264,6 +266,7 @@ not start, 75 when its supervisor loop stalled.
   (io-completed 0)
   (io-finished-at nil)
   (io-last-duration nil)
+  (io-progress 0 :type sb-ext:word)
   (deferred '())
   (io-consumed 0)
   (io-stamp nil)
@@ -339,15 +342,17 @@ not start, 75 when its supervisor loop stalled.
   "Run THUNK, one of SVC's duties, under the healing protocol with SVC's report
    function, and return what it returns. An error that is not a fault is
    reported under duty-failed and NIL is returned, so one failing duty never
-   stops the loop."
+   stops the loop. Either way the duty counts as progress (IO-PROGRESS)."
   (let ((report-fn (service-report-fn svc)))
-    (handler-case
-        (conditions:call-with-healing thunk :report-fn report-fn)
-      (error (e)
-        (ignore-errors
-         (funcall report-fn :error "duty-failed" :bus bus :id id :subject subject
-                  :msg (format nil "~A: ~A" name e)))
-        nil))))
+    (unwind-protect
+         (handler-case
+             (conditions:call-with-healing thunk :report-fn report-fn)
+           (error (e)
+             (ignore-errors
+              (funcall report-fn :error "duty-failed" :bus bus :id id :subject subject
+                       :msg (format nil "~A: ~A" name e)))
+             nil))
+      (sb-ext:atomic-incf (service-io-progress svc)))))
 
 ;;; ------------------------------------------------------------------- systemd
 
@@ -411,7 +416,8 @@ not start, 75 when its supervisor loop stalled.
 (defun stall-p (loop-at outstanding-p posted-at now &key (window +stall-seconds+))
   "True when the service has stalled at NOW: the supervisor loop last came
    round at LOOP-AT, more than WINDOW seconds before, or a pass is
-   OUTSTANDING-P and was posted at POSTED-AT, more than WINDOW seconds before.
+   OUTSTANDING-P and the later of its posting and the I/O thread's last
+   finished duty, POSTED-AT, is more than WINDOW seconds before.
    All times are in seconds on one clock. Pure."
   (and (or (> (- now loop-at) window)
            (and outstanding-p posted-at (> (- now posted-at) window)))
@@ -464,17 +470,17 @@ not start, 75 when its supervisor loop stalled.
     all))
 
 (defun %io-fresh-p (svc now)
-  "True when SVC's I/O thread has no pass outstanding, or has completed one
-   within the I/O progress window of NOW, or was never started. Reads the
-   queue under its own mutex only."
+  "True when SVC's I/O thread has no pass outstanding, or has finished a duty
+   within the I/O progress window of NOW, or was never started. A long pass
+   that keeps finishing duties is fresh; one call held for the window is not.
+   Reads the queue under its own mutex only."
   (or (null (service-io-thread svc))
-      (multiple-value-bind (posted completed)
-          (sb-thread:with-mutex ((service-io-mutex svc))
-            (values (service-io-posted svc) (service-io-completed svc)))
-        (let ((stamp (progress-step (service-io-stamp svc) completed now)))
-          (setf (service-io-stamp svc) stamp)
-          (or (= posted completed)
-              (progress-fresh-p stamp now :window +io-progress-window+))))))
+      (let ((outstanding (sb-thread:with-mutex ((service-io-mutex svc))
+                           (> (service-io-posted svc) (service-io-completed svc))))
+            (stamp (progress-step (service-io-stamp svc) (service-io-progress svc) now)))
+        (setf (service-io-stamp svc) stamp)
+        (or (not outstanding)
+            (progress-fresh-p stamp now :window +io-progress-window+)))))
 
 (defun %write-io-backtrace (svc now)
   "Once per episode of a withheld beat, interrupt SVC's I/O thread so that it
@@ -498,7 +504,7 @@ not start, 75 when its supervisor loop stalled.
           thread
           (lambda ()
             (ignore-errors
-             (format stream "~&dsmr-bus-host: thread ~S completed no pass for ~D s; ~
+             (format stream "~&dsmr-bus-host: thread ~S made no progress for ~D s; ~
                              its backtrace follows~%"
                      (sb-thread:thread-name sb-thread:*current-thread*) seconds)
              (sb-debug:print-backtrace :stream stream :count +backtrace-frames+)
@@ -1079,6 +1085,7 @@ not start, 75 when its supervisor loop stalled.
                (funcall (service-report-fn svc) :error "duty-failed" :subject "io"
                         :msg (format nil "pass: ~A" e)))))
           (let ((finished (get-internal-real-time)))
+            (sb-ext:atomic-incf (service-io-progress svc))
             (sb-thread:with-mutex (mutex)
               (setf (service-io-completed svc) sequence
                     (service-io-finished-at svc) finished
@@ -1101,7 +1108,8 @@ not start, 75 when its supervisor loop stalled.
    nothing queues behind a slow one."
   (sb-thread:with-mutex ((service-io-mutex svc))
     (let ((completed (service-io-completed svc)))
-      (setf (service-io-stamp svc) (progress-step (service-io-stamp svc) completed now))
+      (setf (service-io-stamp svc)
+            (progress-step (service-io-stamp svc) (service-io-progress svc) now))
       (when (> completed (service-io-consumed svc))
         (setf (service-io-consumed svc) completed
               (service-io-wedged-p svc) nil))
@@ -1236,31 +1244,38 @@ not start, 75 when its supervisor loop stalled.
 (defun %start-stall-watchdog (stall-seconds &optional svc)
   "Start a thread that ends the process with status 75 once the supervisor
    loop has not come round for STALL-SECONDS, or a pass of SVC's I/O thread
-   has been outstanding that long (STALL-P).
+   has been outstanding that long with no duty finished (STALL-P).
 
    A wedged service is worse than a dead one: it holds the service lock and
    every agent's pid file, so nothing can take its place, and its agents stop
    hearing the bus. Ending it lets systemd start it again. Under systemd's own
    watchdog this is a second line of defence; without one it is the only one.
    Nothing is written on the way out, since the stream the loop wedged on may
-   be the one that would carry it."
+   be the one that would carry it. The queue is read without its mutex, so a
+   thread holding that mutex cannot hold up this one."
   (%note-loop)
   (sb-thread:make-thread
    (lambda ()
-     (loop
-       (sleep (max 0.2 (min 5 (/ stall-seconds 4))))
-       (let ((units internal-time-units-per-second)
-             (now (get-internal-real-time)))
-         (multiple-value-bind (outstanding posted-at)
-             (if svc
-                 (sb-thread:with-mutex ((service-io-mutex svc))
-                   (values (> (service-io-posted svc) (service-io-completed svc))
-                           (service-io-posted-at svc)))
-                 (values nil nil))
-           (when (stall-p (/ *last-loop* units) outstanding
-                          (and posted-at (/ posted-at units)) (/ now units)
-                          :window stall-seconds)
-             (sb-ext:exit :code 75 :abort t))))))
+     (let ((seen nil)
+           (moved-at (get-internal-real-time)))
+       (loop
+         (sleep (max 0.2 (min 5 (/ stall-seconds 4))))
+         (let ((units internal-time-units-per-second)
+               (now (get-internal-real-time)))
+           (multiple-value-bind (outstanding since)
+               (if svc
+                   (let ((progress (service-io-progress svc))
+                         (posted-at (service-io-posted-at svc)))
+                     (unless (eql progress seen)
+                       (setf seen progress
+                             moved-at now))
+                     (values (> (service-io-posted svc) (service-io-completed svc))
+                             (and posted-at (max posted-at moved-at))))
+                   (values nil nil))
+             (when (stall-p (/ *last-loop* units) outstanding
+                            (and since (/ since units)) (/ now units)
+                            :window stall-seconds)
+               (sb-ext:exit :code 75 :abort t)))))))
    :name "host service stall watchdog"))
 
 (defun %take-service-lock ()
