@@ -801,7 +801,7 @@
    the next call blocks the pass that made it until *STALL-RELEASE* is
    signalled, or for at most 60 s; armed with :MEMORY-LOCKED, it blocks the
    same way holding *STALL-SERVICE*'s mutex; armed with :MEMORY-SLOW, it
-   takes 2 s, then sets *STALL-BROKER-STATES* to the states of
+   takes 4 s, then sets *STALL-BROKER-STATES* to the states of
    *STALL-SERVICE*'s brokers."
   (case *stall-armed*
     (:memory
@@ -818,7 +818,7 @@
     (:memory-slow
      (setf *stall-armed* nil
            *stall-entered* t)
-     (sleep 2)
+     (sleep 4)
      (setf *stall-broker-states* (broker-states *stall-service*)
            *stall-left* t)))
   (readings 50))
@@ -1015,7 +1015,8 @@
                  "a clean-stop marker was written with a pass wedged"))))))
 
 (define-test a-stop-waits-for-a-pass-that-is-still-running
-  "With a pass inside a memory read that takes 2 s, an orderly stop waits
+  "With a pass inside a memory read that takes 4 s, so that no duty finishes
+   for most of the stop's share for the I/O thread, an orderly stop waits
    for the pass to end, says it was orderly, and writes the clean-stop
    marker."
   (with-memory-case (state)
@@ -1045,8 +1046,8 @@
 
 (define-test the-stop-budget-fits-the-unit-s-stop-timeout
   "The shipped unit's TimeoutStopSec leaves at least 2 s beyond the stop
-   budget, and the budget's share for the I/O thread leaves room for the
-   quiet window and for joining the brokers and readers."
+   budget, and the budget keeps a share for the I/O thread and a share for
+   joining the brokers and readers."
   (let ((timeout (unit-stop-timeout (asdf:system-relative-pathname
                                      "dsmr-mcp" "scripts/units/dsmr-bus-host.service")))
         (budget service::+stop-budget-seconds+)
@@ -1055,9 +1056,7 @@
     (when timeout
       (true (<= (+ budget 2) timeout)
             "stop budget ~D s leaves less than 2 s of TimeoutStopSec=~D" budget timeout))
-    (true (< 0 join budget) "join share ~D s, budget ~D s" join budget)
-    (true (< service::+stop-quiet-seconds+ (- budget join))
-          "quiet window ~D s, I/O share ~D s" service::+stop-quiet-seconds+ (- budget join))))
+    (true (< 0 join budget) "join share ~D s, budget ~D s" join budget)))
 
 (define-test the-brokers-serve-until-the-io-thread-ends
   "During an orderly stop with a pass still running, every broker is still
@@ -1083,11 +1082,11 @@
                 "broker states after the stop: ~S" (broker-states svc)))))))
 
 (define-test a-stop-keeps-the-stall-watchdog-s-loop-clause-fresh
-  "While an orderly stop waits on a wedged pass for its quiet window and
-   then joins the brokers and readers, the supervisor loop is noted on every
-   turn of the wait and before every join, so the stall watchdog's loop
-   clause never sees the loop 2 s old, and the stop ends inside the stop
-   budget."
+  "While an orderly stop waits on a wedged pass for its share of the stop
+   budget and then joins the brokers and readers, the supervisor loop is
+   noted on every turn of the wait and before every join, so the stall
+   watchdog's loop clause never sees the loop 2 s old, and the stop ends
+   inside the stop budget."
   (with-memory-case (state)
     (with-io-service (svc sock state)
       (true (await-ready svc sock) "READY=1 did not arrive within 15 s")
@@ -1095,6 +1094,7 @@
         (true start "no pass entered the stalling reader within 10 s")
         (when start
           (let ((units internal-time-units-per-second)
+                (share (- service::+stop-budget-seconds+ service::+stop-join-seconds+))
                 (worst 0)
                 (done nil))
             (service::%note-loop)
@@ -1112,8 +1112,8 @@
               (let ((seconds (/ (- (get-internal-real-time) began) units)))
                 (setf done t)
                 (sb-thread:join-thread sampler :default nil :timeout 5)
-                (true (>= seconds (- service::+stop-quiet-seconds+ 1/2))
-                      "the stop took only ~,1F s, so it proves nothing" seconds)
+                (true (>= seconds (- share 1/2))
+                      "the stop took ~,1F s, less than the I/O share ~D s" seconds share)
                 (true (< seconds service::+stop-budget-seconds+)
                       "the stop took ~,1F s" seconds)
                 (true (< worst 2) "the loop was ~,1F s old during the stop" worst)))))))))

@@ -130,12 +130,9 @@
 
 (defconstant +stop-join-seconds+ 2
   "Seconds of the stop budget kept for joining the brokers and bus readers.
-   The rest is the most the stop waits for the I/O thread to end.")
-
-(defconstant +stop-quiet-seconds+ 3
-  "Seconds an orderly stop waits for the I/O thread to finish a duty before
-   it treats the pass in flight as wedged. A pass asked to stop ends at its
-   next duty, so a pass that is only running ends inside this.")
+   The rest is the most the stop waits for the I/O thread to end. A pass
+   asked to stop ends at its next duty, so a duty that ends inside that share
+   still gives an orderly stop.")
 
 (defconstant +stall-seconds+ 60
   "Seconds the supervisor loop may go without coming round, or a pass on the
@@ -1260,39 +1257,27 @@ not start, 75 when its supervisor loop stalled.
   svc)
 
 (defun %stop-io-thread (svc deadline)
-  "Ask the I/O thread of SVC to end, wake it, and wait for it to end while
-   its pass keeps finishing duties: until it has finished none for
-   +STOP-QUIET-SECONDS+, and until DEADLINE, an internal real time, at most.
-   Each turn of the wait notes the supervisor loop, so the stall watchdog
-   reads the stop as the loop coming round. True when the thread has ended
-   or was never started."
+  "Ask the I/O thread of SVC to end, wake it, and wait for it to end until
+   DEADLINE, an internal real time, at most. Each turn of the wait notes the
+   supervisor loop, so the stall watchdog reads the stop as the loop coming
+   round. True when the thread has ended or was never started."
   (request-stop svc)
   (let ((thread (service-io-thread svc)))
     (or (null thread)
-        (let ((quiet (* +stop-quiet-seconds+ internal-time-units-per-second))
-              (moved (get-internal-real-time))
-              (seen (service-io-progress svc)))
-          (loop
-            (%note-loop)
-            (sb-thread:join-thread thread :default nil :timeout 0.25)
-            (unless (sb-thread:thread-alive-p thread)
-              (return t))
-            (let ((now (get-internal-real-time))
-                  (progress (service-io-progress svc)))
-              (unless (eql progress seen)
-                (setf seen progress
-                      moved now))
-              (when (or (> (- now moved) quiet)
-                        (>= now deadline))
-                (return nil))))))))
+        (loop
+          (%note-loop)
+          (sb-thread:join-thread thread :default nil :timeout 0.25)
+          (unless (sb-thread:thread-alive-p thread)
+            (return t))
+          (when (>= (get-internal-real-time) deadline)
+            (return nil))))))
 
 (defun stop-service (svc &key (mark-clean t))
   "Stop SVC in order within +STOP-BUDGET-SECONDS+, and return it. Safe to
    call more than once.
 
    The I/O thread is asked to end, and a pass still running on it is waited
-   for while it keeps finishing duties (%STOP-IO-THREAD), for the budget less
-   +STOP-JOIN-SECONDS+ at most. The brokers and readers serve the bus until
+   for (%STOP-IO-THREAD), for the budget less +STOP-JOIN-SECONDS+ at most. The brokers and readers serve the bus until
    that wait ends. Each broker then lets its role go without archiving, then
    each reader closes, each joined within what is left of the budget and
    each noting the supervisor loop for the stall watchdog, then
