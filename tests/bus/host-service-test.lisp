@@ -1082,6 +1082,42 @@
           (true (notany (lambda (s) (eq s :serving)) (broker-states svc))
                 "broker states after the stop: ~S" (broker-states svc)))))))
 
+(define-test a-stop-keeps-the-stall-watchdog-s-loop-clause-fresh
+  "While an orderly stop waits on a wedged pass for its quiet window and
+   then joins the brokers and readers, the supervisor loop is noted on every
+   turn of the wait and before every join, so the stall watchdog's loop
+   clause never sees the loop 2 s old, and the stop ends inside the stop
+   budget."
+  (with-memory-case (state)
+    (with-io-service (svc sock state)
+      (true (await-ready svc sock) "READY=1 did not arrive within 15 s")
+      (let ((start (enter-stall svc sock :memory-locked)))
+        (true start "no pass entered the stalling reader within 10 s")
+        (when start
+          (let ((units internal-time-units-per-second)
+                (worst 0)
+                (done nil))
+            (service::%note-loop)
+            (let ((sampler (sb-thread:make-thread
+                            (lambda ()
+                              (loop until done
+                                    do (setf worst (max worst
+                                                        (/ (- (get-internal-real-time)
+                                                              service::*last-loop*)
+                                                           units)))
+                                       (sleep 0.05)))
+                            :name "stall sampler"))
+                  (began (get-internal-real-time)))
+              (service:stop-service svc :mark-clean t)
+              (let ((seconds (/ (- (get-internal-real-time) began) units)))
+                (setf done t)
+                (sb-thread:join-thread sampler :default nil :timeout 5)
+                (true (>= seconds (- service::+stop-quiet-seconds+ 1/2))
+                      "the stop took only ~,1F s, so it proves nothing" seconds)
+                (true (< seconds service::+stop-budget-seconds+)
+                      "the stop took ~,1F s" seconds)
+                (true (< worst 2) "the loop was ~,1F s old during the stop" worst)))))))))
+
 (define-test a-pass-asked-to-stop-starts-no-broker
   "A pass reads a new registration on a bus not yet served and starts that
    bus's broker and reader; a pass run after the stop request does neither."

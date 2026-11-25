@@ -1263,7 +1263,9 @@ not start, 75 when its supervisor loop stalled.
   "Ask the I/O thread of SVC to end, wake it, and wait for it to end while
    its pass keeps finishing duties: until it has finished none for
    +STOP-QUIET-SECONDS+, and until DEADLINE, an internal real time, at most.
-   True when the thread has ended or was never started."
+   Each turn of the wait notes the supervisor loop, so the stall watchdog
+   reads the stop as the loop coming round. True when the thread has ended
+   or was never started."
   (request-stop svc)
   (let ((thread (service-io-thread svc)))
     (or (null thread)
@@ -1271,6 +1273,7 @@ not start, 75 when its supervisor loop stalled.
               (moved (get-internal-real-time))
               (seen (service-io-progress svc)))
           (loop
+            (%note-loop)
             (sb-thread:join-thread thread :default nil :timeout 0.25)
             (unless (sb-thread:thread-alive-p thread)
               (return t))
@@ -1291,7 +1294,8 @@ not start, 75 when its supervisor loop stalled.
    for while it keeps finishing duties (%STOP-IO-THREAD), for the budget less
    +STOP-JOIN-SECONDS+ at most. The brokers and readers serve the bus until
    that wait ends. Each broker then lets its role go without archiving, then
-   each reader closes, each joined within what is left of the budget, then
+   each reader closes, each joined within what is left of the budget and
+   each noting the supervisor loop for the stall watchdog, then
    every agent's descriptors are closed with its pid file, heartbeat and
    registration left in place for the service that follows. With
    MARK-CLEAN, the clean-stop marker is written last, so the next start knows
@@ -1308,6 +1312,7 @@ not start, 75 when its supervisor loop stalled.
            (orderly (%stop-io-thread svc (- deadline (* +stop-join-seconds+ units)))))
       (setf (service-closing svc) t)
       (flet ((join-seconds ()
+               (%note-loop)
                ;; A broker still waiting for its role is joined twice.
                (max 1/20 (min 1 (/ (- deadline (get-internal-real-time)) units 2)))))
         (dolist (entry (%served-brokers svc))
