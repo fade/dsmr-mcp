@@ -1138,6 +1138,81 @@
       (false (gethash "later" (service::service-watches svc))
              "a reader was started for the bus later after the stop request"))))
 
+(defmacro with-wrapped ((name wrapper) &body body)
+  "Run BODY with the global function NAME encapsulated by WRAPPER, a function
+   of the original and the arguments, and remove the encapsulation after."
+  `(progn
+     (sb-int:encapsulate ',name 'mid-pass ,wrapper)
+     (unwind-protect (progn ,@body)
+       (sb-int:unencapsulate ',name 'mid-pass))))
+
+(define-test a-stop-requested-during-discovery-serves-no-further-bus
+  "A stop requested once the buses have been discovered, inside the pass,
+   starts neither a broker nor a reader for a bus not yet served."
+  (with-memory-case (state)
+    (register "alpha")
+    (let ((svc (memory-service))
+          (now (%unix-time))
+          (discovered nil))
+      (service:run-duties svc now)
+      (register "beta" :bus "late")
+      (with-wrapped (dsmr-bus-host/src/bus/host/brokers:discover-buses
+                     (lambda (original &rest args)
+                       (prog1 (apply original args)
+                         (setf discovered t)
+                         (service:request-stop svc))))
+        (service:run-duties svc (+ now 5)))
+      (true discovered "the pass did not reach discovery")
+      (false (gethash "late" (service::service-brokers svc))
+             "a broker was started for the bus late after the stop request")
+      (false (gethash "late" (service::service-watches svc))
+             "a reader was started for the bus late after the stop request"))))
+
+(define-test a-stop-requested-while-surveys-are-requested-counts-no-readers
+  "A stop requested while the identities' surveys are requested, inside the
+   pass, skips the count of the log readers."
+  (with-memory-case (state)
+    (register "alpha")
+    (let ((svc (memory-service))
+          (requested 0)
+          (counted 0))
+      (with-wrapped (ident:request-survey
+                     (lambda (original &rest args)
+                       (incf requested)
+                       (service:request-stop svc)
+                       (apply original args)))
+        (with-wrapped (ident:log-reader-counts
+                       (lambda (original &rest args)
+                         (incf counted)
+                         (apply original args)))
+          (service:run-duties svc (%unix-time))))
+      (true (plusp requested) "the pass requested no survey")
+      (is = 0 counted "log readers counted after the stop request"))))
+
+(define-test a-stop-requested-during-a-survey-applies-no-tick
+  "A stop requested while the first of two surveys is answered, inside the
+   pass, skips the second survey and every identity's tick."
+  (with-memory-case (state)
+    (register "alpha")
+    (register "beta")
+    (let* ((answered 0)
+           (ticked 0)
+           (svc nil))
+      (setf svc (service:make-service :feed-p nil :report-fn #'recording-report
+                                      :memory-reader (lambda () *reading*)
+                                      :survey-fn (lambda (survey)
+                                                   (incf answered)
+                                                   (service:request-stop svc)
+                                                   (ident:run-survey survey))))
+      (push svc *services*)
+      (with-wrapped (ident:identity-tick
+                     (lambda (original &rest args)
+                       (incf ticked)
+                       (apply original args)))
+        (service:run-duties svc (%unix-time)))
+      (is = 1 answered "surveys answered")
+      (is = 0 ticked "identity ticks applied after the stop request"))))
+
 (define-test a-stop-request-wakes-an-idle-io-thread
   "REQUEST-STOP ends an I/O thread waiting for its next pass within 1 s, and
    the stopping flag has no exported writer that could skip the wake-up."
