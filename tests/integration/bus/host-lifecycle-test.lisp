@@ -2,17 +2,18 @@
 ;;;; SPDX-License-Identifier: AGPL-3.0-or-later
 ;;;;
 ;;;; Cross-process tests of the host service binary itself: it starts, beats and
-;;;; serves the unnamed bus; a second copy on the same state root refuses to
-;;;; start; SIGTERM stops it in order without rotating a log; a crash is
-;;;; recorded as an unclean restart on the next start, and only a crash; agents
-;;;; on two buses are served by the one process with no watcher beside it; and a
-;;;; watchdog's SIGABRT ends it rather than leaving it waiting in the low-level
-;;;; monitor.
+;;;; serves the unnamed bus; it tells a notification socket it is ready and
+;;;; alive; a second copy on the same state root refuses to start; SIGTERM stops
+;;;; it in order without rotating a log; a crash is recorded as an unclean
+;;;; restart on the next start, and only a crash; agents on two buses are served
+;;;; by the one process with no watcher beside it; and a watchdog's SIGABRT ends
+;;;; it rather than leaving it waiting in the low-level monitor.
 ;;;;
 ;;;; Every case runs the built bin/dsmr-bus-host under its own fresh state root
-;;;; with no systemd notification socket in its environment. A missing binary is
-;;;; a failure here, not a skip: these are the cases that say the binary works.
-;;;; Only processes a case started are ever signalled.
+;;;; with no systemd notification socket in its environment, except the case
+;;;; that binds one to read the readiness and watchdog messages. A missing
+;;;; binary is a failure here, not a skip: these are the cases that say the
+;;;; binary works. Only processes a case started are ever signalled.
 
 ;; Package evolution guard
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -22,6 +23,9 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :sb-posix))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-bsd-sockets))
 
 (defpackage #:dsmr-mcp/tests/integration/bus/host-lifecycle-test
   (:use #:cl #:zebra)
@@ -49,11 +53,11 @@
 (defvar *services* '()
   "The service processes the current case started, newest first.")
 
-(defun launch (state &key (input nil))
-  "Start the service binary under STATE with no notification socket, its
-   output appended to service.out under STATE, and return the process. INPUT
-   is passed to the launch, so a case can hold the service's standard input
-   open."
+(defun launch (state &key (input nil) notify-socket)
+  "Start the service binary under STATE, its output appended to service.out
+   under STATE, and return the process. NOTIFY_SOCKET names NOTIFY-SOCKET when
+   given and is removed otherwise. INPUT is passed to the launch, so a case
+   can hold the service's standard input open."
   (let* ((out (with-open-file (stream (merge-pathnames "service.out" state)
                                       :direction :output :if-exists :append
                                       :if-does-not-exist :create)
@@ -62,6 +66,8 @@
                    (append (list "env" "-u" "NOTIFY_SOCKET" "-u" "DSMR_BUS_AGENT"
                                  "-u" "DSMR_BUS_SELECTOR")
                            (watcher-env state)
+                           (and notify-socket
+                                (list (format nil "NOTIFY_SOCKET=~A" notify-socket)))
                            (list (uiop:native-namestring (host-binary))))
                    :input input
                    :output (uiop:native-namestring out)
@@ -179,6 +185,26 @@
         when (and cmdline (search needle cmdline))
           collect child))
 
+(defun receive-for (sock seconds &key until)
+  "The datagrams SOCK receives within SECONDS, oldest first, polled every
+   50 ms without blocking. With UNTIL, stop as soon as that message arrives."
+  (let ((buffer (make-array 64 :element-type '(unsigned-byte 8)))
+        (deadline (+ (get-internal-real-time)
+                     (* seconds internal-time-units-per-second)))
+        (got '()))
+    (loop
+      (loop
+        (multiple-value-bind (received length)
+            (handler-case (sb-bsd-sockets:socket-receive sock buffer nil)
+              (error () nil))
+          (if (and received length (plusp length))
+              (push (map 'string #'code-char (subseq buffer 0 length)) got)
+              (return))))
+      (when (or (and until (member until got :test #'string=))
+                (> (get-internal-real-time) deadline))
+        (return (reverse got)))
+      (sleep 0.05))))
+
 ;;; --------------------------------------------------------------------- cases
 
 (define-test the-service-binary-is-built
@@ -204,6 +230,29 @@
         (true (await-serving state process))
         (is = (pid process) (getf (summary state) :pid))
         (true (alive-p (pid process)))))))
+
+(define-test the-service-tells-the-manager-it-is-ready-and-alive
+  "Started with NOTIFY_SOCKET naming a datagram socket the case binds, the
+   service sends READY=1 within 8 s and then at least three WATCHDOG=1 within
+   the following 6 s."
+  (when (host-binary)
+    (with-service-state (state)
+      (let ((path (uiop:native-namestring (merge-pathnames "notify.sock" state)))
+            (sock (make-instance 'sb-bsd-sockets:local-socket :type :datagram))
+            (process nil))
+        (unwind-protect
+             (progn
+               (sb-bsd-sockets:socket-bind sock path)
+               (setf (sb-bsd-sockets:non-blocking-mode sock) t)
+               (register state "alpha")
+               (setf process (launch state :notify-socket path))
+               (true (member "READY=1" (receive-for sock 8 :until "READY=1") :test #'string=)
+                     "READY=1 did not arrive within 8 s")
+               (let ((beats (count "WATCHDOG=1" (receive-for sock 6) :test #'string=)))
+                 (true (>= beats 3) "~D WATCHDOG=1 within 6 s after READY=1" beats)))
+          (when (and process (uiop:process-alive-p process))
+            (ignore-errors (stop-process (pid process))))
+          (ignore-errors (sb-bsd-sockets:socket-close sock)))))))
 
 (define-test a-second-copy-refuses-to-start-beside-the-first
   "A second copy on the same state root exits non-zero within five seconds
