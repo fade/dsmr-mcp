@@ -1076,8 +1076,11 @@ not start, 75 when its supervisor loop stalled.
     (%write-deferred-reports svc)
     (when newly-ready
       (setf (service-ready-noted-p svc) t)
-      (fleetlog:service-log :info "ready buses=~D"
-                            (hash-table-count (service-brokers svc))))
+      (%duty svc "ready-line"
+             (lambda ()
+               (fleetlog:service-log :info "ready buses=~D"
+                                     (hash-table-count (service-brokers svc))))
+             :subject "service"))
     (%scan-registrations svc now)
     (when five
       (%adopt svc now)

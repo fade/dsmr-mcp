@@ -1040,6 +1040,30 @@
     (is eq :external (nth-value 1 (find-symbol "REQUEST-STOP"
                                                '#:dsmr-bus-host/src/bus/host/main)))))
 
+(define-test a-failing-readiness-line-abandons-nothing-else
+  "When the readiness line cannot be written, the failure is reported as a
+   duty failure and the rest of the pass still runs: the status summary for
+   the readiness is written."
+  (with-memory-case (state)
+    (register "alpha")
+    (let ((svc (memory-service))
+          (now (%unix-time)))
+      (service:run-duties svc now)
+      (setf (service::service-ready-p svc) t)
+      (ignore-errors (delete-file (hostfiles:service-status-path)))
+      (sb-int:encapsulate 'fleetlog:service-log 'failing-readiness
+                          (lambda (original level control &rest args)
+                            (if (search "ready buses" control)
+                                (error "stand-in service log failure")
+                                (apply original level control args))))
+      (unwind-protect
+           (let ((escaped (nth-value 1 (ignore-errors (service:run-duties svc (1+ now)) t))))
+             (false escaped "the pass was abandoned: ~A" escaped)
+             (true (probe-file (hostfiles:service-status-path))
+                   "the status summary was not written")
+             (true (reported "duty-failed") "the failure was not reported"))
+        (sb-int:unencapsulate 'fleetlog:service-log 'failing-readiness)))))
+
 (define-test io-progress-stall-rule
   "The stall watchdog's rule: the service has stalled when its loop has not
    come round for more than the window, or when a pass has been outstanding
