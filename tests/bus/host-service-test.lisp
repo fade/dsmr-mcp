@@ -1017,6 +1017,26 @@
                 "no clean-stop marker after a pass that was only running")
           (true (service::service-stop-orderly-p svc) "the stop says it was not orderly"))))))
 
+(define-test a-pass-asked-to-stop-starts-no-broker
+  "A pass reads a new registration on a bus not yet served and starts that
+   bus's broker and reader; a pass run after the stop request does neither."
+  (with-memory-case (state)
+    (register "alpha")
+    (let ((svc (memory-service))
+          (now (%unix-time)))
+      (service:run-duties svc now)
+      (register "beta" :bus "late")
+      (service:run-duties svc (+ now 5))
+      (true (gethash "late" (service::service-brokers svc))
+            "the bus late is not served without a stop request")
+      (register "gamma" :bus "later")
+      (service:request-stop svc)
+      (service:run-duties svc (+ now 10))
+      (false (gethash "later" (service::service-brokers svc))
+             "a broker was started for the bus later after the stop request")
+      (false (gethash "later" (service::service-watches svc))
+             "a reader was started for the bus later after the stop request"))))
+
 (define-test a-stop-request-wakes-an-idle-io-thread
   "REQUEST-STOP ends an I/O thread waiting for its next pass within 1 s, and
    the stopping flag has no exported writer that could skip the wake-up."

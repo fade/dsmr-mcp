@@ -593,7 +593,8 @@ not start, 75 when its supervisor loop stalled.
    again, each identity's tick applies its survey and is settled. A survey
    that signals is reported like any identity duty and applied with the
    answers it holds, so the deafness rule is still sampled and a forced
-   survey still starts the next recycle window.
+   survey still starts the next recycle window. Once SVC is asked to stop,
+   the reader count, the surveys and the ticks still to come are skipped.
 
    A heal of a stranded cursor and a claim still read the log under the
    mutex; they run only for a cursor found stranded and for a new
@@ -614,13 +615,15 @@ not start, 75 when its supervisor loop stalled.
                                      :id (ident:identity-id identity)
                                      :subject (ident:identity-stem identity)))
                             identities))))
-      (let* ((counts (%duty svc "readers"
-                            (lambda ()
-                              (ident:log-reader-counts
-                               (mapcar #'ident:identity-log-path identities)))
-                            :subject "host"))
+      (let* ((counts (unless (service-stopping svc)
+                       (%duty svc "readers"
+                              (lambda ()
+                                (ident:log-reader-counts
+                                 (mapcar #'ident:identity-log-path identities)))
+                              :subject "host")))
              (surveys (loop for identity in identities
                             for request in requests
+                            until (service-stopping svc)
                             collect (or (and request
                                              (%duty svc "identity"
                                                     (lambda () (funcall survey-fn request))
@@ -636,6 +639,7 @@ not start, 75 when its supervisor loop stalled.
         (with-service-lock (svc)
           (loop for identity in identities
                 for survey in surveys
+                until (service-stopping svc)
                 do (let ((identity identity)
                          (survey survey))
                      (%duty svc "identity"
@@ -987,7 +991,8 @@ not start, 75 when its supervisor loop stalled.
 
 (defun %discover (svc)
   "Find the buses SVC should serve, start a broker and a reader for each new
-   one, and return the list."
+   one, and return the list. Once SVC is asked to stop, no further bus is
+   served."
   (let* ((registered (remove-duplicates
                       (mapcar (lambda (identity) (%bus-key (ident:identity-bus identity)))
                               (%identities svc))
@@ -996,7 +1001,8 @@ not start, 75 when its supervisor loop stalled.
                            (lambda () (brokers:discover-buses :registered-buses registered)))
                     (list nil))))
     (dolist (bus buses)
-      (%serve-bus svc bus))
+      (unless (service-stopping svc)
+        (%serve-bus svc bus)))
     buses))
 
 (defun %adopt (svc now)
@@ -1065,7 +1071,8 @@ not start, 75 when its supervisor loop stalled.
    at a time. Last, it writes its status summary, every five seconds and also
    on the first pass after the service became ready, so the summary never
    says a bus is unserved for five seconds after it is served. The first pass
-   does all of it. A pass longer than the progress window writes one line to
+   does all of it. Once SVC is asked to stop, the pass skips every step
+   still to come, so it ends at its next duty. A pass longer than the progress window writes one line to
    the service log with its length and the number of identity surveys that
    read a log."
   (let ((started (get-internal-real-time))
@@ -1081,21 +1088,24 @@ not start, 75 when its supervisor loop stalled.
                (fleetlog:service-log :info "ready buses=~D"
                                      (hash-table-count (service-brokers svc))))
              :subject "service"))
-    (%scan-registrations svc now)
-    (when five
-      (%adopt svc now)
-      (%discover svc)
-      (%sweep-owners svc now))
-    (when second
-      (setf (service-last-second svc) now)
-      (%duty svc "beat" (lambda () (%write-beat now)))
-      (%tick-identities svc now)
-      (%check-brokers svc now)
-      (%duty svc "memory" (lambda () (%check-memory svc now)) :subject "host"))
-    (when five
-      (setf (service-last-five svc) now))
-    (when (or five newly-ready)
-      (%write-status svc now))
+    (macrolet ((unless-stopping (&body body)
+                 `(unless (service-stopping svc) ,@body)))
+      (unless-stopping (%scan-registrations svc now))
+      (when five
+        (unless-stopping (%adopt svc now))
+        (unless-stopping (%discover svc))
+        (unless-stopping (%sweep-owners svc now)))
+      (when second
+        (setf (service-last-second svc) now)
+        (unless-stopping (%duty svc "beat" (lambda () (%write-beat now))))
+        (unless-stopping (%tick-identities svc now))
+        (unless-stopping (%check-brokers svc now))
+        (unless-stopping
+          (%duty svc "memory" (lambda () (%check-memory svc now)) :subject "host")))
+      (when five
+        (setf (service-last-five svc) now))
+      (when (or five newly-ready)
+        (unless-stopping (%write-status svc now))))
     (let ((seconds (/ (- (get-internal-real-time) started)
                       internal-time-units-per-second)))
       (when (> seconds +progress-window+)
