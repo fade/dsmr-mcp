@@ -86,7 +86,7 @@
    #:service-brokers
    #:service-watches
    #:service-ready-p
-   #:service-stopping
+   #:request-stop
    #:start-service
    #:start-io-thread
    #:run-duties
@@ -213,7 +213,7 @@ not start, 75 when its supervisor loop stalled.
    SCANNED says the registrations have been read once, READY-P that systemd
    has been told the service is ready, READY-NOTED-P that a pass has logged
    the readiness and written the status for it. STOPPING asks every thread to
-   end; STOPPED says the stop has run, and STOP-ORDERLY-P that it found the
+   end, and is set only by REQUEST-STOP; STOPPED says the stop has run, and STOP-ORDERLY-P that it found the
    I/O thread ended, which is when the clean-stop marker may be written.
    LOCK-FD holds the service lock.
 
@@ -1224,14 +1224,22 @@ not start, 75 when its supervisor loop stalled.
                             previous-pid count))))
   svc)
 
+(defun request-stop (svc)
+  "Ask every thread of SVC to end, and wake the I/O thread so that it sees
+   the request, and return SVC. Set STOPPING only through this: the I/O
+   thread waits with no timeout, so a request without the wake-up is never
+   seen."
+  (sb-thread:with-mutex ((service-io-mutex svc))
+    (setf (service-stopping svc) t)
+    (sb-thread:condition-broadcast (service-io-queue svc)))
+  svc)
+
 (defun %stop-io-thread (svc)
   "Ask every thread of SVC to end, wake the I/O thread, and wait for it to
    end while its pass keeps finishing duties: until it has finished none for
    +IO-STOP-QUIET-SECONDS+, and for +IO-STOP-LIMIT+ at most. True when it
    has ended or was never started."
-  (sb-thread:with-mutex ((service-io-mutex svc))
-    (setf (service-stopping svc) t)
-    (sb-thread:condition-broadcast (service-io-queue svc)))
+  (request-stop svc)
   (let ((thread (service-io-thread svc)))
     (or (null thread)
         (let* ((units internal-time-units-per-second)

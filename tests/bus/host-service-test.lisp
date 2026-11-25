@@ -1017,6 +1017,29 @@
                 "no clean-stop marker after a pass that was only running")
           (true (service::service-stop-orderly-p svc) "the stop says it was not orderly"))))))
 
+(define-test a-stop-request-wakes-an-idle-io-thread
+  "REQUEST-STOP ends an I/O thread waiting for its next pass within 1 s, and
+   the stopping flag has no exported writer that could skip the wake-up."
+  (with-memory-case (state)
+    (with-io-service (svc sock state)
+      (true (await-ready svc sock) "READY=1 did not arrive within 15 s")
+      (let ((thread (service::service-io-thread svc)))
+        (true (loop repeat 40
+                    thereis (= (service::service-io-posted svc)
+                               (service::service-io-completed svc))
+                    do (sleep 0.05))
+              "the I/O thread did not go idle")
+        (funcall (find-symbol "REQUEST-STOP" '#:dsmr-bus-host/src/bus/host/main) svc)
+        (true (loop repeat 20
+                    thereis (not (sb-thread:thread-alive-p thread))
+                    do (sleep 0.05))
+              "the I/O thread was still waiting 1 s after the request")))
+    (false (eq :external (nth-value 1 (find-symbol "SERVICE-STOPPING"
+                                                   '#:dsmr-bus-host/src/bus/host/main)))
+           "SERVICE-STOPPING is still exported")
+    (is eq :external (nth-value 1 (find-symbol "REQUEST-STOP"
+                                               '#:dsmr-bus-host/src/bus/host/main)))))
+
 (define-test io-progress-stall-rule
   "The stall watchdog's rule: the service has stalled when its loop has not
    come round for more than the window, or when a pass has been outstanding
