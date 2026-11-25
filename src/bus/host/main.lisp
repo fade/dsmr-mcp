@@ -121,14 +121,21 @@
    it keeps finishing duties, and bus delivery goes on throughout, since the
    bus readers run on their own threads.")
 
-(defconstant +io-stop-quiet-seconds+ +io-progress-window+
-  "Seconds an orderly stop waits for the I/O thread to finish a duty before
-   it treats the pass in flight as wedged: the window the beat allows.")
+(defconstant +stop-budget-seconds+ 7
+  "Seconds an orderly stop takes at most, from the request to the last join
+   of a broker or bus reader. The unit file sets TimeoutStopSec=10, and
+   systemd ends a stop that outlasts it with SIGKILL and reports the service
+   failed; the 3 s left over cover the release of the agents' descriptors,
+   the clean-stop marker and the exit.")
 
-(defconstant +io-stop-limit+ 60
-  "Seconds an orderly stop waits at most for the I/O thread to end, however
-   it progresses, so the stop ends well inside systemd's default stop
-   timeout of 90 s.")
+(defconstant +stop-join-seconds+ 2
+  "Seconds of the stop budget kept for joining the brokers and bus readers.
+   The rest is the most the stop waits for the I/O thread to end.")
+
+(defconstant +stop-quiet-seconds+ 3
+  "Seconds an orderly stop waits for the I/O thread to finish a duty before
+   it treats the pass in flight as wedged. A pass asked to stop ends at its
+   next duty, so a pass that is only running ends inside this.")
 
 (defconstant +stall-seconds+ 60
   "Seconds the supervisor loop may go without coming round, or a pass on the
@@ -212,9 +219,12 @@ not start, 75 when its supervisor loop stalled.
    second and once every five seconds duties last ran, in Unix seconds.
    SCANNED says the registrations have been read once, READY-P that systemd
    has been told the service is ready, READY-NOTED-P that a pass has logged
-   the readiness and written the status for it. STOPPING asks every thread to
-   end, and is set only by REQUEST-STOP; STOPPED says the stop has run, and STOP-ORDERLY-P that it found the
-   I/O thread ended, which is when the clean-stop marker may be written.
+   the readiness and written the status for it. STOPPING asks the I/O thread and
+   its pass to end, and is set only by REQUEST-STOP. CLOSING asks the brokers
+   and bus readers to end; the stop sets it once the I/O thread has ended or
+   its share of the stop budget is spent, so the bus is served until then.
+   STOPPED says the stop has run, and STOP-ORDERLY-P that it found the I/O
+   thread ended, which is when the clean-stop marker may be written.
    LOCK-FD holds the service lock.
 
    IO-THREAD is the thread that runs the duty passes, or NIL when the passes
@@ -266,6 +276,7 @@ not start, 75 when its supervisor loop stalled.
   (ready-p nil)
   (ready-noted-p nil)
   (stopping nil)
+  (closing nil)
   (stopped nil)
   (stop-orderly-p nil)
   lock-fd
@@ -967,7 +978,7 @@ not start, 75 when its supervisor loop stalled.
   "Start BUS's broker and its reader when SVC has neither yet, and publish
    the tables' snapshots."
   (let ((report-fn (service-report-fn svc))
-        (stop-fn (lambda () (service-stopping svc))))
+        (stop-fn (lambda () (service-closing svc))))
     (unless (gethash bus (service-brokers svc))
       (let ((bb (%duty svc "broker-start"
                        (lambda ()
@@ -1238,8 +1249,9 @@ not start, 75 when its supervisor loop stalled.
   svc)
 
 (defun request-stop (svc)
-  "Ask every thread of SVC to end, and wake the I/O thread so that it sees
-   the request, and return SVC. Set STOPPING only through this: the I/O
+  "Ask the I/O thread of SVC and its pass to end, wake the thread so that it
+   sees the request, and return SVC. The brokers and readers go on serving
+   until STOP-SERVICE closes them. Set STOPPING only through this: the I/O
    thread waits with no timeout, so a request without the wake-up is never
    seen."
   (sb-thread:with-mutex ((service-io-mutex svc))
@@ -1247,18 +1259,17 @@ not start, 75 when its supervisor loop stalled.
     (sb-thread:condition-broadcast (service-io-queue svc)))
   svc)
 
-(defun %stop-io-thread (svc)
-  "Ask every thread of SVC to end, wake the I/O thread, and wait for it to
-   end while its pass keeps finishing duties: until it has finished none for
-   +IO-STOP-QUIET-SECONDS+, and for +IO-STOP-LIMIT+ at most. True when it
-   has ended or was never started."
+(defun %stop-io-thread (svc deadline)
+  "Ask the I/O thread of SVC to end, wake it, and wait for it to end while
+   its pass keeps finishing duties: until it has finished none for
+   +STOP-QUIET-SECONDS+, and until DEADLINE, an internal real time, at most.
+   True when the thread has ended or was never started."
   (request-stop svc)
   (let ((thread (service-io-thread svc)))
     (or (null thread)
-        (let* ((units internal-time-units-per-second)
-               (began (get-internal-real-time))
-               (moved began)
-               (seen (service-io-progress svc)))
+        (let ((quiet (* +stop-quiet-seconds+ internal-time-units-per-second))
+              (moved (get-internal-real-time))
+              (seen (service-io-progress svc)))
           (loop
             (sb-thread:join-thread thread :default nil :timeout 0.25)
             (unless (sb-thread:thread-alive-p thread)
@@ -1268,18 +1279,21 @@ not start, 75 when its supervisor loop stalled.
               (unless (eql progress seen)
                 (setf seen progress
                       moved now))
-              (when (or (> (- now moved) (* +io-stop-quiet-seconds+ units))
-                        (> (- now began) (* +io-stop-limit+ units)))
+              (when (or (> (- now moved) quiet)
+                        (>= now deadline))
                 (return nil))))))))
 
 (defun stop-service (svc &key (mark-clean t))
-  "Stop SVC in order, and return it. Safe to call more than once.
+  "Stop SVC in order within +STOP-BUDGET-SECONDS+, and return it. Safe to
+   call more than once.
 
-   Every thread is asked to end, and a pass still running on the I/O thread
-   is waited for while it keeps finishing duties (%STOP-IO-THREAD). Each
-   broker then lets its role go without archiving, then each reader closes,
-   then every agent's descriptors are closed with its pid file, heartbeat
-   and registration left in place for the service that follows. With
+   The I/O thread is asked to end, and a pass still running on it is waited
+   for while it keeps finishing duties (%STOP-IO-THREAD), for the budget less
+   +STOP-JOIN-SECONDS+ at most. The brokers and readers serve the bus until
+   that wait ends. Each broker then lets its role go without archiving, then
+   each reader closes, each joined within what is left of the budget, then
+   every agent's descriptors are closed with its pid file, heartbeat and
+   registration left in place for the service that follows. With
    MARK-CLEAN, the clean-stop marker is written last, so the next start knows
    this was not a crash. SERVICE-STOP-ORDERLY-P then says whether the I/O
    thread had ended.
@@ -1289,11 +1303,17 @@ not start, 75 when its supervisor loop stalled.
    the agents' descriptors are left to the process's exit, and no clean-stop
    marker is written, so the next start records an unclean restart."
   (unless (service-stopped svc)
-    (let ((orderly (%stop-io-thread svc)))
-      (dolist (entry (%served-brokers svc))
-        (ignore-errors (brokers:stop-bus-broker (cdr entry) :join-seconds 1)))
-      (dolist (entry (%served-watches svc))
-        (ignore-errors (buswatch:close-bus-watch (cdr entry) :join-seconds 1)))
+    (let* ((units internal-time-units-per-second)
+           (deadline (+ (get-internal-real-time) (* +stop-budget-seconds+ units)))
+           (orderly (%stop-io-thread svc (- deadline (* +stop-join-seconds+ units)))))
+      (setf (service-closing svc) t)
+      (flet ((join-seconds ()
+               ;; A broker still waiting for its role is joined twice.
+               (max 1/20 (min 1 (/ (- deadline (get-internal-real-time)) units 2)))))
+        (dolist (entry (%served-brokers svc))
+          (ignore-errors (brokers:stop-bus-broker (cdr entry) :join-seconds (join-seconds))))
+        (dolist (entry (%served-watches svc))
+          (ignore-errors (buswatch:close-bus-watch (cdr entry) :join-seconds (join-seconds)))))
       (when orderly
         (dolist (identity (%identities svc))
           (ignore-errors (ident:release-identity identity :remove-files nil))))

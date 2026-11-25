@@ -786,12 +786,23 @@
   "The service whose mutex STALLING-MEMORY-READER holds when armed with
    :MEMORY-LOCKED.")
 
+(defvar *stall-broker-states* nil
+  "The states of *STALL-SERVICE*'s brokers when STALLING-MEMORY-READER left
+   its slow read, while the I/O thread was still running.")
+
+(defun broker-states (svc)
+  "The state of each of SVC's brokers, from its published snapshot."
+  (mapcar (lambda (entry)
+            (dsmr-bus-host/src/bus/host/brokers:bus-broker-state (cdr entry)))
+          (service::%served-brokers svc)))
+
 (defun stalling-memory-reader ()
   "A memory reader with 50% of memory available. Once armed with :MEMORY,
    the next call blocks the pass that made it until *STALL-RELEASE* is
    signalled, or for at most 60 s; armed with :MEMORY-LOCKED, it blocks the
    same way holding *STALL-SERVICE*'s mutex; armed with :MEMORY-SLOW, it
-   takes 5 s."
+   takes 2 s, then sets *STALL-BROKER-STATES* to the states of
+   *STALL-SERVICE*'s brokers."
   (case *stall-armed*
     (:memory
      (setf *stall-armed* nil
@@ -807,8 +818,9 @@
     (:memory-slow
      (setf *stall-armed* nil
            *stall-entered* t)
-     (sleep 5)
-     (setf *stall-left* t)))
+     (sleep 2)
+     (setf *stall-broker-states* (broker-states *stall-service*)
+           *stall-left* t)))
   (readings 50))
 
 (defun stalling-survey (survey)
@@ -850,7 +862,8 @@
   "Call THUNK with a service whose I/O thread is started, whose memory reader
    is STALLING-MEMORY-READER, whose survey function is SURVEY-FN and whose
    backtraces go to DIAGNOSTIC, and with a bound, non-blocking datagram
-   socket under STATE that NOTIFY_SOCKET names. Afterwards the stall is
+   socket under STATE that NOTIFY_SOCKET names. *STALL-SERVICE* is set to
+   the service. Afterwards the stall is
    released, the service stopped, its I/O thread joined, NOTIFY_SOCKET
    restored and the socket closed."
   (let ((path (uiop:native-namestring (merge-pathnames "notify.sock" state)))
@@ -860,6 +873,7 @@
     (setf *stall-armed* nil
           *stall-entered* nil
           *stall-left* nil
+          *stall-broker-states* nil
           *stall-release* (sb-thread:make-semaphore :name "stall"))
     (unwind-protect
          (progn
@@ -871,6 +885,7 @@
                                            :survey-fn survey-fn
                                            :diagnostic-stream diagnostic))
            (push svc *services*)
+           (setf *stall-service* svc)
            (service:start-io-thread svc)
            (funcall thunk svc sock))
       (setf *stall-armed* nil)
@@ -978,16 +993,14 @@
 
 (define-test a-stop-does-not-wait-on-a-wedged-pass
   "With a pass held while it holds the service mutex, an orderly stop
-   returns within its bound (the quiet window, a second each to join the
-   broker and the reader, and 4 s of margin), says it was not orderly, and
-   writes no clean-stop marker, so the next start records an unclean
-   restart."
+   returns within the stop budget and half a second, says it was not
+   orderly, and writes no clean-stop marker, so the next start records an
+   unclean restart."
   (with-memory-case (state)
     (with-io-service (svc sock state)
-      (setf *stall-service* svc)
       (true (await-ready svc sock) "READY=1 did not arrive within 15 s")
       (let ((start (enter-stall svc sock :memory-locked))
-            (bound (+ service::+io-stop-quiet-seconds+ 2 4)))
+            (bound (+ service::+stop-budget-seconds+ 1/2)))
         (true start "no pass entered the stalling reader within 10 s")
         (when start
           (true (sb-thread:mutex-owner (service::service-mutex svc))
@@ -996,13 +1009,13 @@
             (service:stop-service svc :mark-clean t)
             (let ((seconds (/ (- (get-internal-real-time) began)
                               internal-time-units-per-second)))
-              (true (< seconds bound) "the stop took ~,1F s, bound ~D s" seconds bound)))
+              (true (< seconds bound) "the stop took ~,1F s, bound ~,1F s" seconds bound)))
           (false (service::service-stop-orderly-p svc) "the stop says it was orderly")
           (false (probe-file (hostfiles:clean-stop-path))
                  "a clean-stop marker was written with a pass wedged"))))))
 
 (define-test a-stop-waits-for-a-pass-that-is-still-running
-  "With a pass inside a memory read that takes 5 s, an orderly stop waits
+  "With a pass inside a memory read that takes 2 s, an orderly stop waits
    for the pass to end, says it was orderly, and writes the clean-stop
    marker."
   (with-memory-case (state)
@@ -1016,6 +1029,58 @@
           (true (probe-file (hostfiles:clean-stop-path))
                 "no clean-stop marker after a pass that was only running")
           (true (service::service-stop-orderly-p svc) "the stop says it was not orderly"))))))
+
+(defun unit-stop-timeout (path)
+  "The TimeoutStopSec= value of the systemd unit at PATH in whole seconds,
+   written bare or with an `s`, or NIL when the unit sets none or spells it
+   otherwise."
+  (loop for line in (uiop:read-file-lines path)
+        for trimmed = (string-trim '(#\Space #\Tab) line)
+        when (uiop:string-prefix-p "TimeoutStopSec=" trimmed)
+          return (multiple-value-bind (value end)
+                     (parse-integer trimmed :start 15 :junk-allowed t)
+                   (and value
+                        (member (subseq trimmed end) '("" "s") :test #'string=)
+                        value))))
+
+(define-test the-stop-budget-fits-the-unit-s-stop-timeout
+  "The shipped unit's TimeoutStopSec leaves at least 2 s beyond the stop
+   budget, and the budget's share for the I/O thread leaves room for the
+   quiet window and for joining the brokers and readers."
+  (let ((timeout (unit-stop-timeout (asdf:system-relative-pathname
+                                     "dsmr-mcp" "scripts/units/dsmr-bus-host.service")))
+        (budget service::+stop-budget-seconds+)
+        (join service::+stop-join-seconds+))
+    (true timeout "the unit sets no TimeoutStopSec in whole seconds")
+    (when timeout
+      (true (<= (+ budget 2) timeout)
+            "stop budget ~D s leaves less than 2 s of TimeoutStopSec=~D" budget timeout))
+    (true (< 0 join budget) "join share ~D s, budget ~D s" join budget)
+    (true (< service::+stop-quiet-seconds+ (- budget join))
+          "quiet window ~D s, I/O share ~D s" service::+stop-quiet-seconds+ (- budget join))))
+
+(define-test the-brokers-serve-until-the-io-thread-ends
+  "During an orderly stop with a pass still running, every broker is still
+   serving when the pass leaves its last duty, and none is serving once the
+   stop returns."
+  (with-memory-case (state)
+    (with-io-service (svc sock state)
+      (true (await-ready svc sock) "READY=1 did not arrive within 15 s")
+      (true (loop repeat 40
+                  thereis (let ((states (broker-states svc)))
+                            (and states (every (lambda (s) (eq s :serving)) states)))
+                  do (tick svc sock (%unix-time))
+                     (sleep 0.25))
+            "no broker was serving before the stop: ~S" (broker-states svc))
+      (let ((start (enter-stall svc sock :memory-slow)))
+        (true start "no pass entered the slow reader within 10 s")
+        (when start
+          (service:stop-service svc :mark-clean t)
+          (true *stall-broker-states* "the slow read recorded no broker")
+          (true (every (lambda (s) (eq s :serving)) *stall-broker-states*)
+                "broker states while the pass ran: ~S" *stall-broker-states*)
+          (true (notany (lambda (s) (eq s :serving)) (broker-states svc))
+                "broker states after the stop: ~S" (broker-states svc)))))))
 
 (define-test a-pass-asked-to-stop-starts-no-broker
   "A pass reads a new registration on a bus not yet served and starts that
@@ -1213,6 +1278,27 @@
           (setf *stall-armed* nil)
           (true (await-completion svc sock sequence (+ start 28))
                 "the slow pass was not consumed within 10 s"))))))
+
+(define-test a-stop-cuts-short-a-pass-of-slow-surveys
+  "With fifteen agents whose surveys take 1 s each and a pass inside them,
+   an orderly stop skips the surveys left and returns within the stop
+   budget, says it was orderly, and writes the clean-stop marker."
+  (with-memory-case (state)
+    (dotimes (i 15) (register (format nil "agent~D" i)))
+    (with-io-service (svc sock state :survey-fn #'slow-survey)
+      (true (await-ready svc sock) "READY=1 did not arrive within 15 s")
+      (let ((start (enter-stall svc sock :slow)))
+        (true start "no pass entered the slow survey within 10 s")
+        (when start
+          (let ((began (get-internal-real-time)))
+            (service:stop-service svc :mark-clean t)
+            (let ((seconds (/ (- (get-internal-real-time) began)
+                              internal-time-units-per-second)))
+              (true (< seconds service::+stop-budget-seconds+)
+                    "the stop took ~,1F s, budget ~D s" seconds service::+stop-budget-seconds+)))
+          (true (service::service-stop-orderly-p svc) "the stop says it was not orderly")
+          (true (probe-file (hostfiles:clean-stop-path))
+                "no clean-stop marker after a pass that was only running"))))))
 
 (defvar *diagnostic-release* (sb-thread:make-semaphore :name "diagnostic")
   "Signalled to let a BLOCKING-STREAM's first write go through. Global, since
