@@ -778,6 +778,44 @@
         (is eq :ok (ident:identity-tick identity (+ start 601) :readers 1 :survey survey))
         (is = 1 (length (log-lines)))))))
 
+(define-test a-cursor-that-cannot-be-rewritten-is-healed-once-per-window
+  "A stranded cursor in a read-only cursors directory clamps. A forced survey
+   that heals it restarts the recycle window, so later ticks inside that
+   window heal nothing, and the next window heals once more."
+  (with-host ()
+    (append-from 1 *other*)
+    (append-from 2 *other*)
+    (write-text (cursor-file) "2")
+    (let* ((identity (claim :recycle-seconds 600 :deaf-seconds 0))
+           (start (%unix-time))
+           (cursors (uiop:native-namestring (default-cursors-dir *bus*)))
+           (breakers (make-hash-table :test 'equal))
+           (*reports* '()))
+      (write-text (cursor-file) "99")
+      (set-mtime (cursor-file) (- start 100))
+      (flet ((tick-at (offset)
+               (conditions:call-with-healing
+                (lambda ()
+                  (ident:identity-tick identity (+ start offset)
+                                       :readers 1 :report-fn #'collect-report))
+                :report-fn #'collect-report :breakers breakers))
+             (heals ()
+               (count-if (lambda (report)
+                           (uiop:string-prefix-p "stranded-cursor" (second report)))
+                         *reports*)))
+        (unwind-protect
+             (progn
+               (sb-posix:chmod cursors #o500)
+               (tick-at 601)
+               (let ((once (heals)))
+                 (true (plusp once) "the forced survey did not heal: ~S" *reports*)
+                 (loop for offset from 602 to 605 do (tick-at offset))
+                 (is = once (heals) "heal reports inside one window: ~S" *reports*)
+                 (is string= "99" (file-text (cursor-file)))
+                 (tick-at 1202)
+                 (is = (* 2 once) (heals) "the next window did not heal: ~S" *reports*)))
+          (sb-posix:chmod cursors #o700))))))
+
 ;;; ------------------------------------------------------------------- readers
 
 (define-test reader-census-counts-only-processes-reading-each-log

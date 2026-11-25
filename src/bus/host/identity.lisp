@@ -826,8 +826,8 @@
    :HEARD when a lapsed identity's agent has read past its pending mail.
 
    Every tick refreshes the heartbeat, checks the pid file is still the one
-   held, and heals the cursor when it was rewritten and found stranded. A
-   served identity then announces unread mail again once a recycle window has
+   held, and heals the cursor when it was rewritten and found stranded; a
+   heal on a forced survey starts the next recycle window. A served identity then announces unread mail again once a recycle window has
    passed quietly, and samples the deafness rule; a lapsed one only watches
    for unread mail. Faults are raised for the supervisor to heal.
 
@@ -857,7 +857,11 @@
           (unless (eq (survey-stranded survey) :unasked)
             (setf (identity-cursor-mtime identity) (survey-mtime survey))
             (when (survey-stranded survey)
-              (%heal-stranded identity now readers wal-path cursors-dir report-fn)))
+              (%heal-stranded identity now readers wal-path cursors-dir report-fn)
+              ;; The heal answers for this window, as a re-arm does; left
+              ;; open, a cursor the heal cannot rewrite is healed every pass.
+              (when (survey-forced survey)
+                (setf (identity-last-activity identity) now))))
           (if (eq (identity-state identity) :lapsed)
               (%lapsed-tick identity survey now readers)
               (progn
