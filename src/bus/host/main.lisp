@@ -21,10 +21,11 @@
 ;;;; broker and bus reader thread has progressed within the progress window and
 ;;;; the I/O thread has finished a duty within its own window or has no pass
 ;;;; outstanding, so a wedged pass still stops the beat and a long one that
-;;;; keeps finishing duties does not; the I/O thread's backtrace is then
-;;;; written to standard error once, since SIGABRT's shows only the main
-;;;; thread. A service whose I/O thread was never started runs each pass
-;;;; inline in the tick, as the in-process tests do.
+;;;; keeps finishing duties does not. The I/O thread's backtrace is then taken
+;;;; once and written to the service log, whose warnings reach the journal,
+;;;; since SIGABRT's shows only the main thread. A service whose I/O thread was
+;;;; never started runs each pass inline in the tick, as the in-process tests
+;;;; do.
 ;;;;
 ;;;; The service also decides when the host gives memory back. It already comes
 ;;;; round once a second for every agent, so it reads the host's memory on the
@@ -215,13 +216,15 @@ not start, 75 when its supervisor loop stalled.
    is the sequence number of the last pass completed, IO-FINISHED-AT the
    internal real time it ended and IO-LAST-DURATION its length in seconds.
    IO-PROGRESS counts the duties and passes the I/O thread has finished; it
-   is moved atomically, outside every mutex. IO-QUEUE is the waitqueue the I/O thread waits on. DEFERRED holds the
-   reports the duty loop could not write itself, as argument lists for
-   REPORT-FN, until the next pass writes them. The duty loop alone keeps
-   IO-CONSUMED, the last completion it consumed, IO-STAMP, the progress stamp
-   of IO-PROGRESS, IO-WEDGED-P, true while a withheld beat has already
-   had the I/O thread's backtrace written, and LAST-BEAT, when it last told
-   systemd anything. DIAGNOSTIC-STREAM takes that backtrace.
+   is moved atomically, outside every mutex. IO-QUEUE is the waitqueue the
+   I/O thread waits on. DEFERRED holds the reports the duty loop could not
+   write itself, as argument lists for REPORT-FN, until the next pass writes
+   them. The duty loop alone keeps IO-CONSUMED, the last completion it
+   consumed, IO-STAMP, the progress stamp of IO-PROGRESS, IO-WEDGED-P, true
+   while a withheld beat has already had the I/O thread's backtrace taken,
+   and LAST-BEAT, when it last told systemd anything. IO-BACKTRACE is that
+   backtrace as text, set by the I/O thread and taken by the duty loop.
+   DIAGNOSTIC-STREAM takes it, or the service log when NIL.
 
    SURVEY-FN answers one identity's survey of the bus's log, without the
    service mutex (IDENT:RUN-SURVEY). PASS-SURVEYS counts the surveys of the
@@ -271,6 +274,7 @@ not start, 75 when its supervisor loop stalled.
   (io-consumed 0)
   (io-stamp nil)
   (io-wedged-p nil)
+  (io-backtrace nil)
   (last-beat nil)
   diagnostic-stream
   survey-fn
@@ -291,7 +295,7 @@ not start, 75 when its supervisor loop stalled.
                           (feed-p t)
                           (memory-reader #'memory:read-memory-readings)
                           memory-thresholds
-                          (diagnostic-stream sb-sys:*stderr*)
+                          diagnostic-stream
                           (survey-fn #'ident:run-survey))
   "A host service for the process PID that reports through REPORT-FN, its bus
    readers subscribing to the brokers' publications when FEED-P is true.
@@ -300,9 +304,9 @@ not start, 75 when its supervisor loop stalled.
    thresholds are MEMORY-THRESHOLDS when given, else read from the environment
    here, once; what the environment got wrong is reported on the first memory
    check, through REPORT-FN like every other finding. DIAGNOSTIC-STREAM takes
-   the I/O thread's backtrace when its pass is wedged; it defaults to the
-   process's standard error, never a dynamic binding, because the I/O thread
-   sees none of its maker's bindings. SURVEY-FN answers each identity's
+   the I/O thread's backtrace when its pass is wedged; left NIL, the
+   backtrace goes to the service log, whose warnings are copied to standard
+   error under the logger's own lock. SURVEY-FN answers each identity's
    survey of the bus's log, once a second, without the service mutex."
   (multiple-value-bind (thresholds warnings)
       (if memory-thresholds
@@ -482,33 +486,55 @@ not start, 75 when its supervisor loop stalled.
         (or (not outstanding)
             (progress-fresh-p stamp now :window +io-progress-window+)))))
 
-(defun %write-io-backtrace (svc now)
+(defun %take-io-backtrace (svc now)
   "Once per episode of a withheld beat, interrupt SVC's I/O thread so that it
-   writes a header naming itself and its seconds without progress at NOW,
-   then its backtrace, to SVC's diagnostic stream. The episode ends when the
-   duty loop consumes a completion.
+   puts a header naming itself and its seconds without progress at NOW, then
+   its backtrace, into IO-BACKTRACE as text. The episode ends when the I/O
+   thread is fresh again.
 
    SIGABRT's own backtrace shows only the main thread, which now sits in the
    duty loop, so this is the one record of where the pass is stuck. The
-   interrupt takes no lock, calls no logger, and returns to the interrupted
-   pass."
+   interrupt may land while the I/O thread holds a mutex, so it writes to no
+   stream and calls no logger: it formats into a string and returns to the
+   interrupted pass. %EMIT-IO-BACKTRACE writes the text."
   (unless (service-io-wedged-p svc)
     (setf (service-io-wedged-p svc) t)
     (let ((thread (service-io-thread svc))
-          (stream (service-diagnostic-stream svc))
           (seconds (let ((stamp (service-io-stamp svc)))
                      (if stamp (- now (cdr stamp)) 0))))
-      (when (and thread stream (sb-thread:thread-alive-p thread))
+      (when (and thread (sb-thread:thread-alive-p thread))
         (ignore-errors
          (sb-thread:interrupt-thread
           thread
           (lambda ()
             (ignore-errors
-             (format stream "~&dsmr-bus-host: thread ~S made no progress for ~D s; ~
-                             its backtrace follows~%"
-                     (sb-thread:thread-name sb-thread:*current-thread*) seconds)
-             (sb-debug:print-backtrace :stream stream :count +backtrace-frames+)
-             (finish-output stream)))))))))
+             (setf (service-io-backtrace svc)
+                   (with-output-to-string (out)
+                     (format out "dsmr-bus-host: thread ~S made no progress for ~D s; ~
+                                  its backtrace follows~%"
+                             (sb-thread:thread-name sb-thread:*current-thread*) seconds)
+                     (sb-debug:print-backtrace :stream out
+                                               :count +backtrace-frames+)))))))))))
+
+(defun %emit-io-backtrace (svc)
+  "When the I/O thread has put its backtrace in IO-BACKTRACE, take it and
+   start a thread that writes it to SVC's diagnostic stream, or line by line
+   to the service log when there is none. Returns at once: a write that
+   blocks holds up only that thread, never the duty loop or the I/O thread."
+  (let ((text (shiftf (service-io-backtrace svc) nil))
+        (stream (service-diagnostic-stream svc)))
+    (when text
+      (ignore-errors
+       (sb-thread:make-thread
+        (lambda ()
+          (ignore-errors
+           (if stream
+               (progn (write-string text stream)
+                      (finish-output stream))
+               (dolist (line (uiop:split-string (string-right-trim '(#\Newline) text)
+                                                :separator '(#\Newline)))
+                 (fleetlog:service-log :warn "~A" line)))))
+        :name "host service diagnostic")))))
 
 ;;; ----------------------------------------------------------------- the duties
 
@@ -907,9 +933,9 @@ not start, 75 when its supervisor loop stalled.
   "Say READY=1 once the service is ready, and from then on WATCHDOG=1 each
    time this runs, once a second, when every broker and bus reader thread has
    progressed and the I/O thread is fresh (%IO-FRESH-P). When the I/O thread
-   is not, the beat is withheld and the thread's backtrace is written once
-   for the episode. Takes no service mutex and writes no log: the readiness
-   line is written by the next pass."
+   is not, the beat is withheld and the thread's backtrace is taken once for
+   the episode, then written by a thread of its own. Takes no service mutex
+   and writes no log itself: the readiness line is written by the next pass."
   (unless (service-ready-p svc)
     (when (%ready-now-p svc)
       (setf (service-ready-p svc) t)
@@ -918,8 +944,11 @@ not start, 75 when its supervisor loop stalled.
         (io-fresh (%io-fresh-p svc now)))
     (when (and (service-ready-p svc) progressing io-fresh)
       (%notify svc "WATCHDOG=1"))
-    (when (and (service-ready-p svc) (not io-fresh))
-      (%write-io-backtrace svc now))))
+    (cond (io-fresh
+           (setf (service-io-wedged-p svc) nil))
+          ((service-ready-p svc)
+           (%take-io-backtrace svc now)))
+    (%emit-io-backtrace svc)))
 
 (defun %serve-bus (svc bus)
   "Start BUS's broker and its reader when SVC has neither yet, and publish

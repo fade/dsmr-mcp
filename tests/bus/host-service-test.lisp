@@ -1104,3 +1104,63 @@
           (setf *stall-armed* nil)
           (true (await-completion svc sock sequence (+ start 28))
                 "the slow pass was not consumed within 10 s"))))))
+
+(defvar *diagnostic-release* (sb-thread:make-semaphore :name "diagnostic")
+  "Signalled to let a BLOCKING-STREAM's first write go through. Global, since
+   the thread that writes sees no case's bindings.")
+
+(defclass blocking-stream (sb-gray:fundamental-character-output-stream)
+  ((text :initform (make-array 0 :element-type 'character :adjustable t :fill-pointer 0)
+         :reader blocking-stream-text)
+   (entered :initform nil :accessor blocking-stream-entered)
+   (released :initform nil :accessor blocking-stream-released))
+  (:documentation "A character output stream whose first write blocks until
+   *DIAGNOSTIC-RELEASE* is signalled, or for at most 60 s, then keeps what
+   it is written."))
+
+(defun %hold-first-write (stream)
+  "Block STREAM's first write until *DIAGNOSTIC-RELEASE* is signalled."
+  (unless (blocking-stream-released stream)
+    (setf (blocking-stream-entered stream) t)
+    (sb-thread:wait-on-semaphore *diagnostic-release* :timeout 60)
+    (setf (blocking-stream-released stream) t)))
+
+(defmethod sb-gray:stream-line-column ((stream blocking-stream))
+  nil)
+
+(defmethod sb-gray:stream-write-char ((stream blocking-stream) char)
+  (%hold-first-write stream)
+  (vector-push-extend char (blocking-stream-text stream)))
+
+(define-test a-blocked-diagnostic-write-holds-up-neither-the-pass-nor-the-beat
+  "With the diagnostic stream blocked, a wedged pass that is then released
+   completes and the beat returns; the backtrace, taken in the I/O thread,
+   reaches the stream once it unblocks."
+  (with-memory-case (state)
+    (setf *diagnostic-release* (sb-thread:make-semaphore :name "diagnostic"))
+    (let ((diagnostic (make-instance 'blocking-stream)))
+      (with-io-service (svc sock state :diagnostic diagnostic)
+        (unwind-protect
+             (progn
+               (true (await-ready svc sock) "READY=1 did not arrive within 15 s")
+               (let ((start (enter-stall svc sock)))
+                 (true start "no pass entered the stalling reader within 10 s")
+                 (when start
+                   (loop for offset from 2 to 28 by 2
+                         do (sleep 0.5)
+                            (tick svc sock (+ start offset)))
+                   (sleep 1)
+                   (true (blocking-stream-entered diagnostic)
+                         "no backtrace reached the diagnostic stream")
+                   (sb-thread:signal-semaphore *stall-release*)
+                   (true (loop for offset from 30 to 40 by 2
+                               do (sleep 0.5)
+                               thereis (plusp (beats (tick svc sock (+ start offset)))))
+                         "WATCHDOG=1 did not return while the diagnostic write was blocked")
+                   (sb-thread:signal-semaphore *diagnostic-release*)
+                   (true (loop repeat 40
+                               thereis (search "STALLING-MEMORY-READER"
+                                               (copy-seq (blocking-stream-text diagnostic)))
+                               do (sleep 0.05))
+                         "the backtrace does not show the stalled reader"))))
+          (sb-thread:signal-semaphore *diagnostic-release* 10))))))
