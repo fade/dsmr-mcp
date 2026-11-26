@@ -154,19 +154,42 @@ fi
 skip=0
 # An earlier case commits a non-AGPL LICENSE; pin the mark TRAILER carries.
 git -C "$repo" config dsmr.attribution.glyph copyleft
-# expect_quiet NAME refused|accepted [HEADER]: files are already staged in $repo.
-# Passes when the outcome is WANT, the pre-commit stderr is empty, and the commit
-# stderr is empty (accepted) or the pre-commit stdout holds HEADER (refused).
+# Only the NUL case exercises shell lint; the rest run without shellcheck.
+git -C "$repo" config --bool dsmr.shellcheck.enabled false
+# A non-UTF-8 byte is binary to grep only under a UTF-8 LC_CTYPE, so the cases
+# below run under one whatever the caller's locale is. The hooks under test set
+# LC_ALL=C per command.
+utf8=$(locale -a 2>/dev/null | grep -aiE '^(C|en_US|en_CA)\.utf-?8$' | head -1)
+if [ -n "$utf8" ]; then export LC_ALL="$utf8"; fi
+# Live only when a bare grep really reports the byte as binary.
+locale_live=no
+if printf 'a\377\n' | grep a 2>&1 | grep -q 'binary file matches'; then locale_live=yes; fi
+
+# expect_quiet NAME refused|accepted [HEADER [SUBJECT]]: files are already staged
+# in $repo. SUBJECT replaces the commit subject. Passes when all of these hold:
+#   - the outcome is WANT
+#   - the pre-commit stderr is empty
+#   - accepted: the commit stderr is empty
+#   - refused: the pre-commit stdout or the commit output names HEADER
+# Skips when no UTF-8 locale is live, or when shell lint is on and shellcheck is
+# missing (its notice goes to stderr).
 expect_quiet() {
-  local name="$1" want="$2" header="${3:-}" got why=""
-  if ! command -v shellcheck >/dev/null 2>&1; then
+  local name="$1" want="$2" header="${3:-}" subject="${4:-chore: add a fixture}" got why=""
+  if [ "$locale_live" != yes ]; then
+    skip=$((skip + 1))
+    echo "SKIP  $name: no UTF-8 locale is installed, so grep would not read the byte as binary"
+    git -C "$repo" reset -q --hard HEAD
+    return
+  fi
+  if [ "$(git -C "$repo" config --bool --get dsmr.shellcheck.enabled)" != false ] \
+     && ! command -v shellcheck >/dev/null 2>&1; then
     skip=$((skip + 1))
     echo "SKIP  $name: shellcheck is not on PATH; the shell-lint companion reports that on stderr"
     git -C "$repo" reset -q --hard HEAD
     return
   fi
   (cd "$repo" && bash .git/hooks/pre-commit) >"$scratch/pc.out" 2>"$scratch/pc.err"
-  if printf 'chore: add a fixture\n\n%s\n' "$TRAILER" \
+  if printf '%s\n\n%s\n' "$subject" "$TRAILER" \
        | git -C "$repo" commit -q -F - >"$scratch/cm.out" 2>"$scratch/cm.err"; then
     got=accepted
   else
@@ -178,8 +201,9 @@ expect_quiet() {
     why="pre-commit wrote to stderr"
   elif [ "$want" = accepted ] && [ -s "$scratch/cm.err" ]; then
     why="commit wrote to stderr"
-  elif [ "$want" = refused ] && ! grep -qF -- "$header" "$scratch/pc.out"; then
-    why="pre-commit stdout does not name '$header'"
+  elif [ "$want" = refused ] \
+       && ! cat "$scratch/pc.out" "$scratch/cm.out" "$scratch/cm.err" | grep -aqF -- "$header"; then
+    why="the refusal does not name '$header'"
   fi
   if [ -z "$why" ]; then
     pass=$((pass + 1)); echo "ok    $name ($want, stderr empty)"
@@ -247,7 +271,14 @@ elif ! numstat_text notes/late-nul.txt; then fixture_fail "$n" "git treats the f
 else expect_quiet "$n" refused "AI-attribution"
 fi
 
+n="long dash on a commit message line with a non-UTF-8 byte"
+mkdir -p "$repo/docs"
+printf 'Plain.\n' > "$repo/docs/msg-case.md"
+git -C "$repo" add docs/msg-case.md
+expect_quiet "$n" refused "long dash in the message" "$(printf 'docs: a %s b \377' "$EM")"
+
 # Real gzip output: byte 0x00 sits in the header's first line.
+git -C "$repo" config --unset dsmr.shellcheck.enabled
 n="NUL in the first line of a staged blob"
 printf 'seed\n' | gzip -n > "$repo/seed.txt.gz"
 git -C "$repo" add seed.txt.gz
