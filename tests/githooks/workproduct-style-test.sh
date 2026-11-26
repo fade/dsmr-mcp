@@ -247,5 +247,15 @@ elif ! numstat_text notes/late-nul.txt; then fixture_fail "$n" "git treats the f
 else expect_quiet "$n" refused "AI-attribution"
 fi
 
+# Real gzip output: byte 0x00 sits in the header's first line.
+n="NUL in the first line of a staged blob"
+printf 'seed\n' | gzip -n > "$repo/seed.txt.gz"
+git -C "$repo" add seed.txt.gz
+if [ "$(LC_ALL=C tr -cd '\000' < "$repo/seed.txt.gz" | wc -c)" -lt 1 ]; then fixture_fail "$n" "holds no NUL"
+elif ! git -C "$repo" diff --cached --numstat -- seed.txt.gz | grep -qE '^-[[:space:]]+-[[:space:]]'; then
+  fixture_fail "$n" "git treats the blob as text"
+else expect_quiet "$n" accepted
+fi
+
 echo "style lint: $pass passed, $fail failed, $skip skipped"
 [ "$fail" -eq 0 ]

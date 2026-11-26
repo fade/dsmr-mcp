@@ -28,7 +28,9 @@ shell_lint_wanted() {
 # Succeeds when the staged blob at path $1 is a script shellcheck can read.
 shell_lint_is_script() {
   local path="$1" first
-  first=$(git show ":$path" 2>/dev/null | head -n 1)
+  # Cut the first line at a NUL: a shell variable cannot hold one, and a binary
+  # blob can carry one in its first line.
+  first=$(git show ":$path" 2>/dev/null | head -n 1 | tr '\000' '\n' | head -n 1)
   case "$first" in
     '#!'*zsh*) return 1 ;;
   esac
@@ -36,7 +38,7 @@ shell_lint_is_script() {
     *.sh) return 0 ;;
   esac
   printf '%s\n' "$first" \
-    | grep -qE '^#!.*[/ ](env +)?(sh|bash|dash|ksh)([[:space:]]|$)'
+    | LC_ALL=C grep -aqE '^#!.*[/ ](env +)?(sh|bash|dash|ksh)([[:space:]]|$)'
 }
 
 run_shell_lint() {
