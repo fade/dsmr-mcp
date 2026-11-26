@@ -21,6 +21,11 @@
 # project takes the ordinary copyright sign. We do not restate other people's
 # licences in our own terms, and the mark in a trailer should not claim we did.
 #
+# A repository that takes no trailer at all (a third party's repository a change
+# is sent to, or a store whose commits another program writes, such as a GNU
+# pass store) sets git config dsmr.attribution.glyph none: the missing-trailer
+# warning is then silent and a trailer line is refused.
+#
 # This exists because nothing enforced it: a repository inherited as MIT
 # accumulated 23 commits carrying the copyleft mark, supplied by a rule that
 # keyed on whose repository it was instead of on the licence. A record saying
@@ -73,6 +78,10 @@ STYLE_WARN="\\<robust(ly|ness)?\\>|\\<leverag(e|es|ed|ing)\\>|\\<landscape\\>|\\
 # subject is the author's decision or the mechanism's effect misassigned.
 STYLE_MIND="\\<(server|gate|hook|check|worker|watcher|broker|daemon|service|image|core|function|parser|code|program|script|lint|tool|launcher|listener|probe)s? (never |always |now |still |also )?(knows|sees|wants|decides|believes|agrees|trusts|notices|remembers|insists|claims|admits|promises|cares|thinks)\\>"
 
+# An attribution trailer: a line that opens with either mark, whitespace, and
+# the name. Used for the missing-trailer warning and the refusal under none.
+TRAILER_RE="^($(printf '\xf0\x9f\x84\xaf')|$(printf '\xc2\xa9'))[[:space:]]+Brian O'Reilly"
+
 # Which attribution mark belongs in this repository's commit trailers.
 #
 # Derived from the licence on disk so it cannot drift from the thing it
@@ -82,11 +91,13 @@ STYLE_MIND="\\<(server|gate|hook|check|worker|watcher|broker|daemon|service|imag
 # somewhere else. Only a tree that answers no to all three is treated as ours
 # and unreleased.
 #
-# Override:  git config dsmr.attribution.glyph copyleft|copyright
+# Override:  git config dsmr.attribution.glyph copyleft|copyright|none
+# none means the repository takes no trailer. Any other value is ignored, so
+# the derivation runs.
 attribution_glyph() {
   local v root f
   v=$(git config --get dsmr.attribution.glyph 2>/dev/null)
-  case "$v" in copyleft|copyright) printf '%s' "$v"; return 0 ;; esac
+  case "$v" in copyleft|copyright|none) printf '%s' "$v"; return 0 ;; esac
   root=$(git rev-parse --show-toplevel 2>/dev/null) || { printf 'copyleft'; return 0; }
   for f in LICENSE LICENCE COPYING LICENSE.txt LICENSE.md COPYING.txt; do
     if [ -f "$root/$f" ]; then
@@ -325,33 +336,48 @@ run_workproduct_lint() {
   # defect actually seen. A MISSING trailer only warns: a merge commit written
   # by the forge carries no body, and making those uncommittable would break
   # landing a pull request to enforce a footer nobody typed.
+  #
+  # With the value none, only a trailer-shaped line is refused, not the bare
+  # mark: a third party's message can carry the copyright sign in prose, such as
+  # a notice-year bump.
   if [ "$mode" != "staged" ]; then
     local want; want=$(attribution_glyph)
     local wrong_mark wrong_name
-    if [ "$want" = "copyright" ]; then
-      wrong_mark='\xf0\x9f\x84\xaf'; wrong_name='copyleft mark'
-    else
-      wrong_mark='\xc2\xa9'; wrong_name='copyright sign'
-    fi
-    if printf '%s\n' "$text" | LC_ALL=C grep -aq "$(printf '%b' "$wrong_mark")"; then
-      echo "✗ work-product lint: wrong attribution mark for this licence."
-      if [ "$want" = "copyright" ]; then
-        echo "    This project's licence is inherited and is not AGPL, so its trailer"
-        echo "    takes the ordinary copyright sign, not the $wrong_name."
-      else
-        echo "    This project is AGPL-3.0-or-later, so its trailer takes the copyleft"
-        echo "    mark, not the $wrong_name."
+    if [ "$want" = "none" ]; then
+      if printf '%s\n' "$text" | LC_ALL=C grep -aqiE "$TRAILER_RE"; then
+        echo "✗ work-product lint: this repository takes no attribution trailer."
+        echo "    dsmr.attribution.glyph is none here: remove the line that opens with an"
+        echo "    attribution mark and names Brian O'Reilly."
+        echo "    If this repository does take one:"
+        echo "      git config dsmr.attribution.glyph copyleft|copyright"
+        blocked=1
       fi
-      echo "    Override if the derivation is wrong here:"
-      echo "      git config dsmr.attribution.glyph copyleft|copyright"
-      blocked=1
-    # A trailer is a line that opens with an attribution mark and the name. The
-    # name alone anywhere in the text is not one: an Author: header or a body
-    # that mentions it would otherwise hide a missing trailer.
-    elif ! printf '%s\n' "$text" \
-           | LC_ALL=C grep -aqiE "^($(printf '\xf0\x9f\x84\xaf')|$(printf '\xc2\xa9'))[[:space:]]+Brian O'Reilly"; then
-      echo "⚠ work-product lint: no attribution trailer found (not blocking)."
-      echo "    Expected a line naming Brian O'Reilly with the $( [ "$want" = copyright ] && echo 'copyright sign' || echo 'copyleft mark' )."
+    else
+      if [ "$want" = "copyright" ]; then
+        wrong_mark='\xf0\x9f\x84\xaf'; wrong_name='copyleft mark'
+      else
+        wrong_mark='\xc2\xa9'; wrong_name='copyright sign'
+      fi
+      if printf '%s\n' "$text" | LC_ALL=C grep -aq "$(printf '%b' "$wrong_mark")"; then
+        echo "✗ work-product lint: wrong attribution mark for this licence."
+        if [ "$want" = "copyright" ]; then
+          echo "    This project's licence is inherited and is not AGPL, so its trailer"
+          echo "    takes the ordinary copyright sign, not the $wrong_name."
+        else
+          echo "    This project is AGPL-3.0-or-later, so its trailer takes the copyleft"
+          echo "    mark, not the $wrong_name."
+        fi
+        echo "    Override if the derivation is wrong here:"
+        echo "      git config dsmr.attribution.glyph copyleft|copyright|none"
+        blocked=1
+      # A trailer is a line that opens with an attribution mark and the name. The
+      # name alone anywhere in the text is not one: an Author: header or a body
+      # that mentions it would otherwise hide a missing trailer.
+      elif ! printf '%s\n' "$text" \
+             | LC_ALL=C grep -aqiE "$TRAILER_RE"; then
+        echo "⚠ work-product lint: no attribution trailer found (not blocking)."
+        echo "    Expected a line naming Brian O'Reilly with the $( [ "$want" = copyright ] && echo 'copyright sign' || echo 'copyleft mark' )."
+      fi
     fi
   fi
 

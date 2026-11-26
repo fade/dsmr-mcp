@@ -169,9 +169,13 @@ The same hooks refuse a commit that credits a code-generation tool as an author,
 the planning indices or file pointers described in [[file:../CONTRIBUTING.md][Contributing]]. They also warn when a commit message has
 no attribution line. My commits end with one naming me. You will see the warning on yours and can
 ignore it, but leave out a © copyright line: the hook refuses a message carrying the © sign,
-because this project is AGPL.
+because this project is AGPL. In a repository that takes no attribution line at all, such as a
+third party's project, set =dsmr.attribution.glyph= to =none=: the hooks then skip the warning and
+refuse a message that carries one. =git cherry-pick= and =git rebase= run no commit-msg hook, so a
+trailer on a picked or rebased commit is not caught.
 
-Check a pull request description before you post it:
+Check a pull request description before you post it. =--check-file= reads the setting of the
+repository it runs in, so check a third party's pull request from inside your checkout of it:
 
 #+begin_src sh
 scripts/githooks/dsmr-workproduct-lint.sh --check-file body.md
@@ -183,6 +187,7 @@ You can tune the hooks for your clone through git config:
 git config --add dsmr.workproductlint.styleexempt 'tests/fixtures/*'   # skip a path
 git config --int dsmr.workproductlint.styledensity 5                   # refuse at 5 lines
 git config --bool dsmr.workproductlint.style false                     # turn off the dash and phrase checks
+git config dsmr.attribution.glyph none                                 # take no attribution line
 #+end_src
 
 =make test-hooks= drives real commits through the hooks: each blocking rule must refuse one commit

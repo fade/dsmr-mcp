@@ -125,6 +125,81 @@ else
   pass=$((pass + 1)); echo "ok    a real trailer is recognized"
 fi
 
+# The dsmr.attribution.glyph override, including none for a repository that takes no trailer.
+TRAILER_C=$(printf '\xc2\xa9 Brian O'"'"'Reilly <fade@deepsky.com>, 2026')
+SIGN_C=$(printf '\xc2\xa9')
+# The unknown-value cases rely on the derivation yielding copyright.
+if [ ! -f "$repo/LICENSE" ] || grep -qiE 'affero|AGPL' "$repo/LICENSE"; then
+  fail=$((fail + 1)); echo "FAIL  glyph cases: fixture: no non-AGPL LICENSE, so the derivation would not yield copyright"
+fi
+# Without shellcheck on PATH the shell-lint companion writes a notice to stderr
+# on every commit, and the silent cases assert empty stderr.
+git -C "$repo" config --bool dsmr.shellcheck.enabled false
+# expect_attr NAME accepted|refused NEEDLE MESSAGE: commits a fresh file with
+# MESSAGE. Empty NEEDLE: the commit stderr must be empty (git runs commit-msg
+# with its stdout on stderr). Otherwise the output must name NEEDLE.
+expect_attr() {
+  local name="$1" want="$2" needle="$3" msg="$4" got why=""
+  mkdir -p "$repo/docs"
+  printf '%s\n' "$name" > "$repo/docs/glyph.md"
+  git -C "$repo" add docs/glyph.md
+  printf '%s\n' "$msg" > "$scratch/attr-msg.txt"
+  if git -C "$repo" commit -q -F "$scratch/attr-msg.txt" >"$scratch/attr.out" 2>"$scratch/attr.err"; then
+    got=accepted
+  else
+    got=refused
+  fi
+  if [ "$got" != "$want" ]; then
+    why="wanted $want, got $got"
+  elif [ -z "$needle" ] && [ -s "$scratch/attr.err" ]; then
+    why="commit wrote to stderr"
+  elif [ -n "$needle" ] && ! cat "$scratch/attr.out" "$scratch/attr.err" | grep -aqF -- "$needle"; then
+    why="output does not name '$needle'"
+  fi
+  if [ -z "$why" ]; then
+    pass=$((pass + 1)); echo "ok    $name ($want)"
+  else
+    fail=$((fail + 1)); echo "FAIL  $name: $why"
+    cat -v "$scratch/attr.out" | sed 's/^/        out: /'
+    cat -v "$scratch/attr.err" | sed 's/^/        err: /'
+  fi
+  git -C "$repo" reset -q --hard HEAD
+}
+git -C "$repo" config dsmr.attribution.glyph none
+expect_attr "glyph none: no trailer, no warning" accepted "" \
+  "$(printf 'docs: tidy\n\nPlain body.')"
+expect_attr "glyph none: copyleft trailer refused" refused "takes no attribution trailer" \
+  "$(printf 'docs: tidy\n\nPlain body.\n\n%s' "$TRAILER")"
+expect_attr "glyph none: copyright trailer refused" refused "takes no attribution trailer" \
+  "$(printf 'docs: tidy\n\nPlain body.\n\n%s' "$TRAILER_C")"
+expect_attr "glyph none: copyright sign in prose is not a trailer" accepted "" \
+  "$(printf 'docs: note the %s year in the notice\n\nPlain body.' "$SIGN_C")"
+# The derivation here yields copyright, so the copyleft mark is the wrong one:
+# with none, the wrong-mark check must not run at all.
+expect_attr "glyph none: copyleft mark in prose is not a trailer" accepted "" \
+  "$(printf 'docs: note the %s mark\n\nPlain body.' "$(printf '\xf0\x9f\x84\xaf')")"
+if cat "$scratch/attr.out" "$scratch/attr.err" | grep -aqF -- 'wrong attribution mark'; then
+  fail=$((fail + 1)); echo "FAIL  glyph none: the wrong-mark check ran"
+else
+  pass=$((pass + 1)); echo "ok    glyph none: the wrong-mark check does not run"
+fi
+expect_attr "glyph none: mark and name mid-line is not a trailer" accepted "" \
+  "$(printf 'docs: tidy\n\nThe old notice read %s Brian O'"'"'Reilly 2019.' "$SIGN_C")"
+git -C "$repo" config dsmr.attribution.glyph bogus
+expect_attr "unknown glyph value: missing trailer still warns" accepted "no attribution trailer found" \
+  "$(printf 'docs: tidy\n\nPlain body.')"
+expect_attr "unknown glyph value: copyleft trailer refused as the wrong mark" refused "wrong attribution mark" \
+  "$(printf 'docs: tidy\n\nPlain body.\n\n%s' "$TRAILER")"
+if cat "$scratch/attr.out" "$scratch/attr.err" | grep -aqF -- 'glyph copyleft|copyright|none'; then
+  pass=$((pass + 1)); echo "ok    wrong-mark remedy names the none value"
+else
+  fail=$((fail + 1)); echo "FAIL  wrong-mark remedy names the none value"
+fi
+expect_attr "unknown glyph value: copyright trailer accepted" accepted "" \
+  "$(printf 'docs: tidy\n\nPlain body.\n\n%s' "$TRAILER_C")"
+git -C "$repo" config --unset dsmr.attribution.glyph
+git -C "$repo" config --unset dsmr.shellcheck.enabled
+
 # The tier can be switched off per repository.
 git -C "$repo" config --bool dsmr.workproductlint.style false
 expect "style tier disabled"         accepted docs/off.md "A ${EM} dash."

@@ -402,6 +402,13 @@ guides.
 
 ⛔ No copyright or attribution trailer, no conventional-commits prefix. **Match the maintainer's own
 log.** Their conventions govern, not ours. Read a handful of their recent commits before judging.
+In a clone used only for upstream work, run `git config dsmr.attribution.glyph none`: the commit hook
+then stays quiet about the missing trailer and refuses a message that carries one. The setting covers
+the whole checkout, so never set it in our fork's checkout, whose own commits carry the copyright
+trailer. With `extensions.worktreeConfig` on, `git config --worktree` scopes it to one worktree.
+`--check-file` reads the setting of the repository it runs in, so check a PR body from inside that
+clone. `git cherry-pick` and `git rebase` run no commit-msg hook, so a trailer on a picked or rebased
+commit is not caught.
 
 ## ⚠ The redisplay trap, which will otherwise make your own probe lie
 
