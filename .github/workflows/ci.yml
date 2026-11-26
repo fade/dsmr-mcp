@@ -128,12 +128,14 @@ jobs:
         # unresolvable framework otherwise falls through to a path that reports
         # success over a suite nothing ever parsed.
         #
-        # Pinned to a commit rather than a branch so a push upstream cannot change
-        # what this job tested.
+        # Pinned to the commit the qlfile names, so a push upstream cannot
+        # change what this job tests.
         run: |
           set -euo pipefail
+          ref=$(awk '$1 == "git" && $2 == "zebra" { for (i = 3; i < NF; i++) if ($i == ":ref") print $(i + 1) }' qlfile)
+          [ -n "$ref" ] || { echo "qlfile has no 'git zebra ... :ref' line" >&2; exit 1; }
           git clone --filter=blob:none https://github.com/fade/zebra.git vendor/zebra
-          git -C vendor/zebra checkout b1510600dadeab0bb3a651f1bc355741b6b9aaac
+          git -C vendor/zebra checkout "$ref"
 
       - name: Prime dependencies (cold — download dist deps + compile)
         # `make test` uses asdf:load-system, which resolves only systems already
@@ -255,11 +257,13 @@ jobs:
           git -C vendor/slynk-client checkout 67b65da7210b4f9a6e373077373528a4c7bed4b5
 
       - name: Vendor zebra (not in the Quicklisp dist)
-        # Pinned to a commit, matching the unit-suite job above.
+        # Pinned to the qlfile's commit, matching the unit-suite job above.
         run: |
           set -euo pipefail
+          ref=$(awk '$1 == "git" && $2 == "zebra" { for (i = 3; i < NF; i++) if ($i == ":ref") print $(i + 1) }' qlfile)
+          [ -n "$ref" ] || { echo "qlfile has no 'git zebra ... :ref' line" >&2; exit 1; }
           git clone --filter=blob:none https://github.com/fade/zebra.git vendor/zebra
-          git -C vendor/zebra checkout b1510600dadeab0bb3a651f1bc355741b6b9aaac
+          git -C vendor/zebra checkout "$ref"
 
       - name: Prime dependencies (download dist deps + compile)
         # Export the same project-local XDG_CACHE_HOME the Makefile uses so the
