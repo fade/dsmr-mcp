@@ -92,8 +92,20 @@ TRAILER_RE="^($(printf '\xf0\x9f\x84\xaf')|$(printf '\xc2\xa9'))[[:space:]]+Bria
 # and unreleased.
 #
 # Override:  git config dsmr.attribution.glyph copyleft|copyright|none
-# none means the repository takes no trailer. Any other value is ignored, so
-# the derivation runs.
+# none means the repository takes no trailer. Any other value, the empty string
+# included, is ignored and the derivation runs; warn_unknown_glyph reports it
+# once per hook run. Values are matched case-sensitively.
+#
+# Kept apart from attribution_glyph because that function's stdout is captured.
+# Call it once per hook run.
+warn_unknown_glyph() {
+  local v
+  v=$(git config --get dsmr.attribution.glyph 2>/dev/null) || return 0
+  case "$v" in copyleft|copyright|none) return 0 ;; esac
+  echo "⚠ work-product lint: dsmr.attribution.glyph is '$v', which is not recognized (not blocking)."
+  echo "    Accepted values: copyleft, copyright, none. The setting is ignored; the mark is derived from the repository."
+  return 0
+}
 attribution_glyph() {
   local v root f
   v=$(git config --get dsmr.attribution.glyph 2>/dev/null)
@@ -342,6 +354,7 @@ run_workproduct_lint() {
   # a notice-year bump.
   if [ "$mode" != "staged" ]; then
     local want; want=$(attribution_glyph)
+    warn_unknown_glyph
     local wrong_mark wrong_name
     if [ "$want" = "none" ]; then
       if printf '%s\n' "$text" | LC_ALL=C grep -aqiE "$TRAILER_RE"; then
