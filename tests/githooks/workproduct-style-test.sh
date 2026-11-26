@@ -186,17 +186,42 @@ fi
 expect_attr "glyph none: mark and name mid-line is not a trailer" accepted "" \
   "$(printf 'docs: tidy\n\nThe old notice read %s Brian O'"'"'Reilly 2019.' "$SIGN_C")"
 git -C "$repo" config dsmr.attribution.glyph bogus
-expect_attr "unknown glyph value: missing trailer still warns" accepted "no attribution trailer found" \
+expect_attr "unrecognized glyph value: missing trailer still warns" accepted "no attribution trailer found" \
   "$(printf 'docs: tidy\n\nPlain body.')"
-expect_attr "unknown glyph value: copyleft trailer refused as the wrong mark" refused "wrong attribution mark" \
+expect_attr "unrecognized glyph value: copyleft trailer refused as the wrong mark" refused "wrong attribution mark" \
   "$(printf 'docs: tidy\n\nPlain body.\n\n%s' "$TRAILER")"
 if cat "$scratch/attr.out" "$scratch/attr.err" | grep -aqF -- 'glyph copyleft|copyright|none'; then
   pass=$((pass + 1)); echo "ok    wrong-mark remedy names the none value"
 else
   fail=$((fail + 1)); echo "FAIL  wrong-mark remedy names the none value"
 fi
-expect_attr "unknown glyph value: copyright trailer accepted" accepted "" \
+expect_attr "unrecognized glyph value: copyright trailer accepted, value reported" accepted \
+  "dsmr.attribution.glyph is 'bogus', which is not recognized" \
   "$(printf 'docs: tidy\n\nPlain body.\n\n%s' "$TRAILER_C")"
+if grep -aqF 'Accepted values: copyleft, copyright, none' "$scratch/attr.err" \
+   && [ "$(grep -ac 'not recognized' "$scratch/attr.err")" = 1 ]; then
+  pass=$((pass + 1)); echo "ok    unrecognized glyph value: one warning naming the accepted values"
+else
+  fail=$((fail + 1)); echo "FAIL  unrecognized glyph value: one warning naming the accepted values"
+fi
+for bad in None off ""; do
+  git -C "$repo" config dsmr.attribution.glyph "$bad"
+  expect_attr "unrecognized glyph '$bad': warned, commit accepted" accepted \
+    "dsmr.attribution.glyph is '$bad', which is not recognized" \
+    "$(printf 'docs: tidy\n\nPlain body.\n\n%s' "$TRAILER_C")"
+done
+for good in copyleft copyright none; do
+  git -C "$repo" config dsmr.attribution.glyph "$good"
+  case "$good" in
+    copyleft) body=$(printf 'docs: tidy\n\nPlain body.\n\n%s' "$TRAILER") ;;
+    copyright) body=$(printf 'docs: tidy\n\nPlain body.\n\n%s' "$TRAILER_C") ;;
+    *) body=$(printf 'docs: tidy\n\nPlain body.') ;;
+  esac
+  expect_attr "recognized glyph '$good': no warning" accepted "" "$body"
+  if grep -aq 'not recognized' "$scratch/attr.out" "$scratch/attr.err"; then
+    fail=$((fail + 1)); echo "FAIL  recognized glyph '$good' drew the unrecognized warning"
+  fi
+done
 git -C "$repo" config --unset dsmr.attribution.glyph
 git -C "$repo" config --unset dsmr.shellcheck.enabled
 
