@@ -150,5 +150,102 @@ else
   pass=$((pass + 1)); echo "ok    --check-file reads Markdown headings"
 fi
 
-echo "style lint: $pass passed, $fail failed"
+# Binary and non-UTF-8 staged content leaves stderr empty, and every check still reads the text.
+skip=0
+# An earlier case commits a non-AGPL LICENSE; pin the mark TRAILER carries.
+git -C "$repo" config dsmr.attribution.glyph copyleft
+# expect_quiet NAME refused|accepted [HEADER]: files are already staged in $repo.
+# Passes when the outcome is WANT, the pre-commit stderr is empty, and the commit
+# stderr is empty (accepted) or the pre-commit stdout holds HEADER (refused).
+expect_quiet() {
+  local name="$1" want="$2" header="${3:-}" got why=""
+  if ! command -v shellcheck >/dev/null 2>&1; then
+    skip=$((skip + 1))
+    echo "SKIP  $name: shellcheck is not on PATH; the shell-lint companion reports that on stderr"
+    git -C "$repo" reset -q --hard HEAD
+    return
+  fi
+  (cd "$repo" && bash .git/hooks/pre-commit) >"$scratch/pc.out" 2>"$scratch/pc.err"
+  if printf 'chore: add a fixture\n\n%s\n' "$TRAILER" \
+       | git -C "$repo" commit -q -F - >"$scratch/cm.out" 2>"$scratch/cm.err"; then
+    got=accepted
+  else
+    got=refused
+  fi
+  if [ "$got" != "$want" ]; then
+    why="wanted $want, got $got"
+  elif [ -s "$scratch/pc.err" ]; then
+    why="pre-commit wrote to stderr"
+  elif [ "$want" = accepted ] && [ -s "$scratch/cm.err" ]; then
+    why="commit wrote to stderr"
+  elif [ "$want" = refused ] && ! grep -qF -- "$header" "$scratch/pc.out"; then
+    why="pre-commit stdout does not name '$header'"
+  fi
+  if [ -z "$why" ]; then
+    pass=$((pass + 1)); echo "ok    $name ($want, stderr empty)"
+  else
+    fail=$((fail + 1)); echo "FAIL  $name: $why"
+    cat -v "$scratch/pc.err" | sed 's/^/        pre-commit: /'
+    cat -v "$scratch/cm.err" | sed 's/^/        commit: /'
+  fi
+  git -C "$repo" reset -q --hard HEAD
+}
+
+# fixture_fail NAME REASON: count the case as failed when its fixture is not the
+# intended one, so a control cannot pass vacuously.
+fixture_fail() {
+  fail=$((fail + 1)); echo "FAIL  $1: fixture: $2"
+  git -C "$repo" reset -q --hard HEAD
+}
+
+# 400 bytes, byte i = (i*167 mod 255) + 1: no NUL, two 0xFF, one newline.
+make_blob() {
+  LC_ALL=C awk 'BEGIN { for (i = 0; i < 400; i++) printf "%c", (i * 167 % 255) + 1 }' > "$1"
+}
+numstat_text() {
+  git -C "$repo" diff --cached --numstat -- "$1" | grep -qE '^[0-9]+[[:space:]]+[0-9]+[[:space:]]'
+}
+
+n="binary blob stays quiet"
+make_blob "$repo/blob.bin"
+git -C "$repo" add blob.bin
+size=$(wc -c < "$repo/blob.bin")
+nuls=$(LC_ALL=C tr -cd '\000' < "$repo/blob.bin" | wc -c)
+ffs=$(LC_ALL=C tr -cd '\377' < "$repo/blob.bin" | wc -c)
+if [ "$size" -ne 400 ]; then fixture_fail "$n" "size is $size, not 400"
+elif [ "$nuls" -ne 0 ]; then fixture_fail "$n" "holds a NUL"
+elif [ "$ffs" -lt 1 ]; then fixture_fail "$n" "holds no 0xFF byte"
+elif ! numstat_text blob.bin; then fixture_fail "$n" "git treats the blob as binary"
+else expect_quiet "$n" accepted
+fi
+
+n="long dash in prose beside a binary blob"
+mkdir -p "$repo/docs" "$repo/bin"
+printf 'The server reads the core %s at start.\n' "$EM" > "$repo/docs/dash-beside-blob.md"
+make_blob "$repo/bin/beside.bin"
+git -C "$repo" add docs/dash-beside-blob.md bin/beside.bin
+expect_quiet "$n" refused "long dash in prose"
+
+n="attribution on a line with a non-UTF-8 byte"
+mkdir -p "$repo/docs"
+{ printf 'ok\n'; printf '%s \377\n' "$ATTR"; } > "$repo/docs/latin1.md"
+git -C "$repo" add docs/latin1.md
+expect_quiet "$n" refused "AI-attribution"
+
+n="long dash on a prose line with a non-UTF-8 byte"
+mkdir -p "$repo/docs"
+printf 'a %s b \351\n' "$EM" > "$repo/docs/latin1-dash.md"
+git -C "$repo" add docs/latin1-dash.md
+expect_quiet "$n" refused "long dash in prose"
+
+n="attribution after a late NUL byte"
+mkdir -p "$repo/notes"
+{ head -c 8200 /dev/zero | LC_ALL=C tr '\000' 'a'; printf '\nxx\000yy\n%s\n' "$ATTR"; } > "$repo/notes/late-nul.txt"
+git -C "$repo" add notes/late-nul.txt
+if [ "$(LC_ALL=C tr -cd '\000' < "$repo/notes/late-nul.txt" | wc -c)" -ne 1 ]; then fixture_fail "$n" "holds no NUL"
+elif ! numstat_text notes/late-nul.txt; then fixture_fail "$n" "git treats the file as binary"
+else expect_quiet "$n" refused "AI-attribution"
+fi
+
+echo "style lint: $pass passed, $fail failed, $skip skipped"
 [ "$fail" -eq 0 ]

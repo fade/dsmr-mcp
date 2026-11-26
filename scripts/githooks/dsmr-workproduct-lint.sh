@@ -182,8 +182,10 @@ style_class() {
 
 # Prints "LINE: text" for each added line of one staged path, numbered as in
 # the new file so a reader can jump straight to it.
+# Reads bytes: gawk under a UTF-8 locale warns on stderr about a non-UTF-8 byte.
+# NUL is removed because a shell variable cannot hold one.
 added_lines_numbered() {
-  git diff --cached --no-color -U0 -- "$1" 2>/dev/null | awk '
+  git diff --cached --no-color -U0 -- "$1" 2>/dev/null | tr -d '\000' | LC_ALL=C awk '
     /^@@/ { split($3, a, ","); n = substr(a[1], 2) + 0; next }
     /^\+\+\+/ { next }
     /^\+/ { print n ": " substr($0, 2); n++ }'
@@ -193,7 +195,7 @@ added_lines_numbered() {
 STYLE_BLOCKED=0
 style_report() {
   local label="$1" pattern="$2" text="$3" where="$4" hits
-  hits=$(printf '%s\n' "$text" | LC_ALL=C grep -Ei -- "$pattern" 2>/dev/null) || true
+  hits=$(printf '%s\n' "$text" | LC_ALL=C grep -aEi -- "$pattern" 2>/dev/null) || true
   [ -n "$hits" ] || return 1
   echo "$label"
   printf '%s\n' "$hits" | sed "s|^|    ${where}|"
@@ -226,14 +228,14 @@ run_style_staged() {
 
 run_style_msg() {
   local text="$1" warns n
-  text=$(printf '%s\n' "$text" | grep -n '')
+  text=$(printf '%s\n' "$text" | LC_ALL=C grep -an '')
   style_report "✗ style: long dash in the message (use a hyphen, comma, colon, or full stop):" \
     "$STYLE_DASH" "$text" "line " && STYLE_BLOCKED=1
   style_report "✗ style: stock phrase in the message (say it plainly):" \
     "$STYLE_BLOCK" "$text" "line " && STYLE_BLOCKED=1
   style_report "⚠ style: code described as having a mind (give the decision to the author):" \
     "$STYLE_MIND" "$text" "line "
-  warns=$(printf '%s\n' "$text" | LC_ALL=C grep -Eic -- "$STYLE_WARN" 2>/dev/null) || true
+  warns=$(printf '%s\n' "$text" | LC_ALL=C grep -aEic -- "$STYLE_WARN" 2>/dev/null) || true
   n=$(style_density)
   if [ "${warns:-0}" -ge "$n" ]; then
     style_report "✗ style: $warns lines carry filler or cliche words (refused at $n per message):" \
@@ -269,11 +271,16 @@ run_workproduct_lint() {
       # checked. Only the .planning/ path check skips it, because a definition
       # names the planning files its agent reads and writes; text_plan is the
       # same scan without those files.
+      #
+      # The diff is read as bytes. Under a UTF-8 locale grep treats a non-UTF-8
+      # byte as binary, reports it on stderr, and drops the line, so a banned
+      # phrase on a line with a stray byte would pass unchecked. NUL is
+      # removed because a shell variable cannot hold one.
       text=$(git diff --cached --no-color -U0 -- . ':(exclude)scripts/githooks/*' 2>/dev/null \
-             | grep -E '^\+' | grep -Ev '^\+\+\+' | sed 's/^+//')
+             | tr -d '\000' | LC_ALL=C grep -aE '^\+' | LC_ALL=C grep -aEv '^\+\+\+' | LC_ALL=C sed 's/^+//')
       text_plan=$({ git diff --cached --no-color -U0 -- . ':(exclude)scripts/githooks/*' ':(exclude,glob)agents/*.md' 2>/dev/null
                     git diff --cached --no-color -U0 -- agents/README.md 2>/dev/null; } \
-                  | grep -E '^\+' | grep -Ev '^\+\+\+' | sed 's/^+//')
+                  | tr -d '\000' | LC_ALL=C grep -aE '^\+' | LC_ALL=C grep -aEv '^\+\+\+' | LC_ALL=C sed 's/^+//')
       ;;
     msg)
       # Stop at the scissors line: `git commit -v` appends the diff below it,
@@ -295,15 +302,15 @@ run_workproduct_lint() {
     if [ "$mode" = "staged" ]; then run_style_staged; else run_style_msg "$text"; fi
     if [ "$STYLE_BLOCKED" = 1 ]; then blocked=1; style_blocked=1; fi
   fi
-  uni=$(printf '%s\n' "$text" | grep -nEi "$UNIVERSAL" 2>/dev/null) || true
-  [ -n "$text_plan" ] && uni="$uni$(printf '%s\n' "$text_plan" | grep -nEi "$PLANNING_REF" 2>/dev/null | sed '1s/^/\n/')"
+  uni=$(printf '%s\n' "$text" | LC_ALL=C grep -anEi "$UNIVERSAL" 2>/dev/null) || true
+  [ -n "$text_plan" ] && uni="$uni$(printf '%s\n' "$text_plan" | LC_ALL=C grep -anEi "$PLANNING_REF" 2>/dev/null | sed '1s/^/\n/')"
   if [ -n "$uni" ]; then
     echo "✗ work-product lint: AI-attribution or .planning/ reference (never allowed):"
     printf '%s\n' "$uni" | sed 's/^/    /'
     blocked=1; vocab_blocked=1
   fi
   if strict_on; then
-    str=$(printf '%s\n' "$text" | grep -nEi "$STRICT" 2>/dev/null) || true
+    str=$(printf '%s\n' "$text" | LC_ALL=C grep -anEi "$STRICT" 2>/dev/null) || true
     if [ -n "$str" ]; then
       echo "✗ work-product lint: internal planning/coordination index in shipped text:"
       printf '%s\n' "$str" | sed 's/^/    /'
@@ -326,7 +333,7 @@ run_workproduct_lint() {
     else
       wrong_mark='\xc2\xa9'; wrong_name='copyright sign'
     fi
-    if printf '%s\n' "$text" | grep -q "$(printf '%b' "$wrong_mark")"; then
+    if printf '%s\n' "$text" | LC_ALL=C grep -aq "$(printf '%b' "$wrong_mark")"; then
       echo "✗ work-product lint: wrong attribution mark for this licence."
       if [ "$want" = "copyright" ]; then
         echo "    This project's licence is inherited and is not AGPL, so its trailer"
@@ -342,7 +349,7 @@ run_workproduct_lint() {
     # name alone anywhere in the text is not one: an Author: header or a body
     # that mentions it would otherwise hide a missing trailer.
     elif ! printf '%s\n' "$text" \
-           | grep -qiE "^($(printf '\xf0\x9f\x84\xaf')|$(printf '\xc2\xa9'))[[:space:]]+Brian O'Reilly"; then
+           | LC_ALL=C grep -aqiE "^($(printf '\xf0\x9f\x84\xaf')|$(printf '\xc2\xa9'))[[:space:]]+Brian O'Reilly"; then
       echo "⚠ work-product lint: no attribution trailer found (not blocking)."
       echo "    Expected a line naming Brian O'Reilly with the $( [ "$want" = copyright ] && echo 'copyright sign' || echo 'copyleft mark' )."
     fi
